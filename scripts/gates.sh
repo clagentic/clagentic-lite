@@ -21,7 +21,24 @@ set -e
 . "$(dirname "$0")/platform.sh"
 ds_load_env
 
-REPO_ROOT=$(ds_repo_root)
+# Tool home: the directory containing scripts/ — resolved from this script's
+# own location so it's correct whether invoked via PATH, symlink, or directly.
+# This is the install tree ($CLAGENTIC_HOME), not the enrolled project root.
+SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+TOOL_HOME="$(dirname "$SCRIPTS_DIR")"
+
+# Project root resolution: CLAGENTIC_PROJECT_ROOT env var wins, then git
+# show-toplevel of cwd. The env var is the override path used when gates.sh
+# is called from a hook shim installed by `clagentic enroll` — the shim
+# stamps __CLAGENTIC_HOME__ at enroll time but does NOT override the project
+# root; instead, git show-toplevel of the repo under commit is used because
+# the hook always runs from inside the enrolled repo's working tree.
+# Explicit CLAGENTIC_PROJECT_ROOT is still supported for scripted/test use.
+if [ -n "${CLAGENTIC_PROJECT_ROOT:-}" ]; then
+  REPO_ROOT="$CLAGENTIC_PROJECT_ROOT"
+else
+  REPO_ROOT=$(ds_repo_root)
+fi
 [ -n "$REPO_ROOT" ] || { echo "gates.sh: not in a git repo" 1>&2; exit 1; }
 
 AUDIT_DB="$REPO_ROOT/.clagentic/audit.db"
@@ -141,7 +158,7 @@ cmd_sast() {
 
 cmd_review() {
   OUT="$REPO_ROOT/.clagentic/last-review.json"
-  git diff --cached --unified=3 | "$REPO_ROOT/scripts/llm-client.sh" review > "$OUT"
+  git diff --cached --unified=3 | "$TOOL_HOME/scripts/llm-client.sh" review > "$OUT"
   # Reject degraded envelopes outright. An LLM wrapper that failed every
   # chain step emits valid JSON with findings:[] — schema-valid but
   # meaningless. Without this check, a misconfigured / auth-broken /
@@ -182,7 +199,7 @@ review_is_degraded() {
 
 cmd_adversarial() {
   OUT="$REPO_ROOT/.clagentic/last-adversarial.md"
-  git diff --cached --unified=3 | "$REPO_ROOT/scripts/llm-client.sh" adversarial > "$OUT"
+  git diff --cached --unified=3 | "$TOOL_HOME/scripts/llm-client.sh" adversarial > "$OUT"
   cmd_log_run adversarial warn "wrote $OUT (non-blocking)"
   cat "$OUT"
 }
@@ -194,7 +211,7 @@ cmd_merge_gate() {
   IN="$REPO_ROOT/.clagentic/gate-summary.json"
   OUT="$REPO_ROOT/.clagentic/last-merge-gate.json"
   build_gate_summary > "$IN"
-  "$REPO_ROOT/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT"
+  "$TOOL_HOME/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT"
   DECISION=""
   if command -v jq >/dev/null 2>&1; then
     DECISION=$(jq -r '.decision // "unknown"' "$OUT" 2>/dev/null)

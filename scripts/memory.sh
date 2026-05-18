@@ -14,7 +14,18 @@ set -e
 . "$(dirname "$0")/platform.sh"
 ds_load_env
 
-REPO_ROOT=$(ds_repo_root)
+# Tool home: resolved from this script's own location (same convention as gates.sh).
+SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+TOOL_HOME="$(dirname "$SCRIPTS_DIR")"
+
+# Project root resolution: same convention as gates.sh.
+# CLAGENTIC_PROJECT_ROOT env var wins, then git show-toplevel of cwd.
+# See gates.sh header comment for the rationale.
+if [ -n "${CLAGENTIC_PROJECT_ROOT:-}" ]; then
+  REPO_ROOT="$CLAGENTIC_PROJECT_ROOT"
+else
+  REPO_ROOT=$(ds_repo_root)
+fi
 [ -n "$REPO_ROOT" ] || { echo "memory.sh: not in a git repo" 1>&2; exit 1; }
 
 DB="$REPO_ROOT/.clagentic/memory.db"
@@ -79,7 +90,7 @@ cmd_recall() {
 
 cmd_summarize_turn() {
   # Pipe stdin through the Summarizer role-call wrapper, then log-turn.
-  SUMMARY=$("$REPO_ROOT/scripts/llm-client.sh" summarize | head -c 200)
+  SUMMARY=$("$TOOL_HOME/scripts/llm-client.sh" summarize | head -c 200)
   [ -z "$SUMMARY" ] && { echo "memory.sh summarize-turn: empty summary, skipping" 1>&2; exit 0; }
   TAGS=$(printf '%s' "$SUMMARY" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]' ' ' | tr ' ' '\n' | \
     awk 'length($0) >= 4 && !/^(this|that|with|from|have|will|what|when|where|which|should|would|could|about|into|been|being|some|then|than|over|under|done|made|note|like|just|also|here|there|their|them)$/' | \
