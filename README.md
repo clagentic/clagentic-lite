@@ -298,18 +298,6 @@ sqlite3 .clagentic/memory.db         # inspect session memory
 
 ---
 
-## Status
-
-Weekend-1 build complete. End-to-end demo runs:
-
-- `./install.sh` writes `.env`, wires hooks, initializes both SQLite files.
-- `scripts/smoke.sh` runs non-interactively and asserts each gate.
-- `/review` calls the configured Reviewer CLI with `model_chain` fallback.
-- `/ship` runs the full sequence, blocks on review-severity or merge-gate refuse, and opens a PR via `gh` if green.
-- Three planted-bug example projects (python, node, go) drive the smoke test.
-
-Open follow-ups: weekend-2 screencast + blog draft (lr-c7d9).
-
 ## License
 
 **FSL-1.1-MIT** — [Functional Source License 1.1, MIT Future License](https://fsl.software/).
