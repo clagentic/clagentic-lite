@@ -17,7 +17,7 @@
 
 Four roles (Builder, Reviewer, Auditor, Merge Gate) with per-role model chains. Five gates (memory recall, safe bash/writes, cross-vendor review, local security scans, session summarize) that fire on Claude Code or Codex events. One SQLite file for session memory, one for the audit trail. POSIX shell. No server. Nothing global. Runs the same on WSL2 Ubuntu and macOS.
 
-It is not a platform. It is what you install on a work laptop so the coding session you have there is visibly more careful than the default.
+It is not a platform. It is what you install on your machine so the coding session you have there is visibly more careful than the default.
 
 ---
 
@@ -59,7 +59,7 @@ Tier names (`flagship`, `default`, `cheap`) resolve to concrete model strings vi
 
 ## Install
 
-Three lines from a clean work laptop:
+Three lines from a clean checkout:
 
 ```sh
 git clone https://github.com/clagentic/clagentic-lite.git
