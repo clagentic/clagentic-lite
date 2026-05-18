@@ -63,7 +63,7 @@ sqlite3 .clagentic/audit.db   # inspect the audit trail directly
 sqlite3 .clagentic/memory.db  # inspect session memory directly
 ```
 
-CI: `.github/workflows/gates.yml` mirrors the local gates on every PR. It runs on both `ubuntu-latest` and `macos-latest`.
+There is intentionally no CI. The gates run on the user's machine via git hooks (pre-commit, pre-push) and Claude Code lifecycle hooks. Re-running the same gates in a hosted CI surface would contradict the no-server contract — and the gates exist to block bad changes locally, not to gate PRs against the upstream repo.
 
 ---
 
@@ -87,8 +87,7 @@ CI: `.github/workflows/gates.yml` mirrors the local gates on every PR. It runs o
 | `scripts/memory.sh` | SQLite session memory CRUD |
 | `scripts/llm-client.sh` | role-aware LLM wrapper with model_chain fallback |
 | `scripts/gates.sh` | gate orchestrator + digest + ship + merge-gate |
-| `scripts/smoke.sh` | non-interactive end-to-end (CI + local) |
-| `.github/workflows/gates.yml` | CI mirror of local gates |
+| `scripts/smoke.sh` | non-interactive end-to-end (local sanity check) |
 | `docs/` | DESIGN, GATES, DEMO-SCRIPT, PORTABILITY |
 | `examples/{python,node,go}/` | demo projects with planted issues |
 | `media/logo/` | brand assets (lockup, icon — see clagentic-brand canonical) |

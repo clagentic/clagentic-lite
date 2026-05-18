@@ -118,7 +118,7 @@ Persistent codex sessions and persistent claude sessions were both considered an
 - `DS_STAT_MTIME` — `stat -c %Y` (GNU) or `stat -f %m` (BSD)
 - `DS_OS` — `linux` (incl. WSL) or `darwin`
 
-Hooks call only POSIX sh + the shims. No `bash-4` features (associative arrays, `${var^^}`, etc.). Tested in CI on both `ubuntu-latest` and `macos-latest`.
+Hooks call only POSIX sh + the shims. No `bash-4` features (associative arrays, `${var^^}`, etc.). Verified by `sh -n` syntax check + `scripts/smoke.sh --quick` local run; not gated by hosted CI.
 
 ## What gets logged
 

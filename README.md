@@ -243,7 +243,7 @@ clagentic-lite/
 │   ├── gates.sh                    gate orchestrator + digest + ship
 │   └── smoke.sh                    non-interactive end-to-end
 ├── examples/{python,node,go}/      demo projects with planted bugs + secrets
-└── .github/workflows/gates.yml     CI mirror of local gates (ubuntu + macos)
+└── (no CI — this is a local-only tool)
 ```
 
 ---

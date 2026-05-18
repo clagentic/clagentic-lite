@@ -3,8 +3,6 @@
 clagentic-lite is tested on:
 - Ubuntu 22.04 / 24.04 under WSL2 (Windows 11)
 - macOS Sonoma (14) and Sequoia (15)
-- Ubuntu 24.04 in CI (`ubuntu-latest`)
-- macOS in CI (`macos-latest`)
 
 It is **not** tested on bare Windows (no WSL), on Alpine, or on BSDs other than macOS. Patches welcome.
 
