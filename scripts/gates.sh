@@ -12,6 +12,8 @@
 #   ship             run all blocking gates, then push + open PR if green
 #   render-review    pretty-print .clagentic/last-review.json
 #   digest           summarize today's audit rows
+#   status           last N runs per gate (default N=10) with color outcomes
+#   tail             follow audit.db, render new gate_runs rows as they land
 #   pre-push         hook entry point (deps + sast + optional review)
 #   log-run          internal: insert one row into gate_runs
 
@@ -429,6 +431,110 @@ cmd_digest() {
   printf '\n'
 }
 
+# ---------------------------------------------------------------- status / tail
+#
+# Visibility surfaces over .clagentic/audit.db that complement `digest`:
+#
+#   status — last N runs per gate (default 10), color-coded outcome. Answers
+#            "what's the recent state of each gate?" at a glance, without
+#            scrolling through a time-ordered digest.
+#   tail   — poll audit.db every 1s for new rows and render them as they land.
+#            POSIX-portable (no inotify); Ctrl-C to quit. Foreground only.
+#
+# Both are read-only. Neither writes to audit.db, neither runs a gate, neither
+# spawns a daemon. This is the CLI-only visibility step before the proposed
+# web inspector (lr-a699) — see docs/DESIGN.md non-goals.
+
+# Color helpers. Honor NO_COLOR (https://no-color.org/) and refuse to emit
+# escape codes when stdout is not a TTY (piping to a file should be plain).
+_color_init() {
+  if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+    C_RESET=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_DIM=""
+  else
+    C_RESET=$(printf '\033[0m')
+    C_GREEN=$(printf '\033[32m')
+    C_RED=$(printf '\033[31m')
+    C_YELLOW=$(printf '\033[33m')
+    C_DIM=$(printf '\033[2m')
+  fi
+}
+
+_color_outcome() {
+  case "$1" in
+    pass)  printf '%s%s%s' "$C_GREEN"  "$1" "$C_RESET" ;;
+    block) printf '%s%s%s' "$C_RED"    "$1" "$C_RESET" ;;
+    warn)  printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" ;;
+    skip)  printf '%s%s%s' "$C_DIM"    "$1" "$C_RESET" ;;
+    *)     printf '%s' "$1" ;;
+  esac
+}
+
+cmd_status() {
+  cmd_init
+  _color_init
+  N="${1:-10}"
+  # Reject anything that isn't a positive integer. A bad N here would inject
+  # straight into the SQL LIMIT clause.
+  case "$N" in
+    ''|*[!0-9]*) echo "gates.sh status: N must be a positive integer (got: $N)" 1>&2; return 2 ;;
+  esac
+  [ "$N" -lt 1 ] && { echo "gates.sh status: N must be >= 1" 1>&2; return 2; }
+
+  printf '\n== clagentic-lite gate status (last %s per gate) ==\n\n' "$N"
+
+  # One row per known gate. Iterate the gate list rather than GROUP BY because
+  # we want a section per gate even when the gate has zero rows (so users
+  # notice "review never ran" rather than silently missing).
+  for GATE in secrets deps sast review adversarial merge-gate ship; do
+    printf '%s\n' "-- $GATE --"
+    ROWS=$(sqlite3 -separator '|' "$AUDIT_DB" \
+      "SELECT ts, outcome, substr(coalesce(details,''),1,60)
+       FROM gate_runs WHERE gate='$GATE' ORDER BY ts DESC LIMIT $N;" 2>/dev/null)
+    if [ -z "$ROWS" ]; then
+      printf '  %s(no runs)%s\n\n' "$C_DIM" "$C_RESET"
+      continue
+    fi
+    # POSIX read loop; IFS=| splits the sqlite3 -separator output.
+    printf '%s\n' "$ROWS" | while IFS='|' read -r TS OUTCOME DETAILS; do
+      COLORED=$(_color_outcome "$OUTCOME")
+      printf '  %s  %-7s  %s\n' "$TS" "$COLORED" "$DETAILS"
+    done
+    printf '\n'
+  done
+}
+
+cmd_tail() {
+  cmd_init
+  _color_init
+  # Start from the current max id so we only render NEW rows. A fresh tail
+  # session shouldn't dump history — use `status` or `digest` for that.
+  LAST_ID=$(sqlite3 "$AUDIT_DB" "SELECT COALESCE(MAX(id),0) FROM gate_runs;" 2>/dev/null)
+  LAST_ID=${LAST_ID:-0}
+  INTERVAL="${CLAGENTIC_TAIL_INTERVAL_SEC:-1}"
+  printf '== clagentic-lite gate tail (Ctrl-C to quit, polling every %ss) ==\n' "$INTERVAL"
+  printf '   starting from gate_runs.id > %s\n\n' "$LAST_ID"
+
+  # Trap INT/TERM so the user gets a clean exit instead of a stack trace from
+  # set -e + a killed sqlite3.
+  trap 'printf "\n[tail] stopped\n"; exit 0' INT TERM
+
+  while :; do
+    NEW=$(sqlite3 -separator '|' "$AUDIT_DB" \
+      "SELECT id, ts, gate, outcome, substr(coalesce(details,''),1,80)
+       FROM gate_runs WHERE id > $LAST_ID ORDER BY id ASC;" 2>/dev/null)
+    if [ -n "$NEW" ]; then
+      # Update LAST_ID from the last line's id BEFORE the read loop — the
+      # loop runs in a subshell (pipe) so any assignment inside is lost.
+      LAST_ID=$(printf '%s\n' "$NEW" | awk -F'|' 'END {print $1}')
+      printf '%s\n' "$NEW" | while IFS='|' read -r ID TS GATE OUTCOME DETAILS; do
+        COLORED=$(_color_outcome "$OUTCOME")
+        printf '  %s  %-12s  %-7s  %s\n' "$TS" "$GATE" "$COLORED" "$DETAILS"
+      done
+    fi
+    sleep "$INTERVAL"
+  done
+}
+
 case "${1:-}" in
   init)           cmd_init ;;
   secrets)        cmd_secrets ;;
@@ -442,5 +548,7 @@ case "${1:-}" in
   pre-push)       cmd_pre_push ;;
   log-run)        shift; cmd_log_run "$@" ;;
   digest)         cmd_digest ;;
-  *) echo "usage: gates.sh {init|secrets|deps|sast|review|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest}" 1>&2; exit 1 ;;
+  status)         shift; cmd_status "$@" ;;
+  tail)           cmd_tail ;;
+  *) echo "usage: gates.sh {init|secrets|deps|sast|review|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest|status|tail}" 1>&2; exit 1 ;;
 esac

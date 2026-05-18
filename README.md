@@ -136,6 +136,8 @@ Two layers — the shell harness, then Claude Code's view of it.
 ```sh
 scripts/smoke.sh --quick   # non-interactive end-to-end without LLM calls
 scripts/gates.sh digest    # show what gates ran today
+scripts/gates.sh status    # last 10 runs per gate, color-coded (status N for other N)
+scripts/gates.sh tail      # follow audit.db live; new gate rows render as they land (Ctrl-C to quit)
 ```
 
 Smoke covers: DB init, seed + recall, gitleaks blocks a planted token, `llm-client.sh review` emits parseable JSON, audit-DB has fresh rows. If smoke passes, the harness is wired correctly.
@@ -289,6 +291,8 @@ Details in `docs/GATES.md`.
 /infosec-rt              # structured red-team threat model
 
 scripts/gates.sh digest  # what gates ran today
+scripts/gates.sh status  # last N runs per gate (default 10), color-coded outcomes
+scripts/gates.sh tail    # follow audit.db live; new gate rows render as they land
 scripts/memory.sh recall <keyword>   # raw recall
 sqlite3 .clagentic/audit.db          # inspect the audit trail
 sqlite3 .clagentic/memory.db         # inspect session memory

@@ -113,6 +113,54 @@ else
   bad "digest failed"
 fi
 
+# ----------------------------------------------------- 6b. status + tail (read-only)
+
+step "6b. gates.sh status (read-only visibility)"
+# Seed a known row so status has something to render in at least one section.
+scripts/gates.sh log-run secrets pass "smoke status seed" >/dev/null 2>&1 || true
+if scripts/gates.sh status 5 >/tmp/clagentic-smoke-status.log 2>&1; then
+  if grep -q -- '-- secrets --' /tmp/clagentic-smoke-status.log; then
+    ok "status exits 0 and renders per-gate sections"
+  else
+    bad "status ran but didn't render gate sections; see /tmp/clagentic-smoke-status.log"
+  fi
+else
+  bad "status failed; see /tmp/clagentic-smoke-status.log"
+fi
+
+# Input validation: status with a non-integer argument must exit non-zero.
+if scripts/gates.sh status abc >/dev/null 2>&1; then
+  bad "status accepted non-integer N (should reject)"
+else
+  ok "status rejects non-integer N"
+fi
+
+step "6c. gates.sh tail picks up new rows"
+# Run tail in the background; insert a row; tail should render it within a
+# few poll intervals. Then SIGINT and read the captured output.
+TAIL_LOG="/tmp/clagentic-smoke-tail.log"
+: > "$TAIL_LOG"
+CLAGENTIC_TAIL_INTERVAL_SEC=1 scripts/gates.sh tail >"$TAIL_LOG" 2>&1 &
+TAIL_PID=$!
+# Give tail a moment to capture MAX(id) before we insert.
+sleep 2
+SENTINEL="smoke tail sentinel $$"
+scripts/gates.sh log-run secrets pass "$SENTINEL" >/dev/null 2>&1 || true
+# Allow up to 5 poll cycles for the sentinel to appear.
+i=0
+while [ $i -lt 5 ]; do
+  if grep -q "$SENTINEL" "$TAIL_LOG" 2>/dev/null; then break; fi
+  sleep 1
+  i=$((i+1))
+done
+kill -INT "$TAIL_PID" 2>/dev/null || true
+wait "$TAIL_PID" 2>/dev/null || true
+if grep -q "$SENTINEL" "$TAIL_LOG"; then
+  ok "tail rendered the new row within the poll window"
+else
+  bad "tail did not render the new row; see $TAIL_LOG"
+fi
+
 # ---------------------------------------------------- 7. audit.db has rows
 
 step "7. audit.db has rows from this run"

@@ -149,9 +149,19 @@ Reads the last assistant turn from the Claude Code transcript path, passes it th
 sqlite3 .clagentic/audit.db \
   "SELECT ts, gate, outcome, substr(details,1,80) FROM gate_runs WHERE ts > date('now','-1 day') ORDER BY ts"
 
-# digest (human-readable)
+# digest (human-readable; time-ordered, last 24h)
 scripts/gates.sh digest
+
+# status (last N runs per gate, color-coded; defaults to N=10)
+scripts/gates.sh status
+scripts/gates.sh status 25
+
+# tail (follow audit.db live; new rows render as they land — Ctrl-C to quit)
+scripts/gates.sh tail
+CLAGENTIC_TAIL_INTERVAL_SEC=2 scripts/gates.sh tail   # adjust poll interval
 ```
+
+`status` and `tail` honor `NO_COLOR=1` and emit plain text when stdout is not a TTY (safe to pipe to a file). Both are read-only — neither writes to `audit.db`, neither runs a gate, neither spawns a daemon.
 
 ## Skipping gates
 
