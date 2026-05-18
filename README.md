@@ -67,6 +67,12 @@ git clone https://github.com/clagentic/clagentic-lite.git ~/.clagentic-lite
 cd ~/code/my-project && clagentic enroll
 ```
 
+If `init` warns that `~/.local/bin` is not on `$PATH`, add this to your shell rc and reopen your shell:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic update` — pulls `--ff-only`, re-checks prereqs, re-stamps shims in enrolled repos if the template version changed.
 
 The tool is cloned once to `~/.clagentic-lite` (or `$CLAGENTIC_HOME` if set). Your projects never contain a copy of the scripts or agent files — they hold only `.clagentic/{audit.db,memory.db}` and thin hook shims that call back to `$CLAGENTIC_HOME`. Update the tool once and every enrolled repo picks it up.
@@ -90,7 +96,7 @@ Required for the security gates (you can install these later and opt-in per gate
 
 | Tool                | Gate     | Linux/WSL                   | macOS                       | Skip with                              |
 |---------------------|----------|-----------------------------|-----------------------------|----------------------------------------|
-| `gitleaks` ≥ 8.25   | secrets  | [gitleaks releases][gl]     | `brew install gitleaks`     | `CLAGENTIC_ALLOW_MISSING_GITLEAKS=1`   |
+| `gitleaks` ≥ 8.25   | secrets  | see [releases][gl]          | `brew install gitleaks`     | `CLAGENTIC_ALLOW_MISSING_GITLEAKS=1`   |
 | `semgrep`           | sast     | `pipx install semgrep`      | `brew install semgrep`      | `CLAGENTIC_ALLOW_MISSING_SEMGREP=1`    |
 | `osv-scanner`       | deps     | [osv-scanner releases][osv] | `brew install osv-scanner`  | `CLAGENTIC_ALLOW_MISSING_OSV=1`        |
 

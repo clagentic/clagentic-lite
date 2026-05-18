@@ -70,7 +70,7 @@ ds_realpath() {
 shim_version() {
   _sv_file="$1"
   [ -f "$_sv_file" ] || { printf ''; return; }
-  grep -m1 'clagentic-lite hook shim' "$_sv_file" 2>/dev/null | sed 's/.*· \(v[^ ]*\) ·.*/\1/'
+  awk '/clagentic-lite hook shim/ { print; exit }' "$_sv_file" 2>/dev/null | sed 's/.*· \(v[^ ]*\) ·.*/\1/'
 }
 
 # Stamp a hook shim from share/hook-shims/<name>.template into a repo's
@@ -208,7 +208,7 @@ _write_global_config() {
   # Prepare destination directory.
   _config_dir="$(dirname "$GLOBAL_CONFIG")"
   if [ ! -d "$_config_dir" ]; then
-    python3 -c "import os; os.makedirs('$_config_dir', 0o700, exist_ok=True)" 2>/dev/null \
+    mkdir -p "$_config_dir" && chmod 700 "$_config_dir" \
       || { warn "cannot create $_config_dir"; return 1; }
   fi
 
@@ -287,7 +287,7 @@ _granular_config_prompts() {
 
 _ensure_local_bin() {
   if [ ! -d "$LOCAL_BIN" ]; then
-    python3 -c "import os; os.makedirs('$LOCAL_BIN', 0o755, exist_ok=True)" 2>/dev/null \
+    mkdir -p "$LOCAL_BIN" \
       || { warn "cannot create $LOCAL_BIN"; return 1; }
   fi
   # Warn if LOCAL_BIN is not on PATH.
@@ -374,7 +374,7 @@ _enroll_one() {
 
   # Initialize .clagentic/ DBs in the enrolled repo.
   _dot="$_canon/.clagentic"
-  python3 -c "import os; os.makedirs('$_dot', 0o755, exist_ok=True)" 2>/dev/null \
+  mkdir -p "$_dot" && chmod 755 "$_dot" \
     || { warn "cannot create $_dot"; return 1; }
 
   CLAGENTIC_PROJECT_ROOT="$_canon" "$CLAGENTIC_HOME/scripts/memory.sh" init
@@ -387,14 +387,14 @@ _enroll_one() {
     /*) _hooks_dir="$_git_dir/hooks" ;;
     *)  _hooks_dir="$_canon/$_git_dir/hooks" ;;
   esac
-  python3 -c "import os; os.makedirs('$_hooks_dir', 0o755, exist_ok=True)" 2>/dev/null || true
+  mkdir -p "$_hooks_dir" || true
 
   stamp_shim pre-commit "$_hooks_dir" || true
   stamp_shim pre-push   "$_hooks_dir" || true
 
   # Register.
   _reg_dir="$(dirname "$REGISTRY")"
-  python3 -c "import os; os.makedirs('$_reg_dir', 0o755, exist_ok=True)" 2>/dev/null || true
+  mkdir -p "$_reg_dir" || true
 
   # Remove any stale entry for this path before appending.
   if [ -f "$REGISTRY" ]; then
@@ -456,7 +456,7 @@ cmd_unenroll() {
   if [ "$UNENROLL_PURGE" -eq 1 ]; then
     _dot="$_canon/.clagentic"
     if [ -d "$_dot" ]; then
-      python3 -c "import shutil; shutil.rmtree('$_dot')" 2>/dev/null
+      rm -rf -- "$_dot"
       say "purged: $_dot"
     fi
   fi
@@ -472,8 +472,9 @@ cmd_list() {
     return 0
   fi
 
+  _HR='------------------------------------------------------------------------------------------'
   printf '%-50s  %-24s  %s\n' "PATH" "LAST GATE RUN" "STATUS"
-  printf '%s\n' "$(printf '%0.s-' $(seq 1 90))"
+  printf '%s\n' "$_HR"
 
   while IFS= read -r _rpath; do
     [ -z "$_rpath" ] && continue
@@ -501,7 +502,7 @@ cmd_list() {
       done
       # Check tool still exists at the baked-in path.
       if [ -f "$_hooks_dir/pre-commit" ]; then
-        _baked=$(grep '__CLAGENTIC_HOME__\|CLAGENTIC_HOME:=' "$_hooks_dir/pre-commit" 2>/dev/null | head -1)
+        _baked=$(grep -E '__CLAGENTIC_HOME__|CLAGENTIC_HOME:=' "$_hooks_dir/pre-commit" 2>/dev/null | head -1)
         if [ -z "$_baked" ] && ! grep -q "$CLAGENTIC_HOME" "$_hooks_dir/pre-commit" 2>/dev/null; then
           _status="tool missing"
         fi
@@ -538,7 +539,7 @@ cmd_doctor() {
 
   # 2. Symlink correct.
   if [ -L "$CLI_SYMLINK" ]; then
-    _sym_target=$(python3 -c "import os; print(os.readlink('$CLI_SYMLINK'))" 2>/dev/null || true)
+    _sym_target=$(readlink "$CLI_SYMLINK" 2>/dev/null || true)
     if [ "$_sym_target" = "$CLAGENTIC_HOME/bin/clagentic" ]; then
       _ok "$CLI_SYMLINK -> $CLAGENTIC_HOME/bin/clagentic"
     else
@@ -662,7 +663,7 @@ cmd_update() {
       _installed_ver=$(shim_version "$_hf")
       if [ "$_installed_ver" != "$SHIM_VERSION" ]; then
         ENROLL_FORCE=0 stamp_shim "$_hook" "$_hd" && {
-          say "re-stamped: $_rpath .git/hooks/$_hook ($installed_ver -> $SHIM_VERSION)"
+          say "re-stamped: $_rpath .git/hooks/$_hook ($_installed_ver -> $SHIM_VERSION)"
           _restamped=$((_restamped+1))
         }
       fi
