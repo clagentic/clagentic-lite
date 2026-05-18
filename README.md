@@ -13,7 +13,7 @@
 
 ---
 
-# clagentic-lite
+# Clagentic:Lite
 
 Four roles (Builder, Reviewer, Auditor, Merge Gate) with per-role model chains. Five gates (memory recall, safe bash/writes, cross-vendor review, local security scans, session summarize) that fire on Claude Code or Codex events. One SQLite file for session memory, one for the audit trail. POSIX shell. No server. Nothing global. Runs the same on WSL2 Ubuntu and macOS.
 
