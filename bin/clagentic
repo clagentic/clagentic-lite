@@ -144,8 +144,19 @@ cmd_init() {
   ds_offer_install gitleaks \
     "see https://github.com/gitleaks/gitleaks#installing" \
     "brew install gitleaks" || true
+  # semgrep: prefer pipx; fall back to user-scoped pip if pipx isn't installed.
+  # ds_offer_install's PATH check would suppress the prompt for "pipx install ..."
+  # on a host without pipx, which is correct but unhelpful — pick a hint here
+  # that matches what's actually installable.
+  if command -v pipx >/dev/null 2>&1; then
+    _SEMGREP_HINT_LINUX="pipx install semgrep"
+  elif command -v python3 >/dev/null 2>&1; then
+    _SEMGREP_HINT_LINUX="python3 -m pip install --user semgrep"
+  else
+    _SEMGREP_HINT_LINUX="see https://semgrep.dev/docs/getting-started/"
+  fi
   ds_offer_install semgrep \
-    "pipx install semgrep" \
+    "$_SEMGREP_HINT_LINUX" \
     "brew install semgrep" || true
   ds_offer_install osv-scanner \
     "see https://google.github.io/osv-scanner/installation/" \

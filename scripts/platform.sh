@@ -186,6 +186,15 @@ except Exception:
 #   Returns 0 if the tool was already present, or if the user ran the install
 #   command successfully. Returns 1 if the user declined or the install failed.
 #   Callers use this for REQUIRED tools where a missing tool is a hard stop.
+#
+#   The prompt is suppressed (and the hint printed as manual instructions only)
+#   when the hint is not a runnable shell command:
+#     - hint starts with "see " (documentation pointer, e.g. "see https://...")
+#     - hint contains "://" (any URL — same idea)
+#     - hint's first token is not on PATH (e.g. "pipx install ..." on a host
+#       without pipx, "brew install ..." on Linux, "apt install ..." on macOS)
+#   This prevents the "Run it now? y -> eval: see: not found" footgun where we
+#   feed a non-command to `eval` and the user watches it fail in real time.
 
 ds_check_tool() {
   _CT_NAME="$1"
@@ -222,7 +231,29 @@ ds_offer_install() {
     _OI_HINT="$_OI_LINUX"
   fi
   printf 'MISSING: %s — install with: %s\n' "$_OI_NAME" "$_OI_HINT"
-  if [ -t 0 ]; then
+
+  # Decide whether the hint is actually a runnable command. If not, fall
+  # through to "Run manually" without prompting — pasting a doc URL into
+  # `eval` just produces a confusing "command not found" right after the
+  # user said yes. Three rejection rules:
+  #   1. starts with "see " (e.g. "see https://github.com/...")
+  #   2. contains "://" (any URL slipped in elsewhere)
+  #   3. first token is not on PATH (e.g. pipx/brew/apt unavailable here)
+  _OI_RUNNABLE=1
+  case "$_OI_HINT" in
+    "see "*|*"://"*) _OI_RUNNABLE=0 ;;
+  esac
+  if [ "$_OI_RUNNABLE" -eq 1 ]; then
+    # First whitespace-delimited token — POSIX, no arrays.
+    _OI_FIRST=$(printf '%s' "$_OI_HINT" | awk '{print $1}')
+    if [ -n "$_OI_FIRST" ] && ! command -v "$_OI_FIRST" >/dev/null 2>&1; then
+      _OI_RUNNABLE=0
+      printf '  (note: %s not on PATH — cannot run the suggested command for you)\n' \
+        "$_OI_FIRST"
+    fi
+  fi
+
+  if [ "$_OI_RUNNABLE" -eq 1 ] && [ -t 0 ]; then
     printf 'Run it now? [y/N]: '
     read -r _OI_REPLY || _OI_REPLY=""
     case "$_OI_REPLY" in
