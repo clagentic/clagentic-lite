@@ -59,13 +59,23 @@ Tier names (`flagship`, `default`, `cheap`) resolve to concrete model strings vi
 
 ## Install
 
-Clone once, enroll per project:
+Clone once, enroll per project. The snippet below is safe to re-run — on a fresh machine it clones, on a machine that already has clagentic-lite it pulls and re-runs `init` (which is also what `clagentic update` does):
 
 ```sh
-git clone https://github.com/clagentic/clagentic-lite.git ~/.clagentic-lite
-~/.clagentic-lite/bin/clagentic init
-cd ~/code/my-project && clagentic enroll
+# First install OR re-run after pulling new commits.
+HOME_DIR="${CLAGENTIC_HOME:-$HOME/.clagentic-lite}"
+if [ -d "$HOME_DIR/.git" ]; then
+  git -C "$HOME_DIR" pull --ff-only
+else
+  git clone https://github.com/clagentic/clagentic-lite.git "$HOME_DIR"
+fi
+"$HOME_DIR/bin/clagentic" init
+
+# Per-project (run from each repo you want gated, or pass the path):
+cd /path/to/your/project && clagentic enroll
 ```
+
+After the first install, the steady-state upgrade is just `clagentic update` — it does the `git pull --ff-only`, re-checks prereqs, and re-stamps hook shims in every enrolled repo if the template version changed.
 
 If `init` warns that `~/.local/bin` is not on `$PATH`, add this to your shell rc and reopen your shell:
 
