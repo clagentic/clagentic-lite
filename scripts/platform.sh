@@ -264,11 +264,65 @@ ds_offer_install() {
           return 0
         else
           printf '  install command failed — install manually and re-run\n' 1>&2
+          ds_pending_record "$_OI_NAME" "$_OI_HINT"
           return 1
         fi
         ;;
     esac
   fi
   printf '  Run manually: %s\n' "$_OI_HINT"
+  ds_pending_record "$_OI_NAME" "$_OI_HINT"
   return 1
+}
+
+# ds_pending_record NAME HINT — append a still-missing tool to the pending
+# list so the caller can print a single collated summary at the end of a
+# prereq check. Newline-separated NAME|HINT pairs. Idempotent: skips duplicates
+# (the same tool might be checked from multiple call sites in the future).
+ds_pending_record() {
+  _PR_NAME="$1"
+  _PR_HINT="$2"
+  _PR_ENTRY="$_PR_NAME|$_PR_HINT"
+  case "
+${DS_PENDING_INSTALLS:-}
+" in
+    *"
+$_PR_ENTRY
+"*) return 0 ;;
+  esac
+  if [ -z "${DS_PENDING_INSTALLS:-}" ]; then
+    DS_PENDING_INSTALLS="$_PR_ENTRY"
+  else
+    DS_PENDING_INSTALLS="$DS_PENDING_INSTALLS
+$_PR_ENTRY"
+  fi
+  export DS_PENDING_INSTALLS
+}
+
+# ds_pending_summary — print the collated still-missing-tools block.
+# No-op when the list is empty. Output goes to stdout; caller decides whether
+# to also exit non-zero (init prefers to warn-and-continue).
+ds_pending_summary() {
+  [ -z "${DS_PENDING_INSTALLS:-}" ] && return 0
+  printf '\n--- still to install (run these manually, then re-run \`clagentic init\`) ---\n'
+  # POSIX-safe iteration over newline-separated entries: substitute IFS for
+  # the loop, avoid bashisms.
+  _OLD_IFS="${IFS-}"
+  IFS='
+'
+  for _PS_ENTRY in $DS_PENDING_INSTALLS; do
+    _PS_NAME="${_PS_ENTRY%%|*}"
+    _PS_HINT="${_PS_ENTRY#*|}"
+    printf '  %-15s  %s\n' "$_PS_NAME" "$_PS_HINT"
+  done
+  IFS="$_OLD_IFS"
+  printf '\n'
+}
+
+# ds_pending_reset — clear the pending list. Call at the top of a fresh
+# prereq pass so re-entry (e.g. cmd_update calling the same helpers) starts
+# clean.
+ds_pending_reset() {
+  DS_PENDING_INSTALLS=""
+  export DS_PENDING_INSTALLS
 }

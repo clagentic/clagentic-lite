@@ -121,6 +121,7 @@ cmd_init() {
   # 2. Prereq detection with offer-to-install for REQUIRED tools.
   say "checking prerequisites..."
   DS_CHECK_MISSING=0; export DS_CHECK_MISSING
+  ds_pending_reset
 
   # Required: sqlite3, git, and at least one JSON validator (jq or python3).
   ds_offer_install sqlite3 "apt install sqlite3" "brew install sqlite" || DS_CHECK_MISSING=$((DS_CHECK_MISSING+1))
@@ -144,14 +145,28 @@ cmd_init() {
   ds_offer_install gitleaks \
     "see https://github.com/gitleaks/gitleaks#installing" \
     "brew install gitleaks" || true
-  # semgrep: prefer pipx; fall back to user-scoped pip if pipx isn't installed.
-  # ds_offer_install's PATH check would suppress the prompt for "pipx install ..."
-  # on a host without pipx, which is correct but unhelpful — pick a hint here
-  # that matches what's actually installable.
+  # semgrep on Linux: the install command depends on what's already present.
+  # Order of preference:
+  #   1. pipx present                       -> pipx install semgrep
+  #   2. no pipx, Python *not* PEP-668      -> python3 -m pip install --user semgrep
+  #   3. no pipx, Python IS PEP-668 managed -> apt install pipx (then re-run init)
+  #   4. no pipx, no python3                -> point at vendor docs
+  # PEP 668 (Debian 12+/Ubuntu 23.04+/modern WSL) refuses unmanaged pip installs
+  # against system Python, so suggesting `pip install --user` there is a recipe
+  # for the "externally-managed-environment" error.
   if command -v pipx >/dev/null 2>&1; then
     _SEMGREP_HINT_LINUX="pipx install semgrep"
   elif command -v python3 >/dev/null 2>&1; then
-    _SEMGREP_HINT_LINUX="python3 -m pip install --user semgrep"
+    # Glob expands to nothing on hosts without the marker. Set -- to safely
+    # iterate; the test catches both "no matches" and "real file present".
+    set -- /usr/lib/python3*/EXTERNALLY-MANAGED /usr/lib/python3/EXTERNALLY-MANAGED
+    _SEMGREP_PEP668=0
+    for _f in "$@"; do [ -e "$_f" ] && _SEMGREP_PEP668=1; done
+    if [ "$_SEMGREP_PEP668" -eq 1 ]; then
+      _SEMGREP_HINT_LINUX="apt install pipx  # then re-run \`clagentic init\` (PEP 668 — system python refuses pip --user)"
+    else
+      _SEMGREP_HINT_LINUX="python3 -m pip install --user semgrep"
+    fi
   else
     _SEMGREP_HINT_LINUX="see https://semgrep.dev/docs/getting-started/"
   fi
@@ -168,6 +183,13 @@ cmd_init() {
       "brew install coreutils (macOS) | apt install coreutils (Linux)"
     warn "no timeout/gtimeout — LLM calls will run without per-call timeouts"
   fi
+
+  # Collated summary of everything that's still missing — required + optional.
+  # The user sees individual MISSING/Run-manually lines as each check fires;
+  # this block re-presents them all at the bottom so a partial install run
+  # leaves the user with a single copy-pasteable list instead of having to
+  # scroll back through interleaved prompts.
+  ds_pending_summary
 
   if [ "$DS_CHECK_MISSING" -gt 0 ]; then
     say "$DS_CHECK_MISSING required tool(s) still missing — fix them and re-run \`clagentic init\`"
@@ -650,8 +672,10 @@ cmd_update() {
   # Re-run prereq detection.
   say "checking prerequisites post-update..."
   DS_CHECK_MISSING=0; export DS_CHECK_MISSING
+  ds_pending_reset
   ds_offer_install sqlite3  "apt install sqlite3"  "brew install sqlite"  || true
   ds_offer_install git      "apt install git"       "xcode-select --install" || true
+  ds_pending_summary
 
   # Re-stamp shims in registered repos if the template version changed.
   if [ ! -f "$REGISTRY" ]; then
