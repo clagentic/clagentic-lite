@@ -57,10 +57,22 @@ If macOS users have Homebrew GNU tools on PATH ahead of system tools, clagentic-
 - `sqlite3` for the memory and audit databases. macOS ships an old SQLite; we use only features available since 3.35 (no JSON1, no FTS5, no window functions).
 - `timeout` or `gtimeout` for LLM-call timeouts. If absent, calls run without timeouts — degraded but not broken, and `install.sh --check` warns.
 
+## Shell idioms in bin/clagentic
+
+`bin/clagentic` introduces a few portable idioms worth documenting:
+
+| Pattern | Why |
+|---|---|
+| `ds_realpath` (in platform.sh) | `readlink -f` is not on macOS by default. Shims via `realpath` if present, `python3 os.path.realpath` fallback, then `cd && pwd + basename` POSIX fallback. |
+| `python3 -c "import os; os.makedirs(...)"` | `mkdir -p` is POSIX but cannot set permissions atomically. Python `makedirs` accepts a mode argument. Used for `~/.config/clagentic/`, `~/.local/state/clagentic/`, and per-repo `.clagentic/`. |
+| `python3 -c "import os; print(os.readlink(...))"` | `readlink` with no flags is POSIX but output varies; Python `os.readlink` is unambiguous. Used by `clagentic doctor` to verify the symlink target. |
+| `python3 -c "import shutil; shutil.rmtree(...)"` | `rm -rf` is POSIX but the path argument handling on edge cases (trailing slash, non-existent) varies. Python `shutil.rmtree` is predictable. Used by `clagentic unenroll --purge`. |
+| `awk` for in-place config edits | `sed -i` portability issues are already in the table above. `awk` with a temp file and `mv` is portable and handles values that contain `/` or other sed metacharacters. |
+
 ## Quick verify
 
 ```sh
-./install.sh --check
+clagentic doctor
 ```
 
-Prints what it found, what's missing, and the install-hint commands for each missing dependency on the detected OS.
+Prints what it found, what's missing, and a numbered punch list for any broken items. Exits 0 if clean, non-zero if any check fails.
