@@ -1,0 +1,446 @@
+#!/bin/sh
+# clagentic-lite :: gate orchestrator
+# Runs gates in sequence, logs outcomes to .clagentic/audit.db.
+#
+# Subcommands:
+#   init             create audit schema
+#   secrets          run gitleaks on staged hunks (pre-commit)
+#   deps             run osv-scanner (pre-push)
+#   sast             run semgrep (pre-push)
+#   review           run cross-vendor review on staged diff
+#   adversarial      run non-blocking adversarial pass
+#   ship             run all blocking gates, then push + open PR if green
+#   render-review    pretty-print .clagentic/last-review.json
+#   digest           summarize today's audit rows
+#   pre-push         hook entry point (deps + sast + optional review)
+#   log-run          internal: insert one row into gate_runs
+
+set -e
+. "$(dirname "$0")/platform.sh"
+ds_load_env
+
+REPO_ROOT=$(ds_repo_root)
+[ -n "$REPO_ROOT" ] || { echo "gates.sh: not in a git repo" 1>&2; exit 1; }
+
+AUDIT_DB="$REPO_ROOT/.clagentic/audit.db"
+mkdir -p "$REPO_ROOT/.clagentic"
+
+cmd_init() {
+  sqlite3 "$AUDIT_DB" <<'SQL'
+CREATE TABLE IF NOT EXISTS gate_runs (
+  id         INTEGER PRIMARY KEY,
+  ts         TEXT NOT NULL,
+  gate       TEXT NOT NULL,
+  outcome    TEXT NOT NULL,
+  details    TEXT,
+  session_id TEXT,
+  branch     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_gate_runs_ts ON gate_runs(ts);
+SQL
+}
+
+cmd_log_run() {
+  cmd_init
+  GATE="$1"
+  OUTCOME="$2"
+  DETAILS="${3:-}"
+  BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  TS=$(ds_date_iso)
+  # Every interpolated value must go through the same escape helper. A branch
+  # named `feat/o'hare` would otherwise corrupt the INSERT under set -e.
+  GATE_ESC=$(ds_sql_escape "$GATE")
+  OUT_ESC=$(ds_sql_escape "$OUTCOME")
+  DETAILS_ESC=$(ds_sql_escape "$DETAILS")
+  BRANCH_ESC=$(ds_sql_escape "$BRANCH")
+  sqlite3 "$AUDIT_DB" \
+    "INSERT INTO gate_runs (ts, gate, outcome, details, branch) VALUES ('$TS', '$GATE_ESC', '$OUT_ESC', '$DETAILS_ESC', '$BRANCH_ESC');"
+}
+
+cmd_secrets() {
+  if ! command -v gitleaks >/dev/null 2>&1; then
+    # FAIL CLOSED. AGENTS.md §4 contract: local tools own the security gate.
+    # If the tool is missing, the gate is offline — the only honest outcome
+    # is to block. Explicit opt-in to skip via CLAGENTIC_ALLOW_MISSING_GITLEAKS=1.
+    if [ "${CLAGENTIC_ALLOW_MISSING_GITLEAKS:-0}" = "1" ]; then
+      echo "[gates] gitleaks not installed — skipping (CLAGENTIC_ALLOW_MISSING_GITLEAKS=1 set)" 1>&2
+      cmd_log_run secrets skip "gitleaks not installed (opt-in skip)"
+      return 0
+    fi
+    echo "[gates] gitleaks not installed — BLOCKING (set CLAGENTIC_ALLOW_MISSING_GITLEAKS=1 to skip, or install: brew install gitleaks | apt install gitleaks)" 1>&2
+    cmd_log_run secrets block "gitleaks not installed (fail-closed)"
+    return 1
+  fi
+  # Build the invocation: gitleaks 8.18+ uses `gitleaks git --pre-commit --staged`;
+  # older versions use `gitleaks protect --staged`. Both honor --config.
+  CFG_ARG=""
+  [ -f "$REPO_ROOT/.gitleaks.toml" ] && CFG_ARG="--config=$REPO_ROOT/.gitleaks.toml"
+
+  # Probe by capability, not version string — `gitleaks version` output
+  # format varies (`v8.18.4`, `8.18.4`, multi-line banner). The `git`
+  # subcommand was added in 8.18; if `gitleaks git --help` exits 0 we use
+  # it, otherwise we fall back to `gitleaks protect`.
+  if gitleaks git --help >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    if gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG; then
+      cmd_log_run secrets pass ""
+    else
+      cmd_log_run secrets block "gitleaks reported findings"
+      return 1
+    fi
+  else
+    # shellcheck disable=SC2086
+    if gitleaks protect --staged --redact --no-banner $CFG_ARG; then
+      cmd_log_run secrets pass ""
+    else
+      cmd_log_run secrets block "gitleaks reported findings"
+      return 1
+    fi
+  fi
+}
+
+cmd_deps() {
+  if ! command -v osv-scanner >/dev/null 2>&1; then
+    if [ "${CLAGENTIC_ALLOW_MISSING_OSV:-0}" = "1" ]; then
+      echo "[gates] osv-scanner not installed — skipping (CLAGENTIC_ALLOW_MISSING_OSV=1 set)" 1>&2
+      cmd_log_run deps skip "osv-scanner not installed (opt-in skip)"
+      return 0
+    fi
+    echo "[gates] osv-scanner not installed — BLOCKING (set CLAGENTIC_ALLOW_MISSING_OSV=1 to skip, or install: brew install osv-scanner | https://google.github.io/osv-scanner/installation/)" 1>&2
+    cmd_log_run deps block "osv-scanner not installed (fail-closed)"
+    return 1
+  fi
+  if osv-scanner --recursive .; then
+    cmd_log_run deps pass ""
+  else
+    cmd_log_run deps block "osv-scanner reported vulnerabilities"
+    return 1
+  fi
+}
+
+cmd_sast() {
+  if ! command -v semgrep >/dev/null 2>&1; then
+    if [ "${CLAGENTIC_ALLOW_MISSING_SEMGREP:-0}" = "1" ]; then
+      echo "[gates] semgrep not installed — skipping (CLAGENTIC_ALLOW_MISSING_SEMGREP=1 set)" 1>&2
+      cmd_log_run sast skip "semgrep not installed (opt-in skip)"
+      return 0
+    fi
+    echo "[gates] semgrep not installed — BLOCKING (set CLAGENTIC_ALLOW_MISSING_SEMGREP=1 to skip, or install: pipx install semgrep | brew install semgrep)" 1>&2
+    cmd_log_run sast block "semgrep not installed (fail-closed)"
+    return 1
+  fi
+  if semgrep --config=auto --error --severity=ERROR; then
+    cmd_log_run sast pass ""
+  else
+    cmd_log_run sast block "semgrep reported ERROR-severity findings"
+    return 1
+  fi
+}
+
+cmd_review() {
+  OUT="$REPO_ROOT/.clagentic/last-review.json"
+  git diff --cached --unified=3 | "$REPO_ROOT/scripts/llm-client.sh" review > "$OUT"
+  # Reject degraded envelopes outright. An LLM wrapper that failed every
+  # chain step emits valid JSON with findings:[] — schema-valid but
+  # meaningless. Without this check, a misconfigured / auth-broken /
+  # network-out Reviewer chain reports "clean review" and the ship passes.
+  if review_is_degraded "$OUT"; then
+    cmd_log_run review block "review degraded (all chain steps failed)"
+    echo "[gates/review] BLOCKED: reviewer chain returned degraded envelope — no real review occurred. See $OUT and scripts/gates.sh digest for the per-step failure reasons." 1>&2
+    cat "$OUT" 1>&2
+    return 1
+  fi
+  # Severity gate: count findings >= configured threshold.
+  THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
+  BLOCKERS=$(severity_blockers "$OUT" "$THRESHOLD")
+  if [ "${BLOCKERS:-0}" -gt 0 ]; then
+    cmd_log_run review block "$BLOCKERS finding(s) at >= $THRESHOLD"
+    cmd_render_review "$OUT" 1>&2
+    return 1
+  fi
+  cmd_log_run review pass "0 findings at >= $THRESHOLD"
+  cmd_render_review "$OUT"
+}
+
+# Detect the "degraded": true marker written by emit_degraded in llm-client.sh.
+# Args: FILE
+# Returns 0 if degraded, 1 if not (or if validators are unavailable — see M2).
+review_is_degraded() {
+  FILE="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -e '.degraded == true' "$FILE" >/dev/null 2>&1
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("degraded") is True else 1)' "$FILE" 2>/dev/null
+  else
+    # No validator — assume not degraded; the no-validator branch is itself
+    # caught by severity_blockers fail-closed.
+    return 1
+  fi
+}
+
+cmd_adversarial() {
+  OUT="$REPO_ROOT/.clagentic/last-adversarial.md"
+  git diff --cached --unified=3 | "$REPO_ROOT/scripts/llm-client.sh" adversarial > "$OUT"
+  cmd_log_run adversarial warn "wrote $OUT (non-blocking)"
+  cat "$OUT"
+}
+
+cmd_merge_gate() {
+  # Final LLM sanity check: feed gate outputs back through the merge-gate
+  # role, which decides approve/refuse. BLOCKING BY DEFAULT — set
+  # CLAGENTIC_MERGE_GATE_BLOCKING=0 to make a 'refuse' decision advisory only.
+  IN="$REPO_ROOT/.clagentic/gate-summary.json"
+  OUT="$REPO_ROOT/.clagentic/last-merge-gate.json"
+  build_gate_summary > "$IN"
+  "$REPO_ROOT/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT"
+  DECISION=""
+  if command -v jq >/dev/null 2>&1; then
+    DECISION=$(jq -r '.decision // "unknown"' "$OUT" 2>/dev/null)
+  elif command -v python3 >/dev/null 2>&1; then
+    DECISION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("decision","unknown"))' "$OUT" 2>/dev/null)
+  fi
+  case "$DECISION" in
+    approve) cmd_log_run merge-gate pass "approve" ;;
+    refuse)
+      cmd_log_run merge-gate block "refuse"
+      cat "$OUT"
+      # Default blocking; set CLAGENTIC_MERGE_GATE_BLOCKING=0 to override.
+      if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
+        return 1
+      fi
+      ;;
+    *)
+      # An unparseable decision is a failure of the merge gate itself.
+      # Fail closed unless explicitly opted out — same rationale as missing
+      # security tools above.
+      cmd_log_run merge-gate block "decision=$DECISION (unparseable)"
+      cat "$OUT" 1>&2
+      if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
+        return 1
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# Severity helpers — POSIX ordering: low < medium < high < critical.
+severity_rank() {
+  case "$1" in
+    low)      echo 1 ;;
+    medium)   echo 2 ;;
+    high)     echo 3 ;;
+    critical) echo 4 ;;
+    *)        echo 0 ;;
+  esac
+}
+
+severity_blockers() {
+  FILE="$1"; THRESHOLD="$2"
+  TR=$(severity_rank "$THRESHOLD")
+  [ "$TR" -eq 0 ] && TR=3   # default to 'high' on unknown threshold
+  # Parse-failure policy: ALWAYS fail closed. The sentinel value 99 trips
+  # the caller's `> 0` block check unambiguously. Three branches that
+  # could fail (jq parse, python3 parse, no validator at all) all return
+  # 99 — there is no path where an unparseable review counts as "clean."
+  # Severity strings are normalized case-insensitively. LLM models routinely
+  # return "HIGH" or "CRITICAL" uppercase — without normalization these rank
+  # 0 (unknown) and blocking findings silently pass.
+  if command -v jq >/dev/null 2>&1; then
+    R=$(jq -r --argjson tr "$TR" '
+      def rank(s):
+        (s // "" | ascii_downcase) as $s
+        | if $s == "critical" then 4
+        elif $s == "high" then 3
+        elif $s == "medium" then 2
+        elif $s == "low" then 1
+        else 0 end;
+      [(.findings // [])[] | select(rank(.severity) >= $tr)] | length
+    ' "$FILE" 2>/dev/null)
+    if [ -z "$R" ]; then echo 99; else echo "$R"; fi
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$FILE" "$TR" <<'PY'
+import json, sys
+ranks = {"low":1,"medium":2,"high":3,"critical":4}
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(99); sys.exit(0)
+tr = int(sys.argv[2])
+print(sum(1 for f in d.get("findings", []) if ranks.get(str(f.get("severity","")).lower(),0) >= tr))
+PY
+  else
+    # No validator at all — fail closed. Sentinel 99 makes the audit-row
+    # message ("99 finding(s) at >= high") visibly unusual so users know
+    # this is "blocked because the gate couldn't read the review" rather
+    # than a model that legitimately found 99 issues.
+    echo 99
+  fi
+}
+
+build_gate_summary() {
+  RV="$REPO_ROOT/.clagentic/last-review.json"
+  AD="$REPO_ROOT/.clagentic/last-adversarial.md"
+  THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
+
+  # Prefer jq; fall back to python3; finally degrade to a minimal envelope
+  # with the review embedded raw (validated as JSON beforehand) and
+  # adversarial dropped (we can't safely escape arbitrary markdown without
+  # a JSON encoder).
+  if command -v jq >/dev/null 2>&1; then
+    RV_PAYLOAD='null'
+    AD_PAYLOAD='""'
+    [ -f "$RV" ] && jq -e . "$RV" >/dev/null 2>&1 && RV_PAYLOAD=$(cat "$RV")
+    [ -f "$AD" ] && AD_PAYLOAD=$(jq -Rs . < "$AD")
+    cat <<EOF
+{
+  "review": $RV_PAYLOAD,
+  "adversarial": $AD_PAYLOAD,
+  "threshold": "$THRESHOLD"
+}
+EOF
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    RV_ARG=""
+    AD_ARG=""
+    [ -f "$RV" ] && RV_ARG="$RV"
+    [ -f "$AD" ] && AD_ARG="$AD"
+    python3 - "$THRESHOLD" "$RV_ARG" "$AD_ARG" <<'PY'
+import json, sys
+threshold = sys.argv[1]
+rv_path = sys.argv[2] if len(sys.argv) > 2 else ""
+ad_path = sys.argv[3] if len(sys.argv) > 3 else ""
+review = None
+if rv_path:
+    try:
+        with open(rv_path) as f:
+            review = json.load(f)
+    except Exception:
+        review = None
+adv = ""
+if ad_path:
+    try:
+        with open(ad_path) as f:
+            adv = f.read()
+    except Exception:
+        adv = ""
+print(json.dumps({"review": review, "adversarial": adv, "threshold": threshold}))
+PY
+    return 0
+  fi
+
+  # No JSON encoder available — emit a minimal envelope with adversarial
+  # dropped. The Merge Gate will see this and may choose to refuse on
+  # incomplete context.
+  if [ -f "$RV" ]; then
+    cat <<EOF
+{"review": $(cat "$RV"), "adversarial": "", "threshold": "$THRESHOLD"}
+EOF
+  else
+    echo "{\"review\": null, \"adversarial\": \"\", \"threshold\": \"$THRESHOLD\"}"
+  fi
+}
+
+cmd_render_review() {
+  FILE="${1:-$REPO_ROOT/.clagentic/last-review.json}"
+  [ -f "$FILE" ] || { echo "no review file at $FILE" 1>&2; return 1; }
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '"== clagentic-lite review ==\nsummary: " + .summary + "\nfindings: " + (.findings | length | tostring) + "\n",
+           (.findings[] | "[" + .severity + "] " + .file + ":" + (.line|tostring) + " " + .message)' \
+      "$FILE"
+  else
+    cat "$FILE"
+  fi
+}
+
+# gate_enabled <name> — returns 0 if the named gate is in CLAGENTIC_GATES,
+# or if CLAGENTIC_GATES is unset (all gates run by default).
+gate_enabled() {
+  N="$1"
+  G="${CLAGENTIC_GATES-}"
+  [ -z "$G" ] && return 0
+  case ",$G," in
+    *,"$N",*) return 0 ;;
+    *)        return 1 ;;
+  esac
+}
+
+cmd_ship() {
+  echo "[gates/ship] running gate sequence (enabled: ${CLAGENTIC_GATES:-all})"
+  # ship_step_skip: print + audit-log a skipped gate. Every gate decision —
+  # including the decision to skip — lands in audit.db per AGENTS.md §6.
+  ship_step_skip() {
+    echo "[gates/ship] skip $1 (not in CLAGENTIC_GATES)"
+    cmd_log_run "$1" skip "not in CLAGENTIC_GATES=${CLAGENTIC_GATES:-}"
+  }
+  if gate_enabled secrets;     then cmd_secrets     || { echo "[gates/ship] BLOCKED at secrets";    exit 1; }; else ship_step_skip secrets;     fi
+  if gate_enabled deps;        then cmd_deps        || { echo "[gates/ship] BLOCKED at deps";       exit 1; }; else ship_step_skip deps;        fi
+  if gate_enabled sast;        then cmd_sast        || { echo "[gates/ship] BLOCKED at sast";       exit 1; }; else ship_step_skip sast;        fi
+  if gate_enabled review;      then cmd_review      || { echo "[gates/ship] BLOCKED at review (severity threshold ${CLAGENTIC_BLOCK_SEVERITY:-high})"; exit 1; }; else ship_step_skip review;      fi
+  if gate_enabled adversarial; then cmd_adversarial || true; else ship_step_skip adversarial; fi
+  if gate_enabled merge-gate;  then cmd_merge_gate  || { echo "[gates/ship] BLOCKED at merge-gate"; exit 1; }; else ship_step_skip merge-gate;  fi
+
+  echo "[gates/ship] all blocking gates passed"
+  BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+  if [ "$BRANCH" = "$DEFAULT_BRANCH" ] || [ -z "$BRANCH" ]; then
+    echo "[gates/ship] on '$BRANCH' — not pushing or opening a PR; create a feature branch first"
+    cmd_log_run ship pass "gates green; no push (branch=$BRANCH)"
+    return 0
+  fi
+
+  # Push + open PR if gh is available, else print a template.
+  if git remote get-url origin >/dev/null 2>&1; then
+    git push -u origin "$BRANCH" || { echo "[gates/ship] push failed"; cmd_log_run ship block "push failed"; exit 1; }
+  fi
+  if command -v gh >/dev/null 2>&1; then
+    if gh pr view "$BRANCH" >/dev/null 2>&1; then
+      echo "[gates/ship] PR already open for $BRANCH"
+    else
+      gh pr create --fill --base "$DEFAULT_BRANCH" --head "$BRANCH" || \
+        echo "[gates/ship] gh pr create failed — open the PR manually"
+    fi
+  else
+    REMOTE=$(git remote get-url origin 2>/dev/null || echo "<remote>")
+    echo "[gates/ship] gh not installed — open a PR manually:"
+    echo "  base=$DEFAULT_BRANCH head=$BRANCH remote=$REMOTE"
+  fi
+  cmd_log_run ship pass "gates green; pushed $BRANCH"
+}
+
+cmd_pre_push() {
+  cmd_deps || exit 1
+  cmd_sast || exit 1
+  [ "${CLAGENTIC_REVIEW_ON_PUSH:-0}" = "1" ] && { cmd_review || exit 1; }
+  exit 0
+}
+
+cmd_digest() {
+  cmd_init
+  printf '\n== clagentic-lite gate digest (last 24h) ==\n\n'
+  sqlite3 -header -column "$AUDIT_DB" \
+    "SELECT ts, gate, outcome, substr(details,1,60) AS details
+     FROM gate_runs WHERE ts > datetime('now','-1 day') ORDER BY ts DESC;"
+  printf '\n'
+  printf 'totals:\n'
+  sqlite3 -column "$AUDIT_DB" \
+    "SELECT outcome, COUNT(*) FROM gate_runs WHERE ts > datetime('now','-1 day') GROUP BY outcome;"
+  printf '\n'
+}
+
+case "${1:-}" in
+  init)           cmd_init ;;
+  secrets)        cmd_secrets ;;
+  deps)           cmd_deps ;;
+  sast)           cmd_sast ;;
+  review)         cmd_review ;;
+  adversarial)    cmd_adversarial ;;
+  merge-gate)     cmd_merge_gate ;;
+  render-review)  shift; cmd_render_review "$@" ;;
+  ship)           cmd_ship ;;
+  pre-push)       cmd_pre_push ;;
+  log-run)        shift; cmd_log_run "$@" ;;
+  digest)         cmd_digest ;;
+  *) echo "usage: gates.sh {init|secrets|deps|sast|review|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest}" 1>&2; exit 1 ;;
+esac

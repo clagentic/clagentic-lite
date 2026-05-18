@@ -1,0 +1,109 @@
+# AGENTS.md — instructions for AI coding assistants working in this repo
+
+This file is the canonical agent-instruction file for any AI coding assistant operating in this repository: Codex, Claude Code (via the `CLAUDE.md` pointer), Cursor, Aider, Copilot CLI, Gemini CLI, and any other tool that respects the [AGENTS.md convention](https://agents.md/).
+
+The repo is **clagentic-lite** — a small, deliberate solo-dev coding harness with five gates and two AI roles. Read `README.md` for the product narrative and `docs/DESIGN.md` for architecture.
+
+---
+
+## How to behave in this repo
+
+### 1. Stay inside the contract
+
+clagentic-lite is intentionally small. New features must justify themselves against the existing five gates (`docs/GATES.md`) and three roles (`docs/DESIGN.md` § "The three roles"). If a proposed change does not strengthen, simplify, or document one of those, push back before writing code.
+
+The non-goals list in `docs/DESIGN.md` is binding. Do not add: a server, a daemon, a vector database, an embedding model, a web UI, a plugin marketplace, multi-agent orchestration, or multi-repo state. Propose those as separate projects.
+
+### 2. Portability is a hard constraint
+
+All shell code is **POSIX sh**. No bash-4 features (associative arrays, `${var^^}`, `mapfile`, `[[ =~ ]]` capture groups). All `sed`/`date`/`stat`/`find` invocations go through `scripts/platform.sh` shims. See `docs/PORTABILITY.md` for the GNU/BSD differences table.
+
+If you add a new shell tool dependency, add a detection block to `install.sh --check` and document it in `docs/PORTABILITY.md`.
+
+### 3. Parameterization is non-negotiable
+
+Nothing personal, nothing org-specific, nothing host-specific is hardcoded. Everything user-supplied goes through `.env` (gitignored) with `.env.example` as the committed template. Branch names, model commands, org slugs, repo hosts — all variables.
+
+If you find a hardcoded value, fix it. If you can't fix it without breaking flow, file it as a TODO comment with `# clagentic-lite:hardcoded` so it shows up in grep.
+
+### 4. The security gate is local-tool-owned
+
+`gitleaks`, `semgrep`, and `osv-scanner` are the blocking security gates. **Do not add LLM calls to the blocking path of any security check.** LLM-driven security commentary is fine and welcome, but only as the non-blocking adversarial layer (Gate 3 extension).
+
+This isn't a technical preference. It's the product story. "The harness does not trust AI for security decisions" is the line that makes the cross-vendor LLM review *more* credible, not less.
+
+### 5. Cross-vendor is the point
+
+Builder and Reviewer must default to different vendors. The Reviewer role's whole job is to surface what the Builder couldn't see, and a same-vendor reviewer shares the Builder's blind spots. If the user configures both roles to the same vendor, the install script warns; don't suppress the warning.
+
+### 6. Audit-first
+
+Every gate decision lands in `.clagentic/audit.db`. If you add a gate, add a `gate_runs` insert. If you bypass a gate, log the bypass. The audit trail is the artifact — it is what a code review or InfoSec conversation reads.
+
+### 7. Read before edit
+
+This is a project rule and a habit. Read the file in full before modifying it. Read every file the change touches, including hooks and config. Partial reads followed by edits that assume unseen content are forbidden.
+
+### 8. No emojis, no fluff
+
+Commit messages, PR descriptions, code comments, log lines — no emojis, no exclamation points, no "Successfully!" Be terse, technical, and accurate. Match the existing tone.
+
+---
+
+## Build / test / run
+
+```sh
+./install.sh                 # set up hooks, render templates, init databases
+./install.sh --check         # verify dependencies, print missing-tool install hints
+scripts/gates.sh review      # run cross-model review on staged diff
+scripts/gates.sh ship        # run all gates in sequence
+scripts/gates.sh digest      # summarize today's audit-db rows
+scripts/memory.sh recall <kw>  # search session summaries
+sqlite3 .clagentic/audit.db   # inspect the audit trail directly
+sqlite3 .clagentic/memory.db  # inspect session memory directly
+```
+
+CI: `.github/workflows/gates.yml` mirrors the local gates on every PR. It runs on both `ubuntu-latest` and `macos-latest`.
+
+---
+
+## File map (load-bearing)
+
+| Path | Purpose |
+|---|---|
+| `AGENTS.md` (this file) | canonical agent instructions, cross-tool |
+| `CLAUDE.md` | thin pointer to `AGENTS.md` for Claude Code compatibility |
+| `README.md` | product narrative + 5-minute demo |
+| `install.sh` | POSIX installer, idempotent, parameter-prompting |
+| `.env.example` | all configurable parameters, no secrets |
+| `.claude/settings.json` | hook wiring |
+| `.claude/agents/{builder,reviewer,auditor,merge-gate}.md` | role contracts (four roles) |
+| `.claude/commands/{review,ship,recall}.md` | user-invokable slash commands |
+| `.claude/skills/{infosec-rt,eng-consult}/SKILL.md` | commentary skills (multi-voice; not gates) |
+| `.claude/hooks/*.sh` | five lifecycle hooks |
+| `.codex/config.toml` | Codex sandbox + role config |
+| `.gitleaks.toml` | gitleaks config — extends defaults, narrow path+token allowlist |
+| `scripts/platform.sh` | GNU/BSD shims + shared helpers (`ds_load_env`, `ds_sql_escape`, `ds_audit_log`, `ds_json_field`, `$DS_TIMEOUT_CMD`) |
+| `scripts/memory.sh` | SQLite session memory CRUD |
+| `scripts/llm-client.sh` | role-aware LLM wrapper with model_chain fallback |
+| `scripts/gates.sh` | gate orchestrator + digest + ship + merge-gate |
+| `scripts/smoke.sh` | non-interactive end-to-end (CI + local) |
+| `.github/workflows/gates.yml` | CI mirror of local gates |
+| `docs/` | DESIGN, GATES, DEMO-SCRIPT, PORTABILITY |
+| `examples/{python,node,go}/` | demo projects with planted issues |
+| `media/logo/` | brand assets (lockup, icon — see clagentic-brand canonical) |
+| `LICENSE` | FSL-1.1-MIT (free personal/internal; commercial licensing at clagentic.ai) |
+
+---
+
+## What to ask the user before doing
+
+- Adding any new external tool dependency
+- Changing the default `BLOCK_SEVERITY` threshold
+- Changing the default Builder, Reviewer, Auditor, Merge Gate, or Summarizer CLI
+- Modifying the rule list in `pre-bash-guard.sh` or `pre-write-guard.sh`
+- Adding anything to the non-goals list in `docs/DESIGN.md`
+- Flipping any fail-closed default to fail-open (the `CLAGENTIC_ALLOW_MISSING_*` opt-ins, `CLAGENTIC_MERGE_GATE_BLOCKING`, the hook fail-closed-without-jq behavior)
+- Loosening the gitleaks allowlist beyond the path + fixture-token intersection
+
+Otherwise, fix what's in front of you and ship it.

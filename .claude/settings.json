@@ -1,0 +1,32 @@
+{
+  "$comment": "clagentic-lite hook wiring. All paths repo-relative. No hostnames, no tokens, no personal identifiers.",
+  "hooks": {
+    "SessionStart": [
+      { "type": "command", "command": ".claude/hooks/session-start.sh" }
+    ],
+    "UserPromptSubmit": [
+      { "type": "command", "command": ".claude/hooks/prompt-inject.sh" }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash", "type": "command", "command": ".claude/hooks/pre-bash-guard.sh" },
+      { "matcher": "Write|Edit", "type": "command", "command": ".claude/hooks/pre-write-guard.sh" }
+    ],
+    "Stop": [
+      { "type": "command", "command": ".claude/hooks/stop-summarize.sh" }
+    ]
+  },
+  "permissions": {
+    "$comment": "Repository-scope only. No personal infrastructure.",
+    "allow": [
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git status:*)",
+      "Bash(git branch:*)",
+      "Bash(sqlite3 .clagentic/*)",
+      "Bash(scripts/*)",
+      "Bash(gitleaks:*)",
+      "Bash(semgrep:*)",
+      "Bash(osv-scanner:*)"
+    ]
+  }
+}

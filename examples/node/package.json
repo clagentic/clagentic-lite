@@ -1,0 +1,11 @@
+{
+  "name": "clagentic-lite-example-node",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Demo project with one planted bug and one planted secret.",
+  "main": "auth.js",
+  "scripts": {
+    "start": "node auth.js"
+  },
+  "license": "SEE LICENSE IN ../../LICENSE"
+}

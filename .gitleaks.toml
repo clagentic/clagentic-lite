@@ -1,0 +1,54 @@
+# clagentic-lite :: gitleaks config
+#
+# Extends the default gitleaks ruleset with a narrow allowlist for the
+# planted demo tokens. Those tokens are the gitleaks public test fixtures
+# (NOT real credentials) and are committed on purpose so the demo has
+# something concrete for the pre-commit gate to block when a user
+# accidentally stages one outside the examples.
+#
+# IMPORTANT: this allowlist is INTERSECTIONAL — a finding is suppressed only
+# when (path matches one of the listed anchored regexes) AND (the leaked
+# value matches one of the listed fixture-token regexes). A real secret
+# pasted into README.md or DEMO-SCRIPT.md will NOT be suppressed; only the
+# specific public test vectors will.
+#
+# Reference: https://github.com/gitleaks/gitleaks#configuration
+#
+# REQUIRES gitleaks >= 8.25 — both `[[allowlists]]` (array-of-tables) and
+# `condition = "AND"` were introduced in 8.25. Older versions silently
+# misread the allowlist (default OR semantics) and would let real secrets
+# in README.md / docs/DEMO-SCRIPT.md slip past. install.sh --check warns
+# if your gitleaks is older.
+
+[extend]
+useDefault = true
+
+# Anchored paths — these regexes must match the full repo-relative path,
+# not a substring of it. Without ^...$ anchors, gitleaks does substring
+# matching and `README\.md` would match any file path containing that.
+[[allowlists]]
+description = "clagentic-lite demo fixtures — public gitleaks test vectors only"
+# CRITICAL: gitleaks allowlists default to OR semantics — path-list and
+# regex-list are independent suppression rules, so a real secret in README.md
+# would be suppressed because the path matches. The "AND" condition forces
+# both lists to match before suppression — only the literal fixture tokens
+# (regex) found IN the named demo files (paths) are allowlisted.
+condition = "AND"
+paths = [
+  '''^examples/python/\.env\.example$''',
+  '''^examples/node/\.env\.example$''',
+  '''^examples/go/\.env\.example$''',
+  '''^examples/README\.md$''',
+  '''^docs/DEMO-SCRIPT\.md$''',
+  '''^README\.md$''',
+]
+# Only the literal public fixtures suppress here. Any OTHER secret pattern
+# in the same paths still triggers gitleaks. This is the load-bearing
+# narrowing — without it, the allowlist would suppress all findings in
+# six files, and a real AWS key accidentally pasted into the README
+# would silently commit.
+regexes = [
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',
+]
+regexTarget = "match"

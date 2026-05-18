@@ -1,0 +1,43 @@
+# clagentic-lite — Codex CLI config
+# Loaded when Codex is invoked from this repo.
+
+[runtime]
+# Approval mode: 'required' means Codex asks before executing any write/network action.
+# clagentic-lite uses Codex primarily as the Reviewer role — read-only by contract.
+approval = "required"
+
+# Sandbox: 'workspace' confines writes to this repo. Reviewer should never write at all;
+# this is defense in depth.
+sandbox = "workspace"
+
+# Network: Codex needs outbound for model calls. Tool-level network access is off.
+network = "model-only"
+
+[roles]
+# Default role for `codex` invocations in this repo.
+# Wrapper script scripts/llm-client.sh sets specific roles per subcommand.
+default = "reviewer"
+
+[[roles.list]]
+name = "reviewer"
+permissions = ["read"]
+prompt_file = ".claude/agents/reviewer.md"
+
+[[roles.list]]
+name = "auditor"
+permissions = ["read"]
+prompt_file = ".claude/agents/auditor.md"
+
+[[roles.list]]
+name = "summarizer"
+permissions = ["read"]
+# Cheap, fast model. Override via CLAGENTIC_SUMMARIZER_TIER.
+tier = "spark"
+
+[mcp_servers]
+# Empty by design. clagentic-lite does not add MCP servers — keep the surface area small.
+# Users can add their own in ~/.codex/config.toml without touching this file.
+
+[telemetry]
+# Local audit log only. No external telemetry.
+local_audit_db = ".clagentic/audit.db"

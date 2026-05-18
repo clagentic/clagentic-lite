@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 112" width="260" height="112">
+  <defs>
+    <linearGradient id="grad" gradientUnits="userSpaceOnUse" x1="0" y1="8" x2="0" y2="104">
+      <stop offset="0%"   stop-color="#00CFFF"/>
+      <stop offset="45%"  stop-color="#4A7FE8"/>
+      <stop offset="100%" stop-color="#7B3FE4"/>
+    </linearGradient>
+    <linearGradient id="grad2" gradientUnits="userSpaceOnUse" x1="148" y1="16" x2="240" y2="96">
+      <stop offset="0%"   stop-color="#00CFFF"/>
+      <stop offset="50%"  stop-color="#4A7FE8"/>
+      <stop offset="100%" stop-color="#7B3FE4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- C mark (outer r=44, inner r=34) centered at 56,56 -->
+  <!-- OUTER r=44 -->
+  <path d="M 92.04 81.24 A 44 44 0 0 1 27.72 89.71" fill="none" stroke="url(#grad)" stroke-width="7.5" stroke-linecap="round"/>
+  <circle cx="92.04" cy="81.24" r="3.2" fill="url(#grad)"/>
+  <path d="M 17.89 78.00 A 44 44 0 0 1 27.72 22.29" fill="none" stroke="url(#grad)" stroke-width="7.5" stroke-linecap="round"/>
+  <path d="M 42.40 14.15 A 44 44 0 0 1 92.04 30.76" fill="none" stroke="url(#grad)" stroke-width="7.5" stroke-linecap="round"/>
+  <circle cx="92.04" cy="30.76" r="3.2" fill="url(#grad)"/>
+  <!-- INNER r=34 -->
+  <path d="M 83.85 75.50 A 34 34 0 0 1 24.05 67.63" fill="none" stroke="url(#grad)" stroke-width="7.5" stroke-linecap="round"/>
+  <circle cx="83.85" cy="75.50" r="3.2" fill="url(#grad)"/>
+  <path d="M 22.02 54.81 A 34 34 0 0 1 51.27 22.33" fill="none" stroke="url(#grad)" stroke-width="7.5" stroke-linecap="round"/>
+  <path d="M 63.07 22.74 A 34 34 0 0 1 83.85 36.50" fill="none" stroke="url(#grad)" stroke-width="7.5" stroke-linecap="round"/>
+  <circle cx="83.85" cy="36.50" r="3.2" fill="url(#grad)"/>
+
+  <!-- Colon separator -->
+  <circle cx="114" cy="40" r="5" fill="url(#grad)"/>
+  <circle cx="114" cy="72" r="5" fill="url(#grad)"/>
+
+  <!-- Lite icon, placed at x=142 per lockup spec -->
+  <!-- Icon frame: x=142 y=8 w=96 h=96, interior center at (190, 56) -->
+  <rect x="142" y="8" width="96" height="96" rx="8" ry="8"
+        fill="none" stroke="url(#grad2)" stroke-width="4.5"/>
+
+  <!-- Central node (filled) — center (190, 56) -->
+  <circle cx="190" cy="56" r="7"
+          fill="url(#grad2)" stroke="none"/>
+
+  <!-- Top-left satellite: (32→166, 34) -->
+  <circle cx="166" cy="34" r="5"
+          fill="none" stroke="url(#grad2)" stroke-width="2.5"/>
+
+  <!-- Top-right satellite: (80→214, 34) -->
+  <circle cx="214" cy="34" r="5"
+          fill="none" stroke="url(#grad2)" stroke-width="2.5"/>
+
+  <!-- Bottom-right satellite: (80→214, 78) -->
+  <circle cx="214" cy="78" r="5"
+          fill="none" stroke="url(#grad2)" stroke-width="2.5"/>
+
+  <!-- Connector: top-left (166,34) to center (190,56) — offset by ~5px toward center to clear circle edges -->
+  <line x1="171" y1="38" x2="184" y2="50"
+        stroke="url(#grad2)" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- Connector: top-right (214,34) to center (190,56) -->
+  <line x1="209" y1="38" x2="196" y2="50"
+        stroke="url(#grad2)" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- Connector: center (190,56) to bottom-right (214,78) -->
+  <line x1="196" y1="62" x2="209" y2="73"
+        stroke="url(#grad2)" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- Orbit arc: upper-left quarter, center (190,56) r=20 -->
+  <path d="M 170 56 A 20 20 0 0 1 190 36"
+        fill="none" stroke="url(#grad2)" stroke-width="1.5" stroke-linecap="round" opacity="0.4"/>
+
+  <!-- Orbit arc: lower-right quarter, center (190,56) r=20 -->
+  <path d="M 210 56 A 20 20 0 0 1 190 76"
+        fill="none" stroke="url(#grad2)" stroke-width="1.5" stroke-linecap="round" opacity="0.4"/>
+
+</svg>
