@@ -47,27 +47,48 @@ ds_repo_root() {
   git rev-parse --show-toplevel 2>/dev/null
 }
 
-# Load .env from the repo root into the current shell. Idempotent — every
-# runtime entry point (hooks, gates.sh, llm-client.sh, memory.sh, smoke.sh)
-# calls this immediately after sourcing platform.sh. install.sh writes the
-# file; everything else reads it. Without this, CLAGENTIC_* settings are
-# silently absent at runtime and the wrapper falls back to hardcoded
-# defaults — the per-role chain configuration is theatrical.
+# Load configuration into the current shell. Load order (each layer can
+# override the previous):
+#   1. ~/.config/clagentic/config   — global defaults (written by `clagentic init`)
+#   2. <project-root>/.clagentic/config — per-repo sparse overrides (optional)
+#   3. Legacy: <project-root>/.env  — backward compat; honored if present
 #
-# Honors a CLAGENTIC_ENV_LOADED guard so re-sourcing in the same process
-# doesn't double-export.
+# Idempotent — honors a CLAGENTIC_ENV_LOADED guard so re-sourcing in the
+# same process doesn't double-export. Every runtime entry point (hooks,
+# gates.sh, llm-client.sh, memory.sh, smoke.sh) calls this immediately
+# after sourcing platform.sh.
 ds_load_env() {
   [ "${CLAGENTIC_ENV_LOADED:-0}" = "1" ] && return 0
-  RR=$(ds_repo_root)
-  [ -n "$RR" ] || return 0
-  ENV_FILE="$RR/.env"
-  if [ -f "$ENV_FILE" ]; then
-    # set -a exports every variable assigned while it's in effect.
+
+  # 1. Global config.
+  _GLOBAL_CFG="$HOME/.config/clagentic/config"
+  if [ -f "$_GLOBAL_CFG" ]; then
     set -a
     # shellcheck disable=SC1090
-    . "$ENV_FILE"
+    . "$_GLOBAL_CFG"
     set +a
   fi
+
+  RR=$(ds_repo_root)
+  if [ -n "$RR" ]; then
+    # 2. Per-repo sparse config (v0.2: optional; not created by default).
+    _REPO_CFG="$RR/.clagentic/config"
+    if [ -f "$_REPO_CFG" ]; then
+      set -a
+      # shellcheck disable=SC1090
+      . "$_REPO_CFG"
+      set +a
+    fi
+    # 3. Legacy .env (v0.1 compatibility; honored but not created in v0.2).
+    _ENV_FILE="$RR/.env"
+    if [ -f "$_ENV_FILE" ]; then
+      set -a
+      # shellcheck disable=SC1090
+      . "$_ENV_FILE"
+      set +a
+    fi
+  fi
+
   CLAGENTIC_ENV_LOADED=1
   export CLAGENTIC_ENV_LOADED
 }
@@ -78,7 +99,7 @@ ds_load_env() {
 #   $DS_TIMEOUT_CMD "$LLM_TIMEOUT" some-cli ...
 # When neither tool is present, DS_TIMEOUT_CMD is set to an empty wrapper
 # that runs the command without a timeout — degraded but doesn't fail-open
-# in a confusing way (install.sh --check warns when timeout is missing).
+# in a confusing way (`clagentic doctor` warns when timeout is missing).
 if command -v timeout >/dev/null 2>&1; then
   DS_TIMEOUT_CMD="timeout"
 elif command -v gtimeout >/dev/null 2>&1; then
@@ -148,4 +169,75 @@ except Exception:
     # No validator. Fail closed signal to the caller.
     return 2
   fi
+}
+
+# ---------------------------------------------------------------- tool detection
+#
+# ds_check_tool NAME HINT_LINUX HINT_DARWIN
+#   Prints "found: /path" or "MISSING — install: <hint>" based on OS.
+#   Returns 0 if found, 1 if missing.
+#   REQUIRED flag: when the fourth arg is "required", also sets DS_CHECK_MISSING
+#   (caller initializes DS_CHECK_MISSING=0 before a loop and inspects after).
+#
+# ds_offer_install NAME HINT_LINUX HINT_DARWIN
+#   Calls ds_check_tool. If missing and stdin is a TTY, prompts
+#   "Run it now? [y/N]:" and on 'y' execs the install command.
+#   On 'N' (or non-TTY), prints the manual command and returns 1.
+#   Returns 0 if the tool was already present, or if the user ran the install
+#   command successfully. Returns 1 if the user declined or the install failed.
+#   Callers use this for REQUIRED tools where a missing tool is a hard stop.
+
+ds_check_tool() {
+  _CT_NAME="$1"
+  _CT_LINUX="$2"
+  _CT_DARWIN="$3"
+  _CT_FLAG="${4:-}"
+  if command -v "$_CT_NAME" >/dev/null 2>&1; then
+    printf '  %-15s found: %s\n' "$_CT_NAME" "$(command -v "$_CT_NAME")"
+    return 0
+  fi
+  if [ "$DS_OS" = "darwin" ]; then
+    printf '  %-15s MISSING — install: %s\n' "$_CT_NAME" "$_CT_DARWIN"
+  else
+    printf '  %-15s MISSING — install: %s\n' "$_CT_NAME" "$_CT_LINUX"
+  fi
+  if [ "${_CT_FLAG:-}" = "required" ]; then
+    DS_CHECK_MISSING=$((${DS_CHECK_MISSING:-0}+1))
+    export DS_CHECK_MISSING
+  fi
+  return 1
+}
+
+ds_offer_install() {
+  _OI_NAME="$1"
+  _OI_LINUX="$2"
+  _OI_DARWIN="$3"
+  if command -v "$_OI_NAME" >/dev/null 2>&1; then
+    printf '  %-15s found: %s\n' "$_OI_NAME" "$(command -v "$_OI_NAME")"
+    return 0
+  fi
+  if [ "$DS_OS" = "darwin" ]; then
+    _OI_HINT="$_OI_DARWIN"
+  else
+    _OI_HINT="$_OI_LINUX"
+  fi
+  printf 'MISSING: %s — install with: %s\n' "$_OI_NAME" "$_OI_HINT"
+  if [ -t 0 ]; then
+    printf 'Run it now? [y/N]: '
+    read -r _OI_REPLY || _OI_REPLY=""
+    case "$_OI_REPLY" in
+      y|Y|yes|YES)
+        # exec the install command; eval needed because hint may be multi-word
+        if eval "$_OI_HINT"; then
+          printf '  %s installed\n' "$_OI_NAME"
+          return 0
+        else
+          printf '  install command failed — install manually and re-run\n' 1>&2
+          return 1
+        fi
+        ;;
+    esac
+  fi
+  printf '  Run manually: %s\n' "$_OI_HINT"
+  return 1
 }

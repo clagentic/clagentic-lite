@@ -1,4 +1,7 @@
-# clagentic-lite — copy to .env and fill in. .env is gitignored.
+# clagentic-lite — global config template.
+# Written to ~/.config/clagentic/config by `clagentic init`.
+# Per-repo .clagentic/config is OPTIONAL and SPARSE — only override keys.
+# Load order at gate-run time: global config → per-repo .clagentic/config → env vars.
 #
 # Per-role contract: each role has its own primary CLI+model and an ordered
 # fallback chain. The chain is walked left-to-right when the primary fails
@@ -8,12 +11,9 @@
 # Roles are independent. Codex does not implicitly fall back to Claude (or
 # vice versa) — every fallback step is something you wrote down on purpose.
 
-# ---------- identity ----------
-# Org slug used in commit trailers and log lines.
-CLAGENTIC_ORG=
-
-# Project slug. Defaults to the repo dir name if unset.
-CLAGENTIC_PROJECT=
+# ---------- tool home ----------
+# Set automatically by `clagentic init`. Edit only if you move the install.
+CLAGENTIC_HOME=
 
 # ---------- model tier table ----------
 # Resolve symbolic tier names to concrete model strings for each CLI.
@@ -49,7 +49,7 @@ CLAGENTIC_BUILDER_TIER=default
 CLAGENTIC_BUILDER_CHAIN=codex:default,claude:flagship
 
 # Reviewer = cross-vendor reviewer. A different CLI from Builder is recommended;
-# install.sh --check warns when they match.
+# `clagentic init` warns when they match.
 CLAGENTIC_REVIEWER_CMD=codex
 CLAGENTIC_REVIEWER_TIER=default
 CLAGENTIC_REVIEWER_CHAIN=claude:default,codex:flagship
@@ -106,8 +106,8 @@ CLAGENTIC_ALLOW_MISSING_GITLEAKS=0
 CLAGENTIC_ALLOW_MISSING_OSV=0
 CLAGENTIC_ALLOW_MISSING_SEMGREP=0
 
-# Strict preflight: make install.sh --check exit non-zero if any required
-# tool is missing. Off by default so CI re-checks don't fail spuriously.
+# Strict preflight: make `clagentic init` exit non-zero if any required
+# tool is missing. Off by default so scripted init runs don't fail spuriously.
 CLAGENTIC_STRICT_PREFLIGHT=0
 
 # ---------- repo host ----------

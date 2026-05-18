@@ -25,7 +25,18 @@ set -e
 . "$(dirname "$0")/platform.sh"
 ds_load_env
 
-REPO_ROOT=$(ds_repo_root || pwd)
+# Tool home: resolved from this script's own location.
+SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+TOOL_HOME="$(dirname "$SCRIPTS_DIR")"
+
+# Project root: CLAGENTIC_PROJECT_ROOT wins, then git show-toplevel.
+# llm-client.sh writes LLM call audit rows to the enrolled project's audit.db,
+# not to $CLAGENTIC_HOME. See gates.sh header for the full rationale.
+if [ -n "${CLAGENTIC_PROJECT_ROOT:-}" ]; then
+  REPO_ROOT="$CLAGENTIC_PROJECT_ROOT"
+else
+  REPO_ROOT=$(ds_repo_root || pwd)
+fi
 AUDIT_DB="$REPO_ROOT/.clagentic/audit.db"
 
 # ---------------------------------------------------------------- prompts -----

@@ -41,7 +41,7 @@ It is not a platform. It is what you install on your machine so the coding sessi
 
 A reviewer that shares the builder's training distribution shares its blind spots. So the Reviewer role defaults to a different CLI than the Builder. But "different CLI" should not be hard-coded: each role declares an ordered chain, drawn from whatever CLIs you actually have on this laptop. If your primary fails (rate limit, auth expired, model deprecated), the wrapper walks the chain and logs which entry succeeded.
 
-Concrete example from `.env.example`:
+Concrete example from `share/config.example`:
 
 ```sh
 CLAGENTIC_BUILDER_CMD=claude
@@ -59,21 +59,31 @@ Tier names (`flagship`, `default`, `cheap`) resolve to concrete model strings vi
 
 ## Install
 
-Three lines from a clean checkout:
+Clone once, enroll per project:
 
 ```sh
-git clone https://github.com/clagentic/clagentic-lite.git
-cd clagentic-lite
-./install.sh
+git clone https://github.com/clagentic/clagentic-lite.git ~/.clagentic-lite
+~/.clagentic-lite/bin/clagentic init
+cd ~/code/my-project && clagentic enroll
 ```
 
-There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `git pull && ./install.sh` — re-running is idempotent.
+If `init` warns that `~/.local/bin` is not on `$PATH`, add this to your shell rc and reopen your shell:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic update` — pulls `--ff-only`, re-checks prereqs, re-stamps shims in enrolled repos if the template version changed.
+
+The tool is cloned once to `~/.clagentic-lite` (or `$CLAGENTIC_HOME` if set). Your projects never contain a copy of the scripts or agent files — they hold only `.clagentic/{audit.db,memory.db}` and thin hook shims that call back to `$CLAGENTIC_HOME`. Update the tool once and every enrolled repo picks it up.
 
 ### Prerequisites
 
 clagentic-lite is small in *code* (~1,500 lines of POSIX shell + agent/skill markdown) but it leans on real tools to do real work. The security gates are deterministic local scanners — gitleaks, semgrep, osv-scanner — not LLM judgment. If you don't have them, you don't have the gates. The harness ships with explicit opt-ins to skip each one (see "Minimal install" below) so you can run a stripped-down version while you decide which gates you want.
 
-Required on PATH before `./install.sh`:
+`clagentic init` detects missing tools and offers to run the install command for you. If you decline, it prints the exact command and exits non-zero.
+
+Required:
 
 | Tool         | Purpose                                | Linux/WSL                   | macOS                       |
 |--------------|----------------------------------------|-----------------------------|-----------------------------|
@@ -86,7 +96,7 @@ Required for the security gates (you can install these later and opt-in per gate
 
 | Tool                | Gate     | Linux/WSL                   | macOS                       | Skip with                              |
 |---------------------|----------|-----------------------------|-----------------------------|----------------------------------------|
-| `gitleaks` ≥ 8.25   | secrets  | [gitleaks releases][gl]     | `brew install gitleaks`     | `CLAGENTIC_ALLOW_MISSING_GITLEAKS=1`   |
+| `gitleaks` ≥ 8.25   | secrets  | see [releases][gl]          | `brew install gitleaks`     | `CLAGENTIC_ALLOW_MISSING_GITLEAKS=1`   |
 | `semgrep`           | sast     | `pipx install semgrep`      | `brew install semgrep`      | `CLAGENTIC_ALLOW_MISSING_SEMGREP=1`    |
 | `osv-scanner`       | deps     | [osv-scanner releases][osv] | `brew install osv-scanner`  | `CLAGENTIC_ALLOW_MISSING_OSV=1`        |
 
@@ -99,7 +109,7 @@ Nice-to-have:
 
 ### Minimal install (just the harness, no security gates)
 
-Want to try the role/review/memory layer without installing gitleaks/semgrep/osv-scanner? Set the three `ALLOW_MISSING` opt-ins to `1` in `.env` after `./install.sh`:
+Want to try the role/review/memory layer without installing gitleaks/semgrep/osv-scanner? Set the three `ALLOW_MISSING` opt-ins to `1` in `~/.config/clagentic/config` after `clagentic init`:
 
 ```sh
 CLAGENTIC_ALLOW_MISSING_GITLEAKS=1
@@ -109,23 +119,26 @@ CLAGENTIC_ALLOW_MISSING_OSV=1
 
 That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memory, and the audit trail — but no deterministic secret/dep/sast scanning. Add the tools when you want the gates. The audit DB will record `skip` rows so you have a paper trail of which gates ran and which didn't.
 
-### What `./install.sh` does
+### What `clagentic init` and `clagentic enroll` do
 
-1. Detects WSL vs macOS, picks portable tool variants (`scripts/platform.sh`).
-2. If `.env` is missing, prompts interactively for each `CLAGENTIC_*` variable (defaults from `.env.example`). Non-TTY runs (CI) skip prompts and use defaults.
-3. Writes `.env` (chmod 600).
-4. Initializes `.clagentic/memory.db` and `.clagentic/audit.db`.
-5. Wires `.git/hooks/pre-commit` and `.git/hooks/pre-push`.
-6. `chmod +x` on every hook and script.
-7. Warns if the repo's current branch doesn't match `CLAGENTIC_DEFAULT_BRANCH` (e.g. you're on `master` but configured `main`) — the `pre-write-guard` rule W-001 needs that to match.
+**`clagentic init`** (run once, in $CLAGENTIC_HOME or anywhere after the symlink is on PATH):
 
-Re-running is safe. An existing `.env` is left alone (delete it to re-prompt).
+1. Verifies `$CLAGENTIC_HOME` is a valid clagentic-lite checkout.
+2. Detects WSL vs macOS, picks portable tool variants (`scripts/platform.sh`).
+3. For each REQUIRED missing tool: prints `MISSING: X — install with: <cmd>` and prompts `Run it now? [y/N]:`. On y, runs the install command. On N, exits non-zero with the manual command.
+4. Two-question front door: accept all defaults (Y/n) + vendor mode ([1] Claude only / [2] Claude+Codex). On Y+mode-2: writes global config and done. On n: up to 6 granular prompts.
+5. Writes `~/.config/clagentic/config` (chmod 600).
+6. Ensures `~/.local/bin/` exists; warns with the exact shell-profile line if not on `$PATH`.
+7. Symlinks `~/.local/bin/clagentic` to `$CLAGENTIC_HOME/bin/clagentic`.
 
-```sh
-./install.sh --check       # verify dependencies, print install hints, no changes
-./install.sh --no-prompt   # use .env.example defaults verbatim (for CI)
-CLAGENTIC_STRICT_PREFLIGHT=1 ./install.sh --check    # exit non-zero on missing required tools
-```
+**`clagentic enroll [PATH]`** (run inside each project you want gates on, default `$PWD`):
+
+1. Verifies the path is a git repo.
+2. Refuses if the path is `$CLAGENTIC_HOME` (use `--self` for dogfood).
+3. Refuses if already enrolled (use `--force` to re-enroll).
+4. Initializes `.clagentic/audit.db` and `.clagentic/memory.db` in that repo.
+5. Stamps `.git/hooks/pre-commit` and `.git/hooks/pre-push` from `share/hook-shims/*.template`, substituting `$CLAGENTIC_HOME` at stamp time. Refuses to overwrite non-clagentic hooks unless `--force`.
+6. Registers the repo path in `~/.local/state/clagentic/registry`.
 
 ### Verify the install
 
@@ -135,9 +148,10 @@ Two layers — the shell harness, then Claude Code's view of it.
 
 ```sh
 scripts/smoke.sh --quick   # non-interactive end-to-end without LLM calls
-scripts/gates.sh digest    # show what gates ran today
+scripts/gates.sh digest    # show what gates ran today (run from an enrolled repo)
 scripts/gates.sh status    # last 10 runs per gate, color-coded (status N for other N)
 scripts/gates.sh tail      # follow audit.db live; new gate rows render as they land (Ctrl-C to quit)
+clagentic doctor           # diagnostics: symlink, prereqs, every enrolled repo's hook status
 ```
 
 Smoke covers: DB init, seed + recall, gitleaks blocks a planted token, `llm-client.sh review` emits parseable JSON, audit-DB has fresh rows. If smoke passes, the harness is wired correctly.
@@ -177,7 +191,7 @@ codex login
 echo 'print "ok"' | codex exec --skip-git-repo-check 'echo this verbatim'
 
 # 4. Tell clagentic-lite which model tier to call
-#    Edit .env (the installer writes the table; you only change the values).
+#    Edit ~/.config/clagentic/config (init writes this; you only change the values).
 #    Models available on a ChatGPT account (Plus/Pro/Free) — what most users have:
 #    CLAGENTIC_MODEL_CODEX_FLAGSHIP=gpt-5.5
 #    CLAGENTIC_MODEL_CODEX_DEFAULT=gpt-5.5
@@ -202,7 +216,7 @@ If you only use Claude Code, set every role's `CMD` to `claude` and put nothing 
 cat "$INPUT" | claude --print --model "$MODEL" --append-system-prompt "$PROMPT"
 ```
 
-A same-CLI configuration is allowed — `install.sh --check` warns that you've lost the cross-CLI signal but does not refuse to install.
+A same-CLI configuration is allowed — `clagentic init` warns that you've lost the cross-CLI signal but does not refuse.
 
 ### Adding a third CLI
 
@@ -218,34 +232,51 @@ CLAGENTIC_MODEL_OLLAMA_DEFAULT=llama3.1:8b
 
 ## Layout
 
+The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). Your enrolled projects hold only the per-repo state — no copy of scripts, agents, or config.
+
 ```
-clagentic-lite/
-├── AGENTS.md                       canonical agent instructions, cross-tool
-├── CLAUDE.md                       pointer to AGENTS.md
-├── README.md                       this file
-├── install.sh                      POSIX installer, idempotent, prompts
-├── .env.example                    every parameter, no secrets
+~/.clagentic-lite/                              the tool — never gated by default
+├── bin/clagentic                               CLI entry point
+├── AGENTS.md                                   canonical agent instructions, cross-tool
+├── CLAUDE.md                                   pointer to AGENTS.md
+├── README.md                                   this file
+├── share/
+│   ├── config.example                          global config template (written to ~/.config/clagentic/config)
+│   └── hook-shims/
+│       ├── pre-commit.template                 stamped into enrolled repos at enroll time
+│       └── pre-push.template
 ├── docs/
-│   ├── DESIGN.md                   architecture and non-goals
-│   ├── GATES.md                    what each gate does, what it blocks
-│   ├── DEMO-SCRIPT.md              5-minute walkthrough
-│   └── PORTABILITY.md              GNU vs BSD tool table
+│   ├── DESIGN.md                               architecture and non-goals
+│   ├── GATES.md                                what each gate does, what it blocks
+│   ├── DEMO-SCRIPT.md                          5-minute walkthrough
+│   └── PORTABILITY.md                          GNU vs BSD tool table
 ├── .claude/
-│   ├── settings.json               hook wiring
+│   ├── settings.json                           hook wiring
 │   ├── agents/{builder,reviewer,auditor,merge-gate}.md
 │   ├── commands/{review,ship,recall}.md
 │   └── hooks/{session-start,prompt-inject,stop-summarize,pre-bash-guard,pre-write-guard}.sh
 ├── .codex/
-│   ├── config.toml                 Codex sandbox + role config
-│   └── AGENTS.md → ../AGENTS.md    symlink so Codex reads the same rules
+│   ├── config.toml                             Codex sandbox + role config
+│   └── AGENTS.md → ../AGENTS.md               symlink so Codex reads the same rules
 ├── scripts/
-│   ├── platform.sh                 GNU/BSD shims
-│   ├── memory.sh                   SQLite session memory CRUD
-│   ├── llm-client.sh               role-aware LLM wrapper with model_chain fallback
-│   ├── gates.sh                    gate orchestrator + digest + ship
-│   └── smoke.sh                    non-interactive end-to-end
-├── examples/{python,node,go}/      demo projects with planted bugs + secrets
-└── (no CI — this is a local-only tool)
+│   ├── platform.sh                             GNU/BSD shims + ds_check_tool/ds_offer_install
+│   ├── memory.sh                               SQLite session memory CRUD
+│   ├── llm-client.sh                           role-aware LLM wrapper with model_chain fallback
+│   ├── gates.sh                                gate orchestrator + digest + ship
+│   └── smoke.sh                                non-interactive end-to-end
+└── examples/{python,node,go}/                  demo projects with planted bugs + secrets
+
+~/.config/clagentic/config                      global config (chmod 600; written by init)
+~/.local/state/clagentic/registry               enrolled repos — one absolute path per line
+~/.local/bin/clagentic                          symlink to $CLAGENTIC_HOME/bin/clagentic
+
+<any enrolled repo>/
+├── .clagentic/
+│   ├── audit.db                                gate run log (written by gates.sh)
+│   └── memory.db                               session memory (written by memory.sh)
+└── .git/hooks/
+    ├── pre-commit                              shim: calls $CLAGENTIC_HOME/scripts/gates.sh secrets
+    └── pre-push                                shim: calls $CLAGENTIC_HOME/scripts/gates.sh pre-push
 ```
 
 ---

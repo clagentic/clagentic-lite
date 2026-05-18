@@ -1,0 +1,696 @@
+#!/bin/sh
+# clagentic-lite :: CLI entry point
+# Clone once to $CLAGENTIC_HOME. Use this CLI for all lifecycle operations.
+#
+# Subcommands:
+#   init [--reconfigure]          first-time setup: prereqs, global config, symlink
+#   enroll [--self] [--force] [PATH...]   wire hooks + init DBs for a repo
+#   unenroll [--purge] [PATH]             remove clagentic hooks, deregister
+#   list                                  show enrolled repos + status
+#   doctor                                diagnostics punch list
+#   update                                git pull + re-prereq + re-stamp shims
+#
+# Design: tool is cloned once (default: ~/.clagentic-lite, override via
+# $CLAGENTIC_HOME). Per-repo enrollment writes only .clagentic/{audit,memory}.db
+# and thin shims in .git/hooks/ that call back to $CLAGENTIC_HOME/scripts/.
+# The tool repo itself is never the thing under gates by default.
+
+set -e
+
+# Resolve CLAGENTIC_HOME: env var wins, else default.
+: "${CLAGENTIC_HOME:=$HOME/.clagentic-lite}"
+export CLAGENTIC_HOME
+
+# Source platform shims from our own install tree.
+SCRIPTS_DIR="$CLAGENTIC_HOME/scripts"
+if [ ! -f "$SCRIPTS_DIR/platform.sh" ]; then
+  # Bootstrap path: being invoked before init has verified $CLAGENTIC_HOME.
+  # Try to resolve from this script's own location.
+  _SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+  SCRIPTS_DIR="$(dirname "$_SELF_DIR")/scripts"
+fi
+if [ ! -f "$SCRIPTS_DIR/platform.sh" ]; then
+  printf 'clagentic: cannot find scripts/platform.sh in %s\n' "$CLAGENTIC_HOME" >&2
+  printf 'Set CLAGENTIC_HOME to the clagentic-lite checkout directory.\n' >&2
+  exit 1
+fi
+. "$SCRIPTS_DIR/platform.sh"
+
+SHARE_DIR="$CLAGENTIC_HOME/share"
+REGISTRY="$HOME/.local/state/clagentic/registry"
+GLOBAL_CONFIG="$HOME/.config/clagentic/config"
+LOCAL_BIN="$HOME/.local/bin"
+CLI_SYMLINK="$LOCAL_BIN/clagentic"
+
+# Shim template version marker. Bump this string when the template content
+# changes so `clagentic update` knows to re-stamp enrolled repos.
+SHIM_VERSION="v1"
+
+say()  { printf '[clagentic] %s\n' "$*"; }
+warn() { printf '[clagentic] WARN: %s\n' "$*" 1>&2; }
+die()  { printf '[clagentic] ERROR: %s\n' "$*" 1>&2; exit 1; }
+
+# ---------------------------------------------------------------- helpers
+
+# Portable absolute path resolution (no readlink -f on macOS by default).
+ds_realpath() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$1" 2>/dev/null || printf '%s' "$1"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$1" 2>/dev/null
+  else
+    # POSIX fallback: cd to dir, print pwd + basename.
+    _rp_dir="$(dirname "$1")"
+    _rp_base="$(basename "$1")"
+    (cd "$_rp_dir" 2>/dev/null && printf '%s/%s' "$(pwd)" "$_rp_base") || printf '%s' "$1"
+  fi
+}
+
+# Read the version marker from an installed hook shim.
+shim_version() {
+  _sv_file="$1"
+  [ -f "$_sv_file" ] || { printf ''; return; }
+  awk '/clagentic-lite hook shim/ { print; exit }' "$_sv_file" 2>/dev/null | sed 's/.*· \(v[^ ]*\) ·.*/\1/'
+}
+
+# Stamp a hook shim from share/hook-shims/<name>.template into a repo's
+# .git/hooks/<name>. Substitutes __CLAGENTIC_HOME__ with the actual path.
+# Args: TEMPLATE_NAME HOOKS_DIR
+# Returns: 0 stamped, 1 refused (existing non-clagentic hook, no --force)
+stamp_shim() {
+  _ss_name="$1"
+  _ss_hooks_dir="$2"
+  _ss_target="$_ss_hooks_dir/$_ss_name"
+  _ss_template="$SHARE_DIR/hook-shims/${_ss_name}.template"
+  [ -f "$_ss_template" ] || { warn "template missing: $_ss_template"; return 1; }
+
+  # If the hook file exists and is NOT clagentic-owned, refuse unless --force.
+  if [ -f "$_ss_target" ]; then
+    if grep -q 'managed-by: clagentic' "$_ss_target" 2>/dev/null; then
+      : # clagentic-owned — overwrite silently
+    elif [ "${ENROLL_FORCE:-0}" = "1" ]; then
+      warn "overwriting existing non-clagentic hook at $_ss_target (--force)"
+    else
+      warn "existing hook at $_ss_target is not clagentic-managed — skipping (use --force to overwrite)"
+      return 1
+    fi
+  fi
+
+  # Write shim: substitute __CLAGENTIC_HOME__ with the real path.
+  sed "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" "$_ss_template" > "$_ss_target"
+  chmod +x "$_ss_target"
+  return 0
+}
+
+# ---------------------------------------------------------------- init
+
+cmd_init() {
+  RECONFIGURE=0
+  for _arg in "$@"; do
+    case "$_arg" in --reconfigure) RECONFIGURE=1 ;; esac
+  done
+
+  say "clagentic-lite init"
+  say "CLAGENTIC_HOME: $CLAGENTIC_HOME"
+
+  # 1. Verify this is a clagentic-lite checkout.
+  if [ ! -f "$CLAGENTIC_HOME/scripts/gates.sh" ]; then
+    die "$CLAGENTIC_HOME does not look like a clagentic-lite checkout (scripts/gates.sh missing)"
+  fi
+
+  # 2. Prereq detection with offer-to-install for REQUIRED tools.
+  say "checking prerequisites..."
+  DS_CHECK_MISSING=0; export DS_CHECK_MISSING
+
+  # Required: sqlite3, git, and at least one JSON validator (jq or python3).
+  ds_offer_install sqlite3 "apt install sqlite3" "brew install sqlite" || DS_CHECK_MISSING=$((DS_CHECK_MISSING+1))
+  ds_offer_install git "apt install git" "xcode-select --install" || DS_CHECK_MISSING=$((DS_CHECK_MISSING+1))
+
+  # jq or python3 — either satisfies the JSON validator requirement.
+  HAS_JSON=0
+  if command -v jq >/dev/null 2>&1; then
+    printf '  %-15s found: %s\n' "jq" "$(command -v jq)"
+    HAS_JSON=1
+  elif command -v python3 >/dev/null 2>&1; then
+    printf '  %-15s found (python3 fallback): %s\n' "jq" "$(command -v python3)"
+    HAS_JSON=1
+  fi
+  if [ "$HAS_JSON" -eq 0 ]; then
+    ds_offer_install jq "apt install jq" "brew install jq" || DS_CHECK_MISSING=$((DS_CHECK_MISSING+1))
+    warn "no JSON validator — PreToolUse hooks will fail closed until jq or python3 is installed"
+  fi
+
+  # Security gate tools — required unless ALLOW_MISSING opts in.
+  ds_offer_install gitleaks \
+    "see https://github.com/gitleaks/gitleaks#installing" \
+    "brew install gitleaks" || true
+  ds_offer_install semgrep \
+    "pipx install semgrep" \
+    "brew install semgrep" || true
+  ds_offer_install osv-scanner \
+    "see https://google.github.io/osv-scanner/installation/" \
+    "brew install osv-scanner" || true
+
+  # Nice-to-have: timeout / gtimeout.
+  if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+    printf '  %-15s MISSING (optional) — install: %s\n' "timeout" \
+      "brew install coreutils (macOS) | apt install coreutils (Linux)"
+    warn "no timeout/gtimeout — LLM calls will run without per-call timeouts"
+  fi
+
+  if [ "$DS_CHECK_MISSING" -gt 0 ]; then
+    say "$DS_CHECK_MISSING required tool(s) still missing — fix them and re-run \`clagentic init\`"
+    if [ "${CLAGENTIC_STRICT_PREFLIGHT:-0}" = "1" ]; then
+      die "strict preflight: $DS_CHECK_MISSING required tool(s) missing"
+    fi
+  fi
+
+  # 3. Two-question front door.
+  if [ -f "$GLOBAL_CONFIG" ] && [ "$RECONFIGURE" -eq 0 ]; then
+    say "global config already exists at $GLOBAL_CONFIG (use --reconfigure to overwrite)"
+  else
+    _write_global_config
+  fi
+
+  # 4. Ensure ~/.local/bin/ exists.
+  _ensure_local_bin
+
+  # 5. Symlink ~/.local/bin/clagentic → $CLAGENTIC_HOME/bin/clagentic.
+  _install_symlink
+
+  say "init complete"
+  say "next: cd into any repo you want gates on, then run \`clagentic enroll\`"
+}
+
+_write_global_config() {
+  # Q1: accept all defaults?
+  ACCEPT_DEFAULTS="y"
+  if [ -t 0 ]; then
+    printf 'Accept all defaults? [Y/n]: '
+    read -r _q1 || _q1=""
+    [ -z "$_q1" ] && _q1="y"
+    case "$_q1" in y|Y|yes|YES) ACCEPT_DEFAULTS="y" ;; *) ACCEPT_DEFAULTS="n" ;; esac
+  fi
+
+  # Q2: vendor mode (only asked when accepting defaults or in granular mode).
+  VENDOR_MODE="2"
+  if [ "$ACCEPT_DEFAULTS" = "y" ] && [ -t 0 ]; then
+    printf 'Vendor mode?  [1] Claude only  [2] Claude + Codex (cross-vendor, default): '
+    read -r _q2 || _q2=""
+    [ -z "$_q2" ] && _q2="2"
+    VENDOR_MODE="$_q2"
+  fi
+
+  # Start with the example as the base.
+  _CONFIG_SRC="$SHARE_DIR/config.example"
+  [ -f "$_CONFIG_SRC" ] || die "share/config.example missing — is \$CLAGENTIC_HOME correct?"
+
+  # Prepare destination directory.
+  _config_dir="$(dirname "$GLOBAL_CONFIG")"
+  if [ ! -d "$_config_dir" ]; then
+    mkdir -p "$_config_dir" && chmod 700 "$_config_dir" \
+      || { warn "cannot create $_config_dir"; return 1; }
+  fi
+
+  cp "$_CONFIG_SRC" "$GLOBAL_CONFIG"
+  chmod 600 "$GLOBAL_CONFIG"
+
+  # Stamp CLAGENTIC_HOME.
+  awk -v home="$CLAGENTIC_HOME" '
+    /^CLAGENTIC_HOME=/ { print "CLAGENTIC_HOME=" home; next }
+    { print }
+  ' "$GLOBAL_CONFIG" > "$GLOBAL_CONFIG.tmp"
+  mv "$GLOBAL_CONFIG.tmp" "$GLOBAL_CONFIG"
+  chmod 600 "$GLOBAL_CONFIG"
+
+  # Apply vendor mode: if mode=1 (Claude only), set all roles to claude.
+  if [ "$VENDOR_MODE" = "1" ]; then
+    awk '
+      /^CLAGENTIC_(REVIEWER|AUDITOR)_CMD=/ { sub(/=.*/, "=claude"); }
+      /^CLAGENTIC_(REVIEWER|AUDITOR)_CHAIN=/ { sub(/=.*/, "=claude:default"); }
+      { print }
+    ' "$GLOBAL_CONFIG" > "$GLOBAL_CONFIG.tmp"
+    mv "$GLOBAL_CONFIG.tmp" "$GLOBAL_CONFIG"
+    chmod 600 "$GLOBAL_CONFIG"
+    warn "Builder and Reviewer both set to 'claude'. Cross-vendor review surfaces blind spots that same-vendor review shares."
+  fi
+
+  # Granular flow: max 6 prompts when user declined all-defaults.
+  if [ "$ACCEPT_DEFAULTS" = "n" ] && [ -t 0 ]; then
+    _granular_config_prompts
+  fi
+
+  say "wrote global config: $GLOBAL_CONFIG (chmod 600)"
+}
+
+_granular_config_prompts() {
+  # 6 prompts max: vendor mode, default branch, repo host, block severity,
+  # builder primary, reviewer primary.
+  printf 'Vendor mode?  [1] Claude only  [2] Claude + Codex (cross-vendor, default): '
+  read -r _vm || _vm=""; [ -z "$_vm" ] && _vm="2"
+
+  printf 'Default branch [main]: '
+  read -r _db || _db=""; [ -z "$_db" ] && _db="main"
+
+  printf 'Repo host (github|gitlab|gitea|none) [github]: '
+  read -r _rh || _rh=""; [ -z "$_rh" ] && _rh="github"
+
+  printf 'Block severity (low|medium|high|critical) [high]: '
+  read -r _bs || _bs=""; [ -z "$_bs" ] && _bs="high"
+
+  printf 'Builder CLI command [claude]: '
+  read -r _bc || _bc=""; [ -z "$_bc" ] && _bc="claude"
+
+  if [ "$_vm" = "2" ]; then
+    printf 'Reviewer CLI command [codex]: '
+    read -r _rc || _rc=""; [ -z "$_rc" ] && _rc="codex"
+  else
+    _rc="$_bc"
+  fi
+
+  awk -v vm="$_vm" -v db="$_db" -v rh="$_rh" -v bs="$_bs" -v bc="$_bc" -v rc="$_rc" '
+    /^CLAGENTIC_DEFAULT_BRANCH=/    { print "CLAGENTIC_DEFAULT_BRANCH=" db; next }
+    /^CLAGENTIC_REPO_HOST=/         { print "CLAGENTIC_REPO_HOST=" rh; next }
+    /^CLAGENTIC_BLOCK_SEVERITY=/    { print "CLAGENTIC_BLOCK_SEVERITY=" bs; next }
+    /^CLAGENTIC_BUILDER_CMD=/       { print "CLAGENTIC_BUILDER_CMD=" bc; next }
+    /^CLAGENTIC_REVIEWER_CMD=/      { print "CLAGENTIC_REVIEWER_CMD=" rc; next }
+    /^CLAGENTIC_(AUDITOR|GATE)_CMD=/ { print $0; next }
+    { print }
+  ' "$GLOBAL_CONFIG" > "$GLOBAL_CONFIG.tmp"
+  mv "$GLOBAL_CONFIG.tmp" "$GLOBAL_CONFIG"
+  chmod 600 "$GLOBAL_CONFIG"
+
+  if [ "$vm" = "1" ] || [ "$_bc" = "$_rc" ]; then
+    warn "Builder and Reviewer both set to '$_bc'. Cross-vendor review surfaces blind spots that same-vendor review shares."
+  fi
+}
+
+_ensure_local_bin() {
+  if [ ! -d "$LOCAL_BIN" ]; then
+    mkdir -p "$LOCAL_BIN" \
+      || { warn "cannot create $LOCAL_BIN"; return 1; }
+  fi
+  # Warn if LOCAL_BIN is not on PATH.
+  case ":$PATH:" in
+    *":$LOCAL_BIN:"*) : ;;
+    *)
+      warn "$LOCAL_BIN is not on \$PATH"
+      warn "Add this line to your shell profile (~/.bashrc, ~/.zshrc, ~/.profile):"
+      warn '  export PATH="$HOME/.local/bin:$PATH"'
+      ;;
+  esac
+}
+
+_install_symlink() {
+  _CLI_TARGET="$CLAGENTIC_HOME/bin/clagentic"
+  if [ ! -f "$_CLI_TARGET" ]; then
+    warn "bin/clagentic not found at $_CLI_TARGET — cannot create symlink"
+    return 1
+  fi
+  chmod +x "$_CLI_TARGET"
+
+  if [ -e "$CLI_SYMLINK" ] && [ ! -L "$CLI_SYMLINK" ]; then
+    warn "$CLI_SYMLINK exists and is a regular file, not a symlink — refusing to overwrite"
+    warn "Remove it manually then re-run \`clagentic init\`"
+    return 1
+  fi
+  # Remove existing symlink (may point to old path) and recreate.
+  rm -f "$CLI_SYMLINK"
+  ln -s "$_CLI_TARGET" "$CLI_SYMLINK"
+  say "symlinked: $CLI_SYMLINK -> $_CLI_TARGET"
+}
+
+# ---------------------------------------------------------------- enroll
+
+cmd_enroll() {
+  ENROLL_SELF=0
+  ENROLL_FORCE=0
+  _paths=""
+
+  for _a in "$@"; do
+    case "$_a" in
+      --self)  ENROLL_SELF=1 ;;
+      --force) ENROLL_FORCE=1 ;;
+      -*)      warn "unknown flag: $_a" ;;
+      *)       _paths="$_paths $_a" ;;
+    esac
+  done
+  export ENROLL_FORCE
+
+  # Default to $PWD if no paths given.
+  [ -z "$_paths" ] && _paths="$PWD"
+
+  for _raw_path in $_paths; do
+    _enroll_one "$(ds_realpath "$_raw_path")"
+  done
+}
+
+_enroll_one() {
+  _ep="$1"
+
+  # Verify it's a git repo.
+  if ! git -C "$_ep" rev-parse --git-dir >/dev/null 2>&1; then
+    warn "enroll: $_ep is not a git repository — skipping"
+    return 1
+  fi
+
+  _canon=$(ds_realpath "$_ep")
+  _home_canon=$(ds_realpath "$CLAGENTIC_HOME")
+
+  # Snake's-head check: refuse to enroll $CLAGENTIC_HOME itself unless --self.
+  if [ "$_canon" = "$_home_canon" ] && [ "$ENROLL_SELF" -ne 1 ]; then
+    warn "enroll: refusing to enroll \$CLAGENTIC_HOME itself ($_canon)"
+    warn "Use --self if you intentionally want the tool to gate itself."
+    return 1
+  fi
+
+  # Already enrolled check.
+  if [ -f "$REGISTRY" ] && grep -qxF "$_canon" "$REGISTRY" 2>/dev/null; then
+    if [ "$ENROLL_FORCE" -ne 1 ]; then
+      warn "enroll: $_canon is already enrolled (use --force to re-enroll)"
+      return 0
+    fi
+  fi
+
+  # Initialize .clagentic/ DBs in the enrolled repo.
+  _dot="$_canon/.clagentic"
+  mkdir -p "$_dot" && chmod 755 "$_dot" \
+    || { warn "cannot create $_dot"; return 1; }
+
+  CLAGENTIC_PROJECT_ROOT="$_canon" "$CLAGENTIC_HOME/scripts/memory.sh" init
+  CLAGENTIC_PROJECT_ROOT="$_canon" "$CLAGENTIC_HOME/scripts/gates.sh" init
+
+  # Stamp hook shims.
+  _git_dir=$(git -C "$_canon" rev-parse --git-dir)
+  # git rev-parse --git-dir may return a relative path when inside the repo.
+  case "$_git_dir" in
+    /*) _hooks_dir="$_git_dir/hooks" ;;
+    *)  _hooks_dir="$_canon/$_git_dir/hooks" ;;
+  esac
+  mkdir -p "$_hooks_dir" || true
+
+  stamp_shim pre-commit "$_hooks_dir" || true
+  stamp_shim pre-push   "$_hooks_dir" || true
+
+  # Register.
+  _reg_dir="$(dirname "$REGISTRY")"
+  mkdir -p "$_reg_dir" || true
+
+  # Remove any stale entry for this path before appending.
+  if [ -f "$REGISTRY" ]; then
+    grep -vxF "$_canon" "$REGISTRY" > "$REGISTRY.tmp" 2>/dev/null || true
+    mv "$REGISTRY.tmp" "$REGISTRY"
+  fi
+  printf '%s\n' "$_canon" >> "$REGISTRY"
+
+  say "enrolled: $_canon"
+}
+
+# ---------------------------------------------------------------- unenroll
+
+cmd_unenroll() {
+  UNENROLL_PURGE=0
+  _path="$PWD"
+
+  for _a in "$@"; do
+    case "$_a" in
+      --purge) UNENROLL_PURGE=1 ;;
+      -*)      warn "unknown flag: $_a" ;;
+      *)       _path="$_a" ;;
+    esac
+  done
+
+  _canon=$(ds_realpath "$_path")
+
+  if ! git -C "$_canon" rev-parse --git-dir >/dev/null 2>&1; then
+    warn "unenroll: $_canon is not a git repository"
+    return 1
+  fi
+
+  _git_dir=$(git -C "$_canon" rev-parse --git-dir)
+  case "$_git_dir" in
+    /*) _hooks_dir="$_git_dir/hooks" ;;
+    *)  _hooks_dir="$_canon/$_git_dir/hooks" ;;
+  esac
+
+  # Remove only clagentic-owned hooks.
+  for _hook in pre-commit pre-push; do
+    _hf="$_hooks_dir/$_hook"
+    if [ -f "$_hf" ]; then
+      if grep -q 'managed-by: clagentic' "$_hf" 2>/dev/null; then
+        rm -f "$_hf"
+        say "removed hook: $_hf"
+      else
+        say "skipping non-clagentic hook: $_hf"
+      fi
+    fi
+  done
+
+  # Deregister.
+  if [ -f "$REGISTRY" ]; then
+    grep -vxF "$_canon" "$REGISTRY" > "$REGISTRY.tmp" 2>/dev/null || true
+    mv "$REGISTRY.tmp" "$REGISTRY"
+  fi
+
+  # Purge .clagentic/ if requested.
+  if [ "$UNENROLL_PURGE" -eq 1 ]; then
+    _dot="$_canon/.clagentic"
+    if [ -d "$_dot" ]; then
+      rm -rf -- "$_dot"
+      say "purged: $_dot"
+    fi
+  fi
+
+  say "unenrolled: $_canon"
+}
+
+# ---------------------------------------------------------------- list
+
+cmd_list() {
+  if [ ! -f "$REGISTRY" ]; then
+    say "no enrolled repos (registry not found at $REGISTRY)"
+    return 0
+  fi
+
+  _HR='------------------------------------------------------------------------------------------'
+  printf '%-50s  %-24s  %s\n' "PATH" "LAST GATE RUN" "STATUS"
+  printf '%s\n' "$_HR"
+
+  while IFS= read -r _rpath; do
+    [ -z "$_rpath" ] && continue
+
+    # Determine status.
+    _status="ok"
+    if [ ! -d "$_rpath" ]; then
+      _status="stale"
+    elif ! git -C "$_rpath" rev-parse --git-dir >/dev/null 2>&1; then
+      _status="not-a-repo"
+    else
+      _git_dir=$(git -C "$_rpath" rev-parse --git-dir)
+      case "$_git_dir" in
+        /*) _hooks_dir="$_git_dir/hooks" ;;
+        *)  _hooks_dir="$_rpath/$_git_dir/hooks" ;;
+      esac
+      # Check both shims are present and clagentic-owned.
+      for _hook in pre-commit pre-push; do
+        _hf="$_hooks_dir/$_hook"
+        if [ ! -f "$_hf" ]; then
+          _status="hooks missing"
+        elif ! grep -q 'managed-by: clagentic' "$_hf" 2>/dev/null; then
+          _status="hooks replaced"
+        fi
+      done
+      # Check tool still exists at the baked-in path.
+      if [ -f "$_hooks_dir/pre-commit" ]; then
+        _baked=$(grep -E '__CLAGENTIC_HOME__|CLAGENTIC_HOME:=' "$_hooks_dir/pre-commit" 2>/dev/null | head -1)
+        if [ -z "$_baked" ] && ! grep -q "$CLAGENTIC_HOME" "$_hooks_dir/pre-commit" 2>/dev/null; then
+          _status="tool missing"
+        fi
+      fi
+    fi
+
+    # Last gate run from audit.db.
+    _db="$_rpath/.clagentic/audit.db"
+    _last_run=""
+    if [ -f "$_db" ]; then
+      _last_run=$(sqlite3 "$_db" "SELECT MAX(ts) FROM gate_runs;" 2>/dev/null || true)
+    fi
+    [ -z "$_last_run" ] && _last_run="(never)"
+
+    printf '%-50s  %-24s  %s\n' "$_rpath" "$_last_run" "$_status"
+  done < "$REGISTRY"
+}
+
+# ---------------------------------------------------------------- doctor
+
+cmd_doctor() {
+  _ok=0; _fail=0
+  _ok()   { printf '  OK   %s\n' "$*"; _ok=$((_ok+1)); }
+  _fail() { printf '  FAIL %s\n' "$*" 1>&2; _fail=$((_fail+1)); }
+
+  printf '\n== clagentic doctor ==\n\n'
+
+  # 1. CLAGENTIC_HOME exists and is a valid checkout.
+  if [ -f "$CLAGENTIC_HOME/scripts/gates.sh" ]; then
+    _ok "CLAGENTIC_HOME=$CLAGENTIC_HOME (valid checkout)"
+  else
+    _fail "CLAGENTIC_HOME=$CLAGENTIC_HOME (gates.sh missing — is this a clagentic-lite checkout?)"
+  fi
+
+  # 2. Symlink correct.
+  if [ -L "$CLI_SYMLINK" ]; then
+    _sym_target=$(readlink "$CLI_SYMLINK" 2>/dev/null || true)
+    if [ "$_sym_target" = "$CLAGENTIC_HOME/bin/clagentic" ]; then
+      _ok "$CLI_SYMLINK -> $CLAGENTIC_HOME/bin/clagentic"
+    else
+      _fail "$CLI_SYMLINK points to $_sym_target (expected $CLAGENTIC_HOME/bin/clagentic)"
+    fi
+  elif [ -e "$CLI_SYMLINK" ]; then
+    _fail "$CLI_SYMLINK exists but is not a symlink"
+  else
+    _fail "$CLI_SYMLINK missing — run \`clagentic init\`"
+  fi
+
+  # 3. LOCAL_BIN on PATH.
+  case ":$PATH:" in
+    *":$LOCAL_BIN:"*) _ok "$LOCAL_BIN is on \$PATH" ;;
+    *) _fail "$LOCAL_BIN is NOT on \$PATH — add: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+  esac
+
+  # 4. Required prereqs.
+  printf '\nprerequisites:\n'
+  for _tool in sqlite3 git; do
+    if command -v "$_tool" >/dev/null 2>&1; then
+      _ok "$_tool found"
+    else
+      _fail "$_tool missing"
+    fi
+  done
+  if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+    _ok "JSON validator (jq or python3) found"
+  else
+    _fail "JSON validator missing (need jq or python3)"
+  fi
+
+  # 5. Security tool status (advisory — missing is a warn, not a fail).
+  printf '\nsecurity tools:\n'
+  for _stool in gitleaks semgrep osv-scanner; do
+    if command -v "$_stool" >/dev/null 2>&1; then
+      _ok "$_stool found"
+    else
+      printf '  WARN %s not installed (security gate will block unless ALLOW_MISSING set)\n' "$_stool"
+    fi
+  done
+
+  # 6. Registry + enrolled repos.
+  printf '\nenrolled repos:\n'
+  if [ ! -f "$REGISTRY" ]; then
+    printf '  (no registry at %s)\n' "$REGISTRY"
+  else
+    while IFS= read -r _rpath; do
+      [ -z "$_rpath" ] && continue
+      if [ ! -d "$_rpath" ]; then
+        _fail "registered repo no longer exists: $_rpath"
+        continue
+      fi
+      _git_dir=$(git -C "$_rpath" rev-parse --git-dir 2>/dev/null || true)
+      if [ -z "$_git_dir" ]; then
+        _fail "$_rpath: not a git repo"
+        continue
+      fi
+      case "$_git_dir" in
+        /*) _hd="$_git_dir/hooks" ;;
+        *)  _hd="$_rpath/$_git_dir/hooks" ;;
+      esac
+      for _hook in pre-commit pre-push; do
+        _hf="$_hd/$_hook"
+        if [ ! -f "$_hf" ]; then
+          _fail "$_rpath: .git/hooks/$_hook missing"
+        elif ! grep -q 'managed-by: clagentic' "$_hf" 2>/dev/null; then
+          _fail "$_rpath: .git/hooks/$_hook not clagentic-managed"
+        elif ! grep -q "$CLAGENTIC_HOME" "$_hf" 2>/dev/null; then
+          _fail "$_rpath: .git/hooks/$_hook points to different CLAGENTIC_HOME (run \`clagentic update\`)"
+        else
+          _ok "$_rpath: .git/hooks/$_hook OK"
+        fi
+      done
+    done < "$REGISTRY"
+  fi
+
+  printf '\n== doctor summary: %s OK, %s FAIL ==\n\n' "$_ok" "$_fail"
+  [ "$_fail" -eq 0 ]
+}
+
+# ---------------------------------------------------------------- update
+
+cmd_update() {
+  say "updating clagentic-lite at $CLAGENTIC_HOME..."
+
+  # Refuse on dirty working tree.
+  if ! git -C "$CLAGENTIC_HOME" diff --quiet 2>/dev/null; then
+    die "working tree at $CLAGENTIC_HOME is dirty — stash or commit changes first"
+  fi
+
+  # ff-only pull.
+  if ! git -C "$CLAGENTIC_HOME" pull --ff-only; then
+    die "git pull --ff-only failed (non-fast-forward divergence or no upstream)"
+  fi
+
+  # Re-run prereq detection.
+  say "checking prerequisites post-update..."
+  DS_CHECK_MISSING=0; export DS_CHECK_MISSING
+  ds_offer_install sqlite3  "apt install sqlite3"  "brew install sqlite"  || true
+  ds_offer_install git      "apt install git"       "xcode-select --install" || true
+
+  # Re-stamp shims in registered repos if the template version changed.
+  if [ ! -f "$REGISTRY" ]; then
+    say "no enrolled repos to re-stamp"
+    return 0
+  fi
+
+  _restamped=0
+  while IFS= read -r _rpath; do
+    [ -z "$_rpath" ] && continue
+    [ -d "$_rpath" ] || continue
+    _git_dir=$(git -C "$_rpath" rev-parse --git-dir 2>/dev/null || true)
+    [ -z "$_git_dir" ] && continue
+    case "$_git_dir" in
+      /*) _hd="$_git_dir/hooks" ;;
+      *)  _hd="$_rpath/$_git_dir/hooks" ;;
+    esac
+    for _hook in pre-commit pre-push; do
+      _hf="$_hd/$_hook"
+      _installed_ver=$(shim_version "$_hf")
+      if [ "$_installed_ver" != "$SHIM_VERSION" ]; then
+        ENROLL_FORCE=0 stamp_shim "$_hook" "$_hd" && {
+          say "re-stamped: $_rpath .git/hooks/$_hook ($_installed_ver -> $SHIM_VERSION)"
+          _restamped=$((_restamped+1))
+        }
+      fi
+    done
+  done < "$REGISTRY"
+
+  say "update complete (re-stamped $_restamped shim(s))"
+}
+
+# ---------------------------------------------------------------- dispatch
+
+case "${1:-}" in
+  init)     shift; cmd_init "$@" ;;
+  enroll)   shift; cmd_enroll "$@" ;;
+  unenroll) shift; cmd_unenroll "$@" ;;
+  list)     cmd_list ;;
+  doctor)   cmd_doctor ;;
+  update)   cmd_update ;;
+  "")
+    printf 'usage: clagentic <subcommand> [args]\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update\n'
+    exit 1
+    ;;
+  *)
+    printf 'clagentic: unknown subcommand: %s\n' "$1" 1>&2
+    printf 'usage: clagentic <subcommand> [args]\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update\n'
+    exit 1
+    ;;
+esac

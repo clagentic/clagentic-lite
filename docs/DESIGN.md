@@ -105,7 +105,7 @@ llm-client.sh <subcmd>
 
 Implementation is **one-shot per call**. Each subcommand resolves the configured chain for its role (`CLAGENTIC_<ROLE>_CMD/_TIER/_CHAIN`), tries each `(cmd, tier)` entry in order, validates the output's schema, and falls through on failure to a degraded envelope marked `"degraded": true`. The gate orchestrator (`scripts/gates.sh`) detects degraded envelopes and blocks rather than treats them as clean reviews.
 
-Per-call timeout is `$CLAGENTIC_LLM_TIMEOUT_SEC` (default 180s) via `timeout` or `gtimeout` — exposed as `$DS_TIMEOUT_CMD` from `scripts/platform.sh`. If neither is available, the wrapper runs without a timeout and `install.sh --check` warns.
+Per-call timeout is `$CLAGENTIC_LLM_TIMEOUT_SEC` (default 180s) via `timeout` or `gtimeout` — exposed as `$DS_TIMEOUT_CMD` from `scripts/platform.sh`. If neither is available, the wrapper runs without a timeout and `clagentic doctor` warns.
 
 Persistent codex sessions and persistent claude sessions were both considered and deferred. The wall-clock difference between repeated one-shots and one persistent session is small on the cadence clagentic-lite is built for (a few `/review` calls per coding session, not hundreds), and the persistent path would require either codex's experimental `app-server` or a long-running daemon — both of which violate the no-server constraint.
 
@@ -138,10 +138,20 @@ CREATE TABLE gate_runs (
 
 `scripts/gates.sh digest` produces a one-screen daily summary. This is the "show your work" surface for a code review or an InfoSec conversation.
 
+## Install shape: clone once, enroll per repo
+
+The tool is cloned once to `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). The tool's own repo is never the thing under gates by default — `clagentic enroll --self` is the dogfood escape hatch.
+
+Per-repo footprint is only `.clagentic/{audit.db,memory.db}` and thin shims in `.git/hooks/` that call back to `$CLAGENTIC_HOME/scripts/`. Update the tool once; every enrolled repo picks up the new version automatically.
+
+`bin/clagentic` is the CLI entry point. It dispatches `init` (setup + symlink), `enroll` (hook stamp + DB init + register), `unenroll` (remove clagentic-owned hooks + deregister), `list` (enrolled status table), `doctor` (diagnostics punch list), and `update` (ff-only pull + re-stamp).
+
+Project root isolation: `gates.sh`, `memory.sh`, and `llm-client.sh` resolve the project root via `CLAGENTIC_PROJECT_ROOT` env var when set, falling back to `git rev-parse --show-toplevel` of cwd. Hook shims run from inside the enrolled repo's working tree, so git show-toplevel finds the enrolled project automatically without the shim needing to know the path at stamp time.
+
 ## Non-goals
 
 - Multi-agent orchestration (no director, no relay).
-- Multi-repo state.
+- Multi-repo state (each enrolled repo has independent DBs; there is no cross-repo index).
 - A web UI.
 - A plugin marketplace.
 - Anything that requires running our own server.
