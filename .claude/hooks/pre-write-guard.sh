@@ -48,7 +48,7 @@ else:
 ' "$REPO_ROOT" "$RAW_PATH" 2>/dev/null)
 else
   # No python3 — keep the raw value. The rule checks below are less robust
-  # without normalization; install.sh --check warns about this case.
+  # without normalization; `clagentic doctor` warns about this case.
   PATH_TARGET="$RAW_PATH"
 fi
 

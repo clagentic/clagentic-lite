@@ -53,9 +53,9 @@ If macOS users have Homebrew GNU tools on PATH ahead of system tools, clagentic-
 
 ## What we DO require
 
-- `jq` **or** `python3` for JSON parsing in PreToolUse hooks. The previous `sed`-based JSON parser was a known security bypass surface (escaped-quote truncation). Without a real validator the hooks fail closed and block every Bash/Write/Edit tool call. `install.sh --check` flags this as a hard miss.
+- `jq` **or** `python3` for JSON parsing in PreToolUse hooks. The previous `sed`-based JSON parser was a known security bypass surface (escaped-quote truncation). Without a real validator the hooks fail closed and block every Bash/Write/Edit tool call. `clagentic doctor` flags this as a hard miss.
 - `sqlite3` for the memory and audit databases. macOS ships an old SQLite; we use only features available since 3.35 (no JSON1, no FTS5, no window functions).
-- `timeout` or `gtimeout` for LLM-call timeouts. If absent, calls run without timeouts — degraded but not broken, and `install.sh --check` warns.
+- `timeout` or `gtimeout` for LLM-call timeouts. If absent, calls run without timeouts — degraded but not broken, and `clagentic doctor` warns.
 
 ## Shell idioms in bin/clagentic
 

@@ -105,7 +105,7 @@ llm-client.sh <subcmd>
 
 Implementation is **one-shot per call**. Each subcommand resolves the configured chain for its role (`CLAGENTIC_<ROLE>_CMD/_TIER/_CHAIN`), tries each `(cmd, tier)` entry in order, validates the output's schema, and falls through on failure to a degraded envelope marked `"degraded": true`. The gate orchestrator (`scripts/gates.sh`) detects degraded envelopes and blocks rather than treats them as clean reviews.
 
-Per-call timeout is `$CLAGENTIC_LLM_TIMEOUT_SEC` (default 180s) via `timeout` or `gtimeout` — exposed as `$DS_TIMEOUT_CMD` from `scripts/platform.sh`. If neither is available, the wrapper runs without a timeout and `install.sh --check` warns.
+Per-call timeout is `$CLAGENTIC_LLM_TIMEOUT_SEC` (default 180s) via `timeout` or `gtimeout` — exposed as `$DS_TIMEOUT_CMD` from `scripts/platform.sh`. If neither is available, the wrapper runs without a timeout and `clagentic doctor` warns.
 
 Persistent codex sessions and persistent claude sessions were both considered and deferred. The wall-clock difference between repeated one-shots and one persistent session is small on the cadence clagentic-lite is built for (a few `/review` calls per coding session, not hundreds), and the persistent path would require either codex's experimental `app-server` or a long-running daemon — both of which violate the no-server constraint.
 

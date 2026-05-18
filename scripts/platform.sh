@@ -47,27 +47,48 @@ ds_repo_root() {
   git rev-parse --show-toplevel 2>/dev/null
 }
 
-# Load .env from the repo root into the current shell. Idempotent — every
-# runtime entry point (hooks, gates.sh, llm-client.sh, memory.sh, smoke.sh)
-# calls this immediately after sourcing platform.sh. install.sh writes the
-# file; everything else reads it. Without this, CLAGENTIC_* settings are
-# silently absent at runtime and the wrapper falls back to hardcoded
-# defaults — the per-role chain configuration is theatrical.
+# Load configuration into the current shell. Load order (each layer can
+# override the previous):
+#   1. ~/.config/clagentic/config   — global defaults (written by `clagentic init`)
+#   2. <project-root>/.clagentic/config — per-repo sparse overrides (optional)
+#   3. Legacy: <project-root>/.env  — backward compat; honored if present
 #
-# Honors a CLAGENTIC_ENV_LOADED guard so re-sourcing in the same process
-# doesn't double-export.
+# Idempotent — honors a CLAGENTIC_ENV_LOADED guard so re-sourcing in the
+# same process doesn't double-export. Every runtime entry point (hooks,
+# gates.sh, llm-client.sh, memory.sh, smoke.sh) calls this immediately
+# after sourcing platform.sh.
 ds_load_env() {
   [ "${CLAGENTIC_ENV_LOADED:-0}" = "1" ] && return 0
-  RR=$(ds_repo_root)
-  [ -n "$RR" ] || return 0
-  ENV_FILE="$RR/.env"
-  if [ -f "$ENV_FILE" ]; then
-    # set -a exports every variable assigned while it's in effect.
+
+  # 1. Global config.
+  _GLOBAL_CFG="$HOME/.config/clagentic/config"
+  if [ -f "$_GLOBAL_CFG" ]; then
     set -a
     # shellcheck disable=SC1090
-    . "$ENV_FILE"
+    . "$_GLOBAL_CFG"
     set +a
   fi
+
+  RR=$(ds_repo_root)
+  if [ -n "$RR" ]; then
+    # 2. Per-repo sparse config (v0.2: optional; not created by default).
+    _REPO_CFG="$RR/.clagentic/config"
+    if [ -f "$_REPO_CFG" ]; then
+      set -a
+      # shellcheck disable=SC1090
+      . "$_REPO_CFG"
+      set +a
+    fi
+    # 3. Legacy .env (v0.1 compatibility; honored but not created in v0.2).
+    _ENV_FILE="$RR/.env"
+    if [ -f "$_ENV_FILE" ]; then
+      set -a
+      # shellcheck disable=SC1090
+      . "$_ENV_FILE"
+      set +a
+    fi
+  fi
+
   CLAGENTIC_ENV_LOADED=1
   export CLAGENTIC_ENV_LOADED
 }
@@ -78,7 +99,7 @@ ds_load_env() {
 #   $DS_TIMEOUT_CMD "$LLM_TIMEOUT" some-cli ...
 # When neither tool is present, DS_TIMEOUT_CMD is set to an empty wrapper
 # that runs the command without a timeout — degraded but doesn't fail-open
-# in a confusing way (install.sh --check warns when timeout is missing).
+# in a confusing way (`clagentic doctor` warns when timeout is missing).
 if command -v timeout >/dev/null 2>&1; then
   DS_TIMEOUT_CMD="timeout"
 elif command -v gtimeout >/dev/null 2>&1; then
