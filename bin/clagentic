@@ -468,11 +468,119 @@ cmd_enroll() {
 
 _enroll_one() {
   _ep="$1"
+  # _ep_orig tracks the original argument so we can write .clagentic-project
+  # to the wrapper directory rather than to the enrolled repo.
+  _ep_orig="$_ep"
 
-  # Verify it's a git repo.
+  # Verify it's a git repo. If not, offer wrapper detection (tty only) or
+  # fall through to a git init offer.
   if ! git -C "$_ep" rev-parse --git-dir >/dev/null 2>&1; then
-    warn "enroll: $_ep is not a git repository — skipping"
-    return 1
+    if [ -t 0 ]; then
+      # Scan for nested git repos up to 3 levels deep.
+      _nested_raw=$(find "$_ep" -maxdepth 3 -name .git -type d 2>/dev/null)
+      _nested_count=0
+      _nested_list=""
+      for _ng in $_nested_raw; do
+        # Strip trailing /.git to get repo path.
+        _nr="${_ng%/.git}"
+        _nested_count=$((_nested_count+1))
+        _nested_list="$_nested_list $_nr"
+      done
+
+      if [ "$_nested_count" -gt 0 ]; then
+        printf 'enroll: %s is not a git repo — found %d nested repo(s):\n' "$_ep" "$_nested_count"
+        _i=0
+        for _nr in $_nested_list; do
+          _i=$((_i+1))
+          printf '  %d) %s\n' "$_i" "$_nr"
+        done
+
+        if [ "$_nested_count" -eq 1 ]; then
+          # Single nested repo: simple Y/n/q prompt.
+          _single_repo=""
+          for _nr in $_nested_list; do _single_repo="$_nr"; done
+          printf 'Enroll it? [Y/n/q(uit)]: '
+          read -r _reply || _reply=""
+          [ -z "$_reply" ] && _reply="Y"
+          case "$_reply" in
+            q|Q)
+              return 1
+              ;;
+            n|N)
+              # Fall through to git init offer below.
+              _nested_count=0
+              ;;
+            *)
+              # Y or blank: enroll the nested repo.
+              printf '%s\n' "$_single_repo" >> "$_ep_orig/.clagentic-project"
+              _enroll_one "$_single_repo"
+              return $?
+              ;;
+          esac
+        else
+          # Multiple nested repos: A / # / n / q prompt.
+          printf 'Enroll: [A]ll / [#] pick one / [n]one (git init instead) / [q]uit: '
+          read -r _reply || _reply=""
+          case "$_reply" in
+            q|Q)
+              return 1
+              ;;
+            n|N)
+              # Fall through to git init offer below.
+              _nested_count=0
+              ;;
+            a|A)
+              # Enroll all nested repos.
+              for _nr in $_nested_list; do
+                printf '%s\n' "$_nr" >> "$_ep_orig/.clagentic-project"
+                _enroll_one "$_nr"
+              done
+              return 0
+              ;;
+            *)
+              # Digit: enroll the numbered repo.
+              _pick="$_reply"
+              _i=0
+              _found=""
+              for _nr in $_nested_list; do
+                _i=$((_i+1))
+                if [ "$_i" = "$_pick" ]; then
+                  _found="$_nr"
+                fi
+              done
+              if [ -n "$_found" ]; then
+                printf '%s\n' "$_found" >> "$_ep_orig/.clagentic-project"
+                _enroll_one "$_found"
+                return $?
+              else
+                warn "enroll: invalid selection '$_reply' — skipping"
+                return 1
+              fi
+              ;;
+          esac
+        fi
+      fi
+
+      # git init offer: reached when no nested repos found, or user chose n.
+      printf 'enroll: no git repo found under %s.\n' "$_ep"
+      printf 'Initialize a new git repo here with `git init`? [Y/n]: '
+      read -r _reply || _reply=""
+      [ -z "$_reply" ] && _reply="Y"
+      case "$_reply" in
+        n|N)
+          warn "enroll: skipping — no git repo and user declined git init"
+          return 1
+          ;;
+        *)
+          git init "$_ep" || { warn "enroll: git init failed for $_ep"; return 1; }
+          # Fall through: _ep is now a git repo; the check below will pass.
+          ;;
+      esac
+    else
+      # Non-tty: original behavior.
+      warn "enroll: $_ep is not a git repository — skipping"
+      return 1
+    fi
   fi
 
   _canon=$(ds_realpath "$_ep")
