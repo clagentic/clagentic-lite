@@ -42,9 +42,27 @@ if [ "$DS_OS" = "linux" ] && grep -qi microsoft /proc/version 2>/dev/null; then
 fi
 export DS_WSL
 
-# Repo root (cached)
+# Repo root: try git first, then walk up looking for a .clagentic-project
+# pointer written by `clagentic enroll` when the user enrolled a nested repo
+# from a wrapper directory.
 ds_repo_root() {
-  git rev-parse --show-toplevel 2>/dev/null
+  _drr=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [ -n "$_drr" ]; then
+    printf '%s' "$_drr"
+    return
+  fi
+  # Walk upward from $PWD looking for a wrapper pointer file.
+  _d="$PWD"
+  while [ "$_d" != "/" ]; do
+    if [ -f "$_d/.clagentic-project" ]; then
+      # Read first non-empty line as the enrolled repo root.
+      _ptr=$(grep -m1 . "$_d/.clagentic-project" 2>/dev/null || true)
+      [ -n "$_ptr" ] && printf '%s' "$_ptr" && return
+      break
+    fi
+    _d="$(dirname "$_d")"
+  done
+  # Both failed — return empty; callers handle the empty case.
 }
 
 # Load configuration into the current shell. Load order (each layer can
