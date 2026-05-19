@@ -46,6 +46,12 @@ CLI_SYMLINK="$LOCAL_BIN/clagentic"
 # changes so `clagentic update` knows to re-stamp enrolled repos.
 SHIM_VERSION="v1"
 
+# Single source of truth for the security-gate tool list. Adding a new
+# scanner means editing this one line — _run_prereq_checks (init/update)
+# and cmd_doctor both iterate this list, so they stay in sync.
+# Space-separated POSIX-sh string (no arrays).
+CLAGENTIC_SECURITY_TOOLS="gitleaks semgrep osv-scanner"
+
 say()  { printf '[clagentic] %s\n' "$*"; }
 warn() { printf '[clagentic] WARN: %s\n' "$*" 1>&2; }
 die()  { printf '[clagentic] ERROR: %s\n' "$*" 1>&2; exit 1; }
@@ -115,6 +121,33 @@ stamp_shim() {
 # JSON validator: jq OR python3 satisfies the requirement (hooks fall back
 # to python3 when jq is absent). Handled separately because of the "either-or".
 
+# Look up per-OS install hints for a security tool, keyed off CLAGENTIC_SECURITY_TOOLS.
+# Echoes "LINUX_HINT|DARWIN_HINT" — caller splits on '|'. Returns 1 for unknown
+# names (so adding a name to CLAGENTIC_SECURITY_TOOLS without adding a hint case
+# here fails loudly instead of silently degrading).
+# semgrep's linux hint is dynamic (PEP 668 picker); the others are static.
+_security_tool_hints() {
+  _STH_NAME="$1"
+  case "$_STH_NAME" in
+    gitleaks)
+      printf '%s|%s' \
+        "see https://github.com/gitleaks/gitleaks#installing" \
+        "brew install gitleaks"
+      ;;
+    semgrep)
+      printf '%s|%s' "$(_semgrep_hint_linux)" "brew install semgrep"
+      ;;
+    osv-scanner)
+      printf '%s|%s' \
+        "see https://google.github.io/osv-scanner/installation/" \
+        "brew install osv-scanner"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # Pick the right semgrep install hint for this host. PEP 668 (Debian 12+,
 # Ubuntu 23.04+, modern WSL) refuses unmanaged pip installs against system
 # Python — suggesting `pip install --user` there produces the
@@ -168,15 +201,16 @@ _run_prereq_checks() {
 
   # Security gate tools — required unless ALLOW_MISSING_* opts in. Not counted
   # toward DS_CHECK_MISSING because the user might legitimately opt out.
-  ds_offer_install gitleaks \
-    "see https://github.com/gitleaks/gitleaks#installing" \
-    "brew install gitleaks" || true
-  ds_offer_install semgrep \
-    "$(_semgrep_hint_linux)" \
-    "brew install semgrep" || true
-  ds_offer_install osv-scanner \
-    "see https://google.github.io/osv-scanner/installation/" \
-    "brew install osv-scanner" || true
+  # List of names lives in CLAGENTIC_SECURITY_TOOLS (top of file); hints come
+  # from _security_tool_hints, which fails loudly if a name lacks a case
+  # (catches "added to list but forgot to add hints" drift).
+  for _stool in $CLAGENTIC_SECURITY_TOOLS; do
+    _sthints=$(_security_tool_hints "$_stool") || \
+      die "internal: no install hint for security tool '$_stool' (update _security_tool_hints in bin/clagentic)"
+    _stl="${_sthints%%|*}"
+    _std="${_sthints##*|}"
+    ds_offer_install "$_stool" "$_stl" "$_std" || true
+  done
 
   # Nice-to-have: timeout / gtimeout.
   if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
@@ -217,6 +251,27 @@ cmd_init() {
   # 1. Verify this is a clagentic-lite checkout.
   if [ ! -f "$CLAGENTIC_HOME/scripts/gates.sh" ]; then
     die "$CLAGENTIC_HOME does not look like a clagentic-lite checkout (scripts/gates.sh missing)"
+  fi
+
+  # 1.5. Freshness check. If CLAGENTIC_HOME is a git checkout and the local
+  # branch is behind its upstream, nudge the user to run `clagentic update`
+  # before continuing — otherwise init runs against stale code (the silent
+  # footgun that bit early users when PRs #3/#4/#5 landed and they kept
+  # re-running init without pulling).
+  # Skippable with CLAGENTIC_SKIP_FETCH=1 for offline use, and silently
+  # tolerant of failure (no upstream, no network, not a worktree, etc.).
+  if [ "${CLAGENTIC_SKIP_FETCH:-0}" != "1" ] \
+      && git -C "$CLAGENTIC_HOME" rev-parse --git-dir >/dev/null 2>&1; then
+    # Best-effort fetch; suppress output. Network failures are non-fatal.
+    git -C "$CLAGENTIC_HOME" fetch --quiet 2>/dev/null || true
+    _BRANCH=$(git -C "$CLAGENTIC_HOME" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    _UPSTREAM=$(git -C "$CLAGENTIC_HOME" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+    if [ -n "$_BRANCH" ] && [ -n "$_UPSTREAM" ]; then
+      _BEHIND=$(git -C "$CLAGENTIC_HOME" rev-list --count "HEAD..$_UPSTREAM" 2>/dev/null || echo 0)
+      if [ "$_BEHIND" -gt 0 ] 2>/dev/null; then
+        warn "$CLAGENTIC_HOME is $_BEHIND commit(s) behind $_UPSTREAM — run \`clagentic update\` to pick up the latest fixes before re-running init"
+      fi
+    fi
   fi
 
   # 2. Prereq detection — shared helper used by init / update / doctor.
@@ -639,8 +694,10 @@ cmd_doctor() {
   fi
 
   # 5. Security tool status (advisory — missing is a warn, not a fail).
+  # Tool names come from CLAGENTIC_SECURITY_TOOLS (top of file), same source
+  # _run_prereq_checks uses — they cannot drift apart.
   printf '\nsecurity tools:\n'
-  for _stool in gitleaks semgrep osv-scanner; do
+  for _stool in $CLAGENTIC_SECURITY_TOOLS; do
     if command -v "$_stool" >/dev/null 2>&1; then
       _ok "$_stool found"
     else
