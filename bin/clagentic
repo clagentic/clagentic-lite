@@ -102,6 +102,107 @@ stamp_shim() {
   return 0
 }
 
+# ---------------------------------------------------------------- prereq helpers
+#
+# Single source of truth for "what tools does clagentic-lite need". cmd_init,
+# cmd_update, and cmd_doctor all call into here so adding a new required tool
+# means editing one function, not three.
+#
+# Required tools: hard prereqs. Init/update will offer to install; doctor
+# will fail if absent.
+# Security tools: needed by the secrets/sast/deps gates. Skippable via the
+# ALLOW_MISSING_* env vars; doctor reports them as WARN, not FAIL.
+# JSON validator: jq OR python3 satisfies the requirement (hooks fall back
+# to python3 when jq is absent). Handled separately because of the "either-or".
+
+# Pick the right semgrep install hint for this host. PEP 668 (Debian 12+,
+# Ubuntu 23.04+, modern WSL) refuses unmanaged pip installs against system
+# Python — suggesting `pip install --user` there produces the
+# "externally-managed-environment" error. Order of preference:
+#   1. pipx present                       -> pipx install semgrep
+#   2. no pipx, Python NOT PEP-668        -> python3 -m pip install --user semgrep
+#   3. no pipx, Python IS PEP-668 managed -> apt install pipx (then re-run init)
+#   4. no pipx, no python3                -> point at vendor docs
+_semgrep_hint_linux() {
+  if command -v pipx >/dev/null 2>&1; then
+    printf '%s' "pipx install semgrep"
+    return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s' "see https://semgrep.dev/docs/getting-started/"
+    return
+  fi
+  set -- /usr/lib/python3*/EXTERNALLY-MANAGED /usr/lib/python3/EXTERNALLY-MANAGED
+  for _f in "$@"; do
+    if [ -e "$_f" ]; then
+      printf '%s' "apt install pipx  # then re-run \`clagentic init\` (PEP 668 — system python refuses pip --user)"
+      return
+    fi
+  done
+  printf '%s' "python3 -m pip install --user semgrep"
+}
+
+# _run_prereq_checks MODE
+#   MODE = "init"   -> ds_offer_install for required + security tools.
+#   MODE = "update" -> same (so post-update checks match init coverage).
+# Sets DS_CHECK_MISSING (required tools only) and DS_PENDING_INSTALLS.
+# Prints the collated still-to-install summary at the end.
+_run_prereq_checks() {
+  _RPC_MODE="${1:-init}"
+  DS_CHECK_MISSING=0; export DS_CHECK_MISSING
+  ds_pending_reset
+
+  # Required: sqlite3, git.
+  ds_offer_install sqlite3 "apt install sqlite3" "brew install sqlite" || DS_CHECK_MISSING=$((DS_CHECK_MISSING+1))
+  ds_offer_install git "apt install git" "xcode-select --install" || DS_CHECK_MISSING=$((DS_CHECK_MISSING+1))
+
+  # Required: jq OR python3. Either one satisfies.
+  if command -v jq >/dev/null 2>&1; then
+    printf '  %-15s found: %s\n' "jq" "$(command -v jq)"
+  elif command -v python3 >/dev/null 2>&1; then
+    printf '  %-15s found (python3 fallback): %s\n' "jq" "$(command -v python3)"
+  else
+    ds_offer_install jq "apt install jq" "brew install jq" || DS_CHECK_MISSING=$((DS_CHECK_MISSING+1))
+    warn "no JSON validator — PreToolUse hooks will fail closed until jq or python3 is installed"
+  fi
+
+  # Security gate tools — required unless ALLOW_MISSING_* opts in. Not counted
+  # toward DS_CHECK_MISSING because the user might legitimately opt out.
+  ds_offer_install gitleaks \
+    "see https://github.com/gitleaks/gitleaks#installing" \
+    "brew install gitleaks" || true
+  ds_offer_install semgrep \
+    "$(_semgrep_hint_linux)" \
+    "brew install semgrep" || true
+  ds_offer_install osv-scanner \
+    "see https://google.github.io/osv-scanner/installation/" \
+    "brew install osv-scanner" || true
+
+  # Nice-to-have: timeout / gtimeout.
+  if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+    printf '  %-15s MISSING (optional) — install: %s\n' "timeout" \
+      "brew install coreutils (macOS) | apt install coreutils (Linux)"
+    warn "no timeout/gtimeout — LLM calls will run without per-call timeouts"
+  fi
+
+  # Single collated summary at the bottom of the run.
+  ds_pending_summary
+
+  if [ "$DS_CHECK_MISSING" -gt 0 ]; then
+    case "$_RPC_MODE" in
+      update)
+        say "$DS_CHECK_MISSING required tool(s) still missing post-update — fix them before next gate run"
+        ;;
+      *)
+        say "$DS_CHECK_MISSING required tool(s) still missing — fix them and re-run \`clagentic init\`"
+        ;;
+    esac
+    if [ "${CLAGENTIC_STRICT_PREFLIGHT:-0}" = "1" ]; then
+      die "strict preflight: $DS_CHECK_MISSING required tool(s) missing"
+    fi
+  fi
+}
+
 # ---------------------------------------------------------------- init
 
 cmd_init() {
@@ -118,89 +219,18 @@ cmd_init() {
     die "$CLAGENTIC_HOME does not look like a clagentic-lite checkout (scripts/gates.sh missing)"
   fi
 
-  # 2. Prereq detection with offer-to-install for REQUIRED tools.
+  # 2. Prereq detection — shared helper used by init / update / doctor.
+  #    On a re-run with config already present, the prereq sweep still runs
+  #    (always useful), but the two-question front door is skipped — silence
+  #    when nothing will change.
   say "checking prerequisites..."
-  DS_CHECK_MISSING=0; export DS_CHECK_MISSING
-  ds_pending_reset
+  _run_prereq_checks init
 
-  # Required: sqlite3, git, and at least one JSON validator (jq or python3).
-  ds_offer_install sqlite3 "apt install sqlite3" "brew install sqlite" || DS_CHECK_MISSING=$((DS_CHECK_MISSING+1))
-  ds_offer_install git "apt install git" "xcode-select --install" || DS_CHECK_MISSING=$((DS_CHECK_MISSING+1))
-
-  # jq or python3 — either satisfies the JSON validator requirement.
-  HAS_JSON=0
-  if command -v jq >/dev/null 2>&1; then
-    printf '  %-15s found: %s\n' "jq" "$(command -v jq)"
-    HAS_JSON=1
-  elif command -v python3 >/dev/null 2>&1; then
-    printf '  %-15s found (python3 fallback): %s\n' "jq" "$(command -v python3)"
-    HAS_JSON=1
-  fi
-  if [ "$HAS_JSON" -eq 0 ]; then
-    ds_offer_install jq "apt install jq" "brew install jq" || DS_CHECK_MISSING=$((DS_CHECK_MISSING+1))
-    warn "no JSON validator — PreToolUse hooks will fail closed until jq or python3 is installed"
-  fi
-
-  # Security gate tools — required unless ALLOW_MISSING opts in.
-  ds_offer_install gitleaks \
-    "see https://github.com/gitleaks/gitleaks#installing" \
-    "brew install gitleaks" || true
-  # semgrep on Linux: the install command depends on what's already present.
-  # Order of preference:
-  #   1. pipx present                       -> pipx install semgrep
-  #   2. no pipx, Python *not* PEP-668      -> python3 -m pip install --user semgrep
-  #   3. no pipx, Python IS PEP-668 managed -> apt install pipx (then re-run init)
-  #   4. no pipx, no python3                -> point at vendor docs
-  # PEP 668 (Debian 12+/Ubuntu 23.04+/modern WSL) refuses unmanaged pip installs
-  # against system Python, so suggesting `pip install --user` there is a recipe
-  # for the "externally-managed-environment" error.
-  if command -v pipx >/dev/null 2>&1; then
-    _SEMGREP_HINT_LINUX="pipx install semgrep"
-  elif command -v python3 >/dev/null 2>&1; then
-    # Glob expands to nothing on hosts without the marker. Set -- to safely
-    # iterate; the test catches both "no matches" and "real file present".
-    set -- /usr/lib/python3*/EXTERNALLY-MANAGED /usr/lib/python3/EXTERNALLY-MANAGED
-    _SEMGREP_PEP668=0
-    for _f in "$@"; do [ -e "$_f" ] && _SEMGREP_PEP668=1; done
-    if [ "$_SEMGREP_PEP668" -eq 1 ]; then
-      _SEMGREP_HINT_LINUX="apt install pipx  # then re-run \`clagentic init\` (PEP 668 — system python refuses pip --user)"
-    else
-      _SEMGREP_HINT_LINUX="python3 -m pip install --user semgrep"
-    fi
-  else
-    _SEMGREP_HINT_LINUX="see https://semgrep.dev/docs/getting-started/"
-  fi
-  ds_offer_install semgrep \
-    "$_SEMGREP_HINT_LINUX" \
-    "brew install semgrep" || true
-  ds_offer_install osv-scanner \
-    "see https://google.github.io/osv-scanner/installation/" \
-    "brew install osv-scanner" || true
-
-  # Nice-to-have: timeout / gtimeout.
-  if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
-    printf '  %-15s MISSING (optional) — install: %s\n' "timeout" \
-      "brew install coreutils (macOS) | apt install coreutils (Linux)"
-    warn "no timeout/gtimeout — LLM calls will run without per-call timeouts"
-  fi
-
-  # Collated summary of everything that's still missing — required + optional.
-  # The user sees individual MISSING/Run-manually lines as each check fires;
-  # this block re-presents them all at the bottom so a partial install run
-  # leaves the user with a single copy-pasteable list instead of having to
-  # scroll back through interleaved prompts.
-  ds_pending_summary
-
-  if [ "$DS_CHECK_MISSING" -gt 0 ]; then
-    say "$DS_CHECK_MISSING required tool(s) still missing — fix them and re-run \`clagentic init\`"
-    if [ "${CLAGENTIC_STRICT_PREFLIGHT:-0}" = "1" ]; then
-      die "strict preflight: $DS_CHECK_MISSING required tool(s) missing"
-    fi
-  fi
-
-  # 3. Two-question front door.
+  # 3. Two-question front door. Skip entirely when global config already
+  #    exists and --reconfigure was not passed — otherwise re-runs of init
+  #    pointlessly ask "Accept all defaults? [Y/n]" every time.
   if [ -f "$GLOBAL_CONFIG" ] && [ "$RECONFIGURE" -eq 0 ]; then
-    say "global config already exists at $GLOBAL_CONFIG (use --reconfigure to overwrite)"
+    say "global config already exists at $GLOBAL_CONFIG (use --reconfigure to re-prompt)"
   else
     _write_global_config
   fi
@@ -212,6 +242,9 @@ cmd_init() {
   _install_symlink
 
   say "init complete"
+  if [ -f "$GLOBAL_CONFIG" ] && [ "$RECONFIGURE" -eq 0 ]; then
+    say "(no config changes — re-ran prereq + symlink only)"
+  fi
   say "next: cd into any repo you want gates on, then run \`clagentic enroll\`"
 }
 
@@ -669,13 +702,11 @@ cmd_update() {
     die "git pull --ff-only failed (non-fast-forward divergence or no upstream)"
   fi
 
-  # Re-run prereq detection.
+  # Re-run the same prereq sweep that init runs — pre-PR-#6 this only
+  # checked sqlite3 + git, so a clagentic update on a host that had since
+  # uninstalled e.g. semgrep would silently leave the gate broken.
   say "checking prerequisites post-update..."
-  DS_CHECK_MISSING=0; export DS_CHECK_MISSING
-  ds_pending_reset
-  ds_offer_install sqlite3  "apt install sqlite3"  "brew install sqlite"  || true
-  ds_offer_install git      "apt install git"       "xcode-select --install" || true
-  ds_pending_summary
+  _run_prereq_checks update
 
   # Re-stamp shims in registered repos if the template version changed.
   if [ ! -f "$REGISTRY" ]; then
