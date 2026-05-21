@@ -131,6 +131,50 @@ stamp_shim() {
   return 0
 }
 
+# Stamp a wrapper-flavored CLAUDE.md into a non-git wrapper directory.
+# Args: WRAPPER_DIR  ENROLLED_REPOS (space-separated absolute paths)
+# No hook wiring — hooks are git-repo-rooted and must not fire from wrapper CWD.
+# Skips if a non-clagentic CLAUDE.md already exists (unless ENROLL_FORCE=1).
+_stamp_wrapper_claude_md() {
+  _wcd="$1"; _wcd_repos="$2"
+  _wcd_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
+  [ -f "$_wcd_template" ] || { warn "CLAUDE.md.wrapper.template missing — skipping wrapper CLAUDE.md"; return 0; }
+
+  _wcd_target="$_wcd/CLAUDE.md"
+  if [ -f "$_wcd_target" ] && ! grep -q 'managed-by: clagentic' "$_wcd_target" 2>/dev/null; then
+    if [ "${ENROLL_FORCE:-0}" = "1" ]; then
+      warn "overwriting existing non-clagentic CLAUDE.md in wrapper $_wcd (--force)"
+    else
+      warn "existing CLAUDE.md in wrapper $_wcd is not clagentic-managed — skipping (use --force to overwrite)"
+      return 0
+    fi
+  fi
+
+  # Generate the file directly — multiline table substitution via sed is
+  # fragile (newlines, special chars in paths). Read template line by line;
+  # replace the token line with the generated table.
+  {
+    while IFS= read -r _tmpl_line; do
+      case "$_tmpl_line" in
+        *__WRAPPER_PROJECT_TABLE__*)
+          printf '| Subfolder | Absolute path |\n'
+          printf '|---|---|\n'
+          for _wr in $_wcd_repos; do
+            _rel="${_wr#$_wcd}"
+            _rel="${_rel#/}"
+            [ -z "$_rel" ] && _rel="$_wr"
+            printf '| `%s` | `%s` |\n' "$_rel" "$_wr"
+          done
+          ;;
+        *)
+          printf '%s\n' "$_tmpl_line"
+          ;;
+      esac
+    done < "$_wcd_template"
+  } > "$_wcd_target"
+  say "stamped wrapper CLAUDE.md: $_wcd_target"
+}
+
 # ---------------------------------------------------------------- prereq helpers
 #
 # Single source of truth for "what tools does clagentic-lite need". cmd_init,
@@ -536,6 +580,7 @@ _enroll_one() {
             *)
               # Y or blank: enroll the nested repo.
               printf '%s\n' "$_single_repo" >> "$_ep_orig/.clagentic-project"
+              _stamp_wrapper_claude_md "$_ep_orig" "$_single_repo"
               _enroll_one "$_single_repo"
               return $?
               ;;
@@ -556,6 +601,9 @@ _enroll_one() {
               # Enroll all nested repos.
               for _nr in $_nested_list; do
                 printf '%s\n' "$_nr" >> "$_ep_orig/.clagentic-project"
+              done
+              _stamp_wrapper_claude_md "$_ep_orig" "$_nested_list"
+              for _nr in $_nested_list; do
                 _enroll_one "$_nr"
               done
               return 0
@@ -573,6 +621,7 @@ _enroll_one() {
               done
               if [ -n "$_found" ]; then
                 printf '%s\n' "$_found" >> "$_ep_orig/.clagentic-project"
+                _stamp_wrapper_claude_md "$_ep_orig" "$_found"
                 _enroll_one "$_found"
                 return $?
               else
