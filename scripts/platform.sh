@@ -46,7 +46,7 @@ export DS_WSL
 # pointer written by `clagentic enroll` when the user enrolled a nested repo
 # from a wrapper directory.
 ds_repo_root() {
-  _drr=$(git rev-parse --show-toplevel 2>/dev/null)
+  _drr=$(git rev-parse --show-toplevel 2>/dev/null || true)
   if [ -n "$_drr" ]; then
     printf '%s' "$_drr"
     return
