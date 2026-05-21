@@ -533,6 +533,18 @@ cmd_enroll() {
   done
 }
 
+
+# _register_wrapper_repo WRAPPER_DIR REPO_PATH
+# Appends REPO_PATH to WRAPPER_DIR/.clagentic-project, stamps wrapper CLAUDE.md,
+# then enrolls the repo.
+_register_wrapper_repo() {
+  _rwr_wrapper="$1"
+  _rwr_repo="$2"
+  printf '%s\n' "$_rwr_repo" >> "$_rwr_wrapper/.clagentic-project"
+  _stamp_wrapper_claude_md "$_rwr_wrapper" "$_rwr_repo"
+  _enroll_one "$_rwr_repo"
+}
+
 _enroll_one() {
   _ep="$1"
   # _ep_orig tracks the original argument so we can write .clagentic-project
@@ -579,9 +591,7 @@ _enroll_one() {
               ;;
             *)
               # Y or blank: enroll the nested repo.
-              printf '%s\n' "$_single_repo" >> "$_ep_orig/.clagentic-project"
-              _stamp_wrapper_claude_md "$_ep_orig" "$_single_repo"
-              _enroll_one "$_single_repo"
+              _register_wrapper_repo "$_ep_orig" "$_single_repo"
               return $?
               ;;
           esac
@@ -600,11 +610,7 @@ _enroll_one() {
             a|A)
               # Enroll all nested repos.
               for _nr in $_nested_list; do
-                printf '%s\n' "$_nr" >> "$_ep_orig/.clagentic-project"
-              done
-              _stamp_wrapper_claude_md "$_ep_orig" "$_nested_list"
-              for _nr in $_nested_list; do
-                _enroll_one "$_nr"
+                _register_wrapper_repo "$_ep_orig" "$_nr"
               done
               return 0
               ;;
@@ -620,9 +626,7 @@ _enroll_one() {
                 fi
               done
               if [ -n "$_found" ]; then
-                printf '%s\n' "$_found" >> "$_ep_orig/.clagentic-project"
-                _stamp_wrapper_claude_md "$_ep_orig" "$_found"
-                _enroll_one "$_found"
+                _register_wrapper_repo "$_ep_orig" "$_found"
                 return $?
               else
                 warn "enroll: invalid selection '$_reply' — skipping"
@@ -1016,6 +1020,34 @@ cmd_doctor() {
       done
     done < "$REGISTRY"
   fi
+
+
+  # 7. Wrapper .clagentic-project pointer files
+  printf '\nwrapper .clagentic-project pointers:\n'
+  _wrapper_found=0
+  if [ -f "$REGISTRY" ]; then
+    while IFS= read -r _rpath; do
+      [ -z "$_rpath" ] && continue
+      _parent=$(dirname "$_rpath")
+      _ptr="$_parent/.clagentic-project"
+      [ -f "$_ptr" ] || continue
+      _wrapper_found=1
+      printf '  checking %s\n' "$_ptr"
+      while IFS= read -r _ppath; do
+        [ -z "$_ppath" ] && continue
+        if [ ! -d "$_ppath" ]; then
+          _fail "stale pointer in $_ptr: '$_ppath' no longer exists"
+        elif ! git -C "$_ppath" rev-parse --git-dir >/dev/null 2>&1; then
+          _fail "stale pointer in $_ptr: '$_ppath' is not a git repo"
+        elif ! grep -qxF "$_ppath" "$REGISTRY" 2>/dev/null; then
+          printf '  WARN  pointer entry %s is not in registry (re-run enroll?)\n' "$_ppath"
+        else
+          _ok "wrapper pointer: $_ppath"
+        fi
+      done < "$_ptr"
+    done < "$REGISTRY"
+  fi
+  [ "$_wrapper_found" -eq 0 ] && printf '  (no wrapper .clagentic-project files found)\n'
 
   printf '\n== doctor summary: %s OK, %s FAIL ==\n\n' "$_ok" "$_fail"
   [ "$_fail" -eq 0 ]
