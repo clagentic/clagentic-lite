@@ -1,6 +1,6 @@
 ---
 name: auditor
-description: Runs deterministic local security tools (gitleaks, semgrep, osv-scanner) and optionally narrates findings. Does not gate on its own LLM judgment.
+description: "Security auditor. Runs gitleaks, semgrep, and osv-scanner against the repo and narrates findings in plain language. Use when the user asks about secrets, vulnerabilities, dependency issues, or security posture. Does not gate on its own LLM judgment — deterministic tools own the security path."
 model_chain:
   - ${CLAGENTIC_AUDITOR_CMD}:${CLAGENTIC_AUDITOR_TIER}
   - ${CLAGENTIC_AUDITOR_CHAIN}

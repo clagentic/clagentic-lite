@@ -75,7 +75,7 @@ fi
 cd /path/to/your/project && clagentic enroll
 ```
 
-After the first install, the steady-state upgrade is just `clagentic update` — it does the `git pull --ff-only`, re-checks prereqs, and re-stamps hook shims in every enrolled repo if the template version changed.
+After the first install, the steady-state upgrade is just `clagentic update` — it does the `git pull --ff-only`, re-checks prereqs, and re-stamps hook shims, `.claude/settings.json`, and `CLAUDE.md` in every enrolled repo when their template versions change.
 
 If `init` warns that `~/.local/bin` is not on `$PATH`, add this to your shell rc and reopen your shell:
 
@@ -83,9 +83,9 @@ If `init` warns that `~/.local/bin` is not on `$PATH`, add this to your shell rc
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic update` — pulls `--ff-only`, re-checks prereqs, re-stamps shims in enrolled repos if the template version changed.
+There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic update` — pulls `--ff-only`, re-checks prereqs, re-stamps all versioned artifacts in enrolled repos when their template versions change.
 
-The tool is cloned once to `~/.clagentic-lite` (or `$CLAGENTIC_HOME` if set). Your projects never contain a copy of the scripts or agent files — they hold only `.clagentic/{audit.db,memory.db}` and thin hook shims that call back to `$CLAGENTIC_HOME`. Update the tool once and every enrolled repo picks it up.
+The tool is cloned once to `~/.clagentic-lite` (or `$CLAGENTIC_HOME` if set). Your projects never contain a copy of the scripts or agent files — they hold only `.clagentic/{audit.db,memory.db}`, thin hook shims, and a `CLAUDE.md` that call back to `$CLAGENTIC_HOME`. Update the tool once and every enrolled repo picks it up.
 
 ### Prerequisites
 
@@ -148,7 +148,15 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 3. Refuses if already enrolled (use `--force` to re-enroll).
 4. Initializes `.clagentic/audit.db` and `.clagentic/memory.db` in that repo.
 5. Stamps `.git/hooks/pre-commit` and `.git/hooks/pre-push` from `share/hook-shims/*.template`, substituting `$CLAGENTIC_HOME` at stamp time. Refuses to overwrite non-clagentic hooks unless `--force`.
-6. Registers the repo path in `~/.local/state/clagentic/registry`.
+6. Generates `.claude/settings.json` (absolute hook paths → `$CLAGENTIC_HOME`), symlinks `.claude/commands` and `.claude/agents`, and adds `.claude/` to `.gitignore`. These are local-only artifacts.
+7. Stamps `CLAUDE.md` at the repo root — activates the Builder contract and exposes agents for Claude Code auto-dispatch. Refuses to overwrite a non-clagentic `CLAUDE.md` unless `--force`.
+8. Registers the repo path in `~/.local/state/clagentic/registry`.
+
+### Solo vs. shared repos
+
+**Solo / private repo**: `CLAUDE.md` is generated and ready to use. If you'd rather not commit it, add it to `.gitignore` yourself — clagentic won't do that automatically because the file is safe to commit.
+
+**Shared repo**: `CLAUDE.md` is committable as-is. It contains no machine-specific paths — only a reference to `$CLAGENTIC_DEFAULT_BRANCH` (substituted at stamp time) and links to the public clagentic-lite repo. Teammates without clagentic installed will see a normal project CLAUDE.md. Teammates with clagentic installed will get full agent auto-dispatch. If you extend it with project-specific rules, `clagentic enroll --force` will refuse to overwrite until you remove the `managed-by: clagentic` marker.
 
 ### Verify the install
 

@@ -48,6 +48,11 @@ CLI_SYMLINK="$LOCAL_BIN/clagentic"
 # changes so `clagentic update` knows to re-stamp enrolled repos.
 SHIM_VERSION="v1"
 
+# Claude Code artifact version markers. Bump when the corresponding template
+# changes so `clagentic update` re-stamps enrolled repos automatically.
+CLAUDE_SETTINGS_VERSION="v2"
+CLAUDE_MD_VERSION="v2"
+
 # Single source of truth for the security-gate tool list. Adding a new
 # scanner means editing this one line — _run_prereq_checks (init/update)
 # and cmd_doctor both iterate this list, so they stay in sync.
@@ -79,6 +84,22 @@ shim_version() {
   _sv_file="$1"
   [ -f "$_sv_file" ] || { printf ''; return; }
   awk '/clagentic-lite hook shim/ { print; exit }' "$_sv_file" 2>/dev/null | sed 's/.*· \(v[^ ]*\) ·.*/\1/'
+}
+
+# Read the version marker from an installed .claude/settings.json.
+# Looks for "clagentic-settings-version: vN" in the $comment field.
+claude_settings_version() {
+  _csv_file="$1"
+  [ -f "$_csv_file" ] || { printf ''; return; }
+  grep -o 'clagentic-settings-version: v[^ ·"]*' "$_csv_file" 2>/dev/null | sed 's/clagentic-settings-version: //'
+}
+
+# Read the version marker from an installed CLAUDE.md.
+# Looks for "clagentic-claude-md-version: vN" in the managed-by comment.
+claude_md_version() {
+  _cmv_file="$1"
+  [ -f "$_cmv_file" ] || { printf ''; return; }
+  grep -o 'clagentic-claude-md-version: v[^ ·>]*' "$_cmv_file" 2>/dev/null | sed 's/clagentic-claude-md-version: //'
 }
 
 # Stamp a hook shim from share/hook-shims/<name>.template into a repo's
@@ -993,9 +1014,41 @@ cmd_update() {
         }
       fi
     done
+
+    # Re-stamp .claude/settings.json if version changed.
+    _cs_file="$_rpath/.claude/settings.json"
+    _cs_ver=$(claude_settings_version "$_cs_file")
+    if [ -f "$_cs_file" ] && grep -q 'managed-by: clagentic' "$_cs_file" 2>/dev/null; then
+      if [ "$_cs_ver" != "$CLAUDE_SETTINGS_VERSION" ]; then
+        _cs_template="$SHARE_DIR/hook-shims/claude-settings.template"
+        if [ -f "$_cs_template" ]; then
+          sed "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" "$_cs_template" > "$_cs_file"
+          say "re-stamped: $_rpath/.claude/settings.json ($_cs_ver -> $CLAUDE_SETTINGS_VERSION)"
+          _restamped=$((_restamped+1))
+        fi
+      fi
+    fi
+
+    # Re-stamp CLAUDE.md if version changed.
+    _cm_file="$_rpath/CLAUDE.md"
+    _cm_ver=$(claude_md_version "$_cm_file")
+    if [ -f "$_cm_file" ] && grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
+      if [ "$_cm_ver" != "$CLAUDE_MD_VERSION" ]; then
+        _cm_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
+        if [ -f "$_cm_template" ]; then
+          _default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+          sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
+              -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_default_branch|g" \
+              "$_cm_template" > "$_cm_file"
+          say "re-stamped: $_rpath/CLAUDE.md ($_cm_ver -> $CLAUDE_MD_VERSION)"
+          _restamped=$((_restamped+1))
+        fi
+      fi
+    fi
+
   done < "$REGISTRY"
 
-  say "update complete (re-stamped $_restamped shim(s))"
+  say "update complete (re-stamped $_restamped artifact(s))"
 }
 
 # ---------------------------------------------------------------- dispatch

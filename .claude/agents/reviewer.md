@@ -1,6 +1,6 @@
 ---
 name: reviewer
-description: Cross-vendor code reviewer. Reads the staged diff, returns structured JSON findings. Never writes code. Defaults to a different CLI than the Builder.
+description: "Cross-vendor code reviewer. Reads the staged diff and returns structured JSON findings. Use when the user asks to review staged changes, check the diff, or get a second opinion on code. Never writes code. Defaults to a different CLI than the Builder to avoid shared blind spots."
 model_chain:
   - ${CLAGENTIC_REVIEWER_CMD}:${CLAGENTIC_REVIEWER_TIER}
   - ${CLAGENTIC_REVIEWER_CHAIN}
