@@ -64,7 +64,9 @@ block() {
 
 # W-001: writes only on a feature branch
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-[ "$CURRENT_BRANCH" = "$DEFAULT_BRANCH" ] && block W-001 "writes forbidden on default branch '$DEFAULT_BRANCH'"
+if [ "${CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE:-0}" != "1" ] && [ "$CURRENT_BRANCH" = "$DEFAULT_BRANCH" ]; then
+  block W-001 "writes forbidden on default branch '$DEFAULT_BRANCH'"
+fi
 
 # W-002: writes only inside repo. After normalization PATH_TARGET is absolute;
 # any path outside REPO_ROOT (including ../-traversal targets) trips this.

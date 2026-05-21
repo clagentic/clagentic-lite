@@ -23,7 +23,7 @@ Keyword extraction is the simplest thing that works: strip stopwords from the pr
 | **Blocks?** | Yes (exit 2). Also blocks if neither `jq` nor `python3` is on PATH — hooks need a JSON validator to parse tool input safely, and a hook that can't parse fails closed. |
 | **JSON parsing** | `ds_json_field` (in `scripts/platform.sh`) routes through `jq` if present, `python3` as fallback. The previous `sed`-based parser truncated on escaped quotes and was a known R-005 bypass surface. |
 | **Path normalization** | `pre-write-guard.sh` resolves relative paths against the repo root via `python3 os.path.realpath` before the W-002 "inside repo" check, so `../outside.txt` traversal blocks. |
-| **Override** | Per-rule env var with required justification (e.g., `CLAGENTIC_ALLOW_FORCE=1` with commit-body explanation) |
+| **Override** | `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` (comma-separated) in `.clagentic/config` or `~/.config/clagentic/config`. Document the reason in your commit or PR body. Never edit `pre-bash-guard.sh` to remove a rule. |
 
 Bash rules (R-001 through R-020) implemented inline in `pre-bash-guard.sh`:
 
@@ -52,12 +52,12 @@ Bash rules (R-001 through R-020) implemented inline in `pre-bash-guard.sh`:
 
 Write rules:
 
-| ID | Rule |
-|---|---|
-| W-001 | No writes to `${CLAGENTIC_DEFAULT_BRANCH}` — must be on a feature branch |
-| W-002 | No writes outside `git rev-parse --show-toplevel` |
-| W-003 | No writes to `.git/`, `.clagentic/`, `.env` |
-| W-004 | No writes to files matching `**/*.pem`, `**/id_rsa*`, `**/*.key` |
+| ID | Rule | Bypass |
+|---|---|---|
+| W-001 | No writes to `${CLAGENTIC_DEFAULT_BRANCH}` — must be on a feature branch | `CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1` in `.clagentic/config` |
+| W-002 | No writes outside `git rev-parse --show-toplevel` | none — path traversal is never legitimate |
+| W-003 | No writes to `.git/`, `.clagentic/`, `.env` | none |
+| W-004 | No writes to files matching `**/*.pem`, `**/id_rsa*`, `**/*.key` | none |
 
 ## Gate 3 — Cross-CLI review
 
@@ -90,10 +90,11 @@ Three independent sub-gates run as standard git hooks:
 
 | | |
 |---|---|
-| **Tool** | `osv-scanner --recursive .` |
-| **Blocks?** | Yes, on any vulnerability. (osv-scanner exits non-zero whenever it reports findings; clagentic-lite treats that as block.) |
-| **Override** | `.osv-ignore.yaml` with documented justification, or `CLAGENTIC_ALLOW_MISSING_OSV=1` if osv-scanner isn't installed locally |
-| **Severity-aware variant** | not implemented in v1; if you want "block on CRITICAL only" run osv-scanner directly with `--format json` and parse via `jq` |
+| **Tool** | `osv-scanner --recursive --severity=<CLAGENTIC_OSV_SEVERITY> .` |
+| **Blocks?** | Yes, on vulnerabilities at or above the configured severity. Default is `CRITICAL`. |
+| **Severity** | Set `CLAGENTIC_OSV_SEVERITY` in `~/.config/clagentic/config` or `.clagentic/config`. Values: `CRITICAL` (default), `HIGH`, `MEDIUM`, `LOW`. Set `LOW` to restore block-on-any-finding behavior. |
+| **Ignore list** | Add CVE/GHSA IDs one-per-line to `~/.config/clagentic/osv-ignore` (global) or `.clagentic/osv-ignore` (repo). Lines starting with `#` and blank lines are ignored. IDs are passed as `--ignore-vulns=<id>` to osv-scanner. |
+| **Missing tool** | Set `CLAGENTIC_ALLOW_MISSING_OSV=1` to skip if osv-scanner is not installed. |
 
 ### 4c. SAST (pre-push)
 
@@ -101,7 +102,8 @@ Three independent sub-gates run as standard git hooks:
 |---|---|
 | **Tool** | `semgrep --config=auto --error --severity=ERROR` |
 | **Blocks?** | Yes, on ERROR. `--error` makes semgrep exit non-zero only on ERROR-severity findings; WARNING-and-below findings still print but don't block. |
-| **Override** | `.semgrepignore` for files; `# nosemgrep: <rule-id> — <reason>` inline, or `CLAGENTIC_ALLOW_MISSING_SEMGREP=1` if semgrep isn't installed locally |
+| **Override** | `.semgrepignore` at the repo root (natively honored by semgrep — add file paths or rule IDs to suppress); `# nosemgrep: <rule-id> — <reason>` inline in source. |
+| **Missing tool** | Set `CLAGENTIC_ALLOW_MISSING_SEMGREP=1` if semgrep is not installed locally. |
 
 Rationale: deterministic tools, well-understood, no LLM in the security path. The LLM-driven `adversarial` layer (Gate 5) is separate and non-blocking by design.
 
@@ -163,9 +165,21 @@ CLAGENTIC_TAIL_INTERVAL_SEC=2 scripts/gates.sh tail   # adjust poll interval
 
 `status` and `tail` honor `NO_COLOR=1` and emit plain text when stdout is not a TTY (safe to pipe to a file). Both are read-only — neither writes to `audit.db`, neither runs a gate, neither spawns a daemon.
 
-## Skipping gates
+## Working around gates — use config, not code edits
 
-There is exactly one supported skip pattern: per-rule environment variable + a written justification that lands in the commit message or PR body. The point is to make a skip *visible* in the audit trail, not impossible.
+**Do not edit hook source files or gate scripts to bypass a blocking rule.** The right path is always a config variable, an ignore file, or a native tool mechanism. The table below covers every supported bypass. All bypasses are visible in the audit trail.
+
+| Gate | Situation | How to handle it |
+|---|---|---|
+| Gate 4a — secrets | False-positive token | Add a path-scoped allowlist entry to `.gitleaks.toml`. Do not use regex allowlists on token literals. |
+| Gate 4b — deps | Pre-existing CVE you accept | Add the ID to `.clagentic/osv-ignore` (repo) or `~/.config/clagentic/osv-ignore` (global). One ID per line. |
+| Gate 4b — deps | Want to ignore below CRITICAL | Set `CLAGENTIC_OSV_SEVERITY=HIGH` (or `MEDIUM`) in `.clagentic/config`. |
+| Gate 4c — SAST | False-positive semgrep rule | Add the file path to `.semgrepignore`, or add `# nosemgrep: <rule-id> — <reason>` inline. |
+| Gate 2 — bash guard | Legitimate command blocked by a rule | Set `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` in `.clagentic/config`. Multiple rules: comma-separated. Add a comment explaining why in the commit. |
+| Gate 2 — write guard (W-001) | Intentional work on default branch | Set `CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1` in `.clagentic/config`. This is unusual — default-branch protection exists for good reason. |
+| Any gate | Tool not installed | Set `CLAGENTIC_ALLOW_MISSING_<TOOL>=1`. Prefer installing the tool. |
+
+**Agents: if a gate blocks you, consult this table first.** Editing `pre-bash-guard.sh`, `pre-write-guard.sh`, or `scripts/gates.sh` to remove a rule or suppress a finding is a contract violation — it removes the protection for all future sessions, not just the one where it was inconvenient. Use the config bypass and explain why.
 
 There is no `--skip-all-gates`.
 

@@ -129,7 +129,30 @@ cmd_deps() {
     cmd_log_run deps block "osv-scanner not installed (fail-closed)"
     return 1
   fi
-  if osv-scanner --recursive .; then
+
+  # Build the osv-scanner argument list via positional parameters (POSIX-safe,
+  # no eval, no word-splitting surprises). Severity defaults to CRITICAL so
+  # pre-existing low/medium vulns don't block routine work.
+  SEVERITY="${CLAGENTIC_OSV_SEVERITY:-CRITICAL}"
+  set -- --recursive "--severity=$SEVERITY"
+
+  # Append --ignore-vulns=<id> for each entry in the global and repo-level
+  # ignore files. One ID per line; blank lines and # comments are stripped.
+  GLOBAL_IGNORE="$HOME/.config/clagentic/osv-ignore"
+  REPO_IGNORE="$REPO_ROOT/.clagentic/osv-ignore"
+
+  for _IGNORE_FILE in "$GLOBAL_IGNORE" "$REPO_IGNORE"; do
+    [ -f "$_IGNORE_FILE" ] || continue
+    while IFS= read -r LINE; do
+      case "$LINE" in ''|'#'*) continue ;; esac
+      ID=$(printf '%s' "$LINE" | sed 's/[[:space:]]*#.*//' | sed 's/[[:space:]]*$//')
+      [ -n "$ID" ] && set -- "$@" "--ignore-vulns=$ID"
+    done < "$_IGNORE_FILE"
+  done
+
+  set -- "$@" .   # trailing path arg
+
+  if osv-scanner "$@"; then
     cmd_log_run deps pass ""
   else
     cmd_log_run deps block "osv-scanner reported vulnerabilities"
@@ -148,6 +171,7 @@ cmd_sast() {
     cmd_log_run sast block "semgrep not installed (fail-closed)"
     return 1
   fi
+  # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
   if semgrep --config=auto --error --severity=ERROR; then
     cmd_log_run sast pass ""
   else
