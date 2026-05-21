@@ -32,6 +32,19 @@ If you find a hardcoded value, fix it. If you can't fix it without breaking flow
 
 This isn't a technical preference. It's the product story. "The harness does not trust AI for security decisions" is the line that makes the cross-vendor LLM review *more* credible, not less.
 
+### 4a. Never edit gate source to bypass a block
+
+**If a gate is blocking you, use the config bypass — do not modify `pre-bash-guard.sh`, `pre-write-guard.sh`, or `scripts/gates.sh` to suppress or remove a rule.** Editing source removes the protection for all future sessions. The supported bypass paths are:
+
+- `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` — skip specific bash-guard rules (comma-separated)
+- `CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1` — skip W-001 write-guard
+- `CLAGENTIC_OSV_SEVERITY=HIGH` — raise osv-scanner threshold
+- `.clagentic/osv-ignore` — per-CVE/GHSA ignore list for osv-scanner
+- `.semgrepignore` or `# nosemgrep:` — semgrep native suppression
+- `.gitleaks.toml` path-scoped allowlist — gitleaks false-positive suppression
+
+Set these in `.clagentic/config` (repo-level) or `~/.config/clagentic/config` (global). Document the reason in the commit or PR body. See `docs/GATES.md` § "Working around gates" for the full table.
+
 ### 5. Cross-vendor is the point
 
 Builder and Reviewer must default to different vendors. The Reviewer role's whole job is to surface what the Builder couldn't see, and a same-vendor reviewer shares the Builder's blind spots. If the user configures both roles to the same vendor, the install script warns; don't suppress the warning.

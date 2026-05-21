@@ -130,42 +130,29 @@ cmd_deps() {
     return 1
   fi
 
-  # Build severity argument: default CRITICAL, but user can override
+  # Build the osv-scanner argument list via positional parameters (POSIX-safe,
+  # no eval, no word-splitting surprises). Severity defaults to CRITICAL so
+  # pre-existing low/medium vulns don't block routine work.
   SEVERITY="${CLAGENTIC_OSV_SEVERITY:-CRITICAL}"
-  OSV_ARGS="--recursive --severity=$SEVERITY ."
+  set -- --recursive "--severity=$SEVERITY"
 
-  # Build ignore-vulns list from global and repo-level ignore files
+  # Append --ignore-vulns=<id> for each entry in the global and repo-level
+  # ignore files. One ID per line; blank lines and # comments are stripped.
   GLOBAL_IGNORE="$HOME/.config/clagentic/osv-ignore"
   REPO_IGNORE="$REPO_ROOT/.clagentic/osv-ignore"
 
-  # Process global ignore file (if it exists)
-  if [ -f "$GLOBAL_IGNORE" ]; then
+  for _IGNORE_FILE in "$GLOBAL_IGNORE" "$REPO_IGNORE"; do
+    [ -f "$_IGNORE_FILE" ] || continue
     while IFS= read -r LINE; do
-      # Skip empty lines and comments
-      case "$LINE" in
-        ''|'#'*) continue ;;
-      esac
-      # Strip trailing whitespace and comments on the same line
+      case "$LINE" in ''|'#'*) continue ;; esac
       ID=$(printf '%s' "$LINE" | sed 's/[[:space:]]*#.*//' | sed 's/[[:space:]]*$//')
-      [ -n "$ID" ] && OSV_ARGS="$OSV_ARGS --ignore-vulns=$ID"
-    done < "$GLOBAL_IGNORE"
-  fi
+      [ -n "$ID" ] && set -- "$@" "--ignore-vulns=$ID"
+    done < "$_IGNORE_FILE"
+  done
 
-  # Process repo-level ignore file (if it exists)
-  if [ -f "$REPO_IGNORE" ]; then
-    while IFS= read -r LINE; do
-      # Skip empty lines and comments
-      case "$LINE" in
-        ''|'#'*) continue ;;
-      esac
-      # Strip trailing whitespace and comments on the same line
-      ID=$(printf '%s' "$LINE" | sed 's/[[:space:]]*#.*//' | sed 's/[[:space:]]*$//')
-      [ -n "$ID" ] && OSV_ARGS="$OSV_ARGS --ignore-vulns=$ID"
-    done < "$REPO_IGNORE"
-  fi
+  set -- "$@" .   # trailing path arg
 
-  # shellcheck disable=SC2086
-  if eval "osv-scanner $OSV_ARGS"; then
+  if osv-scanner "$@"; then
     cmd_log_run deps pass ""
   else
     cmd_log_run deps block "osv-scanner reported vulnerabilities"

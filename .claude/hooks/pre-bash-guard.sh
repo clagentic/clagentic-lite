@@ -128,7 +128,9 @@ case "$CMD" in
         esac
         ;;
     esac
-    [ "$ALLOWED" -eq 0 ] && _rule_allowed R-019 || block R-019 "find -delete needs a literal (non-wildcard) -path constraint"
+    if [ "$ALLOWED" -eq 0 ]; then
+      _rule_allowed R-019 || block R-019 "find -delete needs a literal (non-wildcard) -path constraint"
+    fi
     ;;
   *": > .env"*|*": > "*"/.env"*|*"> .env"*|*"> "*"/.env"*|*"truncate "*".env"*|*": > "*".pem"*|*": > "*".key"*)
                                           _rule_allowed R-020 || block R-020 "truncation of credential file" ;;

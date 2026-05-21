@@ -121,12 +121,17 @@ CLAGENTIC_REPO_HOST=github
 
 # Default branch (assumed protected — writes blocked by pre-write-guard).
 CLAGENTIC_DEFAULT_BRANCH=main
+
 # ---------- security gate bypass controls ----------
-# Comma-separated bash-guard rule IDs to allow (skip blocking). Example: CLAGENTIC_ALLOW_BASH_RULES=R-005,R-011
-# Only use this for rules that conflict with legitimate workflows in your project.
-CLAGENTIC_ALLOW_BASH_RULES=
+# These vars let you work around pre-existing issues without modifying harness
+# source code. Use config, not code edits. See docs/GATES.md for context.
+
+# Comma-separated bash-guard rule IDs to skip (e.g. R-005,R-011).
+# Only use for rules that conflict with legitimate workflows in your project.
+# Unset means no rules are skipped.
+# CLAGENTIC_ALLOW_BASH_RULES=
 
 # Allow writes to the default branch (disables W-001 in pre-write-guard).
-# Only set this if you are intentionally working on the default branch.
-CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=0
+# Only set this if you are intentionally working directly on the default branch.
+# CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1
 
