@@ -117,6 +117,16 @@ role_env() {
 # CLAGENTIC_MODEL_<CLI>_<TIER>. Emits "<cmd>\t<model>" on stdout. Model may
 # be empty if the table has no entry — the CLI is then invoked without a
 # model flag (it uses its own default).
+#
+# Resolution order for the codex CLI:
+#   1. CLAGENTIC_MODEL_CODEX_<TIER> env var (set in ~/.config/clagentic/config)
+#   2. ~/.codex/models.json tiers.<tier>.model  (runtime tier map, never stale)
+#   3. Empty — codex uses its own default
+#
+# The models.json path is the workspace subagent pattern: one file to update
+# when OpenAI renames models, consulted at runtime so enrolled projects do not
+# need to re-run `clagentic init` after a model rename. Env vars always win so
+# users who prefer explicit control can still pin via config.
 resolve_step() {
   STEP="$1"
   # Parse cmd[:tier]. POSIX `cut -d:` on a string with no `:` returns the
@@ -138,6 +148,39 @@ resolve_step() {
   CLI_U=$(printf '%s' "$CLI" | tr '[:lower:]-' '[:upper:]_')
   TIER_U=$(printf '%s' "$TIER" | tr '[:lower:]-' '[:upper:]_')
   MODEL=$(eval "printf '%s' \"\${CLAGENTIC_MODEL_${CLI_U}_${TIER_U}-}\"")
+
+  # For codex: if no env-var model, probe ~/.codex/models.json.
+  # Tier names in models.json mirror clagentic tiers: flagship, mini, spark.
+  # "default" maps to the default_tier entry in models.json.
+  if [ -z "$MODEL" ] && [ "$CLI" = "codex" ]; then
+    _mjson="$HOME/.codex/models.json"
+    if [ -f "$_mjson" ]; then
+      _mj_tier="$TIER"
+      # "default" -> read default_tier from the file, then look up that tier.
+      if [ "$_mj_tier" = "default" ] && command -v python3 >/dev/null 2>&1; then
+        _mj_default=$(python3 -c "
+import json,sys
+try:
+  d=json.load(open('$_mjson'))
+  print(d.get('default_tier','flagship'))
+except: pass
+" 2>/dev/null)
+        [ -n "$_mj_default" ] && _mj_tier="$_mj_default"
+      fi
+      if command -v python3 >/dev/null 2>&1; then
+        MODEL=$(python3 -c "
+import json,sys
+try:
+  d=json.load(open('$_mjson'))
+  print(d.get('tiers',{}).get('$_mj_tier',{}).get('model',''))
+except: pass
+" 2>/dev/null) || MODEL=""
+      elif command -v jq >/dev/null 2>&1; then
+        MODEL=$(jq -r ".tiers[\"$_mj_tier\"].model // empty" "$_mjson" 2>/dev/null) || MODEL=""
+      fi
+    fi
+  fi
+
   printf '%s\t%s' "$CLI" "$MODEL"
 }
 

@@ -187,36 +187,51 @@ If `/infosec-rt` or `/eng-consult` aren't recognized, Claude Code's project-skil
 
 ## Setting up Codex (the default Reviewer)
 
-clagentic-lite defaults to **Claude as Builder, Codex as Reviewer** — that's the point of the cross-CLI pattern. Codex is the OpenAI CLI shipping with ChatGPT Plus / Pro. You need to log in once.
+clagentic-lite defaults to **Claude as Builder, Codex as Reviewer** — that's the point of the cross-CLI pattern. Codex is the OpenAI CLI (`@openai/codex`) backed by a ChatGPT Plus/Pro subscription. No API key needed.
 
 ```sh
 # 1. Install Codex
-#    macOS:   brew install codex
-#    Linux:   see https://github.com/openai/codex#installation
+npm install -g @openai/codex
+# or on macOS: brew install codex
 
-# 2. Authenticate (opens a browser to the OpenAI login flow)
-codex login
+# 2. Authenticate once (device auth — opens browser, no API key)
+codex login --device-auth
 
-# 3. Verify it works
-echo 'print "ok"' | codex exec --skip-git-repo-check 'echo this verbatim'
-
-# 4. Tell clagentic-lite which model tier to call
-#    Edit ~/.config/clagentic/config (init writes this; you only change the values).
-#    Models available on a ChatGPT account (Plus/Pro/Free) — what most users have:
-#    CLAGENTIC_MODEL_CODEX_FLAGSHIP=gpt-5.5
-#    CLAGENTIC_MODEL_CODEX_DEFAULT=gpt-5.5
-#    CLAGENTIC_MODEL_CODEX_CHEAP=gpt-5.5-mini
+# 3. Verify
+echo 'ok' | codex exec --skip-git-repo-check 'repeat back what you read on stdin'
 ```
 
-**Model availability matters.** The `-codex` suffixed model names (`gpt-5-codex`, `gpt-5.5-codex`) are gated to API-key accounts only and will fail with a 400 error on ChatGPT-account logins. clagentic-lite's wrapper surfaces that error in the audit row (`gate=llm-call, outcome=step-failed, details=… — the 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.`) and falls through to the next chain entry. If every step in the chain hits the same wall, you get the degraded envelope with no review — check `scripts/gates.sh digest` to see why.
+### Model configuration
+
+The recommended approach is `~/.codex/models.json` — a runtime tier map that clagentic-lite reads automatically. Update it when OpenAI renames models; no `clagentic init` re-run needed.
+
+```json
+{
+  "tiers": {
+    "flagship": { "model": "gpt-5.5",      "default_effort": "medium", "escalated_effort": "high" },
+    "mini":     { "model": "gpt-5.4-mini", "default_effort": "medium" },
+    "spark":    { "model": "gpt-5.3-codex-spark", "default_effort": "low" }
+  },
+  "default_tier": "flagship",
+  "fallback_policy": "surface_error_no_silent_retry"
+}
+```
+
+Tier names map to clagentic-lite's chain vocabulary: `flagship`, `mini`, `spark`. The `default` tier alias resolves to `default_tier` in the file. If `~/.codex/models.json` is absent, the wrapper falls back to `CLAGENTIC_MODEL_CODEX_*` env vars in `~/.config/clagentic/config` — explicit env vars always win regardless.
+
+**Model availability matters.** The `-codex` suffixed names (`gpt-5-codex`, `gpt-5.5-codex`) are API-key-only and return a 400 error on ChatGPT-account logins. Stick to the base names (`gpt-5.5`, `gpt-5.4-mini`) shown above. When a step fails, the reason appears in the audit row — run `scripts/gates.sh digest` to see it.
 
 The wrapper invokes Codex as:
 
 ```sh
-codex exec --skip-git-repo-check -m "$MODEL" -o "$OUTPUT_FILE" "$PROMPT"
+codex exec --skip-git-repo-check -m "$MODEL" --color never -o "$OUTPUT_FILE" "$PROMPT"
 ```
 
 If Codex returns non-zero or its output fails to parse as the expected JSON (Reviewer / Merge Gate roles), the wrapper falls through to the next entry in the role's chain. The fallback is whatever you put in `CLAGENTIC_REVIEWER_CHAIN` — typically Claude with a comparable tier.
+
+### Why not the official Claude Code Codex plugin
+
+The marketplace plugin (`/codex:rescue`, etc.) gives you hardcoded slash commands with no tier selection, no session continuity, and opaque error handling. The `codex exec` path used here is pure shell, explicit tier, verbatim output, and composable with every other role in the harness.
 
 ### Setting up Claude
 
