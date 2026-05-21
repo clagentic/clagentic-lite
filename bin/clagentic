@@ -11,8 +11,10 @@
 #   update                                git pull + re-prereq + re-stamp shims
 #
 # Design: tool is cloned once (default: ~/.clagentic-lite, override via
-# $CLAGENTIC_HOME). Per-repo enrollment writes only .clagentic/{audit,memory}.db
-# and thin shims in .git/hooks/ that call back to $CLAGENTIC_HOME/scripts/.
+# $CLAGENTIC_HOME). Per-repo enrollment writes .clagentic/{audit,memory}.db,
+# thin shims in .git/hooks/ that call back to $CLAGENTIC_HOME/scripts/, and
+# .claude/settings.json + symlinks to .claude/{commands,agents} so Claude Code
+# picks up hook wiring and slash commands in the enrolled project.
 # The tool repo itself is never the thing under gates by default.
 
 set -e
@@ -621,6 +623,52 @@ _enroll_one() {
   stamp_shim pre-commit "$_hooks_dir" || true
   stamp_shim pre-push   "$_hooks_dir" || true
 
+  # Stamp Claude Code integration (.claude/ inside the enrolled repo).
+  # settings.json: absolute paths so hook scripts resolve back to CLAGENTIC_HOME.
+  # commands/ and agents/: symlinks — pure markdown, no path traversal, stay in
+  # sync automatically when the tool updates.
+  _claude_settings_template="$SHARE_DIR/hook-shims/claude-settings.template"
+  if [ -f "$_claude_settings_template" ]; then
+    _claude_dir="$_canon/.claude"
+    mkdir -p "$_claude_dir" || { warn "cannot create $_claude_dir"; }
+
+    # Generate settings.json with absolute hook paths substituted in.
+    _cs_target="$_claude_dir/settings.json"
+    if [ -f "$_cs_target" ] && ! grep -q 'managed-by: clagentic' "$_cs_target" 2>/dev/null; then
+      if [ "${ENROLL_FORCE:-0}" = "1" ]; then
+        warn "overwriting existing non-clagentic .claude/settings.json (--force)"
+      else
+        warn "existing .claude/settings.json in $_canon is not clagentic-managed — skipping Claude Code wiring (use --force to overwrite)"
+        _claude_dir=""
+      fi
+    fi
+
+    if [ -n "$_claude_dir" ]; then
+      sed "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" "$_claude_settings_template" > "$_cs_target"
+
+      # Symlink commands/ and agents/ — markdown only, no path traversal.
+      ln -sfn "$CLAGENTIC_HOME/.claude/commands" "$_claude_dir/commands"
+      ln -sfn "$CLAGENTIC_HOME/.claude/agents"   "$_claude_dir/agents"
+
+      say "wired Claude Code hooks: $_claude_dir"
+    fi
+  else
+    warn "claude-settings.template missing — skipping Claude Code hook wiring"
+  fi
+
+  # Add .claude/ to the project's .gitignore so the generated wiring is not
+  # accidentally committed to the enrolled repo.
+  _gitignore="$_canon/.gitignore"
+  if [ -f "$_gitignore" ]; then
+    if ! grep -qxF '.claude/' "$_gitignore" 2>/dev/null; then
+      printf '.claude/\n' >> "$_gitignore"
+      say "added .claude/ to $_gitignore"
+    fi
+  else
+    printf '.claude/\n' > "$_gitignore"
+    say "created $_gitignore with .claude/"
+  fi
+
   # Register.
   _reg_dir="$(dirname "$REGISTRY")"
   mkdir -p "$_reg_dir" || true
@@ -674,6 +722,17 @@ cmd_unenroll() {
       fi
     fi
   done
+
+  # Remove clagentic-owned Claude Code integration (.claude/).
+  _cs_file="$_canon/.claude/settings.json"
+  if [ -f "$_cs_file" ] && grep -q 'managed-by: clagentic' "$_cs_file" 2>/dev/null; then
+    rm -f "$_cs_file"
+    # Remove symlinks we own; leave any user-added files.
+    rm -f "$_canon/.claude/commands" "$_canon/.claude/agents"
+    # Remove .claude/ dir only if now empty.
+    rmdir "$_canon/.claude" 2>/dev/null || true
+    say "removed Claude Code wiring: $_canon/.claude"
+  fi
 
   # Deregister.
   if [ -f "$REGISTRY" ]; then

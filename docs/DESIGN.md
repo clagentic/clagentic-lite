@@ -142,7 +142,7 @@ CREATE TABLE gate_runs (
 
 The tool is cloned once to `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). The tool's own repo is never the thing under gates by default — `clagentic enroll --self` is the dogfood escape hatch.
 
-Per-repo footprint is only `.clagentic/{audit.db,memory.db}` and thin shims in `.git/hooks/` that call back to `$CLAGENTIC_HOME/scripts/`. Update the tool once; every enrolled repo picks up the new version automatically.
+Per-repo footprint is `.clagentic/{audit.db,memory.db}`, thin shims in `.git/hooks/` that call back to `$CLAGENTIC_HOME/scripts/`, and a `.claude/` directory containing a generated `settings.json` (with absolute hook paths pointing to `$CLAGENTIC_HOME/.claude/hooks/`) plus symlinks to `$CLAGENTIC_HOME/.claude/{commands,agents}`. The `.claude/` directory is added to the project's `.gitignore` automatically. Update the tool once; every enrolled repo picks up the new version automatically because the hook scripts and the symlinked commands/agents resolve back to `$CLAGENTIC_HOME`.
 
 `bin/clagentic` is the CLI entry point. It dispatches `init` (setup + symlink), `enroll` (hook stamp + DB init + register), `unenroll` (remove clagentic-owned hooks + deregister), `list` (enrolled status table), `doctor` (diagnostics punch list), and `update` (ff-only pull + re-stamp).
 

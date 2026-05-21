@@ -85,7 +85,8 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `share/config.example` | all configurable parameters, no secrets (written to ~/.config/clagentic/config by init) |
 | `share/hook-shims/pre-commit.template` | hook shim template stamped into enrolled repos at enroll time |
 | `share/hook-shims/pre-push.template` | hook shim template stamped into enrolled repos at enroll time |
-| `.claude/settings.json` | hook wiring |
+| `share/hook-shims/claude-settings.template` | settings.json template stamped into enrolled repos — hook paths substituted with absolute `$CLAGENTIC_HOME` paths |
+| `.claude/settings.json` | hook wiring (tool's own repo; enrolled repos get a generated copy in their `.claude/`) |
 | `.claude/agents/{builder,reviewer,auditor,merge-gate}.md` | role contracts (four roles) |
 | `.claude/commands/{review,ship,recall}.md` | user-invokable slash commands |
 | `.claude/skills/{infosec-rt,eng-consult}/SKILL.md` | commentary skills (multi-voice; not gates) |
