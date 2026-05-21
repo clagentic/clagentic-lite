@@ -47,9 +47,32 @@ else:
     sys.stdout.write(os.path.realpath(os.path.join(root, raw)))
 ' "$REPO_ROOT" "$RAW_PATH" 2>/dev/null)
 else
-  # No python3 — keep the raw value. The rule checks below are less robust
-  # without normalization; `clagentic doctor` warns about this case.
-  PATH_TARGET="$RAW_PATH"
+  # python3 not available — use POSIX sh fallback to resolve ../ traversal.
+  # This resolves ../ components but does not resolve symlinks.
+  _posix_realpath() {
+    _pr_path="$1"
+    # Make absolute: join with REPO_ROOT if relative.
+    case "$_pr_path" in
+      /*) ;;
+      *)  _pr_path="$REPO_ROOT/$_pr_path" ;;
+    esac
+    # Walk up from the full path, finding the deepest existing ancestor,
+    # then reconstruct the path from pwd + remaining components.
+    _pr_tail=""
+    while [ -n "$_pr_path" ] && [ "$_pr_path" != "/" ]; do
+      if _pr_dir=$(CDPATH= cd -- "$_pr_path" 2>/dev/null && pwd); then
+        # Found an existing ancestor; return its pwd + tail.
+        printf '%s%s' "$_pr_dir" "$_pr_tail"
+        return 0
+      fi
+      # Parent doesn't exist; accumulate the component and walk up.
+      _pr_tail="/$(basename "$_pr_path")$_pr_tail"
+      _pr_path=$(dirname "$_pr_path")
+    done
+    # Fallback: return the joined absolute path (still better than raw).
+    printf '%s' "$REPO_ROOT/$RAW_PATH"
+  }
+  PATH_TARGET=$(_posix_realpath "$RAW_PATH")
 fi
 
 [ -z "$PATH_TARGET" ] && PATH_TARGET="$RAW_PATH"
