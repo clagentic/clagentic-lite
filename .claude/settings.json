@@ -2,17 +2,17 @@
   "$comment": "clagentic-lite hook wiring. All paths repo-relative. No hostnames, no tokens, no personal identifiers.",
   "hooks": {
     "SessionStart": [
-      { "type": "command", "command": ".claude/hooks/session-start.sh" }
+      { "hooks": [{ "type": "command", "command": ".claude/hooks/session-start.sh" }] }
     ],
     "UserPromptSubmit": [
-      { "type": "command", "command": ".claude/hooks/prompt-inject.sh" }
+      { "hooks": [{ "type": "command", "command": ".claude/hooks/prompt-inject.sh" }] }
     ],
     "PreToolUse": [
-      { "matcher": "Bash", "type": "command", "command": ".claude/hooks/pre-bash-guard.sh" },
-      { "matcher": "Write|Edit", "type": "command", "command": ".claude/hooks/pre-write-guard.sh" }
+      { "matcher": "Bash",       "hooks": [{ "type": "command", "command": ".claude/hooks/pre-bash-guard.sh" }] },
+      { "matcher": "Write|Edit", "hooks": [{ "type": "command", "command": ".claude/hooks/pre-write-guard.sh" }] }
     ],
     "Stop": [
-      { "type": "command", "command": ".claude/hooks/stop-summarize.sh" }
+      { "hooks": [{ "type": "command", "command": ".claude/hooks/stop-summarize.sh" }] }
     ]
   },
   "permissions": {
