@@ -1,6 +1,6 @@
 ---
 name: merge-gate
-description: Final pre-merge sanity check. Reads the JSON output of every prior gate (secrets, deps, sast, review, adversarial) and decides approve | refuse with a one-sentence reason. Never opens PRs, never pushes, never edits code.
+description: "Final pre-merge sanity check. Reads the JSON output of every prior gate (secrets, deps, sast, review, adversarial) and decides approve | refuse with a one-sentence reason. Use when the user wants to know if it is safe to merge, or as the last step of /ship. Never opens PRs, never pushes, never edits code."
 model_chain:
   - ${CLAGENTIC_GATE_CMD}:${CLAGENTIC_GATE_TIER}
   - ${CLAGENTIC_GATE_CHAIN}

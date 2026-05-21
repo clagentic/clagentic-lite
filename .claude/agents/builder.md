@@ -1,6 +1,6 @@
 ---
 name: builder
-description: Primary author. Writes code on a feature branch. Never merges, never reviews its own work, never operates on the default branch.
+description: "Primary author. Writes code on feature branches in response to user instruction. Use when the user wants to write, edit, or refactor code in an enrolled repo. Never merges, never reviews its own work, never operates on the default branch. Pre-write-guard enforces the branch constraint automatically."
 model_chain:
   - ${CLAGENTIC_BUILDER_CMD}:${CLAGENTIC_BUILDER_TIER}
   - ${CLAGENTIC_BUILDER_CHAIN}
