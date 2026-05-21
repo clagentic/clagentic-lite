@@ -86,6 +86,7 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `share/hook-shims/pre-commit.template` | hook shim template stamped into enrolled repos at enroll time |
 | `share/hook-shims/pre-push.template` | hook shim template stamped into enrolled repos at enroll time |
 | `share/hook-shims/claude-settings.template` | settings.json template stamped into enrolled repos — hook paths substituted with absolute `$CLAGENTIC_HOME` paths |
+| `share/hook-shims/CLAUDE.md.template` | CLAUDE.md template stamped into enrolled repo root — activates Builder contract and documents hooks/commands for Claude Code |
 | `.claude/settings.json` | hook wiring (tool's own repo; enrolled repos get a generated copy in their `.claude/`) |
 | `.claude/agents/{builder,reviewer,auditor,merge-gate}.md` | role contracts (four roles) |
 | `.claude/commands/{review,ship,recall}.md` | user-invokable slash commands |

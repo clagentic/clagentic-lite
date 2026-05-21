@@ -656,6 +656,34 @@ _enroll_one() {
     warn "claude-settings.template missing — skipping Claude Code hook wiring"
   fi
 
+  # Stamp CLAUDE.md in the enrolled repo root so Claude Code knows it's
+  # operating under the Builder contract. Uses stamp-time substitution for
+  # CLAGENTIC_HOME (absolute) and CLAGENTIC_DEFAULT_BRANCH (from env, default main).
+  # CLAUDE.md is NOT gitignored — it's a legitimate project file the user may
+  # extend. Protected the same way as settings.json: skip unless managed-by
+  # marker is present or --force is set.
+  _claude_md_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
+  _claude_md_target="$_canon/CLAUDE.md"
+  _default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+  if [ -f "$_claude_md_template" ]; then
+    if [ -f "$_claude_md_target" ] && ! grep -q 'managed-by: clagentic' "$_claude_md_target" 2>/dev/null; then
+      if [ "${ENROLL_FORCE:-0}" = "1" ]; then
+        warn "overwriting existing non-clagentic CLAUDE.md (--force)"
+      else
+        warn "existing CLAUDE.md in $_canon is not clagentic-managed — skipping (use --force to overwrite)"
+        _claude_md_template=""
+      fi
+    fi
+    if [ -n "$_claude_md_template" ]; then
+      sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
+          -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_default_branch|g" \
+          "$_claude_md_template" > "$_claude_md_target"
+      say "stamped CLAUDE.md: $_claude_md_target"
+    fi
+  else
+    warn "CLAUDE.md.template missing — skipping Builder contract stamp"
+  fi
+
   # Add .claude/ to the project's .gitignore so the generated wiring is not
   # accidentally committed to the enrolled repo.
   _gitignore="$_canon/.gitignore"
@@ -732,6 +760,13 @@ cmd_unenroll() {
     # Remove .claude/ dir only if now empty.
     rmdir "$_canon/.claude" 2>/dev/null || true
     say "removed Claude Code wiring: $_canon/.claude"
+  fi
+
+  # Remove clagentic-managed CLAUDE.md.
+  _cm_file="$_canon/CLAUDE.md"
+  if [ -f "$_cm_file" ] && grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
+    rm -f "$_cm_file"
+    say "removed CLAUDE.md: $_cm_file"
   fi
 
   # Deregister.
