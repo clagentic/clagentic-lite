@@ -964,6 +964,11 @@ cmd_doctor() {
   else
     _fail "JSON validator missing (need jq or python3)"
   fi
+  if command -v python3 >/dev/null 2>&1; then
+    _ok "python3 found (W-002 path normalization: full)"
+  else
+    printf "  WARN python3 not found — W-002 uses POSIX fallback normalization (symlink targets not resolved)\n"
+  fi
 
   # 5. Security tool status (advisory — missing is a warn, not a fail).
   # Tool names come from CLAGENTIC_SECURITY_TOOLS (top of file), same source

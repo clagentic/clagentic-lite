@@ -20,9 +20,20 @@ PAYLOAD=$(cat 2>/dev/null || true)
 TRANSCRIPT=$(printf '%s' "$PAYLOAD" | ds_json_field transcript_path)
 SESSION_ID=$(printf '%s' "$PAYLOAD" | ds_json_field session_id)
 
+# Lockfile for debounce: only the last Stop in a burst should summarize.
+LOCK="$REPO_ROOT/.clagentic/stop-summarize.lock"
+
 # Fire and forget: detach so Claude Code's Stop event returns immediately.
 (
+  MY_PID=$$
+  printf '%s\n' "$MY_PID" > "$LOCK" 2>/dev/null || true
+
   sleep "$DEBOUNCE"
+
+  # Debounce check: if a newer Stop fired and wrote a different PID, exit.
+  CURRENT_PID=$(cat "$LOCK" 2>/dev/null || echo "")
+  [ "$CURRENT_PID" = "$MY_PID" ] || exit 0
+
   [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ] || exit 0
 
   # Slice the last assistant turn from the JSONL transcript. python3 is
@@ -83,6 +94,9 @@ PY
 
   # Log to audit trail. ds_audit_log escapes both details and session_id.
   ds_audit_log summarize pass "stop-summarize: session=$SESSION_ID" "$SESSION_ID"
+
+  # Clean up lock file (best-effort).
+  rm -f "$LOCK" 2>/dev/null || true
 ) >/dev/null 2>&1 &
 
 exit 0
