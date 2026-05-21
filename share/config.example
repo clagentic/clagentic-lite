@@ -80,6 +80,11 @@ CLAGENTIC_GATES=secrets,deps,sast,review,adversarial,merge-gate
 # Values: low | medium | high | critical
 CLAGENTIC_BLOCK_SEVERITY=high
 
+# osv-scanner severity threshold. Only vulnerabilities at this level or above block the gate.
+# Options: CRITICAL, HIGH, MEDIUM, LOW (osv-scanner native values). Default: CRITICAL.
+# Set to LOW to restore the original block-on-any-finding behavior.
+CLAGENTIC_OSV_SEVERITY=CRITICAL
+
 # Stop-hook debounce: only summarize after N seconds of quiet.
 CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC=20
 
@@ -116,3 +121,12 @@ CLAGENTIC_REPO_HOST=github
 
 # Default branch (assumed protected — writes blocked by pre-write-guard).
 CLAGENTIC_DEFAULT_BRANCH=main
+# ---------- security gate bypass controls ----------
+# Comma-separated bash-guard rule IDs to allow (skip blocking). Example: CLAGENTIC_ALLOW_BASH_RULES=R-005,R-011
+# Only use this for rules that conflict with legitimate workflows in your project.
+CLAGENTIC_ALLOW_BASH_RULES=
+
+# Allow writes to the default branch (disables W-001 in pre-write-guard).
+# Only set this if you are intentionally working on the default branch.
+CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=0
+

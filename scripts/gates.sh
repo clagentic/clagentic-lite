@@ -129,7 +129,43 @@ cmd_deps() {
     cmd_log_run deps block "osv-scanner not installed (fail-closed)"
     return 1
   fi
-  if osv-scanner --recursive .; then
+
+  # Build severity argument: default CRITICAL, but user can override
+  SEVERITY="${CLAGENTIC_OSV_SEVERITY:-CRITICAL}"
+  OSV_ARGS="--recursive --severity=$SEVERITY ."
+
+  # Build ignore-vulns list from global and repo-level ignore files
+  GLOBAL_IGNORE="$HOME/.config/clagentic/osv-ignore"
+  REPO_IGNORE="$REPO_ROOT/.clagentic/osv-ignore"
+
+  # Process global ignore file (if it exists)
+  if [ -f "$GLOBAL_IGNORE" ]; then
+    while IFS= read -r LINE; do
+      # Skip empty lines and comments
+      case "$LINE" in
+        ''|'#'*) continue ;;
+      esac
+      # Strip trailing whitespace and comments on the same line
+      ID=$(printf '%s' "$LINE" | sed 's/[[:space:]]*#.*//' | sed 's/[[:space:]]*$//')
+      [ -n "$ID" ] && OSV_ARGS="$OSV_ARGS --ignore-vulns=$ID"
+    done < "$GLOBAL_IGNORE"
+  fi
+
+  # Process repo-level ignore file (if it exists)
+  if [ -f "$REPO_IGNORE" ]; then
+    while IFS= read -r LINE; do
+      # Skip empty lines and comments
+      case "$LINE" in
+        ''|'#'*) continue ;;
+      esac
+      # Strip trailing whitespace and comments on the same line
+      ID=$(printf '%s' "$LINE" | sed 's/[[:space:]]*#.*//' | sed 's/[[:space:]]*$//')
+      [ -n "$ID" ] && OSV_ARGS="$OSV_ARGS --ignore-vulns=$ID"
+    done < "$REPO_IGNORE"
+  fi
+
+  # shellcheck disable=SC2086
+  if eval "osv-scanner $OSV_ARGS"; then
     cmd_log_run deps pass ""
   else
     cmd_log_run deps block "osv-scanner reported vulnerabilities"
@@ -148,6 +184,7 @@ cmd_sast() {
     cmd_log_run sast block "semgrep not installed (fail-closed)"
     return 1
   fi
+  # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
   if semgrep --config=auto --error --severity=ERROR; then
     cmd_log_run sast pass ""
   else

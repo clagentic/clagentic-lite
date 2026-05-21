@@ -12,6 +12,14 @@ HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR=.
 . "$HOOK_DIR/../../scripts/platform.sh"
 ds_load_env
 
+# _rule_allowed <rule_id> — returns 0 if the rule is in CLAGENTIC_ALLOW_BASH_RULES, 1 otherwise
+_rule_allowed() {
+  case ",${CLAGENTIC_ALLOW_BASH_RULES}," in
+    *",${1},"*) return 0 ;;
+  esac
+  return 1
+}
+
 DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
 
 # Read tool input from stdin (Claude Code JSON) and extract the command field
@@ -48,13 +56,13 @@ block() {
 }
 
 case "$CMD" in
-  *"rm -rf /"*|*"rm -rf /*"*)            block R-001 "rm -rf root" ;;
-  *"rm -rf \$HOME"*|*"rm -rf ~"*)        block R-002 "rm -rf HOME" ;;
+  *"rm -rf /"*|*"rm -rf /*"*)            _rule_allowed R-001 || block R-001 "rm -rf root" ;;
+  *"rm -rf \$HOME"*|*"rm -rf ~"*)        _rule_allowed R-002 || block R-002 "rm -rf HOME" ;;
   *"curl"*"| sh"*|*"curl"*"| bash"*|*"wget"*"| sh"*|*"wget"*"| bash"*)
-                                          block R-003 "pipe-to-shell antipattern" ;;
-  *"chmod -R 777"*)                       block R-004 "overpermissive chmod" ;;
-  *"git reset --hard"*)                   block R-005 "destructive reset" ;;
-  *"git checkout ."*|*"git restore ."*)   block R-006 "destructive checkout" ;;
+                                          _rule_allowed R-003 || block R-003 "pipe-to-shell antipattern" ;;
+  *"chmod -R 777"*)                       _rule_allowed R-004 || block R-004 "overpermissive chmod" ;;
+  *"git reset --hard"*)                   _rule_allowed R-005 || block R-005 "destructive reset" ;;
+  *"git checkout ."*|*"git restore ."*)   _rule_allowed R-006 || block R-006 "destructive checkout" ;;
   *"git push"*)
     # R-007: block force-push to the default branch. We check for `git push`
     # + ANY force flag anywhere in the command (not just immediately after
@@ -64,44 +72,44 @@ case "$CMD" in
       *"--force"*|*" -f "*|*" -f"|*"-f "*)
         CURRENT_BR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
         case "$CMD" in
-          *"$DEFAULT_BRANCH"*) block R-007 "force-push to default branch (named)" ;;
+          *"$DEFAULT_BRANCH"*) _rule_allowed R-007 || block R-007 "force-push to default branch (named)" ;;
           *)
             if [ "$CURRENT_BR" = "$DEFAULT_BRANCH" ]; then
-              block R-007 "force-push from default branch '$CURRENT_BR' (implicit HEAD)"
+              _rule_allowed R-007 || block R-007 "force-push from default branch '$CURRENT_BR' (implicit HEAD)"
             fi
             ;;
         esac
         ;;
     esac
     ;;
-  *"git clean -fdx"*|*"git clean -fxd"*)  block R-008 "destructive clean" ;;
-  *"--no-verify"*)                        block R-009 "bypass of git hooks" ;;
+  *"git clean -fdx"*|*"git clean -fxd"*)  _rule_allowed R-008 || block R-008 "destructive clean" ;;
+  *"--no-verify"*)                        _rule_allowed R-009 || block R-009 "bypass of git hooks" ;;
   *"npm publish"*|*"pip upload"*|*"twine upload"*|*"cargo publish"*)
-                                          block R-010 "unguarded registry publish" ;;
+                                          _rule_allowed R-010 || block R-010 "unguarded registry publish" ;;
   # R-011 sudo: match `sudo ` at start, ` sudo ` mid, or `; sudo`/`&& sudo` chains.
   # Won't match `pseudo`/`sudoers-edit` etc. because of the space requirement.
   "sudo "*|*"; sudo "*|*"&& sudo "*|*"| sudo "*|*" sudo "*)
-                                          block R-011 "elevation outside harness" ;;
+                                          _rule_allowed R-011 || block R-011 "elevation outside harness" ;;
   *'eval $('*|*'eval "$'*|*"eval '\$("*|*'eval \"$('*)
-                                          block R-012 "indirect execution via eval" ;;
+                                          _rule_allowed R-012 || block R-012 "indirect execution via eval" ;;
   *"aws s3 rm"*"--recursive"*|*"aws s3 rm"*" -r "*)
-                                          block R-013 "recursive s3 delete" ;;
+                                          _rule_allowed R-013 || block R-013 "recursive s3 delete" ;;
   *"terraform destroy"*)
     # Allow if --target=<resource> is present (scoped destroy is legitimate).
     case "$CMD" in
       *"--target="*) : ;;
-      *) block R-014 "unguarded terraform destroy" ;;
+      *) _rule_allowed R-014 || block R-014 "unguarded terraform destroy" ;;
     esac
     ;;
   *"docker system prune -a"*|*"docker system prune --all"*)
-                                          block R-015 "docker prune -a" ;;
-  *"git config --global"*)                block R-016 "mutation of global git config" ;;
+                                          _rule_allowed R-015 || block R-015 "docker prune -a" ;;
+  *"git config --global"*)                _rule_allowed R-016 || block R-016 "mutation of global git config" ;;
   # R-017 chsh / passwd: require word-boundary (start, end, or surrounded by
   # whitespace / shell separators) so we don't catch `mypasswd-rotate.sh` etc.
   "chsh "*|"chsh"|"passwd "*|"passwd"|*" chsh "*|*" chsh"|*" passwd "*|*" passwd"|*"; chsh"*|*"; passwd"*|*"&& chsh"*|*"&& passwd"*)
-                                          block R-017 "account modification" ;;
+                                          _rule_allowed R-017 || block R-017 "account modification" ;;
   *"dd "*"of=/dev/sd"*|*"dd "*"of=/dev/nvme"*|*"dd "*"of=/dev/hd"*|*"> /dev/sd"*|*"> /dev/nvme"*|*"> /dev/hd"*)
-                                          block R-018 "disk-level write" ;;
+                                          _rule_allowed R-018 || block R-018 "disk-level write" ;;
   *"find "*" -delete"*)
     # R-019: find ... -delete must have a non-wildcard -path constraint.
     # `find / -path '*' -delete` would otherwise bypass — `-path` is present
@@ -120,10 +128,10 @@ case "$CMD" in
         esac
         ;;
     esac
-    [ "$ALLOWED" -eq 0 ] && block R-019 "find -delete needs a literal (non-wildcard) -path constraint"
+    [ "$ALLOWED" -eq 0 ] && _rule_allowed R-019 || block R-019 "find -delete needs a literal (non-wildcard) -path constraint"
     ;;
   *": > .env"*|*": > "*"/.env"*|*"> .env"*|*"> "*"/.env"*|*"truncate "*".env"*|*": > "*".pem"*|*": > "*".key"*)
-                                          block R-020 "truncation of credential file" ;;
+                                          _rule_allowed R-020 || block R-020 "truncation of credential file" ;;
 esac
 
 exit 0
