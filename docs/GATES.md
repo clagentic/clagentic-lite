@@ -90,10 +90,10 @@ Three independent sub-gates run as standard git hooks:
 
 | | |
 |---|---|
-| **Tool** | `osv-scanner --recursive --severity=<CLAGENTIC_OSV_SEVERITY> .` |
+| **Tool** | `osv-scanner scan --recursive --config=<tmpfile> .` (v1.9+) or `osv-scanner --recursive --severity=<S> .` (v1.8 and earlier). Version probed by subcommand availability, not version string. |
 | **Blocks?** | Yes, on vulnerabilities at or above the configured severity. Default is `CRITICAL`. |
-| **Severity** | Set `CLAGENTIC_OSV_SEVERITY` in `~/.config/clagentic/config` or `.clagentic/config`. Values: `CRITICAL` (default), `HIGH`, `MEDIUM`, `LOW`. Set `LOW` to restore block-on-any-finding behavior. |
-| **Ignore list** | Add CVE/GHSA IDs one-per-line to `~/.config/clagentic/osv-ignore` (global) or `.clagentic/osv-ignore` (repo). Lines starting with `#` and blank lines are ignored. IDs are passed as `--ignore-vulns=<id>` to osv-scanner. |
+| **Severity** | Set `CLAGENTIC_OSV_SEVERITY` in `~/.config/clagentic/config` or `.clagentic/config`. Values: `CRITICAL` (default), `HIGH`, `MEDIUM`, `LOW`. Set `LOW` to restore block-on-any-finding behavior. For v1.9+, this becomes `MinimumSeverity` in a generated temp config passed via `--config`. |
+| **Ignore list** | Add CVE/GHSA IDs one-per-line to `~/.config/clagentic/osv-ignore` (global) or `.clagentic/osv-ignore` (repo). Lines starting with `#` and blank lines are ignored. For v1.9+, these become `[[IgnoredVulns]]` blocks in the generated temp config; for v1.8 and earlier, they are passed as `--ignore-vulns=<id>`. |
 | **Missing tool** | Set `CLAGENTIC_ALLOW_MISSING_OSV=1` to skip if osv-scanner is not installed. |
 
 ### 4c. SAST (pre-push)

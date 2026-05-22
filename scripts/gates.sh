@@ -130,33 +130,64 @@ cmd_deps() {
     return 1
   fi
 
-  # Build the osv-scanner argument list via positional parameters (POSIX-safe,
-  # no eval, no word-splitting surprises). Severity defaults to CRITICAL so
-  # pre-existing low/medium vulns don't block routine work.
   SEVERITY="${CLAGENTIC_OSV_SEVERITY:-CRITICAL}"
-  set -- --recursive "--severity=$SEVERITY"
-
-  # Append --ignore-vulns=<id> for each entry in the global and repo-level
-  # ignore files. One ID per line; blank lines and # comments are stripped.
   GLOBAL_IGNORE="$HOME/.config/clagentic/osv-ignore"
   REPO_IGNORE="$REPO_ROOT/.clagentic/osv-ignore"
 
-  for _IGNORE_FILE in "$GLOBAL_IGNORE" "$REPO_IGNORE"; do
-    [ -f "$_IGNORE_FILE" ] || continue
-    while IFS= read -r LINE; do
-      case "$LINE" in ''|'#'*) continue ;; esac
-      ID=$(printf '%s' "$LINE" | sed 's/[[:space:]]*#.*//' | sed 's/[[:space:]]*$//')
-      [ -n "$ID" ] && set -- "$@" "--ignore-vulns=$ID"
-    done < "$_IGNORE_FILE"
-  done
+  # Capability-probe: osv-scanner v1.9+ uses `osv-scanner scan` subcommand and
+  # removed --severity / --ignore-vulns CLI flags. v1.8 and earlier use the
+  # flat invocation with those flags. We probe by subcommand availability, not
+  # version string (same pattern as the gitleaks probe above).
+  if osv-scanner scan --help >/dev/null 2>&1; then
+    # v1.9+ path: severity and ignores are config-file-only.
+    # Write a temp toml incorporating CLAGENTIC_OSV_SEVERITY and both ignore
+    # files, then pass it via --config. The temp file is removed on exit.
+    _OSV_TMP=$(mktemp /tmp/clagentic-osv-XXXXXX.toml)
+    trap 'rm -f "$_OSV_TMP"' EXIT
 
-  set -- "$@" .   # trailing path arg
+    # MinimumSeverity: osv-scanner toml key (PascalCase).
+    printf 'MinimumSeverity = "%s"\n' "$SEVERITY" > "$_OSV_TMP"
 
-  if osv-scanner "$@"; then
-    cmd_log_run deps pass ""
+    # IgnoredVulns: one [[IgnoredVulns]] block per ID from ignore files.
+    # One ID per line; blank lines and # comments are stripped.
+    for _IGNORE_FILE in "$GLOBAL_IGNORE" "$REPO_IGNORE"; do
+      [ -f "$_IGNORE_FILE" ] || continue
+      while IFS= read -r LINE; do
+        case "$LINE" in ''|'#'*) continue ;; esac
+        ID=$(printf '%s' "$LINE" | sed 's/[[:space:]]*#.*//' | sed 's/[[:space:]]*$//')
+        [ -n "$ID" ] || continue
+        printf '\n[[IgnoredVulns]]\nid = "%s"\nreason = "clagentic osv-ignore"\n' "$ID" >> "$_OSV_TMP"
+      done < "$_IGNORE_FILE"
+    done
+
+    if osv-scanner scan --recursive "--config=$_OSV_TMP" .; then
+      cmd_log_run deps pass ""
+    else
+      cmd_log_run deps block "osv-scanner reported vulnerabilities"
+      return 1
+    fi
   else
-    cmd_log_run deps block "osv-scanner reported vulnerabilities"
-    return 1
+    # v1.8 and earlier: build argument list via positional parameters
+    # (POSIX-safe, no eval, no word-splitting surprises).
+    set -- --recursive "--severity=$SEVERITY"
+
+    for _IGNORE_FILE in "$GLOBAL_IGNORE" "$REPO_IGNORE"; do
+      [ -f "$_IGNORE_FILE" ] || continue
+      while IFS= read -r LINE; do
+        case "$LINE" in ''|'#'*) continue ;; esac
+        ID=$(printf '%s' "$LINE" | sed 's/[[:space:]]*#.*//' | sed 's/[[:space:]]*$//')
+        [ -n "$ID" ] && set -- "$@" "--ignore-vulns=$ID"
+      done < "$_IGNORE_FILE"
+    done
+
+    set -- "$@" .   # trailing path arg
+
+    if osv-scanner "$@"; then
+      cmd_log_run deps pass ""
+    else
+      cmd_log_run deps block "osv-scanner reported vulnerabilities"
+      return 1
+    fi
   fi
 }
 
