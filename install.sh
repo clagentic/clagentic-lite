@@ -17,12 +17,12 @@ The new install flow is a one-time clone plus a per-project enroll:
     else
       git clone https://github.com/clagentic/clagentic-lite.git "$HOME_DIR"
     fi
-    "$HOME_DIR/bin/clagentic" init
+    "$HOME_DIR/bin/clagentic-lite" init
 
     # Per-project (run from each repo you want gated):
-    cd /path/to/your/project && clagentic enroll
+    cd /path/to/your/project && clagentic-lite enroll
 
-Steady-state upgrades: clagentic update
+Steady-state upgrades: clagentic-lite update
 
 See README.md for the full quickstart.
 EOF

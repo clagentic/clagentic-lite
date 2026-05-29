@@ -17,7 +17,7 @@
 # REQUIRES gitleaks >= 8.25 — both `[[allowlists]]` (array-of-tables) and
 # `condition = "AND"` were introduced in 8.25. Older versions silently
 # misread the allowlist (default OR semantics) and would let real secrets
-# in README.md / docs/DEMO-SCRIPT.md slip past. `clagentic doctor` warns
+# in README.md / docs/DEMO-SCRIPT.md slip past. `clagentic-lite doctor` warns
 # if your gitleaks is older.
 
 [extend]

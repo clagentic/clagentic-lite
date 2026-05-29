@@ -1,6 +1,6 @@
 # CLAUDE.md
 <!-- managed-by: clagentic · clagentic-claude-md-version: v2 -->
-<!-- Re-generate: `clagentic enroll --force <this-folder>` -->
+<!-- Re-generate: `clagentic-lite enroll --force <this-folder>` -->
 
 This folder is a clagentic-lite **wrapper** — it contains enrolled git projects but is not a git repo itself.
 

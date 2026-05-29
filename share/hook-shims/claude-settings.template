@@ -1,5 +1,5 @@
 {
-  "$comment": "clagentic-lite Claude Code hook wiring · clagentic-settings-version: v2 · managed-by: clagentic. Do not edit by hand — re-run `clagentic enroll --force` or `clagentic update` to regenerate.",
+  "$comment": "clagentic-lite Claude Code hook wiring · clagentic-settings-version: v2 · managed-by: clagentic. Do not edit by hand — re-run `clagentic-lite enroll --force` or `clagentic-lite update` to regenerate.",
   "hooks": {
     "SessionStart": [
       { "hooks": [{ "type": "command", "command": "__CLAGENTIC_HOME__/.claude/hooks/session-start.sh" }] }

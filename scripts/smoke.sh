@@ -177,8 +177,8 @@ if command -v python3 >/dev/null 2>&1; then
     git -C "$SMOKE_TMPDIR" config user.name "smoke"
 
     # Enroll with CLAGENTIC_HOME pointing at our tool checkout.
-    if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic" enroll "$SMOKE_TMPDIR" >/tmp/clagentic-smoke-enroll.log 2>&1; then
-      ok "clagentic enroll succeeded on a fresh repo"
+    if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" enroll "$SMOKE_TMPDIR" >/tmp/clagentic-smoke-enroll.log 2>&1; then
+      ok "clagentic-lite enroll succeeded on a fresh repo"
 
       # Verify DBs were created in the enrolled repo, NOT in $TOOL_HOME.
       if [ -f "$SMOKE_TMPDIR/.clagentic/audit.db" ]; then
@@ -230,15 +230,15 @@ if command -v python3 >/dev/null 2>&1; then
       fi
 
       # Re-enroll without --force should refuse.
-      if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic" enroll "$SMOKE_TMPDIR" >/dev/null 2>&1; then
+      if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" enroll "$SMOKE_TMPDIR" >/dev/null 2>&1; then
         bad "second enroll without --force should have been refused"
       else
         ok "second enroll without --force correctly refused"
       fi
 
       # Unenroll: hooks removed, .clagentic/ left intact.
-      if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic" unenroll "$SMOKE_TMPDIR" >/tmp/clagentic-smoke-unenroll.log 2>&1; then
-        ok "clagentic unenroll succeeded"
+      if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" unenroll "$SMOKE_TMPDIR" >/tmp/clagentic-smoke-unenroll.log 2>&1; then
+        ok "clagentic-lite unenroll succeeded"
         if [ ! -f "$_hdir/pre-commit" ] && [ ! -f "$_hdir/pre-push" ]; then
           ok "clagentic-owned hooks removed by unenroll"
         else
@@ -250,11 +250,11 @@ if command -v python3 >/dev/null 2>&1; then
           bad ".clagentic/ removed without --purge"
         fi
       else
-        bad "clagentic unenroll failed; see /tmp/clagentic-smoke-unenroll.log"
+        bad "clagentic-lite unenroll failed; see /tmp/clagentic-smoke-unenroll.log"
       fi
 
     else
-      bad "clagentic enroll failed; see /tmp/clagentic-smoke-enroll.log"
+      bad "clagentic-lite enroll failed; see /tmp/clagentic-smoke-enroll.log"
     fi
 
     # Cleanup.
@@ -266,7 +266,7 @@ fi
 
 # Refuse to enroll $CLAGENTIC_HOME without --self.
 step "8b. enroll refuses to self-enroll without --self"
-if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic" enroll "$TOOL_HOME" >/dev/null 2>&1; then
+if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" enroll "$TOOL_HOME" >/dev/null 2>&1; then
   bad "enroll allowed $TOOL_HOME without --self (snake's-head check failed)"
 else
   ok "enroll refused to enroll \$CLAGENTIC_HOME without --self (AC4)"

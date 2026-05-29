@@ -1,5 +1,5 @@
 # clagentic-lite — global config template.
-# Written to ~/.config/clagentic/config by `clagentic init`.
+# Written to ~/.config/clagentic/config by `clagentic-lite init`.
 # Per-repo .clagentic/config is OPTIONAL and SPARSE — only override keys.
 # Load order at gate-run time: global config → per-repo .clagentic/config → env vars.
 #
@@ -12,7 +12,7 @@
 # vice versa) — every fallback step is something you wrote down on purpose.
 
 # ---------- tool home ----------
-# Set automatically by `clagentic init`. Edit only if you move the install.
+# Set automatically by `clagentic-lite init`. Edit only if you move the install.
 CLAGENTIC_HOME=
 
 # ---------- model tier table ----------
@@ -49,7 +49,7 @@ CLAGENTIC_BUILDER_TIER=default
 CLAGENTIC_BUILDER_CHAIN=codex:default,claude:flagship
 
 # Reviewer = cross-vendor reviewer. A different CLI from Builder is recommended;
-# `clagentic init` warns when they match.
+# `clagentic-lite init` warns when they match.
 CLAGENTIC_REVIEWER_CMD=codex
 CLAGENTIC_REVIEWER_TIER=default
 CLAGENTIC_REVIEWER_CHAIN=claude:default,codex:flagship
@@ -111,7 +111,7 @@ CLAGENTIC_ALLOW_MISSING_GITLEAKS=0
 CLAGENTIC_ALLOW_MISSING_OSV=0
 CLAGENTIC_ALLOW_MISSING_SEMGREP=0
 
-# Strict preflight: make `clagentic init` exit non-zero if any required
+# Strict preflight: make `clagentic-lite init` exit non-zero if any required
 # tool is missing. Off by default so scripted init runs don't fail spuriously.
 CLAGENTIC_STRICT_PREFLIGHT=0
 

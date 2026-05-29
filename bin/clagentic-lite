@@ -32,7 +32,7 @@ if [ ! -f "$SCRIPTS_DIR/platform.sh" ]; then
   SCRIPTS_DIR="$(dirname "$_SELF_DIR")/scripts"
 fi
 if [ ! -f "$SCRIPTS_DIR/platform.sh" ]; then
-  printf 'clagentic: cannot find scripts/platform.sh in %s\n' "$CLAGENTIC_HOME" >&2
+  printf 'clagentic-lite: cannot find scripts/platform.sh in %s\n' "$CLAGENTIC_HOME" >&2
   printf 'Set CLAGENTIC_HOME to the clagentic-lite checkout directory.\n' >&2
   exit 1
 fi
@@ -42,14 +42,14 @@ SHARE_DIR="$CLAGENTIC_HOME/share"
 REGISTRY="$HOME/.local/state/clagentic/registry"
 GLOBAL_CONFIG="$HOME/.config/clagentic/config"
 LOCAL_BIN="$HOME/.local/bin"
-CLI_SYMLINK="$LOCAL_BIN/clagentic"
+CLI_SYMLINK="$LOCAL_BIN/clagentic-lite"
 
 # Shim template version marker. Bump this string when the template content
-# changes so `clagentic update` knows to re-stamp enrolled repos.
+# changes so `clagentic-lite update` knows to re-stamp enrolled repos.
 SHIM_VERSION="v1"
 
 # Claude Code artifact version markers. Bump when the corresponding template
-# changes so `clagentic update` re-stamps enrolled repos automatically.
+# changes so `clagentic-lite update` re-stamps enrolled repos automatically.
 CLAUDE_SETTINGS_VERSION="v2"
 CLAUDE_MD_VERSION="v2"
 
@@ -59,9 +59,9 @@ CLAUDE_MD_VERSION="v2"
 # Space-separated POSIX-sh string (no arrays).
 CLAGENTIC_SECURITY_TOOLS="gitleaks semgrep osv-scanner"
 
-say()  { printf '[clagentic] %s\n' "$*"; }
-warn() { printf '[clagentic] WARN: %s\n' "$*" 1>&2; }
-die()  { printf '[clagentic] ERROR: %s\n' "$*" 1>&2; exit 1; }
+say()  { printf '[clagentic-lite] %s\n' "$*"; }
+warn() { printf '[clagentic-lite] WARN: %s\n' "$*" 1>&2; }
+die()  { printf '[clagentic-lite] ERROR: %s\n' "$*" 1>&2; exit 1; }
 
 # ---------------------------------------------------------------- helpers
 
@@ -235,7 +235,7 @@ _semgrep_hint_linux() {
   set -- /usr/lib/python3*/EXTERNALLY-MANAGED /usr/lib/python3/EXTERNALLY-MANAGED
   for _f in "$@"; do
     if [ -e "$_f" ]; then
-      printf '%s' "apt install pipx  # then re-run \`clagentic init\` (PEP 668 — system python refuses pip --user)"
+      printf '%s' "apt install pipx  # then re-run \`clagentic-lite init\` (PEP 668 — system python refuses pip --user)"
       return
     fi
   done
@@ -273,7 +273,7 @@ _run_prereq_checks() {
   # (catches "added to list but forgot to add hints" drift).
   for _stool in $CLAGENTIC_SECURITY_TOOLS; do
     _sthints=$(_security_tool_hints "$_stool") || \
-      die "internal: no install hint for security tool '$_stool' (update _security_tool_hints in bin/clagentic)"
+      die "internal: no install hint for security tool '$_stool' (update _security_tool_hints in bin/clagentic-lite)"
     _stl="${_sthints%%|*}"
     _std="${_sthints##*|}"
     ds_offer_install "$_stool" "$_stl" "$_std" || true
@@ -295,7 +295,7 @@ _run_prereq_checks() {
         say "$DS_CHECK_MISSING required tool(s) still missing post-update — fix them before next gate run"
         ;;
       *)
-        say "$DS_CHECK_MISSING required tool(s) still missing — fix them and re-run \`clagentic init\`"
+        say "$DS_CHECK_MISSING required tool(s) still missing — fix them and re-run \`clagentic-lite init\`"
         ;;
     esac
     if [ "${CLAGENTIC_STRICT_PREFLIGHT:-0}" = "1" ]; then
@@ -321,7 +321,7 @@ cmd_init() {
   fi
 
   # 1.5. Freshness check. If CLAGENTIC_HOME is a git checkout and the local
-  # branch is behind its upstream, nudge the user to run `clagentic update`
+  # branch is behind its upstream, nudge the user to run `clagentic-lite update`
   # before continuing — otherwise init runs against stale code (the silent
   # footgun that bit early users when PRs #3/#4/#5 landed and they kept
   # re-running init without pulling).
@@ -336,7 +336,7 @@ cmd_init() {
     if [ -n "$_BRANCH" ] && [ -n "$_UPSTREAM" ]; then
       _BEHIND=$(git -C "$CLAGENTIC_HOME" rev-list --count "HEAD..$_UPSTREAM" 2>/dev/null || echo 0)
       if [ "$_BEHIND" -gt 0 ] 2>/dev/null; then
-        warn "$CLAGENTIC_HOME is $_BEHIND commit(s) behind $_UPSTREAM — run \`clagentic update\` to pick up the latest fixes before re-running init"
+        warn "$CLAGENTIC_HOME is $_BEHIND commit(s) behind $_UPSTREAM — run \`clagentic-lite update\` to pick up the latest fixes before re-running init"
       fi
     fi
   fi
@@ -360,14 +360,14 @@ cmd_init() {
   # 4. Ensure ~/.local/bin/ exists.
   _ensure_local_bin
 
-  # 5. Symlink ~/.local/bin/clagentic → $CLAGENTIC_HOME/bin/clagentic.
+  # 5. Symlink ~/.local/bin/clagentic-lite -> $CLAGENTIC_HOME/bin/clagentic-lite.
   _install_symlink
 
   say "init complete"
   if [ -f "$GLOBAL_CONFIG" ] && [ "$RECONFIGURE" -eq 0 ]; then
     say "(no config changes — re-ran prereq + symlink only)"
   fi
-  say "next: cd into any repo you want gates on, then run \`clagentic enroll\`"
+  say "next: cd into any repo you want gates on, then run \`clagentic-lite enroll\`"
 }
 
 _write_global_config() {
@@ -490,16 +490,16 @@ _ensure_local_bin() {
 }
 
 _install_symlink() {
-  _CLI_TARGET="$CLAGENTIC_HOME/bin/clagentic"
+  _CLI_TARGET="$CLAGENTIC_HOME/bin/clagentic-lite"
   if [ ! -f "$_CLI_TARGET" ]; then
-    warn "bin/clagentic not found at $_CLI_TARGET — cannot create symlink"
+    warn "bin/clagentic-lite not found at $_CLI_TARGET — cannot create symlink"
     return 1
   fi
   chmod +x "$_CLI_TARGET"
 
   if [ -e "$CLI_SYMLINK" ] && [ ! -L "$CLI_SYMLINK" ]; then
     warn "$CLI_SYMLINK exists and is a regular file, not a symlink — refusing to overwrite"
-    warn "Remove it manually then re-run \`clagentic init\`"
+    warn "Remove it manually then re-run \`clagentic-lite init\`"
     return 1
   fi
   # Remove existing symlink (may point to old path) and recreate.
@@ -925,7 +925,7 @@ cmd_doctor() {
   _ok()   { printf '  OK   %s\n' "$*"; _ok=$((_ok+1)); }
   _fail() { printf '  FAIL %s\n' "$*" 1>&2; _fail=$((_fail+1)); }
 
-  printf '\n== clagentic doctor ==\n\n'
+  printf '\n== clagentic-lite doctor ==\n\n'
 
   # 1. CLAGENTIC_HOME exists and is a valid checkout.
   if [ -f "$CLAGENTIC_HOME/scripts/gates.sh" ]; then
@@ -937,15 +937,15 @@ cmd_doctor() {
   # 2. Symlink correct.
   if [ -L "$CLI_SYMLINK" ]; then
     _sym_target=$(readlink "$CLI_SYMLINK" 2>/dev/null || true)
-    if [ "$_sym_target" = "$CLAGENTIC_HOME/bin/clagentic" ]; then
-      _ok "$CLI_SYMLINK -> $CLAGENTIC_HOME/bin/clagentic"
+    if [ "$_sym_target" = "$CLAGENTIC_HOME/bin/clagentic-lite" ]; then
+      _ok "$CLI_SYMLINK -> $CLAGENTIC_HOME/bin/clagentic-lite"
     else
-      _fail "$CLI_SYMLINK points to $_sym_target (expected $CLAGENTIC_HOME/bin/clagentic)"
+      _fail "$CLI_SYMLINK points to $_sym_target (expected $CLAGENTIC_HOME/bin/clagentic-lite)"
     fi
   elif [ -e "$CLI_SYMLINK" ]; then
     _fail "$CLI_SYMLINK exists but is not a symlink"
   else
-    _fail "$CLI_SYMLINK missing — run \`clagentic init\`"
+    _fail "$CLI_SYMLINK missing — run \`clagentic-lite init\`"
   fi
 
   # 3. LOCAL_BIN on PATH.
@@ -1013,7 +1013,7 @@ cmd_doctor() {
         elif ! grep -q 'managed-by: clagentic' "$_hf" 2>/dev/null; then
           _fail "$_rpath: .git/hooks/$_hook not clagentic-managed"
         elif ! grep -q "$CLAGENTIC_HOME" "$_hf" 2>/dev/null; then
-          _fail "$_rpath: .git/hooks/$_hook points to different CLAGENTIC_HOME (run \`clagentic update\`)"
+          _fail "$_rpath: .git/hooks/$_hook points to different CLAGENTIC_HOME (run \`clagentic-lite update\`)"
         else
           _ok "$_rpath: .git/hooks/$_hook OK"
         fi
@@ -1069,7 +1069,7 @@ cmd_update() {
   fi
 
   # Re-run the same prereq sweep that init runs — pre-PR-#6 this only
-  # checked sqlite3 + git, so a clagentic update on a host that had since
+  # checked sqlite3 + git, so a clagentic-lite update on a host that had since
   # uninstalled e.g. semgrep would silently leave the gate broken.
   say "checking prerequisites post-update..."
   _run_prereq_checks update
@@ -1147,13 +1147,13 @@ case "${1:-}" in
   doctor)   cmd_doctor ;;
   update)   cmd_update ;;
   "")
-    printf 'usage: clagentic <subcommand> [args]\n'
+    printf 'usage: clagentic-lite <subcommand> [args]\n'
     printf 'subcommands: init, enroll, unenroll, list, doctor, update\n'
     exit 1
     ;;
   *)
-    printf 'clagentic: unknown subcommand: %s\n' "$1" 1>&2
-    printf 'usage: clagentic <subcommand> [args]\n'
+    printf 'clagentic-lite: unknown subcommand: %s\n' "$1" 1>&2
+    printf 'usage: clagentic-lite <subcommand> [args]\n'
     printf 'subcommands: init, enroll, unenroll, list, doctor, update\n'
     exit 1
     ;;
