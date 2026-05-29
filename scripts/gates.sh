@@ -29,7 +29,7 @@ TOOL_HOME="$(dirname "$SCRIPTS_DIR")"
 
 # Project root resolution: CLAGENTIC_PROJECT_ROOT env var wins, then git
 # show-toplevel of cwd. The env var is the override path used when gates.sh
-# is called from a hook shim installed by `clagentic enroll` — the shim
+# is called from a hook shim installed by `clagentic-lite enroll` — the shim
 # stamps __CLAGENTIC_HOME__ at enroll time but does NOT override the project
 # root; instead, git show-toplevel of the repo under commit is used because
 # the hook always runs from inside the enrolled repo's working tree.

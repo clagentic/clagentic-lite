@@ -18,7 +18,7 @@ The non-goals list in `docs/DESIGN.md` is binding. Do not add: a server, a daemo
 
 All shell code is **POSIX sh**. No bash-4 features (associative arrays, `${var^^}`, `mapfile`, `[[ =~ ]]` capture groups). All `sed`/`date`/`stat`/`find` invocations go through `scripts/platform.sh` shims. See `docs/PORTABILITY.md` for the GNU/BSD differences table.
 
-If you add a new shell tool dependency, add a detection block to `bin/clagentic doctor` (via `ds_check_tool` in `scripts/platform.sh`) and document it in `docs/PORTABILITY.md`.
+If you add a new shell tool dependency, add a detection block to `bin/clagentic-lite doctor` (via `ds_check_tool` in `scripts/platform.sh`) and document it in `docs/PORTABILITY.md`.
 
 ### 3. Parameterization is non-negotiable
 
@@ -67,10 +67,10 @@ Commit messages, PR descriptions, code comments, log lines — no emojis, no exc
 
 ```sh
 # First-time setup (run from the clagentic-lite checkout):
-bin/clagentic init                 # prereq detection, global config, symlink
+bin/clagentic-lite init            # prereq detection, global config, symlink
 
 # Per-project enrollment (run from inside the project you want gated):
-clagentic enroll                   # init DBs, stamp hooks, register
+clagentic-lite enroll              # init DBs, stamp hooks, register
 
 # Ongoing use:
 scripts/gates.sh review            # run cross-model review on staged diff
@@ -79,8 +79,8 @@ scripts/gates.sh digest            # summarize today's audit-db rows
 scripts/memory.sh recall <kw>      # search session summaries
 sqlite3 .clagentic/audit.db        # inspect the audit trail directly
 sqlite3 .clagentic/memory.db       # inspect session memory directly
-clagentic doctor                   # verify all prereqs and enrolled-repo hook health
-clagentic list                     # show enrolled repos with last-gate-run and status
+clagentic-lite doctor              # verify all prereqs and enrolled-repo hook health
+clagentic-lite list                # show enrolled repos with last-gate-run and status
 ```
 
 There is intentionally no CI. The gates run on the user's machine via git hooks (pre-commit, pre-push) and Claude Code lifecycle hooks. Re-running the same gates in a hosted CI surface would contradict the no-server contract — and the gates exist to block bad changes locally, not to gate PRs against the upstream repo.
@@ -94,7 +94,7 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `AGENTS.md` (this file) | canonical agent instructions, cross-tool |
 | `CLAUDE.md` | thin pointer to `AGENTS.md` for Claude Code compatibility |
 | `README.md` | product narrative + 5-minute demo |
-| `bin/clagentic` | CLI entry point: init, enroll, unenroll, list, doctor, update |
+| `bin/clagentic-lite` | CLI entry point: init, enroll, unenroll, list, doctor, update |
 | `share/config.example` | all configurable parameters, no secrets (written to ~/.config/clagentic/config by init) |
 | `share/hook-shims/pre-commit.template` | hook shim template stamped into enrolled repos at enroll time |
 | `share/hook-shims/pre-push.template` | hook shim template stamped into enrolled repos at enroll time |

@@ -125,7 +125,7 @@ role_env() {
 #
 # The models.json path is the workspace subagent pattern: one file to update
 # when OpenAI renames models, consulted at runtime so enrolled projects do not
-# need to re-run `clagentic init` after a model rename. Env vars always win so
+# need to re-run `clagentic-lite init` after a model rename. Env vars always win so
 # users who prefer explicit control can still pin via config.
 resolve_step() {
   STEP="$1"

@@ -4,6 +4,8 @@ Claude Code does not yet natively support the `AGENTS.md` cross-tool convention.
 
 **The canonical instructions live in [`AGENTS.md`](./AGENTS.md). Read that file in full.** This pointer is the only thing that lives here.
 
+The CLI binary was renamed from `bin/clagentic` to `bin/clagentic-lite` per the CLI Naming Standard (clagentic-brand/docs/CLI-NAMING-STANDARD.md, task lr-34da). The on-PATH command is now `clagentic-lite`. The `CLAGENTIC_HOME` env var is unchanged (env var renaming is tracked separately in lr-634d).
+
 When this repo is opened by Claude Code, you should:
 
 1. Read `AGENTS.md` completely.

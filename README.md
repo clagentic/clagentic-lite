@@ -59,7 +59,7 @@ Tier names (`flagship`, `default`, `cheap`) resolve to concrete model strings vi
 
 ## Install
 
-Clone once, enroll per project. The snippet below is safe to re-run — on a fresh machine it clones, on a machine that already has clagentic-lite it pulls and re-runs `init` (which is also what `clagentic update` does):
+Clone once, enroll per project. The snippet below is safe to re-run — on a fresh machine it clones, on a machine that already has clagentic-lite it pulls and re-runs `init` (which is also what `clagentic-lite update` does):
 
 ```sh
 # First install OR re-run after pulling new commits.
@@ -69,13 +69,13 @@ if [ -d "$HOME_DIR/.git" ]; then
 else
   git clone https://github.com/clagentic/clagentic-lite.git "$HOME_DIR"
 fi
-"$HOME_DIR/bin/clagentic" init
+"$HOME_DIR/bin/clagentic-lite" init
 
 # Per-project (run from each repo you want gated, or pass the path):
-cd /path/to/your/project && clagentic enroll
+cd /path/to/your/project && clagentic-lite enroll
 ```
 
-After the first install, the steady-state upgrade is just `clagentic update` — it does the `git pull --ff-only`, re-checks prereqs, and re-stamps hook shims, `.claude/settings.json`, and `CLAUDE.md` in every enrolled repo when their template versions change.
+After the first install, the steady-state upgrade is just `clagentic-lite update` — it does the `git pull --ff-only`, re-checks prereqs, and re-stamps hook shims, `.claude/settings.json`, and `CLAUDE.md` in every enrolled repo when their template versions change.
 
 If `init` warns that `~/.local/bin` is not on `$PATH`, add this to your shell rc and reopen your shell:
 
@@ -83,7 +83,7 @@ If `init` warns that `~/.local/bin` is not on `$PATH`, add this to your shell rc
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic update` — pulls `--ff-only`, re-checks prereqs, re-stamps all versioned artifacts in enrolled repos when their template versions change.
+There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic-lite update` — pulls `--ff-only`, re-checks prereqs, re-stamps all versioned artifacts in enrolled repos when their template versions change.
 
 The tool is cloned once to `~/.clagentic-lite` (or `$CLAGENTIC_HOME` if set). Your projects never contain a copy of the scripts or agent files — they hold only `.clagentic/{audit.db,memory.db}`, thin hook shims, and a `CLAUDE.md` that call back to `$CLAGENTIC_HOME`. Update the tool once and every enrolled repo picks it up.
 
@@ -91,7 +91,7 @@ The tool is cloned once to `~/.clagentic-lite` (or `$CLAGENTIC_HOME` if set). Yo
 
 clagentic-lite is small in *code* (~1,500 lines of POSIX shell + agent/skill markdown) but it leans on real tools to do real work. The security gates are deterministic local scanners — gitleaks, semgrep, osv-scanner — not LLM judgment. If you don't have them, you don't have the gates. The harness ships with explicit opt-ins to skip each one (see "Minimal install" below) so you can run a stripped-down version while you decide which gates you want.
 
-`clagentic init` detects missing tools and offers to run the install command for you. If you decline, it prints the exact command and exits non-zero.
+`clagentic-lite init` detects missing tools and offers to run the install command for you. If you decline, it prints the exact command and exits non-zero.
 
 Required:
 
@@ -119,7 +119,7 @@ Nice-to-have:
 
 ### Minimal install (just the harness, no security gates)
 
-Want to try the role/review/memory layer without installing gitleaks/semgrep/osv-scanner? Set the three `ALLOW_MISSING` opt-ins to `1` in `~/.config/clagentic/config` after `clagentic init`:
+Want to try the role/review/memory layer without installing gitleaks/semgrep/osv-scanner? Set the three `ALLOW_MISSING` opt-ins to `1` in `~/.config/clagentic/config` after `clagentic-lite init`:
 
 ```sh
 CLAGENTIC_ALLOW_MISSING_GITLEAKS=1
@@ -129,9 +129,9 @@ CLAGENTIC_ALLOW_MISSING_OSV=1
 
 That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memory, and the audit trail — but no deterministic secret/dep/sast scanning. Add the tools when you want the gates. The audit DB will record `skip` rows so you have a paper trail of which gates ran and which didn't.
 
-### What `clagentic init` and `clagentic enroll` do
+### What `clagentic-lite init` and `clagentic-lite enroll` do
 
-**`clagentic init`** (run once, in $CLAGENTIC_HOME or anywhere after the symlink is on PATH):
+**`clagentic-lite init`** (run once, in $CLAGENTIC_HOME or anywhere after the symlink is on PATH):
 
 1. Verifies `$CLAGENTIC_HOME` is a valid clagentic-lite checkout.
 2. Detects WSL vs macOS, picks portable tool variants (`scripts/platform.sh`).
@@ -139,9 +139,9 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 4. Two-question front door: accept all defaults (Y/n) + vendor mode ([1] Claude only / [2] Claude+Codex). On Y+mode-2: writes global config and done. On n: up to 6 granular prompts.
 5. Writes `~/.config/clagentic/config` (chmod 600).
 6. Ensures `~/.local/bin/` exists; warns with the exact shell-profile line if not on `$PATH`.
-7. Symlinks `~/.local/bin/clagentic` to `$CLAGENTIC_HOME/bin/clagentic`.
+7. Symlinks `~/.local/bin/clagentic-lite` to `$CLAGENTIC_HOME/bin/clagentic-lite`.
 
-**`clagentic enroll [PATH]`** (run inside each project you want gates on, default `$PWD`):
+**`clagentic-lite enroll [PATH]`** (run inside each project you want gates on, default `$PWD`):
 
 1. Verifies the path is a git repo.
 2. Refuses if the path is `$CLAGENTIC_HOME` (use `--self` for dogfood).
@@ -156,7 +156,7 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 
 **Solo / private repo**: `CLAUDE.md` is generated and ready to use. If you'd rather not commit it, add it to `.gitignore` yourself — clagentic won't do that automatically because the file is safe to commit.
 
-**Shared repo**: `CLAUDE.md` is committable as-is. It contains no machine-specific paths — only a reference to `$CLAGENTIC_DEFAULT_BRANCH` (substituted at stamp time) and links to the public clagentic-lite repo. Teammates without clagentic installed will see a normal project CLAUDE.md. Teammates with clagentic installed will get full agent auto-dispatch. If you extend it with project-specific rules, `clagentic enroll --force` will refuse to overwrite until you remove the `managed-by: clagentic` marker.
+**Shared repo**: `CLAUDE.md` is committable as-is. It contains no machine-specific paths — only a reference to `$CLAGENTIC_DEFAULT_BRANCH` (substituted at stamp time) and links to the public clagentic-lite repo. Teammates without clagentic-lite installed will see a normal project CLAUDE.md. Teammates with clagentic-lite installed will get full agent auto-dispatch. If you extend it with project-specific rules, `clagentic-lite enroll --force` will refuse to overwrite until you remove the `managed-by: clagentic` marker.
 
 ### Verify the install
 
@@ -169,7 +169,7 @@ scripts/smoke.sh --quick   # non-interactive end-to-end without LLM calls
 scripts/gates.sh digest    # show what gates ran today (run from an enrolled repo)
 scripts/gates.sh status    # last 10 runs per gate, color-coded (status N for other N)
 scripts/gates.sh tail      # follow audit.db live; new gate rows render as they land (Ctrl-C to quit)
-clagentic doctor           # diagnostics: symlink, prereqs, every enrolled repo's hook status
+clagentic-lite doctor      # diagnostics: symlink, prereqs, every enrolled repo's hook status
 ```
 
 Smoke covers: DB init, seed + recall, gitleaks blocks a planted token, `llm-client.sh review` emits parseable JSON, audit-DB has fresh rows. If smoke passes, the harness is wired correctly.
@@ -211,7 +211,7 @@ echo 'ok' | codex exec --skip-git-repo-check 'repeat back what you read on stdin
 
 ### Model configuration
 
-The recommended approach is `~/.codex/models.json` — a runtime tier map that clagentic-lite reads automatically. Update it when OpenAI renames models; no `clagentic init` re-run needed.
+The recommended approach is `~/.codex/models.json` — a runtime tier map that clagentic-lite reads automatically. Update it when OpenAI renames models; no `clagentic-lite init` re-run needed.
 
 ```json
 {
@@ -249,7 +249,7 @@ If you only use Claude Code, set every role's `CMD` to `claude` and put nothing 
 cat "$INPUT" | claude --print --model "$MODEL" --append-system-prompt "$PROMPT"
 ```
 
-A same-CLI configuration is allowed — `clagentic init` warns that you've lost the cross-CLI signal but does not refuse.
+A same-CLI configuration is allowed — `clagentic-lite init` warns that you've lost the cross-CLI signal but does not refuse.
 
 ### Adding a third CLI
 
@@ -269,7 +269,7 @@ The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). Your enrolled
 
 ```
 ~/.clagentic-lite/                              the tool — never gated by default
-├── bin/clagentic                               CLI entry point
+├── bin/clagentic-lite                          CLI entry point
 ├── AGENTS.md                                   canonical agent instructions, cross-tool
 ├── CLAUDE.md                                   pointer to AGENTS.md
 ├── README.md                                   this file
@@ -301,7 +301,7 @@ The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). Your enrolled
 
 ~/.config/clagentic/config                      global config (chmod 600; written by init)
 ~/.local/state/clagentic/registry               enrolled repos — one absolute path per line
-~/.local/bin/clagentic                          symlink to $CLAGENTIC_HOME/bin/clagentic
+~/.local/bin/clagentic-lite                     symlink to $CLAGENTIC_HOME/bin/clagentic-lite
 
 <any enrolled repo>/
 ├── .clagentic/

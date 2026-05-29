@@ -43,7 +43,7 @@ fi
 export DS_WSL
 
 # Repo root: try git first, then walk up looking for a .clagentic-project
-# pointer written by `clagentic enroll` when the user enrolled a nested repo
+# pointer written by `clagentic-lite enroll` when the user enrolled a nested repo
 # from a wrapper directory.
 ds_repo_root() {
   _drr=$(git rev-parse --show-toplevel 2>/dev/null || true)
@@ -67,7 +67,7 @@ ds_repo_root() {
 
 # Load configuration into the current shell. Load order (each layer can
 # override the previous):
-#   1. ~/.config/clagentic/config   — global defaults (written by `clagentic init`)
+#   1. ~/.config/clagentic/config   — global defaults (written by `clagentic-lite init`)
 #   2. <project-root>/.clagentic/config — per-repo sparse overrides (optional)
 #   3. Legacy: <project-root>/.env  — backward compat; honored if present
 #
@@ -117,7 +117,7 @@ ds_load_env() {
 #   $DS_TIMEOUT_CMD "$LLM_TIMEOUT" some-cli ...
 # When neither tool is present, DS_TIMEOUT_CMD is set to an empty wrapper
 # that runs the command without a timeout — degraded but doesn't fail-open
-# in a confusing way (`clagentic doctor` warns when timeout is missing).
+# in a confusing way (`clagentic-lite doctor` warns when timeout is missing).
 if command -v timeout >/dev/null 2>&1; then
   DS_TIMEOUT_CMD="timeout"
 elif command -v gtimeout >/dev/null 2>&1; then
@@ -322,7 +322,7 @@ $_PR_ENTRY"
 # to also exit non-zero (init prefers to warn-and-continue).
 ds_pending_summary() {
   [ -z "${DS_PENDING_INSTALLS:-}" ] && return 0
-  printf '\n--- still to install (run these manually, then re-run \`clagentic init\`) ---\n'
+  printf '\n--- still to install (run these manually, then re-run \`clagentic-lite init\`) ---\n'
   # POSIX-safe iteration over newline-separated entries: substitute IFS for
   # the loop, avoid bashisms.
   _OLD_IFS="${IFS-}"
