@@ -318,6 +318,25 @@ else
   bad "row cap not enforced: $_row_count rows in DB (cap was $_cap)"
 fi
 
+# ------------------------------------------------- 12. integer-guard: garbage MAX_ROWS
+
+step "12. garbage CLAGENTIC_MEMORY_MAX_ROWS falls back to default (no crash, no injection)"
+# Pass a non-integer value that would be a SQL injection attempt if unguarded.
+# The guard (Peaches lr-61b1) must cause a safe fallback: the command exits 0
+# and the DB is not corrupted.
+_before_count=$(sqlite3 "$REPO_ROOT/.clagentic/memory.db" "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
+if CLAGENTIC_MEMORY_MAX_ROWS='1; DROP TABLE turns; --' CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
+    "$TOOL_HOME/scripts/memory.sh" log-turn "guard test row" "guard" "smoke" >/dev/null 2>&1; then
+  _after_count=$(sqlite3 "$REPO_ROOT/.clagentic/memory.db" "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
+  if [ "${_after_count:-0}" -ge "${_before_count:-0}" ]; then
+    ok "garbage MAX_ROWS fell back cleanly; turns table intact ($_after_count rows)"
+  else
+    bad "turns table disappeared after garbage MAX_ROWS injection attempt"
+  fi
+else
+  bad "memory.sh log-turn crashed on garbage CLAGENTIC_MEMORY_MAX_ROWS"
+fi
+
 # -------------------------------------------------------------------- summary
 
 printf '\n[smoke] passed: %s   failed: %s\n' "$PASS" "$FAIL"

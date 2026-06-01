@@ -58,7 +58,11 @@ cmd_log_turn() {
   # After each INSERT, oldest rows beyond the cap are silently pruned.
   # No scheduler, no daemon — one DELETE per write path. Silent housekeeping.
   MAX_ROWS="${CLAGENTIC_MEMORY_MAX_ROWS:-5000}"
-  # Every interpolated value goes through ds_sql_escape. Including the branch —
+  # Integer guard: reject non-integer values (empty, float, or injection attempt)
+  # and fall back to the documented default. ds_sql_escape does not protect an
+  # unquoted numeric SQL position; the integer check makes the slot unconditionally safe.
+  case "$MAX_ROWS" in ''|*[!0-9]*) MAX_ROWS=5000 ;; esac
+  # String slots go through ds_sql_escape. Including the branch —
   # a value like `feat/o'hare` would otherwise break the INSERT.
   SUMMARY_ESC=$(ds_sql_escape "$SUMMARY")
   TAGS_ESC=$(ds_sql_escape "$TAGS")
@@ -73,9 +77,15 @@ cmd_recall() {
   cmd_init
   # CLAGENTIC_RECALL_LIMIT: max rows returned (default 5).
   RECALL_LIMIT="${CLAGENTIC_RECALL_LIMIT:-5}"
+  # Integer guard: reject non-integer values and fall back to the documented default.
+  # ds_sql_escape does not protect an unquoted numeric SQL LIMIT position.
+  case "$RECALL_LIMIT" in ''|*[!0-9]*) RECALL_LIMIT=5 ;; esac
   # CLAGENTIC_RECALL_MAX_CHARS: hard cap on total injected text (default 1500).
   # Whole rows are dropped from the tail; the last retained row is never split.
   RECALL_MAX_CHARS="${CLAGENTIC_RECALL_MAX_CHARS:-1500}"
+  # Integer guard: reject non-integer values and fall back to the documented default.
+  # Used in shell arithmetic; a non-integer here would cause a syntax error or worse.
+  case "$RECALL_MAX_CHARS" in ''|*[!0-9]*) RECALL_MAX_CHARS=1500 ;; esac
   KW="$*"
   if [ -z "$KW" ]; then
     RAW=$(sqlite3 -separator ' | ' "$DB" "SELECT ts, substr(summary,1,120) FROM turns ORDER BY ts DESC LIMIT $RECALL_LIMIT;")
