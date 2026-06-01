@@ -1049,6 +1049,71 @@ cmd_doctor() {
   fi
   [ "$_wrapper_found" -eq 0 ] && printf '  (no wrapper .clagentic-project files found)\n'
 
+  # 8. LLM CLI auth probes.
+  # Checks that each configured primary CLI is present AND can make a real
+  # call. A CLI on PATH that fails auth silently degrades to the chain
+  # fallback — this surfaces that before it matters in a gate run.
+  # The probe uses a minimal prompt ("ping") with a short timeout so doctor
+  # doesn't stall on a slow network. Results are WARN (not FAIL) because a
+  # missing or unconfigured CLI causes degraded output, not a hard crash.
+  printf '\nLLM CLI auth probes:\n'
+  _llm_probe_timeout=10
+  # Collect the unique set of primary CLIs across all roles.
+  _probed_clis=""
+  for _role_pfx in BUILDER REVIEWER AUDITOR GATE SUMMARIZER; do
+    _pcmd=$(eval "printf '%s' \"\${CLAGENTIC_${_role_pfx}_CMD:-}\"")
+    [ -z "$_pcmd" ] && continue
+    # Skip duplicates.
+    case " $_probed_clis " in
+      *" $_pcmd "*) continue ;;
+    esac
+    _probed_clis="$_probed_clis $_pcmd"
+
+    if ! command -v "$_pcmd" >/dev/null 2>&1; then
+      printf '  WARN %s: not on PATH (roles: %s)\n' "$_pcmd" "$_role_pfx"
+      continue
+    fi
+
+    # CLI is present — probe auth with a minimal call.
+    _probe_out=$(mktemp -t clagentic-doctor-probe.XXXXXX)
+    _probe_err=$(mktemp -t clagentic-doctor-probe-err.XXXXXX)
+    _probe_ok=0
+    case "$_pcmd" in
+      claude)
+        # claude --print "ping" — succeeds on any auth path (OAuth or API key).
+        # CLAGENTIC_DISABLE_RECALL=1 avoids triggering session-start hooks.
+        CLAGENTIC_DISABLE_RECALL=1 \
+          $DS_TIMEOUT_CMD "$_llm_probe_timeout" claude --print "ping" \
+          > "$_probe_out" 2> "$_probe_err" && _probe_ok=1 || true
+        ;;
+      codex)
+        # codex exec with a one-token prompt. --skip-git-repo-check avoids
+        # failures when doctor runs outside an enrolled repo.
+        $DS_TIMEOUT_CMD "$_llm_probe_timeout" codex exec --skip-git-repo-check \
+          --color never "ping" \
+          > "$_probe_out" 2> "$_probe_err" && _probe_ok=1 || true
+        ;;
+      *)
+        # Generic: try `-p ping`.
+        $DS_TIMEOUT_CMD "$_llm_probe_timeout" "$_pcmd" -p "ping" \
+          > "$_probe_out" 2> "$_probe_err" && _probe_ok=1 || true
+        ;;
+    esac
+
+    if [ "$_probe_ok" = "1" ] && [ -s "$_probe_out" ]; then
+      _ok "$_pcmd: auth probe passed"
+    else
+      # Strip ANSI from error output before showing it.
+      _probe_hint=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$_probe_err" 2>/dev/null \
+        | grep -v '^[[:space:]]*$' | head -1 | cut -c1-120) || \
+        _probe_hint=$(head -1 "$_probe_err" 2>/dev/null | cut -c1-120)
+      [ -z "$_probe_hint" ] && _probe_hint="no output (auth expired or model unavailable?)"
+      printf '  WARN %s: auth probe failed — %s\n' "$_pcmd" "$_probe_hint"
+    fi
+    rm -f "$_probe_out" "$_probe_err"
+  done
+  [ -z "$_probed_clis" ] && printf '  (no LLM CLIs configured — set CLAGENTIC_*_CMD in config)\n'
+
   printf '\n== doctor summary: %s OK, %s FAIL ==\n\n' "$_ok" "$_fail"
   [ "$_fail" -eq 0 ]
 }
