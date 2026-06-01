@@ -1,32 +1,43 @@
 # CLAUDE.md
-<!-- managed-by: clagentic · clagentic-claude-md-version: v2 -->
+<!-- managed-by: clagentic · clagentic-claude-md-version: v3 -->
 <!-- Re-generate: `clagentic-lite enroll --force` or `clagentic-lite update` -->
 
 This project is enrolled in [clagentic-lite](https://github.com/clagentic/clagentic-lite) — a local coding harness with cross-vendor review, security gates, and session memory.
 
-## Agents (auto-dispatched by Claude Code)
+## How to work in this repo
 
-| Agent | Activates when you ask to… |
+**These are binding rules for every session, not suggestions.**
+
+1. **Delegate code work to the Builder.** When the user asks you to write, edit, or refactor code, use the `builder` subagent — do not author code directly in the main session. The Builder enforces branch constraints and the full role contract automatically.
+
+2. **Run `/review` after staging changes, before `/ship`.** The Reviewer is a different vendor than the Builder. Cross-vendor review is the load-bearing pattern — skipping it defeats the purpose of the harness. After any `git add`, prompt the user to run `/review` or run it yourself.
+
+3. **Never write to `__CLAGENTIC_DEFAULT_BRANCH__`.** The pre-write-guard blocks it, but do not attempt it. Create a feature branch first.
+
+4. **Never merge pull requests directly.** Use `/ship` — it runs all gates, then opens the PR.
+
+5. **Never bypass security gates.** If `gitleaks`, `semgrep`, or `osv-scanner` block, fix the underlying issue. Do not add suppressions without a written justification in the commit message.
+
+6. **Check `/recall` before answering questions about prior decisions.** Session memory is indexed — search it before guessing.
+
+## Agents
+
+These subagents are available in this session. Claude Code dispatches them automatically based on task fit; you can also invoke them explicitly.
+
+| Agent | When to use |
 |---|---|
-| `builder` | Write, edit, or refactor code |
-| `reviewer` | Review staged changes or get a second opinion on code |
-| `auditor` | Check for secrets, vulnerabilities, or dependency issues |
-| `merge-gate` | Decide whether a change is safe to merge |
+| `builder` | Write, edit, or refactor code — the primary author role |
+| `reviewer` | Review staged changes; get a second opinion; cross-vendor check |
+| `auditor` | Security narration on top of gitleaks/semgrep/osv findings |
+| `merge-gate` | Final approve/refuse decision before opening a PR |
 
 ## Slash commands
 
 | Command | What it does |
 |---|---|
-| `/review` | Cross-vendor review of the staged diff |
+| `/review` | Cross-vendor review of the staged diff (routes through gate orchestrator) |
 | `/ship` | Run all gates in sequence; open a PR if green |
 | `/recall` | Search session memory for prior decisions |
-
-## Builder rules (enforced in this session)
-
-- Work on feature branches. Do not write to `__CLAGENTIC_DEFAULT_BRANCH__` — the pre-write-guard blocks it automatically.
-- Do not merge pull requests — use `/ship` instead.
-- Do not review your own work — use `/review` (different vendor, different blind spots).
-- Do not bypass security gates (`gitleaks`, `semgrep`, `osv-scanner`) — fix the underlying issue.
 
 ## Hooks active
 
@@ -36,6 +47,7 @@ Lifecycle hooks fire automatically via `.claude/settings.json`:
 - **UserPromptSubmit** — keyword recall from session memory
 - **PreToolUse(Bash)** — blocks dangerous shell patterns
 - **PreToolUse(Write|Edit)** — blocks writes to the default branch
+- **PostToolUse(Bash)** — nudges `/review` after `git commit` or `git add`
 - **Stop** — summarizes the turn into `.clagentic/memory.db`
 
 ## Audit trail

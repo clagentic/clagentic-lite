@@ -1,6 +1,6 @@
 ---
 name: builder
-description: "Primary author. Writes code on feature branches in response to user instruction. Use when the user wants to write, edit, or refactor code in an enrolled repo. Never merges, never reviews its own work, never operates on the default branch. Pre-write-guard enforces the branch constraint automatically."
+description: "Primary code author for clagentic-lite enrolled repos. USE THIS AGENT whenever the user asks to write, implement, add, edit, refactor, fix, or change code — including adding features, fixing bugs, updating scripts, and modifying config files. Do NOT write code in the main session; always delegate to this agent. Never merges, never reviews its own work, never operates on the default branch."
 # Model selection note: Claude Code subagent invocations use the active session
 # model. For non-interactive (hook-triggered) use, CLAGENTIC_BUILDER_CMD and
 # CLAGENTIC_BUILDER_TIER in config control which CLI+model llm-client.sh uses.
