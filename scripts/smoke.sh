@@ -282,6 +282,60 @@ else
   bad "audit.db gate_runs has no recent rows"
 fi
 
+# ---------------------------------- 10. pin-first: manual row surfaces before older auto row
+
+step "10. pin-first recall: source=manual row surfaces before newer auto rows (lr-17a8)"
+# Insert a newer auto row and an older manual row.  The manual row is older by ts,
+# so pure recency ordering would surface the auto row first.  Pin-first must override
+# recency and put the manual row first.
+_pin_db="$REPO_ROOT/.clagentic/memory.db"
+sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-smoke%';" 2>/dev/null || true
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-01-02T00:00:00Z', 'smoke', 'lr17a8-smoke auto row newer', 'smoke', 'stop-hook');"
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-01-01T00:00:00Z', 'smoke', 'lr17a8-smoke manual row pinned older', 'smoke', 'manual');"
+_pin_recall=$(CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" "$TOOL_HOME/scripts/memory.sh" recall lr17a8-smoke 2>&1)
+_pin_first=$(printf '%s\n' "$_pin_recall" | grep 'lr17a8-smoke' | head -1)
+if printf '%s' "$_pin_first" | grep -q '\[pin\]'; then
+  ok "pin-first: manual row appeared first in recall output"
+else
+  bad "pin-first: manual row did NOT appear first; first line was: $_pin_first"
+fi
+# Verify [pin] marker is in the second column (not breaking the ' | ' separator).
+if printf '%s' "$_pin_first" | grep -q ' | \[pin\]'; then
+  ok "pin-first: [pin] marker is in the summary column (separator contract preserved)"
+else
+  bad "pin-first: [pin] marker not in expected position; line: $_pin_first"
+fi
+sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-smoke%';" 2>/dev/null || true
+
+# ---------------------------------- 11. seen-N: count shown when duplicates exist
+
+step "11. seen-N: '(seen 2)' shown when two rows share the same summary prefix (lr-17a8)"
+sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-seen%';" 2>/dev/null || true
+# Two rows with an identical 60-char prefix (the full summary is under 60 chars so
+# substr(...,1,60) returns the whole string — both match each other's prefix).
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-02-01T00:00:00Z', 'smoke', 'lr17a8-seen duplicate summary for smoke test', 'smoke', 'stop-hook');"
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-02-02T00:00:00Z', 'smoke', 'lr17a8-seen duplicate summary for smoke test', 'smoke', 'stop-hook');"
+_seen_recall=$(CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" "$TOOL_HOME/scripts/memory.sh" recall lr17a8-seen 2>&1)
+if printf '%s' "$_seen_recall" | grep -q '(seen 2)'; then
+  ok "seen-N: '(seen 2)' annotation present for duplicate summary rows"
+else
+  bad "seen-N: '(seen 2)' not found in recall output; got: $_seen_recall"
+fi
+# Bright-line enforcement: verify the row set without the annotation is identical.
+# We do this by checking that both rows still appear — the count annotation is purely
+# additive text and cannot filter or reorder rows.
+_seen_count=$(printf '%s\n' "$_seen_recall" | grep -c 'lr17a8-seen')
+if [ "${_seen_count:-0}" -ge 2 ]; then
+  ok "seen-N: both duplicate rows present (count annotation does not filter rows)"
+else
+  bad "seen-N: expected 2 lr17a8-seen rows, got $_seen_count"
+fi
+sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-seen%';" 2>/dev/null || true
+
 # -------------------------------------------------------------------- summary
 
 printf '\n[smoke] passed: %s   failed: %s\n' "$PASS" "$FAIL"
