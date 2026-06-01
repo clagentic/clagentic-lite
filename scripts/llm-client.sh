@@ -294,16 +294,28 @@ invoke_claude() {
 invoke_codex() {
   MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"
   TMP_COMBINED=$(mktemp -t clagentic-codex-combined.XXXXXX)
+  TMP_RAW=$(mktemp -t clagentic-codex-raw.XXXXXX)
   { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } > "$TMP_COMBINED"
   if [ -n "$MODEL" ]; then
     $DS_TIMEOUT_CMD "$LLM_TIMEOUT" codex exec --skip-git-repo-check -m "$MODEL" \
-      --color never -o "$OUTPUT_FILE" "$(cat "$TMP_COMBINED")" > "$ERR_FILE" 2>&1
+      --color never -o "$TMP_RAW" "$(cat "$TMP_COMBINED")" > "$ERR_FILE" 2>&1
   else
     $DS_TIMEOUT_CMD "$LLM_TIMEOUT" codex exec --skip-git-repo-check \
-      --color never -o "$OUTPUT_FILE" "$(cat "$TMP_COMBINED")" > "$ERR_FILE" 2>&1
+      --color never -o "$TMP_RAW" "$(cat "$TMP_COMBINED")" > "$ERR_FILE" 2>&1
   fi
   EXIT_CODE=$?
-  rm -f "$TMP_COMBINED"
+  # Strip ANSI CSI sequences from the -o output file before handing it to
+  # validate_output. `codex exec -o` should write clean JSON/text, but
+  # --color never is advisory and some codex versions leak escape sequences
+  # into -o files. A stray ESC sequence causes jq to fail the parse, which
+  # then marks the step as schema-invalid and advances the chain — silently
+  # turning a working Reviewer into a degraded block. Strip is idempotent on
+  # clean output. We already strip the error path (ERR_FILE); this closes
+  # the asymmetry noted in the engineering foundry review (F-009).
+  if [ -s "$TMP_RAW" ]; then
+    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$TMP_RAW" > "$OUTPUT_FILE" 2>/dev/null || cp "$TMP_RAW" "$OUTPUT_FILE"
+  fi
+  rm -f "$TMP_COMBINED" "$TMP_RAW"
   return $EXIT_CODE
 }
 

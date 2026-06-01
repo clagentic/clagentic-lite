@@ -39,6 +39,9 @@ fi
 [ -z "$PROMPT" ] && exit 0
 
 # Strip short tokens and stopwords, take top 5 meaningful words.
+# tr -c '[:alnum:]' reduces to alnum-only tokens, so no SQL metacharacters
+# survive — but we still escape explicitly for defense-in-depth, matching the
+# ds_sql_escape + LIKE-wildcard-escape pattern used in scripts/memory.sh recall.
 KEYWORDS=$(printf '%s\n' "$PROMPT" | tr '[:upper:]' '[:lower:]' | \
   tr -c '[:alnum:]' ' ' | tr ' ' '\n' | \
   awk 'length($0) >= 4 && !/^(this|that|with|from|have|will|what|when|where|which|should|would|could|about|into|been|being|some)$/' | \
@@ -46,13 +49,23 @@ KEYWORDS=$(printf '%s\n' "$PROMPT" | tr '[:upper:]' '[:lower:]' | \
 
 [ -z "$KEYWORDS" ] && exit 0
 
+# Escape a keyword for safe interpolation into a SQLite LIKE pattern.
+# Escapes: single-quote (SQL injection), %, _ (LIKE wildcards), \ (escape char).
+# Input is already alnum-only after tr filtering above, so in practice nothing
+# escapes — but this makes the function the defence, not the filter.
+_sql_like_escape() {
+  printf '%s' "$1" | sed "s/'/\\''/g; s/\\\\/\\\\\\\\/g; s/%/\\\\%/g; s/_/\\\\_/g"
+}
+
 # Build a SQL LIKE clause; bounded to 3 results.
 WHERE=""
 for kw in $KEYWORDS; do
+  _ekw=$(_sql_like_escape "$kw")
+  _clause="(summary LIKE '%${_ekw}%' ESCAPE '\\' OR tags LIKE '%${_ekw}%' ESCAPE '\\')"
   if [ -z "$WHERE" ]; then
-    WHERE="(summary LIKE '%$kw%' OR tags LIKE '%$kw%')"
+    WHERE="$_clause"
   else
-    WHERE="$WHERE OR (summary LIKE '%$kw%' OR tags LIKE '%$kw%')"
+    WHERE="$WHERE OR $_clause"
   fi
 done
 
