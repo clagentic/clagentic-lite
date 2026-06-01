@@ -134,19 +134,18 @@ cmd_deps() {
   GLOBAL_IGNORE="$HOME/.config/clagentic/osv-ignore"
   REPO_IGNORE="$REPO_ROOT/.clagentic/osv-ignore"
 
-  # Capability-probe: osv-scanner v1.9+ uses `osv-scanner scan` subcommand and
-  # removed --severity / --ignore-vulns CLI flags. v1.8 and earlier use the
-  # flat invocation with those flags. We probe by subcommand availability, not
+  # Capability-probe: newer osv-scanner releases use the `scan` subcommand and
+  # removed --severity / --ignore-vulns CLI flags. Older releases use the flat
+  # invocation with those flags. We probe by subcommand availability, not
   # version string (same pattern as the gitleaks probe above).
   if osv-scanner scan --help >/dev/null 2>&1; then
-    # v1.9+ path: severity and ignores are config-file-only.
-    # Write a temp toml incorporating CLAGENTIC_OSV_SEVERITY and both ignore
-    # files, then pass it via --config. The temp file is removed on exit.
+    # Newer path: ignores remain config-file entries, but there is no scan
+    # config key for minimum severity. Capture JSON and apply the configured
+    # threshold to osv-scanner's computed group.max_severity values locally.
     _OSV_TMP=$(mktemp /tmp/clagentic-osv-XXXXXX.toml)
-    trap 'rm -f "$_OSV_TMP"' EXIT
-
-    # MinimumSeverity: osv-scanner toml key (PascalCase).
-    printf 'MinimumSeverity = "%s"\n' "$SEVERITY" > "$_OSV_TMP"
+    _OSV_JSON=$(mktemp /tmp/clagentic-osv-XXXXXX.json)
+    trap 'rm -f "$_OSV_TMP" "$_OSV_JSON"' EXIT
+    : > "$_OSV_TMP"
 
     # IgnoredVulns: one [[IgnoredVulns]] block per ID from ignore files.
     # One ID per line; blank lines and # comments are stripped.
@@ -160,14 +159,30 @@ cmd_deps() {
       done < "$_IGNORE_FILE"
     done
 
-    if osv-scanner scan --recursive "--config=$_OSV_TMP" .; then
-      cmd_log_run deps pass ""
-    else
-      cmd_log_run deps block "osv-scanner reported vulnerabilities"
-      return 1
-    fi
+    _OSV_STATUS=0
+    osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" . > "$_OSV_JSON" || _OSV_STATUS=$?
+    case "$_OSV_STATUS" in
+      0)
+        cmd_log_run deps pass ""
+        ;;
+      1)
+        _OSV_BLOCKERS=$(osv_json_blockers "$_OSV_JSON" "$SEVERITY")
+        if [ "${_OSV_BLOCKERS:-99}" -gt 0 ]; then
+          cat "$_OSV_JSON"
+          cmd_log_run deps block "$_OSV_BLOCKERS vulnerability group(s) at >= $SEVERITY or with unknown severity"
+          return 1
+        fi
+        echo "[gates] osv-scanner reported vulnerabilities below $SEVERITY threshold" 1>&2
+        cmd_log_run deps pass "osv-scanner findings below $SEVERITY threshold"
+        ;;
+      *)
+        cat "$_OSV_JSON" 1>&2
+        cmd_log_run deps block "osv-scanner failed (exit=$_OSV_STATUS)"
+        return 1
+        ;;
+    esac
   else
-    # v1.8 and earlier: build argument list via positional parameters
+    # Older releases: build argument list via positional parameters
     # (POSIX-safe, no eval, no word-splitting surprises).
     set -- --recursive "--severity=$SEVERITY"
 
@@ -188,6 +203,59 @@ cmd_deps() {
       cmd_log_run deps block "osv-scanner reported vulnerabilities"
       return 1
     fi
+  fi
+}
+
+# Count osv-scanner JSON vulnerability groups that meet the configured
+# threshold. Missing or malformed severity data blocks: a scanner finding
+# without a trustworthy score is not safe to discard.
+osv_json_blockers() {
+  FILE="$1"; SEVERITY="$2"
+  case "$SEVERITY" in
+    CRITICAL|critical) MIN_SCORE=9 ;;
+    HIGH|high)         MIN_SCORE=7 ;;
+    MEDIUM|medium)     MIN_SCORE=4 ;;
+    LOW|low)           MIN_SCORE=0.1 ;;
+    *)                 MIN_SCORE=9 ;;
+  esac
+
+  if command -v jq >/dev/null 2>&1; then
+    R=$(jq -r --argjson min "$MIN_SCORE" '
+      [.results[]?.packages[]?
+       | if ((.groups // []) | length) == 0
+         then select(((.vulnerabilities // []) | length) > 0) | {max_severity: ""}
+         else .groups[]
+         end
+       | (.max_severity // "" | try tonumber catch null) as $score
+       | select(($score == null) or ($score >= $min))]
+      | length
+    ' "$FILE" 2>/dev/null)
+    if [ -z "$R" ]; then echo 99; else echo "$R"; fi
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$FILE" "$MIN_SCORE" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    minimum = float(sys.argv[2])
+    blockers = 0
+    for result in data.get("results", []):
+        for package in result.get("packages", []):
+            groups = package.get("groups", [])
+            if not groups and package.get("vulnerabilities", []):
+                blockers += 1
+            for group in groups:
+                try:
+                    score = float(group.get("max_severity", ""))
+                except (TypeError, ValueError):
+                    blockers += 1
+                else:
+                    blockers += score >= minimum
+    print(blockers)
+except Exception:
+    print(99)
+PY
+  else
+    echo 99
   fi
 }
 
