@@ -1114,6 +1114,24 @@ cmd_doctor() {
   done
   [ -z "$_probed_clis" ] && printf '  (no LLM CLIs configured — set CLAGENTIC_*_CMD in config)\n'
 
+  # 9. Cross-vendor invariant check.
+  # The whole point of clagentic-lite is that Builder and Reviewer are different
+  # CLIs so they don't share blind spots. Warn (not fail) when they match —
+  # a single-CLI setup still works, but the cross-vendor property is gone.
+  printf '\ncross-vendor check:\n'
+  _builder_cmd="${CLAGENTIC_BUILDER_CMD:-}"
+  _reviewer_cmd="${CLAGENTIC_REVIEWER_CMD:-}"
+  if [ -z "$_builder_cmd" ] || [ -z "$_reviewer_cmd" ]; then
+    printf '  (Builder or Reviewer CMD not configured — skipping cross-vendor check)\n'
+  elif [ "$_builder_cmd" = "$_reviewer_cmd" ]; then
+    printf '  WARN Builder and Reviewer both use "%s" — cross-vendor review is disabled.\n' "$_builder_cmd"
+    printf '       Set CLAGENTIC_REVIEWER_CMD to a different CLI (e.g. codex vs claude).\n'
+    printf '       Or set CLAGENTIC_REVIEWER_REQUIRED=1 to make same-vendor fallback a hard failure.\n'
+    printf '       See docs/DESIGN.md §"The three roles" for rationale.\n'
+  else
+    _ok "Builder=$_builder_cmd / Reviewer=$_reviewer_cmd (cross-vendor OK)"
+  fi
+
   printf '\n== doctor summary: %s OK, %s FAIL ==\n\n' "$_ok" "$_fail"
   [ "$_fail" -eq 0 ]
 }

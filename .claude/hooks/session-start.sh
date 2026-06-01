@@ -1,9 +1,8 @@
 #!/bin/sh
 # clagentic-lite :: SessionStart hook
-# Injects the 3 most recent session summaries as additional context.
-# Non-blocking — failures are silent.
-#
-# STATUS: stub. Real implementation lands in weekend-1 task #6.
+# Injects the 3 most recent session summaries from .clagentic/memory.db
+# as additionalContext so the session opens with recent decisions visible.
+# Non-blocking — any failure exits 0 silently.
 
 set -e
 
