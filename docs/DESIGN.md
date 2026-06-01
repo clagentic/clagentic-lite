@@ -158,6 +158,26 @@ Project root isolation: `gates.sh`, `memory.sh`, and `llm-client.sh` resolve the
 
 These are excellent things to build. They are not this project.
 
+## When you've outgrown lite
+
+The signals that you have crossed the threshold:
+
+- You want a server or a daemon — a persistent process that runs outside your editor session.
+- You want multi-repo memory — a single recall surface that spans more than one enrolled project.
+- You want ranked or embedding-based retrieval — surfacing rows by relevance scores or vector similarity rather than by your own keywords, recency, or explicit pins.
+- You want multi-agent orchestration — a director that dispatches work to specialized agents, tracks inter-agent state, and retries on failure.
+- You want memory that learns, decays, and promotes itself automatically — a system that decides what is important without your explicit marking.
+
+If you are hitting these limits, the tool did its job. You have grown into needing the real platform.
+
+Named successors:
+
+- **LORE** (Living Operational Recall Engine) — full persistent memory platform with confidence weighting, decay, multi-repo indexing, and a query surface beyond LIKE. See lore.akuehner.com.
+- **clagentic** — the full multi-agent harness: director, relay, agent queue, inter-agent messaging, NAOMI merge gate. clagentic-lite is a distillation of its core loop.
+- **ECC** (affaan-m/ECC) — harness-native operator system: Rust daemon, TUI, seven MCP servers. Heavier than clagentic-lite by design; appropriate for teams running the harness continuously.
+
+No migration tooling is provided, and none is planned. The `.clagentic/memory.db` file is a plain SQLite database. A user who outgrows lite has all their data already — open it with `sqlite3`, export with `.dump`, or query it directly. Building an exporter, an `eject` subcommand, or a schema bridge would couple lite to whichever platform's schema happened to be current at build time; that coupling is a thesis violation through the back door.
+
 ## Open design questions
 
 - **Summarizer cost control:** spark-tier model is fine for one-paragraph summaries, but a chatty session could rack up calls. Add a debounce (`Stop` fires often) — only summarize after N seconds of quiet. Implementation deferred to weekend 2.

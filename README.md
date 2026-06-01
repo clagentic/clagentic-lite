@@ -379,6 +379,18 @@ sqlite3 .clagentic/memory.db         # inspect session memory
 
 ---
 
+## When you've outgrown lite
+
+Signals: you want a server; you want multi-repo memory; you want ranked or embedding-based retrieval; you want multi-agent orchestration; you want memory that learns, decays, and promotes itself automatically.
+
+If you're hitting these limits, the tool did its job — you've grown into needing the real platform.
+
+Named successors: **LORE** (Living Operational Recall Engine — lore.akuehner.com), **clagentic** (full multi-agent harness), **ECC** (affaan-m/ECC — harness-native operator system).
+
+No exporter, no `eject` subcommand, no schema bridge. The `.clagentic/memory.db` SQLite file is plain and greppable; a user who outgrows lite has all their data already. See `docs/DESIGN.md` § "When you've outgrown lite" for the full rationale.
+
+---
+
 ## License
 
 **FSL-1.1-MIT** — [Functional Source License 1.1, MIT Future License](https://fsl.software/).
