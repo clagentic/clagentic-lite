@@ -71,6 +71,18 @@ CLAGENTIC_SUMMARIZER_CMD=claude
 CLAGENTIC_SUMMARIZER_TIER=cheap
 CLAGENTIC_SUMMARIZER_CHAIN=codex:cheap
 
+# ---------- role enforcement ----------
+# By default, when every step in a role's chain fails, the wrapper emits a
+# "degraded" envelope (parseable output, non-blocking) and the gate continues.
+# Set CLAGENTIC_<ROLE>_REQUIRED=1 to make full-chain failure a hard error
+# (non-zero exit, gate blocks). Use this when the cross-vendor property is
+# non-negotiable: e.g. setting CLAGENTIC_REVIEWER_REQUIRED=1 ensures a
+# same-vendor fallback is a detectable gate failure rather than a silent
+# degradation. ROLE names: BUILDER, REVIEWER, AUDITOR, GATE, SUMMARIZER.
+# CLAGENTIC_REVIEWER_REQUIRED=0
+# CLAGENTIC_AUDITOR_REQUIRED=0
+# CLAGENTIC_GATE_REQUIRED=0
+
 # ---------- gates ----------
 # Comma-separated list of gates to run on /ship. Omit to run all.
 # Available: secrets,deps,sast,review,adversarial,merge-gate

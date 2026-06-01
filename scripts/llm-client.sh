@@ -41,6 +41,25 @@ AUDIT_DB="$REPO_ROOT/.clagentic/audit.db"
 
 # ---------------------------------------------------------------- prompts -----
 
+ds_build_prompt() {
+  cat <<'EOF'
+You are the clagentic-lite Builder. Read AGENTS.md in the repository root for
+repo-level conventions, then read the user instruction on stdin.
+
+Write, edit, or refactor code on the current feature branch. Follow the hard
+contract from .claude/agents/builder.md:
+- Never write to the default branch (main).
+- Never merge pull requests.
+- Never bypass security gates.
+- Read every file in full before modifying it.
+- Commit in small, reviewable chunks with terse technical messages.
+
+Output your changes as a unified diff or as a clear description of what you
+created/changed and in which files, so the caller can apply or review the work.
+No emojis. No exclamation points. Match the tone of AGENTS.md.
+EOF
+}
+
 ds_review_prompt() {
   cat <<'EOF'
 You are the clagentic-lite Reviewer. Read the staged git diff on stdin.
@@ -220,68 +239,91 @@ log_attempt() {
 # hung CLI surfaces as a step failure rather than wedging the gate.
 LLM_TIMEOUT="${CLAGENTIC_LLM_TIMEOUT_SEC:-180}"
 
-# Invoke a single CLI step with a prompt. Args: CLI MODEL PROMPT_FILE INPUT_FILE
-#                                                OUTPUT_FILE ERR_FILE
-# Writes stdout to OUTPUT_FILE, stderr to ERR_FILE. Returns 0 on apparent
-# success, non-zero on failure (including timeout = exit 124).
-# Recognized CLIs: claude, codex. Unknown CLIs are invoked generically: the
-# prompt and input are concatenated and piped to `<cli> -p -` if that works,
-# else `<cli>` with the prompt as the first arg.
+# Per-CLI invocation helpers. Each function receives the same fixed args:
+#   MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE
+# Returns 0 on apparent success, non-zero on failure (including exit 124 for
+# timeout, 127 for cli-not-on-PATH). The caller (invoke_step) owns the
+# command-v check and the timeout command prefix.
+
+# Claude Code headless.
+#
+# --bare trade-off: it skips hooks/LSP/plugin sync/auto-memory/CLAUDE.md
+# auto-discovery, which protects against recursive hook firing when
+# this wrapper is invoked from inside an active Claude session.
+# BUT --bare also disables OAuth/keychain reads — it requires
+# ANTHROPIC_API_KEY (or apiKeyHelper). Default Claude Code users
+# auth via OAuth, so --bare would break their setup.
+#
+# Default behavior: NO --bare. OAuth/keychain auth works; recursion
+# protection comes from the prompt-inject.sh / session-start.sh
+# hooks honoring CLAGENTIC_DISABLE_RECALL (set internally) instead.
+#
+# Set CLAGENTIC_CLAUDE_BARE=1 if you authenticate via API key and
+# prefer the tighter --bare invocation surface.
+invoke_claude() {
+  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"
+  BARE_FLAG=""
+  [ "${CLAGENTIC_CLAUDE_BARE:-0}" = "1" ] && BARE_FLAG="--bare"
+  # Tell the inner Claude session NOT to inject recall summaries —
+  # this is the recursion-avoidance path that doesn't require --bare.
+  export CLAGENTIC_DISABLE_RECALL=1
+  if [ -n "$MODEL" ]; then
+    # shellcheck disable=SC2086
+    cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$LLM_TIMEOUT" claude --print $BARE_FLAG --model "$MODEL" \
+      --append-system-prompt "$(cat "$PROMPT_FILE")" \
+      > "$OUTPUT_FILE" 2> "$ERR_FILE"
+  else
+    # shellcheck disable=SC2086
+    cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$LLM_TIMEOUT" claude --print $BARE_FLAG \
+      --append-system-prompt "$(cat "$PROMPT_FILE")" \
+      > "$OUTPUT_FILE" 2> "$ERR_FILE"
+  fi
+}
+
+# Codex non-interactive.
+#
+# We combine prompt and input into a single temp file and pass it as the sole
+# positional argument to `codex exec`. This avoids relying on stdin-block
+# semantics (the claim that codex appends piped stdin as a <stdin> block when
+# a prompt arg is also provided), which is undocumented and version-dependent.
+# A combined-input file is one fixed surface regardless of codex version.
+#
+# stdout from codex exec is progress/spinner output (the final response goes to
+# -o OUTPUT_FILE), so we redirect both stdout and stderr to ERR_FILE — that is
+# intentional, not a mistake.
+invoke_codex() {
+  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"
+  TMP_COMBINED=$(mktemp -t clagentic-codex-combined.XXXXXX)
+  { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } > "$TMP_COMBINED"
+  if [ -n "$MODEL" ]; then
+    $DS_TIMEOUT_CMD "$LLM_TIMEOUT" codex exec --skip-git-repo-check -m "$MODEL" \
+      --color never -o "$OUTPUT_FILE" "$(cat "$TMP_COMBINED")" > "$ERR_FILE" 2>&1
+  else
+    $DS_TIMEOUT_CMD "$LLM_TIMEOUT" codex exec --skip-git-repo-check \
+      --color never -o "$OUTPUT_FILE" "$(cat "$TMP_COMBINED")" > "$ERR_FILE" 2>&1
+  fi
+  EXIT_CODE=$?
+  rm -f "$TMP_COMBINED"
+  return $EXIT_CODE
+}
+
+# Generic: pipe prompt+input via stdin to `<cli> -p -`. If the CLI does not
+# accept that invocation, the step fails and the chain advances.
+invoke_generic() {
+  CLI_BIN="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"
+  { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } | \
+    $DS_TIMEOUT_CMD "$LLM_TIMEOUT" "$CLI_BIN" -p - > "$OUTPUT_FILE" 2> "$ERR_FILE"
+}
+
+# Dispatch a single chain step. Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE
+# Fails with exit 127 if the CLI binary is not on PATH.
 invoke_step() {
   CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"
   command -v "$CLI" >/dev/null 2>&1 || return 127
   case "$CLI" in
-    claude)
-      # Claude Code headless. --print = non-interactive.
-      #
-      # --bare trade-off: it skips hooks/LSP/plugin sync/auto-memory/CLAUDE.md
-      # auto-discovery, which protects against recursive hook firing when
-      # this wrapper is invoked from inside an active Claude session.
-      # BUT --bare also disables OAuth/keychain reads — it requires
-      # ANTHROPIC_API_KEY (or apiKeyHelper). Default Claude Code users
-      # auth via OAuth, so --bare would break their setup.
-      #
-      # Default behavior: NO --bare. OAuth/keychain auth works; recursion
-      # protection comes from the prompt-inject.sh / session-start.sh
-      # hooks honoring CLAGENTIC_DISABLE_RECALL (set internally) instead.
-      #
-      # Set CLAGENTIC_CLAUDE_BARE=1 if you authenticate via API key and
-      # prefer the tighter --bare invocation surface.
-      BARE_FLAG=""
-      [ "${CLAGENTIC_CLAUDE_BARE:-0}" = "1" ] && BARE_FLAG="--bare"
-      # Tell the inner Claude session NOT to inject recall summaries —
-      # this is the recursion-avoidance path that doesn't require --bare.
-      export CLAGENTIC_DISABLE_RECALL=1
-      if [ -n "$MODEL" ]; then
-        # shellcheck disable=SC2086
-        cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$LLM_TIMEOUT" claude --print $BARE_FLAG --model "$MODEL" \
-          --append-system-prompt "$(cat "$PROMPT_FILE")" \
-          > "$OUTPUT_FILE" 2> "$ERR_FILE"
-      else
-        # shellcheck disable=SC2086
-        cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$LLM_TIMEOUT" claude --print $BARE_FLAG \
-          --append-system-prompt "$(cat "$PROMPT_FILE")" \
-          > "$OUTPUT_FILE" 2> "$ERR_FILE"
-      fi
-      ;;
-    codex)
-      # codex exec is non-interactive. -o writes the final message to a file.
-      # We feed prompt + input via stdin; codex appends piped stdin as <stdin>
-      # block when a prompt arg is also provided.
-      if [ -n "$MODEL" ]; then
-        cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$LLM_TIMEOUT" codex exec --skip-git-repo-check -m "$MODEL" \
-          --color never -o "$OUTPUT_FILE" "$(cat "$PROMPT_FILE")" > "$ERR_FILE" 2>&1
-      else
-        cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$LLM_TIMEOUT" codex exec --skip-git-repo-check \
-          --color never -o "$OUTPUT_FILE" "$(cat "$PROMPT_FILE")" > "$ERR_FILE" 2>&1
-      fi
-      ;;
-    *)
-      # Generic: pipe prompt+input via stdin to `<cli> -p -`. If the CLI
-      # doesn't accept that, the step fails and the chain advances.
-      { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } | \
-        $DS_TIMEOUT_CMD "$LLM_TIMEOUT" "$CLI" -p - > "$OUTPUT_FILE" 2> "$ERR_FILE"
-      ;;
+    claude)  invoke_claude  "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" ;;
+    codex)   invoke_codex   "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" ;;
+    *)       invoke_generic "$CLI" "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" ;;
   esac
 }
 
@@ -421,15 +463,23 @@ walk_chain() {
       RESULT=0
       break
     fi
-    # Step failed. Capture the first error line so the audit row is diagnostic
-    # rather than just "step-failed". This is what surfaces "model not available
-    # on this account" / "auth expired" / "timeout" rather than a silent skip.
+    # Step failed. Capture a diagnostic hint for the audit row. For CLIs like
+    # codex whose error output is ANSI-decorated multi-line banners, we strip
+    # escape sequences and skip blank lines to reach the actual error message.
+    # This is what surfaces "model not available on this account" / "auth
+    # expired" / "timeout" rather than a blank or a spinner artifact.
     if [ "$EXIT_CODE" -eq 124 ]; then
       ERR_HINT="timeout after ${LLM_TIMEOUT}s"
     elif [ "$EXIT_CODE" -eq 127 ]; then
       ERR_HINT="cli not on PATH"
     elif [ -s "$TMP_ERR" ]; then
-      ERR_HINT=$(head -1 "$TMP_ERR" | cut -c1-200)
+      # Strip ANSI CSI sequences (ESC [ ... m) then take the first non-empty line.
+      # sed -E is not POSIX but is available on every target (GNU + BSD sed both
+      # support it). POSIX fallback: if sed -E fails, fall back to head -1.
+      ERR_HINT=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$TMP_ERR" 2>/dev/null \
+        | grep -v '^[[:space:]]*$' | head -1 | cut -c1-200) || \
+        ERR_HINT=$(head -1 "$TMP_ERR" | cut -c1-200)
+      [ -z "$ERR_HINT" ] && ERR_HINT="non-empty stderr (exit=$EXIT_CODE)"
     elif [ -s "$TMP_OUT" ]; then
       ERR_HINT="output failed schema validation"
     else
@@ -439,6 +489,19 @@ walk_chain() {
   done < "$TMP_CHAIN"
 
   if [ "$RESULT" -ne 0 ]; then
+    # CLAGENTIC_<ROLE>_REQUIRED=1 makes a full-chain failure hard: the wrapper
+    # exits non-zero instead of emitting a degraded envelope. Use this when the
+    # cross-vendor property is non-negotiable — e.g. CLAGENTIC_REVIEWER_REQUIRED=1
+    # ensures a claude-only fallback is a detectable gate failure, not a silent
+    # same-vendor review.
+    REQUIRED_KEY="CLAGENTIC_$(printf '%s' "$ROLE_U" | tr '[:lower:]-' '[:upper:]_')_REQUIRED"
+    IS_REQUIRED=$(eval "printf '%s' \"\${${REQUIRED_KEY}:-0}\"")
+    if [ "$IS_REQUIRED" = "1" ]; then
+      printf '[clagentic-lite/llm-client] HARD FAILURE: all chain steps failed for required role %s\n' "$ROLE_L" 1>&2
+      log_attempt "$ROLE_L" "" "" "hard-failure" "required role — no fallback permitted"
+      rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
+      return 1
+    fi
     emit_degraded "$MODE" "all chain steps failed for role $ROLE_L"
     log_attempt "$ROLE_L" "" "" "degraded" ""
   fi
@@ -480,15 +543,22 @@ EOF
 
 # --------------------------------------------------------------- subcommands --
 
-cmd_review()      { walk_chain reviewer    json     ds_review_prompt; }
-cmd_summarize()   { walk_chain summarizer  line     ds_summarize_prompt | head -c 200; echo; }
-cmd_adversarial() { walk_chain auditor     markdown ds_adversarial_prompt; }
-cmd_merge_gate()  { walk_chain gate        json     ds_merge_gate_prompt; }
+# build: invoke the configured Builder CLI non-interactively. CLAGENTIC_BUILDER_CMD
+# and CLAGENTIC_BUILDER_TIER in config control which CLI is used. This is the
+# non-interactive parallel to the Claude Code builder.md subagent — same role
+# contract, different invocation context (hook-triggered vs. interactive session).
+# Stdin: user instruction (free text). Stdout: builder output (diff or prose).
+cmd_build()       { walk_chain builder    markdown ds_build_prompt; }
+cmd_review()      { walk_chain reviewer   json     ds_review_prompt; }
+cmd_summarize()   { walk_chain summarizer line     ds_summarize_prompt | head -c 200; echo; }
+cmd_adversarial() { walk_chain auditor    markdown ds_adversarial_prompt; }
+cmd_merge_gate()  { walk_chain gate       json     ds_merge_gate_prompt; }
 
 case "${1:-}" in
+  build)        cmd_build ;;
   review)       cmd_review ;;
   summarize)    cmd_summarize ;;
   adversarial)  cmd_adversarial ;;
   merge-gate)   cmd_merge_gate ;;
-  *) echo "usage: llm-client.sh {review|summarize|adversarial|merge-gate}" 1>&2; exit 1 ;;
+  *) echo "usage: llm-client.sh {build|review|summarize|adversarial|merge-gate}" 1>&2; exit 1 ;;
 esac
