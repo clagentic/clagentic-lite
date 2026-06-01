@@ -116,6 +116,17 @@ CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC=20
 # Disable memory recall injection entirely (UserPromptSubmit hook).
 CLAGENTIC_DISABLE_RECALL=0
 
+# Memory recall row limit: max turns returned by recall (default 5).
+# CLAGENTIC_RECALL_LIMIT=5
+
+# Memory recall char budget: total chars injected per recall call (default 1500).
+# Whole rows are dropped when the budget would be exceeded — no mid-row splits.
+# CLAGENTIC_RECALL_MAX_CHARS=1500
+
+# Memory row cap: oldest rows beyond this limit are pruned after each INSERT (default 5000).
+# Housekeeping is opportunistic and silent — no scheduler, no daemon, one DELETE.
+# CLAGENTIC_MEMORY_MAX_ROWS=5000
+
 # Per-LLM-call timeout (seconds). Hung CLI → step failure → chain advances.
 CLAGENTIC_LLM_TIMEOUT_SEC=180
 

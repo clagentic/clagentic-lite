@@ -9,6 +9,8 @@
 #   list                                  show enrolled repos + status
 #   doctor                                diagnostics punch list
 #   update                                git pull + re-prereq + re-stamp shims
+#   recall [keywords...]                  search session memory for matching summaries
+#   remember "<note>" [tags]              store a manual memory entry
 #
 # Design: tool is cloned once (default: ~/.clagentic-lite, override via
 # $CLAGENTIC_HOME). Per-repo enrollment writes .clagentic/{audit,memory}.db,
@@ -1141,6 +1143,12 @@ cmd_doctor() {
     _ok "Builder=$_builder_cmd / Reviewer=$_reviewer_cmd (cross-vendor OK)"
   fi
 
+  # 10. Memory tunables.
+  printf '\nmemory tunables:\n'
+  _ok "CLAGENTIC_RECALL_LIMIT=${CLAGENTIC_RECALL_LIMIT:-5 (default)}"
+  _ok "CLAGENTIC_RECALL_MAX_CHARS=${CLAGENTIC_RECALL_MAX_CHARS:-1500 (default)}"
+  _ok "CLAGENTIC_MEMORY_MAX_ROWS=${CLAGENTIC_MEMORY_MAX_ROWS:-5000 (default)}"
+
   printf '\n== doctor summary: %s OK, %s FAIL ==\n\n' "$_ok" "$_fail"
   [ "$_fail" -eq 0 ]
 }
@@ -1261,15 +1269,35 @@ case "${1:-}" in
   list)     cmd_list ;;
   doctor)   cmd_doctor ;;
   update)   cmd_update ;;
+  recall)
+    # recall <keywords...>  — search session memory for matching summaries.
+    # Thin dispatch to scripts/memory.sh recall; honors CLAGENTIC_RECALL_LIMIT
+    # and CLAGENTIC_RECALL_MAX_CHARS.
+    shift
+    exec "$SCRIPTS_DIR/memory.sh" recall "$@"
+    ;;
+  remember)
+    # remember "<note>" [tags]  — store a manual memory entry.
+    # Thin dispatch to scripts/memory.sh log-turn with source='manual'.
+    # Does NOT add new plumbing; 'manual' source is already supported.
+    shift
+    if [ $# -eq 0 ]; then
+      printf 'usage: clagentic-lite remember "<note>" [tags]\n' 1>&2
+      exit 1
+    fi
+    _note="$1"; shift
+    _tags="${*:-}"
+    exec "$SCRIPTS_DIR/memory.sh" log-turn "$_note" "$_tags" "manual"
+    ;;
   "")
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update, recall, remember\n'
     exit 1
     ;;
   *)
     printf 'clagentic-lite: unknown subcommand: %s\n' "$1" 1>&2
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update, recall, remember\n'
     exit 1
     ;;
 esac
