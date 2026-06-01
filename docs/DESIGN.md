@@ -89,15 +89,6 @@ The goal is to let the user recognize repeated summaries without hiding any row.
 
 `memory.sh digest` groups recent entries by the first literal tag token in the `tags` column rather than showing a flat list. Entries with no tags appear under `(untagged)`. The grouping key is the raw string the user or summarizer wrote — not computed similarity. Ordering within and across groups is recency-descending (`ORDER BY ts DESC`); the seen-N annotation follows the same display-only rule.
 
-### Defaults
-
-| Variable | Default | Effect |
-|---|---|---|
-| `CLAGENTIC_RECALL_LIMIT` | `5` | Maximum rows returned by `recall` |
-| `CLAGENTIC_RECALL_MAX_CHARS` | `1500` | Hard cap on total injected text; whole rows dropped from the tail |
-
-Non-integer values for either variable fall back silently to the documented default.
-
 ## Cross-CLI review — concrete flow
 
 `/review` slash command routes through `scripts/gates.sh review`:

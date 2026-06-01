@@ -66,17 +66,6 @@ cmd_log_turn() {
 
 cmd_recall() {
   cmd_init
-  # CLAGENTIC_RECALL_LIMIT: max rows returned (default 5).
-  RECALL_LIMIT="${CLAGENTIC_RECALL_LIMIT:-5}"
-  # Integer guard: reject non-integer values and fall back to the documented default.
-  # ds_sql_escape does not protect an unquoted numeric SQL LIMIT position.
-  case "$RECALL_LIMIT" in ''|*[!0-9]*) RECALL_LIMIT=5 ;; esac
-  # CLAGENTIC_RECALL_MAX_CHARS: hard cap on total injected text (default 1500).
-  # Whole rows are dropped from the tail; the last retained row is never split.
-  RECALL_MAX_CHARS="${CLAGENTIC_RECALL_MAX_CHARS:-1500}"
-  # Integer guard: reject non-integer values and fall back to the documented default.
-  # Used in shell arithmetic; a non-integer here would cause a syntax error or worse.
-  case "$RECALL_MAX_CHARS" in ''|*[!0-9]*) RECALL_MAX_CHARS=1500 ;; esac
   KW="$*"
   # Pin-first ordering: source='manual' rows surface before auto rows (lr-17a8).
   # Within each group, most-recent-first.  ORDER BY uses only user-authored facts
@@ -99,7 +88,7 @@ cmd_recall() {
       "SELECT t1.ts, $_DISP_EXPR
        FROM turns t1
        ORDER BY (t1.source='manual') DESC, t1.ts DESC
-       LIMIT $RECALL_LIMIT;")
+       LIMIT 5;")
   else
     WHERE=""
     for kw in $KW; do
@@ -119,24 +108,9 @@ cmd_recall() {
        FROM turns t1
        WHERE $WHERE
        ORDER BY (t1.source='manual') DESC, t1.ts DESC
-       LIMIT $RECALL_LIMIT;")
+       LIMIT 5;")
   fi
-  # Apply RECALL_MAX_CHARS: accumulate lines until the budget is exhausted,
-  # then drop trailing rows whole (never split mid-row).
-  # Uses a temp file to avoid the pipe-subshell variable-isolation trap.
-  _recall_tmp=$(mktemp -t clagentic-recall.XXXXXX)
-  printf '%s\n' "$RAW" > "$_recall_tmp"
-  USED=0
-  while IFS= read -r _rl; do
-    _rl_len=$(printf '%s\n' "$_rl" | wc -c)
-    if [ $((USED + _rl_len)) -gt "$RECALL_MAX_CHARS" ]; then
-      # Budget exhausted — drop this and all remaining rows.
-      break
-    fi
-    printf '%s\n' "$_rl"
-    USED=$((USED + _rl_len))
-  done < "$_recall_tmp"
-  rm -f "$_recall_tmp"
+  printf '%s\n' "$RAW"
 }
 
 cmd_summarize_turn() {
