@@ -1,9 +1,10 @@
 #!/bin/sh
 # clagentic-lite :: UserPromptSubmit hook
-# Extracts keywords from the prompt, greps memory, injects top matches.
-# Non-blocking.
-#
-# STATUS: stub. Real implementation lands in weekend-1 task #6.
+# Extracts keywords from the user's prompt, searches .clagentic/memory.db
+# for matching prior session summaries, and injects the top 3 matches as
+# additionalContext so the session can reference prior decisions without
+# asking the user to recall them manually.
+# Non-blocking — any failure exits 0 silently.
 
 set -e
 

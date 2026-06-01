@@ -106,7 +106,7 @@ Required for the security gates (you can install these later and opt-in per gate
 
 | Tool                | Gate     | Linux/WSL                   | macOS                       | Skip with                              |
 |---------------------|----------|-----------------------------|-----------------------------|----------------------------------------|
-| `gitleaks` ≥ 8.25   | secrets  | see [releases][gl]          | `brew install gitleaks`     | `CLAGENTIC_ALLOW_MISSING_GITLEAKS=1`   |
+| `gitleaks` ≥ 8.18   | secrets  | see [releases][gl]          | `brew install gitleaks`     | `CLAGENTIC_ALLOW_MISSING_GITLEAKS=1`   |
 | `semgrep`           | sast     | `pipx install semgrep`      | `brew install semgrep`      | `CLAGENTIC_ALLOW_MISSING_SEMGREP=1`    |
 | `osv-scanner`       | deps     | [osv-scanner releases][osv] | `brew install osv-scanner`  | `CLAGENTIC_ALLOW_MISSING_OSV=1`        |
 
@@ -156,7 +156,11 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 
 **Solo / private repo**: `CLAUDE.md` is generated and ready to use. If you'd rather not commit it, add it to `.gitignore` yourself — clagentic won't do that automatically because the file is safe to commit.
 
-**Shared repo**: `CLAUDE.md` is committable as-is. It contains no machine-specific paths — only a reference to `$CLAGENTIC_DEFAULT_BRANCH` (substituted at stamp time) and links to the public clagentic-lite repo. Teammates without clagentic-lite installed will see a normal project CLAUDE.md. Teammates with clagentic-lite installed will get full agent auto-dispatch. If you extend it with project-specific rules, `clagentic-lite enroll --force` will refuse to overwrite until you remove the `managed-by: clagentic` marker.
+**Shared repo**: `CLAUDE.md` is committable as-is and is the only clagentic artifact that is meant to be shared. It contains no machine-specific paths. Teammates without clagentic-lite installed will see a normal project CLAUDE.md. Teammates with clagentic-lite installed will get full agent auto-dispatch.
+
+`.claude/` (hook wiring, agent symlinks, `settings.json`) is **local-only** — it is added to `.gitignore` automatically at enroll time and is never committed. Each teammate who wants clagentic-lite active must run `clagentic-lite enroll` in the repo on their own machine. This is by design: hook paths are absolute and machine-specific; sharing them would break the harness on every machine but the original.
+
+If you extend `CLAUDE.md` with project-specific rules, `clagentic-lite enroll --force` will refuse to overwrite until you remove the `managed-by: clagentic` marker.
 
 ### Verify the install
 
@@ -165,12 +169,19 @@ Two layers — the shell harness, then Claude Code's view of it.
 **Shell harness:**
 
 ```sh
-scripts/smoke.sh --quick   # non-interactive end-to-end without LLM calls
-scripts/gates.sh digest    # show what gates ran today (run from an enrolled repo)
-scripts/gates.sh status    # last 10 runs per gate, color-coded (status N for other N)
-scripts/gates.sh tail      # follow audit.db live; new gate rows render as they land (Ctrl-C to quit)
+# Run from inside $CLAGENTIC_HOME (default: ~/.clagentic-lite):
+"$CLAGENTIC_HOME/scripts/smoke.sh" --quick   # non-interactive end-to-end without LLM calls
+
+# Run from inside an enrolled project repo:
+"$CLAGENTIC_HOME/scripts/gates.sh" digest    # show what gates ran today
+"$CLAGENTIC_HOME/scripts/gates.sh" status    # last 10 runs per gate, color-coded
+"$CLAGENTIC_HOME/scripts/gates.sh" tail      # follow audit.db live (Ctrl-C to quit)
+
+# Run from anywhere:
 clagentic-lite doctor      # diagnostics: symlink, prereqs, every enrolled repo's hook status
 ```
+
+Note: `scripts/` lives in `$CLAGENTIC_HOME`, not in your enrolled project. Always use the absolute path form (`"$CLAGENTIC_HOME/scripts/gates.sh"`) when running gate scripts directly from inside a project. The `clagentic-lite` CLI and `/ship`, `/review` slash commands use the correct path automatically.
 
 Smoke covers: DB init, seed + recall, gitleaks blocks a planted token, `llm-client.sh review` emits parseable JSON, audit-DB has fresh rows. If smoke passes, the harness is wired correctly.
 
