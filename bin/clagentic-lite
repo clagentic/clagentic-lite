@@ -1087,11 +1087,20 @@ cmd_doctor() {
           > "$_probe_out" 2> "$_probe_err" && _probe_ok=1 || true
         ;;
       codex)
-        # codex exec with a one-token prompt. --skip-git-repo-check avoids
-        # failures when doctor runs outside an enrolled repo.
+        # Mirror the production invoke_codex path: use -o to capture the
+        # response (stdout is spinner/progress noise). The prior approach
+        # captured stdout, which exercises a different output channel than
+        # every real gate call — causing false PASS or false FAIL.
+        _probe_o=$(mktemp -t clagentic-doctor-codex-o.XXXXXX)
         $DS_TIMEOUT_CMD "$_llm_probe_timeout" codex exec --skip-git-repo-check \
-          --color never "ping" \
-          > "$_probe_out" 2> "$_probe_err" && _probe_ok=1 || true
+          --color never -o "$_probe_o" "ping" \
+          > "$_probe_err" 2>&1 && _probe_ok=1 || true
+        # Strip ANSI from -o file, mirroring invoke_codex's post-processing.
+        if [ -s "$_probe_o" ]; then
+          sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$_probe_o" > "$_probe_out" 2>/dev/null \
+            || cp "$_probe_o" "$_probe_out"
+        fi
+        rm -f "$_probe_o"
         ;;
       *)
         # Generic: try `-p ping`.
@@ -1211,6 +1220,29 @@ cmd_update() {
               "$_cm_template" > "$_cm_file"
           say "re-stamped: $_rpath/CLAUDE.md ($_cm_ver -> $CLAUDE_MD_VERSION)"
           _restamped=$((_restamped+1))
+        fi
+      fi
+    fi
+
+    # Re-stamp wrapper CLAUDE.md if the parent directory has a .clagentic-project
+    # pointer file (meaning it's a wrapper dir). The wrapper CLAUDE.md was never
+    # included in the update loop — it was frozen at enroll time and would never
+    # pick up template changes (foundry finding F-002).
+    _wrapper_dir=$(dirname "$_rpath")
+    _wrapper_ptr="$_wrapper_dir/.clagentic-project"
+    _wrapper_cm="$_wrapper_dir/CLAUDE.md"
+    if [ -f "$_wrapper_ptr" ] && [ -f "$_wrapper_cm" ] && \
+       grep -q 'managed-by: clagentic' "$_wrapper_cm" 2>/dev/null; then
+      _wcm_ver=$(claude_md_version "$_wrapper_cm")
+      if [ "$_wcm_ver" != "$CLAUDE_MD_VERSION" ]; then
+        _wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
+        if [ -f "$_wcm_template" ]; then
+          # Re-build the project table from the pointer file.
+          _wcm_repos=$(cat "$_wrapper_ptr" 2>/dev/null | tr '\n' ' ')
+          ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_wrapper_dir" "$_wcm_repos" && {
+            say "re-stamped wrapper: $_wrapper_cm ($_wcm_ver -> $CLAUDE_MD_VERSION)"
+            _restamped=$((_restamped+1))
+          }
         fi
       fi
     fi

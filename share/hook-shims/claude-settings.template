@@ -25,6 +25,7 @@
       "Bash(git log:*)",
       "Bash(git status:*)",
       "Bash(git branch:*)",
+      "Bash(git add:*)",
       "Bash(sqlite3 .clagentic/*)",
       "Bash(scripts/*)",
       "Bash(gitleaks:*)",

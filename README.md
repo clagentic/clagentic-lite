@@ -227,18 +227,20 @@ The recommended approach is `~/.codex/models.json` — a runtime tier map that c
 ```json
 {
   "tiers": {
-    "flagship": { "model": "gpt-5.5",      "default_effort": "medium", "escalated_effort": "high" },
-    "mini":     { "model": "gpt-5.4-mini", "default_effort": "medium" },
-    "spark":    { "model": "gpt-5.3-codex-spark", "default_effort": "low" }
+    "flagship": { "model": "<your-flagship-model>", "default_effort": "medium", "escalated_effort": "high" },
+    "mini":     { "model": "<your-mini-model>",     "default_effort": "medium" },
+    "spark":    { "model": "<your-spark-model>",    "default_effort": "low" }
   },
   "default_tier": "flagship",
   "fallback_policy": "surface_error_no_silent_retry"
 }
 ```
 
-Tier names map to clagentic-lite's chain vocabulary: `flagship`, `mini`, `spark`. The `default` tier alias resolves to `default_tier` in the file. If `~/.codex/models.json` is absent, the wrapper falls back to `CLAGENTIC_MODEL_CODEX_*` env vars in `~/.config/clagentic/config` — explicit env vars always win regardless.
+Fill in the model IDs that are available on your account. clagentic-lite reads this file at runtime — update it when OpenAI releases new models or renames existing ones, with no `clagentic-lite init` re-run required. Model strings in `~/.config/clagentic/config` (`CLAGENTIC_MODEL_CODEX_*`) are intentionally left blank by default so this file is the sole source of truth.
 
-**Model availability matters.** The `-codex` suffixed names (`gpt-5-codex`, `gpt-5.5-codex`) are API-key-only and return a 400 error on ChatGPT-account logins. Stick to the base names (`gpt-5.5`, `gpt-5.4-mini`) shown above. When a step fails, the reason appears in the audit row — run `scripts/gates.sh digest` to see it.
+Tier names map to clagentic-lite's chain vocabulary: `flagship`, `mini`, `spark`. The `default` tier alias resolves to `default_tier` in the file. Explicit env vars always win over models.json if both are set.
+
+**Model availability matters.** The `-codex` suffixed names (`gpt-5-codex`, `gpt-5.5-codex`) are API-key-only and return a 400 error on ChatGPT-account logins. When a step fails, the reason appears in the audit row — run `"$CLAGENTIC_HOME/scripts/gates.sh" digest` to see it.
 
 The wrapper invokes Codex as:
 

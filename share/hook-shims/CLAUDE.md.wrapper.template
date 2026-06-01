@@ -1,5 +1,5 @@
 # CLAUDE.md
-<!-- managed-by: clagentic · clagentic-claude-md-version: v2 -->
+<!-- managed-by: clagentic · clagentic-claude-md-version: v3 -->
 <!-- Re-generate: `clagentic-lite enroll --force <this-folder>` -->
 
 This folder is a clagentic-lite **wrapper** — it contains enrolled git projects but is not a git repo itself.
@@ -25,5 +25,5 @@ To get full clagentic integration: open a project subfolder in Claude Code, or `
 
 ```sh
 sqlite3 <project>/.clagentic/audit.db "SELECT ts, gate, outcome FROM gate_runs ORDER BY ts DESC LIMIT 20;"
-scripts/gates.sh digest   # run from inside the project folder
+"$CLAGENTIC_HOME/scripts/gates.sh" digest   # run from inside the project folder
 ```

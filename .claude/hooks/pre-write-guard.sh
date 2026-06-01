@@ -93,13 +93,17 @@ fi
 
 # W-002: writes only inside repo. After normalization PATH_TARGET is absolute;
 # any path outside REPO_ROOT (including ../-traversal targets) trips this.
-if [ -n "$REPO_ROOT" ]; then
-  case "$PATH_TARGET" in
-    "$REPO_ROOT"|"$REPO_ROOT"/*) : ;;
-    /*) block W-002 "write target outside repo root '$REPO_ROOT'" ;;
-    *)  block W-002 "could not resolve write target against repo root '$REPO_ROOT'" ;;
-  esac
+# Fail-closed when REPO_ROOT is empty: we cannot determine what "inside the
+# repo" means, so any write must be blocked rather than allowed through.
+# This matches the bash-guard's "can't evaluate → block" stance.
+if [ -z "$REPO_ROOT" ]; then
+  block W-002 "cannot determine repo root — blocking write to unknown scope"
 fi
+case "$PATH_TARGET" in
+  "$REPO_ROOT"|"$REPO_ROOT"/*) : ;;
+  /*) block W-002 "write target outside repo root '$REPO_ROOT'" ;;
+  *)  block W-002 "could not resolve write target against repo root '$REPO_ROOT'" ;;
+esac
 
 # W-003: writes to sensitive paths
 case "$PATH_TARGET" in

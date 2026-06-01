@@ -28,12 +28,20 @@ CLAGENTIC_MODEL_CLAUDE_FLAGSHIP=opus
 CLAGENTIC_MODEL_CLAUDE_DEFAULT=sonnet
 CLAGENTIC_MODEL_CLAUDE_CHEAP=haiku
 #
-# Codex tiers — defaults assume a ChatGPT account (Plus/Pro/Free).
-# API-key accounts can also use gpt-5-codex / gpt-5.5-codex / etc.;
-# ChatGPT-account users CANNOT — those return HTTP 400.
-CLAGENTIC_MODEL_CODEX_FLAGSHIP=gpt-5.5
-CLAGENTIC_MODEL_CODEX_DEFAULT=gpt-5.5
-CLAGENTIC_MODEL_CODEX_CHEAP=gpt-5.5-mini
+# Codex tiers — by default, intentionally left blank so codex uses whatever
+# model is configured in ~/.codex/models.json (the live runtime tier map).
+# That file is the canonical source; clagentic-lite reads it automatically via
+# resolve_step. Do not hardcode model version strings here — they rot silently
+# when OpenAI renames models. Update ~/.codex/models.json instead.
+#
+# Tier name alignment: ~/.codex/models.json uses "flagship", "mini", "spark".
+# clagentic-lite resolves "default" → default_tier in models.json, and looks
+# up "mini"/"spark" directly. Env vars win if set, so you can override a
+# specific tier without touching models.json:
+# CLAGENTIC_MODEL_CODEX_FLAGSHIP=<specific-model-id>
+# CLAGENTIC_MODEL_CODEX_MINI=<specific-model-id>
+# CLAGENTIC_MODEL_CODEX_SPARK=<specific-model-id>
+# CLAGENTIC_MODEL_CODEX_CHEAP=<same-as-spark, for legacy :cheap chains>
 #
 # Add more CLI tables here if you point a role at a different CLI.
 # Example for a local ollama-backed entry:
@@ -50,26 +58,30 @@ CLAGENTIC_BUILDER_CHAIN=codex:default,claude:flagship
 
 # Reviewer = cross-vendor reviewer. A different CLI from Builder is recommended;
 # `clagentic-lite init` warns when they match.
+# Tier names in chains: use flagship/mini/spark for codex (matching models.json),
+# or flagship/default/cheap for claude. Both work; models.json names are canonical
+# for codex since that file is the live source of model strings.
 CLAGENTIC_REVIEWER_CMD=codex
-CLAGENTIC_REVIEWER_TIER=default
+CLAGENTIC_REVIEWER_TIER=flagship
 CLAGENTIC_REVIEWER_CHAIN=claude:default,codex:flagship
 
 # Auditor = LLM narration on top of deterministic scans (gitleaks/semgrep/osv).
 # The Auditor never gates. Local tools own the security path.
 CLAGENTIC_AUDITOR_CMD=codex
-CLAGENTIC_AUDITOR_TIER=default
+CLAGENTIC_AUDITOR_TIER=flagship
 CLAGENTIC_AUDITOR_CHAIN=claude:default
 
 # Merge-gate = final pre-merge sanity check. Reads all green-gate output,
 # either approves or refuses. Never opens a PR, never pushes.
 CLAGENTIC_GATE_CMD=claude
 CLAGENTIC_GATE_TIER=default
-CLAGENTIC_GATE_CHAIN=codex:default
+CLAGENTIC_GATE_CHAIN=codex:flagship
 
 # Summarizer = cheap model used for per-turn Stop-hook summaries.
+# Uses :spark (codex) / :cheap (claude) — the lightest available tier.
 CLAGENTIC_SUMMARIZER_CMD=claude
 CLAGENTIC_SUMMARIZER_TIER=cheap
-CLAGENTIC_SUMMARIZER_CHAIN=codex:cheap
+CLAGENTIC_SUMMARIZER_CHAIN=codex:spark
 
 # ---------- role enforcement ----------
 # By default, when every step in a role's chain fails, the wrapper emits a
