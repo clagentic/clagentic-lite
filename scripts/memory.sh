@@ -54,38 +54,74 @@ cmd_log_turn() {
   SOURCE="${3:-manual}"
   BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
   TS=$(ds_date_iso)
-  # Every interpolated value goes through ds_sql_escape. Including the branch —
+  # CLAGENTIC_MEMORY_MAX_ROWS: opportunistic row cap (default 5000).
+  # After each INSERT, oldest rows beyond the cap are silently pruned.
+  # No scheduler, no daemon — one DELETE per write path. Silent housekeeping.
+  MAX_ROWS="${CLAGENTIC_MEMORY_MAX_ROWS:-5000}"
+  # Integer guard: reject non-integer values (empty, float, or injection attempt)
+  # and fall back to the documented default. ds_sql_escape does not protect an
+  # unquoted numeric SQL position; the integer check makes the slot unconditionally safe.
+  case "$MAX_ROWS" in ''|*[!0-9]*) MAX_ROWS=5000 ;; esac
+  # String slots go through ds_sql_escape. Including the branch —
   # a value like `feat/o'hare` would otherwise break the INSERT.
   SUMMARY_ESC=$(ds_sql_escape "$SUMMARY")
   TAGS_ESC=$(ds_sql_escape "$TAGS")
   SOURCE_ESC=$(ds_sql_escape "$SOURCE")
   BRANCH_ESC=$(ds_sql_escape "$BRANCH")
   sqlite3 "$DB" \
-    "INSERT INTO turns (ts, branch, summary, tags, source) VALUES ('$TS', '$BRANCH_ESC', '$SUMMARY_ESC', '$TAGS_ESC', '$SOURCE_ESC');"
+    "INSERT INTO turns (ts, branch, summary, tags, source) VALUES ('$TS', '$BRANCH_ESC', '$SUMMARY_ESC', '$TAGS_ESC', '$SOURCE_ESC');
+DELETE FROM turns WHERE id NOT IN (SELECT id FROM turns ORDER BY ts DESC LIMIT $MAX_ROWS);"
 }
 
 cmd_recall() {
   cmd_init
+  # CLAGENTIC_RECALL_LIMIT: max rows returned (default 5).
+  RECALL_LIMIT="${CLAGENTIC_RECALL_LIMIT:-5}"
+  # Integer guard: reject non-integer values and fall back to the documented default.
+  # ds_sql_escape does not protect an unquoted numeric SQL LIMIT position.
+  case "$RECALL_LIMIT" in ''|*[!0-9]*) RECALL_LIMIT=5 ;; esac
+  # CLAGENTIC_RECALL_MAX_CHARS: hard cap on total injected text (default 1500).
+  # Whole rows are dropped from the tail; the last retained row is never split.
+  RECALL_MAX_CHARS="${CLAGENTIC_RECALL_MAX_CHARS:-1500}"
+  # Integer guard: reject non-integer values and fall back to the documented default.
+  # Used in shell arithmetic; a non-integer here would cause a syntax error or worse.
+  case "$RECALL_MAX_CHARS" in ''|*[!0-9]*) RECALL_MAX_CHARS=1500 ;; esac
   KW="$*"
   if [ -z "$KW" ]; then
-    sqlite3 -separator ' | ' "$DB" "SELECT ts, substr(summary,1,120) FROM turns ORDER BY ts DESC LIMIT 5;"
-    return
+    RAW=$(sqlite3 -separator ' | ' "$DB" "SELECT ts, substr(summary,1,120) FROM turns ORDER BY ts DESC LIMIT $RECALL_LIMIT;")
+  else
+    WHERE=""
+    for kw in $KW; do
+      # Quote-escape (for SQL injection) AND escape LIKE wildcards % and _
+      # (so a user prompt like "auth_check" doesn't match "authxcheck" etc.).
+      # The ESCAPE '\' clause on each LIKE tells SQLite to treat backslash as
+      # the wildcard-escape character.
+      KW_ESC=$(ds_sql_escape "$kw" | sed 's/\\/\\\\/g; s/%/\\%/g; s/_/\\_/g')
+      if [ -z "$WHERE" ]; then
+        WHERE="(summary LIKE '%$KW_ESC%' ESCAPE '\\' OR tags LIKE '%$KW_ESC%' ESCAPE '\\')"
+      else
+        WHERE="$WHERE OR (summary LIKE '%$KW_ESC%' ESCAPE '\\' OR tags LIKE '%$KW_ESC%' ESCAPE '\\')"
+      fi
+    done
+    RAW=$(sqlite3 -separator ' | ' "$DB" \
+      "SELECT ts, substr(summary,1,120) FROM turns WHERE $WHERE ORDER BY ts DESC LIMIT $RECALL_LIMIT;")
   fi
-  WHERE=""
-  for kw in $KW; do
-    # Quote-escape (for SQL injection) AND escape LIKE wildcards % and _
-    # (so a user prompt like "auth_check" doesn't match "authxcheck" etc.).
-    # The ESCAPE '\' clause on each LIKE tells SQLite to treat backslash as
-    # the wildcard-escape character.
-    KW_ESC=$(ds_sql_escape "$kw" | sed 's/\\/\\\\/g; s/%/\\%/g; s/_/\\_/g')
-    if [ -z "$WHERE" ]; then
-      WHERE="(summary LIKE '%$KW_ESC%' ESCAPE '\\' OR tags LIKE '%$KW_ESC%' ESCAPE '\\')"
-    else
-      WHERE="$WHERE OR (summary LIKE '%$KW_ESC%' ESCAPE '\\' OR tags LIKE '%$KW_ESC%' ESCAPE '\\')"
+  # Apply RECALL_MAX_CHARS: accumulate lines until the budget is exhausted,
+  # then drop trailing rows whole (never split mid-row).
+  # Uses a temp file to avoid the pipe-subshell variable-isolation trap.
+  _recall_tmp=$(mktemp -t clagentic-recall.XXXXXX)
+  printf '%s\n' "$RAW" > "$_recall_tmp"
+  USED=0
+  while IFS= read -r _rl; do
+    _rl_len=$(printf '%s\n' "$_rl" | wc -c)
+    if [ $((USED + _rl_len)) -gt "$RECALL_MAX_CHARS" ]; then
+      # Budget exhausted — drop this and all remaining rows.
+      break
     fi
-  done
-  sqlite3 -separator ' | ' "$DB" \
-    "SELECT ts, substr(summary,1,120) FROM turns WHERE $WHERE ORDER BY ts DESC LIMIT 5;"
+    printf '%s\n' "$_rl"
+    USED=$((USED + _rl_len))
+  done < "$_recall_tmp"
+  rm -f "$_recall_tmp"
 }
 
 cmd_summarize_turn() {

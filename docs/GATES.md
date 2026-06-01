@@ -9,7 +9,7 @@ Each gate is documented here: what it does, where it fires, what blocks, how to 
 | **Fires** | `UserPromptSubmit` (every prompt) |
 | **Tool** | `scripts/memory.sh recall` |
 | **Blocks?** | No (read-only context injection) |
-| **Output** | Up to 3 prior session summaries prepended to the prompt as additional context |
+| **Output** | Up to `CLAGENTIC_RECALL_LIMIT` (default 5) prior session summaries prepended, capped at `CLAGENTIC_RECALL_MAX_CHARS` (default 1500) total chars |
 | **Disable** | `CLAGENTIC_DISABLE_RECALL=1` |
 
 Keyword extraction is the simplest thing that works: strip stopwords from the prompt, take tokens ≥4 chars, `LIKE %token%` against the `tags` and `summary` columns. Top N by recency. If nothing matches, inject nothing.

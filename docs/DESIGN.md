@@ -19,7 +19,7 @@ clagentic-lite is the smallest credible expression of that thesis. It is built t
 
 | # | Gate | Trigger | Mechanism | Blocking |
 |---|------|---------|-----------|----------|
-| 1 | **Memory recall** | `UserPromptSubmit` | `scripts/memory.sh recall <keywords>` → top N summaries injected | no |
+| 1 | **Memory recall** | `UserPromptSubmit` | `scripts/memory.sh recall <keywords>` → top `CLAGENTIC_RECALL_LIMIT` (default 5) summaries injected, capped at `CLAGENTIC_RECALL_MAX_CHARS` (default 1500) chars | no |
 | 2 | **Safe Bash + writes** | `PreToolUse` (Bash, Write, Edit) | regex deny-list on dangerous commands; path-scope check; default-branch protection; hooks fail closed when no JSON validator (jq/python3) available | yes |
 | 3 | **Cross-CLI review** | `/review` slash command, optional pre-push | Builder's staged diff piped to Reviewer; schema-validated JSON findings | findings ≥ `BLOCK_SEVERITY` block `/ship`; degraded envelopes also block |
 | 4 | **Local security scan** | git `pre-commit` (secrets) and `pre-push` (deps, SAST) | gitleaks; osv-scanner; semgrep --error --severity=ERROR. Missing tool fails closed unless `CLAGENTIC_ALLOW_MISSING_*=1` | yes |
@@ -66,6 +66,14 @@ CREATE INDEX idx_turns_tags ON turns(tags);
 ```
 
 Recall is `SELECT summary FROM turns WHERE (summary LIKE ?) OR (tags LIKE ?) ORDER BY ts DESC LIMIT N` with prompt-keyword extraction in shell. No vector search. The SQLite `LIKE` over a few thousand rows is microseconds; if a project ever produces enough history that this becomes slow, that project has outgrown clagentic-lite.
+
+Three env vars govern the recall and retention budget (code defaults; override in `~/.config/clagentic/config` or `.clagentic/config`):
+
+| Var | Default | Effect |
+|---|---|---|
+| `CLAGENTIC_RECALL_LIMIT` | `5` | Max rows returned by `recall` (the SQL `LIMIT`). |
+| `CLAGENTIC_RECALL_MAX_CHARS` | `1500` | Hard cap on total injected text per recall call. Whole rows are dropped from the tail — no mid-row splits that would corrupt the ` | ` separator parse contract. |
+| `CLAGENTIC_MEMORY_MAX_ROWS` | `5000` | Row cap enforced opportunistically after each `log-turn` INSERT. One `DELETE` of the oldest rows beyond the cap; no scheduler, no daemon. |
 
 ## Cross-CLI review — concrete flow
 

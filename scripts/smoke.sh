@@ -323,6 +323,61 @@ else
   bad "audit.db gate_runs has no recent rows"
 fi
 
+# ----------------------------------------- 10. remember verb (source=manual)
+
+step "10. clagentic-lite remember inserts a source=manual row"
+if CLAGENTIC_HOME="$TOOL_HOME" CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
+    "$TOOL_HOME/bin/clagentic-lite" remember "smoke test manual note" "smoke manual" >/dev/null 2>&1; then
+  _manual_count=$(sqlite3 "$REPO_ROOT/.clagentic/memory.db" \
+    "SELECT COUNT(*) FROM turns WHERE source='manual' AND summary='smoke test manual note';" 2>/dev/null || echo 0)
+  if [ "${_manual_count:-0}" -ge 1 ]; then
+    ok "remember inserted a source=manual row"
+  else
+    bad "remember ran but no source=manual row found"
+  fi
+else
+  bad "clagentic-lite remember exited non-zero"
+fi
+
+# ---------------------------------------------------- 11. row-cap pruning
+
+step "11. CLAGENTIC_MEMORY_MAX_ROWS row-cap pruning"
+_cap=10
+# Insert rows exceeding the cap with an artificially low cap, then assert
+# the DB count stays at the cap.
+i=0
+while [ $i -lt 15 ]; do
+  CLAGENTIC_MEMORY_MAX_ROWS="$_cap" CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
+    "$TOOL_HOME/scripts/memory.sh" log-turn "row-cap smoke row $i" "smoke cap" "seed" >/dev/null 2>&1
+  i=$((i+1))
+done
+_row_count=$(sqlite3 "$REPO_ROOT/.clagentic/memory.db" \
+  "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
+if [ "${_row_count:-0}" -le "$_cap" ]; then
+  ok "row cap enforced: $_row_count rows <= cap $_cap"
+else
+  bad "row cap not enforced: $_row_count rows in DB (cap was $_cap)"
+fi
+
+# ------------------------------------------------- 12. integer-guard: garbage MAX_ROWS
+
+step "12. garbage CLAGENTIC_MEMORY_MAX_ROWS falls back to default (no crash, no injection)"
+# Pass a non-integer value that would be a SQL injection attempt if unguarded.
+# The guard (Peaches lr-61b1) must cause a safe fallback: the command exits 0
+# and the DB is not corrupted.
+_before_count=$(sqlite3 "$REPO_ROOT/.clagentic/memory.db" "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
+if CLAGENTIC_MEMORY_MAX_ROWS='1; DROP TABLE turns; --' CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
+    "$TOOL_HOME/scripts/memory.sh" log-turn "guard test row" "guard" "smoke" >/dev/null 2>&1; then
+  _after_count=$(sqlite3 "$REPO_ROOT/.clagentic/memory.db" "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
+  if [ "${_after_count:-0}" -ge "${_before_count:-0}" ]; then
+    ok "garbage MAX_ROWS fell back cleanly; turns table intact ($_after_count rows)"
+  else
+    bad "turns table disappeared after garbage MAX_ROWS injection attempt"
+  fi
+else
+  bad "memory.sh log-turn crashed on garbage CLAGENTIC_MEMORY_MAX_ROWS"
+fi
+
 # -------------------------------------------------------------------- summary
 
 printf '\n[smoke] passed: %s   failed: %s\n' "$PASS" "$FAIL"
