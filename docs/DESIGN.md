@@ -65,7 +65,38 @@ CREATE INDEX idx_turns_ts   ON turns(ts);
 CREATE INDEX idx_turns_tags ON turns(tags);
 ```
 
-Recall is `SELECT summary FROM turns WHERE (summary LIKE ?) OR (tags LIKE ?) ORDER BY ts DESC LIMIT N` with prompt-keyword extraction in shell. No vector search. The SQLite `LIKE` over a few thousand rows is microseconds; if a project ever produces enough history that this becomes slow, that project has outgrown clagentic-lite.
+Recall is LIKE-based keyword search over `summary` and `tags` with prompt-keyword extraction in shell. No vector search. The SQLite `LIKE` over a few thousand rows is microseconds; if a project ever produces enough history that this becomes slow, that project has outgrown clagentic-lite.
+
+### Recall ordering — pin-first
+
+`ORDER BY (source='manual') DESC, ts DESC`
+
+Rows where `source='manual'` sort above all auto-generated rows regardless of timestamp. Within each group (manual and non-manual) ordering is recency-descending. The `[pin]` prefix is prepended to the display text of every manual row so the user can see which entries are pinned.
+
+Ordering is determined solely by `source` and `ts` — user-authored facts. Computed values such as the seen-N occurrence count (below) never appear in `ORDER BY` or `WHERE`.
+
+### Display-only seen-N annotation
+
+When two or more rows share the same summary prefix (first 60 characters), each occurrence in recall or digest output is annotated with `(seen N)` where N is the occurrence count. This is a display-only annotation:
+
+- It is computed in a correlated subquery and appended to the rendered text.
+- It never affects ordering, filtering, or the row set returned.
+- It is omitted when N = 1 (no duplicates).
+
+The goal is to let the user recognize repeated summaries without hiding any row. Both (or all) duplicate rows appear in the output; the annotation is additive text only.
+
+### Tag-grouped digest
+
+`memory.sh digest` groups recent entries by the first literal tag token in the `tags` column rather than showing a flat list. Entries with no tags appear under `(untagged)`. The grouping key is the raw string the user or summarizer wrote — not computed similarity. Ordering within and across groups is recency-descending (`ORDER BY ts DESC`); the seen-N annotation follows the same display-only rule.
+
+### Defaults
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CLAGENTIC_RECALL_LIMIT` | `5` | Maximum rows returned by `recall` |
+| `CLAGENTIC_RECALL_MAX_CHARS` | `1500` | Hard cap on total injected text; whole rows dropped from the tail |
+
+Non-integer values for either variable fall back silently to the documented default.
 
 Three env vars govern the recall and retention budget (code defaults; override in `~/.config/clagentic/config` or `.clagentic/config`):
 
