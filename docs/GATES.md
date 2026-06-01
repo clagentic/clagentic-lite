@@ -90,10 +90,10 @@ Three independent sub-gates run as standard git hooks:
 
 | | |
 |---|---|
-| **Tool** | `osv-scanner scan --recursive --config=<tmpfile> .` (v1.9+) or `osv-scanner --recursive --severity=<S> .` (v1.8 and earlier). Version probed by subcommand availability, not version string. |
+| **Tool** | `osv-scanner scan --recursive --format=json --config=<tmpfile> .` (newer releases) or `osv-scanner --recursive --severity=<S> .` (older releases). Version probed by subcommand availability, not version string. |
 | **Blocks?** | Yes, on vulnerabilities at or above the configured severity. Default is `CRITICAL`. |
-| **Severity** | Set `CLAGENTIC_OSV_SEVERITY` in `~/.config/clagentic/config` or `.clagentic/config`. Values: `CRITICAL` (default), `HIGH`, `MEDIUM`, `LOW`. Set `LOW` to restore block-on-any-finding behavior. For v1.9+, this becomes `MinimumSeverity` in a generated temp config passed via `--config`. |
-| **Ignore list** | Add CVE/GHSA IDs one-per-line to `~/.config/clagentic/osv-ignore` (global) or `.clagentic/osv-ignore` (repo). Lines starting with `#` and blank lines are ignored. For v1.9+, these become `[[IgnoredVulns]]` blocks in the generated temp config; for v1.8 and earlier, they are passed as `--ignore-vulns=<id>`. |
+| **Severity** | Set `CLAGENTIC_OSV_SEVERITY` in `~/.config/clagentic/config` or `.clagentic/config`. Values: `CRITICAL` (default), `HIGH`, `MEDIUM`, `LOW`. Set `LOW` to restore block-on-any-finding behavior. Newer releases no longer expose a scan-time severity filter, so clagentic-lite captures JSON and applies the threshold to osv-scanner's computed `max_severity` values. Missing or malformed severity data blocks fail-closed. |
+| **Ignore list** | Add CVE/GHSA IDs one-per-line to `~/.config/clagentic/osv-ignore` (global) or `.clagentic/osv-ignore` (repo). Lines starting with `#` and blank lines are ignored. For newer releases, these become `[[IgnoredVulns]]` blocks in the generated temp config; for older releases, they are passed as `--ignore-vulns=<id>`. |
 | **Missing tool** | Set `CLAGENTIC_ALLOW_MISSING_OSV=1` to skip if osv-scanner is not installed. |
 
 ### 4c. SAST (pre-push)

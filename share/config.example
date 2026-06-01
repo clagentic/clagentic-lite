@@ -81,7 +81,8 @@ CLAGENTIC_GATES=secrets,deps,sast,review,adversarial,merge-gate
 CLAGENTIC_BLOCK_SEVERITY=high
 
 # osv-scanner severity threshold. Only vulnerabilities at this level or above block the gate.
-# Options: CRITICAL, HIGH, MEDIUM, LOW (osv-scanner native values). Default: CRITICAL.
+# Options: CRITICAL, HIGH, MEDIUM, LOW. Default: CRITICAL. Newer osv-scanner
+# releases expose severity in JSON; clagentic-lite applies this threshold locally.
 # Set to LOW to restore the original block-on-any-finding behavior.
 CLAGENTIC_OSV_SEVERITY=CRITICAL
 
@@ -134,4 +135,3 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # Allow writes to the default branch (disables W-001 in pre-write-guard).
 # Only set this if you are intentionally working directly on the default branch.
 # CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1
-
