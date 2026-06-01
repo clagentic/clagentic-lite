@@ -68,6 +68,7 @@ Write rules:
 | **Blocks?** | (a) Findings ≥ `${CLAGENTIC_BLOCK_SEVERITY}` block `/ship`; (b) degraded envelopes (every Reviewer chain step failed) block; (c) unparseable JSON blocks (sentinel value 99). |
 | **Default severity** | `high` |
 | **Per-call timeout** | `${CLAGENTIC_LLM_TIMEOUT_SEC}` seconds (default 180). Hung CLI → step failure → chain advances. |
+| **Required-role enforcement** | `CLAGENTIC_REVIEWER_REQUIRED=1` makes a full-chain failure a hard gate error (non-zero exit) instead of a degraded envelope. Use when the cross-vendor property is non-negotiable and a same-vendor fallback must be a visible failure rather than a silent degradation. Applies to any role: `CLAGENTIC_<ROLE>_REQUIRED=1`. |
 
 Reviewer prompt and JSON schema are pinned in `.claude/agents/reviewer.md` (Pre-Report Gate + Common False Positives list). Output is persisted at `.clagentic/last-review.json` and into `audit.db.gate_runs`. Per-step LLM-call attempts are logged separately (`gate=llm-call`) with a one-line error hint from stderr.
 
@@ -177,6 +178,7 @@ CLAGENTIC_TAIL_INTERVAL_SEC=2 scripts/gates.sh tail   # adjust poll interval
 | Gate 4c — SAST | False-positive semgrep rule | Add the file path to `.semgrepignore`, or add `# nosemgrep: <rule-id> — <reason>` inline. |
 | Gate 2 — bash guard | Legitimate command blocked by a rule | Set `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` in `.clagentic/config`. Multiple rules: comma-separated. Add a comment explaining why in the commit. |
 | Gate 2 — write guard (W-001) | Intentional work on default branch | Set `CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1` in `.clagentic/config`. This is unusual — default-branch protection exists for good reason. |
+| Gate 3 — review | Cross-vendor fallback silently taken | Set `CLAGENTIC_REVIEWER_REQUIRED=1` to make chain failure a hard error. Chain fallback becomes visible in audit trail and the gate blocks rather than emitting a degraded envelope. |
 | Any gate | Tool not installed | Set `CLAGENTIC_ALLOW_MISSING_<TOOL>=1`. Prefer installing the tool. |
 
 **Agents: if a gate blocks you, consult this table first.** Editing `pre-bash-guard.sh`, `pre-write-guard.sh`, or `scripts/gates.sh` to remove a rule or suppress a finding is a contract violation — it removes the protection for all future sessions, not just the one where it was inconvenient. Use the config bypass and explain why.
