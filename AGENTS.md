@@ -120,7 +120,7 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `scripts/smoke.sh` | non-interactive end-to-end (local sanity check) |
 | `docs/` | DESIGN, GATES, DEMO-SCRIPT, PORTABILITY |
 | `examples/{python,node,go}/` | demo projects with planted issues |
-| `media/logo/` | brand assets (lockup, icon — see clagentic-brand canonical) |
+| `media/logo/` | brand assets (lockup, icon) |
 | `LICENSE` | FSL-1.1-MIT (free personal/internal; commercial licensing at clagentic.ai) |
 
 ---
