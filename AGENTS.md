@@ -14,6 +14,12 @@ clagentic-lite is intentionally small. New features must justify themselves agai
 
 The non-goals list in `docs/DESIGN.md` is binding. Do not add: a server, a daemon, a vector database, an embedding model, a web UI, a plugin marketplace, multi-agent orchestration, or multi-repo state. Propose those as separate projects.
 
+#### Memory feature bright-line test
+
+"Lite may DISPLAY any number the user could verify by eye; lite may not let a number it COMPUTED DECIDE what you see. Ordering is permitted only on facts the user authored directly — recency (ts) and intent (source='manual') — never on a score derived from the corpus. If a user could ever reasonably ask 'why did recall return that and not this?' and the only honest answer involves a number the tool computed (a score, weight, decay, or index rank), the feature belongs in LORE, not lite."
+
+Mechanical form: a computed number is lite-legal only if the result set the user sees would be byte-identical with the number deleted. Ranking, gating, weighting, or decay that changes which rows appear — out. Counts, last-seen timestamps, or tags that annotate a set produced by the user's own words or pins — in. (Ratified in hc-2026-06-01-litemem, tome #552.)
+
 ### 2. Portability is a hard constraint
 
 All shell code is **POSIX sh**. No bash-4 features (associative arrays, `${var^^}`, `mapfile`, `[[ =~ ]]` capture groups). All `sed`/`date`/`stat`/`find` invocations go through `scripts/platform.sh` shims. See `docs/PORTABILITY.md` for the GNU/BSD differences table.
