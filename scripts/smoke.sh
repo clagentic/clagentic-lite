@@ -343,8 +343,6 @@ fi
 
 step "11. CLAGENTIC_MEMORY_MAX_ROWS row-cap pruning"
 _cap=10
-# Insert rows exceeding the cap with an artificially low cap, then assert
-# the DB count stays at the cap.
 i=0
 while [ $i -lt 15 ]; do
   CLAGENTIC_MEMORY_MAX_ROWS="$_cap" CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
@@ -362,9 +360,6 @@ fi
 # ------------------------------------------------- 12. integer-guard: garbage MAX_ROWS
 
 step "12. garbage CLAGENTIC_MEMORY_MAX_ROWS falls back to default (no crash, no injection)"
-# Pass a non-integer value that would be a SQL injection attempt if unguarded.
-# The guard (Peaches lr-61b1) must cause a safe fallback: the command exits 0
-# and the DB is not corrupted.
 _before_count=$(sqlite3 "$REPO_ROOT/.clagentic/memory.db" "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
 if CLAGENTIC_MEMORY_MAX_ROWS='1; DROP TABLE turns; --' CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
     "$TOOL_HOME/scripts/memory.sh" log-turn "guard test row" "guard" "smoke" >/dev/null 2>&1; then
@@ -377,6 +372,93 @@ if CLAGENTIC_MEMORY_MAX_ROWS='1; DROP TABLE turns; --' CLAGENTIC_PROJECT_ROOT="$
 else
   bad "memory.sh log-turn crashed on garbage CLAGENTIC_MEMORY_MAX_ROWS"
 fi
+
+# ---------------------------------- 13. pin-first: manual row surfaces before newer auto row
+
+step "13. pin-first recall: source=manual row surfaces before newer auto rows (lr-17a8)"
+_pin_db="$REPO_ROOT/.clagentic/memory.db"
+sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-smoke%';" 2>/dev/null || true
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-01-02T00:00:00Z', 'smoke', 'lr17a8-smoke auto row newer', 'smoke', 'stop-hook');"
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-01-01T00:00:00Z', 'smoke', 'lr17a8-smoke manual row pinned older', 'smoke', 'manual');"
+_pin_recall=$(CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" "$TOOL_HOME/scripts/memory.sh" recall lr17a8-smoke 2>&1)
+_pin_first=$(printf '%s\n' "$_pin_recall" | grep 'lr17a8-smoke' | head -1)
+if printf '%s' "$_pin_first" | grep -q '\[pin\]'; then
+  ok "pin-first: manual row appeared first in recall output"
+else
+  bad "pin-first: manual row did NOT appear first; first line was: $_pin_first"
+fi
+if printf '%s' "$_pin_first" | grep -q ' | \[pin\]'; then
+  ok "pin-first: [pin] marker is in the summary column (separator contract preserved)"
+else
+  bad "pin-first: [pin] marker not in expected position; line: $_pin_first"
+fi
+sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-smoke%';" 2>/dev/null || true
+
+# ---------------------------------- 14. seen-N: count shown when duplicates exist
+
+step "14. seen-N: '(seen 2)' shown when two rows share the same summary prefix (lr-17a8)"
+sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-seen%';" 2>/dev/null || true
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-02-01T00:00:00Z', 'smoke', 'lr17a8-seen duplicate summary for smoke test', 'smoke', 'stop-hook');"
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-02-02T00:00:00Z', 'smoke', 'lr17a8-seen duplicate summary for smoke test', 'smoke', 'stop-hook');"
+_seen_recall=$(CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" "$TOOL_HOME/scripts/memory.sh" recall lr17a8-seen 2>&1)
+if printf '%s' "$_seen_recall" | grep -q '(seen 2)'; then
+  ok "seen-N: '(seen 2)' annotation present for duplicate summary rows"
+else
+  bad "seen-N: '(seen 2)' not found in recall output; got: $_seen_recall"
+fi
+_seen_count=$(printf '%s\n' "$_seen_recall" | grep -c 'lr17a8-seen')
+if [ "${_seen_count:-0}" -ge 2 ]; then
+  ok "seen-N: both duplicate rows present (count annotation does not filter rows)"
+else
+  bad "seen-N: expected 2 lr17a8-seen rows, got $_seen_count"
+fi
+sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-seen%';" 2>/dev/null || true
+
+# ---- 11b. ordering proof: seen-N count does not drive ORDER; recency holds for
+#           non-pinned rows and pin-first holds for pinned rows.
+#
+# Setup: three rows — a manual pin (older ts) and two auto rows (newer ts, one of
+# which is a duplicate of a third row so it carries a seen-2 count).  Expected order:
+#   1. manual pin    (source=manual, oldest ts — must surface FIRST due to pin-first)
+#   2. newer auto    (source=stop-hook, ts=2021-03-03, no duplicate → no seen count)
+#   3. older auto    (source=stop-hook, ts=2021-03-01, duplicate → seen-2)
+# If the seen-N count were driving order, the high-count row would drift upward.
+# Verifying the manual pin is first AND the auto rows appear in ts-descending order
+# proves both properties simultaneously without any interactive input.
+
+step "11b. ordering proof: pin-first overrides recency; seen-N never drives ORDER"
+sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-ord%';" 2>/dev/null || true
+# Older manual pin
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-01T00:00:00Z', 'smoke', 'lr17a8-ord pinned manual row', 'lr17a8ord', 'manual');"
+# Newer auto, no duplicate (unique prefix)
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-03T00:00:00Z', 'smoke', 'lr17a8-ord auto unique newer', 'lr17a8ord', 'stop-hook');"
+# Older auto with a duplicate to trigger seen-2 annotation
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-01T00:00:01Z', 'smoke', 'lr17a8-ord auto duplicate older A', 'lr17a8ord', 'stop-hook');"
+sqlite3 "$_pin_db" \
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-01T00:00:00Z', 'smoke', 'lr17a8-ord auto duplicate older A', 'lr17a8ord', 'stop-hook');"
+_ord_recall=$(CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" "$TOOL_HOME/scripts/memory.sh" recall lr17a8-ord 2>&1)
+# Line 1 must be the pin.
+_ord_line1=$(printf '%s\n' "$_ord_recall" | grep 'lr17a8-ord' | sed -n '1p')
+# Line 2 must be the newer auto row (ts=2021-03-03), NOT the duplicate.
+_ord_line2=$(printf '%s\n' "$_ord_recall" | grep 'lr17a8-ord' | sed -n '2p')
+if printf '%s' "$_ord_line1" | grep -q '\[pin\]'; then
+  ok "ord-proof: pin row is first"
+else
+  bad "ord-proof: pin row is NOT first; got: $_ord_line1"
+fi
+if printf '%s' "$_ord_line2" | grep -q 'auto unique newer'; then
+  ok "ord-proof: newer auto (no seen count) is second — seen-N does not drive order"
+else
+  bad "ord-proof: expected 'auto unique newer' at position 2; got: $_ord_line2"
+fi
+sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-ord%';" 2>/dev/null || true
 
 # -------------------------------------------------------------------- summary
 
