@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 112" width="112" height="112">
+  <defs>
+    <linearGradient id="grad" gradientUnits="userSpaceOnUse" x1="8" y1="8" x2="104" y2="104">
+      <stop offset="0%"   stop-color="#00CFFF"/>
+      <stop offset="45%"  stop-color="#4A7FE8"/>
+      <stop offset="100%" stop-color="#7B3FE4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Standard terminal frame -->
+  <rect x="8" y="8" width="96" height="96" rx="8" ry="8"
+        fill="none" stroke="url(#grad)" stroke-width="4.5"/>
+
+  <!-- Central node: solid filled circle -->
+  <circle cx="56" cy="56" r="7"
+          fill="url(#grad)" stroke="none"/>
+
+  <!-- Top-left satellite: small open circle -->
+  <circle cx="32" cy="34" r="5"
+          fill="none" stroke="url(#grad)" stroke-width="2.5"/>
+
+  <!-- Bottom-right satellite: small open circle -->
+  <circle cx="80" cy="78" r="5"
+          fill="none" stroke="url(#grad)" stroke-width="2.5"/>
+
+  <!-- Top-right satellite: small open circle -->
+  <circle cx="80" cy="34" r="5"
+          fill="none" stroke="url(#grad)" stroke-width="2.5"/>
+
+  <!-- Connector: top-left to center -->
+  <line x1="37" y1="38" x2="50" y2="50"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- Connector: top-right to center -->
+  <line x1="75" y1="38" x2="62" y2="50"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- Connector: center to bottom-right -->
+  <line x1="62" y1="62" x2="75" y2="73"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- Orbit arc: partial circle suggesting lightweight, orbital motion -->
+  <path d="M 36 56 A 20 20 0 0 1 56 36"
+        fill="none" stroke="url(#grad)" stroke-width="1.5" stroke-linecap="round" opacity="0.4"/>
+
+  <!-- Orbit arc: lower half, dashed feel via short path -->
+  <path d="M 76 56 A 20 20 0 0 1 56 76"
+        fill="none" stroke="url(#grad)" stroke-width="1.5" stroke-linecap="round" opacity="0.4"/>
+
+</svg>
