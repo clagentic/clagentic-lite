@@ -211,15 +211,32 @@ role_chain() {
   PRI_TIER=$(role_env "$RU" TIER "default")
   [ -n "$PRI_CMD" ] && printf '%s:%s\n' "$PRI_CMD" "$PRI_TIER"
   CHAIN=$(role_env "$RU" CHAIN "")
-  [ -z "$CHAIN" ] && return 0
-  # Split on commas. POSIX-safe.
-  OLD_IFS="$IFS"; IFS=,
-  for entry in $CHAIN; do
-    # Trim surrounding whitespace.
-    e=$(printf '%s' "$entry" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    [ -n "$e" ] && printf '%s\n' "$e"
-  done
-  IFS="$OLD_IFS"
+  if [ -n "$CHAIN" ]; then
+    # Split on commas. POSIX-safe.
+    OLD_IFS="$IFS"; IFS=,
+    for entry in $CHAIN; do
+      # Trim surrounding whitespace.
+      e=$(printf '%s' "$entry" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+      [ -n "$e" ] && printf '%s\n' "$e"
+    done
+    IFS="$OLD_IFS"
+  fi
+  # Summarizer-only code-level default. Gate 7 (Stop-hook per-turn summary) is
+  # best-effort; older installs whose config predates the CLAGENTIC_SUMMARIZER_*
+  # block resolve an empty chain and emit a noisy degraded banner. If the
+  # summarizer has no primary CMD and no CHAIN, fall back to the Builder's
+  # configured CLI at the cheapest tier the project uses for summaries. Anyone
+  # who can run the tool at all has a Builder configured, so the summarizer then
+  # silently works. Scoped to SUMMARIZER on purpose: a missing reviewer/auditor/
+  # gate is a real problem and must stay visible — only the summarizer is benign.
+  if [ "$RU" = "SUMMARIZER" ] && [ -z "$PRI_CMD" ] && [ -z "$CHAIN" ]; then
+    BUILDER_CMD=$(role_env BUILDER CMD "")
+    [ -n "$BUILDER_CMD" ] && printf '%s:cheap\n' "$BUILDER_CMD"
+  fi
+  # Always succeed: role_chain is consumed in a command substitution under
+  # `set -e`. A trailing false test (empty builder fallback) would otherwise
+  # propagate non-zero and abort the caller mid-resolution.
+  return 0
 }
 
 # ----------------------------------------------------------- CLI invocation ---
@@ -435,8 +452,16 @@ walk_chain() {
   role_chain "$ROLE_U" > "$TMP_CHAIN"
 
   if [ ! -s "$TMP_CHAIN" ]; then
-    emit_degraded "$MODE" "no chain configured for role $ROLE_L"
-    log_attempt "$ROLE_L" "" "" "degraded" ""
+    if [ "$ROLE_U" = "SUMMARIZER" ]; then
+      # Best-effort role with no chain (and no Builder fallback): emit nothing
+      # and log a clean skip. memory.sh cmd_summarize_turn already guards on an
+      # empty summary ("empty summary, skipping"), so empty stdout is the
+      # correct silent no-op. No scary degraded banner for a benign role.
+      log_attempt "$ROLE_L" "" "" "skip" "no chain configured"
+    else
+      emit_degraded "$MODE" "no chain configured for role $ROLE_L"
+      log_attempt "$ROLE_L" "" "" "degraded" ""
+    fi
     rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
     return 0
   fi

@@ -100,6 +100,47 @@ if [ "$MODE" != "--quick" ]; then
   fi
 fi
 
+# ------------------------------------- 5b. summarizer skips cleanly (no config)
+
+# Gate 7 is best-effort. With no summarizer chain AND no Builder fallback, the
+# wrapper must emit EMPTY stdout (so memory.sh's empty-summary guard skips
+# silently) and must NOT print a degraded banner. Run with all relevant role
+# vars unset in a subshell so we exercise the genuine no-chain path.
+step "5b. summarizer with no chain skips cleanly (no degraded banner)"
+SUMM_OUT=$(env -u CLAGENTIC_SUMMARIZER_CMD -u CLAGENTIC_SUMMARIZER_TIER \
+  -u CLAGENTIC_SUMMARIZER_CHAIN -u CLAGENTIC_BUILDER_CMD \
+  sh -c 'printf "" | "$1" summarize' _ "$TOOL_HOME/scripts/llm-client.sh" 2>/dev/null || true)
+if [ -z "$(printf '%s' "$SUMM_OUT" | tr -d '[:space:]')" ]; then
+  ok "summarizer emitted empty output on no-chain (clean skip)"
+else
+  bad "summarizer emitted non-empty output on no-chain: $SUMM_OUT"
+fi
+if printf '%s' "$SUMM_OUT" | grep -q 'degraded'; then
+  bad "summarizer printed a degraded banner on no-chain (should be silent)"
+else
+  ok "summarizer printed no degraded banner on no-chain"
+fi
+
+# With a Builder configured but no summarizer chain, the wrapper must attempt
+# the Builder CLI at :cheap rather than skipping. We point the Builder at a
+# guaranteed-absent CLI so invoke_step short-circuits with exit 127 (no network
+# call, fully offline) and the audit row records a step-failed for that CLI —
+# proving the fallback was resolved and tried, not skipped. The CLI name is
+# unique so we can match it precisely in the audit trail.
+step "5c. summarizer falls back to Builder CLI when Builder is configured"
+FAKE_CLI="clagentic-smoke-absent-$$"
+env -u CLAGENTIC_SUMMARIZER_CMD -u CLAGENTIC_SUMMARIZER_TIER \
+  -u CLAGENTIC_SUMMARIZER_CHAIN CLAGENTIC_BUILDER_CMD="$FAKE_CLI" \
+  CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
+  sh -c 'printf "" | "$1" summarize' _ "$TOOL_HOME/scripts/llm-client.sh" >/dev/null 2>&1 || true
+if sqlite3 "$REPO_ROOT/.clagentic/audit.db" \
+  "SELECT 1 FROM gate_runs WHERE gate='llm-call' AND details LIKE 'summarizer:$FAKE_CLI:%' AND ts > datetime('now','-1 hour') LIMIT 1;" \
+  2>/dev/null | grep -q 1; then
+  ok "summarizer attempted builder CLI fallback (audit row for $FAKE_CLI)"
+else
+  bad "no audit row for summarizer builder-CLI fallback; fallback not resolved"
+fi
+
 # ----------------------------------------------------------------- 6. digest
 
 step "6. gates.sh digest runs"
