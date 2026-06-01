@@ -259,7 +259,7 @@ Any CLI that accepts a prompt and emits text works. Add a row to the model table
 CLAGENTIC_MODEL_OLLAMA_DEFAULT=llama3.1:8b
 ```
 
-…then reference it in a chain (`CLAGENTIC_REVIEWER_CHAIN=claude:default,ollama:default`). The wrapper's generic invocation path is `<cli> -p -` with prompt+input on stdin; CLIs that need a different surface need a case in `invoke_step` in `scripts/llm-client.sh`.
+…then reference it in a chain (`CLAGENTIC_REVIEWER_CHAIN=claude:default,ollama:default`). The wrapper's generic invocation path is `<cli> -p -` with prompt+input on stdin; CLIs that need a different invocation surface need their own `invoke_<cli>` function in `scripts/llm-client.sh` (see `invoke_claude` and `invoke_codex` for the pattern).
 
 ---
 
@@ -323,7 +323,7 @@ The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). Your enrolled
 | **Auditor** | codex | LLM narration on top of deterministic security scans. Adversarial mode plays attacker. | Read, Bash (security tools) |
 | **Merge Gate** | claude | Final approve/refuse decision over every prior gate's output. Never opens PRs. | Read |
 
-Each role is a markdown file under `.claude/agents/` with the `model_chain` frontmatter and the role contract in the body. The Reviewer file is the longest — it carries the Pre-Report Gate and the Common False Positives list, both load-bearing for output quality.
+Each role is a markdown file under `.claude/agents/` with the role contract in the body. Model selection for non-interactive invocations (via `llm-client.sh`) is controlled by `CLAGENTIC_<ROLE>_CMD` and `CLAGENTIC_<ROLE>_TIER` in config. The Reviewer file is the longest — it carries the Pre-Report Gate and the Common False Positives list, both load-bearing for output quality.
 
 ---
 
