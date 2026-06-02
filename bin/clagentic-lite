@@ -11,6 +11,8 @@
 #   update [--restamp]                    git pull + re-prereq + re-stamp shims
 #   recall [keywords...]                  search session memory for matching summaries
 #   remember "<note>" [tags]              store a manual memory entry
+#   show memory|gates [N]         pretty-print last N rows from .clagentic/ DBs
+#   export [--output PATH]        write self-contained HTML report of memory + gates
 #
 # Design: tool is cloned once (default: ~/.clagentic-lite, override via
 # $CLAGENTIC_HOME). Per-repo enrollment writes .clagentic/{audit,memory}.db,
@@ -1349,6 +1351,279 @@ cmd_update() {
   say "update complete (re-stamped $_restamped artifact(s))"
 }
 
+# ---------------------------------------------------------------- show
+
+cmd_show() {
+  _show_sub="${1:-}"
+  _show_n="${2:-10}"
+  # validate _show_n is a positive integer
+  case "$_show_n" in
+    ''|*[!0-9]*) die "show: N must be a positive integer, got: $_show_n" ;;
+  esac
+
+  _show_root="${CLAGENTIC_PROJECT_ROOT:-$PWD}"
+  # walk up from _show_root to find a directory containing .clagentic/
+  _show_search="$_show_root"
+  while [ -n "$_show_search" ] && [ "$_show_search" != "/" ]; do
+    if [ -d "$_show_search/.clagentic" ]; then
+      _show_root="$_show_search"
+      break
+    fi
+    _show_search="$(dirname "$_show_search")"
+  done
+
+  case "$_show_sub" in
+    memory)
+      _db="$_show_root/.clagentic/memory.db"
+      [ -f "$_db" ] || die "show: no memory.db at $_db — is this an enrolled repo?"
+      printf '\n=== session memory (last %s) ===\n\n' "$_show_n"
+      sqlite3 -separator ' | ' "$_db" \
+        "SELECT substr(ts,1,16), source, substr(summary,1,120)
+         FROM turns
+         ORDER BY CASE source WHEN 'manual' THEN 0 ELSE 1 END, ts DESC
+         LIMIT $_show_n;" 2>/dev/null \
+        | while IFS= read -r _row; do printf '  %s\n' "$_row"; done
+      printf '\n'
+      ;;
+    gates)
+      _db="$_show_root/.clagentic/audit.db"
+      [ -f "$_db" ] || die "show: no audit.db at $_db — is this an enrolled repo?"
+      printf '\n=== gate runs (last %s) ===\n\n' "$_show_n"
+      sqlite3 -separator ' | ' "$_db" \
+        "SELECT substr(ts,1,16), gate, outcome, substr(coalesce(details,''),1,80)
+         FROM gate_runs
+         ORDER BY ts DESC
+         LIMIT $_show_n;" 2>/dev/null \
+        | while IFS= read -r _row; do printf '  %s\n' "$_row"; done
+      printf '\n'
+      ;;
+    '')
+      die "show: subcommand required — use: show memory [N] | show gates [N]"
+      ;;
+    *)
+      die "show: unknown subcommand '$_show_sub' — use: memory | gates"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------- export
+
+cmd_export() {
+  _export_output=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --output) shift; _export_output="$1" ;;
+      *)        _export_output="$1" ;;
+    esac
+    shift
+  done
+
+  _export_root="${CLAGENTIC_PROJECT_ROOT:-$PWD}"
+  # walk up from _export_root to find a directory containing .clagentic/
+  _export_search="$_export_root"
+  while [ -n "$_export_search" ] && [ "$_export_search" != "/" ]; do
+    if [ -d "$_export_search/.clagentic" ]; then
+      _export_root="$_export_search"
+      break
+    fi
+    _export_search="$(dirname "$_export_search")"
+  done
+
+  _mem_db="$_export_root/.clagentic/memory.db"
+  _audit_db="$_export_root/.clagentic/audit.db"
+
+  [ -f "$_mem_db" ]   || die "export: no memory.db at $_mem_db — is this an enrolled repo?"
+  [ -f "$_audit_db" ] || die "export: no audit.db at $_audit_db — is this an enrolled repo?"
+
+  [ -z "$_export_output" ] && _export_output="$_export_root/.clagentic/report.html"
+
+  # serialize memory rows to JSON via python3
+  _mem_json=$(python3 -c "
+import sqlite3, json, sys
+db = sqlite3.connect(sys.argv[1])
+rows = db.execute(
+  'SELECT ts, source, summary, tags FROM turns'
+  ' ORDER BY CASE source WHEN \"manual\" THEN 0 ELSE 1 END, ts DESC LIMIT 500'
+).fetchall()
+print(json.dumps([{'ts': r[0], 'source': r[1], 'summary': r[2] or '', 'tags': r[3] or ''} for r in rows]))
+db.close()
+" "$_mem_db" 2>/dev/null) || _mem_json='[]'
+
+  # serialize gate_runs rows to JSON via python3
+  _gates_json=$(python3 -c "
+import sqlite3, json, sys
+db = sqlite3.connect(sys.argv[1])
+rows = db.execute(
+  'SELECT ts, gate, outcome, coalesce(details,\"\") FROM gate_runs ORDER BY ts DESC LIMIT 500'
+).fetchall()
+print(json.dumps([{'ts': r[0], 'gate': r[1], 'outcome': r[2], 'details': r[3]} for r in rows]))
+db.close()
+" "$_audit_db" 2>/dev/null) || _gates_json='[]'
+
+  _export_ts=$(python3 -c "import datetime; print(datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))" 2>/dev/null) || _export_ts="unknown"
+
+  say "export: writing $_export_output"
+
+  # Write HTML to a temp file first, then move into place atomically.
+  _export_tmp="${_export_output}.tmp.$$"
+
+  cat > "$_export_tmp" << HTMLEOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clagentic-lite report</title>
+<style>
+  body { font-family: monospace; background: #1a1a1a; color: #d4d4d4; margin: 0; padding: 1rem 2rem; }
+  h1 { font-size: 1.1rem; color: #9cdcfe; margin-bottom: 0.2rem; }
+  .meta { font-size: 0.8rem; color: #6a9955; margin-bottom: 1.5rem; }
+  .tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+  .tab { padding: 0.3rem 1rem; cursor: pointer; background: #2d2d2d; border: 1px solid #444; color: #d4d4d4; font-family: monospace; font-size: 0.9rem; }
+  .tab.active { background: #0e639c; border-color: #0e639c; color: #fff; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .controls { margin-bottom: 0.75rem; }
+  input[type=text] { background: #2d2d2d; border: 1px solid #555; color: #d4d4d4; padding: 0.3rem 0.6rem; font-family: monospace; font-size: 0.85rem; width: 30rem; }
+  .filter-btn { padding: 0.25rem 0.75rem; cursor: pointer; background: #2d2d2d; border: 1px solid #555; color: #d4d4d4; font-family: monospace; font-size: 0.85rem; margin-right: 0.3rem; }
+  .filter-btn.active { border-color: #9cdcfe; color: #9cdcfe; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
+  th { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #555; color: #9cdcfe; }
+  td { padding: 0.35rem 0.6rem; border-bottom: 1px solid #2d2d2d; vertical-align: top; white-space: pre-wrap; word-break: break-word; }
+  tr:hover td { background: #252526; }
+  .src-manual { color: #4ec9b0; }
+  .src-stop-hook { color: #6a9955; }
+  .outcome-pass { color: #4ec9b0; }
+  .outcome-block { color: #f44747; }
+  .outcome-skip { color: #808080; }
+  .outcome-warn { color: #dcdcaa; }
+  .empty { color: #808080; padding: 1rem; }
+</style>
+</head>
+<body>
+<h1>clagentic-lite report</h1>
+<div class="meta">repo: $_export_root &nbsp;|&nbsp; generated: $_export_ts</div>
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('memory')">Memory</button>
+  <button class="tab" onclick="switchTab('gates')">Gates</button>
+</div>
+
+<div id="panel-memory" class="panel active">
+  <div class="controls">
+    <input type="text" id="mem-search" placeholder="search memory..." oninput="filterMemory()">
+  </div>
+  <table id="mem-table">
+    <thead><tr><th>ts</th><th>source</th><th>summary</th><th>tags</th></tr></thead>
+    <tbody id="mem-body"></tbody>
+  </table>
+</div>
+
+<div id="panel-gates" class="panel">
+  <div class="controls">
+    <button class="filter-btn active" onclick="filterGates('all',this)">all</button>
+    <button class="filter-btn" onclick="filterGates('pass',this)">pass</button>
+    <button class="filter-btn" onclick="filterGates('block',this)">block</button>
+    <button class="filter-btn" onclick="filterGates('skip',this)">skip</button>
+  </div>
+  <table id="gates-table">
+    <thead><tr><th>ts</th><th>gate</th><th>outcome</th><th>details</th></tr></thead>
+    <tbody id="gates-body"></tbody>
+  </table>
+</div>
+
+<script>
+var MEM = $_mem_json;
+var GATES = $_gates_json;
+var _gatesFilter = 'all';
+
+function esc(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function srcClass(s) {
+  if (s === 'manual') return 'src-manual';
+  if (s === 'stop-hook' || s === 'summarize-turn') return 'src-stop-hook';
+  return '';
+}
+
+function outcomeClass(o) {
+  if (o === 'pass')  return 'outcome-pass';
+  if (o === 'block') return 'outcome-block';
+  if (o === 'skip')  return 'outcome-skip';
+  if (o === 'warn')  return 'outcome-warn';
+  return '';
+}
+
+function renderMemory(rows) {
+  var tb = document.getElementById('mem-body');
+  if (!rows.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">(no rows)</td></tr>'; return; }
+  var html = '';
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    html += '<tr><td>' + esc(r.ts) + '</td>'
+          + '<td class="' + srcClass(r.source) + '">' + esc(r.source) + '</td>'
+          + '<td>' + esc(r.summary) + '</td>'
+          + '<td>' + esc(r.tags) + '</td></tr>';
+  }
+  tb.innerHTML = html;
+}
+
+function filterMemory() {
+  var q = document.getElementById('mem-search').value.toLowerCase();
+  if (!q) { renderMemory(MEM); return; }
+  var filtered = MEM.filter(function(r) {
+    return (r.summary || '').toLowerCase().indexOf(q) !== -1
+        || (r.tags    || '').toLowerCase().indexOf(q) !== -1
+        || (r.source  || '').toLowerCase().indexOf(q) !== -1;
+  });
+  renderMemory(filtered);
+}
+
+function renderGates(rows) {
+  var tb = document.getElementById('gates-body');
+  if (!rows.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">(no rows)</td></tr>'; return; }
+  var html = '';
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    html += '<tr><td>' + esc(r.ts) + '</td>'
+          + '<td>' + esc(r.gate) + '</td>'
+          + '<td class="' + outcomeClass(r.outcome) + '">' + esc(r.outcome) + '</td>'
+          + '<td>' + esc(r.details) + '</td></tr>';
+  }
+  tb.innerHTML = html;
+}
+
+function filterGates(outcome, btn) {
+  _gatesFilter = outcome;
+  var btns = document.querySelectorAll('.filter-btn');
+  for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
+  if (btn) btn.classList.add('active');
+  var rows = outcome === 'all' ? GATES : GATES.filter(function(r) { return r.outcome === outcome; });
+  renderGates(rows);
+}
+
+function switchTab(name) {
+  var tabs = document.querySelectorAll('.tab');
+  var panels = document.querySelectorAll('.panel');
+  for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove('active');
+  for (var i = 0; i < panels.length; i++) panels[i].classList.remove('active');
+  var idx = name === 'memory' ? 0 : 1;
+  tabs[idx].classList.add('active');
+  document.getElementById('panel-' + name).classList.add('active');
+}
+
+renderMemory(MEM);
+renderGates(GATES);
+</script>
+</body>
+</html>
+HTMLEOF
+
+  mv "$_export_tmp" "$_export_output"
+  say "export complete: $_export_output"
+  say "open with: open $_export_output  (macOS) or xdg-open $_export_output  (Linux)"
+}
+
 # ---------------------------------------------------------------- dispatch
 
 case "${1:-}" in
@@ -1378,15 +1653,17 @@ case "${1:-}" in
     _tags="${*:-}"
     exec "$SCRIPTS_DIR/memory.sh" log-turn "$_note" "$_tags" "manual"
     ;;
+  show)   shift; cmd_show "$@" ;;
+  export) shift; cmd_export "$@" ;;
   "")
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember, show, export\n'
     exit 1
     ;;
   *)
     printf 'clagentic-lite: unknown subcommand: %s\n' "$1" 1>&2
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember, show, export\n'
     exit 1
     ;;
 esac

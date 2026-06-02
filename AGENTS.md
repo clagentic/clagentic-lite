@@ -87,6 +87,9 @@ sqlite3 .clagentic/audit.db        # inspect the audit trail directly
 sqlite3 .clagentic/memory.db       # inspect session memory directly
 clagentic-lite doctor              # verify all prereqs and enrolled-repo hook health
 clagentic-lite list                # show enrolled repos with last-gate-run and status
+clagentic-lite show memory [N]     # pretty-print last N session memory rows (default 10)
+clagentic-lite show gates [N]      # pretty-print last N gate run rows (default 10)
+clagentic-lite export              # write self-contained HTML report to .clagentic/report.html
 ```
 
 There is intentionally no CI. The gates run on the user's machine via git hooks (pre-commit, pre-push) and Claude Code lifecycle hooks. Re-running the same gates in a hosted CI surface would contradict the no-server contract — and the gates exist to block bad changes locally, not to gate PRs against the upstream repo.
@@ -100,7 +103,7 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `AGENTS.md` (this file) | canonical agent instructions, cross-tool |
 | `CLAUDE.md` | thin pointer to `AGENTS.md` for Claude Code compatibility |
 | `README.md` | product narrative + 5-minute demo |
-| `bin/clagentic-lite` | CLI entry point: init, enroll, unenroll, list, doctor, update |
+| `bin/clagentic-lite` | CLI entry point: init, enroll, unenroll, list, doctor, update, recall, remember, show, export |
 | `share/config.example` | all configurable parameters, no secrets (written to ~/.config/clagentic/config by init) |
 | `share/hook-shims/pre-commit.template` | hook shim template stamped into enrolled repos at enroll time |
 | `share/hook-shims/pre-push.template` | hook shim template stamped into enrolled repos at enroll time |

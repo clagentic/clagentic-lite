@@ -209,7 +209,7 @@ The signals that you have crossed the threshold:
 
 If you are hitting these limits, the tool did its job. The right next step is a heavier harness that explicitly provides those capabilities — a persistent memory store with a real query engine, a multi-agent director, or an embedding-based retrieval layer.
 
-No migration tooling is provided, and none is planned. The `.clagentic/memory.db` file is a plain SQLite database. A user who outgrows lite has all their data already — open it with `sqlite3`, export with `.dump`, or query it directly. Building an exporter, an `eject` subcommand, or a schema bridge would couple lite to whichever platform's schema happened to be current at build time; that coupling is a thesis violation through the back door.
+No `eject` subcommand and no schema bridge are provided, and none are planned. The `.clagentic/memory.db` file is a plain SQLite database. A user who outgrows lite has all their data already — open it with `sqlite3`, export with `.dump`, query it directly, or run `clagentic-lite export` to generate a self-contained HTML report. Building a schema bridge would couple lite to whichever platform's schema happened to be current at build time; that coupling is a thesis violation through the back door.
 
 ## Open design questions
 

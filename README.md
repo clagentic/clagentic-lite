@@ -373,6 +373,10 @@ scripts/gates.sh tail    # follow audit.db live; new gate rows render as they la
 scripts/memory.sh recall <keyword>   # raw recall
 sqlite3 .clagentic/audit.db          # inspect the audit trail
 sqlite3 .clagentic/memory.db         # inspect session memory
+clagentic-lite show memory [N]       # pretty-print last N session memory rows (default 10)
+clagentic-lite show gates [N]        # pretty-print last N gate run rows (default 10)
+clagentic-lite export                # write self-contained HTML report to .clagentic/report.html
+clagentic-lite export --output PATH  # write report to a specific path
 ```
 
 `/eng-consult` and `/infosec-rt` are **skills**, not gates — they return structured commentary you read and act on at your own discretion. Both are user-invocable as slash commands at any time. Claude Code may *also* auto-select them on relevant prompts (`/infosec-rt` is scoped to threat-modeling vocabulary; `/eng-consult` is scoped to multi-discipline review vocabulary), but skill auto-selection is heuristic-not-deterministic — when you want the panel, invoke it explicitly. See `.claude/skills/{infosec-rt,eng-consult}/SKILL.md` for the full protocol.
@@ -385,7 +389,7 @@ Signals: you want a server; you want multi-repo memory; you want ranked or embed
 
 If you're hitting these limits, the tool did its job — you've grown into needing a heavier harness that provides those capabilities explicitly.
 
-No exporter, no `eject` subcommand, no schema bridge. The `.clagentic/memory.db` SQLite file is plain and greppable; a user who outgrows lite has all their data already. See `docs/DESIGN.md` § "When you've outgrown lite" for the full rationale.
+No `eject` subcommand, no schema bridge. `.clagentic/memory.db` is plain SQLite — query it directly with `sqlite3`, or run `clagentic-lite export` to generate a self-contained HTML report. No migration tooling or schema bridge is planned. See `docs/DESIGN.md` § "When you've outgrown lite" for the full rationale.
 
 ---
 
