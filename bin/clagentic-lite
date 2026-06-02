@@ -8,7 +8,7 @@
 #   unenroll [--purge] [PATH]             remove clagentic hooks, deregister
 #   list                                  show enrolled repos + status
 #   doctor                                diagnostics punch list
-#   update                                git pull + re-prereq + re-stamp shims
+#   update [--restamp]                    git pull + re-prereq + re-stamp shims
 #   recall [keywords...]                  search session memory for matching summaries
 #   remember "<note>" [tags]              store a manual memory entry
 #
@@ -1156,6 +1156,11 @@ cmd_doctor() {
 # ---------------------------------------------------------------- update
 
 cmd_update() {
+  RESTAMP=0
+  for _arg in "$@"; do
+    case "$_arg" in --restamp) RESTAMP=1 ;; esac
+  done
+
   say "updating clagentic-lite at $CLAGENTIC_HOME..."
 
   # Refuse on dirty working tree.
@@ -1181,6 +1186,7 @@ cmd_update() {
   fi
 
   _restamped=0
+  _would_restamp=0
   while IFS= read -r _rpath; do
     [ -z "$_rpath" ] && continue
     [ -d "$_rpath" ] || continue
@@ -1194,6 +1200,7 @@ cmd_update() {
       _hf="$_hd/$_hook"
       _installed_ver=$(shim_version "$_hf")
       if [ "$_installed_ver" != "$SHIM_VERSION" ]; then
+        _would_restamp=1
         ENROLL_FORCE=0 stamp_shim "$_hook" "$_hd" && {
           say "re-stamped: $_rpath .git/hooks/$_hook ($_installed_ver -> $SHIM_VERSION)"
           _restamped=$((_restamped+1))
@@ -1206,6 +1213,7 @@ cmd_update() {
     _cs_ver=$(claude_settings_version "$_cs_file")
     if [ -f "$_cs_file" ] && grep -q 'managed-by: clagentic' "$_cs_file" 2>/dev/null; then
       if [ "$_cs_ver" != "$CLAUDE_SETTINGS_VERSION" ]; then
+        _would_restamp=1
         _cs_template="$SHARE_DIR/hook-shims/claude-settings.template"
         if [ -f "$_cs_template" ]; then
           sed "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" "$_cs_template" > "$_cs_file"
@@ -1220,6 +1228,7 @@ cmd_update() {
     _cm_ver=$(claude_md_version "$_cm_file")
     if [ -f "$_cm_file" ] && grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
       if [ "$_cm_ver" != "$CLAUDE_MD_VERSION" ]; then
+        _would_restamp=1
         _cm_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
         if [ -f "$_cm_template" ]; then
           _default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
@@ -1243,6 +1252,7 @@ cmd_update() {
        grep -q 'managed-by: clagentic' "$_wrapper_cm" 2>/dev/null; then
       _wcm_ver=$(claude_md_version "$_wrapper_cm")
       if [ "$_wcm_ver" != "$CLAUDE_MD_VERSION" ]; then
+        _would_restamp=1
         _wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
         if [ -f "$_wcm_template" ]; then
           # Re-build the project table from the pointer file.
@@ -1257,6 +1267,76 @@ cmd_update() {
 
   done < "$REGISTRY"
 
+  # Interactive prompt: if nothing was auto-stamped and --restamp not passed,
+  # offer to re-stamp anyway when running on a tty.
+  if [ "$_would_restamp" -eq 0 ] && [ "$RESTAMP" -eq 0 ] && [ -t 0 ] && [ -f "$REGISTRY" ]; then
+    _managed_count=0
+    while IFS= read -r _rpath; do
+      [ -z "$_rpath" ] && continue
+      [ -d "$_rpath" ] || continue
+      [ -f "$_rpath/CLAUDE.md" ] && grep -q 'managed-by: clagentic' "$_rpath/CLAUDE.md" 2>/dev/null && \
+        _managed_count=$((_managed_count+1))
+    done < "$REGISTRY"
+    if [ "$_managed_count" -gt 0 ]; then
+      printf '[clagentic-lite] All %d enrolled repo(s) already at CLAUDE.md %s.\n' "$_managed_count" "$CLAUDE_MD_VERSION"
+      printf 'Re-stamp CLAUDE.md and settings.json anyway? [y/N]: '
+      read -r _restamp_reply || _restamp_reply=""
+      case "$_restamp_reply" in
+        y|Y|yes|YES) RESTAMP=1 ;;
+      esac
+    fi
+  fi
+
+  # --restamp pass: force re-stamp all managed artifacts regardless of version.
+  if [ "$RESTAMP" -eq 1 ] && [ -f "$REGISTRY" ]; then
+    while IFS= read -r _rpath; do
+      [ -z "$_rpath" ] && continue
+      [ -d "$_rpath" ] || continue
+
+      # Re-stamp CLAUDE.md.
+      _cm_file="$_rpath/CLAUDE.md"
+      if [ -f "$_cm_file" ] && grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
+        _cm_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
+        if [ -f "$_cm_template" ]; then
+          _default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+          sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
+              -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_default_branch|g" \
+              "$_cm_template" > "$_cm_file"
+          say "re-stamped (--restamp): $_rpath/CLAUDE.md"
+          _restamped=$((_restamped+1))
+        fi
+      fi
+
+      # Re-stamp settings.json.
+      _cs_file="$_rpath/.claude/settings.json"
+      if [ -f "$_cs_file" ] && grep -q 'managed-by: clagentic' "$_cs_file" 2>/dev/null; then
+        _cs_template="$SHARE_DIR/hook-shims/claude-settings.template"
+        if [ -f "$_cs_template" ]; then
+          sed "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" "$_cs_template" > "$_cs_file"
+          say "re-stamped (--restamp): $_rpath/.claude/settings.json"
+          _restamped=$((_restamped+1))
+        fi
+      fi
+
+      # Re-stamp wrapper CLAUDE.md if applicable.
+      _wrapper_dir=$(dirname "$_rpath")
+      _wrapper_ptr="$_wrapper_dir/.clagentic-project"
+      _wrapper_cm="$_wrapper_dir/CLAUDE.md"
+      if [ -f "$_wrapper_ptr" ] && [ -f "$_wrapper_cm" ] && \
+         grep -q 'managed-by: clagentic' "$_wrapper_cm" 2>/dev/null; then
+        _wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
+        if [ -f "$_wcm_template" ]; then
+          _wcm_repos=$(cat "$_wrapper_ptr" 2>/dev/null | tr '\n' ' ')
+          ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_wrapper_dir" "$_wcm_repos" && {
+            say "re-stamped wrapper (--restamp): $_wrapper_cm"
+            _restamped=$((_restamped+1))
+          }
+        fi
+      fi
+
+    done < "$REGISTRY"
+  fi
+
   say "update complete (re-stamped $_restamped artifact(s))"
 }
 
@@ -1268,7 +1348,7 @@ case "${1:-}" in
   unenroll) shift; cmd_unenroll "$@" ;;
   list)     cmd_list ;;
   doctor)   cmd_doctor ;;
-  update)   cmd_update ;;
+  update)   shift; cmd_update "$@" ;;
   recall)
     # recall <keywords...>  — search session memory for matching summaries.
     # Thin dispatch to scripts/memory.sh recall; honors CLAGENTIC_RECALL_LIMIT
@@ -1291,13 +1371,13 @@ case "${1:-}" in
     ;;
   "")
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update, recall, remember\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember\n'
     exit 1
     ;;
   *)
     printf 'clagentic-lite: unknown subcommand: %s\n' "$1" 1>&2
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update, recall, remember\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember\n'
     exit 1
     ;;
 esac
