@@ -430,6 +430,18 @@ _write_global_config() {
     _granular_config_prompts
   fi
 
+  # Stamp bleed-patterns template if not already present. This is a side-by-side
+  # companion to config — it lives in the same directory but is not gitignored
+  # (patterns are private, so the file is never committed to the public repo).
+  # Skip silently if it already exists — do not overwrite a user's pattern list.
+  _BLEED_SRC="$SHARE_DIR/bleed-patterns.example"
+  _BLEED_DEST="$(dirname "$GLOBAL_CONFIG")/bleed-patterns"
+  if [ -f "$_BLEED_SRC" ] && [ ! -f "$_BLEED_DEST" ]; then
+    cp "$_BLEED_SRC" "$_BLEED_DEST"
+    chmod 600 "$_BLEED_DEST"
+    say "wrote bleed-patterns template: $_BLEED_DEST (add your private patterns there)"
+  fi
+
   say "wrote global config: $GLOBAL_CONFIG (chmod 600)"
 }
 

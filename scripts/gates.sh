@@ -4,6 +4,7 @@
 #
 # Subcommands:
 #   init             create audit schema
+#   bleed            scan committed files for internal/private string bleed
 #   secrets          run gitleaks on staged hunks (pre-commit)
 #   deps             run osv-scanner (pre-push)
 #   sast             run semgrep (pre-push)
@@ -257,6 +258,93 @@ PY
   else
     echo 99
   fi
+}
+
+cmd_bleed() {
+  # Internal-bleed scan: grep committed tracked files for patterns loaded from
+  # a user-supplied pattern file. Patterns are BRE (grep -f), one per line;
+  # lines starting with # and blank lines are ignored.
+  #
+  # Pattern file resolution (first found wins):
+  #   1. ${CLAGENTIC_PROJECT_ROOT:-$PWD}/.clagentic/bleed-patterns  (repo-level)
+  #   2. $HOME/.config/clagentic/bleed-patterns                     (global user config)
+  #
+  # If neither exists, the gate skips non-blocking with a warning — the gate
+  # is opt-in via pattern config, not fail-closed on missing config.
+  # Project-level exclusions: .clagentic-bleed-ignore (one path-substring per line).
+
+  _BLEED_PAT_FILE=""
+  if [ -f "${CLAGENTIC_PROJECT_ROOT:-$PWD}/.clagentic/bleed-patterns" ]; then
+    _BLEED_PAT_FILE="${CLAGENTIC_PROJECT_ROOT:-$PWD}/.clagentic/bleed-patterns"
+  elif [ -f "$HOME/.config/clagentic/bleed-patterns" ]; then
+    _BLEED_PAT_FILE="$HOME/.config/clagentic/bleed-patterns"
+  fi
+
+  if [ -z "$_BLEED_PAT_FILE" ]; then
+    echo "[gates/bleed] no pattern file found — skipping (configure ~/.config/clagentic/bleed-patterns to enable)"
+    cmd_log_run bleed pass "no pattern file"
+    return 0
+  fi
+
+  # Strip comments/blanks into a temp file of active patterns.
+  _BLEED_TMP=$(mktemp -t clagentic-bleed-pats.XXXXXX)
+  grep -v '^[[:space:]]*#' "$_BLEED_PAT_FILE" | grep -v '^[[:space:]]*$' > "$_BLEED_TMP" || true
+  if [ ! -s "$_BLEED_TMP" ]; then
+    rm -f "$_BLEED_TMP"
+    echo "[gates/bleed] pattern file has no active patterns — skipping"
+    cmd_log_run bleed pass "empty pattern file"
+    return 0
+  fi
+
+  # Collect tracked file list; warn but don't block if git fails.
+  _BLEED_FILES=$(git -C "$REPO_ROOT" ls-files 2>/dev/null) || {
+    rm -f "$_BLEED_TMP"
+    echo "[gates/bleed] git ls-files failed — skipping" 1>&2
+    cmd_log_run bleed pass "git ls-files failed (non-blocking)"
+    return 0
+  }
+
+  # Always exclude .git/ and .clagentic/ (binary DBs, pattern files).
+  _BLEED_FILES=$(printf '%s\n' "$_BLEED_FILES" \
+    | grep -v -e '^\.git/' -e '^\.clagentic/' || true)
+
+  if [ -z "$_BLEED_FILES" ]; then
+    rm -f "$_BLEED_TMP"
+    cmd_log_run bleed pass "no files to scan"
+    return 0
+  fi
+
+  # Apply project-level exclusions from .clagentic-bleed-ignore.
+  _BLEED_IGNORE="$REPO_ROOT/.clagentic-bleed-ignore"
+  if [ -f "$_BLEED_IGNORE" ]; then
+    while IFS= read -r _BLINE; do
+      case "$_BLINE" in ''|'#'*) continue ;; esac
+      _BLEED_FILES=$(printf '%s\n' "$_BLEED_FILES" | grep -vF "$_BLINE" || true)
+    done < "$_BLEED_IGNORE"
+  fi
+
+  if [ -z "$_BLEED_FILES" ]; then
+    rm -f "$_BLEED_TMP"
+    cmd_log_run bleed pass "all files excluded"
+    return 0
+  fi
+
+  # Scan: grep -f reads patterns from file; -I skips binary; -l names files only.
+  # Prepend REPO_ROOT so xargs can reach files from any cwd.
+  _BLEED_HITS=$(printf '%s\n' "$_BLEED_FILES" \
+    | xargs -I{} grep -lIf "$_BLEED_TMP" -- "$REPO_ROOT/{}" 2>/dev/null || true)
+  rm -f "$_BLEED_TMP"
+
+  if [ -n "$_BLEED_HITS" ]; then
+    echo "[gates/bleed] BLOCKED — internal bleed patterns found:" 1>&2
+    printf '%s\n' "$_BLEED_HITS" 1>&2
+    cmd_log_run bleed block "bleed patterns found in: $(printf '%s' "$_BLEED_HITS" | tr '\n' ' ')"
+    return 1
+  fi
+
+  echo "[gates/bleed] clean"
+  cmd_log_run bleed pass "no bleed patterns found"
+  return 0
 }
 
 cmd_sast() {
@@ -516,6 +604,7 @@ cmd_ship() {
     echo "[gates/ship] skip $1 (not in CLAGENTIC_GATES)"
     cmd_log_run "$1" skip "not in CLAGENTIC_GATES=${CLAGENTIC_GATES:-}"
   }
+  if gate_enabled bleed;        then cmd_bleed        || { echo "[gates/ship] BLOCKED at internal-bleed"; exit 1; }; else ship_step_skip bleed;        fi
   if gate_enabled secrets;     then cmd_secrets     || { echo "[gates/ship] BLOCKED at secrets";    exit 1; }; else ship_step_skip secrets;     fi
   if gate_enabled deps;        then cmd_deps        || { echo "[gates/ship] BLOCKED at deps";       exit 1; }; else ship_step_skip deps;        fi
   if gate_enabled sast;        then cmd_sast        || { echo "[gates/ship] BLOCKED at sast";       exit 1; }; else ship_step_skip sast;        fi
@@ -625,7 +714,7 @@ cmd_status() {
   # One row per known gate. Iterate the gate list rather than GROUP BY because
   # we want a section per gate even when the gate has zero rows (so users
   # notice "review never ran" rather than silently missing).
-  for GATE in secrets deps sast review adversarial merge-gate ship; do
+  for GATE in bleed secrets deps sast review adversarial merge-gate ship; do
     printf '%s\n' "-- $GATE --"
     ROWS=$(sqlite3 -separator '|' "$AUDIT_DB" \
       "SELECT ts, outcome, substr(coalesce(details,''),1,60)
@@ -677,6 +766,7 @@ cmd_tail() {
 
 case "${1:-}" in
   init)           cmd_init ;;
+  bleed)          cmd_bleed ;;
   secrets)        cmd_secrets ;;
   deps)           cmd_deps ;;
   sast)           cmd_sast ;;
@@ -690,5 +780,5 @@ case "${1:-}" in
   digest)         cmd_digest ;;
   status)         shift; cmd_status "$@" ;;
   tail)           cmd_tail ;;
-  *) echo "usage: gates.sh {init|secrets|deps|sast|review|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest|status|tail}" 1>&2; exit 1 ;;
+  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest|status|tail}" 1>&2; exit 1 ;;
 esac
