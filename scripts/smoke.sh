@@ -6,6 +6,10 @@
 # Usage:
 #   scripts/smoke.sh           # full run; non-zero on any failure
 #   scripts/smoke.sh --quick   # skip the LLM-call steps (review, summarize)
+#
+# Note: bin/clagentic-lite has no "build" subcommand and never did. A reported
+# stale cmd_build reference (lr-9eed) was investigated; none exists in this file.
+# No smoke step for cmd_build is present because the subcommand does not exist.
 
 set -e
 # Resolve tool home from this script's own location.
