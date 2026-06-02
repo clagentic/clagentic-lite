@@ -82,6 +82,37 @@ else
   printf '  SKIP  gitleaks not installed\n'
 fi
 
+# ------------------------------------------------ 4b. bleed gate blocks planted pattern
+
+step "4b. bleed gate blocks a planted internal bleed pattern"
+_BLEED_TARGET="$REPO_ROOT/.clagentic-smoke-bleed.tmp"
+_BLEED_PAT_DIR="$REPO_ROOT/.clagentic"
+_BLEED_PAT_FILE="$_BLEED_PAT_DIR/bleed-patterns"
+_BLEED_PAT_EXISTED=0
+[ -f "$_BLEED_PAT_FILE" ] && _BLEED_PAT_EXISTED=1
+
+# Create a pattern file with a safe synthetic pattern that can never appear
+# in real code — this string is deliberately unmatchable in the committed repo.
+mkdir -p "$_BLEED_PAT_DIR"
+printf 'internal\.example-clagentic-smoke\.invalid\n' > "$_BLEED_PAT_FILE"
+
+# Create a file containing that pattern and stage it.
+printf 'this.is.internal.example-clagentic-smoke.invalid.test\n' > "$_BLEED_TARGET"
+git add -f -- "$_BLEED_TARGET" 2>/dev/null || true
+
+if CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" "$TOOL_HOME/scripts/gates.sh" bleed >/tmp/clagentic-smoke-bleed.log 2>&1; then
+  bad "gates.sh bleed PASSED on a file with a planted bleed pattern (should block)"
+else
+  ok "gates.sh bleed blocked the planted pattern (non-zero exit)"
+fi
+
+git reset HEAD -- "$_BLEED_TARGET" >/dev/null 2>&1 || true
+rm -f "$_BLEED_TARGET"
+# Restore pattern file state: remove if we created it, leave untouched if it pre-existed.
+if [ "$_BLEED_PAT_EXISTED" -eq 0 ]; then
+  rm -f "$_BLEED_PAT_FILE"
+fi
+
 # --------------------------------------------------- 5. llm-client.sh review JSON
 
 if [ "$MODE" != "--quick" ]; then

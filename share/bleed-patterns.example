@@ -1,0 +1,21 @@
+# clagentic-lite internal-bleed pattern config
+# Copy to ~/.config/clagentic/bleed-patterns and add your own patterns.
+# One grep BRE pattern per line. Lines starting with # and blank lines are ignored.
+#
+# The bleed gate scans all committed tracked files for these patterns and blocks
+# if any match is found. This catches private strings that must never appear in
+# a public repo before they are pushed.
+#
+# Categories to consider:
+#   - Private hostnames (e.g. \.internal\.example\.com)
+#   - Internal repo or product names not yet public
+#   - Internal tracking IDs if they follow a detectable pattern
+#   - Personal email addresses or usernames not for public attribution
+#
+# Pattern syntax: POSIX BRE (grep -f), one pattern per line.
+# Dot (.) matches any character; escape with backslash for a literal dot (e.g. \.host\.example\.com).
+# Lines starting with # and blank lines are ignored.
+#
+# Example entries (all commented out — add your own below):
+# \.internal\.example\.com
+# my-private-repo
