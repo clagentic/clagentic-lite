@@ -1242,7 +1242,8 @@ cmd_update() {
   fi
 
   _restamped=0
-  _would_restamp=0
+  _would_restamp=0           # set when any shim or artifact is out of version
+  _would_restamp_artifacts=0 # set only when a CLAUDE.md/settings artifact is out of version
   while IFS= read -r _rpath; do
     [ -z "$_rpath" ] && continue
     [ -d "$_rpath" ] || continue
@@ -1290,15 +1291,22 @@ cmd_update() {
     fi
     if [ "$_need_restamp" -eq 1 ]; then
       _would_restamp=1
-      _n=$(_restamp_repo_artifacts "$_rpath" "")
-      _restamped=$((_restamped+_n))
+      _would_restamp_artifacts=1
+      # Only auto-stamp when --restamp was not passed; if it was, the force
+      # pass below handles all repos uniformly (avoids double-stamp).
+      if [ "$RESTAMP" -eq 0 ]; then
+        _n=$(_restamp_repo_artifacts "$_rpath" "")
+        _restamped=$((_restamped+_n))
+      fi
     fi
 
   done < "$REGISTRY"
 
-  # Interactive prompt: if nothing was auto-stamped and --restamp not passed,
-  # offer to re-stamp anyway when running on a tty.
-  if [ "$_would_restamp" -eq 0 ] && [ "$RESTAMP" -eq 0 ] && [ -t 0 ] && [ -f "$REGISTRY" ]; then
+  # Interactive prompt: if no artifact (CLAUDE.md/settings) was out of version
+  # and --restamp not passed, offer to re-stamp anyway when running on a tty.
+  # Uses _would_restamp_artifacts (not _would_restamp) so a shim-only update
+  # does not suppress the prompt for CLAUDE.md/settings artifacts.
+  if [ "$_would_restamp_artifacts" -eq 0 ] && [ "$RESTAMP" -eq 0 ] && [ -t 0 ] && [ -f "$REGISTRY" ]; then
     _managed_count=0
     while IFS= read -r _rpath; do
       [ -z "$_rpath" ] && continue
@@ -1308,7 +1316,7 @@ cmd_update() {
     done < "$REGISTRY"
     if [ "$_managed_count" -gt 0 ]; then
       printf '[clagentic-lite] All %d enrolled repo(s) already at CLAUDE.md %s.\n' "$_managed_count" "$CLAUDE_MD_VERSION"
-      printf 'Re-stamp CLAUDE.md and settings.json anyway? [y/N]: '
+      printf 'Re-stamp CLAUDE.md, settings.json, and wrapper CLAUDE.md anyway? [y/N]: '
       read -r _restamp_reply || _restamp_reply=""
       case "$_restamp_reply" in
         y|Y|yes|YES) RESTAMP=1 ;;
