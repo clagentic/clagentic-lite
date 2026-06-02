@@ -82,6 +82,20 @@ else
   printf '  SKIP  gitleaks not installed\n'
 fi
 
+# ------------------------------------------------ 4b. bleed gate blocks planted pattern
+
+step "4b. bleed gate blocks a planted internal bleed pattern"
+_BLEED_TARGET="$REPO_ROOT/.clagentic-smoke-bleed.tmp"
+printf 'lore.akuehner.com\n' > "$_BLEED_TARGET"
+git add -f -- "$_BLEED_TARGET" 2>/dev/null || true
+if CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" "$TOOL_HOME/scripts/gates.sh" bleed >/tmp/clagentic-smoke-bleed.log 2>&1; then
+  bad "gates.sh bleed PASSED on a file with a planted bleed pattern (should block)"
+else
+  ok "gates.sh bleed blocked the planted pattern (non-zero exit)"
+fi
+git reset HEAD -- "$_BLEED_TARGET" >/dev/null 2>&1 || true
+rm -f "$_BLEED_TARGET"
+
 # --------------------------------------------------- 5. llm-client.sh review JSON
 
 if [ "$MODE" != "--quick" ]; then
