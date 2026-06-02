@@ -1155,6 +1155,62 @@ cmd_doctor() {
 
 # ---------------------------------------------------------------- update
 
+# _restamp_repo_artifacts PATH LABEL
+# Stamp CLAUDE.md, .claude/settings.json, and wrapper CLAUDE.md for PATH.
+# LABEL is appended to each say message (e.g. "" for version-mismatch path,
+# " (--restamp)" for the force pass) so callers can distinguish log lines.
+# Prints the number of artifacts written to stdout; caller adds to _restamped.
+# Version checking is the caller's responsibility — this function always writes.
+_restamp_repo_artifacts() {
+  _ra_path="$1"
+  _ra_label="$2"
+  _ra_count=0
+
+  # Re-stamp CLAUDE.md.
+  _ra_cm="$_ra_path/CLAUDE.md"
+  if [ -f "$_ra_cm" ] && grep -q 'managed-by: clagentic' "$_ra_cm" 2>/dev/null; then
+    _ra_cm_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
+    if [ -f "$_ra_cm_template" ]; then
+      _ra_default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+      sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
+          -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_ra_default_branch|g" \
+          "$_ra_cm_template" > "$_ra_cm"
+      say "re-stamped${_ra_label}: $_ra_path/CLAUDE.md"
+      _ra_count=$((_ra_count+1))
+    fi
+  fi
+
+  # Re-stamp .claude/settings.json.
+  _ra_cs="$_ra_path/.claude/settings.json"
+  if [ -f "$_ra_cs" ] && grep -q 'managed-by: clagentic' "$_ra_cs" 2>/dev/null; then
+    _ra_cs_template="$SHARE_DIR/hook-shims/claude-settings.template"
+    if [ -f "$_ra_cs_template" ]; then
+      sed "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" "$_ra_cs_template" > "$_ra_cs"
+      say "re-stamped${_ra_label}: $_ra_path/.claude/settings.json"
+      _ra_count=$((_ra_count+1))
+    fi
+  fi
+
+  # Re-stamp wrapper CLAUDE.md if the parent dir has a .clagentic-project pointer.
+  _ra_wrapper_dir=$(dirname "$_ra_path")
+  _ra_wrapper_ptr="$_ra_wrapper_dir/.clagentic-project"
+  _ra_wrapper_cm="$_ra_wrapper_dir/CLAUDE.md"
+  if [ -f "$_ra_wrapper_ptr" ] && [ -f "$_ra_wrapper_cm" ] && \
+     grep -q 'managed-by: clagentic' "$_ra_wrapper_cm" 2>/dev/null; then
+    _ra_wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
+    if [ -f "$_ra_wcm_template" ]; then
+      # Re-build the project table from the pointer file.
+      _ra_wcm_repos=$(cat "$_ra_wrapper_ptr" 2>/dev/null | tr '\n' ' ')
+      ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_ra_wrapper_dir" "$_ra_wcm_repos" && {
+        say "re-stamped wrapper${_ra_label}: $_ra_wrapper_cm"
+        _ra_count=$((_ra_count+1))
+      }
+    fi
+  fi
+
+  printf '%d\n' "$_ra_count"
+}
+
 cmd_update() {
   RESTAMP=0
   for _arg in "$@"; do
@@ -1208,61 +1264,34 @@ cmd_update() {
       fi
     done
 
-    # Re-stamp .claude/settings.json if version changed.
+    # Re-stamp .claude/settings.json, CLAUDE.md, and wrapper CLAUDE.md if any
+    # version changed.  _restamp_repo_artifacts handles all three writes; we
+    # check versions here to decide whether to call it and to set _would_restamp.
+    # Guards mirror the originals: only compare version when the file exists and
+    # carries the managed-by marker (or, for wrapper, when the pointer exists).
+    _need_restamp=0
     _cs_file="$_rpath/.claude/settings.json"
-    _cs_ver=$(claude_settings_version "$_cs_file")
     if [ -f "$_cs_file" ] && grep -q 'managed-by: clagentic' "$_cs_file" 2>/dev/null; then
-      if [ "$_cs_ver" != "$CLAUDE_SETTINGS_VERSION" ]; then
-        _would_restamp=1
-        _cs_template="$SHARE_DIR/hook-shims/claude-settings.template"
-        if [ -f "$_cs_template" ]; then
-          sed "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" "$_cs_template" > "$_cs_file"
-          say "re-stamped: $_rpath/.claude/settings.json ($_cs_ver -> $CLAUDE_SETTINGS_VERSION)"
-          _restamped=$((_restamped+1))
-        fi
-      fi
+      _cs_ver=$(claude_settings_version "$_cs_file")
+      [ "$_cs_ver" != "$CLAUDE_SETTINGS_VERSION" ] && _need_restamp=1
     fi
-
-    # Re-stamp CLAUDE.md if version changed.
     _cm_file="$_rpath/CLAUDE.md"
-    _cm_ver=$(claude_md_version "$_cm_file")
     if [ -f "$_cm_file" ] && grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
-      if [ "$_cm_ver" != "$CLAUDE_MD_VERSION" ]; then
-        _would_restamp=1
-        _cm_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
-        if [ -f "$_cm_template" ]; then
-          _default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
-          sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
-              -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_default_branch|g" \
-              "$_cm_template" > "$_cm_file"
-          say "re-stamped: $_rpath/CLAUDE.md ($_cm_ver -> $CLAUDE_MD_VERSION)"
-          _restamped=$((_restamped+1))
-        fi
-      fi
+      _cm_ver=$(claude_md_version "$_cm_file")
+      [ "$_cm_ver" != "$CLAUDE_MD_VERSION" ] && _need_restamp=1
     fi
-
-    # Re-stamp wrapper CLAUDE.md if the parent directory has a .clagentic-project
-    # pointer file (meaning it's a wrapper dir). The wrapper CLAUDE.md was never
-    # included in the update loop — it was frozen at enroll time and would never
-    # pick up template changes (foundry finding F-002).
-    _wrapper_dir=$(dirname "$_rpath")
-    _wrapper_ptr="$_wrapper_dir/.clagentic-project"
-    _wrapper_cm="$_wrapper_dir/CLAUDE.md"
-    if [ -f "$_wrapper_ptr" ] && [ -f "$_wrapper_cm" ] && \
-       grep -q 'managed-by: clagentic' "$_wrapper_cm" 2>/dev/null; then
-      _wcm_ver=$(claude_md_version "$_wrapper_cm")
-      if [ "$_wcm_ver" != "$CLAUDE_MD_VERSION" ]; then
-        _would_restamp=1
-        _wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
-        if [ -f "$_wcm_template" ]; then
-          # Re-build the project table from the pointer file.
-          _wcm_repos=$(cat "$_wrapper_ptr" 2>/dev/null | tr '\n' ' ')
-          ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_wrapper_dir" "$_wcm_repos" && {
-            say "re-stamped wrapper: $_wrapper_cm ($_wcm_ver -> $CLAUDE_MD_VERSION)"
-            _restamped=$((_restamped+1))
-          }
-        fi
-      fi
+    _vck_wrapper_dir=$(dirname "$_rpath")
+    _vck_wrapper_ptr="$_vck_wrapper_dir/.clagentic-project"
+    _vck_wrapper_cm="$_vck_wrapper_dir/CLAUDE.md"
+    if [ -f "$_vck_wrapper_ptr" ] && [ -f "$_vck_wrapper_cm" ] && \
+       grep -q 'managed-by: clagentic' "$_vck_wrapper_cm" 2>/dev/null; then
+      _wcm_ver=$(claude_md_version "$_vck_wrapper_cm")
+      [ "$_wcm_ver" != "$CLAUDE_MD_VERSION" ] && _need_restamp=1
+    fi
+    if [ "$_need_restamp" -eq 1 ]; then
+      _would_restamp=1
+      _n=$(_restamp_repo_artifacts "$_rpath" "")
+      _restamped=$((_restamped+_n))
     fi
 
   done < "$REGISTRY"
@@ -1292,48 +1321,8 @@ cmd_update() {
     while IFS= read -r _rpath; do
       [ -z "$_rpath" ] && continue
       [ -d "$_rpath" ] || continue
-
-      # Re-stamp CLAUDE.md.
-      _cm_file="$_rpath/CLAUDE.md"
-      if [ -f "$_cm_file" ] && grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
-        _cm_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
-        if [ -f "$_cm_template" ]; then
-          _default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
-          sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
-              -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_default_branch|g" \
-              "$_cm_template" > "$_cm_file"
-          say "re-stamped (--restamp): $_rpath/CLAUDE.md"
-          _restamped=$((_restamped+1))
-        fi
-      fi
-
-      # Re-stamp settings.json.
-      _cs_file="$_rpath/.claude/settings.json"
-      if [ -f "$_cs_file" ] && grep -q 'managed-by: clagentic' "$_cs_file" 2>/dev/null; then
-        _cs_template="$SHARE_DIR/hook-shims/claude-settings.template"
-        if [ -f "$_cs_template" ]; then
-          sed "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" "$_cs_template" > "$_cs_file"
-          say "re-stamped (--restamp): $_rpath/.claude/settings.json"
-          _restamped=$((_restamped+1))
-        fi
-      fi
-
-      # Re-stamp wrapper CLAUDE.md if applicable.
-      _wrapper_dir=$(dirname "$_rpath")
-      _wrapper_ptr="$_wrapper_dir/.clagentic-project"
-      _wrapper_cm="$_wrapper_dir/CLAUDE.md"
-      if [ -f "$_wrapper_ptr" ] && [ -f "$_wrapper_cm" ] && \
-         grep -q 'managed-by: clagentic' "$_wrapper_cm" 2>/dev/null; then
-        _wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
-        if [ -f "$_wcm_template" ]; then
-          _wcm_repos=$(cat "$_wrapper_ptr" 2>/dev/null | tr '\n' ' ')
-          ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_wrapper_dir" "$_wcm_repos" && {
-            say "re-stamped wrapper (--restamp): $_wrapper_cm"
-            _restamped=$((_restamped+1))
-          }
-        fi
-      fi
-
+      _n=$(_restamp_repo_artifacts "$_rpath" " (--restamp)")
+      _restamped=$((_restamped+_n))
     done < "$REGISTRY"
   fi
 
