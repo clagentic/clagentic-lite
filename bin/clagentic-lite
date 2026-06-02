@@ -1516,12 +1516,6 @@ db.close()
     <thead><tr><th>ts</th><th>source</th><th>summary</th><th>tags</th></tr></thead>
     <tbody id="mem-body"></tbody>
   </table>
-  <noscript>
-  <table>
-    <thead><tr><th>ts</th><th>source</th><th>summary</th><th>tags</th></tr></thead>
-    <tbody id="mem-noscript"></tbody>
-  </table>
-  </noscript>
 </div>
 
 <div id="panel-gates" class="panel">
