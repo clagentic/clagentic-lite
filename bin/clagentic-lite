@@ -1259,27 +1259,25 @@ cmd_update() {
 
   say "updating clagentic-lite at $CLAGENTIC_HOME..."
 
-  # If plugin.json is the only dirty file (leftover uncommitted version bump
-  # from a prior update run), restore it so the dirty check passes. The bump
-  # will be re-applied and committed properly below.
+  # Stash any local modifications (e.g. uncommitted plugin.json version bumps
+  # from a prior update, or edits made by an overzealous AI session), pull,
+  # then drop the stash. The stash is dropped rather than popped — local edits
+  # to $CLAGENTIC_HOME are never user work worth preserving.
   _plugin_json_rel="plugins/clagentic-lite-agents/.claude-plugin/plugin.json"
-  _dirty_files=$(git -C "$CLAGENTIC_HOME" diff --name-only 2>/dev/null)
-  if [ -n "$_dirty_files" ]; then
-    _non_plugin=$(printf '%s\n' "$_dirty_files" | grep -v "^${_plugin_json_rel}$" || true)
-    if [ -z "$_non_plugin" ]; then
-      git -C "$CLAGENTIC_HOME" checkout -- "$_plugin_json_rel" 2>/dev/null || true
-    fi
-  fi
-
-  # Refuse on dirty working tree.
+  _stashed=0
   if ! git -C "$CLAGENTIC_HOME" diff --quiet 2>/dev/null; then
-    die "working tree at $CLAGENTIC_HOME is dirty — stash or commit changes first"
+    git -C "$CLAGENTIC_HOME" stash push -m "clagentic-lite update auto-stash" 2>/dev/null && _stashed=1 || \
+      warn "could not stash local changes in $CLAGENTIC_HOME — proceeding anyway"
   fi
 
   # ff-only pull.
   if ! git -C "$CLAGENTIC_HOME" pull --ff-only; then
+    [ "$_stashed" -eq 1 ] && git -C "$CLAGENTIC_HOME" stash drop 2>/dev/null || true
     die "git pull --ff-only failed (non-fast-forward divergence or no upstream)"
   fi
+
+  # Drop the stash — local edits to CLAGENTIC_HOME are tool internals, not user work.
+  [ "$_stashed" -eq 1 ] && git -C "$CLAGENTIC_HOME" stash drop 2>/dev/null || true
 
   # Re-run the same prereq sweep that init runs — pre-PR-#6 this only
   # checked sqlite3 + git, so a clagentic-lite update on a host that had since
