@@ -1273,9 +1273,14 @@ cmd_update() {
   # Local edits to CLAGENTIC_HOME are tool internals, not user work — but the
   # user should confirm before we silently discard them. On non-tty (CI, scripts),
   # warn and proceed automatically so update remains unattended-safe.
+  #
+  # plugin.json is intentionally excluded: cmd_update patch-bumps its version in
+  # place (no commit) so that 'claude plugin update' picks up the new number.
+  # That file will always appear dirty after an update run; it must not trigger
+  # the discard prompt or block the ff-only pull on the next run.
   _plugin_json_rel="plugins/clagentic-lite-agents/.claude-plugin/plugin.json"
-  if ! git -C "$CLAGENTIC_HOME" diff --quiet 2>/dev/null; then
-    _dirty=$(git -C "$CLAGENTIC_HOME" diff --name-only 2>/dev/null)
+  _dirty=$(git -C "$CLAGENTIC_HOME" diff --name-only 2>/dev/null | grep -v "^${_plugin_json_rel}$" || true)
+  if [ -n "$_dirty" ]; then
     if [ -t 0 ]; then
       printf '[clagentic-lite] WARN: uncommitted changes in %s:\n' "$CLAGENTIC_HOME" >&2
       printf '%s\n' "$_dirty" | sed 's/^/  /' >&2
@@ -1293,7 +1298,7 @@ cmd_update() {
     else
       # Non-tty (CI, script): warn and proceed, discard changes.
       warn "non-tty: discarding uncommitted changes in $CLAGENTIC_HOME to proceed with update"
-      warn "dirty files: $(git -C "$CLAGENTIC_HOME" diff --name-only 2>/dev/null | tr '\n' ' ')"
+      warn "dirty files: $(printf '%s\n' "$_dirty" | tr '\n' ' ')"
       git -C "$CLAGENTIC_HOME" stash push -q -m "clagentic-lite update discard" 2>/dev/null
       git -C "$CLAGENTIC_HOME" stash drop -q 2>/dev/null || true
     fi
@@ -1332,17 +1337,11 @@ cmd_update() {
             "$_plugin_json" > "$_plugin_json.tmp"
           mv "$_plugin_json.tmp" "$_plugin_json"
           say "bumped plugin version: $_cur_ver -> $_new_ver"
-          # Commit the version bump so the working tree stays clean for
-          # subsequent update runs (dirty-tree check would block otherwise).
-          # -c user.name/email applies only to this invocation; it ensures the
-          # commit succeeds on machines with no git user config set globally.
-          git -C "$CLAGENTIC_HOME" add "$_plugin_json_rel" 2>/dev/null && \
-            git -C "$CLAGENTIC_HOME" \
-              -c user.name=clagentic-lite \
-              -c user.email=clagentic-lite@localhost \
-              commit -m "chore: bump clagentic-lite-agents plugin version to $_new_ver" \
-              2>/dev/null || \
-            warn "could not commit plugin version bump — agents may be stale until resolved"
+          # plugin.json is intentionally left as a dirty unstaged file.
+          # The dirty-tree check above excludes it by path, so it will not
+          # prompt or block on the next update run.  Committing it here would
+          # create a local commit that diverges from upstream on every user
+          # machine — breaking the next ff-only pull for everyone.
           ;;
       esac
     else
