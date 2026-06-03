@@ -3,12 +3,12 @@
 # Clone once to $CLAGENTIC_HOME. Use this CLI for all lifecycle operations.
 #
 # Subcommands:
-#   init [--reconfigure]          first-time setup: prereqs, global config, symlink
+#   init [--reconfigure]          first-time setup: prereqs, global config, symlink, plugin install
 #   enroll [--self] [--force] [PATH...]   wire hooks + init DBs for a repo
 #   unenroll [--purge] [PATH]             remove clagentic hooks, deregister
 #   list                                  show enrolled repos + status
 #   doctor                                diagnostics punch list
-#   update [--restamp]                    git pull + re-prereq + re-stamp shims
+#   update [--restamp]                    git pull + re-prereq + re-stamp shims + plugin update
 #   recall [keywords...]                  search session memory for matching summaries
 #   remember "<note>" [tags]              store a manual memory entry
 #   show memory|gates [N]         pretty-print last N rows from .clagentic/ DBs
@@ -17,8 +17,10 @@
 # Design: tool is cloned once (default: ~/.clagentic-lite, override via
 # $CLAGENTIC_HOME). Per-repo enrollment writes .clagentic/{audit,memory}.db,
 # thin shims in .git/hooks/ that call back to $CLAGENTIC_HOME/scripts/, and
-# .claude/settings.json + symlinks to .claude/{commands,agents} so Claude Code
+# .claude/settings.json + symlink to .claude/commands so Claude Code
 # picks up hook wiring and slash commands in the enrolled project.
+# The four role agents (builder, reviewer, auditor, merge-gate) are installed
+# globally via 'claude plugin install' at init time — no per-repo agent copies.
 # The tool repo itself is never the thing under gates by default.
 
 set -e
@@ -366,6 +368,22 @@ cmd_init() {
 
   # 5. Symlink ~/.local/bin/clagentic-lite -> $CLAGENTIC_HOME/bin/clagentic-lite.
   _install_symlink
+
+  # 6. Install the agent plugin globally so Claude Code discovers the four role
+  # agents (builder, reviewer, auditor, merge-gate) in every project session.
+  # 'claude plugin install' is idempotent — re-running init is safe.
+  _plugin_dir="$CLAGENTIC_HOME/plugins/clagentic-lite-agents"
+  if [ -d "$_plugin_dir" ]; then
+    if command -v claude >/dev/null 2>&1; then
+      claude plugin install "$_plugin_dir" && \
+        say "installed plugin: clagentic-lite-agents (agents available globally)" || \
+        warn "claude plugin install failed — agents may not be discoverable until this is resolved"
+    else
+      warn "claude not on PATH — skipping plugin install (run manually: claude plugin install $_plugin_dir)"
+    fi
+  else
+    warn "plugin directory not found: $_plugin_dir (clagentic-lite checkout may be incomplete)"
+  fi
 
   say "init complete"
   if [ -f "$GLOBAL_CONFIG" ] && [ "$RECONFIGURE" -eq 0 ]; then
@@ -715,8 +733,10 @@ _enroll_one() {
 
   # Stamp Claude Code integration (.claude/ inside the enrolled repo).
   # settings.json: absolute paths so hook scripts resolve back to CLAGENTIC_HOME.
-  # commands/ and agents/: symlinks — pure markdown, no path traversal, stay in
-  # sync automatically when the tool updates.
+  # commands/: symlink — pure markdown, no path traversal, stays in sync
+  # automatically when the tool updates.
+  # agents: installed globally via the clagentic-lite-agents plugin; no per-repo
+  # files needed.
   _claude_settings_template="$SHARE_DIR/hook-shims/claude-settings.template"
   if [ -f "$_claude_settings_template" ]; then
     _claude_dir="$_canon/.claude"
@@ -739,17 +759,8 @@ _enroll_one() {
       # Symlink commands/ — markdown only, no path traversal.
       ln -sfn "$CLAGENTIC_HOME/.claude/commands" "$_claude_dir/commands"
 
-      # Copy agent files individually so they work without CLAGENTIC_HOME being
-      # set on the enrolled machine, and because Claude Code may not follow
-      # directory symlinks for agent discovery.
-      mkdir -p "$_claude_dir/agents"
-      for _af in builder.md reviewer.md auditor.md merge-gate.md; do
-        _af_src="$CLAGENTIC_HOME/.claude/agents/$_af"
-        if [ -f "$_af_src" ]; then
-          cp "$_af_src" "$_claude_dir/agents/$_af"
-          say "copied agent: $_af -> $_claude_dir/agents/$_af"
-        fi
-      done
+      # Agent files are installed globally via the clagentic-lite-agents plugin
+      # (claude plugin install, run during init). No per-repo copy needed.
 
       say "wired Claude Code hooks: $_claude_dir"
     fi
@@ -858,12 +869,7 @@ cmd_unenroll() {
     rm -f "$_cs_file"
     # Remove symlink we own for commands/.
     rm -f "$_canon/.claude/commands"
-    # Remove individual copied agent files; leave any user-added agents.
-    for _af in builder.md reviewer.md auditor.md merge-gate.md; do
-      rm -f "$_canon/.claude/agents/$_af"
-    done
-    # Remove agents/ dir only if empty (preserves user-added files).
-    rmdir "$_canon/.claude/agents" 2>/dev/null || true
+    # Agents are installed globally via the plugin — no per-repo files to remove.
     # Remove .claude/ dir only if now empty.
     rmdir "$_canon/.claude" 2>/dev/null || true
     say "removed Claude Code wiring: $_canon/.claude"
@@ -1222,22 +1228,9 @@ _restamp_repo_artifacts() {
     fi
   fi
 
-  # Re-copy agent files so enrolled repos pick up changes after an update.
-  # Only re-copy when the .claude/agents/ directory already exists (meaning
-  # the repo was enrolled with the copy-on-enroll scheme or the user created
-  # it manually). Skip silently for repos still using the old symlink form —
-  # those will need a re-enroll to migrate, which is the right user action.
-  _ra_agents_dir="$_ra_path/.claude/agents"
-  if [ -d "$_ra_agents_dir" ] && [ ! -L "$_ra_agents_dir" ]; then
-    for _af in builder.md reviewer.md auditor.md merge-gate.md; do
-      _af_src="$CLAGENTIC_HOME/.claude/agents/$_af"
-      if [ -f "$_af_src" ]; then
-        cp "$_af_src" "$_ra_agents_dir/$_af"
-        say "refreshed agent${_ra_label}: $_ra_path/.claude/agents/$_af"
-        _ra_count=$((_ra_count+1))
-      fi
-    done
-  fi
+  # Agent files are installed globally via the clagentic-lite-agents plugin.
+  # cmd_update bumps plugin.json version and calls 'claude plugin update'
+  # to refresh agents on the user's machine — no per-repo copy to maintain.
 
   # Re-stamp wrapper CLAUDE.md if the parent dir has a .clagentic-project pointer.
   _ra_wrapper_dir=$(dirname "$_ra_path")
@@ -1380,6 +1373,40 @@ cmd_update() {
       _n=$(_restamp_repo_artifacts "$_rpath" " (--restamp)")
       _restamped=$((_restamped+_n))
     done < "$REGISTRY"
+  fi
+
+  # Bump plugin.json version and update the globally-installed plugin.
+  # The plugin loader is version-string-gated: it will not re-install unless
+  # the version in plugin.json changes. Patch-bump (x.y.Z -> x.y.Z+1) is
+  # sufficient. Uses POSIX sed — no bash arithmetic on arrays (AGENTS.md §2).
+  _plugin_json="$CLAGENTIC_HOME/plugins/clagentic-lite-agents/.claude-plugin/plugin.json"
+  if [ -f "$_plugin_json" ]; then
+    # Extract current version: "version": "x.y.z"
+    _cur_ver=$(grep '"version"' "$_plugin_json" | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    if [ -n "$_cur_ver" ]; then
+      # Patch-bump: split on '.', increment last segment.
+      _ver_major=$(printf '%s' "$_cur_ver" | cut -d. -f1)
+      _ver_minor=$(printf '%s' "$_cur_ver" | cut -d. -f2)
+      _ver_patch=$(printf '%s' "$_cur_ver" | cut -d. -f3)
+      _ver_patch=$((_ver_patch+1))
+      _new_ver="${_ver_major}.${_ver_minor}.${_ver_patch}"
+      sed "s/\"version\"[[:space:]]*:[[:space:]]*\"$_cur_ver\"/\"version\": \"$_new_ver\"/" \
+        "$_plugin_json" > "$_plugin_json.tmp"
+      mv "$_plugin_json.tmp" "$_plugin_json"
+      say "bumped plugin version: $_cur_ver -> $_new_ver"
+    else
+      warn "could not read plugin version from $_plugin_json — skipping version bump"
+    fi
+
+    if command -v claude >/dev/null 2>&1; then
+      claude plugin update clagentic-lite-agents && \
+        say "updated plugin: clagentic-lite-agents" || \
+        warn "claude plugin update failed — agents may be stale until this is resolved"
+    else
+      warn "claude not on PATH — skipping plugin update (run manually: claude plugin update clagentic-lite-agents)"
+    fi
+  else
+    warn "plugin manifest not found: $_plugin_json — skipping plugin update"
   fi
 
   say "update complete (re-stamped $_restamped artifact(s))"
