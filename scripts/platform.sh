@@ -35,6 +35,12 @@ else
   ds_stat_mtime() { stat -f %m "$1"; }    # BSD
 fi
 
+# File size in bytes (portable: wc -c is POSIX; tr strips any whitespace padding
+# that BSD wc emits with leading spaces before the count).
+ds_file_size() {
+  wc -c < "$1" | tr -d '[:space:]'
+}
+
 # Are we under WSL?
 DS_WSL=0
 if [ "$DS_OS" = "linux" ] && grep -qi microsoft /proc/version 2>/dev/null; then

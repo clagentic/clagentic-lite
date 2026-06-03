@@ -130,6 +130,18 @@ CLAGENTIC_DISABLE_RECALL=0
 # Per-LLM-call timeout (seconds). Hung CLI → step failure → chain advances.
 CLAGENTIC_LLM_TIMEOUT_SEC=180
 
+# Input-size-proportional timeout scaling. When CLAGENTIC_LLM_TIMEOUT_AUTO_SCALE=1
+# (the default), the per-call timeout is computed as:
+#   timeout = BASE + ceil(input_bytes / BYTES_PER_SEC), capped at MAX_SEC.
+# This prevents 180s from firing on very large diffs (200 KB+) while keeping
+# short calls at the base timeout. Set AUTO_SCALE=0 to disable and use BASE only.
+CLAGENTIC_LLM_TIMEOUT_MAX_SEC=900
+CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC=2048
+CLAGENTIC_LLM_TIMEOUT_AUTO_SCALE=1
+# Per-role overrides (optional — takes precedence over the global BASE/MAX):
+# CLAGENTIC_REVIEWER_TIMEOUT_SEC=240
+# CLAGENTIC_REVIEWER_TIMEOUT_MAX_SEC=1200
+
 # Claude invocation surface: by default the wrapper does NOT pass --bare,
 # because --bare disables OAuth/keychain reads and requires ANTHROPIC_API_KEY.
 # Set =1 only if you authenticate Claude via API key — the --bare invocation
