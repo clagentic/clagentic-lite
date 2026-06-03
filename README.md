@@ -21,7 +21,21 @@ It is not a platform. It is what you install on your machine so the coding sessi
 
 ---
 
+## Two steps: install once, enroll per project
+
+clagentic-lite has two distinct steps.
+
+**`clagentic-lite init`** — runs once per machine. Installs the tool, wires the symlink, detects prereqs, and writes global config. After this, `clagentic-lite` is on your PATH.
+
+**`clagentic-lite enroll`** — runs once per project (inside each git repo you want gated). This is the activation step. Without it, nothing gates your code: no hooks fire, no session memory writes, Claude Code sees no agents or slash commands, and no audit trail exists for that repo.
+
+If you only run `init` and skip `enroll`, the tool is installed but inert.
+
+---
+
 ## What you get
+
+All capabilities below are per-project and activate only in enrolled repos (`clagentic-lite enroll`).
 
 | Capability | How it works |
 |---|---|
@@ -71,9 +85,12 @@ else
 fi
 "$HOME_DIR/bin/clagentic-lite" init
 
-# Per-project (run from each repo you want gated, or pass the path):
+# Step 2 — per-project activation (REQUIRED for each repo you want gated):
+# Without this, no hooks fire and Claude Code sees no agents.
 cd /path/to/your/project && clagentic-lite enroll
 ```
+
+If you stop after `init` without running `enroll` in at least one project, the harness is installed but dormant — no gates are active anywhere.
 
 After the first install, the steady-state upgrade is just `clagentic-lite update` — it does the `git pull --ff-only`, re-checks prereqs, and re-stamps hook shims, `.claude/settings.json`, and `CLAUDE.md` in every enrolled repo when their template versions change.
 
