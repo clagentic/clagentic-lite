@@ -19,7 +19,7 @@
 # thin shims in .git/hooks/ that call back to $CLAGENTIC_HOME/scripts/, and
 # .claude/settings.json + symlink to .claude/commands so Claude Code
 # picks up hook wiring and slash commands in the enrolled project.
-# The four role agents (builder, reviewer, auditor, merge-gate) are installed
+# The five role agents (builder, reviewer, auditor, merge-gate, troubleshooter) are installed
 # globally via 'claude plugin install' at init time — no per-repo agent copies.
 # The tool repo itself is never the thing under gates by default.
 
@@ -370,7 +370,7 @@ cmd_init() {
   _install_symlink
 
   # 6. Register the clagentic-lite marketplace and install the agent plugin so
-  # Claude Code discovers the four role agents globally in every session.
+  # Claude Code discovers the five role agents globally in every session.
   # Sequence: marketplace add (registers source) -> plugin install by name.
   # 'claude plugin marketplace add' is idempotent — re-running init is safe.
   if command -v claude >/dev/null 2>&1; then

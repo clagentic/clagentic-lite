@@ -10,7 +10,7 @@ The repo is **clagentic-lite** — a small, deliberate solo-dev coding harness w
 
 ### 1. Stay inside the contract
 
-clagentic-lite is intentionally small. New features must justify themselves against the existing five gates (`docs/GATES.md`) and three roles (`docs/DESIGN.md` § "The three roles"). If a proposed change does not strengthen, simplify, or document one of those, push back before writing code.
+clagentic-lite is intentionally small. New features must justify themselves against the existing five gates (`docs/GATES.md`) and five roles (`docs/DESIGN.md` § "The five roles"). If a proposed change does not strengthen, simplify, or document one of those, push back before writing code.
 
 The non-goals list in `docs/DESIGN.md` is binding. Do not add: a server, a daemon, a vector database, an embedding model, a web UI, a plugin marketplace, multi-agent orchestration, or multi-repo state. Propose those as separate projects.
 
@@ -110,10 +110,9 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `share/hook-shims/claude-settings.template` | settings.json template stamped into enrolled repos — hook paths substituted with absolute `$CLAGENTIC_HOME` paths |
 | `share/hook-shims/CLAUDE.md.template` | CLAUDE.md template stamped into enrolled repo root — activates Builder contract and documents hooks/commands for Claude Code |
 | `.claude/settings.json` | hook wiring (tool's own repo; enrolled repos get a generated copy in their `.claude/`) |
-| `.claude/agents/{builder,reviewer,auditor,merge-gate}.md` | role contracts (tool's own Claude Code session) |
 | `.claude-plugin/marketplace.json` | plugin marketplace manifest — declares the `clagentic-lite-agents` plugin |
 | `plugins/clagentic-lite-agents/.claude-plugin/plugin.json` | per-plugin manifest; version bumped by `clagentic-lite update` |
-| `plugins/clagentic-lite-agents/agents/{builder,reviewer,auditor,merge-gate}.md` | role contracts installed globally via `claude plugin install` at `clagentic-lite init` time |
+| `plugins/clagentic-lite-agents/agents/{builder,reviewer,auditor,merge-gate,troubleshooter}.md` | role contracts installed globally via `claude plugin install` at `clagentic-lite init` time |
 | `.claude/commands/{review,ship,recall}.md` | user-invokable slash commands |
 | `.claude/skills/{infosec-rt,eng-consult}/SKILL.md` | commentary skills (multi-voice; not gates) |
 | `.claude/hooks/*.sh` | five lifecycle hooks |

@@ -44,6 +44,7 @@ All capabilities below are per-project and activate only in enrolled repos (`cla
 | **Local-tool security gates** | gitleaks pre-commit, osv-scanner + semgrep pre-push. Deterministic. Blocking. No LLM in the security path. |
 | **LLM adversarial pass** | Auditor role plays attacker on the diff. Non-blocking. Logged. Attach to PR if interesting. |
 | **Merge gate** | Final LLM check reads every prior gate's structured output and returns `approve|refuse`. Never opens PRs, never pushes. |
+| **Troubleshooter** | Read-only failure diagnosis agent. Receives one artifact (gate error, hook trace, wrong output), applies structured Tier 0→2 diagnosis, emits root cause and bounce target. Never writes, never dispatches. |
 | **Session memory** | Stop-hook pipes the last assistant turn through the Summarizer, writes one row to `.clagentic/memory.db`. UserPromptSubmit hook recalls relevant rows into the next prompt's context. |
 | **Safe-by-default tool use** | PreToolUse hooks (`pre-bash-guard.sh`, `pre-write-guard.sh`) block 20 dangerous patterns and writes to the default branch / outside repo / to credential-shaped paths. |
 | **Audit trail** | Every gate decision, every LLM call attempt, every block — one row in `.clagentic/audit.db`. `scripts/gates.sh digest` is the readout. |
@@ -165,7 +166,7 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 3. Refuses if already enrolled (use `--force` to re-enroll).
 4. Initializes `.clagentic/audit.db` and `.clagentic/memory.db` in that repo.
 5. Stamps `.git/hooks/pre-commit` and `.git/hooks/pre-push` from `share/hook-shims/*.template`, substituting `$CLAGENTIC_HOME` at stamp time. Refuses to overwrite non-clagentic hooks unless `--force`.
-6. Generates `.claude/settings.json` (absolute hook paths → `$CLAGENTIC_HOME`), symlinks `.claude/commands` and `.claude/agents`, and adds `.claude/` to `.gitignore`. These are local-only artifacts.
+6. Generates `.claude/settings.json` (absolute hook paths → `$CLAGENTIC_HOME`), symlinks `.claude/commands`, and adds `.claude/` to `.gitignore`. These are local-only artifacts. Role agents are installed globally via the `clagentic-lite-agents` plugin at `init` time — no per-repo copies.
 7. Stamps `CLAUDE.md` at the repo root — activates the Builder contract and exposes agents for Claude Code auto-dispatch. Refuses to overwrite a non-clagentic `CLAUDE.md` unless `--force`.
 8. Registers the repo path in `~/.local/state/clagentic/registry`.
 
@@ -175,7 +176,7 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 
 **Shared repo**: `CLAUDE.md` is committable as-is and is the only clagentic artifact that is meant to be shared. It contains no machine-specific paths. Teammates without clagentic-lite installed will see a normal project CLAUDE.md. Teammates with clagentic-lite installed will get full agent auto-dispatch.
 
-`.claude/` (hook wiring, agent symlinks, `settings.json`) is **local-only** — it is added to `.gitignore` automatically at enroll time and is never committed. Each teammate who wants clagentic-lite active must run `clagentic-lite enroll` in the repo on their own machine. This is by design: hook paths are absolute and machine-specific; sharing them would break the harness on every machine but the original.
+`.claude/` (hook wiring, command symlinks, `settings.json`) is **local-only** — it is added to `.gitignore` automatically at enroll time and is never committed. Each teammate who wants clagentic-lite active must run `clagentic-lite enroll` in the repo on their own machine. This is by design: hook paths are absolute and machine-specific; sharing them would break the harness on every machine but the original.
 
 If you extend `CLAUDE.md` with project-specific rules, `clagentic-lite enroll --force` will refuse to overwrite until you remove the `managed-by: clagentic` marker.
 

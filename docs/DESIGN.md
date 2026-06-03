@@ -27,7 +27,7 @@ clagentic-lite is the smallest credible expression of that thesis. It is built t
 | 6 | **Merge Gate** | `/ship` | LLM reads every prior gate's structured output and returns `{decision, reason}` JSON | yes by default (`CLAGENTIC_MERGE_GATE_BLOCKING=1`) |
 | 7 | **Session summarize** | `Stop` | async, debounced: Summarizer reads transcript → one-line summary → SQLite | no (best-effort) |
 
-## The four roles
+## The five roles
 
 | Role | CLI (default) | Job | Tools allowed |
 |---|---|---|---|
@@ -35,6 +35,7 @@ clagentic-lite is the smallest credible expression of that thesis. It is built t
 | **Reviewer** | `codex` | Read staged diff, return structured findings. Never writes code. | Read, Bash (read-only) |
 | **Auditor** | `codex` | LLM narration on top of deterministic security scans. Adversarial mode plays attacker. | Read, Bash (security tools) |
 | **Merge Gate** | `claude` | Final approve/refuse decision over every prior gate's output. Never opens PRs, never pushes. | Read |
+| **Troubleshooter** | `claude` | Read-only failure diagnosis. Receives one artifact, emits root cause + bounce target. Never writes, never dispatches. | Read, Glob, Grep, Bash (read-only) |
 
 Plus a non-role **Summarizer** (default `claude` at cheap tier) wired into the Stop hook for per-turn session memory.
 
