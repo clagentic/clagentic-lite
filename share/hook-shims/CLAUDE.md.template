@@ -1,5 +1,5 @@
 # CLAUDE.md
-<!-- managed-by: clagentic · clagentic-claude-md-version: v3 -->
+<!-- managed-by: clagentic · clagentic-claude-md-version: v4 -->
 <!-- Re-generate: `clagentic-lite enroll --force` or `clagentic-lite update` -->
 
 This project is enrolled in [clagentic-lite](https://github.com/clagentic/clagentic-lite) — a local coding harness with cross-vendor review, security gates, and session memory.
@@ -8,7 +8,7 @@ This project is enrolled in [clagentic-lite](https://github.com/clagentic/clagen
 
 **These are binding rules for every session, not suggestions.**
 
-1. **Delegate code work to the Builder.** When the user asks you to write, edit, or refactor code, use the `builder` subagent — do not author code directly in the main session. The Builder enforces branch constraints and the full role contract automatically.
+1. **Delegate code work to the Builder.** When the user asks you to write, edit, or refactor code, use the `clagentic-lite-agents:builder` subagent — do not author code directly in the main session. The Builder enforces branch constraints and the full role contract automatically.
 
 2. **Run `/review` after staging changes, before `/ship`.** The Reviewer is a different vendor than the Builder. Cross-vendor review is the load-bearing pattern — skipping it defeats the purpose of the harness. After any `git add`, prompt the user to run `/review` or run it yourself.
 
@@ -26,10 +26,10 @@ These subagents are available in this session. Claude Code dispatches them autom
 
 | Agent | When to use |
 |---|---|
-| `builder` | Write, edit, or refactor code — the primary author role |
-| `reviewer` | Review staged changes; get a second opinion; cross-vendor check |
-| `auditor` | Security narration on top of gitleaks/semgrep/osv findings |
-| `merge-gate` | Final approve/refuse decision before opening a PR |
+| `clagentic-lite-agents:builder` | Write, edit, or refactor code — the primary author role |
+| `clagentic-lite-agents:reviewer` | Review staged changes; get a second opinion; cross-vendor check |
+| `clagentic-lite-agents:auditor` | Security narration on top of gitleaks/semgrep/osv findings |
+| `clagentic-lite-agents:merge-gate` | Final approve/refuse decision before opening a PR |
 
 ## Slash commands
 
