@@ -1259,6 +1259,18 @@ cmd_update() {
 
   say "updating clagentic-lite at $CLAGENTIC_HOME..."
 
+  # If plugin.json is the only dirty file (leftover uncommitted version bump
+  # from a prior update run), restore it so the dirty check passes. The bump
+  # will be re-applied and committed properly below.
+  _plugin_json_rel="plugins/clagentic-lite-agents/.claude-plugin/plugin.json"
+  _dirty_files=$(git -C "$CLAGENTIC_HOME" diff --name-only 2>/dev/null)
+  if [ -n "$_dirty_files" ]; then
+    _non_plugin=$(printf '%s\n' "$_dirty_files" | grep -v "^${_plugin_json_rel}$" || true)
+    if [ -z "$_non_plugin" ]; then
+      git -C "$CLAGENTIC_HOME" checkout -- "$_plugin_json_rel" 2>/dev/null || true
+    fi
+  fi
+
   # Refuse on dirty working tree.
   if ! git -C "$CLAGENTIC_HOME" diff --quiet 2>/dev/null; then
     die "working tree at $CLAGENTIC_HOME is dirty — stash or commit changes first"
@@ -1297,6 +1309,12 @@ cmd_update() {
             "$_plugin_json" > "$_plugin_json.tmp"
           mv "$_plugin_json.tmp" "$_plugin_json"
           say "bumped plugin version: $_cur_ver -> $_new_ver"
+          # Commit the version bump so the working tree stays clean for
+          # subsequent update runs (dirty-tree check would block otherwise).
+          git -C "$CLAGENTIC_HOME" add "$_plugin_json_rel" 2>/dev/null && \
+            git -C "$CLAGENTIC_HOME" commit -m "chore: bump clagentic-lite-agents plugin version to $_new_ver" \
+              --no-gpg-sign 2>/dev/null || \
+            warn "could not commit plugin version bump — next update run may fail dirty-tree check"
           ;;
       esac
     else
