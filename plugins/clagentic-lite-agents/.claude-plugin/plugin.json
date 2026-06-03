@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "clagentic-lite-agents",
+  "version": "1.0.0",
+  "description": "The four clagentic-lite role agents: builder (primary code author), reviewer (cross-vendor code review), auditor (security gates), merge-gate (final pre-merge sanity check). Install once via clagentic-lite init; Claude Code discovers agents in every session without per-repo file copies.",
+  "author": {
+    "name": "andy",
+    "email": "akuehner@gmail.com"
+  },
+  "homepage": "https://forgejo.akuehner.com/clagentic/clagentic-lite",
+  "keywords": ["agents", "code-review", "security", "gates", "clagentic"]
+}

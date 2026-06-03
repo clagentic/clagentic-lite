@@ -73,7 +73,7 @@ Commit messages, PR descriptions, code comments, log lines — no emojis, no exc
 
 ```sh
 # First-time setup (run from the clagentic-lite checkout):
-bin/clagentic-lite init            # prereq detection, global config, symlink
+bin/clagentic-lite init            # prereq detection, global config, symlink, plugin install
 
 # Per-project enrollment (run from inside the project you want gated):
 clagentic-lite enroll              # init DBs, stamp hooks, register
@@ -110,7 +110,10 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `share/hook-shims/claude-settings.template` | settings.json template stamped into enrolled repos — hook paths substituted with absolute `$CLAGENTIC_HOME` paths |
 | `share/hook-shims/CLAUDE.md.template` | CLAUDE.md template stamped into enrolled repo root — activates Builder contract and documents hooks/commands for Claude Code |
 | `.claude/settings.json` | hook wiring (tool's own repo; enrolled repos get a generated copy in their `.claude/`) |
-| `.claude/agents/{builder,reviewer,auditor,merge-gate}.md` | role contracts (four roles) |
+| `.claude/agents/{builder,reviewer,auditor,merge-gate}.md` | role contracts (tool's own Claude Code session) |
+| `.claude-plugin/marketplace.json` | plugin marketplace manifest — declares the `clagentic-lite-agents` plugin |
+| `plugins/clagentic-lite-agents/.claude-plugin/plugin.json` | per-plugin manifest; version bumped by `clagentic-lite update` |
+| `plugins/clagentic-lite-agents/agents/{builder,reviewer,auditor,merge-gate}.md` | role contracts installed globally via `claude plugin install` at `clagentic-lite init` time |
 | `.claude/commands/{review,ship,recall}.md` | user-invokable slash commands |
 | `.claude/skills/{infosec-rt,eng-consult}/SKILL.md` | commentary skills (multi-voice; not gates) |
 | `.claude/hooks/*.sh` | five lifecycle hooks |
