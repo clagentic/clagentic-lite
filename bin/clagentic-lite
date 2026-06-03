@@ -736,9 +736,20 @@ _enroll_one() {
     if [ -n "$_claude_dir" ]; then
       sed "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" "$_claude_settings_template" > "$_cs_target"
 
-      # Symlink commands/ and agents/ — markdown only, no path traversal.
+      # Symlink commands/ — markdown only, no path traversal.
       ln -sfn "$CLAGENTIC_HOME/.claude/commands" "$_claude_dir/commands"
-      ln -sfn "$CLAGENTIC_HOME/.claude/agents"   "$_claude_dir/agents"
+
+      # Copy agent files individually so they work without CLAGENTIC_HOME being
+      # set on the enrolled machine, and because Claude Code may not follow
+      # directory symlinks for agent discovery.
+      mkdir -p "$_claude_dir/agents"
+      for _af in builder.md reviewer.md auditor.md merge-gate.md; do
+        _af_src="$CLAGENTIC_HOME/.claude/agents/$_af"
+        if [ -f "$_af_src" ]; then
+          cp "$_af_src" "$_claude_dir/agents/$_af"
+          say "copied agent: $_af -> $_claude_dir/agents/$_af"
+        fi
+      done
 
       say "wired Claude Code hooks: $_claude_dir"
     fi
@@ -845,8 +856,14 @@ cmd_unenroll() {
   _cs_file="$_canon/.claude/settings.json"
   if [ -f "$_cs_file" ] && grep -q 'managed-by: clagentic' "$_cs_file" 2>/dev/null; then
     rm -f "$_cs_file"
-    # Remove symlinks we own; leave any user-added files.
-    rm -f "$_canon/.claude/commands" "$_canon/.claude/agents"
+    # Remove symlink we own for commands/.
+    rm -f "$_canon/.claude/commands"
+    # Remove individual copied agent files; leave any user-added agents.
+    for _af in builder.md reviewer.md auditor.md merge-gate.md; do
+      rm -f "$_canon/.claude/agents/$_af"
+    done
+    # Remove agents/ dir only if empty (preserves user-added files).
+    rmdir "$_canon/.claude/agents" 2>/dev/null || true
     # Remove .claude/ dir only if now empty.
     rmdir "$_canon/.claude" 2>/dev/null || true
     say "removed Claude Code wiring: $_canon/.claude"
@@ -1203,6 +1220,23 @@ _restamp_repo_artifacts() {
       say "re-stamped${_ra_label}: $_ra_path/.claude/settings.json"
       _ra_count=$((_ra_count+1))
     fi
+  fi
+
+  # Re-copy agent files so enrolled repos pick up changes after an update.
+  # Only re-copy when the .claude/agents/ directory already exists (meaning
+  # the repo was enrolled with the copy-on-enroll scheme or the user created
+  # it manually). Skip silently for repos still using the old symlink form —
+  # those will need a re-enroll to migrate, which is the right user action.
+  _ra_agents_dir="$_ra_path/.claude/agents"
+  if [ -d "$_ra_agents_dir" ] && [ ! -L "$_ra_agents_dir" ]; then
+    for _af in builder.md reviewer.md auditor.md merge-gate.md; do
+      _af_src="$CLAGENTIC_HOME/.claude/agents/$_af"
+      if [ -f "$_af_src" ]; then
+        cp "$_af_src" "$_ra_agents_dir/$_af"
+        say "refreshed agent${_ra_label}: $_ra_path/.claude/agents/$_af"
+        _ra_count=$((_ra_count+1))
+      fi
+    done
   fi
 
   # Re-stamp wrapper CLAUDE.md if the parent dir has a .clagentic-project pointer.
