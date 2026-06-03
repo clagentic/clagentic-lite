@@ -256,6 +256,44 @@ log_attempt() {
 # hung CLI surfaces as a step failure rather than wedging the gate.
 LLM_TIMEOUT="${CLAGENTIC_LLM_TIMEOUT_SEC:-180}"
 
+# Compute a per-call timeout scaled to the combined input size.
+# Args: ROLE_U (uppercase role, e.g. REVIEWER) BYTES (combined input bytes)
+# Returns the timeout in seconds on stdout.
+#
+# Scaling formula: timeout = BASE + ceil(BYTES / RATE), capped at MAX.
+#   BASE  — CLAGENTIC_<ROLE>_TIMEOUT_SEC, falls back to CLAGENTIC_LLM_TIMEOUT_SEC (180)
+#   RATE  — CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC (2048): bytes the LLM processes per second
+#   MAX   — CLAGENTIC_<ROLE>_TIMEOUT_MAX_SEC, falls back to CLAGENTIC_LLM_TIMEOUT_MAX_SEC (900)
+# Set CLAGENTIC_LLM_TIMEOUT_AUTO_SCALE=0 to disable scaling and return BASE.
+llm_timeout_for() {
+  ROLE_U="$1"
+  BYTES="$2"
+
+  BASE=$(role_env "$ROLE_U" TIMEOUT_SEC "${CLAGENTIC_LLM_TIMEOUT_SEC:-180}")
+  RATE="${CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC:-2048}"
+  MAX=$(role_env "$ROLE_U" TIMEOUT_MAX_SEC "${CLAGENTIC_LLM_TIMEOUT_MAX_SEC:-900}")
+
+  # Normalize config to integers; use safe defaults on parse failure.
+  case "$BASE" in ''|*[!0-9]*) BASE=180 ;; esac
+  case "$RATE" in ''|*[!0-9]*) RATE=2048 ;; esac
+  case "$MAX"  in ''|*[!0-9]*) MAX=900 ;; esac
+  [ "$RATE" -le 0 ] && RATE=2048
+
+  # Exit early if auto-scaling disabled.
+  [ "${CLAGENTIC_LLM_TIMEOUT_AUTO_SCALE:-1}" = "0" ] && { printf '%s\n' "$BASE"; return; }
+
+  # Scale: ceiling division avoids undercounting for the final partial chunk.
+  EXTRA=$(( (BYTES + RATE - 1) / RATE ))
+  T=$(( BASE + EXTRA ))
+
+  # Cap at max when max is set and positive.
+  if [ "$MAX" -gt 0 ] && [ "$T" -gt "$MAX" ]; then
+    T="$MAX"
+  fi
+
+  printf '%s\n' "$T"
+}
+
 # Per-CLI invocation helpers. Each function receives the same fixed args:
 #   MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE
 # Returns 0 on apparent success, non-zero on failure (including exit 124 for
@@ -278,7 +316,7 @@ LLM_TIMEOUT="${CLAGENTIC_LLM_TIMEOUT_SEC:-180}"
 # Set CLAGENTIC_CLAUDE_BARE=1 if you authenticate via API key and
 # prefer the tighter --bare invocation surface.
 invoke_claude() {
-  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"
+  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"
   BARE_FLAG=""
   [ "${CLAGENTIC_CLAUDE_BARE:-0}" = "1" ] && BARE_FLAG="--bare"
   # Tell the inner Claude session NOT to inject recall summaries —
@@ -286,12 +324,12 @@ invoke_claude() {
   export CLAGENTIC_DISABLE_RECALL=1
   if [ -n "$MODEL" ]; then
     # shellcheck disable=SC2086
-    cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$LLM_TIMEOUT" claude --print $BARE_FLAG --model "$MODEL" \
+    cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $BARE_FLAG --model "$MODEL" \
       --append-system-prompt "$(cat "$PROMPT_FILE")" \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   else
     # shellcheck disable=SC2086
-    cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$LLM_TIMEOUT" claude --print $BARE_FLAG \
+    cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $BARE_FLAG \
       --append-system-prompt "$(cat "$PROMPT_FILE")" \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   fi
@@ -311,15 +349,15 @@ invoke_claude() {
 # -o OUTPUT_FILE), so we redirect both stdout and stderr to ERR_FILE — that is
 # intentional, not a mistake.
 invoke_codex() {
-  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"
+  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"
   TMP_COMBINED=$(mktemp -t clagentic-codex-combined.XXXXXX)
   TMP_RAW=$(mktemp -t clagentic-codex-raw.XXXXXX)
   { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } > "$TMP_COMBINED"
   if [ -n "$MODEL" ]; then
-    $DS_TIMEOUT_CMD "$LLM_TIMEOUT" codex exec --skip-git-repo-check -m "$MODEL" \
+    $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec --skip-git-repo-check -m "$MODEL" \
       --color never -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1
   else
-    $DS_TIMEOUT_CMD "$LLM_TIMEOUT" codex exec --skip-git-repo-check \
+    $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec --skip-git-repo-check \
       --color never -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1
   fi
   EXIT_CODE=$?
@@ -341,20 +379,21 @@ invoke_codex() {
 # Generic: pipe prompt+input via stdin to `<cli> -p -`. If the CLI does not
 # accept that invocation, the step fails and the chain advances.
 invoke_generic() {
-  CLI_BIN="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"
+  CLI_BIN="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"
   { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } | \
-    $DS_TIMEOUT_CMD "$LLM_TIMEOUT" "$CLI_BIN" -p - > "$OUTPUT_FILE" 2> "$ERR_FILE"
+    $DS_TIMEOUT_CMD "$CALL_TIMEOUT" "$CLI_BIN" -p - > "$OUTPUT_FILE" 2> "$ERR_FILE"
 }
 
-# Dispatch a single chain step. Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE
+# Dispatch a single chain step.
+# Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE CALL_TIMEOUT
 # Fails with exit 127 if the CLI binary is not on PATH.
 invoke_step() {
-  CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"
+  CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"
   command -v "$CLI" >/dev/null 2>&1 || return 127
   case "$CLI" in
-    claude)  invoke_claude  "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" ;;
-    codex)   invoke_codex   "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" ;;
-    *)       invoke_generic "$CLI" "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" ;;
+    claude)  invoke_claude  "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
+    codex)   invoke_codex   "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
+    *)       invoke_generic "$CLI" "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
   esac
 }
 
@@ -453,6 +492,13 @@ walk_chain() {
   $PFUNC > "$TMP_PROMPT"
   role_chain "$ROLE_U" > "$TMP_CHAIN"
 
+  # Compute the combined input size for proportional timeout scaling.
+  # Both files exist at this point; ds_file_size returns 0 on empty files.
+  INPUT_BYTES=$(ds_file_size "$TMP_IN")
+  PROMPT_BYTES=$(ds_file_size "$TMP_PROMPT")
+  CALL_BYTES=$(( INPUT_BYTES + PROMPT_BYTES + 2 ))
+  CALL_TIMEOUT=$(llm_timeout_for "$ROLE_U" "$CALL_BYTES")
+
   if [ ! -s "$TMP_CHAIN" ]; then
     if [ "$ROLE_U" = "SUMMARIZER" ]; then
       # Best-effort role with no chain (and no Builder fallback): emit nothing
@@ -490,7 +536,7 @@ walk_chain() {
     : > "$TMP_ERR"
     : > "$TMP_OUT"
     EXIT_CODE=0
-    invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" \
+    invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" \
       || EXIT_CODE=$?
     if [ "$EXIT_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
       if [ "$ATTEMPT" -eq 1 ]; then
@@ -508,7 +554,7 @@ walk_chain() {
     # This is what surfaces "model not available on this account" / "auth
     # expired" / "timeout" rather than a blank or a spinner artifact.
     if [ "$EXIT_CODE" -eq 124 ]; then
-      ERR_HINT="timeout after ${LLM_TIMEOUT}s"
+      ERR_HINT="timeout after ${CALL_TIMEOUT}s (input=${CALL_BYTES} bytes)"
     elif [ "$EXIT_CODE" -eq 127 ]; then
       ERR_HINT="cli not on PATH"
     elif [ -s "$TMP_ERR" ]; then
