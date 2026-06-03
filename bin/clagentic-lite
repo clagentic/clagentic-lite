@@ -1398,14 +1398,23 @@ cmd_update() {
     fi
 
     if command -v claude >/dev/null 2>&1; then
-      claude plugin marketplace update clagentic-lite && \
-        say "refreshed marketplace: clagentic-lite" || \
-        warn "claude plugin marketplace update failed — plugin may be stale"
-      claude plugin update "clagentic-lite-agents@clagentic-lite" && \
-        say "updated plugin: clagentic-lite-agents" || \
-        warn "claude plugin update failed — agents may be stale; run: claude plugin update clagentic-lite-agents@clagentic-lite"
+      # Ensure marketplace is registered (idempotent).
+      claude plugin marketplace add "$CLAGENTIC_HOME" --scope user 2>/dev/null || true
+      # If already installed, update. If not installed, install from scratch.
+      if claude plugin list 2>/dev/null | grep -q "clagentic-lite-agents"; then
+        claude plugin marketplace update clagentic-lite && \
+          say "refreshed marketplace: clagentic-lite" || \
+          warn "claude plugin marketplace update failed — plugin may be stale"
+        claude plugin update "clagentic-lite-agents@clagentic-lite" && \
+          say "updated plugin: clagentic-lite-agents" || \
+          warn "claude plugin update failed; run: claude plugin update clagentic-lite-agents@clagentic-lite"
+      else
+        claude plugin install "clagentic-lite-agents@clagentic-lite" && \
+          say "installed plugin: clagentic-lite-agents (agents now available globally)" || \
+          warn "claude plugin install failed; run: claude plugin install clagentic-lite-agents@clagentic-lite"
+      fi
     else
-      warn "claude not on PATH — skipping plugin update (run manually: claude plugin update clagentic-lite-agents@clagentic-lite)"
+      warn "claude not on PATH — skipping plugin install/update (run manually: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite-agents@clagentic-lite)"
     fi
   else
     warn "plugin manifest not found: $_plugin_json — skipping plugin update"
