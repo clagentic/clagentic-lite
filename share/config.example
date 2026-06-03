@@ -135,8 +135,10 @@ CLAGENTIC_LLM_TIMEOUT_SEC=180
 #   timeout = BASE + ceil(input_bytes / BYTES_PER_SEC), capped at MAX_SEC.
 # This prevents 180s from firing on very large diffs (200 KB+) while keeping
 # short calls at the base timeout. Set AUTO_SCALE=0 to disable and use BASE only.
+# BYTES_PER_SEC is calibrated from observed latency: ~500 B/s for a review-quality
+# pass. The old default (2048) underestimated by 4x and caused timeouts on 170KB diffs.
 CLAGENTIC_LLM_TIMEOUT_MAX_SEC=900
-CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC=2048
+CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC=500
 CLAGENTIC_LLM_TIMEOUT_AUTO_SCALE=1
 # Per-role overrides (optional — takes precedence over the global BASE/MAX):
 # CLAGENTIC_REVIEWER_TIMEOUT_SEC=240
