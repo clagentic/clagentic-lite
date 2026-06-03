@@ -2,6 +2,8 @@
 
 Each gate is documented here: what it does, where it fires, what blocks, how to override.
 
+> **Scope:** All gates described here are per-project. They activate only in enrolled repos. If a gate is not firing, confirm the project is enrolled: run `clagentic-lite list` to see enrolled repos, or `clagentic-lite enroll` to enroll the current directory.
+
 ## Gate 1 — Memory inject
 
 | | |
