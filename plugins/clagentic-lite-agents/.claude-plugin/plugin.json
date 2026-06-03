@@ -7,6 +7,6 @@
     "name": "andy",
     "email": "akuehner@gmail.com"
   },
-  "homepage": "https://forgejo.akuehner.com/clagentic/clagentic-lite",
+  "homepage": "https://github.com/clagentic/clagentic-lite",
   "keywords": ["agents", "code-review", "security", "gates", "clagentic"]
 }
