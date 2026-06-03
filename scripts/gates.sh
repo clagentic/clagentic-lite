@@ -376,8 +376,20 @@ cmd_review() {
   # network-out Reviewer chain reports "clean review" and the ship passes.
   if review_is_degraded "$OUT"; then
     cmd_log_run review block "review degraded (all chain steps failed)"
-    echo "[gates/review] BLOCKED: reviewer chain returned degraded envelope — no real review occurred. See $OUT and scripts/gates.sh digest for the per-step failure reasons." 1>&2
-    cat "$OUT" 1>&2
+    echo "[gates/review] BLOCKED: reviewer chain returned degraded envelope — no real review occurred." 1>&2
+    # Pull the per-step failure reasons from the audit DB so the user sees them
+    # in the terminal without having to run `digest` or open last-review.json.
+    ADB="$REPO_ROOT/.clagentic/audit.db"
+    if [ -f "$ADB" ] && command -v sqlite3 >/dev/null 2>&1; then
+      STEP_HINTS=$(sqlite3 "$ADB" \
+        "SELECT '  ' || details FROM gate_runs WHERE gate='llm-call' AND outcome='step-failed' AND details LIKE 'reviewer%' ORDER BY id DESC LIMIT 6;" \
+        2>/dev/null)
+      if [ -n "$STEP_HINTS" ]; then
+        printf '[gates/review] per-step failures (most recent first):\n' 1>&2
+        printf '%s\n' "$STEP_HINTS" 1>&2
+      fi
+    fi
+    echo "[gates/review] full details: $OUT  |  scripts/gates.sh digest" 1>&2
     return 1
   fi
   # Severity gate: count findings >= configured threshold.
