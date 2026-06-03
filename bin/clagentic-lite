@@ -178,7 +178,7 @@ _stamp_wrapper_claude_md() {
       esac
     done < "$_wcd_template"
   } > "$_wcd_target"
-  say "stamped wrapper CLAUDE.md: $_wcd_target"
+  say "stamped wrapper CLAUDE.md: $_wcd_target" >&2
 }
 
 # ---------------------------------------------------------------- prereq helpers
