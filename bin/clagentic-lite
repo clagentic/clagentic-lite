@@ -374,12 +374,22 @@ cmd_init() {
   # Sequence: marketplace add (registers source) -> plugin install by name.
   # 'claude plugin marketplace add' is idempotent — re-running init is safe.
   if command -v claude >/dev/null 2>&1; then
-    claude plugin marketplace add "$CLAGENTIC_HOME" --scope user && \
-      say "registered marketplace: clagentic-lite" || \
-      warn "claude plugin marketplace add failed — skipping plugin install"
-    claude plugin install "clagentic-lite-agents@clagentic-lite" && \
-      say "installed plugin: clagentic-lite-agents (agents available globally)" || \
-      warn "claude plugin install failed — run manually: claude plugin install clagentic-lite-agents@clagentic-lite"
+    # Best-effort pre-registration so the subsequent list check can find the plugin
+    # even when the marketplace was not previously registered.
+    claude plugin marketplace add "$CLAGENTIC_HOME" --scope user 2>/dev/null || true
+    if claude plugin list 2>/dev/null | grep -q "clagentic-lite-agents"; then
+      say "plugin clagentic-lite-agents already installed"
+    else
+      if claude plugin marketplace add "$CLAGENTIC_HOME" --scope user; then
+        if claude plugin install "clagentic-lite-agents@clagentic-lite"; then
+          say "installed plugin: clagentic-lite-agents (agents available globally)"
+        else
+          warn "claude plugin install failed — run manually: claude plugin install clagentic-lite-agents@clagentic-lite"
+        fi
+      else
+        warn "claude plugin marketplace add failed — run manually: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite-agents@clagentic-lite"
+      fi
+    fi
   else
     warn "claude not on PATH — skipping plugin install; after adding to PATH run: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite-agents@clagentic-lite"
   fi
@@ -1259,25 +1269,40 @@ cmd_update() {
 
   say "updating clagentic-lite at $CLAGENTIC_HOME..."
 
-  # Stash any local modifications (e.g. uncommitted plugin.json version bumps
-  # from a prior update, or edits made by an overzealous AI session), pull,
-  # then drop the stash. The stash is dropped rather than popped — local edits
-  # to $CLAGENTIC_HOME are never user work worth preserving.
+  # If CLAGENTIC_HOME has uncommitted changes, prompt before discarding them.
+  # Local edits to CLAGENTIC_HOME are tool internals, not user work — but the
+  # user should confirm before we silently discard them. On non-tty (CI, scripts),
+  # warn and proceed automatically so update remains unattended-safe.
   _plugin_json_rel="plugins/clagentic-lite-agents/.claude-plugin/plugin.json"
-  _stashed=0
   if ! git -C "$CLAGENTIC_HOME" diff --quiet 2>/dev/null; then
-    git -C "$CLAGENTIC_HOME" stash push -m "clagentic-lite update auto-stash" 2>/dev/null && _stashed=1 || \
-      warn "could not stash local changes in $CLAGENTIC_HOME — proceeding anyway"
+    _dirty=$(git -C "$CLAGENTIC_HOME" diff --name-only 2>/dev/null)
+    if [ -t 0 ]; then
+      printf '[clagentic-lite] WARN: uncommitted changes in %s:\n' "$CLAGENTIC_HOME" >&2
+      printf '%s\n' "$_dirty" | sed 's/^/  /' >&2
+      printf 'These changes will be discarded to proceed with update. Continue? [y/N]: '
+      read -r _stash_reply || _stash_reply=""
+      case "$_stash_reply" in
+        y|Y|yes|YES)
+          git -C "$CLAGENTIC_HOME" stash push -q -m "clagentic-lite update discard" 2>/dev/null
+          git -C "$CLAGENTIC_HOME" stash drop -q 2>/dev/null || true
+          ;;
+        *)
+          die "update cancelled — stash or commit changes in $CLAGENTIC_HOME first"
+          ;;
+      esac
+    else
+      # Non-tty (CI, script): warn and proceed, discard changes.
+      warn "non-tty: discarding uncommitted changes in $CLAGENTIC_HOME to proceed with update"
+      warn "dirty files: $(git -C "$CLAGENTIC_HOME" diff --name-only 2>/dev/null | tr '\n' ' ')"
+      git -C "$CLAGENTIC_HOME" stash push -q -m "clagentic-lite update discard" 2>/dev/null
+      git -C "$CLAGENTIC_HOME" stash drop -q 2>/dev/null || true
+    fi
   fi
 
   # ff-only pull.
   if ! git -C "$CLAGENTIC_HOME" pull --ff-only; then
-    [ "$_stashed" -eq 1 ] && git -C "$CLAGENTIC_HOME" stash drop 2>/dev/null || true
     die "git pull --ff-only failed (non-fast-forward divergence or no upstream)"
   fi
-
-  # Drop the stash — local edits to CLAGENTIC_HOME are tool internals, not user work.
-  [ "$_stashed" -eq 1 ] && git -C "$CLAGENTIC_HOME" stash drop 2>/dev/null || true
 
   # Re-run the same prereq sweep that init runs — pre-PR-#6 this only
   # checked sqlite3 + git, so a clagentic-lite update on a host that had since
@@ -1309,10 +1334,15 @@ cmd_update() {
           say "bumped plugin version: $_cur_ver -> $_new_ver"
           # Commit the version bump so the working tree stays clean for
           # subsequent update runs (dirty-tree check would block otherwise).
+          # -c user.name/email applies only to this invocation; it ensures the
+          # commit succeeds on machines with no git user config set globally.
           git -C "$CLAGENTIC_HOME" add "$_plugin_json_rel" 2>/dev/null && \
-            git -C "$CLAGENTIC_HOME" commit -m "chore: bump clagentic-lite-agents plugin version to $_new_ver" \
-              --no-gpg-sign 2>/dev/null || \
-            warn "could not commit plugin version bump — next update run may fail dirty-tree check"
+            git -C "$CLAGENTIC_HOME" \
+              -c user.name=clagentic-lite \
+              -c user.email=clagentic-lite@localhost \
+              commit -m "chore: bump clagentic-lite-agents plugin version to $_new_ver" \
+              2>/dev/null || \
+            warn "could not commit plugin version bump — agents may be stale until resolved"
           ;;
       esac
     else
