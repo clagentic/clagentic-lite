@@ -4,17 +4,15 @@
     "name": "andy",
     "email": "akuehner@gmail.com"
   },
-  "description": "Marketplace for plugins shipped alongside clagentic-lite. Installs the four AI role agents (builder, reviewer, auditor, merge-gate) globally so Claude Code discovers them in any enrolled project without per-repo file copies.",
+  "metadata": {
+    "description": "Plugins shipped alongside clagentic-lite. Installs the four AI role agents (builder, reviewer, auditor, merge-gate) globally so Claude Code discovers them in any enrolled project."
+  },
   "plugins": [
     {
       "name": "clagentic-lite-agents",
-      "source": {
-        "type": "local",
-        "path": "./plugins/clagentic-lite-agents"
-      },
-      "description": "The four clagentic-lite role agents: builder (primary code author), reviewer (cross-vendor code review), auditor (security gates), merge-gate (final pre-merge sanity check). Installed globally via clagentic-lite init; updated via clagentic-lite update.",
-      "category": "agents",
-      "tags": ["agents", "code-review", "security", "gates", "clagentic"]
+      "source": "./plugins/clagentic-lite-agents",
+      "description": "The four clagentic-lite role agents: builder (primary code author), reviewer (cross-vendor code review), auditor (security gates), merge-gate (final pre-merge sanity check).",
+      "version": "1.0.0"
     }
   ]
 }
