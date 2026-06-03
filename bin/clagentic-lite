@@ -1275,6 +1275,57 @@ cmd_update() {
   say "checking prerequisites post-update..."
   _run_prereq_checks update
 
+  # Install or update the agent plugin. This runs before the registry check so
+  # it works on machines with no enrolled repos (e.g. freshly cloned installs
+  # where init was run before the plugin system existed).
+  _plugin_json="$CLAGENTIC_HOME/plugins/clagentic-lite-agents/.claude-plugin/plugin.json"
+  if [ -f "$_plugin_json" ]; then
+    # Extract current version: "version": "x.y.z" — strip whitespace for dash compat.
+    _cur_ver=$(grep '"version"' "$_plugin_json" | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | tr -d '[:space:]')
+    if [ -n "$_cur_ver" ]; then
+      # Patch-bump: split on '.', increment last segment.
+      # Validate each segment is numeric before arithmetic (dash strict).
+      _ver_major=$(printf '%s' "$_cur_ver" | cut -d. -f1)
+      _ver_minor=$(printf '%s' "$_cur_ver" | cut -d. -f2)
+      _ver_patch=$(printf '%s' "$_cur_ver" | cut -d. -f3)
+      case "$_ver_patch" in
+        ''|*[!0-9]*) warn "plugin version patch segment not numeric: '$_ver_patch' — skipping version bump" ;;
+        *)
+          _ver_patch=$((_ver_patch+1))
+          _new_ver="${_ver_major}.${_ver_minor}.${_ver_patch}"
+          sed "s/\"version\"[[:space:]]*:[[:space:]]*\"$_cur_ver\"/\"version\": \"$_new_ver\"/" \
+            "$_plugin_json" > "$_plugin_json.tmp"
+          mv "$_plugin_json.tmp" "$_plugin_json"
+          say "bumped plugin version: $_cur_ver -> $_new_ver"
+          ;;
+      esac
+    else
+      warn "could not read plugin version from $_plugin_json — skipping version bump"
+    fi
+
+    if command -v claude >/dev/null 2>&1; then
+      # Ensure marketplace is registered (idempotent).
+      claude plugin marketplace add "$CLAGENTIC_HOME" --scope user 2>/dev/null || true
+      # If already installed, update. If not installed, install from scratch.
+      if claude plugin list 2>/dev/null | grep -q "clagentic-lite-agents"; then
+        claude plugin marketplace update clagentic-lite && \
+          say "refreshed marketplace: clagentic-lite" || \
+          warn "claude plugin marketplace update failed — plugin may be stale"
+        claude plugin update "clagentic-lite-agents@clagentic-lite" && \
+          say "updated plugin: clagentic-lite-agents" || \
+          warn "claude plugin update failed; run: claude plugin update clagentic-lite-agents@clagentic-lite"
+      else
+        claude plugin install "clagentic-lite-agents@clagentic-lite" && \
+          say "installed plugin: clagentic-lite-agents (agents now available globally)" || \
+          warn "claude plugin install failed; run: claude plugin install clagentic-lite-agents@clagentic-lite"
+      fi
+    else
+      warn "claude not on PATH — skipping plugin install/update (run manually: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite-agents@clagentic-lite)"
+    fi
+  else
+    warn "plugin manifest not found: $_plugin_json — skipping plugin update"
+  fi
+
   # Re-stamp shims in registered repos if the template version changed.
   if [ ! -f "$REGISTRY" ]; then
     say "no enrolled repos to re-stamp"
@@ -1372,52 +1423,6 @@ cmd_update() {
       _n=$(_restamp_repo_artifacts "$_rpath" " (--restamp)")
       _restamped=$((_restamped+_n))
     done < "$REGISTRY"
-  fi
-
-  # Bump plugin.json version and update the globally-installed plugin.
-  # The plugin loader is version-string-gated: it will not re-install unless
-  # the version in plugin.json changes. Patch-bump (x.y.Z -> x.y.Z+1) is
-  # sufficient. Uses POSIX sed — no bash arithmetic on arrays (AGENTS.md §2).
-  _plugin_json="$CLAGENTIC_HOME/plugins/clagentic-lite-agents/.claude-plugin/plugin.json"
-  if [ -f "$_plugin_json" ]; then
-    # Extract current version: "version": "x.y.z"
-    _cur_ver=$(grep '"version"' "$_plugin_json" | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-    if [ -n "$_cur_ver" ]; then
-      # Patch-bump: split on '.', increment last segment.
-      _ver_major=$(printf '%s' "$_cur_ver" | cut -d. -f1)
-      _ver_minor=$(printf '%s' "$_cur_ver" | cut -d. -f2)
-      _ver_patch=$(printf '%s' "$_cur_ver" | cut -d. -f3)
-      _ver_patch=$((_ver_patch+1))
-      _new_ver="${_ver_major}.${_ver_minor}.${_ver_patch}"
-      sed "s/\"version\"[[:space:]]*:[[:space:]]*\"$_cur_ver\"/\"version\": \"$_new_ver\"/" \
-        "$_plugin_json" > "$_plugin_json.tmp"
-      mv "$_plugin_json.tmp" "$_plugin_json"
-      say "bumped plugin version: $_cur_ver -> $_new_ver"
-    else
-      warn "could not read plugin version from $_plugin_json — skipping version bump"
-    fi
-
-    if command -v claude >/dev/null 2>&1; then
-      # Ensure marketplace is registered (idempotent).
-      claude plugin marketplace add "$CLAGENTIC_HOME" --scope user 2>/dev/null || true
-      # If already installed, update. If not installed, install from scratch.
-      if claude plugin list 2>/dev/null | grep -q "clagentic-lite-agents"; then
-        claude plugin marketplace update clagentic-lite && \
-          say "refreshed marketplace: clagentic-lite" || \
-          warn "claude plugin marketplace update failed — plugin may be stale"
-        claude plugin update "clagentic-lite-agents@clagentic-lite" && \
-          say "updated plugin: clagentic-lite-agents" || \
-          warn "claude plugin update failed; run: claude plugin update clagentic-lite-agents@clagentic-lite"
-      else
-        claude plugin install "clagentic-lite-agents@clagentic-lite" && \
-          say "installed plugin: clagentic-lite-agents (agents now available globally)" || \
-          warn "claude plugin install failed; run: claude plugin install clagentic-lite-agents@clagentic-lite"
-      fi
-    else
-      warn "claude not on PATH — skipping plugin install/update (run manually: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite-agents@clagentic-lite)"
-    fi
-  else
-    warn "plugin manifest not found: $_plugin_json — skipping plugin update"
   fi
 
   say "update complete (re-stamped $_restamped artifact(s))"
