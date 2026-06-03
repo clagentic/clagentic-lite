@@ -299,11 +299,13 @@ invoke_claude() {
 
 # Codex non-interactive.
 #
-# We combine prompt and input into a single temp file and pass it as the sole
-# positional argument to `codex exec`. This avoids relying on stdin-block
-# semantics (the claim that codex appends piped stdin as a <stdin> block when
-# a prompt arg is also provided), which is undocumented and version-dependent.
-# A combined-input file is one fixed surface regardless of codex version.
+# We combine prompt and input into a single temp file and feed it via stdin
+# using the documented `-` sentinel (`codex exec - < FILE`). This avoids the
+# MAX_ARG_STRLEN ceiling (~131 KB on Linux) that rejects large diffs when the
+# combined input is passed as a positional argument. stdin has no such limit.
+#
+# `codex exec --help`: "If not provided as an argument (or if `-` is used),
+# instructions are read from stdin."
 #
 # stdout from codex exec is progress/spinner output (the final response goes to
 # -o OUTPUT_FILE), so we redirect both stdout and stderr to ERR_FILE — that is
@@ -315,10 +317,10 @@ invoke_codex() {
   { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } > "$TMP_COMBINED"
   if [ -n "$MODEL" ]; then
     $DS_TIMEOUT_CMD "$LLM_TIMEOUT" codex exec --skip-git-repo-check -m "$MODEL" \
-      --color never -o "$TMP_RAW" "$(cat "$TMP_COMBINED")" > "$ERR_FILE" 2>&1
+      --color never -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1
   else
     $DS_TIMEOUT_CMD "$LLM_TIMEOUT" codex exec --skip-git-repo-check \
-      --color never -o "$TMP_RAW" "$(cat "$TMP_COMBINED")" > "$ERR_FILE" 2>&1
+      --color never -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1
   fi
   EXIT_CODE=$?
   # Strip ANSI CSI sequences from the -o output file before handing it to
