@@ -2,7 +2,7 @@
   <img src="media/logo/lite-lockup-256.png" alt="Clagentic:Lite" width="260" />
 </p>
 
-<h4 align="center">A personal coding harness with serious gates. POSIX shell, two SQLite files, no server.</h4>
+<h4 align="center">Cross-vendor AI coding harness with deterministic security gates. Gated Builder+Reviewer roles, full SQLite audit trail. No server, no cloud.</h4>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg" alt="License: FSL-1.1-MIT" /></a>
@@ -15,7 +15,7 @@
 
 # Clagentic:Lite
 
-Four roles (Builder, Reviewer, Auditor, Merge Gate) with per-role model chains. Five gates (memory recall, safe bash/writes, cross-vendor review, local security scans, session summarize) that fire on Claude Code or Codex events. One SQLite file for session memory, one for the audit trail. POSIX shell. No server. Nothing global. Runs the same on WSL2 Ubuntu and macOS.
+Five roles (Builder, Reviewer, Auditor, Merge Gate, Troubleshooter) with per-role model chains. Five gates (memory recall, safe bash/writes, cross-vendor review, local security scans, session summarize) that fire on Claude Code or Codex events. One SQLite file for session memory, one for the audit trail. POSIX shell. No server. Nothing global. Runs the same on WSL2 Ubuntu and macOS.
 
 It is not a platform. It is what you install on your machine so the coding session you have there is visibly more careful than the default.
 
