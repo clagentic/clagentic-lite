@@ -1273,14 +1273,8 @@ cmd_update() {
   # Local edits to CLAGENTIC_HOME are tool internals, not user work — but the
   # user should confirm before we silently discard them. On non-tty (CI, scripts),
   # warn and proceed automatically so update remains unattended-safe.
-  #
-  # plugin.json is intentionally excluded: cmd_update patch-bumps its version in
-  # place (no commit) so that 'claude plugin update' picks up the new number.
-  # That file will always appear dirty after an update run; it must not trigger
-  # the discard prompt or block the ff-only pull on the next run.
-  _plugin_json_rel="plugins/clagentic-lite-agents/.claude-plugin/plugin.json"
-  _dirty=$(git -C "$CLAGENTIC_HOME" diff --name-only 2>/dev/null | grep -v "^${_plugin_json_rel}$" || true)
-  if [ -n "$_dirty" ]; then
+  if ! git -C "$CLAGENTIC_HOME" diff --quiet 2>/dev/null; then
+    _dirty=$(git -C "$CLAGENTIC_HOME" diff --name-only 2>/dev/null)
     if [ -t 0 ]; then
       printf '[clagentic-lite] WARN: uncommitted changes in %s:\n' "$CLAGENTIC_HOME" >&2
       printf '%s\n' "$_dirty" | sed 's/^/  /' >&2
@@ -1298,7 +1292,7 @@ cmd_update() {
     else
       # Non-tty (CI, script): warn and proceed, discard changes.
       warn "non-tty: discarding uncommitted changes in $CLAGENTIC_HOME to proceed with update"
-      warn "dirty files: $(printf '%s\n' "$_dirty" | tr '\n' ' ')"
+      warn "dirty files: $(git -C "$CLAGENTIC_HOME" diff --name-only 2>/dev/null | tr '\n' ' ')"
       git -C "$CLAGENTIC_HOME" stash push -q -m "clagentic-lite update discard" 2>/dev/null
       git -C "$CLAGENTIC_HOME" stash drop -q 2>/dev/null || true
     fi
@@ -1320,33 +1314,9 @@ cmd_update() {
   # where init was run before the plugin system existed).
   _plugin_json="$CLAGENTIC_HOME/plugins/clagentic-lite-agents/.claude-plugin/plugin.json"
   if [ -f "$_plugin_json" ]; then
-    # Extract current version: "version": "x.y.z" — strip whitespace for dash compat.
-    _cur_ver=$(grep '"version"' "$_plugin_json" | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | tr -d '[:space:]')
-    if [ -n "$_cur_ver" ]; then
-      # Patch-bump: split on '.', increment last segment.
-      # Validate each segment is numeric before arithmetic (dash strict).
-      _ver_major=$(printf '%s' "$_cur_ver" | cut -d. -f1)
-      _ver_minor=$(printf '%s' "$_cur_ver" | cut -d. -f2)
-      _ver_patch=$(printf '%s' "$_cur_ver" | cut -d. -f3)
-      case "$_ver_patch" in
-        ''|*[!0-9]*) warn "plugin version patch segment not numeric: '$_ver_patch' — skipping version bump" ;;
-        *)
-          _ver_patch=$((_ver_patch+1))
-          _new_ver="${_ver_major}.${_ver_minor}.${_ver_patch}"
-          sed "s/\"version\"[[:space:]]*:[[:space:]]*\"$_cur_ver\"/\"version\": \"$_new_ver\"/" \
-            "$_plugin_json" > "$_plugin_json.tmp"
-          mv "$_plugin_json.tmp" "$_plugin_json"
-          say "bumped plugin version: $_cur_ver -> $_new_ver"
-          # plugin.json is intentionally left as a dirty unstaged file.
-          # The dirty-tree check above excludes it by path, so it will not
-          # prompt or block on the next update run.  Committing it here would
-          # create a local commit that diverges from upstream on every user
-          # machine — breaking the next ff-only pull for everyone.
-          ;;
-      esac
-    else
-      warn "could not read plugin version from $_plugin_json — skipping version bump"
-    fi
+    # plugin.json version is bumped by maintainer PRs that change agent files.
+    # cmd_update does not touch the version — local bumps drift from upstream
+    # and break cache invalidation when the repo ships a real version change.
 
     if command -v claude >/dev/null 2>&1; then
       # Ensure marketplace is registered (idempotent).
