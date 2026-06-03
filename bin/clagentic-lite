@@ -1211,7 +1211,7 @@ _restamp_repo_artifacts() {
       sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
           -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_ra_default_branch|g" \
           "$_ra_cm_template" > "$_ra_cm"
-      say "re-stamped${_ra_label}: $_ra_path/CLAUDE.md"
+      say "re-stamped${_ra_label}: $_ra_path/CLAUDE.md" >&2
       _ra_count=$((_ra_count+1))
     fi
   fi
@@ -1222,7 +1222,7 @@ _restamp_repo_artifacts() {
     _ra_cs_template="$SHARE_DIR/hook-shims/claude-settings.template"
     if [ -f "$_ra_cs_template" ]; then
       sed "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" "$_ra_cs_template" > "$_ra_cs"
-      say "re-stamped${_ra_label}: $_ra_path/.claude/settings.json"
+      say "re-stamped${_ra_label}: $_ra_path/.claude/settings.json" >&2
       _ra_count=$((_ra_count+1))
     fi
   fi
@@ -1242,7 +1242,7 @@ _restamp_repo_artifacts() {
       # Re-build the project table from the pointer file.
       _ra_wcm_repos=$(cat "$_ra_wrapper_ptr" 2>/dev/null | tr '\n' ' ')
       ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_ra_wrapper_dir" "$_ra_wcm_repos" && {
-        say "re-stamped wrapper${_ra_label}: $_ra_wrapper_cm"
+        say "re-stamped wrapper${_ra_label}: $_ra_wrapper_cm" >&2
         _ra_count=$((_ra_count+1))
       }
     fi
