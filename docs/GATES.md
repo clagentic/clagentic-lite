@@ -181,7 +181,44 @@ CLAGENTIC_TAIL_INTERVAL_SEC=2 scripts/gates.sh tail   # adjust poll interval
 | Gate 2 — bash guard | Legitimate command blocked by a rule | Set `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` in `.clagentic/config`. Multiple rules: comma-separated. Add a comment explaining why in the commit. |
 | Gate 2 — write guard (W-001) | Intentional work on default branch | Set `CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1` in `.clagentic/config`. This is unusual — default-branch protection exists for good reason. |
 | Gate 3 — review | Cross-vendor fallback silently taken | Set `CLAGENTIC_REVIEWER_REQUIRED=1` to make chain failure a hard error. Chain fallback becomes visible in audit trail and the gate blocks rather than emitting a degraded envelope. |
+| Gate 6 — adversarial (via merge-gate) | By-design behavior flagged as a CWE finding | Commit `.clagentic/adversarial-acks.json` to the repo. See "adversarial-acks.json" below. |
 | Any gate | Tool not installed | Set `CLAGENTIC_ALLOW_MISSING_<TOOL>=1`. Prefer installing the tool. |
+
+### adversarial-acks.json — per-finding acknowledgment for the merge gate
+
+When an adversarial finding reflects intentional design (e.g., a service that reads untrusted input by contract), you can acknowledge it rather than suppress the adversarial pass entirely. The acknowledgment is committed to the repo so it is visible in code review and audit.
+
+**File location:** `.clagentic/adversarial-acks.json` in the enrolled repo root.
+
+**Schema:** a JSON array of ack objects. Copy `.clagentic/adversarial-acks.json.example` from the clagentic-lite install tree as a starting point.
+
+```json
+[
+  {
+    "cwe": "CWE-807",
+    "path_glob": "src/reachability/**",
+    "rationale": "Deployment-discovery reads K8s workload specs by design; security analysts viewing CVEs is the product surface.",
+    "acknowledged_by": "andy",
+    "acknowledged_at": "2026-06-04"
+  }
+]
+```
+
+Fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `cwe` | yes | CWE identifier string, e.g. `"CWE-807"` |
+| `path_glob` | no | If present, the ack only applies when the cited file matches this glob. If absent, the ack covers all paths for that CWE. |
+| `rationale` | yes | Human-readable explanation of why the finding is intentional |
+| `acknowledged_by` | yes | Who made the call |
+| `acknowledged_at` | yes | ISO date string |
+
+**Coverage rule:** a finding is covered when (a) its CWE matches `acks[].cwe`, and (b) either `path_glob` is absent or the cited file matches `path_glob`.
+
+**Effect:** when all blocking adversarial findings are covered, the merge gate approves and logs `approve (N acknowledged finding(s))` in `audit.db`. Uncovered findings still refuse. The gate output includes an `acknowledged` array listing each covered finding with its rationale, so the audit trail is complete.
+
+**Important:** the acks file must be committed deliberately. A missing file means no acks are in effect — the merge gate sees an empty list and refuses on any unmitigated CWE finding.
 
 **Agents: if a gate blocks you, consult this table first.** Editing `pre-bash-guard.sh`, `pre-write-guard.sh`, or `scripts/gates.sh` to remove a rule or suppress a finding is a contract violation — it removes the protection for all future sessions, not just the one where it was inconvenient. Use the config bypass and explain why.
 
