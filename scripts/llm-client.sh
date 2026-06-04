@@ -262,25 +262,25 @@ LLM_TIMEOUT="${CLAGENTIC_LLM_TIMEOUT_SEC:-180}"
 #
 # Scaling formula: timeout = BASE + ceil(BYTES / RATE), capped at MAX.
 #   BASE  — CLAGENTIC_<ROLE>_TIMEOUT_SEC, falls back to CLAGENTIC_LLM_TIMEOUT_SEC (180)
-#   RATE  — CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC (500): bytes processed per second of wall-clock
-#           budget. 500 B/s is calibrated from observed review latency: a 170KB diff takes
-#           ~340s at current model speeds. The old default (2048) underestimated by 4x,
-#           causing all chain steps to time out on diffs >~100KB.
-#   MAX   — CLAGENTIC_<ROLE>_TIMEOUT_MAX_SEC, falls back to CLAGENTIC_LLM_TIMEOUT_MAX_SEC (900)
+#   RATE  — CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC (300): bytes processed per second of wall-clock
+#           budget. 300 B/s is conservatively calibrated for large review diffs: a 156KB diff
+#           takes ceil(156251/300)=521s of budget beyond the 180s base. The old default (500)
+#           produced only 493s total on that diff and caused the LLM to hit the wall.
+#   MAX   — CLAGENTIC_<ROLE>_TIMEOUT_MAX_SEC, falls back to CLAGENTIC_LLM_TIMEOUT_MAX_SEC (1800)
 # Set CLAGENTIC_LLM_TIMEOUT_AUTO_SCALE=0 to disable scaling and return BASE.
 llm_timeout_for() {
   ROLE_U="$1"
   BYTES="$2"
 
   BASE=$(role_env "$ROLE_U" TIMEOUT_SEC "${CLAGENTIC_LLM_TIMEOUT_SEC:-180}")
-  RATE="${CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC:-500}"
-  MAX=$(role_env "$ROLE_U" TIMEOUT_MAX_SEC "${CLAGENTIC_LLM_TIMEOUT_MAX_SEC:-900}")
+  RATE="${CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC:-300}"
+  MAX=$(role_env "$ROLE_U" TIMEOUT_MAX_SEC "${CLAGENTIC_LLM_TIMEOUT_MAX_SEC:-1800}")
 
   # Normalize config to integers; use safe defaults on parse failure.
   case "$BASE" in ''|*[!0-9]*) BASE=180 ;; esac
-  case "$RATE" in ''|*[!0-9]*) RATE=500 ;; esac
-  case "$MAX"  in ''|*[!0-9]*) MAX=900 ;; esac
-  [ "$RATE" -le 0 ] && RATE=500
+  case "$RATE" in ''|*[!0-9]*) RATE=300 ;; esac
+  case "$MAX"  in ''|*[!0-9]*) MAX=1800 ;; esac
+  [ "$RATE" -le 0 ] && RATE=300
 
   # Exit early if auto-scaling disabled.
   [ "${CLAGENTIC_LLM_TIMEOUT_AUTO_SCALE:-1}" = "0" ] && { printf '%s\n' "$BASE"; return; }
