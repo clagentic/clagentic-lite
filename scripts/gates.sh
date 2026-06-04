@@ -442,7 +442,34 @@ cmd_merge_gate() {
     DECISION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("decision","unknown"))' "$OUT" 2>/dev/null)
   fi
   case "$DECISION" in
-    approve) cmd_log_run merge-gate pass "approve" ;;
+    approve)
+      ACK_COUNT=0
+      ACK_DETAIL=""
+      if command -v jq >/dev/null 2>&1; then
+        ACK_COUNT=$(jq -r '(.acknowledged // []) | length' "$OUT" 2>/dev/null || echo 0)
+        # Serialize per-finding detail (cwe + file + rationale) into the audit
+        # details column so the audit trail records WHICH findings were waved
+        # through, not just how many. AGENTS.md §6: the audit trail is the artifact.
+        if [ "${ACK_COUNT:-0}" -gt 0 ]; then
+          ACK_DETAIL=$(jq -r '.acknowledged[] | "\(.cwe) \(.file) — \(.rationale)"' "$OUT" 2>/dev/null | tr '\n' '; ')
+        fi
+      elif command -v python3 >/dev/null 2>&1; then
+        ACK_COUNT=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("acknowledged",[])))' "$OUT" 2>/dev/null || echo 0)
+        if [ "${ACK_COUNT:-0}" -gt 0 ]; then
+          ACK_DETAIL=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+parts = ["{} {} — {}".format(f.get("cwe",""), f.get("file",""), f.get("rationale","")) for f in d.get("acknowledged",[])]
+print("; ".join(parts))
+' "$OUT" 2>/dev/null)
+        fi
+      fi
+      if [ "${ACK_COUNT:-0}" -gt 0 ]; then
+        cmd_log_run merge-gate pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL"
+      else
+        cmd_log_run merge-gate pass "approve"
+      fi
+      ;;
     refuse)
       cmd_log_run merge-gate block "refuse"
       cat "$OUT"
@@ -522,6 +549,7 @@ PY
 build_gate_summary() {
   RV="$REPO_ROOT/.clagentic/last-review.json"
   AD="$REPO_ROOT/.clagentic/last-adversarial.md"
+  ACKS_FILE="$REPO_ROOT/.clagentic/adversarial-acks.json"
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
 
   # Prefer jq; fall back to python3; finally degrade to a minimal envelope
@@ -531,12 +559,15 @@ build_gate_summary() {
   if command -v jq >/dev/null 2>&1; then
     RV_PAYLOAD='null'
     AD_PAYLOAD='""'
+    ACKS_PAYLOAD='[]'
     [ -f "$RV" ] && jq -e . "$RV" >/dev/null 2>&1 && RV_PAYLOAD=$(cat "$RV")
     [ -f "$AD" ] && AD_PAYLOAD=$(jq -Rs . < "$AD")
+    [ -f "$ACKS_FILE" ] && ACKS_PAYLOAD=$(jq -c . "$ACKS_FILE" 2>/dev/null || echo '[]')
     cat <<EOF
 {
   "review": $RV_PAYLOAD,
   "adversarial": $AD_PAYLOAD,
+  "adversarial_acks": $ACKS_PAYLOAD,
   "threshold": "$THRESHOLD"
 }
 EOF
@@ -546,13 +577,16 @@ EOF
   if command -v python3 >/dev/null 2>&1; then
     RV_ARG=""
     AD_ARG=""
+    ACKS_ARG=""
     [ -f "$RV" ] && RV_ARG="$RV"
     [ -f "$AD" ] && AD_ARG="$AD"
-    python3 - "$THRESHOLD" "$RV_ARG" "$AD_ARG" <<'PY'
+    [ -f "$ACKS_FILE" ] && ACKS_ARG="$ACKS_FILE"
+    python3 - "$THRESHOLD" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" <<'PY'
 import json, sys
 threshold = sys.argv[1]
-rv_path = sys.argv[2] if len(sys.argv) > 2 else ""
-ad_path = sys.argv[3] if len(sys.argv) > 3 else ""
+rv_path   = sys.argv[2] if len(sys.argv) > 2 else ""
+ad_path   = sys.argv[3] if len(sys.argv) > 3 else ""
+acks_path = sys.argv[4] if len(sys.argv) > 4 else ""
 review = None
 if rv_path:
     try:
@@ -567,7 +601,14 @@ if ad_path:
             adv = f.read()
     except Exception:
         adv = ""
-print(json.dumps({"review": review, "adversarial": adv, "threshold": threshold}))
+acks = []
+if acks_path:
+    try:
+        with open(acks_path) as f:
+            acks = json.load(f)
+    except Exception:
+        acks = []
+print(json.dumps({"review": review, "adversarial": adv, "adversarial_acks": acks, "threshold": threshold}))
 PY
     return 0
   fi
@@ -577,10 +618,10 @@ PY
   # incomplete context.
   if [ -f "$RV" ]; then
     cat <<EOF
-{"review": $(cat "$RV"), "adversarial": "", "threshold": "$THRESHOLD"}
+{"review": $(cat "$RV"), "adversarial": "", "adversarial_acks": [], "threshold": "$THRESHOLD"}
 EOF
   else
-    echo "{\"review\": null, \"adversarial\": \"\", \"threshold\": \"$THRESHOLD\"}"
+    echo "{\"review\": null, \"adversarial\": \"\", \"adversarial_acks\": [], \"threshold\": \"$THRESHOLD\"}"
   fi
 }
 

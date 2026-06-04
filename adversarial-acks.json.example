@@ -1,0 +1,9 @@
+[
+  {
+    "cwe": "CWE-807",
+    "path_glob": "src/reachability/**",
+    "rationale": "Deployment-discovery reads K8s workload specs by design; security analysts viewing CVEs is the product surface.",
+    "acknowledged_by": "andy",
+    "acknowledged_at": "2026-06-04"
+  }
+]
