@@ -550,6 +550,7 @@ build_gate_summary() {
   RV="$REPO_ROOT/.clagentic/last-review.json"
   AD="$REPO_ROOT/.clagentic/last-adversarial.md"
   ACKS_FILE="$REPO_ROOT/.clagentic/adversarial-acks.json"
+  AR_FILE="$REPO_ROOT/.clagentic/accepted-risks.md"
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
 
   # Prefer jq; fall back to python3; finally degrade to a minimal envelope
@@ -560,14 +561,17 @@ build_gate_summary() {
     RV_PAYLOAD='null'
     AD_PAYLOAD='""'
     ACKS_PAYLOAD='[]'
+    AR_PAYLOAD='""'
     [ -f "$RV" ] && jq -e . "$RV" >/dev/null 2>&1 && RV_PAYLOAD=$(cat "$RV")
     [ -f "$AD" ] && AD_PAYLOAD=$(jq -Rs . < "$AD")
     [ -f "$ACKS_FILE" ] && ACKS_PAYLOAD=$(jq -c . "$ACKS_FILE" 2>/dev/null || echo '[]')
+    [ -f "$AR_FILE" ] && AR_PAYLOAD=$(jq -Rs . < "$AR_FILE")
     cat <<EOF
 {
   "review": $RV_PAYLOAD,
   "adversarial": $AD_PAYLOAD,
   "adversarial_acks": $ACKS_PAYLOAD,
+  "accepted_risks": $AR_PAYLOAD,
   "threshold": "$THRESHOLD"
 }
 EOF
@@ -578,15 +582,18 @@ EOF
     RV_ARG=""
     AD_ARG=""
     ACKS_ARG=""
+    AR_ARG=""
     [ -f "$RV" ] && RV_ARG="$RV"
     [ -f "$AD" ] && AD_ARG="$AD"
     [ -f "$ACKS_FILE" ] && ACKS_ARG="$ACKS_FILE"
-    python3 - "$THRESHOLD" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" <<'PY'
+    [ -f "$AR_FILE" ] && AR_ARG="$AR_FILE"
+    python3 - "$THRESHOLD" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" <<'PY'
 import json, sys
 threshold = sys.argv[1]
 rv_path   = sys.argv[2] if len(sys.argv) > 2 else ""
 ad_path   = sys.argv[3] if len(sys.argv) > 3 else ""
 acks_path = sys.argv[4] if len(sys.argv) > 4 else ""
+ar_path   = sys.argv[5] if len(sys.argv) > 5 else ""
 review = None
 if rv_path:
     try:
@@ -608,20 +615,27 @@ if acks_path:
             acks = json.load(f)
     except Exception:
         acks = []
-print(json.dumps({"review": review, "adversarial": adv, "adversarial_acks": acks, "threshold": threshold}))
+ar = ""
+if ar_path:
+    try:
+        with open(ar_path) as f:
+            ar = f.read()
+    except Exception:
+        ar = ""
+print(json.dumps({"review": review, "adversarial": adv, "adversarial_acks": acks, "accepted_risks": ar, "threshold": threshold}))
 PY
     return 0
   fi
 
   # No JSON encoder available — emit a minimal envelope with adversarial
-  # dropped. The Merge Gate will see this and may choose to refuse on
-  # incomplete context.
+  # and accepted_risks dropped. The Merge Gate will see this and may choose
+  # to refuse on incomplete context.
   if [ -f "$RV" ]; then
     cat <<EOF
-{"review": $(cat "$RV"), "adversarial": "", "adversarial_acks": [], "threshold": "$THRESHOLD"}
+{"review": $(cat "$RV"), "adversarial": "", "adversarial_acks": [], "accepted_risks": "", "threshold": "$THRESHOLD"}
 EOF
   else
-    echo "{\"review\": null, \"adversarial\": \"\", \"adversarial_acks\": [], \"threshold\": \"$THRESHOLD\"}"
+    echo "{\"review\": null, \"adversarial\": \"\", \"adversarial_acks\": [], \"accepted_risks\": \"\", \"threshold\": \"$THRESHOLD\"}"
   fi
 }
 

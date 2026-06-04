@@ -32,6 +32,7 @@ Standard input is a single JSON object:
   "review": { ...reviewer.md schema... } | null,
   "adversarial": "<markdown>" | "",
   "adversarial_acks": [...] | [],
+  "accepted_risks": "<markdown from .clagentic/accepted-risks.md>" | "",
   "threshold": "low | medium | high | critical"
 }
 ```
@@ -52,6 +53,8 @@ Each entry in `adversarial_acks` has the shape:
 
 `path_glob` is optional; all other fields are required.
 
+`accepted_risks` is freetext markdown from `.clagentic/accepted-risks.md`. When non-empty it documents architectural risk decisions the team has made. See "Accepted risks" below.
+
 ## Output schema
 
 Strict JSON, no prose before or after:
@@ -61,26 +64,41 @@ Strict JSON, no prose before or after:
   "decision": "approve" | "refuse",
   "reason":   "<one short sentence>",
   "acknowledged": [
-    { "cwe": "CWE-NNN", "file": "src/foo.py:42", "rationale": "<from acks entry>" }
+    {
+      "cwe": "CWE-NNN",
+      "file": "src/foo.py:42",
+      "rationale": "<from acks or accepted_risks entry>",
+      "source": "adversarial-acks" | "accepted-risks"
+    }
   ]
 }
 ```
 
-`acknowledged` is omitted (or `[]`) when there are no acknowledged findings.
+`acknowledged` is omitted (or `[]`) when there are no acknowledged findings. The `source` field is optional but preferred: set it to `"adversarial-acks"` when the acknowledgment came from `adversarial_acks`, or `"accepted-risks"` when it came from the `accepted_risks` document. This aids the audit trail when reviewers inspect `last-merge-gate.json`.
 
 ## Decision rules
 
 **Refuse** if any of the following:
 
 - `review.findings` contains any finding at severity `>= threshold`.
-- `adversarial` contains a CWE citation paired with concrete file:line evidence, no follow-up "mitigated" note, AND the finding is not covered by an entry in `adversarial_acks`. A finding is covered when: (a) its CWE identifier matches `acks[].cwe`, and (b) either `acks[].path_glob` is absent OR the cited file matches `acks[].path_glob`.
+- `adversarial` contains a CWE citation paired with concrete file:line evidence, no follow-up "mitigated" note, AND the finding is not covered by an entry in `adversarial_acks` AND it is not inherent product behavior documented in `accepted_risks`.
 - The review's `summary` contradicts its `findings` (claims clean while listing high-severity items).
 
 **Approve** otherwise. A clean review with `findings: []` is the normal case; approve it.
 
 ## Acknowledged findings
 
-When all adversarial findings that would otherwise block are covered by `adversarial_acks`, approve but populate the `acknowledged` array in your output listing each covered finding. Include the CWE, the file:line cited in the adversarial report, and the rationale from the matching ack entry.
+When all adversarial findings that would otherwise block are covered by `adversarial_acks` or `accepted_risks`, approve but populate the `acknowledged` array in your output listing each covered finding. Include the CWE, the file:line cited in the adversarial report, the rationale, and the source.
+
+## Accepted risks
+
+When `accepted_risks` is non-empty, treat it as a list of architectural decisions the team has documented and accepted. For each adversarial finding that would otherwise block:
+
+- If the finding describes behavior that is inherent to the stated purpose of the system as documented in `accepted_risks` (e.g., a security dashboard reading CVE data and exposing it to authenticated analysts), classify it as acknowledged with rationale drawn from the matching `accepted_risks` entry rather than refusing.
+- Set `"source": "accepted-risks"` on the acknowledged entry so the audit trail records the origin.
+- Only refuse when the finding represents an unintentional gap not covered by the accepted risks documentation — i.e., the behavior the finding describes is not what the product is supposed to do.
+
+The `adversarial_acks` mechanism (per-CWE structured JSON) takes precedence when both apply to the same finding. Use `accepted_risks` for broader, prose-documented architectural decisions that cover classes of findings rather than individual CWEs.
 
 ## What to refuse separately
 
