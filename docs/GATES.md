@@ -136,6 +136,8 @@ For a heavier, structured threat-model pass, use the `/infosec-rt` skill instead
 
 The Merge Gate is the last LLM check before the PR is opened. It never overrides the deterministic security gates (those already gated upstream) and never adds its own findings — it reads the structured outputs of every prior gate and returns a single approve/refuse decision.
 
+If an adversarial finding describes inherent product behavior (e.g., a security dashboard that exposes CVE data to authenticated analysts), commit `.clagentic/accepted-risks.md` to the repo documenting the decision. The merge-gate reads that file and classifies covered findings as acknowledged rather than refusing. Copy `share/accepted-risks.example.md` from the clagentic-lite install tree as a starting template. For per-CWE structured acknowledgments with path-glob scoping, `.clagentic/adversarial-acks.json` remains the more precise mechanism and takes precedence when both apply.
+
 ## Gate 7 — Session summarize
 
 | | |
@@ -181,7 +183,8 @@ CLAGENTIC_TAIL_INTERVAL_SEC=2 scripts/gates.sh tail   # adjust poll interval
 | Gate 2 — bash guard | Legitimate command blocked by a rule | Set `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` in `.clagentic/config`. Multiple rules: comma-separated. Add a comment explaining why in the commit. |
 | Gate 2 — write guard (W-001) | Intentional work on default branch | Set `CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1` in `.clagentic/config`. This is unusual — default-branch protection exists for good reason. |
 | Gate 3 — review | Cross-vendor fallback silently taken | Set `CLAGENTIC_REVIEWER_REQUIRED=1` to make chain failure a hard error. Chain fallback becomes visible in audit trail and the gate blocks rather than emitting a degraded envelope. |
-| Gate 6 — adversarial (via merge-gate) | By-design behavior flagged as a CWE finding | Commit `.clagentic/adversarial-acks.json` to the repo. See "adversarial-acks.json" below. |
+| Gate 6 — adversarial (via merge-gate) | By-design behavior flagged as a CWE finding (per-CWE, path-scoped) | Commit `.clagentic/adversarial-acks.json` to the repo. See "adversarial-acks.json" below. |
+| Gate 6 — adversarial (via merge-gate) | Finding is inherent product behavior (architectural, not per-CWE) | Commit `.clagentic/accepted-risks.md` documenting the decision. Copy `share/accepted-risks.example.md` as template. See "accepted-risks.md" below. |
 | Any gate | Tool not installed | Set `CLAGENTIC_ALLOW_MISSING_<TOOL>=1`. Prefer installing the tool. |
 
 ### adversarial-acks.json — per-finding acknowledgment for the merge gate
@@ -219,6 +222,22 @@ Fields:
 **Effect:** when all blocking adversarial findings are covered, the merge gate approves and writes a `gate_runs` row to `audit.db` with the full per-finding detail (CWE, cited file:line, rationale) in the `details` column. Uncovered findings still refuse. The gate output also includes an `acknowledged` array for inspection via `clagentic-lite show gates`.
 
 **Important:** the acks file must be committed deliberately. A missing file means no acks are in effect — the merge gate sees an empty list and refuses on any unmitigated CWE finding.
+
+### accepted-risks.md — architectural risk documentation for the merge gate
+
+When an adversarial finding describes behavior that is inherent to the product's stated purpose — not a bug or an oversight, but a deliberate architectural decision — commit `.clagentic/accepted-risks.md` to the repo documenting that decision. The merge-gate reads this file and uses it to classify covered findings as acknowledged rather than refused.
+
+**File location:** `.clagentic/accepted-risks.md` in the enrolled repo root.
+
+**Template:** copy `share/accepted-risks.example.md` from the clagentic-lite install tree. It shows the recommended format with example entries.
+
+**Format:** freetext markdown. Each entry should state the CWE(s) it covers, the specific behavior that triggers the finding, why that behavior is intentional, and who accepted it and when.
+
+**Effect:** the merge-gate reads the document and, for each adversarial finding that would otherwise block, checks whether the finding describes behavior that is inherent to the stated product purpose as documented in `accepted_risks`. Covered findings are approved with `"source": "accepted-risks"` in the `acknowledged` array. Uncovered findings still refuse.
+
+**When to use this vs. adversarial-acks.json:** use `adversarial-acks.json` for precise per-CWE, path-glob-scoped acknowledgments. Use `accepted-risks.md` for broader architectural decisions that cover classes of findings rather than individual CWEs — e.g., "this entire subsystem exposes security intelligence data to authenticated analysts because that is the product." Both mechanisms are active simultaneously; `adversarial-acks.json` takes precedence when both apply to the same finding.
+
+**Important:** the file must be committed deliberately. Its presence in version history is part of the audit trail — it is the documented record that a human accepted this risk, not a suppression added to make a gate go green.
 
 **Agents: if a gate blocks you, consult this table first.** Editing `pre-bash-guard.sh`, `pre-write-guard.sh`, or `scripts/gates.sh` to remove a rule or suppress a finding is a contract violation — it removes the protection for all future sessions, not just the one where it was inconvenient. Use the config bypass and explain why.
 
