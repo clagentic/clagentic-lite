@@ -444,13 +444,28 @@ cmd_merge_gate() {
   case "$DECISION" in
     approve)
       ACK_COUNT=0
+      ACK_DETAIL=""
       if command -v jq >/dev/null 2>&1; then
         ACK_COUNT=$(jq -r '(.acknowledged // []) | length' "$OUT" 2>/dev/null || echo 0)
+        # Serialize per-finding detail (cwe + file + rationale) into the audit
+        # details column so the audit trail records WHICH findings were waved
+        # through, not just how many. AGENTS.md §6: the audit trail is the artifact.
+        if [ "${ACK_COUNT:-0}" -gt 0 ]; then
+          ACK_DETAIL=$(jq -r '.acknowledged[] | "\(.cwe) \(.file) — \(.rationale)"' "$OUT" 2>/dev/null | tr '\n' '; ')
+        fi
       elif command -v python3 >/dev/null 2>&1; then
         ACK_COUNT=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("acknowledged",[])))' "$OUT" 2>/dev/null || echo 0)
+        if [ "${ACK_COUNT:-0}" -gt 0 ]; then
+          ACK_DETAIL=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+parts = ["{} {} — {}".format(f.get("cwe",""), f.get("file",""), f.get("rationale","")) for f in d.get("acknowledged",[])]
+print("; ".join(parts))
+' "$OUT" 2>/dev/null)
+        fi
       fi
       if [ "${ACK_COUNT:-0}" -gt 0 ]; then
-        cmd_log_run merge-gate pass "approve ($ACK_COUNT acknowledged finding(s))"
+        cmd_log_run merge-gate pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL"
       else
         cmd_log_run merge-gate pass "approve"
       fi

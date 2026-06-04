@@ -190,7 +190,7 @@ When an adversarial finding reflects intentional design (e.g., a service that re
 
 **File location:** `.clagentic/adversarial-acks.json` in the enrolled repo root.
 
-**Schema:** a JSON array of ack objects. Copy `.clagentic/adversarial-acks.json.example` from the clagentic-lite install tree as a starting point.
+**Schema:** a JSON array of ack objects. Copy `adversarial-acks.json.example` from the clagentic-lite install tree root as a starting point.
 
 ```json
 [
@@ -216,7 +216,7 @@ Fields:
 
 **Coverage rule:** a finding is covered when (a) its CWE matches `acks[].cwe`, and (b) either `path_glob` is absent or the cited file matches `path_glob`.
 
-**Effect:** when all blocking adversarial findings are covered, the merge gate approves and logs `approve (N acknowledged finding(s))` in `audit.db`. Uncovered findings still refuse. The gate output includes an `acknowledged` array listing each covered finding with its rationale, so the audit trail is complete.
+**Effect:** when all blocking adversarial findings are covered, the merge gate approves and writes a `gate_runs` row to `audit.db` with the full per-finding detail (CWE, cited file:line, rationale) in the `details` column. Uncovered findings still refuse. The gate output also includes an `acknowledged` array for inspection via `clagentic-lite show gates`.
 
 **Important:** the acks file must be committed deliberately. A missing file means no acks are in effect — the merge gate sees an empty list and refuses on any unmitigated CWE finding.
 
