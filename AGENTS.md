@@ -82,9 +82,9 @@ bin/clagentic-lite init            # prereq detection, global config, symlink, p
 clagentic-lite enroll              # init DBs, stamp hooks, register
 
 # Ongoing use:
-scripts/gates.sh review            # run cross-model review on staged diff
-scripts/gates.sh ship              # run all gates in sequence
-scripts/gates.sh digest            # summarize today's audit-db rows
+clagentic-lite gates review        # run cross-model review on staged diff
+clagentic-lite gates ship          # run all gates in sequence
+clagentic-lite gates digest        # summarize today's audit-db rows
 scripts/memory.sh recall <kw>      # search session summaries
 sqlite3 .clagentic/audit.db        # inspect the audit trail directly
 sqlite3 .clagentic/memory.db       # inspect session memory directly
@@ -106,7 +106,7 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `AGENTS.md` (this file) | canonical agent instructions, cross-tool |
 | `CLAUDE.md` | thin pointer to `AGENTS.md` for Claude Code compatibility |
 | `README.md` | product narrative + 5-minute demo |
-| `bin/clagentic-lite` | CLI entry point: init, enroll, unenroll, list, doctor, update, recall, remember, show, export |
+| `bin/clagentic-lite` | CLI entry point: init, enroll, unenroll, list, doctor, update, recall, remember, show, export, gates |
 | `share/config.example` | all configurable parameters, no secrets (written to ~/.config/clagentic/config by init) |
 | `share/hook-shims/pre-commit.template` | hook shim template stamped into enrolled repos at enroll time |
 | `share/hook-shims/pre-push.template` | hook shim template stamped into enrolled repos at enroll time |
@@ -130,6 +130,28 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `examples/{python,node,go}/` | demo projects with planted issues |
 | `media/logo/` | brand assets (lockup, icon) |
 | `LICENSE` | FSL-1.1-MIT (free personal/internal; commercial licensing at clagentic.ai) |
+
+---
+
+## Template version-bump protocol
+
+Three generated artifacts are stamped into enrolled repos at enroll time and kept in sync by `clagentic-lite update`: `CLAUDE.md`, `.claude/settings.json`, and `.git/hooks/{pre-commit,pre-push}`. Each has a version constant in `bin/clagentic-lite` (`CLAUDE_MD_VERSION`, `CLAUDE_SETTINGS_VERSION`, `SHIM_VERSION`). `clagentic-lite update` compares the installed version against the constant and restamps only when they differ.
+
+**Rule: any change to a template file requires a version bump to its corresponding constant.** Without the bump, `update` sees matching versions and skips the restamp — enrolled repos never receive the change.
+
+| Template file | Version constant | When to bump |
+|---|---|---|
+| `share/hook-shims/CLAUDE.md.template` | `CLAUDE_MD_VERSION` in `bin/clagentic-lite` | Any content change to the template |
+| `share/hook-shims/CLAUDE.md.wrapper.template` | `CLAUDE_MD_VERSION` (same constant) | Any content change to the wrapper template |
+| `share/hook-shims/claude-settings.template` | `CLAUDE_SETTINGS_VERSION` in `bin/clagentic-lite` | Any content change to the settings template |
+| `share/hook-shims/pre-commit.template` | `SHIM_VERSION` in `bin/clagentic-lite` | Any content change to the hook shim |
+| `share/hook-shims/pre-push.template` | `SHIM_VERSION` (same constant) | Any content change to the hook shim |
+
+The version strings are arbitrary (`v1`, `v2`, ...) — increment by one each time. The template file itself should also carry the updated version in its managed-by comment (e.g. `clagentic-claude-md-version: v6`) so the installed copy is self-describing.
+
+**After bumping:** run `clagentic-lite update` (or `clagentic-lite update --restamp` to force all enrolled repos regardless of version). Users on older installs get the restamp automatically on their next `update` run.
+
+**`.claude/commands/` is different.** Those files are symlinked directly from `$CLAGENTIC_HOME/.claude/commands` into enrolled repos — no stamping, no version tracking. Changes take effect immediately for all enrolled repos. No version bump needed.
 
 ---
 
