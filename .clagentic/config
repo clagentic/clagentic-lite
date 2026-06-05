@@ -1,0 +1,3 @@
+# clagentic-lite repo-level config overrides
+# examples/ contains demo fixtures with pinned Go stdlib; exclude from osv-scanner
+CLAGENTIC_OSV_EXCLUDE=examples
