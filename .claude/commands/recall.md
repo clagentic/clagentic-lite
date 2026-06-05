@@ -6,7 +6,7 @@ argument-hint: "<keywords>"
 Search this project's session memory.
 
 ```sh
-scripts/memory.sh recall "$ARGUMENTS"
+clagentic-lite recall "$ARGUMENTS"
 ```
 
 Returns up to 5 prior session summaries matching the keywords, most recent first. No vector search — this is a SQLite `LIKE` over the `summary` and `tags` columns of `.clagentic/memory.db`.
