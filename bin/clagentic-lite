@@ -17,8 +17,8 @@
 # Design: tool is cloned once (default: ~/.clagentic-lite, override via
 # $CLAGENTIC_HOME). Per-repo enrollment writes .clagentic/{audit,memory}.db,
 # thin shims in .git/hooks/ that call back to $CLAGENTIC_HOME/scripts/, and
-# .claude/settings.json + symlink to .claude/commands so Claude Code
-# picks up hook wiring and slash commands in the enrolled project.
+# .claude/settings.json + symlinks to .claude/commands and .claude/skills so
+# Claude Code picks up hook wiring, slash commands, and invocable skills.
 # The five role agents (builder, reviewer, auditor, merge-gate, troubleshooter) are installed
 # globally via 'claude plugin install' at init time — no per-repo agent copies.
 # The tool repo itself is never the thing under gates by default.
@@ -57,7 +57,7 @@ SHIM_VERSION="v1"
 # Claude Code artifact version markers. Bump when the corresponding template
 # changes so `clagentic-lite update` re-stamps enrolled repos automatically.
 CLAUDE_SETTINGS_VERSION="v3"
-CLAUDE_MD_VERSION="v4"
+CLAUDE_MD_VERSION="v5"
 
 # Single source of truth for the security-gate tool list. Adding a new
 # scanner means editing this one line — _run_prereq_checks (init/update)
@@ -768,6 +768,13 @@ _enroll_one() {
       # Symlink commands/ — markdown only, no path traversal.
       ln -sfn "$CLAGENTIC_HOME/.claude/commands" "$_claude_dir/commands"
 
+      # Symlink skills/ — invocable slash-command skills (/infosec-rt, /eng-consult).
+      # Points to share/skills/ in the clagentic-lite checkout so updates propagate
+      # automatically on next `clagentic-lite update`.
+      if [ -d "$CLAGENTIC_HOME/share/skills" ]; then
+        ln -sfn "$CLAGENTIC_HOME/share/skills" "$_claude_dir/skills"
+      fi
+
       # Agent files are installed globally via the clagentic-lite-agents plugin
       # (claude plugin install, run during init). No per-repo copy needed.
 
@@ -876,8 +883,9 @@ cmd_unenroll() {
   _cs_file="$_canon/.claude/settings.json"
   if [ -f "$_cs_file" ] && grep -q 'managed-by: clagentic' "$_cs_file" 2>/dev/null; then
     rm -f "$_cs_file"
-    # Remove symlink we own for commands/.
+    # Remove symlinks we own for commands/ and skills/.
     rm -f "$_canon/.claude/commands"
+    rm -f "$_canon/.claude/skills"
     # Agents are installed globally via the plugin — no per-repo files to remove.
     # Remove .claude/ dir only if now empty.
     rmdir "$_canon/.claude" 2>/dev/null || true
@@ -1240,6 +1248,12 @@ _restamp_repo_artifacts() {
   # Agent files are installed globally via the clagentic-lite-agents plugin.
   # cmd_update bumps plugin.json version and calls 'claude plugin update'
   # to refresh agents on the user's machine — no per-repo copy to maintain.
+
+  # Re-point skills/ symlink — keeps enrolled repos in sync when share/skills/ changes.
+  _ra_skills_dir="$_ra_path/.claude/skills"
+  if [ -d "$CLAGENTIC_HOME/share/skills" ]; then
+    ln -sfn "$CLAGENTIC_HOME/share/skills" "$_ra_skills_dir"
+  fi
 
   # Re-stamp wrapper CLAUDE.md if the parent dir has a .clagentic-project pointer.
   _ra_wrapper_dir=$(dirname "$_ra_path")

@@ -1,5 +1,5 @@
 # CLAUDE.md
-<!-- managed-by: clagentic · clagentic-claude-md-version: v4 -->
+<!-- managed-by: clagentic · clagentic-claude-md-version: v5 -->
 <!-- Re-generate: `clagentic-lite enroll --force` or `clagentic-lite update` -->
 
 This project is enrolled in [clagentic-lite](https://github.com/clagentic/clagentic-lite) — a local coding harness with cross-vendor review, security gates, and session memory.
@@ -39,6 +39,8 @@ These subagents are available in this session. Claude Code dispatches them autom
 | `/review` | Cross-vendor review of the staged diff (routes through gate orchestrator) |
 | `/ship` | Run all gates in sequence; open a PR if green |
 | `/recall` | Search session memory for prior decisions |
+| `/eng-consult` | Multi-voice engineering panel — quality, security, SRE, UX review of a file or codebase |
+| `/infosec-rt` | Security red team — attacker personas model exploit chains; returns a ranked hardening plan |
 
 ## Hooks active
 
