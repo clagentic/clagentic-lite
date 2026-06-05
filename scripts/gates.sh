@@ -135,11 +135,24 @@ cmd_deps() {
   GLOBAL_IGNORE="$HOME/.config/clagentic/osv-ignore"
   REPO_IGNORE="$REPO_ROOT/.clagentic/osv-ignore"
 
-  # Capability-probe: newer osv-scanner releases use the `scan` subcommand and
-  # removed --severity / --ignore-vulns CLI flags. Older releases use the flat
-  # invocation with those flags. We probe by subcommand availability, not
-  # version string (same pattern as the gitleaks probe above).
-  if osv-scanner scan --help >/dev/null 2>&1; then
+  # Capability-probe: osv-scanner v2.x uses `scan source` subcommand; v1.x
+  # used a flat invocation with --severity / --ignore-vulns flags (removed in
+  # v2). Probe in preference order: v2 (`scan source`), v1-new (`scan`), else
+  # legacy flat invocation. We probe by subcommand availability, not version
+  # string.
+  # Determine invocation style by major version. v2.x uses `scan source -r`;
+  # v1.x new-style uses `scan --recursive`; very old releases use flat flags.
+  # --help exits 127 on all subcommands (urfave/cli behavior), so we parse
+  # the version string instead.
+  _OSV_MAJOR=$(osv-scanner --version 2>/dev/null | sed -n 's/osv-scanner version: \([0-9]*\)\..*/\1/p')
+  _OSV_SUBCMD=""
+  if [ "${_OSV_MAJOR:-0}" -ge 2 ] 2>/dev/null; then
+    _OSV_SUBCMD="source"   # v2.x: scan source -r
+  elif osv-scanner scan --help 2>&1 | grep -q 'USAGE'; then
+    _OSV_SUBCMD="scan"     # v1.x with scan subcommand
+  fi
+
+  if [ -n "$_OSV_SUBCMD" ]; then
     # Newer path: ignores remain config-file entries, but there is no scan
     # config key for minimum severity. Capture JSON and apply the configured
     # threshold to osv-scanner's computed group.max_severity values locally.
@@ -161,7 +174,11 @@ cmd_deps() {
     done
 
     _OSV_STATUS=0
-    osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" . > "$_OSV_JSON" || _OSV_STATUS=$?
+    if [ "$_OSV_SUBCMD" = "source" ]; then
+      osv-scanner scan source -r --format=json "--config=$_OSV_TMP" . > "$_OSV_JSON" || _OSV_STATUS=$?
+    else
+      osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" . > "$_OSV_JSON" || _OSV_STATUS=$?
+    fi
     case "$_OSV_STATUS" in
       0)
         cmd_log_run deps pass ""
@@ -183,7 +200,8 @@ cmd_deps() {
         ;;
     esac
   else
-    # Older releases: build argument list via positional parameters
+    # Legacy releases (pre-scan-subcommand): build argument list via positional
+    # parameters (POSIX-safe, no eval, no word-splitting surprises).
     # (POSIX-safe, no eval, no word-splitting surprises).
     set -- --recursive "--severity=$SEVERITY"
 
