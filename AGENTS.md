@@ -113,11 +113,12 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `share/hook-shims/claude-settings.template` | settings.json template stamped into enrolled repos — hook paths substituted with absolute `$CLAGENTIC_HOME` paths |
 | `share/hook-shims/CLAUDE.md.template` | CLAUDE.md template stamped into enrolled repo root — activates Builder contract and documents hooks/commands for Claude Code |
 | `.claude/settings.json` | hook wiring (tool's own repo; enrolled repos get a generated copy in their `.claude/`) |
-| `.claude-plugin/marketplace.json` | plugin marketplace manifest — declares the `clagentic-lite-agents` plugin |
-| `plugins/clagentic-lite-agents/.claude-plugin/plugin.json` | per-plugin manifest; version bumped by `clagentic-lite update` |
-| `plugins/clagentic-lite-agents/agents/{builder,reviewer,auditor,merge-gate,troubleshooter}.md` | role contracts installed globally via `claude plugin install` at `clagentic-lite init` time |
+| `.claude-plugin/marketplace.json` | plugin marketplace manifest — declares the `clagentic-lite` plugin |
+| `plugins/clagentic-lite/.claude-plugin/plugin.json` | per-plugin manifest; version bumped by `clagentic-lite update` |
+| `plugins/clagentic-lite/agents/{builder,reviewer,auditor,merge-gate,troubleshooter}.md` | role contracts installed globally via `claude plugin install` at `clagentic-lite init` time |
+| `plugins/clagentic-lite/skills/infosec-rt/SKILL.md` | infosec red-team commentary skill — installed globally via the plugin |
+| `plugins/clagentic-lite/skills/eng-consult/SKILL.md` | engineering consulting panel skill — installed globally via the plugin |
 | `.claude/commands/recall.md` | `/recall` slash command — session memory search |
-| `.claude/skills/{infosec-rt,eng-consult}/SKILL.md` | commentary skills (multi-voice; not gates) |
 | `.claude/hooks/*.sh` | five lifecycle hooks |
 | `.codex/config.toml` | Codex sandbox + role config |
 | `.gitleaks.toml` | gitleaks config — extends defaults, narrow path+token allowlist |

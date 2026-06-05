@@ -166,7 +166,7 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 3. Refuses if already enrolled (use `--force` to re-enroll).
 4. Initializes `.clagentic/audit.db` and `.clagentic/memory.db` in that repo.
 5. Stamps `.git/hooks/pre-commit` and `.git/hooks/pre-push` from `share/hook-shims/*.template`, substituting `$CLAGENTIC_HOME` at stamp time. Refuses to overwrite non-clagentic hooks unless `--force`.
-6. Generates `.claude/settings.json` (absolute hook paths → `$CLAGENTIC_HOME`), symlinks `.claude/commands`, and adds `.claude/` to `.gitignore`. These are local-only artifacts. Role agents are installed globally via the `clagentic-lite-agents` plugin at `init` time — no per-repo copies.
+6. Generates `.claude/settings.json` (absolute hook paths → `$CLAGENTIC_HOME`), symlinks `.claude/commands`, and adds `.claude/` to `.gitignore`. These are local-only artifacts. Role agents and commentary skills are installed globally via the `clagentic-lite` plugin at `init` time — no per-repo copies.
 7. Stamps `CLAUDE.md` at the repo root — activates the Builder contract and exposes agents for Claude Code auto-dispatch. Refuses to overwrite a non-clagentic `CLAUDE.md` unless `--force`.
 8. Registers the repo path in `~/.local/state/clagentic/registry`.
 
@@ -316,9 +316,13 @@ The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). Your enrolled
 │   └── PORTABILITY.md                          GNU vs BSD tool table
 ├── .claude/
 │   ├── settings.json                           hook wiring
-│   ├── agents/{builder,reviewer,auditor,merge-gate}.md
 │   ├── commands/{review,ship,recall}.md
 │   └── hooks/{session-start,prompt-inject,stop-summarize,pre-bash-guard,pre-write-guard}.sh
+├── plugins/
+│   └── clagentic-lite/
+│       ├── .claude-plugin/plugin.json          plugin manifest (name, version, skills list)
+│       ├── agents/{builder,reviewer,auditor,merge-gate,troubleshooter}.md  role contracts
+│       └── skills/{infosec-rt,eng-consult}/SKILL.md  commentary skills
 ├── .codex/
 │   ├── config.toml                             Codex sandbox + role config
 │   └── AGENTS.md → ../AGENTS.md               symlink so Codex reads the same rules
@@ -397,7 +401,7 @@ clagentic-lite export                # write self-contained HTML report to .clag
 clagentic-lite export --output PATH  # write report to a specific path
 ```
 
-`/eng-consult` and `/infosec-rt` are **skills**, not gates — they return structured commentary you read and act on at your own discretion. Both are user-invocable as slash commands at any time. Claude Code may *also* auto-select them on relevant prompts (`/infosec-rt` is scoped to threat-modeling vocabulary; `/eng-consult` is scoped to multi-discipline review vocabulary), but skill auto-selection is heuristic-not-deterministic — when you want the panel, invoke it explicitly. See `.claude/skills/{infosec-rt,eng-consult}/SKILL.md` for the full protocol.
+`/eng-consult` and `/infosec-rt` are **skills**, not gates — they return structured commentary you read and act on at your own discretion. Both are user-invocable as slash commands at any time. Claude Code may *also* auto-select them on relevant prompts (`/infosec-rt` is scoped to threat-modeling vocabulary; `/eng-consult` is scoped to multi-discipline review vocabulary), but skill auto-selection is heuristic-not-deterministic — when you want the panel, invoke it explicitly. See `plugins/clagentic-lite/skills/{infosec-rt,eng-consult}/SKILL.md` for the full protocol.
 
 ---
 

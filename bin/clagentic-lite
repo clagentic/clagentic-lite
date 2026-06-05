@@ -19,10 +19,11 @@
 # Design: tool is cloned once (default: ~/.clagentic-lite, override via
 # $CLAGENTIC_HOME). Per-repo enrollment writes .clagentic/{audit,memory}.db,
 # thin shims in .git/hooks/ that call back to $CLAGENTIC_HOME/scripts/, and
-# .claude/settings.json + symlinks to .claude/commands and .claude/skills so
-# Claude Code picks up hook wiring, slash commands, and invocable skills.
-# The five role agents (builder, reviewer, auditor, merge-gate, troubleshooter) are installed
-# globally via 'claude plugin install' at init time — no per-repo agent copies.
+# .claude/settings.json + symlink to .claude/commands so Claude Code picks up
+# hook wiring and slash commands.
+# The five role agents (builder, reviewer, auditor, merge-gate, troubleshooter) and
+# commentary skills (/infosec-rt, /eng-consult) are installed globally via
+# 'claude plugin install' at init time — no per-repo copies.
 # The tool repo itself is never the thing under gates by default.
 
 set -e
@@ -59,7 +60,7 @@ SHIM_VERSION="v1"
 # Claude Code artifact version markers. Bump when the corresponding template
 # changes so `clagentic-lite update` re-stamps enrolled repos automatically.
 CLAUDE_SETTINGS_VERSION="v3"
-CLAUDE_MD_VERSION="v7"
+CLAUDE_MD_VERSION="v8"
 
 # Single source of truth for the security-gate tool list. Adding a new
 # scanner means editing this one line — _run_prereq_checks (init/update)
@@ -379,21 +380,21 @@ cmd_init() {
     # Best-effort pre-registration so the subsequent list check can find the plugin
     # even when the marketplace was not previously registered.
     claude plugin marketplace add "$CLAGENTIC_HOME" --scope user 2>/dev/null || true
-    if claude plugin list 2>/dev/null | grep -q "clagentic-lite-agents"; then
-      say "plugin clagentic-lite-agents already installed"
+    if claude plugin list 2>/dev/null | grep -q "clagentic-lite"; then
+      say "plugin clagentic-lite already installed"
     else
       if claude plugin marketplace add "$CLAGENTIC_HOME" --scope user; then
-        if claude plugin install "clagentic-lite-agents@clagentic-lite"; then
-          say "installed plugin: clagentic-lite-agents (agents available globally)"
+        if claude plugin install "clagentic-lite@clagentic-lite"; then
+          say "installed plugin: clagentic-lite (agents and skills available globally)"
         else
-          warn "claude plugin install failed — run manually: claude plugin install clagentic-lite-agents@clagentic-lite"
+          warn "claude plugin install failed — run manually: claude plugin install clagentic-lite@clagentic-lite"
         fi
       else
-        warn "claude plugin marketplace add failed — run manually: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite-agents@clagentic-lite"
+        warn "claude plugin marketplace add failed — run manually: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite@clagentic-lite"
       fi
     fi
   else
-    warn "claude not on PATH — skipping plugin install; after adding to PATH run: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite-agents@clagentic-lite"
+    warn "claude not on PATH — skipping plugin install; after adding to PATH run: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite@clagentic-lite"
   fi
 
   say "init complete"
@@ -746,7 +747,7 @@ _enroll_one() {
   # settings.json: absolute paths so hook scripts resolve back to CLAGENTIC_HOME.
   # commands/: symlink — pure markdown, no path traversal, stays in sync
   # automatically when the tool updates.
-  # agents: installed globally via the clagentic-lite-agents plugin; no per-repo
+  # agents and skills: installed globally via the clagentic-lite plugin; no per-repo
   # files needed.
   _claude_settings_template="$SHARE_DIR/hook-shims/claude-settings.template"
   if [ -f "$_claude_settings_template" ]; then
@@ -770,14 +771,11 @@ _enroll_one() {
       # Symlink commands/ — markdown only, no path traversal.
       ln -sfn "$CLAGENTIC_HOME/.claude/commands" "$_claude_dir/commands"
 
-      # Symlink skills/ — invocable slash-command skills (/infosec-rt, /eng-consult).
-      # Points to share/skills/ in the clagentic-lite checkout so updates propagate
-      # automatically on next `clagentic-lite update`.
-      if [ -d "$CLAGENTIC_HOME/share/skills" ]; then
-        ln -sfn "$CLAGENTIC_HOME/share/skills" "$_claude_dir/skills"
-      fi
+      # Skills (/infosec-rt, /eng-consult) are installed globally via the
+      # clagentic-lite plugin (claude plugin install, run during init).
+      # No per-repo symlink needed — Claude Code discovers them from the plugin.
 
-      # Agent files are installed globally via the clagentic-lite-agents plugin
+      # Agent files are installed globally via the clagentic-lite plugin
       # (claude plugin install, run during init). No per-repo copy needed.
 
       say "wired Claude Code hooks: $_claude_dir"
@@ -885,10 +883,9 @@ cmd_unenroll() {
   _cs_file="$_canon/.claude/settings.json"
   if [ -f "$_cs_file" ] && grep -q 'managed-by: clagentic' "$_cs_file" 2>/dev/null; then
     rm -f "$_cs_file"
-    # Remove symlinks we own for commands/ and skills/.
+    # Remove symlink we own for commands/.
     rm -f "$_canon/.claude/commands"
-    rm -f "$_canon/.claude/skills"
-    # Agents are installed globally via the plugin — no per-repo files to remove.
+    # Agents and skills are installed globally via the plugin — no per-repo files to remove.
     # Remove .claude/ dir only if now empty.
     rmdir "$_canon/.claude" 2>/dev/null || true
     say "removed Claude Code wiring: $_canon/.claude"
@@ -1247,15 +1244,9 @@ _restamp_repo_artifacts() {
     fi
   fi
 
-  # Agent files are installed globally via the clagentic-lite-agents plugin.
+  # Agent files and skills are installed globally via the clagentic-lite plugin.
   # cmd_update bumps plugin.json version and calls 'claude plugin update'
-  # to refresh agents on the user's machine — no per-repo copy to maintain.
-
-  # Re-point skills/ symlink — keeps enrolled repos in sync when share/skills/ changes.
-  _ra_skills_dir="$_ra_path/.claude/skills"
-  if [ -d "$CLAGENTIC_HOME/share/skills" ]; then
-    ln -sfn "$CLAGENTIC_HOME/share/skills" "$_ra_skills_dir"
-  fi
+  # to refresh agents and skills on the user's machine — no per-repo copy to maintain.
 
   # Re-stamp wrapper CLAUDE.md if the parent dir has a .clagentic-project pointer.
   _ra_wrapper_dir=$(dirname "$_ra_path")
@@ -1340,9 +1331,9 @@ cmd_update() {
   # Install or update the agent plugin. This runs before the registry check so
   # it works on machines with no enrolled repos (e.g. freshly cloned installs
   # where init was run before the plugin system existed).
-  _plugin_json="$CLAGENTIC_HOME/plugins/clagentic-lite-agents/.claude-plugin/plugin.json"
+  _plugin_json="$CLAGENTIC_HOME/plugins/clagentic-lite/.claude-plugin/plugin.json"
   if [ -f "$_plugin_json" ]; then
-    # plugin.json version is bumped by maintainer PRs that change agent files.
+    # plugin.json version is bumped by maintainer PRs that change agent or skill files.
     # cmd_update does not touch the version — local bumps drift from upstream
     # and break cache invalidation when the repo ships a real version change.
 
@@ -1350,20 +1341,20 @@ cmd_update() {
       # Ensure marketplace is registered (idempotent).
       claude plugin marketplace add "$CLAGENTIC_HOME" --scope user 2>/dev/null || true
       # If already installed, update. If not installed, install from scratch.
-      if claude plugin list 2>/dev/null | grep -q "clagentic-lite-agents"; then
+      if claude plugin list 2>/dev/null | grep -q "clagentic-lite"; then
         claude plugin marketplace update clagentic-lite && \
           say "refreshed marketplace: clagentic-lite" || \
           warn "claude plugin marketplace update failed — plugin may be stale"
-        claude plugin update "clagentic-lite-agents@clagentic-lite" && \
-          say "updated plugin: clagentic-lite-agents" || \
-          warn "claude plugin update failed; run: claude plugin update clagentic-lite-agents@clagentic-lite"
+        claude plugin update "clagentic-lite@clagentic-lite" && \
+          say "updated plugin: clagentic-lite" || \
+          warn "claude plugin update failed; run: claude plugin update clagentic-lite@clagentic-lite"
       else
-        claude plugin install "clagentic-lite-agents@clagentic-lite" && \
-          say "installed plugin: clagentic-lite-agents (agents now available globally)" || \
-          warn "claude plugin install failed; run: claude plugin install clagentic-lite-agents@clagentic-lite"
+        claude plugin install "clagentic-lite@clagentic-lite" && \
+          say "installed plugin: clagentic-lite (agents and skills now available globally)" || \
+          warn "claude plugin install failed; run: claude plugin install clagentic-lite@clagentic-lite"
       fi
     else
-      warn "claude not on PATH — skipping plugin install/update (run manually: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite-agents@clagentic-lite)"
+      warn "claude not on PATH — skipping plugin install/update (run manually: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite@clagentic-lite)"
     fi
   else
     warn "plugin manifest not found: $_plugin_json — skipping plugin update"
