@@ -47,13 +47,20 @@ if [ "${CLAGENTIC_SKIP_UPDATE_ALERT:-0}" != "1" ] \
 
   if [ "$_AGE" -ge "$_FETCH_INTERVAL" ]; then
     # Best-effort fetch; 5 s timeout; suppress all output.
-    $DS_TIMEOUT_CMD 5 git -C "$CLAGENTIC_HOME" fetch --quiet 2>/dev/null || true
-    # Stamp the state file (mtime is the clock — content is irrelevant).
-    mkdir -p "$_STATE_DIR" 2>/dev/null || true
-    printf '%s\n' "$_NOW" > "$_STATE_FILE" 2>/dev/null || true
+    # Only stamp the state file when the fetch succeeds — a network failure must
+    # not lock out update detection for 24 h.
+    if $DS_TIMEOUT_CMD 5 git -C "$CLAGENTIC_HOME" fetch --quiet 2>/dev/null; then
+      mkdir -p "$_STATE_DIR" 2>/dev/null || true
+      printf '%s\n' "$_NOW" > "$_STATE_FILE" 2>/dev/null || true
+    fi
   fi
 
   _UPSTREAM=$(git -C "$CLAGENTIC_HOME" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+  if [ -z "$_UPSTREAM" ]; then
+    # No tracking branch configured; fall back to origin/main so new installs
+    # still receive the update notice after the initial fetch.
+    git -C "$CLAGENTIC_HOME" rev-parse --verify origin/main >/dev/null 2>&1 && _UPSTREAM="origin/main" || true
+  fi
   if [ -n "$_UPSTREAM" ]; then
     _BEHIND=$(git -C "$CLAGENTIC_HOME" rev-list --count "HEAD..$_UPSTREAM" 2>/dev/null || echo 0)
     if [ "${_BEHIND:-0}" -gt 0 ] 2>/dev/null; then
@@ -81,8 +88,16 @@ fi
 
 [ -z "$CONTEXT" ] && exit 0
 
+# Escape the context string for safe embedding in a JSON string value.
+# sed handles backslash and double-quote; tr collapses literal newlines to
+# spaces so the JSON remains single-line. jq is not assumed to be present.
+_json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
+}
+CONTEXT_JSON=$(_json_escape "$CONTEXT")
+
 cat <<EOF
 {
-  "additionalContext": "${CONTEXT}"
+  "additionalContext": "${CONTEXT_JSON}"
 }
 EOF
