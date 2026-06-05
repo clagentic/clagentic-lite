@@ -85,7 +85,7 @@ clagentic-lite enroll              # init DBs, stamp hooks, register
 clagentic-lite gates review        # run cross-model review on staged diff
 clagentic-lite gates ship          # run all gates in sequence
 clagentic-lite gates digest        # summarize today's audit-db rows
-scripts/memory.sh recall <kw>      # search session summaries
+clagentic-lite recall <kw>          # search session summaries
 sqlite3 .clagentic/audit.db        # inspect the audit trail directly
 sqlite3 .clagentic/memory.db       # inspect session memory directly
 clagentic-lite doctor              # verify all prereqs and enrolled-repo hook health
@@ -116,7 +116,7 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `.claude-plugin/marketplace.json` | plugin marketplace manifest — declares the `clagentic-lite-agents` plugin |
 | `plugins/clagentic-lite-agents/.claude-plugin/plugin.json` | per-plugin manifest; version bumped by `clagentic-lite update` |
 | `plugins/clagentic-lite-agents/agents/{builder,reviewer,auditor,merge-gate,troubleshooter}.md` | role contracts installed globally via `claude plugin install` at `clagentic-lite init` time |
-| `.claude/commands/{review,ship,recall}.md` | user-invokable slash commands |
+| `.claude/commands/recall.md` | `/recall` slash command — session memory search |
 | `.claude/skills/{infosec-rt,eng-consult}/SKILL.md` | commentary skills (multi-voice; not gates) |
 | `.claude/hooks/*.sh` | five lifecycle hooks |
 | `.codex/config.toml` | Codex sandbox + role config |
