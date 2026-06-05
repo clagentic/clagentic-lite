@@ -203,6 +203,12 @@ cmd_deps() {
         echo "[gates] osv-scanner reported vulnerabilities below $SEVERITY threshold" 1>&2
         cmd_log_run deps pass "osv-scanner findings below $SEVERITY threshold"
         ;;
+      128)
+        # v2.x exits 128 when no package sources are found (e.g. all paths
+        # excluded). Treat as clean — nothing to scan is not a failure.
+        echo "[gates] osv-scanner: no package sources found (all paths excluded or empty repo)" 1>&2
+        cmd_log_run deps pass "no package sources found"
+        ;;
       *)
         cat "$_OSV_JSON" 1>&2
         cmd_log_run deps block "osv-scanner failed (exit=$_OSV_STATUS)"
