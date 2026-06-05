@@ -104,6 +104,11 @@ CLAGENTIC_GATES=secrets,deps,sast,review,adversarial,merge-gate
 # Values: low | medium | high | critical
 CLAGENTIC_BLOCK_SEVERITY=high
 
+# Space-separated directory paths to exclude from osv-scanner (v2.x only, passed as
+# --experimental-exclude per entry). Use for demo fixtures, vendored examples, or dirs
+# that are not deployed. Paths are relative to the repo root.
+# CLAGENTIC_OSV_EXCLUDE=examples vendor
+
 # osv-scanner severity threshold. Only vulnerabilities at this level or above block the gate.
 # Options: CRITICAL, HIGH, MEDIUM, LOW. Default: CRITICAL. Newer osv-scanner
 # releases expose severity in JSON; clagentic-lite applies this threshold locally.

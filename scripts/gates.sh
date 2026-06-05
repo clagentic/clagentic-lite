@@ -173,9 +173,19 @@ cmd_deps() {
       done < "$_IGNORE_FILE"
     done
 
+    # Build exclude flags from CLAGENTIC_OSV_EXCLUDE (space-separated paths).
+    # v2 uses --experimental-exclude; v1-scan has no equivalent (skip silently).
+    _OSV_EXCL_FLAGS=""
+    if [ -n "${CLAGENTIC_OSV_EXCLUDE:-}" ] && [ "$_OSV_SUBCMD" = "source" ]; then
+      for _ep in $CLAGENTIC_OSV_EXCLUDE; do
+        _OSV_EXCL_FLAGS="$_OSV_EXCL_FLAGS --experimental-exclude $_ep"
+      done
+    fi
+
     _OSV_STATUS=0
     if [ "$_OSV_SUBCMD" = "source" ]; then
-      osv-scanner scan source -r --format=json "--config=$_OSV_TMP" . > "$_OSV_JSON" || _OSV_STATUS=$?
+      # shellcheck disable=SC2086
+      osv-scanner scan source -r --format=json "--config=$_OSV_TMP" $_OSV_EXCL_FLAGS . > "$_OSV_JSON" || _OSV_STATUS=$?
     else
       osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" . > "$_OSV_JSON" || _OSV_STATUS=$?
     fi
