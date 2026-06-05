@@ -1,5 +1,5 @@
 # CLAUDE.md
-<!-- managed-by: clagentic · clagentic-claude-md-version: v5 -->
+<!-- managed-by: clagentic · clagentic-claude-md-version: v6 -->
 <!-- Re-generate: `clagentic-lite enroll --force` or `clagentic-lite update` -->
 
 This project is enrolled in [clagentic-lite](https://github.com/clagentic/clagentic-lite) — a local coding harness with cross-vendor review, security gates, and session memory.
@@ -14,7 +14,7 @@ This project is enrolled in [clagentic-lite](https://github.com/clagentic/clagen
 
 3. **Never write to `__CLAGENTIC_DEFAULT_BRANCH__`.** The pre-write-guard blocks it, but do not attempt it. Create a feature branch first.
 
-4. **Never merge pull requests directly.** Use `/ship` — it runs all gates, then opens the PR.
+4. **Never open a PR directly.** Use `/ship` — it runs all gates, then opens the PR.
 
 5. **Never bypass security gates.** If `gitleaks`, `semgrep`, or `osv-scanner` block, fix the underlying issue. Do not add suppressions without a written justification in the commit message.
 
@@ -56,6 +56,6 @@ Lifecycle hooks fire automatically via `.claude/settings.json`:
 ## Audit trail
 
 ```sh
-scripts/gates.sh digest          # today's gate runs
+clagentic-lite gates digest      # today's gate runs
 sqlite3 .clagentic/audit.db "SELECT ts, gate, outcome FROM gate_runs ORDER BY ts DESC LIMIT 20;"
 ```

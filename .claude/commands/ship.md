@@ -5,7 +5,7 @@ description: Run all gates in sequence. If green, open a PR. Every decision logg
 Run the full gate sequence and ship if green.
 
 ```sh
-scripts/gates.sh ship
+clagentic-lite gates ship
 ```
 
 This runs, in order:
