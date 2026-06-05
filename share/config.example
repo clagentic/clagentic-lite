@@ -116,6 +116,10 @@ CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC=20
 # Disable memory recall injection entirely (UserPromptSubmit hook).
 CLAGENTIC_DISABLE_RECALL=0
 
+# Suppress the session-start update alert (set =1 if you manage updates manually
+# or the network fetch is unwanted — e.g. air-gapped environments).
+CLAGENTIC_SKIP_UPDATE_ALERT=0
+
 # Memory recall row limit: max turns returned by recall (default 5).
 # CLAGENTIC_RECALL_LIMIT=5
 

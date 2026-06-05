@@ -1,26 +1,88 @@
 #!/bin/sh
 # clagentic-lite :: SessionStart hook
-# Injects the 3 most recent session summaries from .clagentic/memory.db
-# as additionalContext so the session opens with recent decisions visible.
+# 1. Injects up to 3 recent session summaries from .clagentic/memory.db as
+#    additionalContext so the session opens with recent decisions visible.
+# 2. Checks whether the clagentic-lite tool itself is behind its upstream and,
+#    if so, appends a terse one-line update notice.  Rate-limited to one
+#    git fetch per 24 h via ~/.config/clagentic/update-check.  Non-blocking —
+#    any failure exits 0 silently.  Suppress with CLAGENTIC_SKIP_UPDATE_ALERT=1.
+#
 # Non-blocking — any failure exits 0 silently.
-
-set -e
 
 # shellcheck source=../../scripts/platform.sh
 . "$(dirname "$0")/../../scripts/platform.sh" 2>/dev/null || true
 
 MEMORY_DB="${PWD}/.clagentic/memory.db"
-[ -f "$MEMORY_DB" ] || exit 0
 
-# Print up to 3 most recent summaries as additionalContext.
-# Output JSON understood by Claude Code's hook protocol.
-RECENT=$(sqlite3 "$MEMORY_DB" \
-  "SELECT '[' || ts || '] ' || summary FROM turns ORDER BY ts DESC LIMIT 3;" 2>/dev/null || true)
+# ---- 1. Recent session summaries ----------------------------------------
 
-[ -z "$RECENT" ] && exit 0
+RECENT=""
+if [ -f "$MEMORY_DB" ]; then
+  RECENT=$(sqlite3 "$MEMORY_DB" \
+    "SELECT '[' || ts || '] ' || summary FROM turns ORDER BY ts DESC LIMIT 3;" 2>/dev/null || true)
+fi
+
+# ---- 2. Update alert -------------------------------------------------------
+# Resolve CLAGENTIC_HOME; fall back to the hook file's grandparent directory
+# (mirrors the bin/clagentic-lite resolution logic).
+: "${CLAGENTIC_HOME:=$HOME/.clagentic-lite}"
+
+UPDATE_MSG=""
+
+if [ "${CLAGENTIC_SKIP_UPDATE_ALERT:-0}" != "1" ] \
+    && git -C "$CLAGENTIC_HOME" rev-parse --git-dir >/dev/null 2>&1; then
+
+  # State file: track the last time we did a network fetch.
+  _STATE_DIR="$HOME/.config/clagentic"
+  _STATE_FILE="$_STATE_DIR/update-check"
+  _FETCH_INTERVAL=86400   # 24 h in seconds
+  _NOW=$(date +%s 2>/dev/null || echo 0)
+  _LAST=0
+
+  if [ -f "$_STATE_FILE" ]; then
+    _LAST=$(ds_stat_mtime "$_STATE_FILE" 2>/dev/null || echo 0)
+  fi
+
+  _AGE=$(( _NOW - _LAST ))
+
+  if [ "$_AGE" -ge "$_FETCH_INTERVAL" ]; then
+    # Best-effort fetch; 5 s timeout; suppress all output.
+    $DS_TIMEOUT_CMD 5 git -C "$CLAGENTIC_HOME" fetch --quiet 2>/dev/null || true
+    # Stamp the state file (mtime is the clock — content is irrelevant).
+    mkdir -p "$_STATE_DIR" 2>/dev/null || true
+    printf '%s\n' "$_NOW" > "$_STATE_FILE" 2>/dev/null || true
+  fi
+
+  _UPSTREAM=$(git -C "$CLAGENTIC_HOME" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+  if [ -n "$_UPSTREAM" ]; then
+    _BEHIND=$(git -C "$CLAGENTIC_HOME" rev-list --count "HEAD..$_UPSTREAM" 2>/dev/null || echo 0)
+    if [ "${_BEHIND:-0}" -gt 0 ] 2>/dev/null; then
+      UPDATE_MSG="UPDATE AVAILABLE · clagentic-lite is ${_BEHIND} commit(s) behind upstream — run \`clagentic-lite update\` to install, or set CLAGENTIC_SKIP_UPDATE_ALERT=1 to suppress."
+    fi
+  fi
+fi
+
+# ---- 3. Emit combined additionalContext ------------------------------------
+# Build the context string from whichever parts are non-empty.
+
+CONTEXT=""
+
+if [ -n "$RECENT" ]; then
+  CONTEXT="CLAGENTIC RECALL · ${PWD##*/} · most recent session summaries:\n${RECENT}"
+fi
+
+if [ -n "$UPDATE_MSG" ]; then
+  if [ -n "$CONTEXT" ]; then
+    CONTEXT="${CONTEXT}\n\n${UPDATE_MSG}"
+  else
+    CONTEXT="$UPDATE_MSG"
+  fi
+fi
+
+[ -z "$CONTEXT" ] && exit 0
 
 cat <<EOF
 {
-  "additionalContext": "CLAGENTIC RECALL · ${PWD##*/} · most recent session summaries:\n${RECENT}"
+  "additionalContext": "${CONTEXT}"
 }
 EOF
