@@ -13,6 +13,8 @@
 #   remember "<note>" [tags]              store a manual memory entry
 #   show memory|gates [N]         pretty-print last N rows from .clagentic/ DBs
 #   export [--output PATH]        write self-contained HTML report of memory + gates
+#   gates <subcmd> [args...]      proxy to $CLAGENTIC_HOME/scripts/gates.sh
+#                                 (ship, review, adversarial, digest, status, tail, ...)
 #
 # Design: tool is cloned once (default: ~/.clagentic-lite, override via
 # $CLAGENTIC_HOME). Per-repo enrollment writes .clagentic/{audit,memory}.db,
@@ -57,7 +59,7 @@ SHIM_VERSION="v1"
 # Claude Code artifact version markers. Bump when the corresponding template
 # changes so `clagentic-lite update` re-stamps enrolled repos automatically.
 CLAUDE_SETTINGS_VERSION="v3"
-CLAUDE_MD_VERSION="v5"
+CLAUDE_MD_VERSION="v6"
 
 # Single source of truth for the security-gate tool list. Adding a new
 # scanner means editing this one line — _run_prereq_checks (init/update)
@@ -1761,15 +1763,23 @@ case "${1:-}" in
     ;;
   show)   shift; cmd_show "$@" ;;
   export) shift; cmd_export "$@" ;;
+  gates)
+    # gates <subcmd> [args...]  — proxy to the gate orchestrator.
+    # gates.sh lives in CLAGENTIC_HOME/scripts/ and is not on PATH, so all
+    # enrolled-repo command docs and CLAUDE.md files route through this
+    # subcommand rather than referencing the bare scripts/ relative path.
+    shift
+    exec "$SCRIPTS_DIR/gates.sh" "$@"
+    ;;
   "")
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember, show, export\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember, show, export, gates\n'
     exit 1
     ;;
   *)
     printf 'clagentic-lite: unknown subcommand: %s\n' "$1" 1>&2
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember, show, export\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember, show, export, gates\n'
     exit 1
     ;;
 esac
