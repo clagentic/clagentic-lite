@@ -245,7 +245,7 @@ There is no `--skip-all-gates`.
 
 ## Skills vs gates
 
-clagentic-lite ships two commentary skills under `.claude/skills/`:
+clagentic-lite ships two commentary skills globally via the `clagentic-lite` plugin (in `plugins/clagentic-lite/skills/`, discovered automatically by Claude Code):
 
 - `/eng-consult` — multi-voice engineering consulting panel (Principal + PM + Security/QA/SRE/UX, plus optional Perf/A11y/Tech Writer/Supply Chain). Independent specialist findings → Triage → Recommendations.
 - `/infosec-rt` — structured red-team threat model (Pen Tester + Insider, optional Supply Chain Analyst). Independent attack scenarios → Chain Analysis → Scenario Ranking → Hardening Ruling. Output voice is intentionally Wodehousian; technical substance is precise.

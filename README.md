@@ -215,7 +215,7 @@ Open the repo in Claude Code and type each of these. If any are "command not fou
 /eng-consult       → convenes the multi-voice engineering consulting panel
 ```
 
-If `/infosec-rt` or `/eng-consult` aren't recognized, Claude Code's project-skills discovery isn't finding `.claude/skills/`. Confirm the directory exists and that `SKILL.md` inside each has proper frontmatter (`name:`, `description:`, `user_invocable: true`).
+If `/infosec-rt` or `/eng-consult` aren't recognized, the `clagentic-lite` plugin may not be installed or may have failed to load. Run `claude plugin list` and check for `clagentic-lite` with status `✔ active`. If it shows failed, re-run `clagentic-lite init`. Skills are discovered by Claude Code from the plugin's `skills/` directory — no per-repo files are needed.
 
 [gl]: https://github.com/gitleaks/gitleaks/releases
 [osv]: https://google.github.io/osv-scanner/installation/
@@ -320,7 +320,7 @@ The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). Your enrolled
 │   └── hooks/{session-start,prompt-inject,stop-summarize,pre-bash-guard,pre-write-guard}.sh
 ├── plugins/
 │   └── clagentic-lite/
-│       ├── .claude-plugin/plugin.json          plugin manifest (name, version, skills list)
+│       ├── .claude-plugin/plugin.json          plugin manifest (name, version)
 │       ├── agents/{builder,reviewer,auditor,merge-gate,troubleshooter}.md  role contracts
 │       └── skills/{infosec-rt,eng-consult}/SKILL.md  commentary skills
 ├── .codex/

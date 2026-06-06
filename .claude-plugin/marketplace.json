@@ -12,7 +12,7 @@
       "name": "clagentic-lite",
       "source": "./plugins/clagentic-lite",
       "description": "The five clagentic-lite role agents (builder, reviewer, auditor, merge-gate, troubleshooter) plus commentary skills (/infosec-rt, /eng-consult). Installed globally via clagentic-lite init.",
-      "version": "1.2.0"
+      "version": "1.2.1"
     }
   ]
 }

@@ -41,7 +41,7 @@ Plus a non-role **Summarizer** (default `claude` at cheap tier) wired into the S
 
 Cross-CLI is the point — a Reviewer that shares the Builder's training distribution shares its blind spots. Each role declares its own `model_chain` (primary `(cmd, tier)` + ordered fallback list) in `.env` so the *vendor* is configurable per role, not hard-coded.
 
-Two commentary skills live under `.claude/skills/` for deeper deliberation:
+Two commentary skills are installed globally via the `clagentic-lite` plugin (discovered by Claude Code from `plugins/clagentic-lite/skills/`):
 
 - `/eng-consult` — multi-voice consulting panel (Principal + PM + Security/QA/SRE/UX, plus optional Perf/A11y/Tech Writer/Supply Chain).
 - `/infosec-rt` — structured red-team threat model (Pen Tester + Insider, optional Supply Chain Analyst).
