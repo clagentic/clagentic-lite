@@ -114,7 +114,7 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `share/hook-shims/CLAUDE.md.template` | CLAUDE.md template stamped into enrolled repo root — activates Builder contract and documents hooks/commands for Claude Code |
 | `.claude/settings.json` | hook wiring (tool's own repo; enrolled repos get a generated copy in their `.claude/`) |
 | `.claude-plugin/marketplace.json` | plugin marketplace manifest — declares the `clagentic-lite` plugin |
-| `plugins/clagentic-lite/.claude-plugin/plugin.json` | per-plugin manifest; version bumped by `clagentic-lite update` |
+| `plugins/clagentic-lite/.claude-plugin/plugin.json` | per-plugin manifest; version bumped by maintainer PRs that change agent or skill files — never by `clagentic-lite update` |
 | `plugins/clagentic-lite/agents/{builder,reviewer,auditor,merge-gate,troubleshooter}.md` | role contracts installed globally via `claude plugin install` at `clagentic-lite init` time |
 | `plugins/clagentic-lite/skills/infosec-rt/SKILL.md` | infosec red-team commentary skill — installed globally via the plugin |
 | `plugins/clagentic-lite/skills/eng-consult/SKILL.md` | engineering consulting panel skill — installed globally via the plugin |
@@ -153,6 +153,20 @@ The version strings are arbitrary (`v1`, `v2`, ...) — increment by one each ti
 **After bumping:** run `clagentic-lite update` (or `clagentic-lite update --restamp` to force all enrolled repos regardless of version). Users on older installs get the restamp automatically on their next `update` run.
 
 **`.claude/commands/` is different.** Those files are symlinked directly from `$CLAGENTIC_HOME/.claude/commands` into enrolled repos — no stamping, no version tracking. Changes take effect immediately for all enrolled repos. No version bump needed.
+
+## Plugin rename protocol
+
+If a plugin is renamed, `cmd_update`'s installed-check uses an exact-token grep — `grep -qE '(^|[[:space:]])<name>(@|[[:space:]]|$)'` — so the old name will not match the new one. This means the update will fall through to `plugin install`, which is correct for a fresh install but will leave the old plugin installed alongside the new one.
+
+**Rule: any plugin rename requires an explicit migration step in both `cmd_init` and `cmd_update`.** Pattern:
+
+1. Before the installed-check, detect the old name with the same exact-token grep.
+2. If found, uninstall it: `claude plugin uninstall "<old-name>@clagentic-lite"` with a fallback to bare `claude plugin uninstall "<old-name>"`.
+3. Then proceed with the normal install/update path.
+
+The migration block stays in the code permanently — it is a no-op once the old name is gone, and removing it breaks users who skipped intermediate versions.
+
+**Plugin manifest `skills` field**: Claude Code discovers skills from a plugin's `skills/` subdirectory automatically (same convention as `agents/`). Do not add a `skills` array to `plugin.json` — the field is not in the supported manifest schema and will cause `plugin install` to fail entirely, blocking agent delivery too.
 
 ---
 

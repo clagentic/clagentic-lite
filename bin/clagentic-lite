@@ -380,7 +380,22 @@ cmd_init() {
     # Best-effort pre-registration so the subsequent list check can find the plugin
     # even when the marketplace was not previously registered.
     claude plugin marketplace add "$CLAGENTIC_HOME" --scope user 2>/dev/null || true
-    if claude plugin list 2>/dev/null | grep -q "clagentic-lite"; then
+
+    # Migration: uninstall the old plugin name (clagentic-lite-agents, shipped before v1.2.0)
+    # before checking for or installing the current name. The old name contains "clagentic-lite"
+    # as a substring, so a naive grep match would incorrectly treat it as "already installed"
+    # and skip the install of the renamed plugin.
+    if claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite-agents(@|[[:space:]]|$)'; then
+      say "migrating: removing old plugin name clagentic-lite-agents..."
+      claude plugin uninstall "clagentic-lite-agents@clagentic-lite" 2>/dev/null || \
+        claude plugin uninstall "clagentic-lite-agents" 2>/dev/null || \
+        warn "could not uninstall old plugin clagentic-lite-agents — remove manually: claude plugin uninstall clagentic-lite-agents"
+    fi
+
+    # Exact-match check: grep for the new plugin name as a whole token, not a substring.
+    # "clagentic-lite-agents" contains "clagentic-lite" as a prefix; substring grep would
+    # falsely match it and skip the install of the renamed plugin.
+    if claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite(@|[[:space:]]|$)'; then
       say "plugin clagentic-lite already installed"
     else
       if claude plugin marketplace add "$CLAGENTIC_HOME" --scope user; then
@@ -1340,8 +1355,23 @@ cmd_update() {
     if command -v claude >/dev/null 2>&1; then
       # Ensure marketplace is registered (idempotent).
       claude plugin marketplace add "$CLAGENTIC_HOME" --scope user 2>/dev/null || true
-      # If already installed, update. If not installed, install from scratch.
-      if claude plugin list 2>/dev/null | grep -q "clagentic-lite"; then
+
+      # Migration: uninstall old plugin name (clagentic-lite-agents, pre-v1.2.0) before
+      # the exact-match check below. Without this, the old name's presence causes the
+      # check to fall through to 'plugin update' which fails because the current name
+      # was never installed under the old label.
+      if claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite-agents(@|[[:space:]]|$)'; then
+        say "migrating: removing old plugin name clagentic-lite-agents..."
+        claude plugin uninstall "clagentic-lite-agents@clagentic-lite" 2>/dev/null || \
+          claude plugin uninstall "clagentic-lite-agents" 2>/dev/null || \
+          warn "could not uninstall old plugin clagentic-lite-agents — remove manually: claude plugin uninstall clagentic-lite-agents"
+      fi
+
+      # Exact-match check: look for the current plugin name as a whole token.
+      # Substring grep would match the old name clagentic-lite-agents (which contains
+      # "clagentic-lite" as a prefix) and falsely branch into 'plugin update' even when
+      # the current plugin was never installed.
+      if claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite(@|[[:space:]]|$)'; then
         claude plugin marketplace update clagentic-lite && \
           say "refreshed marketplace: clagentic-lite" || \
           warn "claude plugin marketplace update failed — plugin may be stale"
