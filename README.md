@@ -1,19 +1,22 @@
 <p align="center">
-  <img src="media/logo/lite-lockup-256.png" alt="Clagentic:Lite" width="260" />
+  <img src="media/logo/lite-lockup-256.png" alt="clagentic:lite" width="260" />
 </p>
 
-<h4 align="center">Cross-vendor AI coding harness with deterministic security gates. Gated Builder+Reviewer roles, full SQLite audit trail. No server, no cloud.</h4>
+<h4 align="center">Cross-vendor coding harness. Built for builders.</h4>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg" alt="License: FSL-1.1-MIT" /></a>
-  <img src="https://img.shields.io/badge/shell-POSIX-blue.svg" alt="POSIX shell" />
-  <img src="https://img.shields.io/badge/OS-WSL2%20%7C%20macOS-lightgrey.svg" alt="WSL2 | macOS" />
-  <a href="https://ko-fi.com/clagentic"><img src="https://img.shields.io/badge/Support-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white" alt="Support on Ko-fi" /></a>
+  <a href="https://clagentic.ai"><img src="https://img.shields.io/badge/-clagentic.ai-00CFFF?style=flat&logoColor=white" alt="clagentic.ai" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-FSL--1.1--MIT-blue?style=flat" alt="License: FSL-1.1-MIT" /></a>
+  <img src="https://img.shields.io/badge/shell-POSIX-4EAA25?style=flat&logo=gnubash&logoColor=white" alt="POSIX shell" />
+  <img src="https://img.shields.io/badge/OS-WSL2%20%7C%20macOS-lightgrey?style=flat" alt="WSL2 | macOS" />
+  <a href="https://ko-fi.com/clagentic"><img src="https://img.shields.io/badge/Ko--fi-FF5E5B?style=flat&logo=ko-fi&logoColor=white&label=support" alt="Support on Ko-fi" /></a>
 </p>
 
 ---
 
-# Clagentic:Lite
+# clagentic:lite
+
+Cross-vendor AI coding harness with deterministic security gates and a full SQLite audit trail. Part of the [clagentic](https://clagentic.ai) suite.
 
 Five roles (Builder, Reviewer, Auditor, Merge Gate, Troubleshooter) with per-role model chains. Five gates (memory recall, safe bash/writes, cross-vendor review, local security scans, session summarize) that fire on Claude Code or Codex events. One SQLite file for session memory, one for the audit trail. POSIX shell. No server. Nothing global. Runs the same on WSL2 Ubuntu and macOS.
 
@@ -415,12 +418,22 @@ No `eject` subcommand, no schema bridge. `.clagentic/memory.db` is plain SQLite 
 
 ---
 
+## Support
+
+If clagentic:lite is useful to you: [ko-fi.com/clagentic](https://ko-fi.com/clagentic)
+
+## Disclaimer
+
+Not affiliated with Anthropic or OpenAI. Claude is a trademark of Anthropic. Codex is a
+trademark of OpenAI. Provided "as is" without warranty. Users are responsible for
+complying with their AI provider's terms of service.
+
 ## License
 
-**FSL-1.1-MIT** — [Functional Source License 1.1, MIT Future License](https://fsl.software/).
+[FSL-1.1-MIT](LICENSE) — Functional Source License 1.1, with MIT as the Change License.
 
-- **Free** for personal use, internal-business use, evaluation, education, research, and contributing back.
-- **Not free** for offering clagentic-lite (or a substantial fork) as a competing commercial product or service.
-- Each release **auto-converts to MIT** on its second anniversary — fully open source, no restrictions, on a rolling 2-year window.
+Free for personal, internal-business, evaluation, research, and non-commercial use.
+Not free for offering this tool (or a substantial fork) as a competing commercial product.
+Each release auto-converts to MIT on its second anniversary.
 
-Commercial licensing inquiries: [clagentic.ai](https://clagentic.ai). See `LICENSE` for the full text and the plain-English summary.
+Commercial licensing inquiries: [clagentic.ai](https://clagentic.ai).
