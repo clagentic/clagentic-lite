@@ -1,5 +1,5 @@
 # CLAUDE.md
-<!-- managed-by: clagentic · clagentic-claude-md-version: v3 -->
+<!-- managed-by: clagentic · clagentic-claude-md-version: v9 -->
 <!-- Re-generate: `clagentic-lite enroll --force <this-folder>` -->
 
 This folder is a clagentic-lite **wrapper** — it contains enrolled git projects but is not a git repo itself.
@@ -10,20 +10,20 @@ __WRAPPER_PROJECT_TABLE__
 
 ## Working in this folder
 
-Agents, slash commands (`/review`, `/ship`, `/recall`), and lifecycle hooks (SessionStart, PreToolUse, Stop) **only work when Claude Code is opened directly inside a project subfolder**. They are coupled to the git repo root and will not fire correctly from this wrapper folder.
+Agents, slash commands (`/recall`), and lifecycle hooks (SessionStart, PreToolUse, Stop) **only work when Claude Code is opened directly inside a project subfolder**. They are coupled to the git repo root and will not fire correctly from this wrapper folder.
 
 To get full clagentic integration: open a project subfolder in Claude Code, or `cd` into it and start a new session.
 
 ## Builder rules (apply in all enrolled projects)
 
 - Work on feature branches. Do not write to the default branch.
-- Do not merge pull requests — use `/ship` inside the project.
-- Do not review your own work — use `/review` (cross-vendor, different blind spots).
+- Do not merge pull requests — run `clagentic-lite gates ship` inside the project.
+- Do not review your own work — run `clagentic-lite gates review` (cross-vendor, different blind spots).
 - Do not bypass security gates (`gitleaks`, `semgrep`, `osv-scanner`) — fix the underlying issue.
 
 ## Audit trail (per project)
 
 ```sh
 sqlite3 <project>/.clagentic/audit.db "SELECT ts, gate, outcome FROM gate_runs ORDER BY ts DESC LIMIT 20;"
-"$CLAGENTIC_HOME/scripts/gates.sh" digest   # run from inside the project folder
+clagentic-lite gates digest   # run from inside the project folder
 ```

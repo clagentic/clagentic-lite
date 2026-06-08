@@ -1,5 +1,5 @@
 # CLAUDE.md
-<!-- managed-by: clagentic · clagentic-claude-md-version: v8 -->
+<!-- managed-by: clagentic · clagentic-claude-md-version: v9 -->
 <!-- Re-generate: `clagentic-lite enroll --force` or `clagentic-lite update` -->
 
 This project is enrolled in [clagentic-lite](https://github.com/clagentic/clagentic-lite) — a local coding harness with cross-vendor review, security gates, and session memory.
