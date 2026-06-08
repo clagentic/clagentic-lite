@@ -60,7 +60,7 @@ SHIM_VERSION="v1"
 # Claude Code artifact version markers. Bump when the corresponding template
 # changes so `clagentic-lite update` re-stamps enrolled repos automatically.
 CLAUDE_SETTINGS_VERSION="v3"
-CLAUDE_MD_VERSION="v8"
+CLAUDE_MD_VERSION="v9"
 
 # Single source of truth for the security-gate tool list. Adding a new
 # scanner means editing this one line — _run_prereq_checks (init/update)
@@ -1086,6 +1086,31 @@ cmd_doctor() {
           _fail "$_rpath: .git/hooks/$_hook points to different CLAGENTIC_HOME (run \`clagentic-lite update\`)"
         else
           _ok "$_rpath: .git/hooks/$_hook OK"
+        fi
+      done
+      # Check CLAUDE.md version in enrolled repo.
+      _cm_file="$_rpath/CLAUDE.md"
+      if [ ! -f "$_cm_file" ]; then
+        printf '  WARN  %s: CLAUDE.md missing (run `clagentic-lite enroll --force`)\n' "$_rpath"
+      elif ! grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
+        printf '  WARN  %s: CLAUDE.md not clagentic-managed (manual CLAUDE.md?)\n' "$_rpath"
+      else
+        _repo_cm_ver=$(grep 'clagentic-claude-md-version:' "$_cm_file" 2>/dev/null \
+          | sed 's/.*clagentic-claude-md-version:[[:space:]]*//' \
+          | tr -d ' >-' | head -1)
+        if [ "$_repo_cm_ver" != "$CLAUDE_MD_VERSION" ]; then
+          _fail "$_rpath: CLAUDE.md version $_repo_cm_ver (current: $CLAUDE_MD_VERSION) — run \`clagentic-lite update\`"
+        else
+          _ok "$_rpath: CLAUDE.md version $CLAUDE_MD_VERSION OK"
+        fi
+      fi
+      # Check for stale command docs removed in v1.1.0.
+      for _stale_cmd in ship.md review.md; do
+        _stale_path="$_rpath/.claude/commands/$_stale_cmd"
+        # Commands dir is a symlink to central install — stale docs only exist
+        # when the symlink target is an old checkout that still has them.
+        if [ -f "$_stale_path" ]; then
+          _fail "$_rpath: stale command doc .claude/commands/$_stale_cmd found — run \`clagentic-lite update --restamp\`"
         fi
       done
     done < "$REGISTRY"
