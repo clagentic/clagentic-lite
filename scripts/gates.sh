@@ -104,7 +104,7 @@ cmd_secrets() {
   _SECRETS_DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
   _SECRETS_CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
   _SECRETS_ON_FEATURE=0
-  if [ -z "$_SECRETS_STAGED" ] && [ -n "$_SECRETS_CURRENT_BRANCH" ] && [ "$_SECRETS_CURRENT_BRANCH" != "$_SECRETS_DEFAULT_BRANCH" ]; then
+  if [ -z "$_SECRETS_STAGED" ] && [ -n "$_SECRETS_CURRENT_BRANCH" ] && [ "$_SECRETS_CURRENT_BRANCH" != "$_SECRETS_DEFAULT_BRANCH" ] && [ "$_SECRETS_CURRENT_BRANCH" != "HEAD" ]; then
     _SECRETS_ON_FEATURE=1
   fi
 
@@ -139,7 +139,7 @@ cmd_secrets() {
       # Older gitleaks has no history-scan subcommand. The staged scan is a
       # no-op on an empty index, so skip it and log the limitation.
       printf '[gates/secrets] no staged changes on feature branch — older gitleaks cannot scan history; skipping staged scan\n' 1>&2
-      cmd_log_run secrets skip "older gitleaks; no staged changes on feature branch (history scan unavailable)"
+      cmd_log_run secrets warn "older gitleaks; no staged changes on feature branch (history scan unavailable)"
     else
       # shellcheck disable=SC2086
       if gitleaks protect --staged --redact --no-banner $CFG_ARG; then
@@ -449,14 +449,13 @@ get_review_diff() {
   DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
   CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 
-  STAGED=$(git diff --cached --unified=3 2>/dev/null)
-  if [ -n "$STAGED" ]; then
+  if git diff --cached --name-only 2>/dev/null | grep -q .; then
     printf '[gates/review] using staged diff\n' 1>&2
-    printf '%s\n' "$STAGED"
+    git diff --cached --unified=3 2>/dev/null
     return 0
   fi
 
-  if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ]; then
+  if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ] && [ "$CURRENT_BRANCH" != "HEAD" ]; then
     # Fetch the base ref so the comparison is accurate even in a fresh clone.
     # Failure here is non-fatal — git diff will simply fall back to local state.
     git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true

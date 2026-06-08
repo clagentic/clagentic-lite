@@ -80,7 +80,7 @@ Strict JSON, no prose before or after:
 
 **Refuse** if any of the following:
 
-- `review` is `null`: this means the Reviewer was invoked against an empty diff — a bug in the calling workflow, not a gate finding. Refuse with reason: `"review is null — re-run 'clagentic-lite gates ship' from the feature branch with changes committed; the review gate requires a non-empty diff"`.
+- `review` is `null`: this means the Reviewer was invoked against an empty diff — a bug in the calling workflow, not a gate finding. Refuse with reason: `"review is null — re-run the ship gate sequence from the feature branch with changes committed; the review gate requires a non-empty diff"`.
 - `review.findings` contains any finding at severity `>= threshold`.
 - `adversarial` contains a CWE citation paired with concrete file:line evidence, no follow-up "mitigated" note, AND the finding is not covered by an entry in `adversarial_acks` AND it is not inherent product behavior documented in `accepted_risks`.
 - The review's `summary` contradicts its `findings` (claims clean while listing high-severity items).
