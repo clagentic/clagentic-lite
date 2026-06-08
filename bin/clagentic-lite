@@ -1095,9 +1095,7 @@ cmd_doctor() {
       elif ! grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
         printf '  WARN  %s: CLAUDE.md not clagentic-managed (manual CLAUDE.md?)\n' "$_rpath"
       else
-        _repo_cm_ver=$(grep 'clagentic-claude-md-version:' "$_cm_file" 2>/dev/null \
-          | sed 's/.*clagentic-claude-md-version:[[:space:]]*//' \
-          | tr -d ' >-' | head -1)
+        _repo_cm_ver=$(claude_md_version "$_cm_file")
         if [ "$_repo_cm_ver" != "$CLAUDE_MD_VERSION" ]; then
           _fail "$_rpath: CLAUDE.md version $_repo_cm_ver (current: $CLAUDE_MD_VERSION) — run \`clagentic-lite update\`"
         else
