@@ -5,10 +5,10 @@
 # Subcommands:
 #   init             create audit schema
 #   bleed            scan committed files for internal/private string bleed
-#   secrets          run gitleaks on staged hunks (pre-commit)
+#   secrets          run gitleaks on staged hunks; branch history scan when no staged changes
 #   deps             run osv-scanner (pre-push)
 #   sast             run semgrep (pre-push)
-#   review           run cross-vendor review on staged diff
+#   review           run cross-vendor review on staged diff; branch diff when no staged changes
 #   adversarial      run non-blocking adversarial pass
 #   ship             run all blocking gates, then push + open PR if green
 #   render-review    pretty-print .clagentic/last-review.json
@@ -96,25 +96,58 @@ cmd_secrets() {
   CFG_ARG=""
   [ -f "$REPO_ROOT/.gitleaks.toml" ] && CFG_ARG="--config=$REPO_ROOT/.gitleaks.toml"
 
+  # Determine whether there are staged changes. When the index is empty and
+  # we are on a feature branch, scan the full branch history instead — staged-
+  # only mode is a no-op on a clean index and would silently miss committed
+  # secrets in a PR workflow.
+  _SECRETS_STAGED=$(git diff --cached --name-only 2>/dev/null)
+  _SECRETS_DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+  _SECRETS_CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  _SECRETS_ON_FEATURE=0
+  if [ -z "$_SECRETS_STAGED" ] && [ -n "$_SECRETS_CURRENT_BRANCH" ] && [ "$_SECRETS_CURRENT_BRANCH" != "$_SECRETS_DEFAULT_BRANCH" ]; then
+    _SECRETS_ON_FEATURE=1
+  fi
+
   # Probe by capability, not version string — `gitleaks version` output
   # format varies (`v8.18.4`, `8.18.4`, multi-line banner). The `git`
   # subcommand was added in 8.18; if `gitleaks git --help` exits 0 we use
   # it, otherwise we fall back to `gitleaks protect`.
   if gitleaks git --help >/dev/null 2>&1; then
-    # shellcheck disable=SC2086
-    if gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG; then
-      cmd_log_run secrets pass ""
+    if [ "$_SECRETS_ON_FEATURE" = "1" ]; then
+      # No staged changes on a feature branch — scan the branch's committed
+      # history rather than the (empty) index. This catches secrets in
+      # already-committed hunks that would otherwise be invisible to --staged.
+      printf '[gates/secrets] no staged changes — scanning branch history with gitleaks git\n' 1>&2
+      # shellcheck disable=SC2086
+      if gitleaks git --redact --no-banner $CFG_ARG; then
+        cmd_log_run secrets pass "branch history scan (no staged changes)"
+      else
+        cmd_log_run secrets block "gitleaks reported findings (branch history scan)"
+        return 1
+      fi
     else
-      cmd_log_run secrets block "gitleaks reported findings"
-      return 1
+      # shellcheck disable=SC2086
+      if gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG; then
+        cmd_log_run secrets pass ""
+      else
+        cmd_log_run secrets block "gitleaks reported findings"
+        return 1
+      fi
     fi
   else
-    # shellcheck disable=SC2086
-    if gitleaks protect --staged --redact --no-banner $CFG_ARG; then
-      cmd_log_run secrets pass ""
+    if [ "$_SECRETS_ON_FEATURE" = "1" ]; then
+      # Older gitleaks has no history-scan subcommand. The staged scan is a
+      # no-op on an empty index, so skip it and log the limitation.
+      printf '[gates/secrets] no staged changes on feature branch — older gitleaks cannot scan history; skipping staged scan\n' 1>&2
+      cmd_log_run secrets skip "older gitleaks; no staged changes on feature branch (history scan unavailable)"
     else
-      cmd_log_run secrets block "gitleaks reported findings"
-      return 1
+      # shellcheck disable=SC2086
+      if gitleaks protect --staged --redact --no-banner $CFG_ARG; then
+        cmd_log_run secrets pass ""
+      else
+        cmd_log_run secrets block "gitleaks reported findings"
+        return 1
+      fi
     fi
   fi
 }
@@ -401,9 +434,43 @@ cmd_sast() {
   fi
 }
 
+# get_review_diff — prints the best available diff to stdout for use by
+# cmd_review and cmd_adversarial.
+#
+# Priority:
+#   1. Staged diff (git diff --cached) — normal pre-commit path.
+#   2. Branch diff against origin/<default_branch> — PR path when index is
+#      clean but we are on a feature branch with committed changes.
+#   3. Empty — on the default branch with no staged changes; review will see
+#      an empty diff (the merge-gate has an explicit null-review rule for this).
+#
+# Prints one diagnostic line to stderr indicating which mode is active.
+get_review_diff() {
+  DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+
+  STAGED=$(git diff --cached --unified=3 2>/dev/null)
+  if [ -n "$STAGED" ]; then
+    printf '[gates/review] using staged diff\n' 1>&2
+    printf '%s\n' "$STAGED"
+    return 0
+  fi
+
+  if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ]; then
+    # Fetch the base ref so the comparison is accurate even in a fresh clone.
+    # Failure here is non-fatal — git diff will simply fall back to local state.
+    git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+    printf '[gates/review] no staged changes — using branch diff vs origin/%s\n' "$DEFAULT_BRANCH" 1>&2
+    git diff "origin/${DEFAULT_BRANCH}...HEAD" --unified=3 2>/dev/null
+    return 0
+  fi
+
+  printf '[gates/review] no staged changes and on default branch — empty diff\n' 1>&2
+}
+
 cmd_review() {
   OUT="$REPO_ROOT/.clagentic/last-review.json"
-  git diff --cached --unified=3 | "$TOOL_HOME/scripts/llm-client.sh" review > "$OUT"
+  get_review_diff | "$TOOL_HOME/scripts/llm-client.sh" review > "$OUT"
   # Reject degraded envelopes outright. An LLM wrapper that failed every
   # chain step emits valid JSON with findings:[] — schema-valid but
   # meaningless. Without this check, a misconfigured / auth-broken /
@@ -456,7 +523,7 @@ review_is_degraded() {
 
 cmd_adversarial() {
   OUT="$REPO_ROOT/.clagentic/last-adversarial.md"
-  git diff --cached --unified=3 | "$TOOL_HOME/scripts/llm-client.sh" adversarial > "$OUT"
+  get_review_diff | "$TOOL_HOME/scripts/llm-client.sh" adversarial > "$OUT"
   cmd_log_run adversarial warn "wrote $OUT (non-blocking)"
   cat "$OUT"
 }
