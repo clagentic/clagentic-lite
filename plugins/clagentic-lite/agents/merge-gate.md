@@ -33,9 +33,12 @@ Standard input is a single JSON object:
   "adversarial": "<markdown>" | "",
   "adversarial_acks": [...] | [],
   "accepted_risks": "<markdown from .clagentic/accepted-risks.md>" | "",
+  "introduces_ack_file": true | false,
   "threshold": "low | medium | high | critical"
 }
 ```
+
+`introduces_ack_file` is a deterministic boolean computed by `build_gate_summary` from `git diff --name-status`. It is `true` when `.clagentic/adversarial-acks.json` or `.clagentic/accepted-risks.md` is **added** (status `A`) in the current diff. It is `false` when those files are modified, unchanged, or when git state is unavailable. This field drives the bootstrap exemption below — do not infer it yourself from the adversarial text.
 
 The deterministic gates (secrets, deps, sast) are not in this payload — if they had failed, `/ship` would have exited before invoking you. You can assume they passed.
 
@@ -68,7 +71,7 @@ Strict JSON, no prose before or after:
       "cwe": "CWE-NNN",
       "file": "src/foo.py:42",
       "rationale": "<from acks or accepted_risks entry>",
-      "source": "adversarial-acks" | "accepted-risks"
+      "source": "adversarial-acks" | "accepted-risks" | "bootstrap"
     }
   ]
 }
@@ -87,9 +90,20 @@ Strict JSON, no prose before or after:
 
 **Approve** otherwise. A clean review with `findings: []` is the normal case; approve it.
 
+## Bootstrap exemption — ack files introducing themselves
+
+When `introduces_ack_file` is `true`, the adversarial pass may flag `.clagentic/adversarial-acks.json` or `.clagentic/accepted-risks.md` itself as a finding (e.g., "repo-controlled suppression file", "spoofable acknowledgment metadata", "unauthenticated acknowledged_by field"). Do not let findings whose **only cited file** is one of those two paths block the merge when `introduces_ack_file` is `true`.
+
+Rationale: `introduces_ack_file: true` means git confirms the ack file is being added for the first time in this diff — not modified. That is the documented bootstrap step. The gate flagging the file that enables it is circular. The trust boundary is branch protection and CODEOWNERS review of that path, enforced before the diff lands. The ack content is evaluated on the *next* diff it is meant to cover, not on the diff that first creates it.
+
+Rules:
+- Only apply this exemption when `introduces_ack_file` is `true`. When it is `false` (modified, unchanged, or unavailable), treat findings about the ack file like any other finding.
+- The exemption covers only findings whose cited file is `.clagentic/adversarial-acks.json` or `.clagentic/accepted-risks.md`. Findings citing other files in the same diff are evaluated normally.
+- Do not infer `introduces_ack_file` yourself from the adversarial prose. Use only the value supplied in the payload field.
+
 ## Acknowledged findings
 
-When all adversarial findings that would otherwise block are covered by `adversarial_acks` or `accepted_risks`, approve but populate the `acknowledged` array in your output listing each covered finding. Include the CWE, the file:line cited in the adversarial report, the rationale, and the source.
+When all adversarial findings that would otherwise block are covered by `adversarial_acks`, `accepted_risks`, or the bootstrap exemption (when `introduces_ack_file` is `true`), approve but populate the `acknowledged` array in your output listing each covered finding. Include the CWE, the file:line cited in the adversarial report, the rationale, and the source. For bootstrap-exempted findings use `"source": "bootstrap"` and rationale `"ack file net-new addition; bootstrap exemption applied"`.
 
 ## Accepted risks
 

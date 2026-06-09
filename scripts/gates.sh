@@ -653,6 +653,26 @@ build_gate_summary() {
   AR_FILE="$REPO_ROOT/.clagentic/accepted-risks.md"
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
 
+  # Detect whether the ack/accepted-risks files are net-new (status A) in the
+  # current diff. This flag is passed to the merge-gate to enable the bootstrap
+  # exemption without requiring the LLM to infer it from prose. We check both
+  # the staged index and the branch diff (same priority as get_review_diff).
+  # Failure is fail-open (false) — the flag is informational only.
+  _ack_rel=".clagentic/adversarial-acks.json"
+  _ar_rel=".clagentic/accepted-risks.md"
+  INTRODUCES_ACK_FILE="false"
+  _diff_status=""
+  if git diff --cached --name-status 2>/dev/null | grep -q .; then
+    _diff_status=$(git diff --cached --name-status 2>/dev/null)
+  else
+    _DEFAULT_BRANCH=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | tr -d ' \n')
+    [ -z "$_DEFAULT_BRANCH" ] && _DEFAULT_BRANCH="main"
+    _diff_status=$(git diff "origin/${_DEFAULT_BRANCH}...HEAD" --name-status 2>/dev/null)
+  fi
+  if printf '%s\n' "$_diff_status" | grep -qE "^A[[:space:]]+(\\.clagentic/adversarial-acks\\.json|\\.clagentic/accepted-risks\\.md)$"; then
+    INTRODUCES_ACK_FILE="true"
+  fi
+
   # Prefer jq; fall back to python3; finally degrade to a minimal envelope
   # with the review embedded raw (validated as JSON beforehand) and
   # adversarial dropped (we can't safely escape arbitrary markdown without
@@ -672,6 +692,7 @@ build_gate_summary() {
   "adversarial": $AD_PAYLOAD,
   "adversarial_acks": $ACKS_PAYLOAD,
   "accepted_risks": $AR_PAYLOAD,
+  "introduces_ack_file": $INTRODUCES_ACK_FILE,
   "threshold": "$THRESHOLD"
 }
 EOF
@@ -687,13 +708,14 @@ EOF
     [ -f "$AD" ] && AD_ARG="$AD"
     [ -f "$ACKS_FILE" ] && ACKS_ARG="$ACKS_FILE"
     [ -f "$AR_FILE" ] && AR_ARG="$AR_FILE"
-    python3 - "$THRESHOLD" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" <<'PY'
+    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" <<'PY'
 import json, sys
-threshold = sys.argv[1]
-rv_path   = sys.argv[2] if len(sys.argv) > 2 else ""
-ad_path   = sys.argv[3] if len(sys.argv) > 3 else ""
-acks_path = sys.argv[4] if len(sys.argv) > 4 else ""
-ar_path   = sys.argv[5] if len(sys.argv) > 5 else ""
+threshold       = sys.argv[1]
+introduces_ack  = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
+rv_path         = sys.argv[3] if len(sys.argv) > 3 else ""
+ad_path         = sys.argv[4] if len(sys.argv) > 4 else ""
+acks_path       = sys.argv[5] if len(sys.argv) > 5 else ""
+ar_path         = sys.argv[6] if len(sys.argv) > 6 else ""
 review = None
 if rv_path:
     try:
@@ -722,20 +744,21 @@ if ar_path:
             ar = f.read()
     except Exception:
         ar = ""
-print(json.dumps({"review": review, "adversarial": adv, "adversarial_acks": acks, "accepted_risks": ar, "threshold": threshold}))
+print(json.dumps({"review": review, "adversarial": adv, "adversarial_acks": acks, "accepted_risks": ar, "introduces_ack_file": introduces_ack, "threshold": threshold}))
 PY
     return 0
   fi
 
   # No JSON encoder available — emit a minimal envelope with adversarial
   # and accepted_risks dropped. The Merge Gate will see this and may choose
-  # to refuse on incomplete context.
+  # to refuse on incomplete context. introduces_ack_file is included as false
+  # (conservative — no bootstrap exemption in degraded mode).
   if [ -f "$RV" ]; then
     cat <<EOF
-{"review": $(cat "$RV"), "adversarial": "", "adversarial_acks": [], "accepted_risks": "", "threshold": "$THRESHOLD"}
+{"review": $(cat "$RV"), "adversarial": "", "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
 EOF
   else
-    echo "{\"review\": null, \"adversarial\": \"\", \"adversarial_acks\": [], \"accepted_risks\": \"\", \"threshold\": \"$THRESHOLD\"}"
+    echo "{\"review\": null, \"adversarial\": \"\", \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
   fi
 }
 

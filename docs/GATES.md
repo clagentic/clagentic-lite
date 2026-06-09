@@ -223,6 +223,8 @@ Fields:
 
 **Important:** the acks file must be committed deliberately. A missing file means no acks are in effect — the merge gate sees an empty list and refuses on any unmitigated CWE finding.
 
+**Bootstrap sequence — first ack in a repo:** the first time you commit `.clagentic/adversarial-acks.json` (or `accepted-risks.md`), the merge-gate adversarial pass may flag the file itself ("repo-controlled suppression", "unauthenticated acknowledged_by"). The gate-summary payload includes a deterministic `introduces_ack_file` boolean (set by `build_gate_summary` via `git diff --name-status`). When `true` — meaning the ack file is being **added** in this exact diff, not modified — the merge-gate applies a bootstrap exemption and does not block on findings whose only cited file is the ack file itself. Findings on other files in the same diff are still evaluated normally. Recommended practice: add `.clagentic/adversarial-acks.json` and `.clagentic/accepted-risks.md` to `.github/CODEOWNERS` (or your host's equivalent) so all future edits require explicit human approval. Once the ack file is on the default branch, subsequent diffs that the ack covers pass normally.
+
 ### accepted-risks.md — architectural risk documentation for the merge gate
 
 When an adversarial finding describes behavior that is inherent to the product's stated purpose — not a bug or an oversight, but a deliberate architectural decision — commit `.clagentic/accepted-risks.md` to the repo documenting that decision. The merge-gate reads this file and uses it to classify covered findings as acknowledged rather than refused.
@@ -238,6 +240,8 @@ When an adversarial finding describes behavior that is inherent to the product's
 **When to use this vs. adversarial-acks.json:** use `adversarial-acks.json` for precise per-CWE, path-glob-scoped acknowledgments. Use `accepted-risks.md` for broader architectural decisions that cover classes of findings rather than individual CWEs — e.g., "this entire subsystem exposes security intelligence data to authenticated analysts because that is the product." Both mechanisms are active simultaneously; `adversarial-acks.json` takes precedence when both apply to the same finding.
 
 **Important:** the file must be committed deliberately. Its presence in version history is part of the audit trail — it is the documented record that a human accepted this risk, not a suppression added to make a gate go green.
+
+**Bootstrap:** same mechanism as `adversarial-acks.json` above — `introduces_ack_file` is `true` when this file is added, and the merge-gate does not block on findings citing only this path. The ack takes effect for subsequent diffs.
 
 **Agents: if a gate blocks you, consult this table first.** Editing `pre-bash-guard.sh`, `pre-write-guard.sh`, or `scripts/gates.sh` to remove a rule or suppress a finding is a contract violation — it removes the protection for all future sessions, not just the one where it was inconvenient. Use the config bypass and explain why.
 
