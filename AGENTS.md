@@ -144,6 +144,8 @@ Four generated artifacts are stamped into enrolled repos at enroll time and kept
 - `.claude/settings.json` — hook wiring (gitignored)
 - `.git/hooks/{pre-commit,pre-push}` — gate shims
 
+**Hard rule: the committed `CLAUDE.md` contains only the thin notice — never builder rules, agent tables, or gate commands.** Those belong in `.clagentic/builder-contract.md` (gitignored, injected at session start) or `CLAUDE.md.wrapper.template` (local-only, non-git directories). The notice's own language is "if not enrolled, follow normal project workflow" — any rules framed as unconditional mandates in the committed file contradict that and mislead non-clagentic contributors. Do not add rule content to `CLAUDE.md.template`.
+
 Each has a version constant in `bin/clagentic-lite`. `clagentic-lite update` compares the installed version against the constant and restamps only when they differ.
 
 **Rule: any change to a template file requires a version bump to its corresponding constant.** Without the bump, `update` sees matching versions and skips the restamp — enrolled repos never receive the change.
@@ -157,7 +159,7 @@ Each has a version constant in `bin/clagentic-lite`. `clagentic-lite update` com
 | `share/hook-shims/pre-commit.template` | `SHIM_VERSION` in `bin/clagentic-lite` | Any content change to the hook shim |
 | `share/hook-shims/pre-push.template` | `SHIM_VERSION` (same constant) | Any content change to the hook shim |
 
-`CLAUDE_MD_VERSION` is retired — replaced by the three narrower constants above. During the transition period it remains in `bin/clagentic-lite` as a tombstone so old installed files continue to compare correctly. Doctor will warn on any repo still carrying the old `clagentic-claude-md-version` marker; `update` will migrate them to the thin notice.
+`CLAUDE_MD_VERSION` is retired — replaced by the three narrower constants above. During the transition period it remains in `bin/clagentic-lite` as a tombstone so old installed files continue to compare correctly. Doctor will warn on any repo still carrying the old `clagentic-claude-md-version` marker; `update` will migrate them to the thin notice with a full replace (no old rule content preserved). If a repo's committed `CLAUDE.md` still contains a "How to work in this repo" rules block after updating, run `clagentic-lite update --restamp` to force a clean restamp.
 
 The version strings are arbitrary (`v1`, `v2`, ...) — increment by one each time. The template file itself should also carry the updated version in its managed-by comment (e.g. `clagentic-notice-version: v2`) so the installed copy is self-describing.
 
