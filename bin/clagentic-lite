@@ -1654,7 +1654,27 @@ cmd_update() {
       [ "$_cs_ver" != "$CLAUDE_SETTINGS_VERSION" ] && _need_restamp=1
     fi
     _cm_file="$_rpath/CLAUDE.md"
-    if [ -f "$_cm_file" ] && grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
+    if [ ! -f "$_cm_file" ]; then
+      # CLAUDE.md entirely absent — restamp unconditionally.
+      _need_restamp=1
+    elif ! grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
+      # managed-by marker stripped (user removed the notice). On a TTY, prompt
+      # before re-adding; on non-TTY, warn but do not auto-restamp (user may
+      # have intentionally replaced it). --restamp overrides and restores it.
+      if [ "$RESTAMP" -eq 1 ]; then
+        _need_restamp=1
+      elif [ -t 0 ]; then
+        printf '[clagentic-lite] WARN: %s/CLAUDE.md enrollment notice is missing or was removed.\n' "$_rpath" >&2
+        printf 'Re-add the enrollment notice? [y/N]: '
+        read -r _notice_reply || _notice_reply=""
+        case "$_notice_reply" in
+          y|Y|yes|YES) _need_restamp=1 ;;
+          *) warn "$_rpath: skipping CLAUDE.md notice re-add (run \`clagentic-lite update --restamp\` to restore)" ;;
+        esac
+      else
+        warn "$_rpath: CLAUDE.md enrollment notice missing — run \`clagentic-lite update --restamp\` to restore"
+      fi
+    else
       # Support both old marker (clagentic-claude-md-version) and new notice
       # marker (clagentic-notice-version) so the comparison works during transition.
       _cm_notice_ver=$(claude_notice_version "$_cm_file")
