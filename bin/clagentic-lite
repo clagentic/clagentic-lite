@@ -1466,13 +1466,25 @@ _restamp_repo_artifacts() {
   _ra_count=0
 
   # Re-stamp CLAUDE.md notice block only, preserving user content below.
-  # The committed repo CLAUDE.md is now a thin notice (~7 lines) that is true
+  # The committed repo CLAUDE.md is now a thin notice (~9 lines) that is true
   # for any teammate regardless of whether clagentic-lite is installed.
+  #
+  # Old-style fat files (clagentic-claude-md-version marker, pre-5eb8dd6) are
+  # fully replaced — their entire content was managed, no user content follows
+  # the block. _restamp_notice_block would misidentify the fat block's own
+  # rules content (lines 9+) as user content and re-append it after the new
+  # thin template, producing an inconsistent committed file that tells
+  # non-clagentic contributors "these are binding rules" unconditionally.
   _ra_cm="$_ra_path/CLAUDE.md"
   if [ -f "$_ra_cm" ] && grep -q 'managed-by: clagentic' "$_ra_cm" 2>/dev/null; then
     _ra_cm_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
     if [ -f "$_ra_cm_template" ]; then
-      _restamp_notice_block "$_ra_cm" "$_ra_cm_template"
+      if grep -q 'clagentic-claude-md-version' "$_ra_cm" 2>/dev/null; then
+        # Old fat template — full replace; no user content to preserve.
+        cp "$_ra_cm_template" "$_ra_cm"
+      else
+        _restamp_notice_block "$_ra_cm" "$_ra_cm_template"
+      fi
       say "re-stamped${_ra_label}: $_ra_path/CLAUDE.md" >&2
       _ra_count=$((_ra_count+1))
     fi
