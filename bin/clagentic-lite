@@ -66,7 +66,7 @@ CLAUDE_SETTINGS_VERSION="v3"
 CLAUDE_MD_VERSION="v9"
 # Thin enrollment notice in the committed repo CLAUDE.md. Bump only on
 # notice text changes — stable by design.
-CLAUDE_NOTICE_VERSION="v1"
+CLAUDE_NOTICE_VERSION="v2"
 # Local .clagentic/builder-contract.md — full builder rules, never committed.
 # Bump on any content change; cheap restamp (gitignored).
 CLAUDE_CONTRACT_VERSION="v1"
@@ -1376,48 +1376,72 @@ cmd_doctor() {
 # _restamp_notice_block FILE TEMPLATE
 # Replace the clagentic-managed notice block at the top of FILE with the
 # contents of TEMPLATE, preserving any user content that follows it.
-# "Managed block" = everything from the first line through the last HTML
-# comment line (<!-- ... -->) in the header cluster (contiguous top section).
-# If the file is short (≤10 lines, e.g. just the notice), the whole file is
-# replaced.  If no closing comment is found, replace the whole file as a safe
-# fallback.
+#
+# Boundary detection (in priority order):
+#   1. Closing sentinel "<!-- /clagentic-notice -->" in the first 20 lines —
+#      authoritative end-of-block marker present in v2+ templates.
+#   2. File is short (< v1 block length) — replace whole file; no user content.
+#   3. v1 fallback: no sentinel found. Use the fixed v1 block length (8 lines)
+#      as the split boundary. v1 block was exactly 8 lines (the current template
+#      minus the sentinel line). User content starts at line 9.
+#      IMPORTANT: do not substitute _rnb_tmpl_lines here — the current template
+#      is 9 lines (v2), but the installed file is 8-line v1. Using the current
+#      template length is off by one and silently drops the first user line.
+#
+# V1_BLOCK_LINES is the fixed line count of the CLAUDE.md.template at v1.
+# It must not be changed. If the template grows, bump CLAUDE_NOTICE_VERSION and
+# add a new sentinel-based path; never change this constant.
+_RNB_V1_BLOCK_LINES=8
 _restamp_notice_block() {
   _rnb_file="$1"
   _rnb_template="$2"
   _rnb_total=$(wc -l < "$_rnb_file" 2>/dev/null || echo 0)
 
-  # Simple path: file is short — just replace the whole thing.
-  if [ "$_rnb_total" -le 10 ]; then
+  # Short path: file has fewer lines than the v1 block — nothing follows the
+  # managed block regardless of version.
+  if [ "$_rnb_total" -lt "$_RNB_V1_BLOCK_LINES" ]; then
     cp "$_rnb_template" "$_rnb_file"
     return 0
   fi
 
-  # Find the last HTML comment line in the header cluster.
-  # Read the first 10 lines; find the last one that starts with "<!--".
-  _rnb_last_comment=0
+  # Find the closing sentinel "<!-- /clagentic-notice -->" in the first 20 lines.
+  _rnb_sentinel_line=0
   _rnb_lineno=0
   while IFS= read -r _rnb_line; do
     _rnb_lineno=$((_rnb_lineno+1))
-    [ "$_rnb_lineno" -gt 10 ] && break
+    [ "$_rnb_lineno" -gt 20 ] && break
     case "$_rnb_line" in
-      '<!--'*) _rnb_last_comment="$_rnb_lineno" ;;
+      '<!-- /clagentic-notice -->'*) _rnb_sentinel_line="$_rnb_lineno"; break ;;
     esac
   done < "$_rnb_file"
 
-  if [ "$_rnb_last_comment" -eq 0 ]; then
-    # No managed comment found — replace whole file as safe fallback.
-    cp "$_rnb_template" "$_rnb_file"
+  if [ "$_rnb_sentinel_line" -eq 0 ]; then
+    # No sentinel — v1 install. Split at the fixed v1 block boundary.
+    # User content starts at line _RNB_V1_BLOCK_LINES + 1 = 9.
+    _rnb_user_start=$((_RNB_V1_BLOCK_LINES + 1))
+    _rnb_user=""
+    if [ "$_rnb_user_start" -le "$_rnb_total" ]; then
+      _rnb_user=$(tail -n "+${_rnb_user_start}" "$_rnb_file" 2>/dev/null || true)
+    fi
+    if [ -n "$_rnb_user" ]; then
+      {
+        cat "$_rnb_template"
+        printf '%s\n' "$_rnb_user"
+      } > "$_rnb_file"
+    else
+      cp "$_rnb_template" "$_rnb_file"
+    fi
     return 0
   fi
 
-  # Extract user content after the managed block (may be empty).
-  _rnb_user_start=$((_rnb_last_comment+1))
+  # Sentinel found — split at sentinel line; user content follows.
+  _rnb_user_start=$((_rnb_sentinel_line+1))
   _rnb_user=""
   if [ "$_rnb_user_start" -le "$_rnb_total" ]; then
     _rnb_user=$(tail -n "+${_rnb_user_start}" "$_rnb_file" 2>/dev/null || true)
   fi
 
-  # Write: notice block from template, then user content if any.
+  # Write: notice block from template (includes sentinel), then user content.
   if [ -n "$_rnb_user" ]; then
     {
       cat "$_rnb_template"

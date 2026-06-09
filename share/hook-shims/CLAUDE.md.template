@@ -1,8 +1,9 @@
 # CLAUDE.md
-<!-- managed-by: clagentic · clagentic-notice-version: v1 -->
+<!-- managed-by: clagentic · clagentic-notice-version: v2 -->
 <!-- Re-generate: `clagentic-lite enroll --force` or `clagentic-lite update` -->
 
 This project supports clagentic-lite enrollment.
 If clagentic-lite is installed and this repo is enrolled on your machine,
 local hooks, gates, and a builder contract activate automatically.
 If not enrolled, follow normal project workflow. Run `clagentic-lite doctor` to check status.
+<!-- /clagentic-notice -->
