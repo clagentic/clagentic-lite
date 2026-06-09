@@ -111,7 +111,8 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `share/hook-shims/pre-commit.template` | hook shim template stamped into enrolled repos at enroll time |
 | `share/hook-shims/pre-push.template` | hook shim template stamped into enrolled repos at enroll time |
 | `share/hook-shims/claude-settings.template` | settings.json template stamped into enrolled repos — hook paths substituted with absolute `$CLAGENTIC_HOME` paths |
-| `share/hook-shims/CLAUDE.md.template` | CLAUDE.md template stamped into enrolled repo root — activates Builder contract and documents hooks/commands for Claude Code |
+| `share/hook-shims/CLAUDE.md.template` | CLAUDE.md template stamped into enrolled repo root — thin enrollment notice, unconditionally true for any teammate |
+| `share/hook-shims/builder-contract.template` | builder-contract.md template stamped into `.clagentic/` (gitignored) — full builder rules, agent table, commands, hooks, gate reference; injected at session start |
 | `.claude/settings.json` | hook wiring (tool's own repo; enrolled repos get a generated copy in their `.claude/`) |
 | `.claude-plugin/marketplace.json` | plugin marketplace manifest — declares the `clagentic-lite` plugin |
 | `plugins/clagentic-lite/.claude-plugin/plugin.json` | per-plugin manifest; version bumped by maintainer PRs that change agent or skill files — never by `clagentic-lite update` |
@@ -136,19 +137,29 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 
 ## Template version-bump protocol
 
-Three generated artifacts are stamped into enrolled repos at enroll time and kept in sync by `clagentic-lite update`: `CLAUDE.md`, `.claude/settings.json`, and `.git/hooks/{pre-commit,pre-push}`. Each has a version constant in `bin/clagentic-lite` (`CLAUDE_MD_VERSION`, `CLAUDE_SETTINGS_VERSION`, `SHIM_VERSION`). `clagentic-lite update` compares the installed version against the constant and restamps only when they differ.
+Four generated artifacts are stamped into enrolled repos at enroll time and kept in sync by `clagentic-lite update`:
+
+- `CLAUDE.md` — thin enrollment notice (committed, user-extensible)
+- `.clagentic/builder-contract.md` — full builder rules (gitignored, local only)
+- `.claude/settings.json` — hook wiring (gitignored)
+- `.git/hooks/{pre-commit,pre-push}` — gate shims
+
+Each has a version constant in `bin/clagentic-lite`. `clagentic-lite update` compares the installed version against the constant and restamps only when they differ.
 
 **Rule: any change to a template file requires a version bump to its corresponding constant.** Without the bump, `update` sees matching versions and skips the restamp — enrolled repos never receive the change.
 
 | Template file | Version constant | When to bump |
 |---|---|---|
-| `share/hook-shims/CLAUDE.md.template` | `CLAUDE_MD_VERSION` in `bin/clagentic-lite` | Any content change to the template |
-| `share/hook-shims/CLAUDE.md.wrapper.template` | `CLAUDE_MD_VERSION` (same constant) | Any content change to the wrapper template |
+| `share/hook-shims/CLAUDE.md.template` | `CLAUDE_NOTICE_VERSION` in `bin/clagentic-lite` | Any content change to the thin notice |
+| `share/hook-shims/builder-contract.template` | `CLAUDE_CONTRACT_VERSION` in `bin/clagentic-lite` | Any change to builder rules, agents, commands, hooks, or gate reference |
+| `share/hook-shims/CLAUDE.md.wrapper.template` | `CLAUDE_WRAPPER_VERSION` in `bin/clagentic-lite` | Any content change to the wrapper template |
 | `share/hook-shims/claude-settings.template` | `CLAUDE_SETTINGS_VERSION` in `bin/clagentic-lite` | Any content change to the settings template |
 | `share/hook-shims/pre-commit.template` | `SHIM_VERSION` in `bin/clagentic-lite` | Any content change to the hook shim |
 | `share/hook-shims/pre-push.template` | `SHIM_VERSION` (same constant) | Any content change to the hook shim |
 
-The version strings are arbitrary (`v1`, `v2`, ...) — increment by one each time. The template file itself should also carry the updated version in its managed-by comment (e.g. `clagentic-claude-md-version: v6`) so the installed copy is self-describing.
+`CLAUDE_MD_VERSION` is retired — replaced by the three narrower constants above. During the transition period it remains in `bin/clagentic-lite` as a tombstone so old installed files continue to compare correctly. Doctor will warn on any repo still carrying the old `clagentic-claude-md-version` marker; `update` will migrate them to the thin notice.
+
+The version strings are arbitrary (`v1`, `v2`, ...) — increment by one each time. The template file itself should also carry the updated version in its managed-by comment (e.g. `clagentic-notice-version: v2`) so the installed copy is self-describing.
 
 **After bumping:** run `clagentic-lite update` (or `clagentic-lite update --restamp` to force all enrolled repos regardless of version). Users on older installs get the restamp automatically on their next `update` run.
 
