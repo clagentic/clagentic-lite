@@ -13,6 +13,7 @@
 . "$(dirname "$0")/../../scripts/platform.sh" 2>/dev/null || true
 
 MEMORY_DB="${PWD}/.clagentic/memory.db"
+CONTRACT_MD="${PWD}/.clagentic/builder-contract.md"
 
 # ---- 1. Recent session summaries ----------------------------------------
 
@@ -20,6 +21,17 @@ RECENT=""
 if [ -f "$MEMORY_DB" ]; then
   RECENT=$(sqlite3 "$MEMORY_DB" \
     "SELECT '[' || ts || '] ' || summary FROM turns ORDER BY ts DESC LIMIT 3;" 2>/dev/null || true)
+fi
+
+# ---- 1b. Builder contract injection ----------------------------------------
+# Inject .clagentic/builder-contract.md so Claude Code receives the full
+# builder rules, agent table, and gate reference at session open. The contract
+# is gitignored (local machine only) — this is the delivery path that replaces
+# the fat committed CLAUDE.md. Best-effort: missing contract is not an error.
+
+CONTRACT_CONTENT=""
+if [ -f "$CONTRACT_MD" ]; then
+  CONTRACT_CONTENT=$(cat "$CONTRACT_MD" 2>/dev/null || true)
 fi
 
 # ---- 2. Update alert -------------------------------------------------------
@@ -74,8 +86,17 @@ fi
 
 CONTEXT=""
 
+if [ -n "$CONTRACT_CONTENT" ]; then
+  CONTEXT="$CONTRACT_CONTENT"
+fi
+
 if [ -n "$RECENT" ]; then
-  CONTEXT="CLAGENTIC RECALL · ${PWD##*/} · most recent session summaries:\n${RECENT}"
+  _recall_block="CLAGENTIC RECALL · ${PWD##*/} · most recent session summaries:\n${RECENT}"
+  if [ -n "$CONTEXT" ]; then
+    CONTEXT="${CONTEXT}\n\n${_recall_block}"
+  else
+    CONTEXT="$_recall_block"
+  fi
 fi
 
 if [ -n "$UPDATE_MSG" ]; then

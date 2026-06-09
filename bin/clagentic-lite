@@ -60,7 +60,19 @@ SHIM_VERSION="v1"
 # Claude Code artifact version markers. Bump when the corresponding template
 # changes so `clagentic-lite update` re-stamps enrolled repos automatically.
 CLAUDE_SETTINGS_VERSION="v3"
+# CLAUDE_MD_VERSION is retired — replaced by three narrower constants below.
+# The variable is kept as a tombstone so doctor/update version-compare calls
+# against old installed files continue to work during the transition period.
 CLAUDE_MD_VERSION="v9"
+# Thin enrollment notice in the committed repo CLAUDE.md. Bump only on
+# notice text changes — stable by design.
+CLAUDE_NOTICE_VERSION="v1"
+# Local .clagentic/builder-contract.md — full builder rules, never committed.
+# Bump on any content change; cheap restamp (gitignored).
+CLAUDE_CONTRACT_VERSION="v1"
+# Local wrapper CLAUDE.md — rich local dashboard, never committed.
+# Bump on any template change; cheap restamp (local).
+CLAUDE_WRAPPER_VERSION="v1"
 
 # Single source of truth for the security-gate tool list. Adding a new
 # scanner means editing this one line — _run_prereq_checks (init/update)
@@ -104,11 +116,33 @@ claude_settings_version() {
 }
 
 # Read the version marker from an installed CLAUDE.md.
-# Looks for "clagentic-claude-md-version: vN" in the managed-by comment.
+# Handles both old marker (clagentic-claude-md-version) and the new notice
+# marker (clagentic-notice-version) so version checks work during transition.
 claude_md_version() {
   _cmv_file="$1"
   [ -f "$_cmv_file" ] || { printf ''; return; }
   grep -o 'clagentic-claude-md-version: v[^ ·>]*' "$_cmv_file" 2>/dev/null | sed 's/clagentic-claude-md-version: //'
+}
+
+# Read the thin-notice version from an installed repo CLAUDE.md.
+claude_notice_version() {
+  _cnv_file="$1"
+  [ -f "$_cnv_file" ] || { printf ''; return; }
+  grep -o 'clagentic-notice-version: v[^ ·>]*' "$_cnv_file" 2>/dev/null | sed 's/clagentic-notice-version: //'
+}
+
+# Read the builder-contract version from .clagentic/builder-contract.md.
+claude_contract_version() {
+  _ccv_file="$1"
+  [ -f "$_ccv_file" ] || { printf ''; return; }
+  grep -o 'clagentic-contract-version: v[^ ·>]*' "$_ccv_file" 2>/dev/null | sed 's/clagentic-contract-version: //'
+}
+
+# Read the wrapper CLAUDE.md version.
+claude_wrapper_version() {
+  _cwv_file="$1"
+  [ -f "$_cwv_file" ] || { printf ''; return; }
+  grep -o 'clagentic-wrapper-version: v[^ ·>]*' "$_cwv_file" 2>/dev/null | sed 's/clagentic-wrapper-version: //'
 }
 
 # Stamp a hook shim from share/hook-shims/<name>.template into a repo's
@@ -166,14 +200,47 @@ _stamp_wrapper_claude_md() {
     while IFS= read -r _tmpl_line; do
       case "$_tmpl_line" in
         *__WRAPPER_PROJECT_TABLE__*)
-          printf '| Subfolder | Absolute path |\n'
-          printf '|---|---|\n'
-          for _wr in $_wcd_repos; do
-            _rel="${_wr#$_wcd}"
-            _rel="${_rel#/}"
-            [ -z "$_rel" ] && _rel="$_wr"
-            printf '| `%s` | `%s` |\n' "$_rel" "$_wr"
-          done
+          # Include last-gate-run column when sqlite3 is available (best-effort).
+          if command -v sqlite3 >/dev/null 2>&1; then
+            printf '| Subfolder | Last gate run | Status |\n'
+            printf '|---|---|---|\n'
+            for _wr in $_wcd_repos; do
+              _rel="${_wr#$_wcd}"
+              _rel="${_rel#/}"
+              [ -z "$_rel" ] && _rel="$_wr"
+              _wcd_db="$_wr/.clagentic/audit.db"
+              _wcd_last=""
+              if [ -f "$_wcd_db" ]; then
+                _wcd_last=$(sqlite3 "$_wcd_db" "SELECT MAX(ts) FROM gate_runs;" 2>/dev/null || true)
+              fi
+              [ -z "$_wcd_last" ] && _wcd_last="never"
+              # Check hook presence for a quick health indicator.
+              _wcd_status="ok"
+              _wcd_git_dir=$(git -C "$_wr" rev-parse --git-dir 2>/dev/null || true)
+              if [ -z "$_wcd_git_dir" ]; then
+                _wcd_status="not-a-repo"
+              else
+                case "$_wcd_git_dir" in
+                  /*) _wcd_hd="$_wcd_git_dir/hooks" ;;
+                  *)  _wcd_hd="$_wr/$_wcd_git_dir/hooks" ;;
+                esac
+                if [ ! -f "$_wcd_hd/pre-commit" ]; then
+                  _wcd_status="hooks missing"
+                fi
+              fi
+              printf '| `%s` | %s | %s |\n' "$_rel" "$_wcd_last" "$_wcd_status"
+            done
+          else
+            # sqlite3 not available — simpler table without last-gate column.
+            printf '| Subfolder | Absolute path |\n'
+            printf '|---|---|\n'
+            for _wr in $_wcd_repos; do
+              _rel="${_wr#$_wcd}"
+              _rel="${_rel#/}"
+              [ -z "$_rel" ] && _rel="$_wr"
+              printf '| `%s` | `%s` |\n' "$_rel" "$_wr"
+            done
+          fi
           ;;
         *)
           printf '%s\n' "$_tmpl_line"
@@ -799,15 +866,14 @@ _enroll_one() {
     warn "claude-settings.template missing — skipping Claude Code hook wiring"
   fi
 
-  # Stamp CLAUDE.md in the enrolled repo root so Claude Code knows it's
-  # operating under the Builder contract. Uses stamp-time substitution for
-  # CLAGENTIC_HOME (absolute) and CLAGENTIC_DEFAULT_BRANCH (from env, default main).
+  # Stamp CLAUDE.md in the enrolled repo root with a thin enrollment notice.
+  # The notice is unconditionally true: it describes enrollment support without
+  # binding rules that assume clagentic-lite is installed for all teammates.
   # CLAUDE.md is NOT gitignored — it's a legitimate project file the user may
-  # extend. Protected the same way as settings.json: skip unless managed-by
-  # marker is present or --force is set.
+  # extend. The notice block is ~5 lines; user content below it is preserved on
+  # restamp (see _restamp_repo_artifacts).
   _claude_md_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
   _claude_md_target="$_canon/CLAUDE.md"
-  _default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
   if [ -f "$_claude_md_template" ]; then
     if [ -f "$_claude_md_target" ] && ! grep -q 'managed-by: clagentic' "$_claude_md_target" 2>/dev/null; then
       if [ "${ENROLL_FORCE:-0}" = "1" ]; then
@@ -818,26 +884,45 @@ _enroll_one() {
       fi
     fi
     if [ -n "$_claude_md_template" ]; then
-      sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
-          -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_default_branch|g" \
-          "$_claude_md_template" > "$_claude_md_target"
+      cp "$_claude_md_template" "$_claude_md_target"
       say "stamped CLAUDE.md: $_claude_md_target"
     fi
   else
-    warn "CLAUDE.md.template missing — skipping Builder contract stamp"
+    warn "CLAUDE.md.template missing — skipping enrollment notice stamp"
   fi
 
-  # Add .claude/ to the project's .gitignore so the generated wiring is not
-  # accidentally committed to the enrolled repo.
+  # Stamp .clagentic/builder-contract.md — full builder rules, agent table,
+  # slash commands, hooks, and gate reference. Gitignored (local machine only).
+  # Injected by session-start.sh at session open so Claude Code gets the full
+  # contract every session without it living in a committed file.
+  _contract_template="$SHARE_DIR/hook-shims/builder-contract.template"
+  _contract_target="$_canon/.clagentic/builder-contract.md"
+  _default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+  if [ -f "$_contract_template" ]; then
+    mkdir -p "$_canon/.clagentic" 2>/dev/null || true
+    sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
+        -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_default_branch|g" \
+        "$_contract_template" > "$_contract_target"
+    say "stamped builder contract: $_contract_target"
+  else
+    warn "builder-contract.template missing — skipping builder contract stamp"
+  fi
+
+  # Add .claude/ and .clagentic/ to the project's .gitignore so the generated
+  # wiring and local machine state are not accidentally committed.
   _gitignore="$_canon/.gitignore"
   if [ -f "$_gitignore" ]; then
     if ! grep -qxF '.claude/' "$_gitignore" 2>/dev/null; then
       printf '.claude/\n' >> "$_gitignore"
       say "added .claude/ to $_gitignore"
     fi
+    if ! grep -qxF '.clagentic/' "$_gitignore" 2>/dev/null; then
+      printf '.clagentic/\n' >> "$_gitignore"
+      say "added .clagentic/ to $_gitignore"
+    fi
   else
-    printf '.claude/\n' > "$_gitignore"
-    say "created $_gitignore with .claude/"
+    printf '.claude/\n.clagentic/\n' > "$_gitignore"
+    say "created $_gitignore with .claude/ and .clagentic/"
   fi
 
   # Register.
@@ -920,12 +1005,17 @@ cmd_unenroll() {
   fi
 
   # Purge .clagentic/ if requested.
+  # Note: .clagentic/ contains audit.db, memory.db, and builder-contract.md —
+  # all local machine state (gitignored). The --purge flag removes this data.
+  # Without --purge, .clagentic/ is left in place (data is preserved).
   if [ "$UNENROLL_PURGE" -eq 1 ]; then
     _dot="$_canon/.clagentic"
     if [ -d "$_dot" ]; then
       rm -rf -- "$_dot"
       say "purged: $_dot"
     fi
+  else
+    say "note: .clagentic/ left in place (use --purge to remove audit.db, memory.db, and builder-contract.md)"
   fi
 
   say "unenrolled: $_canon"
@@ -1088,18 +1178,55 @@ cmd_doctor() {
           _ok "$_rpath: .git/hooks/$_hook OK"
         fi
       done
-      # Check CLAUDE.md version in enrolled repo.
+      # Check CLAUDE.md enrollment notice in enrolled repo.
       _cm_file="$_rpath/CLAUDE.md"
       if [ ! -f "$_cm_file" ]; then
         printf '  WARN  %s: CLAUDE.md missing (run `clagentic-lite enroll --force`)\n' "$_rpath"
       elif ! grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
         printf '  WARN  %s: CLAUDE.md not clagentic-managed (manual CLAUDE.md?)\n' "$_rpath"
       else
-        _repo_cm_ver=$(claude_md_version "$_cm_file")
-        if [ "$_repo_cm_ver" != "$CLAUDE_MD_VERSION" ]; then
-          _fail "$_rpath: CLAUDE.md version $_repo_cm_ver (current: $CLAUDE_MD_VERSION) — run \`clagentic-lite update\`"
+        # Check for new thin-notice marker first; fall back to legacy marker.
+        _repo_notice_ver=$(claude_notice_version "$_cm_file")
+        _repo_old_ver=$(claude_md_version "$_cm_file")
+        if [ -n "$_repo_notice_ver" ]; then
+          if [ "$_repo_notice_ver" != "$CLAUDE_NOTICE_VERSION" ]; then
+            # Notice drift is low-risk — INFO not FAIL.
+            printf '  INFO  %s: CLAUDE.md notice version %s (current: %s) — run `clagentic-lite update` to refresh\n' \
+              "$_rpath" "$_repo_notice_ver" "$CLAUDE_NOTICE_VERSION"
+          else
+            _ok "$_rpath: CLAUDE.md notice version $CLAUDE_NOTICE_VERSION OK"
+          fi
+        elif [ -n "$_repo_old_ver" ]; then
+          # Old fat CLAUDE.md — warn; update will migrate to thin notice.
+          printf '  WARN  %s: CLAUDE.md uses old format (clagentic-claude-md-version: %s) — run `clagentic-lite update` to migrate to thin notice\n' \
+            "$_rpath" "$_repo_old_ver"
         else
-          _ok "$_rpath: CLAUDE.md version $CLAUDE_MD_VERSION OK"
+          printf '  WARN  %s: CLAUDE.md has managed-by marker but no version tag — run `clagentic-lite update --restamp`\n' "$_rpath"
+        fi
+      fi
+      # Check builder-contract.md (local, gitignored).
+      _contract_file="$_rpath/.clagentic/builder-contract.md"
+      if [ ! -f "$_contract_file" ]; then
+        printf '  WARN  %s: .clagentic/builder-contract.md missing — sessions lack full builder context (run `clagentic-lite enroll --force`)\n' "$_rpath"
+      elif ! grep -q 'managed-by: clagentic' "$_contract_file" 2>/dev/null; then
+        printf '  WARN  %s: .clagentic/builder-contract.md not clagentic-managed\n' "$_rpath"
+      else
+        _repo_contract_ver=$(claude_contract_version "$_contract_file")
+        if [ "$_repo_contract_ver" != "$CLAUDE_CONTRACT_VERSION" ]; then
+          # Auto-restamp contract on doctor run — it's gitignored and cheap.
+          _ra_default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+          _ra_ct="$SHARE_DIR/hook-shims/builder-contract.template"
+          if [ -f "$_ra_ct" ]; then
+            sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
+                -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_ra_default_branch|g" \
+                "$_ra_ct" > "$_contract_file"
+            _ok "$_rpath: .clagentic/builder-contract.md auto-restamped to $CLAUDE_CONTRACT_VERSION"
+          else
+            printf '  WARN  %s: .clagentic/builder-contract.md version %s (current: %s) — run `clagentic-lite update`\n' \
+              "$_rpath" "$_repo_contract_ver" "$CLAUDE_CONTRACT_VERSION"
+          fi
+        else
+          _ok "$_rpath: .clagentic/builder-contract.md version $CLAUDE_CONTRACT_VERSION OK"
         fi
       fi
       # Check for stale command docs removed in v1.1.0.
@@ -1246,8 +1373,65 @@ cmd_doctor() {
 
 # ---------------------------------------------------------------- update
 
+# _restamp_notice_block FILE TEMPLATE
+# Replace the clagentic-managed notice block at the top of FILE with the
+# contents of TEMPLATE, preserving any user content that follows it.
+# "Managed block" = everything from the first line through the last HTML
+# comment line (<!-- ... -->) in the header cluster (contiguous top section).
+# If the file is short (≤10 lines, e.g. just the notice), the whole file is
+# replaced.  If no closing comment is found, replace the whole file as a safe
+# fallback.
+_restamp_notice_block() {
+  _rnb_file="$1"
+  _rnb_template="$2"
+  _rnb_total=$(wc -l < "$_rnb_file" 2>/dev/null || echo 0)
+
+  # Simple path: file is short — just replace the whole thing.
+  if [ "$_rnb_total" -le 10 ]; then
+    cp "$_rnb_template" "$_rnb_file"
+    return 0
+  fi
+
+  # Find the last HTML comment line in the header cluster.
+  # Read the first 10 lines; find the last one that starts with "<!--".
+  _rnb_last_comment=0
+  _rnb_lineno=0
+  while IFS= read -r _rnb_line; do
+    _rnb_lineno=$((_rnb_lineno+1))
+    [ "$_rnb_lineno" -gt 10 ] && break
+    case "$_rnb_line" in
+      '<!--'*) _rnb_last_comment="$_rnb_lineno" ;;
+    esac
+  done < "$_rnb_file"
+
+  if [ "$_rnb_last_comment" -eq 0 ]; then
+    # No managed comment found — replace whole file as safe fallback.
+    cp "$_rnb_template" "$_rnb_file"
+    return 0
+  fi
+
+  # Extract user content after the managed block (may be empty).
+  _rnb_user_start=$((_rnb_last_comment+1))
+  _rnb_user=""
+  if [ "$_rnb_user_start" -le "$_rnb_total" ]; then
+    _rnb_user=$(tail -n "+${_rnb_user_start}" "$_rnb_file" 2>/dev/null || true)
+  fi
+
+  # Write: notice block from template, then user content if any.
+  if [ -n "$_rnb_user" ]; then
+    {
+      cat "$_rnb_template"
+      printf '%s\n' "$_rnb_user"
+    } > "$_rnb_file"
+  else
+    cp "$_rnb_template" "$_rnb_file"
+  fi
+  return 0
+}
+
 # _restamp_repo_artifacts PATH LABEL
-# Stamp CLAUDE.md, .claude/settings.json, and wrapper CLAUDE.md for PATH.
+# Re-stamp the enrollment notice in CLAUDE.md, builder-contract.md,
+# .claude/settings.json, and wrapper CLAUDE.md for PATH.
 # LABEL is appended to each say message (e.g. "" for version-mismatch path,
 # " (--restamp)" for the force pass) so callers can distinguish log lines.
 # Prints the number of artifacts written to stdout; caller adds to _restamped.
@@ -1257,16 +1441,30 @@ _restamp_repo_artifacts() {
   _ra_label="$2"
   _ra_count=0
 
-  # Re-stamp CLAUDE.md.
+  # Re-stamp CLAUDE.md notice block only, preserving user content below.
+  # The committed repo CLAUDE.md is now a thin notice (~7 lines) that is true
+  # for any teammate regardless of whether clagentic-lite is installed.
   _ra_cm="$_ra_path/CLAUDE.md"
   if [ -f "$_ra_cm" ] && grep -q 'managed-by: clagentic' "$_ra_cm" 2>/dev/null; then
     _ra_cm_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
     if [ -f "$_ra_cm_template" ]; then
+      _restamp_notice_block "$_ra_cm" "$_ra_cm_template"
+      say "re-stamped${_ra_label}: $_ra_path/CLAUDE.md" >&2
+      _ra_count=$((_ra_count+1))
+    fi
+  fi
+
+  # Re-stamp .clagentic/builder-contract.md — always a full restamp (gitignored,
+  # no user content, local only).
+  _ra_contract="$_ra_path/.clagentic/builder-contract.md"
+  if [ -f "$_ra_contract" ] && grep -q 'managed-by: clagentic' "$_ra_contract" 2>/dev/null; then
+    _ra_contract_template="$SHARE_DIR/hook-shims/builder-contract.template"
+    if [ -f "$_ra_contract_template" ]; then
       _ra_default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
       sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
           -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_ra_default_branch|g" \
-          "$_ra_cm_template" > "$_ra_cm"
-      say "re-stamped${_ra_label}: $_ra_path/CLAUDE.md" >&2
+          "$_ra_contract_template" > "$_ra_contract"
+      say "re-stamped${_ra_label}: $_ra_path/.clagentic/builder-contract.md" >&2
       _ra_count=$((_ra_count+1))
     fi
   fi
@@ -1295,7 +1493,7 @@ _restamp_repo_artifacts() {
     _ra_wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
     if [ -f "$_ra_wcm_template" ]; then
       # Re-build the project table from the pointer file.
-      _ra_wcm_repos=$(cat "$_ra_wrapper_ptr" 2>/dev/null | tr '\n' ' ')
+      _ra_wcm_repos=$(tr '\n' ' ' < "$_ra_wrapper_ptr" 2>/dev/null || true)
       ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_ra_wrapper_dir" "$_ra_wcm_repos" && {
         say "re-stamped wrapper${_ra_label}: $_ra_wrapper_cm" >&2
         _ra_count=$((_ra_count+1))
@@ -1443,9 +1641,10 @@ cmd_update() {
       fi
     done
 
-    # Re-stamp .claude/settings.json, CLAUDE.md, and wrapper CLAUDE.md if any
-    # version changed.  _restamp_repo_artifacts handles all three writes; we
-    # check versions here to decide whether to call it and to set _would_restamp.
+    # Re-stamp .claude/settings.json, CLAUDE.md notice, builder-contract.md,
+    # and wrapper CLAUDE.md if any version changed.
+    # _restamp_repo_artifacts handles all writes; we check versions here to
+    # decide whether to call it and to set _would_restamp.
     # Guards mirror the originals: only compare version when the file exists and
     # carries the managed-by marker (or, for wrapper, when the pointer exists).
     _need_restamp=0
@@ -1456,16 +1655,30 @@ cmd_update() {
     fi
     _cm_file="$_rpath/CLAUDE.md"
     if [ -f "$_cm_file" ] && grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
-      _cm_ver=$(claude_md_version "$_cm_file")
-      [ "$_cm_ver" != "$CLAUDE_MD_VERSION" ] && _need_restamp=1
+      # Support both old marker (clagentic-claude-md-version) and new notice
+      # marker (clagentic-notice-version) so the comparison works during transition.
+      _cm_notice_ver=$(claude_notice_version "$_cm_file")
+      _cm_old_ver=$(claude_md_version "$_cm_file")
+      if [ -n "$_cm_notice_ver" ]; then
+        # New-style notice file.
+        [ "$_cm_notice_ver" != "$CLAUDE_NOTICE_VERSION" ] && _need_restamp=1
+      elif [ -n "$_cm_old_ver" ]; then
+        # Old-style fat CLAUDE.md — always restamp to migrate to thin notice.
+        _need_restamp=1
+      fi
+    fi
+    _contract_file="$_rpath/.clagentic/builder-contract.md"
+    if [ -f "$_contract_file" ] && grep -q 'managed-by: clagentic' "$_contract_file" 2>/dev/null; then
+      _contract_ver=$(claude_contract_version "$_contract_file")
+      [ "$_contract_ver" != "$CLAUDE_CONTRACT_VERSION" ] && _need_restamp=1
     fi
     _vck_wrapper_dir=$(dirname "$_rpath")
     _vck_wrapper_ptr="$_vck_wrapper_dir/.clagentic-project"
     _vck_wrapper_cm="$_vck_wrapper_dir/CLAUDE.md"
     if [ -f "$_vck_wrapper_ptr" ] && [ -f "$_vck_wrapper_cm" ] && \
        grep -q 'managed-by: clagentic' "$_vck_wrapper_cm" 2>/dev/null; then
-      _wcm_ver=$(claude_md_version "$_vck_wrapper_cm")
-      [ "$_wcm_ver" != "$CLAUDE_MD_VERSION" ] && _need_restamp=1
+      _wcm_ver=$(claude_wrapper_version "$_vck_wrapper_cm")
+      [ "$_wcm_ver" != "$CLAUDE_WRAPPER_VERSION" ] && _need_restamp=1
     fi
     if [ "$_need_restamp" -eq 1 ]; then
       _would_restamp=1
@@ -1493,8 +1706,8 @@ cmd_update() {
         _managed_count=$((_managed_count+1))
     done < "$REGISTRY"
     if [ "$_managed_count" -gt 0 ]; then
-      printf '[clagentic-lite] All %d enrolled repo(s) already at CLAUDE.md %s.\n' "$_managed_count" "$CLAUDE_MD_VERSION"
-      printf 'Re-stamp CLAUDE.md, settings.json, and wrapper CLAUDE.md anyway? [y/N]: '
+      printf '[clagentic-lite] All %d enrolled repo(s) already at current artifact versions.\n' "$_managed_count"
+      printf 'Re-stamp CLAUDE.md notice, builder-contract.md, settings.json, and wrapper CLAUDE.md anyway? [y/N]: '
       read -r _restamp_reply || _restamp_reply=""
       case "$_restamp_reply" in
         y|Y|yes|YES) RESTAMP=1 ;;
