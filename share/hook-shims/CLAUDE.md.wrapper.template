@@ -1,5 +1,5 @@
 # CLAUDE.md
-<!-- managed-by: clagentic · clagentic-claude-md-version: v9 -->
+<!-- managed-by: clagentic · clagentic-wrapper-version: v1 -->
 <!-- Re-generate: `clagentic-lite enroll --force <this-folder>` -->
 
 This folder is a clagentic-lite **wrapper** — it contains enrolled git projects but is not a git repo itself.
@@ -16,14 +16,58 @@ To get full clagentic integration: open a project subfolder in Claude Code, or `
 
 ## Builder rules (apply in all enrolled projects)
 
-- Work on feature branches. Do not write to the default branch.
-- Do not merge pull requests — run `clagentic-lite gates ship` inside the project.
-- Do not review your own work — run `clagentic-lite gates review` (cross-vendor, different blind spots).
-- Do not bypass security gates (`gitleaks`, `semgrep`, `osv-scanner`) — fix the underlying issue.
+1. **Delegate code work to the Builder.** When the user asks you to write, edit, or refactor code, use the `clagentic-lite:builder` subagent — do not author code directly in the main session.
+
+2. **Review with the Reviewer agent after staging, before opening a PR.** Use `clagentic-lite:reviewer` directly. Cross-vendor review is the load-bearing pattern; skipping it defeats the purpose of the harness.
+
+3. **Never write to the default branch.** The pre-write-guard blocks it, but do not attempt it. Create a feature branch first.
+
+4. **Gate before opening a PR.** Run `clagentic-lite gates ship` — it runs all blocking gates (secrets, deps, sast, review, adversarial, merge-gate) and opens the PR only if all pass.
+
+5. **Never bypass security gates.** If `gitleaks`, `semgrep`, or `osv-scanner` block, fix the underlying issue. Do not add suppressions without a written justification in the commit message.
+
+## Agents
+
+| Agent | When to use |
+|---|---|
+| `clagentic-lite:builder` | Write, edit, or refactor code — the primary code author |
+| `clagentic-lite:reviewer` | Review staged changes; cross-vendor second opinion after Builder completes work |
+| `clagentic-lite:auditor` | Security narration on top of gitleaks/semgrep/osv findings |
+| `clagentic-lite:merge-gate` | Final approve/refuse decision before opening a PR |
+| `clagentic-lite:troubleshooter` | Diagnose a gate failure, hook error, or unexpected output — read-only |
+
+## Slash commands
+
+| Command | What it does |
+|---|---|
+| `/recall` | Search session memory for prior decisions |
+| `/eng-consult` | Multi-voice engineering panel — quality, security, SRE, UX review of a file or codebase |
+| `/infosec-rt` | Security red team — attacker personas model exploit chains; returns a ranked hardening plan |
+
+## Commands (from this wrapper level)
+
+```sh
+# Enrollment
+clagentic-lite enroll <project-subfolder>     # enroll a project under this wrapper
+clagentic-lite unenroll <project-subfolder>   # remove clagentic wiring from a project
+clagentic-lite list                           # show all enrolled repos with status
+
+# Diagnostics
+clagentic-lite doctor                         # verify prereqs and enrolled-repo health
+
+# Updates
+clagentic-lite update                         # pull latest, re-stamp all enrolled repos
+clagentic-lite update --restamp               # force re-stamp all managed artifacts
+```
 
 ## Audit trail (per project)
 
 ```sh
+# Query gate runs for a specific project
 sqlite3 <project>/.clagentic/audit.db "SELECT ts, gate, outcome FROM gate_runs ORDER BY ts DESC LIMIT 20;"
-clagentic-lite gates digest   # run from inside the project folder
+
+# From inside the project folder:
+clagentic-lite gates digest
+clagentic-lite show gates [N]
+clagentic-lite show memory [N]
 ```

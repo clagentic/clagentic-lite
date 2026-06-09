@@ -1,0 +1,63 @@
+# clagentic-lite builder contract
+<!-- managed-by: clagentic · clagentic-contract-version: v1 -->
+<!-- Re-generate: `clagentic-lite enroll --force` or `clagentic-lite update` -->
+
+This file is local to your machine and gitignored. It is injected at session
+start so the full builder contract is available in every Claude Code session
+without living in a committed file.
+
+## How to work in this repo
+
+**These are binding rules for every session, not suggestions.**
+
+1. **Delegate code work to the Builder.** When the user asks you to write, edit, or refactor code, use the `clagentic-lite:builder` subagent — do not author code directly in the main session.
+
+2. **Review with the Reviewer agent after staging, before opening a PR.** Use `clagentic-lite:reviewer` directly. The Reviewer is a different vendor than the Builder — cross-vendor review is the load-bearing pattern; skipping it defeats the purpose of the harness.
+
+3. **Never write to `__CLAGENTIC_DEFAULT_BRANCH__`.** The pre-write-guard blocks it, but do not attempt it. Create a feature branch first.
+
+4. **Gate before opening a PR.** Run `clagentic-lite gates ship` — it runs all blocking gates (secrets, deps, sast, review, adversarial, merge-gate) and opens the PR only if all pass.
+
+5. **Never bypass security gates.** If `gitleaks`, `semgrep`, or `osv-scanner` block, fix the underlying issue. Do not add suppressions without a written justification in the commit message.
+
+6. **Check `/recall` before answering questions about prior decisions.** Session memory is indexed — search it before guessing.
+
+## Agents
+
+These subagents are available in this session. Claude Code dispatches them automatically based on task fit; you can also invoke them explicitly.
+
+| Agent | When to use |
+|---|---|
+| `clagentic-lite:builder` | Write, edit, or refactor code — the primary code author |
+| `clagentic-lite:reviewer` | Review staged changes; cross-vendor second opinion after Builder completes work |
+| `clagentic-lite:auditor` | Security narration on top of gitleaks/semgrep/osv findings |
+| `clagentic-lite:merge-gate` | Final approve/refuse decision before opening a PR |
+| `clagentic-lite:troubleshooter` | Diagnose a gate failure, hook error, or unexpected output — read-only |
+
+## Slash commands
+
+| Command | What it does |
+|---|---|
+| `/recall` | Search session memory for prior decisions |
+| `/eng-consult` | Multi-voice engineering panel — quality, security, SRE, UX review of a file or codebase |
+| `/infosec-rt` | Security red team — attacker personas model exploit chains; returns a ranked hardening plan |
+
+## Hooks active
+
+Lifecycle hooks fire automatically via `.claude/settings.json`:
+
+- **SessionStart** — injects recent session summaries as context
+- **UserPromptSubmit** — keyword recall from session memory
+- **PreToolUse(Bash)** — blocks dangerous shell patterns
+- **PreToolUse(Write|Edit)** — blocks writes to the default branch
+- **PostToolUse(Bash)** — nudges review after `git commit` or `git add`
+- **Stop** — summarizes the turn into `.clagentic/memory.db`
+
+## Gate runner
+
+```sh
+clagentic-lite gates ship          # run all gates; open PR if green
+clagentic-lite gates review        # cross-vendor review on staged diff
+clagentic-lite gates digest        # today's gate runs
+sqlite3 .clagentic/audit.db "SELECT ts, gate, outcome FROM gate_runs ORDER BY ts DESC LIMIT 20;"
+```
