@@ -194,3 +194,11 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # Allow writes to the default branch (disables W-001 in pre-write-guard).
 # Only set this if you are intentionally working directly on the default branch.
 # CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1
+
+# Skip the staleness check on gate output files (last-review.json,
+# last-adversarial.md). Use when artifacts were produced in a prior CI step
+# or an air-gapped environment where the files are known-fresh despite a
+# HEAD SHA mismatch (e.g. the gate ran on the same diff in a different
+# working tree). Without this flag, build_gate_summary refuses to feed a
+# stale payload to the merge-gate LLM.
+# CLAGENTIC_ALLOW_STALE_PAYLOAD=1

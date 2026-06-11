@@ -470,6 +470,38 @@ get_review_diff() {
 cmd_review() {
   OUT="$REPO_ROOT/.clagentic/last-review.json"
   get_review_diff | "$TOOL_HOME/scripts/llm-client.sh" review > "$OUT"
+  # Stamp the output with the current HEAD SHA so build_gate_summary can
+  # detect stale payloads (file written against a different branch/commit).
+  # Best-effort: if git or jq/python3 are unavailable, skip silently.
+  _review_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+  if [ -n "$_review_sha" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      _review_tmp=$(mktemp -t clagentic-review-stamp.XXXXXX)
+      if jq --arg sha "$_review_sha" '. + {_clagentic_diff_sha: $sha}' "$OUT" > "$_review_tmp" 2>/dev/null; then
+        mv "$_review_tmp" "$OUT"
+      else
+        rm -f "$_review_tmp"
+      fi
+    elif command -v python3 >/dev/null 2>&1; then
+      _review_tmp=$(mktemp -t clagentic-review-stamp.XXXXXX)
+      if python3 - "$OUT" "$_review_sha" "$_review_tmp" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    d["_clagentic_diff_sha"] = sys.argv[2]
+    with open(sys.argv[3], "w") as f:
+        json.dump(d, f)
+except Exception:
+    sys.exit(1)
+PYEOF
+      then
+        mv "$_review_tmp" "$OUT"
+      else
+        rm -f "$_review_tmp"
+      fi
+    fi
+  fi
   # Reject degraded envelopes outright. An LLM wrapper that failed every
   # chain step emits valid JSON with findings:[] — schema-valid but
   # meaningless. Without this check, a misconfigured / auth-broken /
@@ -523,6 +555,15 @@ review_is_degraded() {
 cmd_adversarial() {
   OUT="$REPO_ROOT/.clagentic/last-adversarial.md"
   get_review_diff | "$TOOL_HOME/scripts/llm-client.sh" adversarial > "$OUT"
+  # Prepend a SHA stamp comment as the first line so build_gate_summary can
+  # detect stale payloads. Best-effort: skip if git unavailable or SHA empty.
+  _adv_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+  if [ -n "$_adv_sha" ]; then
+    _adv_tmp=$(mktemp -t clagentic-adv-stamp.XXXXXX)
+    printf '<!-- clagentic-diff-sha: %s -->\n' "$_adv_sha" > "$_adv_tmp"
+    cat "$OUT" >> "$_adv_tmp"
+    mv "$_adv_tmp" "$OUT"
+  fi
   cmd_log_run adversarial warn "wrote $OUT (non-blocking)"
   cat "$OUT"
 }
@@ -534,6 +575,27 @@ cmd_merge_gate() {
   IN="$REPO_ROOT/.clagentic/gate-summary.json"
   OUT="$REPO_ROOT/.clagentic/last-merge-gate.json"
   build_gate_summary > "$IN"
+
+  # Detect a stale-payload envelope emitted by build_gate_summary.
+  # A stale payload means gate artifacts describe a different commit — skip
+  # the LLM call entirely (deterministic refusal, no token burn) and write a
+  # synthetic refusal to last-merge-gate.json.
+  _stale_check=""
+  if command -v jq >/dev/null 2>&1; then
+    _stale_check=$(jq -r '.stale_payload // "false"' "$IN" 2>/dev/null || echo "false")
+  elif command -v python3 >/dev/null 2>&1; then
+    _stale_check=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(str(d.get("stale_payload","false")).lower())' "$IN" 2>/dev/null || echo "false")
+  fi
+  if [ "${_stale_check}" = "true" ]; then
+    printf '{"decision": "refuse", "reason": "stale gate payload — re-run clagentic-lite gates review and gates adversarial first"}\n' > "$OUT"
+    cmd_log_run merge-gate block "stale payload — re-run review + adversarial (SHA mismatch)"
+    cat "$OUT"
+    if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
+      return 1
+    fi
+    return 0
+  fi
+
   "$TOOL_HOME/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT"
   DECISION=""
   if command -v jq >/dev/null 2>&1; then
@@ -652,6 +714,72 @@ build_gate_summary() {
   ACKS_FILE="$REPO_ROOT/.clagentic/adversarial-acks.json"
   AR_FILE="$REPO_ROOT/.clagentic/accepted-risks.md"
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
+
+  # Staleness check: compare HEAD SHA against the SHA stamped in each gate
+  # output file. A mismatch means the file was written against a different
+  # commit and the merge-gate would receive stale data. Fail-open for the
+  # stamp itself — if no stamp is present the file may predate this feature,
+  # which we treat as stale (it could be arbitrarily old).
+  #
+  # Skip the check when CLAGENTIC_ALLOW_STALE_PAYLOAD=1 (e.g. CI pipelines
+  # that write gate artifacts in a prior step, or air-gapped environments).
+  CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+  if [ -n "$CURRENT_SHA" ]; then
+    if [ "${CLAGENTIC_ALLOW_STALE_PAYLOAD:-0}" = "1" ]; then
+      cmd_log_run merge-gate warn "CLAGENTIC_ALLOW_STALE_PAYLOAD=1: proceeding with potentially stale gate payload"
+    else
+      STALE_PAYLOAD=false
+      STALE_GATES=""
+
+      # Extract SHA from last-review.json.
+      _rv_sha=""
+      if [ -f "$RV" ]; then
+        if command -v jq >/dev/null 2>&1; then
+          _rv_sha=$(jq -r '._clagentic_diff_sha // ""' "$RV" 2>/dev/null || echo "")
+        elif command -v python3 >/dev/null 2>&1; then
+          _rv_sha=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("_clagentic_diff_sha",""))' "$RV" 2>/dev/null || echo "")
+        fi
+        # File exists: stale if stamp is empty (pre-feature file) OR stamp mismatches.
+        if [ -z "$_rv_sha" ] || [ "$_rv_sha" != "$CURRENT_SHA" ]; then
+          STALE_PAYLOAD=true
+          STALE_GATES="review"
+        fi
+      fi
+
+      # Extract SHA from last-adversarial.md (first-line comment).
+      _ad_sha=""
+      if [ -f "$AD" ]; then
+        _ad_sha=$(sed -n '1s/<!-- clagentic-diff-sha: \(.*\) -->/\1/p' "$AD" 2>/dev/null || echo "")
+        if [ -z "$_ad_sha" ] || [ "$_ad_sha" != "$CURRENT_SHA" ]; then
+          STALE_PAYLOAD=true
+          if [ -n "$STALE_GATES" ]; then
+            STALE_GATES="$STALE_GATES adversarial"
+          else
+            STALE_GATES="adversarial"
+          fi
+        fi
+      fi
+
+      if [ "$STALE_PAYLOAD" = "true" ]; then
+        # Emit a minimal stale-payload envelope and return. cmd_merge_gate will
+        # detect this and short-circuit before making an LLM call.
+        _rv_sha_val="${_rv_sha:-}"
+        _ad_sha_val="${_ad_sha:-}"
+        # Build stale_gates JSON array.
+        _stale_arr=""
+        for _sg in $STALE_GATES; do
+          if [ -n "$_stale_arr" ]; then
+            _stale_arr="${_stale_arr}, \"$_sg\""
+          else
+            _stale_arr="\"$_sg\""
+          fi
+        done
+        printf '{"stale_payload": true, "stale_gates": [%s], "current_sha": "%s", "review_sha": "%s", "adversarial_sha": "%s"}\n' \
+          "$_stale_arr" "$CURRENT_SHA" "$_rv_sha_val" "$_ad_sha_val"
+        return 0
+      fi
+    fi
+  fi
 
   # Detect whether the ack/accepted-risks files are net-new (status A) in the
   # current diff. This flag is passed to the merge-gate to enable the bootstrap
