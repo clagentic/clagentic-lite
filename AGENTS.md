@@ -51,7 +51,7 @@ This isn't a technical preference. It's the product story. "The harness does not
 - `.clagentic/adversarial-acks.json` — per-CWE structured acknowledgment for adversarial/merge-gate false positives (path-glob scoped, committed, audited). This is a workflow convenience for trusted internal contributors, not a security control — `acknowledged_by` is unverified plain text and a contributor can add both a regression and a covering ack in the same diff. Path-glob should be scoped as narrowly as possible; overly broad globs allow future regressions in covered files to be silently acknowledged. Protect this path with CODEOWNERS so edits require reviewer sign-off outside the submitter.
 - `.clagentic/accepted-risks.md` — freetext markdown documenting architectural risk decisions where an adversarial finding describes inherent product behavior; the merge-gate reads this file and classifies covered findings as acknowledged rather than refused. Copy `share/accepted-risks.example.md` from the install tree as a template.
 - `CLAGENTIC_SKIP_UPDATE_ALERT=1` — suppress the session-start update-available notice (air-gapped or manually managed installs)
-- `CLAGENTIC_ALLOW_STALE_PAYLOAD=1` — skip the staleness check on gate output files (`last-review.json`, `last-adversarial.md`); use when artifacts were written in a prior CI step or air-gapped environment where the files are known-fresh despite the SHA mismatch
+- `CLAGENTIC_ALLOW_STALE_PAYLOAD=1` — skip the staleness check on gate output files (`.clagentic/lite/last-review.json`, `.clagentic/lite/last-adversarial.md`); use when artifacts were written in a prior CI step or air-gapped environment where the files are known-fresh despite the SHA mismatch
 
 Set these in `.clagentic/config` (repo-level) or `~/.config/clagentic/config` (global). Document the reason in the commit or PR body. See `docs/GATES.md` § "Working around gates" for the full table.
 
@@ -61,7 +61,7 @@ Builder and Reviewer must default to different vendors. The Reviewer role's whol
 
 ### 6. Audit-first
 
-Every gate decision lands in `.clagentic/audit.db`. If you add a gate, add a `gate_runs` insert. If you bypass a gate, log the bypass. The audit trail is the artifact — it is what a code review or InfoSec conversation reads.
+Every gate decision lands in `.clagentic/lite/audit.db`. If you add a gate, add a `gate_runs` insert. If you bypass a gate, log the bypass. The audit trail is the artifact — it is what a code review or InfoSec conversation reads.
 
 ### 7. Read before edit
 
@@ -87,13 +87,13 @@ clagentic-lite gates review        # run cross-model review on staged diff
 clagentic-lite gates ship          # run all gates in sequence
 clagentic-lite gates digest        # summarize today's audit-db rows
 clagentic-lite recall <kw>          # search session summaries
-sqlite3 .clagentic/audit.db        # inspect the audit trail directly
-sqlite3 .clagentic/memory.db       # inspect session memory directly
+sqlite3 .clagentic/lite/audit.db   # inspect the audit trail directly
+sqlite3 .clagentic/lite/memory.db  # inspect session memory directly
 clagentic-lite doctor              # verify all prereqs and enrolled-repo hook health
 clagentic-lite list                # show enrolled repos with last-gate-run and status
 clagentic-lite show memory [N]     # pretty-print last N session memory rows (default 10)
 clagentic-lite show gates [N]      # pretty-print last N gate run rows (default 10)
-clagentic-lite export              # write self-contained HTML report to .clagentic/report.html
+clagentic-lite export              # write self-contained HTML report to .clagentic/lite/report.html
 ```
 
 There is intentionally no CI. The gates run on the user's machine via git hooks (pre-commit, pre-push) and Claude Code lifecycle hooks. Re-running the same gates in a hosted CI surface would contradict the no-server contract — and the gates exist to block bad changes locally, not to gate PRs against the upstream repo.
@@ -113,7 +113,7 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `share/hook-shims/pre-push.template` | hook shim template stamped into enrolled repos at enroll time |
 | `share/hook-shims/claude-settings.template` | settings.json template stamped into enrolled repos — hook paths substituted with absolute `$CLAGENTIC_HOME` paths |
 | `share/hook-shims/CLAUDE.md.template` | CLAUDE.md template stamped into enrolled repo root — thin enrollment notice, unconditionally true for any teammate |
-| `share/hook-shims/builder-contract.template` | builder-contract.md template stamped into `.clagentic/` (gitignored) — full builder rules, agent table, commands, hooks, gate reference; injected at session start |
+| `share/hook-shims/builder-contract.template` | builder-contract.md template stamped into `.clagentic/lite/` (gitignored) — full builder rules, agent table, commands, hooks, gate reference; injected at session start |
 | `.claude/settings.json` | hook wiring (tool's own repo; enrolled repos get a generated copy in their `.claude/`) |
 | `.claude-plugin/marketplace.json` | plugin marketplace manifest — declares the `clagentic-lite` plugin |
 | `plugins/clagentic-lite/.claude-plugin/plugin.json` | per-plugin manifest; version bumped by maintainer PRs that change agent or skill files — never by `clagentic-lite update` |
@@ -141,11 +141,11 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 Four generated artifacts are stamped into enrolled repos at enroll time and kept in sync by `clagentic-lite update`:
 
 - `CLAUDE.md` — thin enrollment notice (committed, user-extensible)
-- `.clagentic/builder-contract.md` — full builder rules (gitignored, local only)
+- `.clagentic/lite/builder-contract.md` — full builder rules (gitignored, local only)
 - `.claude/settings.json` — hook wiring (gitignored)
 - `.git/hooks/{pre-commit,pre-push}` — gate shims
 
-**Hard rule: the committed `CLAUDE.md` contains only the thin notice — never builder rules, agent tables, or gate commands.** Those belong in `.clagentic/builder-contract.md` (gitignored, injected at session start) or `CLAUDE.md.wrapper.template` (local-only, non-git directories). The notice's own language is "if not enrolled, follow normal project workflow" — any rules framed as unconditional mandates in the committed file contradict that and mislead non-clagentic contributors. Do not add rule content to `CLAUDE.md.template`.
+**Hard rule: the committed `CLAUDE.md` contains only the thin notice — never builder rules, agent tables, or gate commands.** Those belong in `.clagentic/lite/builder-contract.md` (gitignored, injected at session start) or `CLAUDE.md.wrapper.template` (local-only, non-git directories). The notice's own language is "if not enrolled, follow normal project workflow" — any rules framed as unconditional mandates in the committed file contradict that and mislead non-clagentic contributors. Do not add rule content to `CLAUDE.md.template`.
 
 Each has a version constant in `bin/clagentic-lite`. `clagentic-lite update` compares the installed version against the constant and restamps only when they differ.
 
@@ -154,7 +154,7 @@ Each has a version constant in `bin/clagentic-lite`. `clagentic-lite update` com
 | Template file | Version constant | When to bump |
 |---|---|---|
 | `share/hook-shims/CLAUDE.md.template` | `CLAUDE_NOTICE_VERSION` in `bin/clagentic-lite` | Any content change to the thin notice |
-| `share/hook-shims/builder-contract.template` | `CLAUDE_CONTRACT_VERSION` in `bin/clagentic-lite` | Any change to builder rules, agents, commands, hooks, or gate reference |
+| `share/hook-shims/builder-contract.template` | `CLAUDE_CONTRACT_VERSION` in `bin/clagentic-lite` | Any change to builder rules, agents, commands, hooks, gate reference, or `.clagentic/lite/` path references |
 | `share/hook-shims/CLAUDE.md.wrapper.template` | `CLAUDE_WRAPPER_VERSION` in `bin/clagentic-lite` | Any content change to the wrapper template |
 | `share/hook-shims/claude-settings.template` | `CLAUDE_SETTINGS_VERSION` in `bin/clagentic-lite` | Any content change to the settings template |
 | `share/hook-shims/pre-commit.template` | `SHIM_VERSION` in `bin/clagentic-lite` | Any content change to the hook shim |

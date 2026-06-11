@@ -1,6 +1,6 @@
 #!/bin/sh
 # clagentic-lite :: UserPromptSubmit hook
-# Extracts keywords from the user's prompt, searches .clagentic/memory.db
+# Extracts keywords from the user's prompt, searches .clagentic/lite/memory.db
 # for matching prior session summaries, and injects the top 3 matches as
 # additionalContext so the session can reference prior decisions without
 # asking the user to recall them manually.
@@ -10,7 +10,7 @@ set -e
 
 [ "${CLAGENTIC_DISABLE_RECALL:-0}" = "1" ] && exit 0
 
-MEMORY_DB="${PWD}/.clagentic/memory.db"
+MEMORY_DB="${PWD}/.clagentic/lite/memory.db"
 [ -f "$MEMORY_DB" ] || exit 0
 
 # Source platform shims for ds_json_field — same real JSON parser used by

@@ -1,6 +1,6 @@
 #!/bin/sh
 # clagentic-lite :: memory layer
-# SQLite session memory. One DB per project at .clagentic/memory.db.
+# SQLite session memory. One DB per project at .clagentic/lite/memory.db.
 #
 # Subcommands:
 #   init                  create schema if missing
@@ -28,8 +28,8 @@ else
 fi
 [ -n "$REPO_ROOT" ] || { echo "memory.sh: not in a git repo" 1>&2; exit 1; }
 
-DB="$REPO_ROOT/.clagentic/memory.db"
-mkdir -p "$REPO_ROOT/.clagentic"
+DB="$REPO_ROOT/.clagentic/lite/memory.db"
+mkdir -p "$REPO_ROOT/.clagentic/lite"
 
 cmd_init() {
   sqlite3 "$DB" <<'SQL'

@@ -1,6 +1,6 @@
 #!/bin/sh
 # clagentic-lite :: gate orchestrator
-# Runs gates in sequence, logs outcomes to .clagentic/audit.db.
+# Runs gates in sequence, logs outcomes to .clagentic/lite/audit.db.
 #
 # Subcommands:
 #   init             create audit schema
@@ -11,7 +11,7 @@
 #   review           run cross-vendor review on staged diff; branch diff when no staged changes
 #   adversarial      run non-blocking adversarial pass
 #   ship             run all blocking gates, then push + open PR if green
-#   render-review    pretty-print .clagentic/last-review.json
+#   render-review    pretty-print .clagentic/lite/last-review.json
 #   digest           summarize today's audit rows
 #   status           last N runs per gate (default N=10) with color outcomes
 #   tail             follow audit.db, render new gate_runs rows as they land
@@ -42,8 +42,8 @@ else
 fi
 [ -n "$REPO_ROOT" ] || { echo "gates.sh: not in a git repo" 1>&2; exit 1; }
 
-AUDIT_DB="$REPO_ROOT/.clagentic/audit.db"
-mkdir -p "$REPO_ROOT/.clagentic"
+AUDIT_DB="$REPO_ROOT/.clagentic/lite/audit.db"
+mkdir -p "$REPO_ROOT/.clagentic/lite"
 
 cmd_init() {
   sqlite3 "$AUDIT_DB" <<'SQL'
@@ -468,7 +468,7 @@ get_review_diff() {
 }
 
 cmd_review() {
-  OUT="$REPO_ROOT/.clagentic/last-review.json"
+  OUT="$REPO_ROOT/.clagentic/lite/last-review.json"
   get_review_diff | "$TOOL_HOME/scripts/llm-client.sh" review > "$OUT"
   # Stamp the output with the current HEAD SHA so build_gate_summary can
   # detect stale payloads (file written against a different branch/commit).
@@ -511,7 +511,7 @@ PYEOF
     echo "[gates/review] BLOCKED: reviewer chain returned degraded envelope — no real review occurred." 1>&2
     # Pull the per-step failure reasons from the audit DB so the user sees them
     # in the terminal without having to run `digest` or open last-review.json.
-    ADB="$REPO_ROOT/.clagentic/audit.db"
+    ADB="$REPO_ROOT/.clagentic/lite/audit.db"
     if [ -f "$ADB" ] && command -v sqlite3 >/dev/null 2>&1; then
       STEP_HINTS=$(sqlite3 "$ADB" \
         "SELECT '  ' || details FROM gate_runs WHERE gate='llm-call' AND outcome='step-failed' AND details LIKE 'reviewer%' ORDER BY id DESC LIMIT 6;" \
@@ -553,7 +553,7 @@ review_is_degraded() {
 }
 
 cmd_adversarial() {
-  OUT="$REPO_ROOT/.clagentic/last-adversarial.md"
+  OUT="$REPO_ROOT/.clagentic/lite/last-adversarial.md"
   get_review_diff | "$TOOL_HOME/scripts/llm-client.sh" adversarial > "$OUT"
   # Prepend a SHA stamp comment as the first line so build_gate_summary can
   # detect stale payloads. Best-effort: skip if git unavailable or SHA empty.
@@ -572,8 +572,8 @@ cmd_merge_gate() {
   # Final LLM sanity check: feed gate outputs back through the merge-gate
   # role, which decides approve/refuse. BLOCKING BY DEFAULT — set
   # CLAGENTIC_MERGE_GATE_BLOCKING=0 to make a 'refuse' decision advisory only.
-  IN="$REPO_ROOT/.clagentic/gate-summary.json"
-  OUT="$REPO_ROOT/.clagentic/last-merge-gate.json"
+  IN="$REPO_ROOT/.clagentic/lite/gate-summary.json"
+  OUT="$REPO_ROOT/.clagentic/lite/last-merge-gate.json"
   build_gate_summary > "$IN"
 
   # Detect a stale-payload envelope emitted by build_gate_summary.
@@ -709,8 +709,8 @@ PY
 }
 
 build_gate_summary() {
-  RV="$REPO_ROOT/.clagentic/last-review.json"
-  AD="$REPO_ROOT/.clagentic/last-adversarial.md"
+  RV="$REPO_ROOT/.clagentic/lite/last-review.json"
+  AD="$REPO_ROOT/.clagentic/lite/last-adversarial.md"
   ACKS_FILE="$REPO_ROOT/.clagentic/adversarial-acks.json"
   AR_FILE="$REPO_ROOT/.clagentic/accepted-risks.md"
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
@@ -891,7 +891,7 @@ EOF
 }
 
 cmd_render_review() {
-  FILE="${1:-$REPO_ROOT/.clagentic/last-review.json}"
+  FILE="${1:-$REPO_ROOT/.clagentic/lite/last-review.json}"
   [ -f "$FILE" ] || { echo "no review file at $FILE" 1>&2; return 1; }
   if command -v jq >/dev/null 2>&1; then
     jq -r '"== clagentic-lite review ==\nsummary: " + .summary + "\nfindings: " + (.findings | length | tostring) + "\n",
@@ -980,7 +980,7 @@ cmd_digest() {
 
 # ---------------------------------------------------------------- status / tail
 #
-# Visibility surfaces over .clagentic/audit.db that complement `digest`:
+# Visibility surfaces over .clagentic/lite/audit.db that complement `digest`:
 #
 #   status — last N runs per gate (default 10), color-coded outcome. Answers
 #            "what's the recent state of each gate?" at a glance, without

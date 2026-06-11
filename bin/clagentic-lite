@@ -16,8 +16,8 @@
 #   gates <subcmd> [args...]      proxy to $CLAGENTIC_HOME/scripts/gates.sh
 #                                 (ship, review, adversarial, digest, status, tail, ...)
 #
-# Design: tool is cloned once (default: ~/.clagentic-lite, override via
-# $CLAGENTIC_HOME). Per-repo enrollment writes .clagentic/{audit,memory}.db,
+# Design: tool is cloned once (default: ~/.clagentic/lite, override via
+# $CLAGENTIC_HOME). Per-repo enrollment writes .clagentic/lite/{audit,memory}.db,
 # thin shims in .git/hooks/ that call back to $CLAGENTIC_HOME/scripts/, and
 # .claude/settings.json + symlink to .claude/commands so Claude Code picks up
 # hook wiring and slash commands.
@@ -29,7 +29,7 @@
 set -e
 
 # Resolve CLAGENTIC_HOME: env var wins, else default.
-: "${CLAGENTIC_HOME:=$HOME/.clagentic-lite}"
+: "${CLAGENTIC_HOME:=$HOME/.clagentic/lite}"
 export CLAGENTIC_HOME
 
 # Source platform shims from our own install tree.
@@ -55,11 +55,11 @@ CLI_SYMLINK="$LOCAL_BIN/clagentic-lite"
 
 # Shim template version marker. Bump this string when the template content
 # changes so `clagentic-lite update` knows to re-stamp enrolled repos.
-SHIM_VERSION="v1"
+SHIM_VERSION="v2"
 
 # Claude Code artifact version markers. Bump when the corresponding template
 # changes so `clagentic-lite update` re-stamps enrolled repos automatically.
-CLAUDE_SETTINGS_VERSION="v3"
+CLAUDE_SETTINGS_VERSION="v4"
 # CLAUDE_MD_VERSION is retired — replaced by three narrower constants below.
 # The variable is kept as a tombstone so doctor/update version-compare calls
 # against old installed files continue to work during the transition period.
@@ -67,12 +67,12 @@ CLAUDE_MD_VERSION="v9"
 # Thin enrollment notice in the committed repo CLAUDE.md. Bump only on
 # notice text changes — stable by design.
 CLAUDE_NOTICE_VERSION="v2"
-# Local .clagentic/builder-contract.md — full builder rules, never committed.
+# Local .clagentic/lite/builder-contract.md — full builder rules, never committed.
 # Bump on any content change; cheap restamp (gitignored).
-CLAUDE_CONTRACT_VERSION="v1"
+CLAUDE_CONTRACT_VERSION="v2"
 # Local wrapper CLAUDE.md — rich local dashboard, never committed.
 # Bump on any template change; cheap restamp (local).
-CLAUDE_WRAPPER_VERSION="v1"
+CLAUDE_WRAPPER_VERSION="v2"
 
 # Single source of truth for the security-gate tool list. Adding a new
 # scanner means editing this one line — _run_prereq_checks (init/update)
@@ -131,7 +131,7 @@ claude_notice_version() {
   grep -o 'clagentic-notice-version: v[^ ·>]*' "$_cnv_file" 2>/dev/null | sed 's/clagentic-notice-version: //'
 }
 
-# Read the builder-contract version from .clagentic/builder-contract.md.
+# Read the builder-contract version from .clagentic/lite/builder-contract.md.
 claude_contract_version() {
   _ccv_file="$1"
   [ -f "$_ccv_file" ] || { printf ''; return; }
@@ -208,7 +208,7 @@ _stamp_wrapper_claude_md() {
               _rel="${_wr#$_wcd}"
               _rel="${_rel#/}"
               [ -z "$_rel" ] && _rel="$_wr"
-              _wcd_db="$_wr/.clagentic/audit.db"
+              _wcd_db="$_wr/.clagentic/lite/audit.db"
               _wcd_last=""
               if [ -f "$_wcd_db" ]; then
                 _wcd_last=$(sqlite3 "$_wcd_db" "SELECT MAX(ts) FROM gate_runs;" 2>/dev/null || true)
@@ -805,8 +805,8 @@ _enroll_one() {
     fi
   fi
 
-  # Initialize .clagentic/ DBs in the enrolled repo.
-  _dot="$_canon/.clagentic"
+  # Initialize .clagentic/lite/ DBs in the enrolled repo.
+  _dot="$_canon/.clagentic/lite"
   mkdir -p "$_dot" && chmod 755 "$_dot" \
     || { warn "cannot create $_dot"; return 1; }
 
@@ -900,15 +900,15 @@ _enroll_one() {
     warn "CLAUDE.md.template missing — skipping enrollment notice stamp"
   fi
 
-  # Stamp .clagentic/builder-contract.md — full builder rules, agent table,
+  # Stamp .clagentic/lite/builder-contract.md — full builder rules, agent table,
   # slash commands, hooks, and gate reference. Gitignored (local machine only).
   # Injected by session-start.sh at session open so Claude Code gets the full
   # contract every session without it living in a committed file.
   _contract_template="$SHARE_DIR/hook-shims/builder-contract.template"
-  _contract_target="$_canon/.clagentic/builder-contract.md"
+  _contract_target="$_canon/.clagentic/lite/builder-contract.md"
   _default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
   if [ -f "$_contract_template" ]; then
-    mkdir -p "$_canon/.clagentic" 2>/dev/null || true
+    mkdir -p "$_canon/.clagentic/lite" 2>/dev/null || true
     sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
         -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_default_branch|g" \
         "$_contract_template" > "$_contract_target"
@@ -918,62 +918,50 @@ _enroll_one() {
   fi
 
   # Add .claude/ to .gitignore (fully tool-generated, never committed).
-  # For .clagentic/, ignore only ephemeral tool-state files; governance files
-  # (adversarial-acks.json, osv-ignore, accepted-risks.md, config) are meant
-  # to be committed and code-reviewed — a blanket .clagentic/ ignore would
-  # prevent that.  Each pattern is idempotent: skipped if already present.
+  # For .clagentic/, ignore the entire lite/ subdir (all ephemeral tool-state).
+  # Governance files (adversarial-acks.json, osv-ignore, accepted-risks.md, config)
+  # live at .clagentic/ top level and are unaffected by the .clagentic/lite/ blanket.
+  # Each pattern is idempotent: skipped if already present.
   _gitignore="$_canon/.gitignore"
-  # Ephemeral .clagentic/ patterns to ignore (one per line, no leading spaces).
-  _clagentic_ignores=$(printf '%s\n' \
-    '.clagentic/audit.db' \
-    '.clagentic/memory.db' \
-    '.clagentic/builder-contract.md' \
-    '.clagentic/last-review.json' \
-    '.clagentic/last-adversarial.md' \
-    '.clagentic/last-merge-gate.json' \
-    '.clagentic/gate-summary.json' \
-    '.clagentic/stop-summarize.lock' \
-    '.clagentic/report.html')
+  # Single blanket pattern for all ephemeral state under .clagentic/lite/.
+  _clagentic_ignores='.clagentic/lite/'
   if [ ! -f "$_gitignore" ]; then
     printf '.claude/\n' > "$_gitignore"
     printf '%s\n' "$_clagentic_ignores" >> "$_gitignore"
-    say "created $_gitignore with .claude/ and ephemeral .clagentic/ patterns"
+    say "created $_gitignore with .claude/ and .clagentic/lite/ patterns"
   else
     if ! grep -qxF '.claude/' "$_gitignore" 2>/dev/null; then
       printf '.claude/\n' >> "$_gitignore"
       say "added .claude/ to $_gitignore"
     fi
-    # If a prior enrollment wrote the blanket .clagentic/ line, leave it in
-    # place (removing it could re-expose already-ignored files); just note it.
+    # If a prior enrollment wrote the blanket .clagentic/ line, note it so the
+    # user knows governance files may be untrackable under that broad pattern.
     if grep -qxF '.clagentic/' "$_gitignore" 2>/dev/null; then
-      say "note: $_gitignore already has blanket .clagentic/ — governance files (adversarial-acks.json, osv-ignore, accepted-risks.md) may be untrackable; consider replacing with per-file patterns"
+      say "note: $_gitignore has blanket .clagentic/ — governance files (adversarial-acks.json, osv-ignore, accepted-risks.md) may be untrackable; consider replacing with .clagentic/lite/"
     else
-      # Write per-file ephemeral patterns.
-      printf '%s\n' "$_clagentic_ignores" | while IFS= read -r _pat; do
-        if ! grep -qxF "$_pat" "$_gitignore" 2>/dev/null; then
-          printf '%s\n' "$_pat" >> "$_gitignore"
-        fi
-      done
-      say "added ephemeral .clagentic/ patterns to $_gitignore"
+      if ! grep -qxF "$_clagentic_ignores" "$_gitignore" 2>/dev/null; then
+        printf '%s\n' "$_clagentic_ignores" >> "$_gitignore"
+        say "added .clagentic/lite/ to $_gitignore"
+      fi
     fi
   fi
-  # Migration warning: detect tracked .clagentic/ files that should be ephemeral.
+  # Migration warning: detect tracked .clagentic/lite/ files that should be ephemeral.
   # These cause perpetual dirty state and polluted commits.
   _tracked_ephemeral=""
   if git -C "$_canon" rev-parse --git-dir >/dev/null 2>&1; then
     _tracked_ephemeral=$(git -C "$_canon" ls-files \
-      '.clagentic/audit.db' '.clagentic/memory.db' \
-      '.clagentic/builder-contract.md' '.clagentic/last-review.json' \
-      '.clagentic/last-adversarial.md' '.clagentic/last-merge-gate.json' \
-      '.clagentic/gate-summary.json' '.clagentic/stop-summarize.lock' \
-      '.clagentic/report.html' 2>/dev/null || true)
+      '.clagentic/lite/audit.db' '.clagentic/lite/memory.db' \
+      '.clagentic/lite/builder-contract.md' '.clagentic/lite/last-review.json' \
+      '.clagentic/lite/last-adversarial.md' '.clagentic/lite/last-merge-gate.json' \
+      '.clagentic/lite/gate-summary.json' '.clagentic/lite/stop-summarize.lock' \
+      '.clagentic/lite/report.html' 2>/dev/null || true)
   fi
   if [ -n "$_tracked_ephemeral" ]; then
-    warn "migration needed: the following ephemeral .clagentic/ files are tracked in git and will cause perpetual dirty state:"
+    warn "migration needed: the following ephemeral .clagentic/lite/ files are tracked in git and will cause perpetual dirty state:"
     printf '%s\n' "$_tracked_ephemeral" | while IFS= read -r _tf; do
       printf '    %s\n' "$_tf" >&2
     done
-    warn "run: git rm --cached $(printf '%s\n' "$_tracked_ephemeral" | tr '\n' ' ') && git commit -m 'chore: untrack ephemeral .clagentic/ files'"
+    warn "run: git rm --cached $(printf '%s\n' "$_tracked_ephemeral" | tr '\n' ' ') && git commit -m 'chore: untrack ephemeral .clagentic/lite/ files'"
   fi
 
   # Register.
@@ -1055,18 +1043,20 @@ cmd_unenroll() {
     mv "$REGISTRY.tmp" "$REGISTRY"
   fi
 
-  # Purge .clagentic/ if requested.
-  # Note: .clagentic/ contains audit.db, memory.db, and builder-contract.md —
+  # Purge .clagentic/lite/ if requested.
+  # Note: .clagentic/lite/ contains audit.db, memory.db, and builder-contract.md —
   # all local machine state (gitignored). The --purge flag removes this data.
-  # Without --purge, .clagentic/ is left in place (data is preserved).
+  # Without --purge, .clagentic/lite/ is left in place (data is preserved).
+  # Governance files at .clagentic/ top level (adversarial-acks.json, osv-ignore,
+  # accepted-risks.md, config) are never removed by unenroll.
   if [ "$UNENROLL_PURGE" -eq 1 ]; then
-    _dot="$_canon/.clagentic"
+    _dot="$_canon/.clagentic/lite"
     if [ -d "$_dot" ]; then
       rm -rf -- "$_dot"
       say "purged: $_dot"
     fi
   else
-    say "note: .clagentic/ left in place (use --purge to remove audit.db, memory.db, and builder-contract.md)"
+    say "note: .clagentic/lite/ left in place (use --purge to remove audit.db, memory.db, and builder-contract.md)"
   fi
 
   say "unenrolled: $_canon"
@@ -1118,7 +1108,7 @@ cmd_list() {
     fi
 
     # Last gate run from audit.db.
-    _db="$_rpath/.clagentic/audit.db"
+    _db="$_rpath/.clagentic/lite/audit.db"
     _last_run=""
     if [ -f "$_db" ]; then
       _last_run=$(sqlite3 "$_db" "SELECT MAX(ts) FROM gate_runs;" 2>/dev/null || true)
@@ -1256,11 +1246,11 @@ cmd_doctor() {
         fi
       fi
       # Check builder-contract.md (local, gitignored).
-      _contract_file="$_rpath/.clagentic/builder-contract.md"
+      _contract_file="$_rpath/.clagentic/lite/builder-contract.md"
       if [ ! -f "$_contract_file" ]; then
-        printf '  WARN  %s: .clagentic/builder-contract.md missing — sessions lack full builder context (run `clagentic-lite enroll --force`)\n' "$_rpath"
+        printf '  WARN  %s: .clagentic/lite/builder-contract.md missing — sessions lack full builder context (run `clagentic-lite enroll --force`)\n' "$_rpath"
       elif ! grep -q 'managed-by: clagentic' "$_contract_file" 2>/dev/null; then
-        printf '  WARN  %s: .clagentic/builder-contract.md not clagentic-managed\n' "$_rpath"
+        printf '  WARN  %s: .clagentic/lite/builder-contract.md not clagentic-managed\n' "$_rpath"
       else
         _repo_contract_ver=$(claude_contract_version "$_contract_file")
         if [ "$_repo_contract_ver" != "$CLAUDE_CONTRACT_VERSION" ]; then
@@ -1268,16 +1258,17 @@ cmd_doctor() {
           _ra_default_branch="${CLAGENTIC_DEFAULT_BRANCH:-main}"
           _ra_ct="$SHARE_DIR/hook-shims/builder-contract.template"
           if [ -f "$_ra_ct" ]; then
+            mkdir -p "$_rpath/.clagentic/lite" 2>/dev/null || true
             sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
                 -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_ra_default_branch|g" \
                 "$_ra_ct" > "$_contract_file"
-            _ok "$_rpath: .clagentic/builder-contract.md auto-restamped to $CLAUDE_CONTRACT_VERSION"
+            _ok "$_rpath: .clagentic/lite/builder-contract.md auto-restamped to $CLAUDE_CONTRACT_VERSION"
           else
-            printf '  WARN  %s: .clagentic/builder-contract.md version %s (current: %s) — run `clagentic-lite update`\n' \
+            printf '  WARN  %s: .clagentic/lite/builder-contract.md version %s (current: %s) — run `clagentic-lite update`\n' \
               "$_rpath" "$_repo_contract_ver" "$CLAUDE_CONTRACT_VERSION"
           fi
         else
-          _ok "$_rpath: .clagentic/builder-contract.md version $CLAUDE_CONTRACT_VERSION OK"
+          _ok "$_rpath: .clagentic/lite/builder-contract.md version $CLAUDE_CONTRACT_VERSION OK"
         fi
       fi
       # Check for stale command docs removed in v1.1.0.
@@ -1541,9 +1532,9 @@ _restamp_repo_artifacts() {
     fi
   fi
 
-  # Re-stamp .clagentic/builder-contract.md — always a full restamp (gitignored,
+  # Re-stamp .clagentic/lite/builder-contract.md — always a full restamp (gitignored,
   # no user content, local only).
-  _ra_contract="$_ra_path/.clagentic/builder-contract.md"
+  _ra_contract="$_ra_path/.clagentic/lite/builder-contract.md"
   if [ -f "$_ra_contract" ] && grep -q 'managed-by: clagentic' "$_ra_contract" 2>/dev/null; then
     _ra_contract_template="$SHARE_DIR/hook-shims/builder-contract.template"
     if [ -f "$_ra_contract_template" ]; then
@@ -1551,7 +1542,7 @@ _restamp_repo_artifacts() {
       sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
           -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_ra_default_branch|g" \
           "$_ra_contract_template" > "$_ra_contract"
-      say "re-stamped${_ra_label}: $_ra_path/.clagentic/builder-contract.md" >&2
+      say "re-stamped${_ra_label}: $_ra_path/.clagentic/lite/builder-contract.md" >&2
       _ra_count=$((_ra_count+1))
     fi
   fi
@@ -1596,6 +1587,78 @@ cmd_update() {
   for _arg in "$@"; do
     case "$_arg" in --restamp) RESTAMP=1 ;; esac
   done
+
+  # Migration: ~/.clagentic-lite -> ~/.clagentic/lite
+  # Detect old default home and offer to migrate. Only runs when:
+  #   - the old path exists
+  #   - the new path does NOT exist (clean migration, not already done)
+  #   - CLAGENTIC_HOME is currently pointing at the new default (i.e. user has
+  #     not set a custom CLAGENTIC_HOME — we only auto-migrate the default)
+  _old_home="$HOME/.clagentic-lite"
+  _new_home="$HOME/.clagentic/lite"
+  if [ -d "$_old_home" ] && [ ! -d "$_new_home" ] && [ "$CLAGENTIC_HOME" = "$_new_home" ]; then
+    say "migration available: ~/.clagentic-lite -> ~/.clagentic/lite (brand namespace standardization)"
+    _migrate_reply="y"
+    if [ -t 0 ]; then
+      printf '[clagentic-lite] Move %s to %s? [Y/n]: ' "$_old_home" "$_new_home"
+      read -r _migrate_reply || _migrate_reply="y"
+      [ -z "$_migrate_reply" ] && _migrate_reply="y"
+    fi
+    case "$_migrate_reply" in
+      n|N) warn "skipping home migration — hooks will fail until CLAGENTIC_HOME is updated" ;;
+      *)
+        mkdir -p "$(dirname "$_new_home")"
+        mv "$_old_home" "$_new_home" && say "moved: $_old_home -> $_new_home" || \
+          die "failed to move $_old_home to $_new_home"
+        # Update CLAGENTIC_HOME for the rest of this run.
+        CLAGENTIC_HOME="$_new_home"
+        export CLAGENTIC_HOME
+        SCRIPTS_DIR="$CLAGENTIC_HOME/scripts"
+        SHARE_DIR="$CLAGENTIC_HOME/share"
+        say "note: update your shell profile if you have CLAGENTIC_HOME set explicitly"
+        say "  export CLAGENTIC_HOME=\"\$HOME/.clagentic/lite\""
+        ;;
+    esac
+  fi
+
+  # Per-repo migration: .clagentic/<ephemeral> -> .clagentic/lite/<ephemeral>
+  _EPHEMERAL_FILES="audit.db memory.db builder-contract.md last-review.json last-adversarial.md last-merge-gate.json gate-summary.json stop-summarize.lock report.html"
+  if [ -f "$REGISTRY" ]; then
+    while IFS= read -r _mpath; do
+      [ -z "$_mpath" ] && continue
+      [ -d "$_mpath" ] || continue
+      _old_dot="$_mpath/.clagentic"
+      _new_dot="$_mpath/.clagentic/lite"
+      # Check if any old-path ephemeral files exist and new dir doesn't
+      _needs_migrate=0
+      for _ef in $_EPHEMERAL_FILES; do
+        [ -f "$_old_dot/$_ef" ] && [ ! -d "$_new_dot" ] && _needs_migrate=1 && break
+      done
+      if [ "$_needs_migrate" -eq 1 ]; then
+        mkdir -p "$_new_dot"
+        for _ef in $_EPHEMERAL_FILES; do
+          [ -f "$_old_dot/$_ef" ] && mv "$_old_dot/$_ef" "$_new_dot/$_ef" && \
+            say "migrated: $_mpath/.clagentic/$_ef -> .clagentic/lite/$_ef"
+        done
+        # Update gitignore: replace old per-file patterns with single blanket.
+        # Skip if a blanket .clagentic/ line already covers .clagentic/lite/.
+        _gi="$_mpath/.gitignore"
+        if [ -f "$_gi" ]; then
+          if grep -qxF '.clagentic/' "$_gi" 2>/dev/null; then
+            say "note: $_mpath/.gitignore has blanket .clagentic/ — already covers .clagentic/lite/"
+          else
+            _updated=$(grep -v "^\.clagentic/audit\.db$\|^\.clagentic/memory\.db$\|^\.clagentic/builder-contract\.md$\|^\.clagentic/last-review\.json$\|^\.clagentic/last-adversarial\.md$\|^\.clagentic/last-merge-gate\.json$\|^\.clagentic/gate-summary\.json$\|^\.clagentic/stop-summarize\.lock$\|^\.clagentic/report\.html$" "$_gi" 2>/dev/null || true)
+            if ! printf '%s\n' "$_updated" | grep -qxF '.clagentic/lite/'; then
+              { printf '%s\n' "$_updated" | grep -v '^$'; printf '.clagentic/lite/\n'; } > "$_gi"
+              say "updated .gitignore: replaced per-file patterns with .clagentic/lite/ blanket"
+            else
+              printf '%s\n' "$_updated" | grep -v '^$' > "$_gi"
+            fi
+          fi
+        fi
+      fi
+    done < "$REGISTRY"
+  fi
 
   say "updating clagentic-lite at $CLAGENTIC_HOME..."
 
@@ -1774,7 +1837,7 @@ cmd_update() {
         _need_restamp=1
       fi
     fi
-    _contract_file="$_rpath/.clagentic/builder-contract.md"
+    _contract_file="$_rpath/.clagentic/lite/builder-contract.md"
     if [ -f "$_contract_file" ] && grep -q 'managed-by: clagentic' "$_contract_file" 2>/dev/null; then
       _contract_ver=$(claude_contract_version "$_contract_file")
       [ "$_contract_ver" != "$CLAUDE_CONTRACT_VERSION" ] && _need_restamp=1
@@ -1846,10 +1909,10 @@ cmd_show() {
   esac
 
   _show_root="${CLAGENTIC_PROJECT_ROOT:-$PWD}"
-  # walk up from _show_root to find a directory containing .clagentic/
+  # walk up from _show_root to find a directory containing .clagentic/lite/
   _show_search="$_show_root"
   while [ -n "$_show_search" ] && [ "$_show_search" != "/" ]; do
-    if [ -d "$_show_search/.clagentic" ]; then
+    if [ -d "$_show_search/.clagentic/lite" ]; then
       _show_root="$_show_search"
       break
     fi
@@ -1858,7 +1921,7 @@ cmd_show() {
 
   case "$_show_sub" in
     memory)
-      _db="$_show_root/.clagentic/memory.db"
+      _db="$_show_root/.clagentic/lite/memory.db"
       [ -f "$_db" ] || die "show: no memory.db at $_db — is this an enrolled repo?"
       printf '\n=== session memory (last %s) ===\n\n' "$_show_n"
       sqlite3 -separator ' | ' "$_db" \
@@ -1870,7 +1933,7 @@ cmd_show() {
       printf '\n'
       ;;
     gates)
-      _db="$_show_root/.clagentic/audit.db"
+      _db="$_show_root/.clagentic/lite/audit.db"
       [ -f "$_db" ] || die "show: no audit.db at $_db — is this an enrolled repo?"
       printf '\n=== gate runs (last %s) ===\n\n' "$_show_n"
       sqlite3 -separator ' | ' "$_db" \
@@ -1903,23 +1966,23 @@ cmd_export() {
   done
 
   _export_root="${CLAGENTIC_PROJECT_ROOT:-$PWD}"
-  # walk up from _export_root to find a directory containing .clagentic/
+  # walk up from _export_root to find a directory containing .clagentic/lite/
   _export_search="$_export_root"
   while [ -n "$_export_search" ] && [ "$_export_search" != "/" ]; do
-    if [ -d "$_export_search/.clagentic" ]; then
+    if [ -d "$_export_search/.clagentic/lite" ]; then
       _export_root="$_export_search"
       break
     fi
     _export_search="$(dirname "$_export_search")"
   done
 
-  _mem_db="$_export_root/.clagentic/memory.db"
-  _audit_db="$_export_root/.clagentic/audit.db"
+  _mem_db="$_export_root/.clagentic/lite/memory.db"
+  _audit_db="$_export_root/.clagentic/lite/audit.db"
 
   [ -f "$_mem_db" ]   || die "export: no memory.db at $_mem_db — is this an enrolled repo?"
   [ -f "$_audit_db" ] || die "export: no audit.db at $_audit_db — is this an enrolled repo?"
 
-  [ -z "$_export_output" ] && _export_output="$_export_root/.clagentic/report.html"
+  [ -z "$_export_output" ] && _export_output="$_export_root/.clagentic/lite/report.html"
 
   # serialize memory rows to JSON via python3
   _mem_json=$(python3 -c "

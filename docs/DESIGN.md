@@ -50,7 +50,7 @@ Skills are commentary only — they do not gate `/ship`. See `docs/GATES.md` § 
 
 ## Memory — minimal viable recall
 
-One SQLite file per project, at `.clagentic/memory.db`. One table:
+One SQLite file per project, at `.clagentic/lite/memory.db`. One table:
 
 ```sql
 CREATE TABLE turns (
@@ -113,9 +113,9 @@ Three env vars govern the recall and retention budget (code defaults; override i
 
 1. `git diff --cached --unified=3` → stdin to `scripts/llm-client.sh review`.
 2. The wrapper walks the Reviewer's model_chain — primary, then each fallback `(cmd, tier)` — and validates output against the reviewer schema (`.findings` must be an array). Schema-invalid output advances the chain; if every step fails, it returns a degraded envelope marked `"degraded": true`.
-3. Findings written to `.clagentic/last-review.json`. The Reviewer prompt is fixed (`.claude/agents/reviewer.md`): role, JSON schema, severity scale, Pre-Report Gate, Common False Positives.
+3. Findings written to `.clagentic/lite/last-review.json`. The Reviewer prompt is fixed (`.claude/agents/reviewer.md`): role, JSON schema, severity scale, Pre-Report Gate, Common False Positives.
 4. `gates.sh cmd_review` rejects degraded envelopes (block) and counts findings at `>= CLAGENTIC_BLOCK_SEVERITY` (block on any). Pass otherwise.
-5. Outcome row inserted into `.clagentic/audit.db.gate_runs` (`gate=review`, `outcome=pass|block`).
+5. Outcome row inserted into `.clagentic/lite/audit.db.gate_runs` (`gate=review`, `outcome=pass|block`).
 6. `cmd_render_review` pretty-prints the JSON to the session.
 7. Builder may revise in the same session. Each revision restarts the loop. Max 3 rounds (operator discipline; not enforced in code).
 
@@ -127,7 +127,7 @@ The Reviewer never edits files. The Builder never gates its own work. `/review` 
 
 1. Reviewer is reprompted: "you are an attacker. What would you exploit in this diff?"
 2. Builder is reprompted: "the reviewer suggests these attacks. Which are plausible? Which are overstated?"
-3. Both outputs land in `.clagentic/last-adversarial.md`, attached to the PR as a comment.
+3. Both outputs land in `.clagentic/lite/last-adversarial.md`, attached to the PR as a comment.
 
 This is the demo flourish. It's also genuinely useful, but it's not on the blocking path.
 
@@ -162,7 +162,7 @@ Hooks call only POSIX sh + the shims. No `bash-4` features (associative arrays, 
 
 ## What gets logged
 
-Every gate run inserts one row into `.clagentic/audit.db`:
+Every gate run inserts one row into `.clagentic/lite/audit.db`:
 
 ```sql
 CREATE TABLE gate_runs (
@@ -180,9 +180,9 @@ CREATE TABLE gate_runs (
 
 ## Install shape: clone once, enroll per repo
 
-The tool is cloned once to `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). The tool's own repo is never the thing under gates by default — `clagentic-lite enroll --self` is the dogfood escape hatch.
+The tool is cloned once to `$CLAGENTIC_HOME` (default `~/.clagentic/lite`). The tool's own repo is never the thing under gates by default — `clagentic-lite enroll --self` is the dogfood escape hatch.
 
-Per-repo footprint is `.clagentic/{audit.db,memory.db}`, thin shims in `.git/hooks/` that call back to `$CLAGENTIC_HOME/scripts/`, and a `.claude/` directory containing a generated `settings.json` (with absolute hook paths pointing to `$CLAGENTIC_HOME/.claude/hooks/`) plus symlinks to `$CLAGENTIC_HOME/.claude/{commands,agents}`. The `.claude/` directory is added to the project's `.gitignore` automatically. Update the tool once; every enrolled repo picks up the new version automatically because the hook scripts and the symlinked commands/agents resolve back to `$CLAGENTIC_HOME`.
+Per-repo footprint is `.clagentic/lite/{audit.db,memory.db}`, thin shims in `.git/hooks/` that call back to `$CLAGENTIC_HOME/scripts/`, and a `.claude/` directory containing a generated `settings.json` (with absolute hook paths pointing to `$CLAGENTIC_HOME/.claude/hooks/`) plus symlinks to `$CLAGENTIC_HOME/.claude/{commands,agents}`. The `.claude/` directory is added to the project's `.gitignore` automatically. Update the tool once; every enrolled repo picks up the new version automatically because the hook scripts and the symlinked commands/agents resolve back to `$CLAGENTIC_HOME`.
 
 `bin/clagentic-lite` is the CLI entry point. It dispatches `init` (setup + symlink), `enroll` (hook stamp + DB init + register), `unenroll` (remove clagentic-owned hooks + deregister), `list` (enrolled status table), `doctor` (diagnostics punch list), and `update` (ff-only pull + re-stamp).
 
@@ -210,7 +210,7 @@ The signals that you have crossed the threshold:
 
 If you are hitting these limits, the tool did its job. The right next step is a heavier harness that explicitly provides those capabilities — a persistent memory store with a real query engine, a multi-agent director, or an embedding-based retrieval layer.
 
-No `eject` subcommand and no schema bridge are provided, and none are planned. The `.clagentic/memory.db` file is a plain SQLite database. A user who outgrows lite has all their data already — open it with `sqlite3`, export with `.dump`, query it directly, or run `clagentic-lite export` to generate a self-contained HTML report. Building a schema bridge would couple lite to whichever platform's schema happened to be current at build time; that coupling is a thesis violation through the back door.
+No `eject` subcommand and no schema bridge are provided, and none are planned. The `.clagentic/lite/memory.db` file is a plain SQLite database. A user who outgrows lite has all their data already — open it with `sqlite3`, export with `.dump`, query it directly, or run `clagentic-lite export` to generate a self-contained HTML report. Building a schema bridge would couple lite to whichever platform's schema happened to be current at build time; that coupling is a thesis violation through the back door.
 
 ## Open design questions
 
