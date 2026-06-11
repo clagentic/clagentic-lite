@@ -1896,11 +1896,25 @@ cmd_update() {
     fi
   fi
 
-  # --restamp pass: force re-stamp all managed artifacts regardless of version.
+  # --restamp pass: force re-stamp all managed artifacts AND shims regardless of version.
   if [ "$RESTAMP" -eq 1 ] && [ -f "$REGISTRY" ]; then
     while IFS= read -r _rpath; do
       [ -z "$_rpath" ] && continue
       [ -d "$_rpath" ] || continue
+      # Re-stamp hook shims unconditionally under --restamp.
+      _rs_git_dir=$(git -C "$_rpath" rev-parse --git-dir 2>/dev/null || true)
+      if [ -n "$_rs_git_dir" ]; then
+        case "$_rs_git_dir" in
+          /*) _rs_hd="$_rs_git_dir/hooks" ;;
+          *)  _rs_hd="$_rpath/$_rs_git_dir/hooks" ;;
+        esac
+        for _hook in pre-commit pre-push; do
+          ENROLL_FORCE=1 stamp_shim "$_hook" "$_rs_hd" && {
+            say "re-stamped (--restamp): $_rpath .git/hooks/$_hook"
+            _restamped=$((_restamped+1))
+          }
+        done
+      fi
       _n=$(_restamp_repo_artifacts "$_rpath" " (--restamp)")
       _restamped=$((_restamped+_n))
     done < "$REGISTRY"
