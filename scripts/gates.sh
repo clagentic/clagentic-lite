@@ -1,6 +1,6 @@
 #!/bin/sh
 # clagentic-lite :: gate orchestrator
-# Runs gates in sequence, logs outcomes to .clagentic/audit.db.
+# Runs gates in sequence, logs outcomes to .clagentic/lite/audit.db.
 #
 # Subcommands:
 #   init             create audit schema
@@ -11,7 +11,7 @@
 #   review           run cross-vendor review on staged diff; branch diff when no staged changes
 #   adversarial      run non-blocking adversarial pass
 #   ship             run all blocking gates, then push + open PR if green
-#   render-review    pretty-print .clagentic/last-review.json
+#   render-review    pretty-print .clagentic/lite/last-review.json
 #   digest           summarize today's audit rows
 #   status           last N runs per gate (default N=10) with color outcomes
 #   tail             follow audit.db, render new gate_runs rows as they land
@@ -980,7 +980,7 @@ cmd_digest() {
 
 # ---------------------------------------------------------------- status / tail
 #
-# Visibility surfaces over .clagentic/audit.db that complement `digest`:
+# Visibility surfaces over .clagentic/lite/audit.db that complement `digest`:
 #
 #   status — last N runs per gate (default 10), color-coded outcome. Answers
 #            "what's the recent state of each gate?" at a glance, without

@@ -51,7 +51,7 @@ Lifecycle hooks fire automatically via `.claude/settings.json`:
 - **PreToolUse(Bash)** — blocks dangerous shell patterns
 - **PreToolUse(Write|Edit)** — blocks writes to the default branch
 - **PostToolUse(Bash)** — nudges review after `git commit` or `git add`
-- **Stop** — summarizes the turn into `.clagentic/memory.db`
+- **Stop** — summarizes the turn into `.clagentic/lite/memory.db`
 
 ## Gate runner
 

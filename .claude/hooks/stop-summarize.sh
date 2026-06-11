@@ -1,7 +1,7 @@
 #!/bin/sh
 # clagentic-lite :: Stop hook
 # Async: summarize the last assistant turn via the Summarizer role, write one
-# row to .clagentic/memory.db. Best-effort. Never blocks the user.
+# row to .clagentic/lite/memory.db. Best-effort. Never blocks the user.
 #
 # Claude Code passes a JSON payload on stdin with fields including
 # session_id, transcript_path, and stop_hook_active. We read it before

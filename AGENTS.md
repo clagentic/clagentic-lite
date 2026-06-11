@@ -93,7 +93,7 @@ clagentic-lite doctor              # verify all prereqs and enrolled-repo hook h
 clagentic-lite list                # show enrolled repos with last-gate-run and status
 clagentic-lite show memory [N]     # pretty-print last N session memory rows (default 10)
 clagentic-lite show gates [N]      # pretty-print last N gate run rows (default 10)
-clagentic-lite export              # write self-contained HTML report to .clagentic/report.html
+clagentic-lite export              # write self-contained HTML report to .clagentic/lite/report.html
 ```
 
 There is intentionally no CI. The gates run on the user's machine via git hooks (pre-commit, pre-push) and Claude Code lifecycle hooks. Re-running the same gates in a hosted CI surface would contradict the no-server contract — and the gates exist to block bad changes locally, not to gate PRs against the upstream repo.
@@ -113,7 +113,7 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `share/hook-shims/pre-push.template` | hook shim template stamped into enrolled repos at enroll time |
 | `share/hook-shims/claude-settings.template` | settings.json template stamped into enrolled repos — hook paths substituted with absolute `$CLAGENTIC_HOME` paths |
 | `share/hook-shims/CLAUDE.md.template` | CLAUDE.md template stamped into enrolled repo root — thin enrollment notice, unconditionally true for any teammate |
-| `share/hook-shims/builder-contract.template` | builder-contract.md template stamped into `.clagentic/` (gitignored) — full builder rules, agent table, commands, hooks, gate reference; injected at session start |
+| `share/hook-shims/builder-contract.template` | builder-contract.md template stamped into `.clagentic/lite/` (gitignored) — full builder rules, agent table, commands, hooks, gate reference; injected at session start |
 | `.claude/settings.json` | hook wiring (tool's own repo; enrolled repos get a generated copy in their `.claude/`) |
 | `.claude-plugin/marketplace.json` | plugin marketplace manifest — declares the `clagentic-lite` plugin |
 | `plugins/clagentic-lite/.claude-plugin/plugin.json` | per-plugin manifest; version bumped by maintainer PRs that change agent or skill files — never by `clagentic-lite update` |
@@ -141,11 +141,11 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 Four generated artifacts are stamped into enrolled repos at enroll time and kept in sync by `clagentic-lite update`:
 
 - `CLAUDE.md` — thin enrollment notice (committed, user-extensible)
-- `.clagentic/builder-contract.md` — full builder rules (gitignored, local only)
+- `.clagentic/lite/builder-contract.md` — full builder rules (gitignored, local only)
 - `.claude/settings.json` — hook wiring (gitignored)
 - `.git/hooks/{pre-commit,pre-push}` — gate shims
 
-**Hard rule: the committed `CLAUDE.md` contains only the thin notice — never builder rules, agent tables, or gate commands.** Those belong in `.clagentic/builder-contract.md` (gitignored, injected at session start) or `CLAUDE.md.wrapper.template` (local-only, non-git directories). The notice's own language is "if not enrolled, follow normal project workflow" — any rules framed as unconditional mandates in the committed file contradict that and mislead non-clagentic contributors. Do not add rule content to `CLAUDE.md.template`.
+**Hard rule: the committed `CLAUDE.md` contains only the thin notice — never builder rules, agent tables, or gate commands.** Those belong in `.clagentic/lite/builder-contract.md` (gitignored, injected at session start) or `CLAUDE.md.wrapper.template` (local-only, non-git directories). The notice's own language is "if not enrolled, follow normal project workflow" — any rules framed as unconditional mandates in the committed file contradict that and mislead non-clagentic contributors. Do not add rule content to `CLAUDE.md.template`.
 
 Each has a version constant in `bin/clagentic-lite`. `clagentic-lite update` compares the installed version against the constant and restamps only when they differ.
 

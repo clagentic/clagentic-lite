@@ -1,6 +1,6 @@
 #!/bin/sh
 # clagentic-lite :: UserPromptSubmit hook
-# Extracts keywords from the user's prompt, searches .clagentic/memory.db
+# Extracts keywords from the user's prompt, searches .clagentic/lite/memory.db
 # for matching prior session summaries, and injects the top 3 matches as
 # additionalContext so the session can reference prior decisions without
 # asking the user to recall them manually.

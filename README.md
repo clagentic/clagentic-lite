@@ -48,9 +48,9 @@ All capabilities below are per-project and activate only in enrolled repos (`cla
 | **LLM adversarial pass** | Auditor role plays attacker on the diff. Non-blocking. Logged. Attach to PR if interesting. |
 | **Merge gate** | Final LLM check reads every prior gate's structured output and returns `approve|refuse`. Never opens PRs, never pushes. |
 | **Troubleshooter** | Read-only failure diagnosis agent. Receives one artifact (gate error, hook trace, wrong output), applies structured Tier 0→2 diagnosis, emits root cause and bounce target. Never writes, never dispatches. |
-| **Session memory** | Stop-hook pipes the last assistant turn through the Summarizer, writes one row to `.clagentic/memory.db`. UserPromptSubmit hook recalls relevant rows into the next prompt's context. |
+| **Session memory** | Stop-hook pipes the last assistant turn through the Summarizer, writes one row to `.clagentic/lite/memory.db`. UserPromptSubmit hook recalls relevant rows into the next prompt's context. |
 | **Safe-by-default tool use** | PreToolUse hooks (`pre-bash-guard.sh`, `pre-write-guard.sh`) block 20 dangerous patterns and writes to the default branch / outside repo / to credential-shaped paths. |
-| **Audit trail** | Every gate decision, every LLM call attempt, every block — one row in `.clagentic/audit.db`. `scripts/gates.sh digest` is the readout. |
+| **Audit trail** | Every gate decision, every LLM call attempt, every block — one row in `.clagentic/lite/audit.db`. `scripts/gates.sh digest` is the readout. |
 | **Commentary skills** | `/eng-consult` (multi-voice consulting panel: Principal + PM + Security/QA/SRE/UX) and `/infosec-rt` (structured red-team threat model with chained attack scenarios). User-invocable any time; Claude Code may also auto-select on relevant prompts. Commentary only — neither blocks `/ship`. |
 
 ---
@@ -167,7 +167,7 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 1. Verifies the path is a git repo.
 2. Refuses if the path is `$CLAGENTIC_HOME` (use `--self` for dogfood).
 3. Refuses if already enrolled (use `--force` to re-enroll).
-4. Initializes `.clagentic/audit.db` and `.clagentic/memory.db` in that repo.
+4. Initializes `.clagentic/lite/audit.db` and `.clagentic/lite/memory.db` in that repo.
 5. Stamps `.git/hooks/pre-commit` and `.git/hooks/pre-push` from `share/hook-shims/*.template`, substituting `$CLAGENTIC_HOME` at stamp time. Refuses to overwrite non-clagentic hooks unless `--force`.
 6. Generates `.claude/settings.json` (absolute hook paths → `$CLAGENTIC_HOME`), symlinks `.claude/commands`, and adds `.claude/` to `.gitignore`. These are local-only artifacts. Role agents and commentary skills are installed globally via the `clagentic-lite` plugin at `init` time — no per-repo copies.
 7. Stamps `CLAUDE.md` at the repo root — activates the Builder contract and exposes agents for Claude Code auto-dispatch. Refuses to overwrite a non-clagentic `CLAUDE.md` unless `--force`.
@@ -405,7 +405,7 @@ sqlite3 .clagentic/lite/audit.db     # inspect the audit trail
 sqlite3 .clagentic/lite/memory.db    # inspect session memory
 clagentic-lite show memory [N]       # pretty-print last N session memory rows (default 10)
 clagentic-lite show gates [N]        # pretty-print last N gate run rows (default 10)
-clagentic-lite export                # write self-contained HTML report to .clagentic/report.html
+clagentic-lite export                # write self-contained HTML report to .clagentic/lite/report.html
 clagentic-lite export --output PATH  # write report to a specific path
 ```
 
@@ -419,7 +419,7 @@ Signals: you want a server; you want multi-repo memory; you want ranked or embed
 
 If you're hitting these limits, the tool did its job — you've grown into needing a heavier harness that provides those capabilities explicitly.
 
-No `eject` subcommand, no schema bridge. `.clagentic/memory.db` is plain SQLite — query it directly with `sqlite3`, or run `clagentic-lite export` to generate a self-contained HTML report. No migration tooling or schema bridge is planned. See `docs/DESIGN.md` § "When you've outgrown lite" for the full rationale.
+No `eject` subcommand, no schema bridge. `.clagentic/lite/memory.db` is plain SQLite — query it directly with `sqlite3`, or run `clagentic-lite export` to generate a self-contained HTML report. No migration tooling or schema bridge is planned. See `docs/DESIGN.md` § "When you've outgrown lite" for the full rationale.
 
 ---
 

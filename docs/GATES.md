@@ -259,7 +259,7 @@ clagentic-lite ships two commentary skills globally via the `clagentic-lite` plu
 **Skills are commentary, not gates.** They auto-load on relevant keywords and can be invoked explicitly as slash commands. Their output is structured advice you read and act on at your discretion. They do not:
 
 - block `/ship` (only the deterministic security gates + the LLM review severity check + the Merge Gate block `/ship`)
-- write to `.clagentic/last-review.json` or `last-merge-gate.json` (those are reserved for the gate orchestrator)
+- write to `.clagentic/lite/last-review.json` or `last-merge-gate.json` (those are reserved for the gate orchestrator)
 - override or suppress a deterministic-gate finding (gitleaks/semgrep/osv-scanner findings are authoritative; a skill can discuss them but cannot mark them resolved)
 
 The boundary is deliberate. Gates are mechanical and auditable; skills are deliberative and exploratory. Mixing them collapses both into mush.

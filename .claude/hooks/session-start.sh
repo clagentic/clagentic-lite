@@ -1,6 +1,6 @@
 #!/bin/sh
 # clagentic-lite :: SessionStart hook
-# 1. Injects up to 3 recent session summaries from .clagentic/memory.db as
+# 1. Injects up to 3 recent session summaries from .clagentic/lite/memory.db as
 #    additionalContext so the session opens with recent decisions visible.
 # 2. Checks whether the clagentic-lite tool itself is behind its upstream and,
 #    if so, appends a terse one-line update notice.  Rate-limited to one
@@ -24,7 +24,7 @@ if [ -f "$MEMORY_DB" ]; then
 fi
 
 # ---- 1b. Builder contract injection ----------------------------------------
-# Inject .clagentic/builder-contract.md so Claude Code receives the full
+# Inject .clagentic/lite/builder-contract.md so Claude Code receives the full
 # builder rules, agent table, and gate reference at session open. The contract
 # is gitignored (local machine only) — this is the delivery path that replaces
 # the fat committed CLAUDE.md. Best-effort: missing contract is not an error.

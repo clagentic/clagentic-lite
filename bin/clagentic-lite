@@ -131,7 +131,7 @@ claude_notice_version() {
   grep -o 'clagentic-notice-version: v[^ ·>]*' "$_cnv_file" 2>/dev/null | sed 's/clagentic-notice-version: //'
 }
 
-# Read the builder-contract version from .clagentic/builder-contract.md.
+# Read the builder-contract version from .clagentic/lite/builder-contract.md.
 claude_contract_version() {
   _ccv_file="$1"
   [ -f "$_ccv_file" ] || { printf ''; return; }
@@ -1542,7 +1542,7 @@ _restamp_repo_artifacts() {
       sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
           -e "s|__CLAGENTIC_DEFAULT_BRANCH__|$_ra_default_branch|g" \
           "$_ra_contract_template" > "$_ra_contract"
-      say "re-stamped${_ra_label}: $_ra_path/.clagentic/builder-contract.md" >&2
+      say "re-stamped${_ra_label}: $_ra_path/.clagentic/lite/builder-contract.md" >&2
       _ra_count=$((_ra_count+1))
     fi
   fi

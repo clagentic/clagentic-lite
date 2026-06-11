@@ -1,6 +1,6 @@
 #!/bin/sh
 # clagentic-lite :: memory layer
-# SQLite session memory. One DB per project at .clagentic/memory.db.
+# SQLite session memory. One DB per project at .clagentic/lite/memory.db.
 #
 # Subcommands:
 #   init                  create schema if missing
