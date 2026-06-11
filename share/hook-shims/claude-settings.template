@@ -1,5 +1,5 @@
 {
-  "$comment": "clagentic-lite Claude Code hook wiring · clagentic-settings-version: v3 · managed-by: clagentic. Do not edit by hand — re-run `clagentic-lite enroll --force` or `clagentic-lite update` to regenerate.",
+  "$comment": "clagentic-lite Claude Code hook wiring · clagentic-settings-version: v4 · managed-by: clagentic. Do not edit by hand — re-run `clagentic-lite enroll --force` or `clagentic-lite update` to regenerate.",
   "hooks": {
     "SessionStart": [
       { "hooks": [{ "type": "command", "command": "__CLAGENTIC_HOME__/.claude/hooks/session-start.sh" }] }
@@ -26,7 +26,7 @@
       "Bash(git status:*)",
       "Bash(git branch:*)",
       "Bash(git add:*)",
-      "Bash(sqlite3 .clagentic/*)",
+      "Bash(sqlite3 .clagentic/lite/*)",
       "Bash(scripts/*)",
       "Bash(gitleaks:*)",
       "Bash(semgrep:*)",

@@ -1,5 +1,5 @@
 # clagentic-lite builder contract
-<!-- managed-by: clagentic · clagentic-contract-version: v1 -->
+<!-- managed-by: clagentic · clagentic-contract-version: v2 -->
 <!-- Re-generate: `clagentic-lite enroll --force` or `clagentic-lite update` -->
 
 This file is local to your machine and gitignored. It is injected at session
@@ -59,5 +59,5 @@ Lifecycle hooks fire automatically via `.claude/settings.json`:
 clagentic-lite gates ship          # run all gates; open PR if green
 clagentic-lite gates review        # cross-vendor review on staged diff
 clagentic-lite gates digest        # today's gate runs
-sqlite3 .clagentic/audit.db "SELECT ts, gate, outcome FROM gate_runs ORDER BY ts DESC LIMIT 20;"
+sqlite3 .clagentic/lite/audit.db "SELECT ts, gate, outcome FROM gate_runs ORDER BY ts DESC LIMIT 20;"
 ```

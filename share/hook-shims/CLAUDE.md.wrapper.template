@@ -1,5 +1,5 @@
 # CLAUDE.md
-<!-- managed-by: clagentic · clagentic-wrapper-version: v1 -->
+<!-- managed-by: clagentic · clagentic-wrapper-version: v2 -->
 <!-- Re-generate: `clagentic-lite enroll --force <this-folder>` -->
 
 This folder is a clagentic-lite **wrapper** — it contains enrolled git projects but is not a git repo itself.
@@ -64,7 +64,7 @@ clagentic-lite update --restamp               # force re-stamp all managed artif
 
 ```sh
 # Query gate runs for a specific project
-sqlite3 <project>/.clagentic/audit.db "SELECT ts, gate, outcome FROM gate_runs ORDER BY ts DESC LIMIT 20;"
+sqlite3 <project>/.clagentic/lite/audit.db "SELECT ts, gate, outcome FROM gate_runs ORDER BY ts DESC LIMIT 20;"
 
 # From inside the project folder:
 clagentic-lite gates digest

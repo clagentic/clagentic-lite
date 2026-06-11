@@ -10,7 +10,7 @@ set -e
 
 [ "${CLAGENTIC_DISABLE_RECALL:-0}" = "1" ] && exit 0
 
-MEMORY_DB="${PWD}/.clagentic/memory.db"
+MEMORY_DB="${PWD}/.clagentic/lite/memory.db"
 [ -f "$MEMORY_DB" ] || exit 0
 
 # Source platform shims for ds_json_field — same real JSON parser used by

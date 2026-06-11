@@ -21,7 +21,7 @@ TRANSCRIPT=$(printf '%s' "$PAYLOAD" | ds_json_field transcript_path)
 SESSION_ID=$(printf '%s' "$PAYLOAD" | ds_json_field session_id)
 
 # Lockfile for debounce: only the last Stop in a burst should summarize.
-LOCK="$REPO_ROOT/.clagentic/stop-summarize.lock"
+LOCK="$REPO_ROOT/.clagentic/lite/stop-summarize.lock"
 
 # Fire and forget: detach so Claude Code's Stop event returns immediately.
 (
@@ -42,7 +42,7 @@ LOCK="$REPO_ROOT/.clagentic/stop-summarize.lock"
   # diagnostic to audit.db and exit cleanly. A grep+tail fallback would
   # feed raw JSONL into the summarizer, which is worse than no summary.
   if ! command -v python3 >/dev/null 2>&1; then
-    AUDIT="$REPO_ROOT/.clagentic/audit.db"
+    AUDIT="$REPO_ROOT/.clagentic/lite/audit.db"
     if [ -f "$AUDIT" ]; then
       sqlite3 "$AUDIT" \
         "INSERT INTO gate_runs (ts, gate, outcome, details) VALUES (datetime('now'), 'summarize', 'skip', 'python3 missing');" 2>/dev/null || true

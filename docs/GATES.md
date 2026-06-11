@@ -11,7 +11,7 @@ Each gate is documented here: what it does, where it fires, what blocks, how to 
 | **Fires** | `UserPromptSubmit` (every prompt) |
 | **Tool** | `scripts/memory.sh recall` |
 | **Blocks?** | No (read-only context injection) |
-| **Output** | Up to `CLAGENTIC_RECALL_LIMIT` (default 5) prior session summaries prepended, capped at `CLAGENTIC_RECALL_MAX_CHARS` (default 1500) total chars |
+| **Output** | Up to `CLAGENTIC_RECALL_LIMIT` (default 5) prior session summaries prepended, capped at `CLAGENTIC_RECALL_MAX_CHARS` (default 1500) total chars. Memory DB at `.clagentic/lite/memory.db`. |
 | **Disable** | `CLAGENTIC_DISABLE_RECALL=1` |
 
 Keyword extraction is the simplest thing that works: strip stopwords from the prompt, take tokens ≥4 chars, `LIKE %token%` against the `tags` and `summary` columns. Top N by recency. If nothing matches, inject nothing.
@@ -72,7 +72,7 @@ Write rules:
 | **Per-call timeout** | `${CLAGENTIC_LLM_TIMEOUT_SEC}` seconds (default 180). Hung CLI → step failure → chain advances. |
 | **Required-role enforcement** | `CLAGENTIC_REVIEWER_REQUIRED=1` makes a full-chain failure a hard gate error (non-zero exit) instead of a degraded envelope. Use when the cross-vendor property is non-negotiable and a same-vendor fallback must be a visible failure rather than a silent degradation. Applies to any role: `CLAGENTIC_<ROLE>_REQUIRED=1`. |
 
-Reviewer prompt and JSON schema are pinned in `.claude/agents/reviewer.md` (Pre-Report Gate + Common False Positives list). Output is persisted at `.clagentic/last-review.json` and into `audit.db.gate_runs`. Per-step LLM-call attempts are logged separately (`gate=llm-call`) with a one-line error hint from stderr.
+Reviewer prompt and JSON schema are pinned in `.claude/agents/reviewer.md` (Pre-Report Gate + Common False Positives list). Output is persisted at `.clagentic/lite/last-review.json` and into `audit.db.gate_runs`. Per-step LLM-call attempts are logged separately (`gate=llm-call`) with a one-line error hint from stderr.
 
 The Reviewer never has write tools. The Builder never sees its own review pre-graded. The Reviewer prompt forbids "looks good to me" outputs without specific evidence.
 
@@ -117,7 +117,7 @@ Rationale: deterministic tools, well-understood, no LLM in the security path. Th
 | **Fires** | `/review --adversarial`; `scripts/gates.sh adversarial` |
 | **Tool** | Auditor role via `scripts/llm-client.sh adversarial` |
 | **Blocks?** | No — commentary only |
-| **Output** | Markdown attack scenarios saved to `.clagentic/last-adversarial.md`; attach to PR if interesting |
+| **Output** | Markdown attack scenarios saved to `.clagentic/lite/last-adversarial.md`; attach to PR if interesting |
 
 The Auditor argues, in concrete terms, how a hostile user could exploit each new or modified input surface. Cites file:line. Names threats with CWE if obvious. If nothing is exploitable, says so in one sentence and lists the surfaces considered.
 
@@ -129,8 +129,8 @@ For a heavier, structured threat-model pass, use the `/infosec-rt` skill instead
 |---|---|
 | **Fires** | `scripts/gates.sh ship` (the `/ship` slash command), after all other gates have passed |
 | **Tool** | LLM "gate" role via `scripts/llm-client.sh merge-gate` |
-| **Input** | A JSON gate-summary payload (`.clagentic/gate-summary.json`) built from `last-review.json` + `last-adversarial.md` + threshold |
-| **Output** | `{decision: "approve" | "refuse", reason: "<one sentence>"}` JSON at `.clagentic/last-merge-gate.json` |
+| **Input** | A JSON gate-summary payload (`.clagentic/lite/gate-summary.json`) built from `last-review.json` + `last-adversarial.md` + threshold |
+| **Output** | `{decision: "approve" | "refuse", reason: "<one sentence>"}` JSON at `.clagentic/lite/last-merge-gate.json` |
 | **Blocks?** | **Yes by default** (`CLAGENTIC_MERGE_GATE_BLOCKING=1`). Set to `0` to make advisory. |
 | **Unparseable decision** | Also blocks — schema-invalid merge-gate output is treated as a gate failure, not a pass. |
 
@@ -147,13 +147,13 @@ If an adversarial finding describes inherent product behavior (e.g., a security 
 | **Blocks?** | No |
 | **Debounce** | `CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC=20` |
 
-Reads the last assistant turn from the Claude Code transcript path, passes it through the Summarizer (`CLAGENTIC_SUMMARIZER_CMD` at cheap tier), inserts one row into `.clagentic/memory.db.turns` with `source='stop-hook'`. Best-effort: if the summarizer fails, the session continues uninterrupted and the row is skipped. `python3` is required for transcript JSONL parsing — without it, the hook logs `summarize skip` to audit.db and exits cleanly.
+Reads the last assistant turn from the Claude Code transcript path, passes it through the Summarizer (`CLAGENTIC_SUMMARIZER_CMD` at cheap tier), inserts one row into `.clagentic/lite/memory.db.turns` with `source='stop-hook'`. Best-effort: if the summarizer fails, the session continues uninterrupted and the row is skipped. `python3` is required for transcript JSONL parsing — without it, the hook logs `summarize skip` to audit.db and exits cleanly.
 
 ## Auditing what happened
 
 ```sh
 # every gate run today
-sqlite3 .clagentic/audit.db \
+sqlite3 .clagentic/lite/audit.db \
   "SELECT ts, gate, outcome, substr(details,1,80) FROM gate_runs WHERE ts > date('now','-1 day') ORDER BY ts"
 
 # digest (human-readable; time-ordered, last 24h)

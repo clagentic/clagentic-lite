@@ -12,8 +12,8 @@
 # shellcheck source=../../scripts/platform.sh
 . "$(dirname "$0")/../../scripts/platform.sh" 2>/dev/null || true
 
-MEMORY_DB="${PWD}/.clagentic/memory.db"
-CONTRACT_MD="${PWD}/.clagentic/builder-contract.md"
+MEMORY_DB="${PWD}/.clagentic/lite/memory.db"
+CONTRACT_MD="${PWD}/.clagentic/lite/builder-contract.md"
 
 # ---- 1. Recent session summaries ----------------------------------------
 
@@ -37,7 +37,7 @@ fi
 # ---- 2. Update alert -------------------------------------------------------
 # Resolve CLAGENTIC_HOME; fall back to the hook file's grandparent directory
 # (mirrors the bin/clagentic-lite resolution logic).
-: "${CLAGENTIC_HOME:=$HOME/.clagentic-lite}"
+: "${CLAGENTIC_HOME:=$HOME/.clagentic/lite}"
 
 UPDATE_MSG=""
 

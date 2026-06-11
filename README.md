@@ -81,7 +81,7 @@ Clone once, enroll per project. The snippet below is safe to re-run — on a fre
 
 ```sh
 # First install OR re-run after pulling new commits.
-HOME_DIR="${CLAGENTIC_HOME:-$HOME/.clagentic-lite}"
+HOME_DIR="${CLAGENTIC_HOME:-$HOME/.clagentic/lite}"
 if [ -d "$HOME_DIR/.git" ]; then
   git -C "$HOME_DIR" pull --ff-only
 else
@@ -106,7 +106,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic-lite update` — pulls `--ff-only`, re-checks prereqs, re-stamps all versioned artifacts in enrolled repos when their template versions change.
 
-The tool is cloned once to `~/.clagentic-lite` (or `$CLAGENTIC_HOME` if set). Your projects never contain a copy of the scripts or agent files — they hold only `.clagentic/{audit.db,memory.db}`, thin hook shims, and a `CLAUDE.md` that call back to `$CLAGENTIC_HOME`. Update the tool once and every enrolled repo picks it up.
+The tool is cloned once to `~/.clagentic/lite` (or `$CLAGENTIC_HOME` if set). Your projects never contain a copy of the scripts or agent files — they hold only `.clagentic/lite/{audit.db,memory.db}`, thin hook shims, and a `CLAUDE.md` that call back to `$CLAGENTIC_HOME`. Update the tool once and every enrolled repo picks it up.
 
 ### Prerequisites
 
@@ -302,7 +302,7 @@ CLAGENTIC_MODEL_OLLAMA_DEFAULT=llama3.1:8b
 The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). Your enrolled projects hold only the per-repo state — no copy of scripts, agents, or config.
 
 ```
-~/.clagentic-lite/                              the tool — never gated by default
+~/.clagentic/lite/                              the tool — never gated by default
 ├── bin/clagentic-lite                          CLI entry point
 ├── AGENTS.md                                   canonical agent instructions, cross-tool
 ├── CLAUDE.md                                   pointer to AGENTS.md
@@ -343,8 +343,13 @@ The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). Your enrolled
 
 <any enrolled repo>/
 ├── .clagentic/
-│   ├── audit.db                                gate run log (written by gates.sh)
-│   └── memory.db                               session memory (written by memory.sh)
+│   ├── adversarial-acks.json                   per-CWE ack list (governance, committed)
+│   ├── accepted-risks.md                       architectural risk docs (governance, committed)
+│   ├── osv-ignore                              osv CVE ignore list (governance, committed)
+│   ├── config                                  repo-level config overrides (governance, committed)
+│   └── lite/
+│       ├── audit.db                            gate run log (written by gates.sh, gitignored)
+│       └── memory.db                           session memory (written by memory.sh, gitignored)
 └── .git/hooks/
     ├── pre-commit                              shim: calls $CLAGENTIC_HOME/scripts/gates.sh secrets
     └── pre-push                                shim: calls $CLAGENTIC_HOME/scripts/gates.sh pre-push
@@ -396,8 +401,8 @@ scripts/gates.sh digest  # what gates ran today
 scripts/gates.sh status  # last N runs per gate (default 10), color-coded outcomes
 scripts/gates.sh tail    # follow audit.db live; new gate rows render as they land
 scripts/memory.sh recall <keyword>   # raw recall
-sqlite3 .clagentic/audit.db          # inspect the audit trail
-sqlite3 .clagentic/memory.db         # inspect session memory
+sqlite3 .clagentic/lite/audit.db     # inspect the audit trail
+sqlite3 .clagentic/lite/memory.db    # inspect session memory
 clagentic-lite show memory [N]       # pretty-print last N session memory rows (default 10)
 clagentic-lite show gates [N]        # pretty-print last N gate run rows (default 10)
 clagentic-lite export                # write self-contained HTML report to .clagentic/report.html

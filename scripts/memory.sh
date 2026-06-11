@@ -28,8 +28,8 @@ else
 fi
 [ -n "$REPO_ROOT" ] || { echo "memory.sh: not in a git repo" 1>&2; exit 1; }
 
-DB="$REPO_ROOT/.clagentic/memory.db"
-mkdir -p "$REPO_ROOT/.clagentic"
+DB="$REPO_ROOT/.clagentic/lite/memory.db"
+mkdir -p "$REPO_ROOT/.clagentic/lite"
 
 cmd_init() {
   sqlite3 "$DB" <<'SQL'
