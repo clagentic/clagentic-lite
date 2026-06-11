@@ -35,10 +35,17 @@ export CLAGENTIC_HOME
 # Source platform shims from our own install tree.
 SCRIPTS_DIR="$CLAGENTIC_HOME/scripts"
 if [ ! -f "$SCRIPTS_DIR/platform.sh" ]; then
-  # Bootstrap path: being invoked before init has verified $CLAGENTIC_HOME.
-  # Try to resolve from this script's own location.
+  # Bootstrap path: being invoked before init has verified $CLAGENTIC_HOME, or
+  # when the install directory has moved (e.g. ~/.clagentic-lite -> ~/.clagentic/lite
+  # migration). Try to resolve from this script's own location.
   _SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-  SCRIPTS_DIR="$(dirname "$_SELF_DIR")/scripts"
+  _SELF_SCRIPTS="$(dirname "$_SELF_DIR")/scripts"
+  if [ -f "$_SELF_SCRIPTS/platform.sh" ]; then
+    # Binary's own directory is valid — realign CLAGENTIC_HOME to match.
+    CLAGENTIC_HOME="$(dirname "$_SELF_DIR")"
+    export CLAGENTIC_HOME
+    SCRIPTS_DIR="$_SELF_SCRIPTS"
+  fi
 fi
 if [ ! -f "$SCRIPTS_DIR/platform.sh" ]; then
   printf 'clagentic-lite: cannot find scripts/platform.sh in %s\n' "$CLAGENTIC_HOME" >&2
@@ -1592,11 +1599,15 @@ cmd_update() {
   # Detect old default home and offer to migrate. Only runs when:
   #   - the old path exists
   #   - the new path does NOT exist (clean migration, not already done)
-  #   - CLAGENTIC_HOME is currently pointing at the new default (i.e. user has
-  #     not set a custom CLAGENTIC_HOME — we only auto-migrate the default)
+  #   - CLAGENTIC_HOME is either the old default (binary running from old path,
+  #     user has not yet updated their shell profile) OR the new default (user
+  #     updated shell profile but the directory hasn't been moved yet).
+  #   Custom CLAGENTIC_HOME values that are neither old nor new default are left
+  #   alone — user manages their own install location.
   _old_home="$HOME/.clagentic-lite"
   _new_home="$HOME/.clagentic/lite"
-  if [ -d "$_old_home" ] && [ ! -d "$_new_home" ] && [ "$CLAGENTIC_HOME" = "$_new_home" ]; then
+  if [ -d "$_old_home" ] && [ ! -d "$_new_home" ] && \
+     { [ "$CLAGENTIC_HOME" = "$_old_home" ] || [ "$CLAGENTIC_HOME" = "$_new_home" ]; }; then
     say "migration available: ~/.clagentic-lite -> ~/.clagentic/lite (brand namespace standardization)"
     _migrate_reply="y"
     if [ -t 0 ]; then
