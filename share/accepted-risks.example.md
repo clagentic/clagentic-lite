@@ -9,6 +9,13 @@ at merge-gate time and injected into the gate-summary payload as the `accepted_r
 field. Commit it deliberately — its presence in version history is part of the audit
 trail.
 
+**Trust model:** this file is repo-controlled. It is a workflow convenience for trusted
+internal contributors, not a security control. A contributor can add a behavior change
+and a covering accepted-risk entry in the same diff; there is no automated check against
+this. The structural fix is CODEOWNERS protection on `.clagentic/accepted-risks.md` and
+`.clagentic/adversarial-acks.json` so edits require review outside the submitter. Until
+that is in place, treat these files as convenience mechanisms, not enforcement controls.
+
 ## Format
 
 Each risk entry should include:

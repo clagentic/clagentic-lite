@@ -58,7 +58,7 @@ Each entry in `adversarial_acks` has the shape:
 }
 ```
 
-`path_glob` is optional; all other fields are required.
+`path_glob` is optional; all other fields are required. `acknowledged_by` is a plain string — it is not verified or authenticated. `path_glob` should be as narrow as the actual affected scope; broad globs reduce the value of the ack as a targeted suppression and allow future regressions in covered files to pass silently.
 
 `accepted_risks` is freetext markdown from `.clagentic/accepted-risks.md`. When non-empty it documents architectural risk decisions the team has made. See "Accepted risks" below.
 
