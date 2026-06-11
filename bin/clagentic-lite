@@ -875,15 +875,24 @@ _enroll_one() {
   _claude_md_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
   _claude_md_target="$_canon/CLAUDE.md"
   if [ -f "$_claude_md_template" ]; then
-    if [ -f "$_claude_md_target" ] && ! grep -q 'managed-by: clagentic' "$_claude_md_target" 2>/dev/null; then
-      if [ "${ENROLL_FORCE:-0}" = "1" ]; then
+    if [ -f "$_claude_md_target" ]; then
+      if grep -q 'managed-by: clagentic' "$_claude_md_target" 2>/dev/null; then
+        # Already clagentic-managed — splice in the new notice block while
+        # preserving any project-owned content below the sentinel.  This is
+        # the same path update uses; a bare cp would destroy the user's block.
+        _restamp_notice_block "$_claude_md_target" "$_claude_md_template"
+        say "re-stamped CLAUDE.md (preserved project-owned content): $_claude_md_target"
+      elif [ "${ENROLL_FORCE:-0}" = "1" ]; then
+        # Not clagentic-managed + --force: full overwrite.  No project-owned
+        # block to preserve (clagentic never wrote one here before).
         warn "overwriting existing non-clagentic CLAUDE.md (--force)"
+        cp "$_claude_md_template" "$_claude_md_target"
+        say "stamped CLAUDE.md: $_claude_md_target"
       else
         warn "existing CLAUDE.md in $_canon is not clagentic-managed — skipping (use --force to overwrite)"
-        _claude_md_template=""
       fi
-    fi
-    if [ -n "$_claude_md_template" ]; then
+    else
+      # No existing file — plain stamp.
       cp "$_claude_md_template" "$_claude_md_target"
       say "stamped CLAUDE.md: $_claude_md_target"
     fi
@@ -908,21 +917,63 @@ _enroll_one() {
     warn "builder-contract.template missing — skipping builder contract stamp"
   fi
 
-  # Add .claude/ and .clagentic/ to the project's .gitignore so the generated
-  # wiring and local machine state are not accidentally committed.
+  # Add .claude/ to .gitignore (fully tool-generated, never committed).
+  # For .clagentic/, ignore only ephemeral tool-state files; governance files
+  # (adversarial-acks.json, osv-ignore, accepted-risks.md, config) are meant
+  # to be committed and code-reviewed — a blanket .clagentic/ ignore would
+  # prevent that.  Each pattern is idempotent: skipped if already present.
   _gitignore="$_canon/.gitignore"
-  if [ -f "$_gitignore" ]; then
+  # Ephemeral .clagentic/ patterns to ignore (one per line, no leading spaces).
+  _clagentic_ignores=$(printf '%s\n' \
+    '.clagentic/audit.db' \
+    '.clagentic/memory.db' \
+    '.clagentic/builder-contract.md' \
+    '.clagentic/last-review.json' \
+    '.clagentic/last-adversarial.md' \
+    '.clagentic/last-merge-gate.json' \
+    '.clagentic/gate-summary.json' \
+    '.clagentic/stop-summarize.lock' \
+    '.clagentic/report.html')
+  if [ ! -f "$_gitignore" ]; then
+    printf '.claude/\n' > "$_gitignore"
+    printf '%s\n' "$_clagentic_ignores" >> "$_gitignore"
+    say "created $_gitignore with .claude/ and ephemeral .clagentic/ patterns"
+  else
     if ! grep -qxF '.claude/' "$_gitignore" 2>/dev/null; then
       printf '.claude/\n' >> "$_gitignore"
       say "added .claude/ to $_gitignore"
     fi
-    if ! grep -qxF '.clagentic/' "$_gitignore" 2>/dev/null; then
-      printf '.clagentic/\n' >> "$_gitignore"
-      say "added .clagentic/ to $_gitignore"
+    # If a prior enrollment wrote the blanket .clagentic/ line, leave it in
+    # place (removing it could re-expose already-ignored files); just note it.
+    if grep -qxF '.clagentic/' "$_gitignore" 2>/dev/null; then
+      say "note: $_gitignore already has blanket .clagentic/ — governance files (adversarial-acks.json, osv-ignore, accepted-risks.md) may be untrackable; consider replacing with per-file patterns"
+    else
+      # Write per-file ephemeral patterns.
+      printf '%s\n' "$_clagentic_ignores" | while IFS= read -r _pat; do
+        if ! grep -qxF "$_pat" "$_gitignore" 2>/dev/null; then
+          printf '%s\n' "$_pat" >> "$_gitignore"
+        fi
+      done
+      say "added ephemeral .clagentic/ patterns to $_gitignore"
     fi
-  else
-    printf '.claude/\n.clagentic/\n' > "$_gitignore"
-    say "created $_gitignore with .claude/ and .clagentic/"
+  fi
+  # Migration warning: detect tracked .clagentic/ files that should be ephemeral.
+  # These cause perpetual dirty state and polluted commits.
+  _tracked_ephemeral=""
+  if git -C "$_canon" rev-parse --git-dir >/dev/null 2>&1; then
+    _tracked_ephemeral=$(git -C "$_canon" ls-files \
+      '.clagentic/audit.db' '.clagentic/memory.db' \
+      '.clagentic/builder-contract.md' '.clagentic/last-review.json' \
+      '.clagentic/last-adversarial.md' '.clagentic/last-merge-gate.json' \
+      '.clagentic/gate-summary.json' '.clagentic/stop-summarize.lock' \
+      '.clagentic/report.html' 2>/dev/null || true)
+  fi
+  if [ -n "$_tracked_ephemeral" ]; then
+    warn "migration needed: the following ephemeral .clagentic/ files are tracked in git and will cause perpetual dirty state:"
+    printf '%s\n' "$_tracked_ephemeral" | while IFS= read -r _tf; do
+      printf '    %s\n' "$_tf" >&2
+    done
+    warn "run: git rm --cached $(printf '%s\n' "$_tracked_ephemeral" | tr '\n' ' ') && git commit -m 'chore: untrack ephemeral .clagentic/ files'"
   fi
 
   # Register.
