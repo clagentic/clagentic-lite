@@ -29,6 +29,8 @@ Standard input is a single JSON object:
 
 ```json
 {
+  "stale_payload": true | false,              // omitted or false = fresh
+  "stale_gates": ["review", "adversarial"],   // present only when stale_payload is true
   "review": { ...reviewer.md schema... } | null,
   "adversarial": "<markdown>" | "",
   "adversarial_acks": [...] | [],
@@ -37,6 +39,8 @@ Standard input is a single JSON object:
   "threshold": "low | medium | high | critical"
 }
 ```
+
+When `stale_payload` is `true`, `build_gate_summary` emits only the minimal stale envelope (no review/adversarial fields). The agent should handle both forms gracefully: a full payload with `stale_payload: true` set, or the minimal stale-only envelope where the other fields are absent.
 
 `introduces_ack_file` is a deterministic boolean computed by `build_gate_summary` from `git diff --name-status`. It is `true` when `.clagentic/adversarial-acks.json` or `.clagentic/accepted-risks.md` is **added** (status `A`) in the current diff. It is `false` when those files are modified, unchanged, or when git state is unavailable. This field drives the bootstrap exemption below — do not infer it yourself from the adversarial text.
 
@@ -83,6 +87,7 @@ Strict JSON, no prose before or after:
 
 **Refuse** if any of the following:
 
+- `stale_payload` is `true`: the gate output files were written against a different commit. Refuse with reason: `"stale gate payload — re-run 'clagentic-lite gates review' and 'clagentic-lite gates adversarial' first, then re-run merge-gate"`. List the specific gates from `stale_gates` if the field is present.
 - `review` is `null`: this means the Reviewer was invoked against an empty diff — a bug in the calling workflow, not a gate finding. Refuse with reason: `"review is null — re-run the ship gate sequence from the feature branch with changes committed; the review gate requires a non-empty diff"`.
 - `review.findings` contains any finding at severity `>= threshold`.
 - `adversarial` contains a CWE citation paired with concrete file:line evidence, no follow-up "mitigated" note, AND the finding is not covered by an entry in `adversarial_acks` AND it is not inherent product behavior documented in `accepted_risks`.

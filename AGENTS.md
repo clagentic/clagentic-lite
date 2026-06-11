@@ -51,6 +51,7 @@ This isn't a technical preference. It's the product story. "The harness does not
 - `.clagentic/adversarial-acks.json` — per-CWE structured acknowledgment for adversarial/merge-gate false positives (path-glob scoped, committed, audited)
 - `.clagentic/accepted-risks.md` — freetext markdown documenting architectural risk decisions where an adversarial finding describes inherent product behavior; the merge-gate reads this file and classifies covered findings as acknowledged rather than refused. Copy `share/accepted-risks.example.md` from the install tree as a template.
 - `CLAGENTIC_SKIP_UPDATE_ALERT=1` — suppress the session-start update-available notice (air-gapped or manually managed installs)
+- `CLAGENTIC_ALLOW_STALE_PAYLOAD=1` — skip the staleness check on gate output files (`last-review.json`, `last-adversarial.md`); use when artifacts were written in a prior CI step or air-gapped environment where the files are known-fresh despite the SHA mismatch
 
 Set these in `.clagentic/config` (repo-level) or `~/.config/clagentic/config` (global). Document the reason in the commit or PR body. See `docs/GATES.md` § "Working around gates" for the full table.
 
