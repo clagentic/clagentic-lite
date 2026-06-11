@@ -1,5 +1,5 @@
 #!/bin/sh
-# clagentic-lite hook shim · v1 · do not edit by hand
+# clagentic-lite hook shim · v2 · do not edit by hand
 # managed-by: clagentic
 : "${CLAGENTIC_HOME:=__CLAGENTIC_HOME__}"
 if [ ! -x "$CLAGENTIC_HOME/scripts/gates.sh" ]; then

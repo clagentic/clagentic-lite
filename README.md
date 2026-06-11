@@ -190,7 +190,7 @@ Two layers — the shell harness, then Claude Code's view of it.
 **Shell harness:**
 
 ```sh
-# Run from inside $CLAGENTIC_HOME (default: ~/.clagentic-lite):
+# Run from inside $CLAGENTIC_HOME (default: ~/.clagentic/lite):
 "$CLAGENTIC_HOME/scripts/smoke.sh" --quick   # non-interactive end-to-end without LLM calls
 
 # Run from inside an enrolled project repo:
@@ -299,7 +299,7 @@ CLAGENTIC_MODEL_OLLAMA_DEFAULT=llama3.1:8b
 
 ## Layout
 
-The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic-lite`). Your enrolled projects hold only the per-repo state — no copy of scripts, agents, or config.
+The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic/lite`). Your enrolled projects hold only the per-repo state — no copy of scripts, agents, or config.
 
 ```
 ~/.clagentic/lite/                              the tool — never gated by default

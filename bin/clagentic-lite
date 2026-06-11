@@ -1640,16 +1640,20 @@ cmd_update() {
           [ -f "$_old_dot/$_ef" ] && mv "$_old_dot/$_ef" "$_new_dot/$_ef" && \
             say "migrated: $_mpath/.clagentic/$_ef -> .clagentic/lite/$_ef"
         done
-        # Update gitignore: replace old per-file patterns with single blanket
+        # Update gitignore: replace old per-file patterns with single blanket.
+        # Skip if a blanket .clagentic/ line already covers .clagentic/lite/.
         _gi="$_mpath/.gitignore"
         if [ -f "$_gi" ]; then
-          _updated=$(grep -v "^\.clagentic/audit\.db$\|^\.clagentic/memory\.db$\|^\.clagentic/builder-contract\.md$\|^\.clagentic/last-review\.json$\|^\.clagentic/last-adversarial\.md$\|^\.clagentic/last-merge-gate\.json$\|^\.clagentic/gate-summary\.json$\|^\.clagentic/stop-summarize\.lock$\|^\.clagentic/report\.html$" "$_gi" 2>/dev/null || true)
-          if ! printf '%s\n' "$_updated" | grep -qxF '.clagentic/lite/'; then
-            printf '%s\n' "$_updated" > "$_gi"
-            printf '.clagentic/lite/\n' >> "$_gi"
-            say "updated .gitignore: replaced per-file patterns with .clagentic/lite/ blanket"
+          if grep -qxF '.clagentic/' "$_gi" 2>/dev/null; then
+            say "note: $_mpath/.gitignore has blanket .clagentic/ — already covers .clagentic/lite/"
           else
-            printf '%s\n' "$_updated" > "$_gi"
+            _updated=$(grep -v "^\.clagentic/audit\.db$\|^\.clagentic/memory\.db$\|^\.clagentic/builder-contract\.md$\|^\.clagentic/last-review\.json$\|^\.clagentic/last-adversarial\.md$\|^\.clagentic/last-merge-gate\.json$\|^\.clagentic/gate-summary\.json$\|^\.clagentic/stop-summarize\.lock$\|^\.clagentic/report\.html$" "$_gi" 2>/dev/null || true)
+            if ! printf '%s\n' "$_updated" | grep -qxF '.clagentic/lite/'; then
+              { printf '%s\n' "$_updated" | grep -v '^$'; printf '.clagentic/lite/\n'; } > "$_gi"
+              say "updated .gitignore: replaced per-file patterns with .clagentic/lite/ blanket"
+            else
+              printf '%s\n' "$_updated" | grep -v '^$' > "$_gi"
+            fi
           fi
         fi
       fi
