@@ -183,7 +183,12 @@ stamp_shim() {
 
 # Stamp a wrapper-flavored CLAUDE.md into a non-git wrapper directory.
 # Args: WRAPPER_DIR  ENROLLED_REPOS (space-separated absolute paths)
-# No hook wiring — hooks are git-repo-rooted and must not fire from wrapper CWD.
+# Note: Claude Code lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse,
+# PostToolUse, Stop) are CWD-agnostic — they load from .claude/settings.json
+# relative to the CWD at session open, NOT from the git repo root. Only git
+# pre-commit/pre-push hooks are git-repo-rooted. Wrapper sessions must also
+# have .claude/settings.json stamped so lifecycle hooks fire correctly.
+# See _stamp_wrapper_settings for that wiring.
 # Skips if a non-clagentic CLAUDE.md already exists (unless ENROLL_FORCE=1).
 _stamp_wrapper_claude_md() {
   _wcd="$1"; _wcd_repos="$2"
@@ -256,6 +261,55 @@ _stamp_wrapper_claude_md() {
     done < "$_wcd_template"
   } > "$_wcd_target"
   say "stamped wrapper CLAUDE.md: $_wcd_target" >&2
+}
+
+# Stamp .claude/settings.json and symlink .claude/commands into a non-git
+# wrapper directory so Claude Code lifecycle hooks fire when opened there.
+# Args: WRAPPER_DIR
+# Only adds .claude/ to .gitignore when the wrapper dir is not itself a git repo.
+_stamp_wrapper_settings() {
+  _sws_wrapper="$1"
+  _sws_template="$SHARE_DIR/hook-shims/claude-settings.template"
+  [ -f "$_sws_template" ] || { warn "claude-settings.template missing — skipping wrapper settings stamp"; return 0; }
+
+  _sws_claude_dir="$_sws_wrapper/.claude"
+  mkdir -p "$_sws_claude_dir" || { warn "cannot create $_sws_claude_dir"; return 0; }
+
+  # Stamp settings.json with __CLAGENTIC_HOME__ substituted.
+  # Use a distinct $comment marker so the wrapper file is self-describing.
+  _sws_target="$_sws_claude_dir/settings.json"
+  if [ -f "$_sws_target" ] && ! grep -q 'managed-by: clagentic' "$_sws_target" 2>/dev/null; then
+    if [ "${ENROLL_FORCE:-0}" = "1" ]; then
+      warn "overwriting existing non-clagentic .claude/settings.json in wrapper $_sws_wrapper (--force)"
+    else
+      warn "existing .claude/settings.json in wrapper $_sws_wrapper is not clagentic-managed — skipping (use --force to overwrite)"
+      return 0
+    fi
+  fi
+
+  # Generate settings.json from the shared template, but replace the $comment
+  # value so it identifies this as a wrapper-settings file (version: v1).
+  sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
+      -e 's|clagentic-settings-version: v[^ ]*|clagentic-wrapper-settings-version: v1|g' \
+      "$_sws_template" > "$_sws_target"
+
+  # Symlink commands/ so slash commands are available in wrapper sessions.
+  ln -sfn "$CLAGENTIC_HOME/.claude/commands" "$_sws_claude_dir/commands"
+
+  # Add .claude/ to .gitignore only when the wrapper dir is not a git repo.
+  # (Wrapper dirs are by definition non-git, but guard for robustness.)
+  if ! git -C "$_sws_wrapper" rev-parse --git-dir >/dev/null 2>&1; then
+    _sws_gi="$_sws_wrapper/.gitignore"
+    if [ ! -f "$_sws_gi" ]; then
+      printf '.claude/\n' > "$_sws_gi"
+      say "created $_sws_gi with .claude/ pattern" >&2
+    elif ! grep -qxF '.claude/' "$_sws_gi" 2>/dev/null; then
+      printf '.claude/\n' >> "$_sws_gi"
+      say "added .claude/ to $_sws_gi" >&2
+    fi
+  fi
+
+  say "stamped wrapper .claude/settings.json: $_sws_target" >&2
 }
 
 # ---------------------------------------------------------------- prereq helpers
@@ -671,12 +725,14 @@ cmd_enroll() {
 
 # _register_wrapper_repo WRAPPER_DIR REPO_PATH
 # Appends REPO_PATH to WRAPPER_DIR/.clagentic-project, stamps wrapper CLAUDE.md,
+# stamps wrapper .claude/settings.json so lifecycle hooks fire from wrapper CWD,
 # then enrolls the repo.
 _register_wrapper_repo() {
   _rwr_wrapper="$1"
   _rwr_repo="$2"
   printf '%s\n' "$_rwr_repo" >> "$_rwr_wrapper/.clagentic-project"
   _stamp_wrapper_claude_md "$_rwr_wrapper" "$_rwr_repo"
+  _stamp_wrapper_settings "$_rwr_wrapper"
   _enroll_one "$_rwr_repo"
 }
 
@@ -1569,7 +1625,8 @@ _restamp_repo_artifacts() {
   # cmd_update bumps plugin.json version and calls 'claude plugin update'
   # to refresh agents and skills on the user's machine — no per-repo copy to maintain.
 
-  # Re-stamp wrapper CLAUDE.md if the parent dir has a .clagentic-project pointer.
+  # Re-stamp wrapper CLAUDE.md and .claude/settings.json if the parent dir has
+  # a .clagentic-project pointer.
   _ra_wrapper_dir=$(dirname "$_ra_path")
   _ra_wrapper_ptr="$_ra_wrapper_dir/.clagentic-project"
   _ra_wrapper_cm="$_ra_wrapper_dir/CLAUDE.md"
@@ -1584,6 +1641,11 @@ _restamp_repo_artifacts() {
         _ra_count=$((_ra_count+1))
       }
     fi
+    # Re-stamp wrapper .claude/settings.json alongside CLAUDE.md.
+    ENROLL_FORCE=1 _stamp_wrapper_settings "$_ra_wrapper_dir" && {
+      say "re-stamped wrapper settings${_ra_label}: $_ra_wrapper_dir/.claude/settings.json" >&2
+      _ra_count=$((_ra_count+1))
+    }
   fi
 
   printf '%d\n' "$_ra_count"

@@ -12,6 +12,17 @@ ds_load_env
 DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
 REPO_ROOT=$(ds_repo_root || echo "")
 
+# Wrapper-CWD fallback: if CWD is not a git repo but has a .clagentic-project
+# pointer, read the first enrolled repo path and use it as REPO_ROOT so W-001
+# and W-002 checks operate against the actual project repo.
+# If neither applies, keep fail-closed behavior (REPO_ROOT stays empty).
+if [ -z "$REPO_ROOT" ] && [ -f "${PWD}/.clagentic-project" ]; then
+  _pwg_primary=$(head -n 1 "${PWD}/.clagentic-project" 2>/dev/null || true)
+  if [ -n "$_pwg_primary" ]; then
+    REPO_ROOT="$_pwg_primary"
+  fi
+fi
+
 # Read the Claude Code tool-call JSON and extract file_path via real JSON
 # parsing — NOT sed.
 INPUT=$(cat 2>/dev/null || true)
