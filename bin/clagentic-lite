@@ -80,6 +80,9 @@ CLAUDE_CONTRACT_VERSION="v2"
 # Local wrapper CLAUDE.md — rich local dashboard, never committed.
 # Bump on any template change; cheap restamp (local).
 CLAUDE_WRAPPER_VERSION="v2"
+# Wrapper .claude/settings.json — lifecycle hook wiring for wrapper-level sessions.
+# Bump on any content change to trigger restamp via _restamp_repo_artifacts.
+CLAUDE_WRAPPER_SETTINGS_VERSION="v1"
 
 # Single source of truth for the security-gate tool list. Adding a new
 # scanner means editing this one line — _run_prereq_checks (init/update)
@@ -150,6 +153,13 @@ claude_wrapper_version() {
   _cwv_file="$1"
   [ -f "$_cwv_file" ] || { printf ''; return; }
   grep -o 'clagentic-wrapper-version: v[^ ·>]*' "$_cwv_file" 2>/dev/null | sed 's/clagentic-wrapper-version: //'
+}
+
+# Read the wrapper .claude/settings.json version.
+claude_wrapper_settings_version() {
+  _cwsv_file="$1"
+  [ -f "$_cwsv_file" ] || { printf ''; return; }
+  grep -o 'clagentic-wrapper-settings-version: v[^ ·>]*' "$_cwsv_file" 2>/dev/null | sed 's/clagentic-wrapper-settings-version: //'
 }
 
 # Stamp a hook shim from share/hook-shims/<name>.template into a repo's
@@ -290,7 +300,7 @@ _stamp_wrapper_settings() {
   # Generate settings.json from the shared template, but replace the $comment
   # value so it identifies this as a wrapper-settings file (version: v1).
   sed -e "s|__CLAGENTIC_HOME__|$CLAGENTIC_HOME|g" \
-      -e 's|clagentic-settings-version: v[^ ]*|clagentic-wrapper-settings-version: v1|g' \
+      -e "s|clagentic-settings-version: v[^ ]*|clagentic-wrapper-settings-version: $CLAUDE_WRAPPER_SETTINGS_VERSION|g" \
       "$_sws_template" > "$_sws_target"
 
   # Symlink commands/ so slash commands are available in wrapper sessions.
@@ -1922,6 +1932,10 @@ cmd_update() {
        grep -q 'managed-by: clagentic' "$_vck_wrapper_cm" 2>/dev/null; then
       _wcm_ver=$(claude_wrapper_version "$_vck_wrapper_cm")
       [ "$_wcm_ver" != "$CLAUDE_WRAPPER_VERSION" ] && _need_restamp=1
+      # Also check wrapper settings.json version.
+      _vck_wrapper_sj="$_vck_wrapper_dir/.claude/settings.json"
+      _wsj_ver=$(claude_wrapper_settings_version "$_vck_wrapper_sj")
+      [ "$_wsj_ver" != "$CLAUDE_WRAPPER_SETTINGS_VERSION" ] && _need_restamp=1
     fi
     if [ "$_need_restamp" -eq 1 ]; then
       _would_restamp=1
