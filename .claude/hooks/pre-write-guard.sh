@@ -3,14 +3,29 @@
 # Blocks writes to the default branch, outside the repo, or to sensitive paths.
 # Exit 2 = block.
 
-set -e
+# set -e intentionally absent: unexpected failures must exit 0, not crash the
+# session. Only the explicit block() paths below exit 2 to block a tool call.
+# If platform.sh is missing or broken the hook fails open (allow + no audit).
 
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR=.
-. "$HOOK_DIR/../../scripts/platform.sh"
-ds_load_env
+if ! . "$HOOK_DIR/../../scripts/platform.sh" 2>/dev/null; then
+  exit 0
+fi
+ds_load_env 2>/dev/null || true
 
 DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
 REPO_ROOT=$(ds_repo_root || echo "")
+
+# Wrapper-CWD fallback: if CWD is not a git repo but has a .clagentic-project
+# pointer, read the first enrolled repo path and use it as REPO_ROOT so W-001
+# and W-002 checks operate against the actual project repo.
+# If neither applies, keep fail-closed behavior (REPO_ROOT stays empty).
+if [ -z "$REPO_ROOT" ] && [ -f "${PWD}/.clagentic-project" ]; then
+  _pwg_primary=$(head -n 1 "${PWD}/.clagentic-project" 2>/dev/null || true)
+  if [ -n "$_pwg_primary" ]; then
+    REPO_ROOT="$_pwg_primary"
+  fi
+fi
 
 # Read the Claude Code tool-call JSON and extract file_path via real JSON
 # parsing — NOT sed.

@@ -6,7 +6,8 @@
 # asking the user to recall them manually.
 # Non-blocking — any failure exits 0 silently.
 
-set -e
+# set -e intentionally absent — this hook is non-blocking and must always
+# exit 0 on unexpected failures.
 
 [ "${CLAGENTIC_DISABLE_RECALL:-0}" = "1" ] && exit 0
 

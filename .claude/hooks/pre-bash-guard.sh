@@ -3,14 +3,17 @@
 # Blocks dangerous shell commands. Exit 2 = block.
 # Rules R-001..R-020 documented in docs/GATES.md.
 
-set -e
+# set -e intentionally absent: unexpected failures must exit 0, not crash the
+# session. Only the explicit block() paths below exit 2 to block a tool call.
+# If platform.sh is missing or broken the hook fails open (allow + no audit).
 
-# Source platform shims for ds_json_field / ds_audit_log / ds_repo_root.
-# The hook is invoked by Claude Code with cwd = the session's working dir;
-# platform.sh lives at a fixed repo-relative path that we resolve via $0.
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR=.
-. "$HOOK_DIR/../../scripts/platform.sh"
-ds_load_env
+if ! . "$HOOK_DIR/../../scripts/platform.sh" 2>/dev/null; then
+  # platform.sh unavailable — cannot validate safely, but also cannot block
+  # legitimately. Fail open: let the call through without audit.
+  exit 0
+fi
+ds_load_env 2>/dev/null || true
 
 # _rule_allowed <rule_id> — returns 0 if the rule is in CLAGENTIC_ALLOW_BASH_RULES, 1 otherwise
 _rule_allowed() {

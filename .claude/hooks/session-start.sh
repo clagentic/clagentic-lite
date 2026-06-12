@@ -15,6 +15,18 @@
 MEMORY_DB="${PWD}/.clagentic/lite/memory.db"
 CONTRACT_MD="${PWD}/.clagentic/lite/builder-contract.md"
 
+# Wrapper-CWD fallback: if the memory DB is absent and a .clagentic-project
+# pointer exists in CWD, read the first enrolled repo path and redirect
+# MEMORY_DB and CONTRACT_MD to that repo's .clagentic/lite/ paths.
+# Only the first line is used — multi-repo wrappers use the primary project.
+if [ ! -f "$MEMORY_DB" ] && [ -f "${PWD}/.clagentic-project" ]; then
+  _ws_primary=$(head -n 1 "${PWD}/.clagentic-project" 2>/dev/null || true)
+  if [ -n "$_ws_primary" ]; then
+    MEMORY_DB="${_ws_primary}/.clagentic/lite/memory.db"
+    CONTRACT_MD="${_ws_primary}/.clagentic/lite/builder-contract.md"
+  fi
+fi
+
 # ---- 1. Recent session summaries ----------------------------------------
 
 RECENT=""
