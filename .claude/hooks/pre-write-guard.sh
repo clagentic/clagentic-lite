@@ -101,7 +101,11 @@ block() {
 }
 
 # W-001: writes only on a feature branch
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+# Use REPO_ROOT for the branch check so wrapper sessions (where $PWD is not a
+# git repo) resolve the branch against the actual enrolled repo, not the
+# wrapper directory. Without -C, git rev-parse returns "" in a wrapper CWD,
+# "$ != main" is false, and W-001 silently allows writes to main.
+CURRENT_BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 if [ "${CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE:-0}" != "1" ] && [ "$CURRENT_BRANCH" = "$DEFAULT_BRANCH" ]; then
   block W-001 "writes forbidden on default branch '$DEFAULT_BRANCH'"
 fi
