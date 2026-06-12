@@ -3,11 +3,15 @@
 # Blocks writes to the default branch, outside the repo, or to sensitive paths.
 # Exit 2 = block.
 
-set -e
+# set -e intentionally absent: unexpected failures must exit 0, not crash the
+# session. Only the explicit block() paths below exit 2 to block a tool call.
+# If platform.sh is missing or broken the hook fails open (allow + no audit).
 
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR=.
-. "$HOOK_DIR/../../scripts/platform.sh"
-ds_load_env
+if ! . "$HOOK_DIR/../../scripts/platform.sh" 2>/dev/null; then
+  exit 0
+fi
+ds_load_env 2>/dev/null || true
 
 DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
 REPO_ROOT=$(ds_repo_root || echo "")

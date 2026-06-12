@@ -8,8 +8,8 @@
 # detaching so the payload is captured before the parent closes stdin.
 
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR=.
-. "$HOOK_DIR/../../scripts/platform.sh"
-ds_load_env
+. "$HOOK_DIR/../../scripts/platform.sh" 2>/dev/null || exit 0
+ds_load_env 2>/dev/null || true
 
 DEBOUNCE="${CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC:-20}"
 REPO_ROOT=$(ds_repo_root || pwd)
