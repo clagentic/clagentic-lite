@@ -34,7 +34,7 @@ bad()  { printf '  FAIL  %s\n' "$*" 1>&2; FAIL=$((FAIL+1)); }
 
 # ---------------------------------------------------------------- 1. doctor prereqs
 
-step "1. clagentic doctor prereq checks (read-only)"
+step "1. clagentic-lite doctor prereq checks (read-only)"
 # We only check that doctor exits 0 for prereq tools that ARE on this machine.
 # Don't fail smoke if security tools are missing — smoke runs on a bare CI box.
 if command -v sqlite3 >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then

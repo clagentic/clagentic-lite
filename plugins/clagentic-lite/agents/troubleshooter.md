@@ -35,7 +35,7 @@ Check the obvious before diving deep:
 4. Is `audit.db` / `memory.db` valid SQLite? (`sqlite3 .clagentic/audit.db "PRAGMA integrity_check;"`)
 5. Is the hook shim present and executable? (`ls -l .git/hooks/pre-commit .git/hooks/pre-push`)
 6. Are the required env vars set? (check `.clagentic/config`, `~/.config/clagentic/config` for the relevant role chain)
-7. Is `CLAGENTIC_HOME` set and pointing to a valid install? (`ls "$CLAGENTIC_HOME/scripts/gates.sh"`)
+7. Is `CLAGENTIC_LITE_HOME` set and pointing to a valid install? (`ls "$CLAGENTIC_LITE_HOME/scripts/gates.sh"`)
 
 If Tier 0 finds the cause, emit the finding immediately. Do not proceed to Tier 1.
 

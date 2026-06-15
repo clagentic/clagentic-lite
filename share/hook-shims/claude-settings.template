@@ -1,21 +1,21 @@
 {
-  "$comment": "clagentic-lite Claude Code hook wiring · clagentic-settings-version: v4 · managed-by: clagentic. Do not edit by hand — re-run `clagentic-lite enroll --force` or `clagentic-lite update` to regenerate.",
+  "$comment": "clagentic-lite Claude Code hook wiring · clagentic-settings-version: v5 · managed-by: clagentic. Do not edit by hand — re-run `clagentic-lite enroll --force` or `clagentic-lite update` to regenerate.",
   "hooks": {
     "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "__CLAGENTIC_HOME__/.claude/hooks/session-start.sh" }] }
+      { "hooks": [{ "type": "command", "command": "__CLAGENTIC_LITE_HOME__/.claude/hooks/session-start.sh" }] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "__CLAGENTIC_HOME__/.claude/hooks/prompt-inject.sh" }] }
+      { "hooks": [{ "type": "command", "command": "__CLAGENTIC_LITE_HOME__/.claude/hooks/prompt-inject.sh" }] }
     ],
     "PreToolUse": [
-      { "matcher": "Bash",       "hooks": [{ "type": "command", "command": "__CLAGENTIC_HOME__/.claude/hooks/pre-bash-guard.sh" }] },
-      { "matcher": "Write|Edit", "hooks": [{ "type": "command", "command": "__CLAGENTIC_HOME__/.claude/hooks/pre-write-guard.sh" }] }
+      { "matcher": "Bash",       "hooks": [{ "type": "command", "command": "__CLAGENTIC_LITE_HOME__/.claude/hooks/pre-bash-guard.sh" }] },
+      { "matcher": "Write|Edit", "hooks": [{ "type": "command", "command": "__CLAGENTIC_LITE_HOME__/.claude/hooks/pre-write-guard.sh" }] }
     ],
     "PostToolUse": [
-      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "__CLAGENTIC_HOME__/.claude/hooks/post-tool-nudge.sh" }] }
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "__CLAGENTIC_LITE_HOME__/.claude/hooks/post-tool-nudge.sh" }] }
     ],
     "Stop": [
-      { "hooks": [{ "type": "command", "command": "__CLAGENTIC_HOME__/.claude/hooks/stop-summarize.sh" }] }
+      { "hooks": [{ "type": "command", "command": "__CLAGENTIC_LITE_HOME__/.claude/hooks/stop-summarize.sh" }] }
     ]
   },
   "permissions": {
