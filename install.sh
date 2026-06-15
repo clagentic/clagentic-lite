@@ -11,7 +11,7 @@ install.sh was removed in clagentic-lite v0.2.
 The new install flow is a one-time clone plus a per-project enroll:
 
     # First install OR re-run after pulling new commits:
-    HOME_DIR="${CLAGENTIC_HOME:-$HOME/.clagentic-lite}"
+    HOME_DIR="${CLAGENTIC_LITE_HOME:=${CLAGENTIC_HOME:-$HOME/.clagentic/lite}}"
     if [ -d "$HOME_DIR/.git" ]; then
       git -C "$HOME_DIR" pull --ff-only
     else

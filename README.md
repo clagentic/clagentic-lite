@@ -81,7 +81,7 @@ Clone once, enroll per project. The snippet below is safe to re-run — on a fre
 
 ```sh
 # First install OR re-run after pulling new commits.
-HOME_DIR="${CLAGENTIC_HOME:-$HOME/.clagentic/lite}"
+HOME_DIR="${CLAGENTIC_LITE_HOME:-$HOME/.clagentic/lite}"
 if [ -d "$HOME_DIR/.git" ]; then
   git -C "$HOME_DIR" pull --ff-only
 else
@@ -106,7 +106,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic-lite update` — pulls `--ff-only`, re-checks prereqs, re-stamps all versioned artifacts in enrolled repos when their template versions change.
 
-The tool is cloned once to `~/.clagentic/lite` (or `$CLAGENTIC_HOME` if set). Your projects never contain a copy of the scripts or agent files — they hold only `.clagentic/lite/{audit.db,memory.db}`, thin hook shims, and a `CLAUDE.md` that call back to `$CLAGENTIC_HOME`. Update the tool once and every enrolled repo picks it up.
+The tool is cloned once to `~/.clagentic/lite` (or `$CLAGENTIC_LITE_HOME` if set). Your projects never contain a copy of the scripts or agent files — they hold only `.clagentic/lite/{audit.db,memory.db}`, thin hook shims, and a `CLAUDE.md` that call back to `$CLAGENTIC_LITE_HOME`. Update the tool once and every enrolled repo picks it up.
 
 ### Prerequisites
 
@@ -152,20 +152,20 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 
 ### What `clagentic-lite init` and `clagentic-lite enroll` do
 
-**`clagentic-lite init`** (run once, in $CLAGENTIC_HOME or anywhere after the symlink is on PATH):
+**`clagentic-lite init`** (run once, in $CLAGENTIC_LITE_HOME or anywhere after the symlink is on PATH):
 
-1. Verifies `$CLAGENTIC_HOME` is a valid clagentic-lite checkout.
+1. Verifies `$CLAGENTIC_LITE_HOME` is a valid clagentic-lite checkout.
 2. Detects WSL vs macOS, picks portable tool variants (`scripts/platform.sh`).
 3. For each REQUIRED missing tool: prints `MISSING: X — install with: <cmd>` and prompts `Run it now? [y/N]:`. On y, runs the install command. On N, exits non-zero with the manual command.
 4. Two-question front door: accept all defaults (Y/n) + vendor mode ([1] Claude only / [2] Claude+Codex). On Y+mode-2: writes global config and done. On n: up to 6 granular prompts.
 5. Writes `~/.config/clagentic/config` (chmod 600).
 6. Ensures `~/.local/bin/` exists; warns with the exact shell-profile line if not on `$PATH`.
-7. Symlinks `~/.local/bin/clagentic-lite` to `$CLAGENTIC_HOME/bin/clagentic-lite`.
+7. Symlinks `~/.local/bin/clagentic-lite` to `$CLAGENTIC_LITE_HOME/bin/clagentic-lite`.
 
 **`clagentic-lite enroll [PATH]`** (run inside each project you want gates on, default `$PWD`):
 
 1. Verifies the path is a git repo.
-2. Refuses if the path is `$CLAGENTIC_HOME` (use `--self` for dogfood).
+2. Refuses if the path is `$CLAGENTIC_LITE_HOME` (use `--self` for dogfood).
 3. Refuses if already enrolled (use `--force` to re-enroll).
 4. Initializes `.clagentic/lite/audit.db` and `.clagentic/lite/memory.db` in that repo.
 5. Stamps `.git/hooks/pre-commit` and `.git/hooks/pre-push` from `share/hook-shims/*.template`, substituting `$CLAGENTIC_HOME` at stamp time. Refuses to overwrite non-clagentic hooks unless `--force`.
@@ -175,7 +175,7 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 
 ### Solo vs. shared repos
 
-**Solo / private repo**: `CLAUDE.md` is generated and ready to use. If you'd rather not commit it, add it to `.gitignore` yourself — clagentic won't do that automatically because the file is safe to commit.
+**Solo / private repo**: `CLAUDE.md` is generated and ready to use. If you'd rather not commit it, add it to `.gitignore` yourself — clagentic-lite won't do that automatically because the file is safe to commit.
 
 **Shared repo**: `CLAUDE.md` is committable as-is and is the only clagentic artifact that is meant to be shared. It contains no machine-specific paths. Teammates without clagentic-lite installed will see a normal project CLAUDE.md. Teammates with clagentic-lite installed will get full agent auto-dispatch.
 
@@ -190,19 +190,19 @@ Two layers — the shell harness, then Claude Code's view of it.
 **Shell harness:**
 
 ```sh
-# Run from inside $CLAGENTIC_HOME (default: ~/.clagentic/lite):
-"$CLAGENTIC_HOME/scripts/smoke.sh" --quick   # non-interactive end-to-end without LLM calls
+# Run from inside $CLAGENTIC_LITE_HOME (default: ~/.clagentic/lite):
+"$CLAGENTIC_LITE_HOME/scripts/smoke.sh" --quick   # non-interactive end-to-end without LLM calls
 
 # Run from inside an enrolled project repo:
-"$CLAGENTIC_HOME/scripts/gates.sh" digest    # show what gates ran today
-"$CLAGENTIC_HOME/scripts/gates.sh" status    # last 10 runs per gate, color-coded
-"$CLAGENTIC_HOME/scripts/gates.sh" tail      # follow audit.db live (Ctrl-C to quit)
+"$CLAGENTIC_LITE_HOME/scripts/gates.sh" digest    # show what gates ran today
+"$CLAGENTIC_LITE_HOME/scripts/gates.sh" status    # last 10 runs per gate, color-coded
+"$CLAGENTIC_LITE_HOME/scripts/gates.sh" tail      # follow audit.db live (Ctrl-C to quit)
 
 # Run from anywhere:
 clagentic-lite doctor      # diagnostics: symlink, prereqs, every enrolled repo's hook status
 ```
 
-Note: `scripts/` lives in `$CLAGENTIC_HOME`, not in your enrolled project. Always use the absolute path form (`"$CLAGENTIC_HOME/scripts/gates.sh"`) when running gate scripts directly from inside a project. The `clagentic-lite` CLI and `/ship`, `/review` slash commands use the correct path automatically.
+Note: `scripts/` lives in `$CLAGENTIC_LITE_HOME`, not in your enrolled project. Always use the absolute path form (`"$CLAGENTIC_LITE_HOME/scripts/gates.sh"`) when running gate scripts directly from inside a project. The `clagentic-lite` CLI and `/ship`, `/review` slash commands use the correct path automatically.
 
 Smoke covers: DB init, seed + recall, gitleaks blocks a planted token, `llm-client.sh review` emits parseable JSON, audit-DB has fresh rows. If smoke passes, the harness is wired correctly.
 
@@ -299,7 +299,7 @@ CLAGENTIC_MODEL_OLLAMA_DEFAULT=llama3.1:8b
 
 ## Layout
 
-The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic/lite`). Your enrolled projects hold only the per-repo state — no copy of scripts, agents, or config.
+The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enrolled projects hold only the per-repo state — no copy of scripts, agents, or config.
 
 ```
 ~/.clagentic/lite/                              the tool — never gated by default
@@ -339,7 +339,7 @@ The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic/lite`). Your enrolled
 
 ~/.config/clagentic/config                      global config (chmod 600; written by init)
 ~/.local/state/clagentic/registry               enrolled repos — one absolute path per line
-~/.local/bin/clagentic-lite                     symlink to $CLAGENTIC_HOME/bin/clagentic-lite
+~/.local/bin/clagentic-lite                     symlink to $CLAGENTIC_LITE_HOME/bin/clagentic-lite
 
 <any enrolled repo>/
 ├── .clagentic/
@@ -351,8 +351,8 @@ The tool lives in `$CLAGENTIC_HOME` (default `~/.clagentic/lite`). Your enrolled
 │       ├── audit.db                            gate run log (written by gates.sh, gitignored)
 │       └── memory.db                           session memory (written by memory.sh, gitignored)
 └── .git/hooks/
-    ├── pre-commit                              shim: calls $CLAGENTIC_HOME/scripts/gates.sh secrets
-    └── pre-push                                shim: calls $CLAGENTIC_HOME/scripts/gates.sh pre-push
+    ├── pre-commit                              shim: calls $CLAGENTIC_LITE_HOME/scripts/gates.sh secrets
+    └── pre-push                                shim: calls $CLAGENTIC_LITE_HOME/scripts/gates.sh pre-push
 ```
 
 ---

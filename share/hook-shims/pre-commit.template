@@ -1,9 +1,9 @@
 #!/bin/sh
-# clagentic-lite hook shim · v2 · do not edit by hand
+# clagentic-lite hook shim · v3 · do not edit by hand
 # managed-by: clagentic
-: "${CLAGENTIC_HOME:=__CLAGENTIC_HOME__}"
-if [ ! -x "$CLAGENTIC_HOME/scripts/gates.sh" ]; then
-  printf 'clagentic-lite missing at %s — run `clagentic-lite doctor`\n' "$CLAGENTIC_HOME" >&2
+: "${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}"
+if [ ! -x "$CLAGENTIC_LITE_HOME/scripts/gates.sh" ]; then
+  printf 'clagentic-lite missing at %s — run `clagentic-lite doctor`\n' "$CLAGENTIC_LITE_HOME" >&2
   exit 1
 fi
-exec "$CLAGENTIC_HOME/scripts/gates.sh" secrets
+exec "$CLAGENTIC_LITE_HOME/scripts/gates.sh" secrets

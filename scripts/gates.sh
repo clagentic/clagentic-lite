@@ -24,14 +24,14 @@ ds_load_env
 
 # Tool home: the directory containing scripts/ — resolved from this script's
 # own location so it's correct whether invoked via PATH, symlink, or directly.
-# This is the install tree ($CLAGENTIC_HOME), not the enrolled project root.
+# This is the install tree ($CLAGENTIC_LITE_HOME), not the enrolled project root.
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOL_HOME="$(dirname "$SCRIPTS_DIR")"
 
 # Project root resolution: CLAGENTIC_PROJECT_ROOT env var wins, then git
 # show-toplevel of cwd. The env var is the override path used when gates.sh
 # is called from a hook shim installed by `clagentic-lite enroll` — the shim
-# stamps __CLAGENTIC_HOME__ at enroll time but does NOT override the project
+# stamps __CLAGENTIC_LITE_HOME__ at enroll time but does NOT override the project
 # root; instead, git show-toplevel of the repo under commit is used because
 # the hook always runs from inside the enrolled repo's working tree.
 # Explicit CLAGENTIC_PROJECT_ROOT is still supported for scripted/test use.

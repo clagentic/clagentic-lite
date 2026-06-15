@@ -180,9 +180,9 @@ CREATE TABLE gate_runs (
 
 ## Install shape: clone once, enroll per repo
 
-The tool is cloned once to `$CLAGENTIC_HOME` (default `~/.clagentic/lite`). The tool's own repo is never the thing under gates by default — `clagentic-lite enroll --self` is the dogfood escape hatch.
+The tool is cloned once to `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). The tool's own repo is never the thing under gates by default — `clagentic-lite enroll --self` is the dogfood escape hatch.
 
-Per-repo footprint is `.clagentic/lite/{audit.db,memory.db}`, thin shims in `.git/hooks/` that call back to `$CLAGENTIC_HOME/scripts/`, and a `.claude/` directory containing a generated `settings.json` (with absolute hook paths pointing to `$CLAGENTIC_HOME/.claude/hooks/`) plus symlinks to `$CLAGENTIC_HOME/.claude/{commands,agents}`. The `.claude/` directory is added to the project's `.gitignore` automatically. Update the tool once; every enrolled repo picks up the new version automatically because the hook scripts and the symlinked commands/agents resolve back to `$CLAGENTIC_HOME`.
+Per-repo footprint is `.clagentic/lite/{audit.db,memory.db}`, thin shims in `.git/hooks/` that call back to `$CLAGENTIC_LITE_HOME/scripts/`, and a `.claude/` directory containing a generated `settings.json` (with absolute hook paths pointing to `$CLAGENTIC_LITE_HOME/.claude/hooks/`) plus symlinks to `$CLAGENTIC_LITE_HOME/.claude/{commands,agents}`. The `.claude/` directory is added to the project's `.gitignore` automatically. Update the tool once; every enrolled repo picks up the new version automatically because the hook scripts and the symlinked commands/agents resolve back to `$CLAGENTIC_LITE_HOME`.
 
 `bin/clagentic-lite` is the CLI entry point. It dispatches `init` (setup + symlink), `enroll` (hook stamp + DB init + register), `unenroll` (remove clagentic-owned hooks + deregister), `list` (enrolled status table), `doctor` (diagnostics punch list), and `update` (ff-only pull + re-stamp).
 

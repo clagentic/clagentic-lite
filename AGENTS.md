@@ -111,7 +111,7 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 | `share/config.example` | all configurable parameters, no secrets (written to ~/.config/clagentic/config by init) |
 | `share/hook-shims/pre-commit.template` | hook shim template stamped into enrolled repos at enroll time |
 | `share/hook-shims/pre-push.template` | hook shim template stamped into enrolled repos at enroll time |
-| `share/hook-shims/claude-settings.template` | settings.json template stamped into enrolled repos — hook paths substituted with absolute `$CLAGENTIC_HOME` paths |
+| `share/hook-shims/claude-settings.template` | settings.json template stamped into enrolled repos — hook paths substituted with absolute `$CLAGENTIC_LITE_HOME` paths |
 | `share/hook-shims/CLAUDE.md.template` | CLAUDE.md template stamped into enrolled repo root — thin enrollment notice, unconditionally true for any teammate |
 | `share/hook-shims/builder-contract.template` | builder-contract.md template stamped into `.clagentic/lite/` (gitignored) — full builder rules, agent table, commands, hooks, gate reference; injected at session start |
 | `.claude/settings.json` | hook wiring (tool's own repo; enrolled repos get a generated copy in their `.claude/`) |
@@ -166,7 +166,7 @@ The version strings are arbitrary (`v1`, `v2`, ...) — increment by one each ti
 
 **After bumping:** run `clagentic-lite update` (or `clagentic-lite update --restamp` to force all enrolled repos regardless of version). Users on older installs get the restamp automatically on their next `update` run.
 
-**`.claude/commands/` is different.** Those files are symlinked directly from `$CLAGENTIC_HOME/.claude/commands` into enrolled repos — no stamping, no version tracking. Changes take effect immediately for all enrolled repos. No version bump needed.
+**`.claude/commands/` is different.** Those files are symlinked directly from `$CLAGENTIC_LITE_HOME/.claude/commands` into enrolled repos — no stamping, no version tracking. Changes take effect immediately for all enrolled repos. No version bump needed.
 
 ## Plugin rename protocol
 

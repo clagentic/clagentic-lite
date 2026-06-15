@@ -47,14 +47,14 @@ if [ -f "$CONTRACT_MD" ]; then
 fi
 
 # ---- 2. Update alert -------------------------------------------------------
-# Resolve CLAGENTIC_HOME; fall back to the hook file's grandparent directory
+# Resolve CLAGENTIC_LITE_HOME; fall back to the hook file's grandparent directory
 # (mirrors the bin/clagentic-lite resolution logic).
-: "${CLAGENTIC_HOME:=$HOME/.clagentic/lite}"
+: "${CLAGENTIC_LITE_HOME:=${CLAGENTIC_HOME:-$HOME/.clagentic/lite}}"
 
 UPDATE_MSG=""
 
 if [ "${CLAGENTIC_SKIP_UPDATE_ALERT:-0}" != "1" ] \
-    && git -C "$CLAGENTIC_HOME" rev-parse --git-dir >/dev/null 2>&1; then
+    && git -C "$CLAGENTIC_LITE_HOME" rev-parse --git-dir >/dev/null 2>&1; then
 
   # State file: track the last time we did a network fetch.
   _STATE_DIR="$HOME/.config/clagentic"
@@ -73,20 +73,20 @@ if [ "${CLAGENTIC_SKIP_UPDATE_ALERT:-0}" != "1" ] \
     # Best-effort fetch; 5 s timeout; suppress all output.
     # Only stamp the state file when the fetch succeeds — a network failure must
     # not lock out update detection for 24 h.
-    if $DS_TIMEOUT_CMD 5 git -C "$CLAGENTIC_HOME" fetch --quiet 2>/dev/null; then
+    if $DS_TIMEOUT_CMD 5 git -C "$CLAGENTIC_LITE_HOME" fetch --quiet 2>/dev/null; then
       mkdir -p "$_STATE_DIR" 2>/dev/null || true
       printf '%s\n' "$_NOW" > "$_STATE_FILE" 2>/dev/null || true
     fi
   fi
 
-  _UPSTREAM=$(git -C "$CLAGENTIC_HOME" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+  _UPSTREAM=$(git -C "$CLAGENTIC_LITE_HOME" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
   if [ -z "$_UPSTREAM" ]; then
     # No tracking branch configured; fall back to origin/main so new installs
     # still receive the update notice after the initial fetch.
-    git -C "$CLAGENTIC_HOME" rev-parse --verify origin/main >/dev/null 2>&1 && _UPSTREAM="origin/main" || true
+    git -C "$CLAGENTIC_LITE_HOME" rev-parse --verify origin/main >/dev/null 2>&1 && _UPSTREAM="origin/main" || true
   fi
   if [ -n "$_UPSTREAM" ]; then
-    _BEHIND=$(git -C "$CLAGENTIC_HOME" rev-list --count "HEAD..$_UPSTREAM" 2>/dev/null || echo 0)
+    _BEHIND=$(git -C "$CLAGENTIC_LITE_HOME" rev-list --count "HEAD..$_UPSTREAM" 2>/dev/null || echo 0)
     if [ "${_BEHIND:-0}" -gt 0 ] 2>/dev/null; then
       UPDATE_MSG="UPDATE AVAILABLE · clagentic-lite is ${_BEHIND} commit(s) behind upstream — run \`clagentic-lite update\` to install, or set CLAGENTIC_SKIP_UPDATE_ALERT=1 to suppress."
     fi

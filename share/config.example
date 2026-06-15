@@ -13,7 +13,9 @@
 
 # ---------- tool home ----------
 # Set automatically by `clagentic-lite init`. Edit only if you move the install.
-CLAGENTIC_HOME=
+# CLAGENTIC_HOME is the deprecated name — still honored with a one-time warning for
+# back-compat. Migrate to CLAGENTIC_LITE_HOME.
+CLAGENTIC_LITE_HOME=
 
 # ---------- model tier table ----------
 # Resolve symbolic tier names to concrete model strings for each CLI.
