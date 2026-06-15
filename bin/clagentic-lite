@@ -1417,17 +1417,19 @@ cmd_doctor() {
         [ "$_lowest" = "$_codex_min" ] && _codex_ok=1
       else
         # Arithmetic fallback: simple integer comparison on MAJOR.MINOR.PATCH.
-        _ci_maj=$(printf '%s' "$_codex_ver" | cut -d. -f1)
-        _ci_min=$(printf '%s' "$_codex_ver" | cut -d. -f2)
-        _ci_pat=$(printf '%s' "$_codex_ver" | cut -d. -f3)
-        _cm_maj=$(printf '%s' "$_codex_min" | cut -d. -f1)
-        _cm_min=$(printf '%s' "$_codex_min" | cut -d. -f2)
-        _cm_pat=$(printf '%s' "$_codex_min" | cut -d. -f3)
-        if   [ "${_ci_maj:-0}" -gt "${_cm_maj:-0}" ]; then _codex_ok=1
-        elif [ "${_ci_maj:-0}" -lt "${_cm_maj:-0}" ]; then _codex_ok=0
-        elif [ "${_ci_min:-0}" -gt "${_cm_min:-0}" ]; then _codex_ok=1
-        elif [ "${_ci_min:-0}" -lt "${_cm_min:-0}" ]; then _codex_ok=0
-        elif [ "${_ci_pat:-0}" -ge "${_cm_pat:-0}" ]; then _codex_ok=1
+        # Strip non-numeric suffixes (pre-release tags) to avoid arithmetic errors,
+        # consistent with the version_ge() helper in llm-client.sh.
+        _ci_maj=$(printf '%s' "$_codex_ver" | cut -d. -f1 | tr -cd '0-9'); _ci_maj="${_ci_maj:-0}"
+        _ci_min=$(printf '%s' "$_codex_ver" | cut -d. -f2 | tr -cd '0-9'); _ci_min="${_ci_min:-0}"
+        _ci_pat=$(printf '%s' "$_codex_ver" | cut -d. -f3 | tr -cd '0-9'); _ci_pat="${_ci_pat:-0}"
+        _cm_maj=$(printf '%s' "$_codex_min" | cut -d. -f1 | tr -cd '0-9'); _cm_maj="${_cm_maj:-0}"
+        _cm_min=$(printf '%s' "$_codex_min" | cut -d. -f2 | tr -cd '0-9'); _cm_min="${_cm_min:-0}"
+        _cm_pat=$(printf '%s' "$_codex_min" | cut -d. -f3 | tr -cd '0-9'); _cm_pat="${_cm_pat:-0}"
+        if   [ "$_ci_maj" -gt "$_cm_maj" ]; then _codex_ok=1
+        elif [ "$_ci_maj" -lt "$_cm_maj" ]; then _codex_ok=0
+        elif [ "$_ci_min" -gt "$_cm_min" ]; then _codex_ok=1
+        elif [ "$_ci_min" -lt "$_cm_min" ]; then _codex_ok=0
+        elif [ "$_ci_pat" -ge "$_cm_pat" ]; then _codex_ok=1
         fi
       fi
       if [ "$_codex_ok" -eq 1 ]; then

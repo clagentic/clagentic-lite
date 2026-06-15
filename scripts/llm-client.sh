@@ -552,10 +552,10 @@ validate_output() {
               jq -e '.findings // [] | all(.severity == null or (.severity | ascii_downcase | IN("low","medium","high","critical")))' "$F" >/dev/null 2>&1 || return 1
             else
               # Try single-key wrapper: extract the sole value, check it has .findings.
-              # `to_entries | .[0].value` on a one-key object yields the inner object.
+              # `to_entries[0].value` on a one-key object yields the inner object directly.
               # Fails (returns non-zero) on multi-key objects or non-objects.
-              jq -e '(to_entries | length == 1) and (.[to_entries[0].key].findings | type == "array")' "$F" >/dev/null 2>&1 || return 1
-              jq -e '.[to_entries[0].key].findings // [] | all(.severity == null or (.severity | ascii_downcase | IN("low","medium","high","critical")))' "$F" >/dev/null 2>&1 || return 1
+              jq -e '(to_entries | length == 1) and (to_entries[0].value.findings | type == "array")' "$F" >/dev/null 2>&1 || return 1
+              jq -e 'to_entries[0].value.findings // [] | all(.severity == null or (.severity | ascii_downcase | IN("low","medium","high","critical")))' "$F" >/dev/null 2>&1 || return 1
             fi
             ;;
           gate)
@@ -564,7 +564,7 @@ validate_output() {
               : # Bare top-level .decision — primary path.
             else
               # Single-key wrapper: inner object must have .decision.
-              jq -e '(to_entries | length == 1) and (.[to_entries[0].key].decision | ascii_downcase | IN("approve","refuse"))' "$F" >/dev/null 2>&1 || return 1
+              jq -e '(to_entries | length == 1) and (to_entries[0].value.decision | ascii_downcase | IN("approve","refuse"))' "$F" >/dev/null 2>&1 || return 1
             fi
             ;;
         esac
