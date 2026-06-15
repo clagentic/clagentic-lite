@@ -290,7 +290,7 @@ _stamp_wrapper_settings() {
   _sws_claude_dir="$_sws_wrapper/.claude"
   mkdir -p "$_sws_claude_dir" || { warn "cannot create $_sws_claude_dir"; return 0; }
 
-  # Stamp settings.json with __CLAGENTIC_HOME__ substituted.
+  # Stamp settings.json with __CLAGENTIC_LITE_HOME__ substituted.
   # Use a distinct $comment marker so the wrapper file is self-describing.
   _sws_target="$_sws_claude_dir/settings.json"
   if [ -f "$_sws_target" ] && ! grep -q 'managed-by: clagentic' "$_sws_target" 2>/dev/null; then
@@ -522,7 +522,7 @@ cmd_init() {
   if command -v claude >/dev/null 2>&1; then
     # Best-effort pre-registration so the subsequent list check can find the plugin
     # even when the marketplace was not previously registered.
-    claude plugin marketplace add "$CLAGENTIC_LITE_HOME"--scope user 2>/dev/null || true
+    claude plugin marketplace add "$CLAGENTIC_LITE_HOME" --scope user 2>/dev/null || true
 
     # Migration: uninstall the old plugin name (clagentic-lite-agents, shipped before v1.2.0)
     # before checking for or installing the current name. The old name contains "clagentic-lite"
@@ -541,18 +541,18 @@ cmd_init() {
     if claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite(@|[[:space:]]|$)'; then
       say "plugin clagentic-lite already installed"
     else
-      if claude plugin marketplace add "$CLAGENTIC_LITE_HOME"--scope user; then
+      if claude plugin marketplace add "$CLAGENTIC_LITE_HOME" --scope user; then
         if claude plugin install "clagentic-lite@clagentic-lite"; then
           say "installed plugin: clagentic-lite (agents and skills available globally)"
         else
           warn "claude plugin install failed — run manually: claude plugin install clagentic-lite@clagentic-lite"
         fi
       else
-        warn "claude plugin marketplace add failed — run manually: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite@clagentic-lite"
+        warn "claude plugin marketplace add failed — run manually: claude plugin marketplace add $CLAGENTIC_LITE_HOME && claude plugin install clagentic-lite@clagentic-lite"
       fi
     fi
   else
-    warn "claude not on PATH — skipping plugin install; after adding to PATH run: claude plugin marketplace add $CLAGENTIC_HOME && claude plugin install clagentic-lite@clagentic-lite"
+    warn "claude not on PATH — skipping plugin install; after adding to PATH run: claude plugin marketplace add $CLAGENTIC_LITE_HOME && claude plugin install clagentic-lite@clagentic-lite"
   fi
 
   say "init complete"
