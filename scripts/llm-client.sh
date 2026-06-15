@@ -29,6 +29,94 @@ ds_load_env
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOL_HOME="$(dirname "$SCRIPTS_DIR")"
 
+# ---------------------------------------------------------- version constants ---
+
+# Minimum codex CLI version whose full flag set is known-compatible.
+# v0.137.0 is the earliest version observed dropping a flag that an older
+# invoke_codex invocation used. When codex >= this version, use the full flag
+# set (--skip-git-repo-check -m M --color never -o FILE -). When older or
+# unknown, fall back to a minimal `codex exec -` form and capture the banner
+# as ERR_HINT rather than failing opaquely.
+CODEX_MIN_VERSION="0.137.0"
+
+# version_ge INSTALLED_VER MIN_VER
+# Returns 0 (true) if INSTALLED_VER >= MIN_VER, 1 otherwise.
+# Compares dotted MAJOR.MINOR.PATCH version strings.
+# Each component is compared numerically; extra trailing components are treated
+# as zero on the shorter version. Non-numeric components (pre-release suffixes)
+# cause the comparison to treat that component as 0 — conservative/safe.
+# Uses sort -V (GNU coreutils + BSD sort both support -V on the target platforms
+# per docs/PORTABILITY.md). Falls back to a pure-arithmetic POSIX path when
+# sort -V is unavailable.
+version_ge() {
+  _vge_inst="$1"
+  _vge_min="$2"
+  # Normalize: strip any leading 'v'.
+  _vge_inst="${_vge_inst#v}"
+  _vge_min="${_vge_min#v}"
+  # Identical strings — fast path.
+  [ "$_vge_inst" = "$_vge_min" ] && return 0
+  # Use sort -V if available: feed both versions, take the first (lowest).
+  # If the lowest is the min version, installed >= min.
+  if sort -V /dev/null 2>/dev/null; then
+    _vge_lowest=$(printf '%s\n%s\n' "$_vge_inst" "$_vge_min" | sort -V | head -1)
+    [ "$_vge_lowest" = "$_vge_min" ] && return 0 || return 1
+  fi
+  # Pure-arithmetic POSIX fallback: compare component by component.
+  _vge_i_maj=$(printf '%s' "$_vge_inst" | cut -d. -f1)
+  _vge_i_min=$(printf '%s' "$_vge_inst" | cut -d. -f2)
+  _vge_i_pat=$(printf '%s' "$_vge_inst" | cut -d. -f3)
+  _vge_m_maj=$(printf '%s' "$_vge_min"  | cut -d. -f1)
+  _vge_m_min=$(printf '%s' "$_vge_min"  | cut -d. -f2)
+  _vge_m_pat=$(printf '%s' "$_vge_min"  | cut -d. -f3)
+  # Strip non-numeric suffixes (e.g. pre-release tags); treat as 0 if absent.
+  _vge_i_maj=$(printf '%s' "${_vge_i_maj:-0}" | tr -cd '0-9'); _vge_i_maj="${_vge_i_maj:-0}"
+  _vge_i_min=$(printf '%s' "${_vge_i_min:-0}" | tr -cd '0-9'); _vge_i_min="${_vge_i_min:-0}"
+  _vge_i_pat=$(printf '%s' "${_vge_i_pat:-0}" | tr -cd '0-9'); _vge_i_pat="${_vge_i_pat:-0}"
+  _vge_m_maj=$(printf '%s' "${_vge_m_maj:-0}" | tr -cd '0-9'); _vge_m_maj="${_vge_m_maj:-0}"
+  _vge_m_min=$(printf '%s' "${_vge_m_min:-0}" | tr -cd '0-9'); _vge_m_min="${_vge_m_min:-0}"
+  _vge_m_pat=$(printf '%s' "${_vge_m_pat:-0}" | tr -cd '0-9'); _vge_m_pat="${_vge_m_pat:-0}"
+  if   [ "$_vge_i_maj" -gt "$_vge_m_maj" ]; then return 0
+  elif [ "$_vge_i_maj" -lt "$_vge_m_maj" ]; then return 1
+  elif [ "$_vge_i_min" -gt "$_vge_m_min" ]; then return 0
+  elif [ "$_vge_i_min" -lt "$_vge_m_min" ]; then return 1
+  elif [ "$_vge_i_pat" -ge "$_vge_m_pat" ]; then return 0
+  else return 1
+  fi
+}
+
+# codex_version_check
+# Probes `codex --version` ONCE per process; caches the result so repeated
+# chain steps do not re-invoke the CLI. Sets:
+#   _CODEX_VERSION_STR   — raw version string (e.g. "0.137.0")
+#   _CODEX_VERSION_CODE  — 0 ok/compatible, 1 too-old, 127 not-on-PATH
+# Must be called before the first invoke_codex; invoke_codex reads the cache.
+_CODEX_VERSION_STR=""
+_CODEX_VERSION_CODE=""
+codex_version_check() {
+  # Return cached result if already probed.
+  [ -n "$_CODEX_VERSION_CODE" ] && return 0
+  if ! command -v codex >/dev/null 2>&1; then
+    _CODEX_VERSION_STR="not-found"
+    _CODEX_VERSION_CODE=127
+    return 0
+  fi
+  # Extract version: `codex --version` emits "codex X.Y.Z" or just "X.Y.Z".
+  _cvraw=$(codex --version 2>/dev/null || true)
+  # Parse: take the first token that looks like a dotted version number.
+  _CODEX_VERSION_STR=$(printf '%s' "$_cvraw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  if [ -z "$_CODEX_VERSION_STR" ]; then
+    # Could not parse a version — treat as unknown/too-old; use minimal form.
+    _CODEX_VERSION_STR="unknown"
+    _CODEX_VERSION_CODE=1
+  elif version_ge "$_CODEX_VERSION_STR" "$CODEX_MIN_VERSION"; then
+    _CODEX_VERSION_CODE=0
+  else
+    _CODEX_VERSION_CODE=1
+  fi
+  return 0
+}
+
 # Project root: CLAGENTIC_PROJECT_ROOT wins, then git show-toplevel.
 # llm-client.sh writes LLM call audit rows to the enrolled project's audit.db,
 # not to $CLAGENTIC_LITE_HOME. See gates.sh header for the full rationale.
@@ -351,19 +439,47 @@ invoke_claude() {
 # stdout from codex exec is progress/spinner output (the final response goes to
 # -o OUTPUT_FILE), so we redirect both stdout and stderr to ERR_FILE — that is
 # intentional, not a mistake.
+#
+# Version-gated flag set (CODEX_MIN_VERSION):
+#   >= min: full flags --skip-git-repo-check -m M --color never -o FILE -
+#   <  min: minimal `codex exec -` only; the banner/stderr is captured as
+#           ERR_HINT so the audit row is actionable. The -o flag is NOT used
+#           when version is unknown/old because the flag itself may be the one
+#           that was removed — writing output to ERR_FILE instead lets
+#           validate_output see empty TMP_RAW and fail cleanly.
 invoke_codex() {
   MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"
   TMP_COMBINED=$(mktemp -t clagentic-codex-combined.XXXXXX)
   TMP_RAW=$(mktemp -t clagentic-codex-raw.XXXXXX)
   { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } > "$TMP_COMBINED"
-  if [ -n "$MODEL" ]; then
-    $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec --skip-git-repo-check -m "$MODEL" \
-      --color never -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1
+
+  # Probe version once (result is cached in _CODEX_VERSION_CODE / _CODEX_VERSION_STR).
+  codex_version_check
+
+  _codex_exit=0
+  if [ "$_CODEX_VERSION_CODE" -eq 0 ]; then
+    # Full flag set: version is known-compatible.
+    if [ -n "$MODEL" ]; then
+      $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec --skip-git-repo-check -m "$MODEL" \
+        --color never -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1 || _codex_exit=$?
+    else
+      $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec --skip-git-repo-check \
+        --color never -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1 || _codex_exit=$?
+    fi
   else
-    $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec --skip-git-repo-check \
-      --color never -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1
+    # Minimal form: version is too old or unparseable. Avoid flags that may
+    # have been removed. Output goes to stdout (captured as TMP_RAW via
+    # redirect) rather than -o flag to sidestep any flag-surface change.
+    # ERR_FILE receives stderr; the caller reads it for the ERR_HINT.
+    $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec - \
+      < "$TMP_COMBINED" > "$TMP_RAW" 2> "$ERR_FILE" || _codex_exit=$?
+    # Prepend a version-mismatch note to ERR_FILE so the ERR_HINT in the
+    # audit row is precise and actionable regardless of what codex printed.
+    _codex_ver_note="codex CLI v${_CODEX_VERSION_STR} < required v${CODEX_MIN_VERSION} — flag set may differ; using minimal form"
+    _codex_err_old=$(cat "$ERR_FILE" 2>/dev/null || true)
+    { printf '%s\n' "$_codex_ver_note"; printf '%s\n' "$_codex_err_old"; } > "$ERR_FILE"
   fi
-  EXIT_CODE=$?
+  EXIT_CODE=$_codex_exit
   # Strip ANSI CSI sequences from the -o output file before handing it to
   # validate_output. `codex exec -o` should write clean JSON/text, but
   # --color never is advisory and some codex versions leak escape sequences
@@ -414,40 +530,89 @@ validate_output() {
   case "$MODE" in
     json)
       # Pick the per-role required shape.
-      # - reviewer/auditor: top-level .findings must be an array
-      # - gate: top-level .decision must be "approve" or "refuse"
+      # - reviewer/auditor: top-level .findings must be an array; OR the
+      #   object has a single wrapper key whose value contains .findings
+      #   (tolerated for CLIs that wrap their JSON response). The wrapper
+      #   tolerance is intentionally narrow: we still require .findings to be
+      #   an array and each finding's severity to be valid — only the top-level
+      #   nesting depth is relaxed. Fail-closed contract for required roles is
+      #   unchanged: if no validator is available, the step fails.
+      # - gate: top-level .decision must be "approve" or "refuse"; OR a
+      #   single-key wrapper whose value has .decision with the same constraint.
       # - other roles: accept any valid JSON object
       if command -v jq >/dev/null 2>&1; then
         jq -e . "$F" >/dev/null 2>&1 || return 1
         case "$ROLE" in
           reviewer|auditor)
-            # .findings must be an array; if findings exist, each must have
-            # a severity that normalizes to one of the four valid tiers.
-            # Catches `{"findings":[{"severity":"HIGH"}]}` (would pass with
-            # plain array check) AND `{"findings":[{"severity":"oops"}]}`.
-            jq -e '.findings | type == "array"' "$F" >/dev/null 2>&1 || return 1
-            jq -e '.findings // [] | all(.severity == null or (.severity | ascii_downcase | IN("low","medium","high","critical")))' "$F" >/dev/null 2>&1 || return 1
+            # Primary: bare top-level .findings array (strict, preferred shape).
+            # Widened: single-key wrapper object containing .findings array.
+            # Severity check applies to whichever form is accepted.
+            if jq -e '.findings | type == "array"' "$F" >/dev/null 2>&1; then
+              # Bare top-level .findings — primary path.
+              jq -e '.findings // [] | all(.severity == null or (.severity | ascii_downcase | IN("low","medium","high","critical")))' "$F" >/dev/null 2>&1 || return 1
+            else
+              # Try single-key wrapper: extract the sole value, check it has .findings.
+              # `to_entries | .[0].value` on a one-key object yields the inner object.
+              # Fails (returns non-zero) on multi-key objects or non-objects.
+              jq -e '(to_entries | length == 1) and (.[to_entries[0].key].findings | type == "array")' "$F" >/dev/null 2>&1 || return 1
+              jq -e '.[to_entries[0].key].findings // [] | all(.severity == null or (.severity | ascii_downcase | IN("low","medium","high","critical")))' "$F" >/dev/null 2>&1 || return 1
+            fi
             ;;
           gate)
-            # Decision must be approve|refuse, case-insensitive.
-            jq -e '.decision | ascii_downcase | IN("approve","refuse")' "$F" >/dev/null 2>&1 || return 1
+            # Decision must be approve|refuse, case-insensitive; tolerate one wrapper level.
+            if jq -e '.decision | ascii_downcase | IN("approve","refuse")' "$F" >/dev/null 2>&1; then
+              : # Bare top-level .decision — primary path.
+            else
+              # Single-key wrapper: inner object must have .decision.
+              jq -e '(to_entries | length == 1) and (.[to_entries[0].key].decision | ascii_downcase | IN("approve","refuse"))' "$F" >/dev/null 2>&1 || return 1
+            fi
             ;;
         esac
         return 0
       elif command -v python3 >/dev/null 2>&1; then
         python3 - "$F" "$ROLE" <<'PY' 2>/dev/null
 import json, sys
+
+def findings_valid(lst):
+    valid_sev = {"low", "medium", "high", "critical"}
+    for item in lst:
+        sev = item.get("severity")
+        if sev is not None and sev.lower() not in valid_sev:
+            return False
+    return True
+
 try:
     d = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(1)
 role = sys.argv[2] if len(sys.argv) > 2 else ""
 if role in ("reviewer", "auditor"):
-    if not isinstance(d.get("findings"), list):
-        sys.exit(1)
+    # Primary: bare top-level .findings.
+    if isinstance(d.get("findings"), list):
+        if not findings_valid(d["findings"]):
+            sys.exit(1)
+    else:
+        # Widened: single-key wrapper containing .findings.
+        keys = list(d.keys()) if isinstance(d, dict) else []
+        if len(keys) != 1:
+            sys.exit(1)
+        inner = d[keys[0]]
+        if not isinstance(inner, dict) or not isinstance(inner.get("findings"), list):
+            sys.exit(1)
+        if not findings_valid(inner["findings"]):
+            sys.exit(1)
 elif role == "gate":
-    if d.get("decision") not in ("approve", "refuse"):
-        sys.exit(1)
+    # Primary: bare top-level .decision.
+    if d.get("decision") in ("approve", "refuse"):
+        pass
+    else:
+        # Widened: single-key wrapper.
+        keys = list(d.keys()) if isinstance(d, dict) else []
+        if len(keys) != 1:
+            sys.exit(1)
+        inner = d[keys[0]]
+        if not isinstance(inner, dict) or inner.get("decision") not in ("approve", "refuse"):
+            sys.exit(1)
 sys.exit(0)
 PY
         return $?
@@ -569,7 +734,20 @@ walk_chain() {
         ERR_HINT=$(head -1 "$TMP_ERR" | cut -c1-200)
       [ -z "$ERR_HINT" ] && ERR_HINT="non-empty stderr (exit=$EXIT_CODE)"
     elif [ -s "$TMP_OUT" ]; then
-      ERR_HINT="output failed schema validation"
+      # Output was non-empty but failed validate_output schema check.
+      # Emit a precise hint: include what shape was expected so the audit
+      # row is actionable without having to re-run the gate manually.
+      case "$ROLE_L" in
+        reviewer|auditor)
+          ERR_HINT="output schema mismatch: expected JSON with top-level .findings array (role=$ROLE_L mode=$MODE)"
+          ;;
+        gate)
+          ERR_HINT="output schema mismatch: expected JSON with .decision=approve|refuse (role=$ROLE_L mode=$MODE)"
+          ;;
+        *)
+          ERR_HINT="output failed schema validation (role=$ROLE_L mode=$MODE)"
+          ;;
+      esac
     else
       ERR_HINT="empty output (exit=$EXIT_CODE)"
     fi

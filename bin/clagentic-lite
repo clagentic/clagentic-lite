@@ -1389,6 +1389,71 @@ cmd_doctor() {
   fi
   [ "$_wrapper_found" -eq 0 ] && printf '  (no wrapper .clagentic-project files found)\n'
 
+  # 8a. LLM CLI version detection — non-blocking; info/warn only.
+  # Shows installed codex and claude versions so CLI drift is visible before
+  # a gate run surfaces it as a cryptic step-failed. Uses the same
+  # CODEX_MIN_VERSION constant that invoke_codex uses for flag-set selection.
+  # Not a FAIL: missing CLIs are caught in auth probes below.
+  printf '\nLLM CLI versions:\n'
+  # Load CODEX_MIN_VERSION from llm-client.sh without executing it as a subprocess.
+  # The constant is defined near the top of that file; grep it out directly so
+  # doctor and invoke_codex share the same value without duplication.
+  _SCRIPTS_DIR="$CLAGENTIC_LITE_HOME/scripts"
+  _codex_min=$(grep -E '^CODEX_MIN_VERSION=' "$_SCRIPTS_DIR/llm-client.sh" 2>/dev/null \
+    | head -1 | sed 's/CODEX_MIN_VERSION="\{0,1\}\([^"]*\)"\{0,1\}/\1/')
+  [ -z "$_codex_min" ] && _codex_min="(unknown)"
+  if command -v codex >/dev/null 2>&1; then
+    _codex_ver_raw=$(codex --version 2>/dev/null || true)
+    _codex_ver=$(printf '%s' "$_codex_ver_raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [ -z "$_codex_ver" ]; then
+      printf '  INFO codex: on PATH but version unparseable (output: %s)\n' \
+        "$(printf '%s' "$_codex_ver_raw" | head -1 | cut -c1-80)"
+      printf '       Minimum required: %s — will use minimal codex exec form\n' "$_codex_min"
+    else
+      # Compare against CODEX_MIN_VERSION using the same sort -V approach as version_ge.
+      _codex_ok=0
+      if sort -V /dev/null 2>/dev/null; then
+        _lowest=$(printf '%s\n%s\n' "$_codex_ver" "$_codex_min" | sort -V | head -1)
+        [ "$_lowest" = "$_codex_min" ] && _codex_ok=1
+      else
+        # Arithmetic fallback: simple integer comparison on MAJOR.MINOR.PATCH.
+        _ci_maj=$(printf '%s' "$_codex_ver" | cut -d. -f1)
+        _ci_min=$(printf '%s' "$_codex_ver" | cut -d. -f2)
+        _ci_pat=$(printf '%s' "$_codex_ver" | cut -d. -f3)
+        _cm_maj=$(printf '%s' "$_codex_min" | cut -d. -f1)
+        _cm_min=$(printf '%s' "$_codex_min" | cut -d. -f2)
+        _cm_pat=$(printf '%s' "$_codex_min" | cut -d. -f3)
+        if   [ "${_ci_maj:-0}" -gt "${_cm_maj:-0}" ]; then _codex_ok=1
+        elif [ "${_ci_maj:-0}" -lt "${_cm_maj:-0}" ]; then _codex_ok=0
+        elif [ "${_ci_min:-0}" -gt "${_cm_min:-0}" ]; then _codex_ok=1
+        elif [ "${_ci_min:-0}" -lt "${_cm_min:-0}" ]; then _codex_ok=0
+        elif [ "${_ci_pat:-0}" -ge "${_cm_pat:-0}" ]; then _codex_ok=1
+        fi
+      fi
+      if [ "$_codex_ok" -eq 1 ]; then
+        printf '  INFO codex %s (>= required %s — full flag set enabled)\n' "$_codex_ver" "$_codex_min"
+      else
+        printf '  WARN codex %s < required %s — minimal codex exec form will be used; flag-set mismatch step-fails chain\n' \
+          "$_codex_ver" "$_codex_min"
+        printf '       Upgrade codex to >= %s to restore full flag support.\n' "$_codex_min"
+      fi
+    fi
+  else
+    printf '  INFO codex: not on PATH (minimum required: %s)\n' "$_codex_min"
+  fi
+  if command -v claude >/dev/null 2>&1; then
+    _claude_ver_raw=$(claude --version 2>/dev/null || true)
+    _claude_ver=$(printf '%s' "$_claude_ver_raw" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    if [ -n "$_claude_ver" ]; then
+      printf '  INFO claude %s (on PATH)\n' "$_claude_ver"
+    else
+      printf '  INFO claude: on PATH (version: %s)\n' \
+        "$(printf '%s' "$_claude_ver_raw" | head -1 | cut -c1-60)"
+    fi
+  else
+    printf '  INFO claude: not on PATH\n'
+  fi
+
   # 8. LLM CLI auth probes.
   # Checks that each configured primary CLI is present AND can make a real
   # call. A CLI on PATH that fails auth silently degrades to the chain
