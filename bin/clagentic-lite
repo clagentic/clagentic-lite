@@ -866,11 +866,11 @@ _enroll_one() {
   fi
 
   _canon=$(ds_realpath "$_ep")
-  _home_canon=$(ds_realpath "$CLAGENTIC_HOME")
+  _home_canon=$(ds_realpath "$CLAGENTIC_LITE_HOME")
 
-  # Snake's-head check: refuse to enroll $CLAGENTIC_HOME itself unless --self.
+  # Snake's-head check: refuse to enroll $CLAGENTIC_LITE_HOME itself unless --self.
   if [ "$_canon" = "$_home_canon" ] && [ "$ENROLL_SELF" -ne 1 ]; then
-    warn "enroll: refusing to enroll \$CLAGENTIC_HOME itself ($_canon)"
+    warn "enroll: refusing to enroll \$CLAGENTIC_LITE_HOME itself ($_canon)"
     warn "Use --self if you intentionally want the tool to gate itself."
     return 1
   fi
@@ -904,7 +904,7 @@ _enroll_one() {
   stamp_shim pre-push   "$_hooks_dir" || true
 
   # Stamp Claude Code integration (.claude/ inside the enrolled repo).
-  # settings.json: absolute paths so hook scripts resolve back to CLAGENTIC_HOME.
+  # settings.json: absolute paths so hook scripts resolve back to CLAGENTIC_LITE_HOME.
   # commands/: symlink — pure markdown, no path traversal, stays in sync
   # automatically when the tool updates.
   # agents and skills: installed globally via the clagentic-lite plugin; no per-repo
