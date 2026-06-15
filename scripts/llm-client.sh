@@ -18,7 +18,7 @@
 #     JSON outputs), or empty output, the wrapper advances to the next entry.
 #   - If every step fails, the wrapper emits a "degraded but valid" output
 #     so the caller (gate orchestrator, hook) never crashes.
-#   - Each attempt is logged to .clagentic/audit.db.gate_runs with
+#   - Each attempt is logged to .clagentic/lite/audit.db.gate_runs with
 #     gate='llm-call', outcome='pass'|'fallback'|'degraded', details=<role:cmd:tier>.
 
 set -e
@@ -37,7 +37,7 @@ if [ -n "${CLAGENTIC_PROJECT_ROOT:-}" ]; then
 else
   REPO_ROOT=$(ds_repo_root || pwd)
 fi
-AUDIT_DB="$REPO_ROOT/.clagentic/audit.db"
+AUDIT_DB="$REPO_ROOT/.clagentic/lite/audit.db"
 
 # ---------------------------------------------------------------- prompts -----
 

@@ -168,7 +168,7 @@ env -u CLAGENTIC_SUMMARIZER_CMD -u CLAGENTIC_SUMMARIZER_TIER \
   -u CLAGENTIC_SUMMARIZER_CHAIN CLAGENTIC_BUILDER_CMD="$FAKE_CLI" \
   CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
   sh -c 'printf "" | "$1" summarize' _ "$TOOL_HOME/scripts/llm-client.sh" >/dev/null 2>&1 || true
-if sqlite3 "$REPO_ROOT/.clagentic/audit.db" \
+if sqlite3 "$REPO_ROOT/.clagentic/lite/audit.db" \
   "SELECT 1 FROM gate_runs WHERE gate='llm-call' AND details LIKE 'summarizer:$FAKE_CLI:%' AND ts > datetime('now','-1 hour') LIMIT 1;" \
   2>/dev/null | grep -q 1; then
   ok "summarizer attempted builder CLI fallback (audit row for $FAKE_CLI)"
@@ -230,7 +230,7 @@ fi
 # ---------------------------------------------------- 7. audit.db has rows
 
 step "7. audit.db has rows from this run"
-COUNT=$(sqlite3 "$REPO_ROOT/.clagentic/audit.db" "SELECT COUNT(*) FROM gate_runs WHERE ts > datetime('now','-1 hour');" 2>/dev/null || echo 0)
+COUNT=$(sqlite3 "$REPO_ROOT/.clagentic/lite/audit.db" "SELECT COUNT(*) FROM gate_runs WHERE ts > datetime('now','-1 hour');" 2>/dev/null || echo 0)
 if [ "${COUNT:-0}" -gt 0 ]; then
   ok "audit.db gate_runs has $COUNT recent row(s)"
 else
@@ -257,12 +257,12 @@ if command -v python3 >/dev/null 2>&1; then
       ok "clagentic-lite enroll succeeded on a fresh repo"
 
       # Verify DBs were created in the enrolled repo, NOT in $TOOL_HOME.
-      if [ -f "$SMOKE_TMPDIR/.clagentic/audit.db" ]; then
+      if [ -f "$SMOKE_TMPDIR/.clagentic/lite/audit.db" ]; then
         ok "audit.db created in enrolled repo"
       else
         bad "audit.db missing in enrolled repo"
       fi
-      if [ -f "$SMOKE_TMPDIR/.clagentic/memory.db" ]; then
+      if [ -f "$SMOKE_TMPDIR/.clagentic/lite/memory.db" ]; then
         ok "memory.db created in enrolled repo"
       else
         bad "memory.db missing in enrolled repo"
@@ -290,10 +290,10 @@ if command -v python3 >/dev/null 2>&1; then
       # Verify that a gate fired in the enrolled repo writes to THAT repo's audit.db.
       # gates.sh secrets with no staged files should pass (or at least not crash)
       # and write a row to the enrolled repo's audit.db — not to $TOOL_HOME's DB.
-      _tool_db_before=$(sqlite3 "$TOOL_HOME/.clagentic/audit.db" "SELECT COUNT(*) FROM gate_runs;" 2>/dev/null || echo "0")
+      _tool_db_before=$(sqlite3 "$TOOL_HOME/.clagentic/lite/audit.db" "SELECT COUNT(*) FROM gate_runs;" 2>/dev/null || echo "0")
       (cd "$SMOKE_TMPDIR" && CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/scripts/gates.sh" secrets) >/dev/null 2>&1 || true
-      _tool_db_after=$(sqlite3 "$TOOL_HOME/.clagentic/audit.db" "SELECT COUNT(*) FROM gate_runs;" 2>/dev/null || echo "0")
-      _enroll_db_count=$(sqlite3 "$SMOKE_TMPDIR/.clagentic/audit.db" "SELECT COUNT(*) FROM gate_runs;" 2>/dev/null || echo "0")
+      _tool_db_after=$(sqlite3 "$TOOL_HOME/.clagentic/lite/audit.db" "SELECT COUNT(*) FROM gate_runs;" 2>/dev/null || echo "0")
+      _enroll_db_count=$(sqlite3 "$SMOKE_TMPDIR/.clagentic/lite/audit.db" "SELECT COUNT(*) FROM gate_runs;" 2>/dev/null || echo "0")
       if [ "${_enroll_db_count:-0}" -gt 0 ]; then
         ok "gate run wrote to enrolled repo's audit.db (AC5)"
       else
@@ -351,7 +351,7 @@ fi
 # ---------------------------------------------------- 9. audit.db row check
 
 step "9. audit.db has rows from this run"
-COUNT=$(sqlite3 "$REPO_ROOT/.clagentic/audit.db" "SELECT COUNT(*) FROM gate_runs WHERE ts > datetime('now','-1 hour');" 2>/dev/null || echo 0)
+COUNT=$(sqlite3 "$REPO_ROOT/.clagentic/lite/audit.db" "SELECT COUNT(*) FROM gate_runs WHERE ts > datetime('now','-1 hour');" 2>/dev/null || echo 0)
 if [ "${COUNT:-0}" -gt 0 ]; then
   ok "audit.db gate_runs has $COUNT recent row(s)"
 else
@@ -363,7 +363,7 @@ fi
 step "10. clagentic-lite remember inserts a source=manual row"
 if CLAGENTIC_HOME="$TOOL_HOME" CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
     "$TOOL_HOME/bin/clagentic-lite" remember "smoke test manual note" "smoke manual" >/dev/null 2>&1; then
-  _manual_count=$(sqlite3 "$REPO_ROOT/.clagentic/memory.db" \
+  _manual_count=$(sqlite3 "$REPO_ROOT/.clagentic/lite/memory.db" \
     "SELECT COUNT(*) FROM turns WHERE source='manual' AND summary='smoke test manual note';" 2>/dev/null || echo 0)
   if [ "${_manual_count:-0}" -ge 1 ]; then
     ok "remember inserted a source=manual row"
@@ -384,7 +384,7 @@ while [ $i -lt 15 ]; do
     "$TOOL_HOME/scripts/memory.sh" log-turn "row-cap smoke row $i" "smoke cap" "seed" >/dev/null 2>&1
   i=$((i+1))
 done
-_row_count=$(sqlite3 "$REPO_ROOT/.clagentic/memory.db" \
+_row_count=$(sqlite3 "$REPO_ROOT/.clagentic/lite/memory.db" \
   "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
 if [ "${_row_count:-0}" -le "$_cap" ]; then
   ok "row cap enforced: $_row_count rows <= cap $_cap"
@@ -395,10 +395,10 @@ fi
 # ------------------------------------------------- 12. integer-guard: garbage MAX_ROWS
 
 step "12. garbage CLAGENTIC_MEMORY_MAX_ROWS falls back to default (no crash, no injection)"
-_before_count=$(sqlite3 "$REPO_ROOT/.clagentic/memory.db" "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
+_before_count=$(sqlite3 "$REPO_ROOT/.clagentic/lite/memory.db" "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
 if CLAGENTIC_MEMORY_MAX_ROWS='1; DROP TABLE turns; --' CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
     "$TOOL_HOME/scripts/memory.sh" log-turn "guard test row" "guard" "smoke" >/dev/null 2>&1; then
-  _after_count=$(sqlite3 "$REPO_ROOT/.clagentic/memory.db" "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
+  _after_count=$(sqlite3 "$REPO_ROOT/.clagentic/lite/memory.db" "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
   if [ "${_after_count:-0}" -ge "${_before_count:-0}" ]; then
     ok "garbage MAX_ROWS fell back cleanly; turns table intact ($_after_count rows)"
   else
@@ -411,7 +411,7 @@ fi
 # ---------------------------------- 13. pin-first: manual row surfaces before newer auto row
 
 step "13. pin-first recall: source=manual row surfaces before newer auto rows (lr-17a8)"
-_pin_db="$REPO_ROOT/.clagentic/memory.db"
+_pin_db="$REPO_ROOT/.clagentic/lite/memory.db"
 sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-smoke%';" 2>/dev/null || true
 sqlite3 "$_pin_db" \
   "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-01-02T00:00:00Z', 'smoke', 'lr17a8-smoke auto row newer', 'smoke', 'stop-hook');"

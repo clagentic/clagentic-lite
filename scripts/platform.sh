@@ -143,7 +143,7 @@ ds_sql_escape() {
   printf '%s' "$1" | sed "s/'/''/g"
 }
 
-# Write one row to .clagentic/audit.db. Resolves repo root itself so callers
+# Write one row to .clagentic/lite/audit.db. Resolves repo root itself so callers
 # from any cwd (subdirectory hook invocations, etc.) hit the right DB.
 # Args: GATE OUTCOME DETAILS [SESSION_ID]
 # Silent on any failure — audit logging is best-effort by contract.
@@ -151,7 +151,7 @@ ds_audit_log() {
   GATE="$1"; OUTCOME="$2"; DETAILS="${3:-}"; SID="${4:-}"
   RR=$(ds_repo_root)
   [ -n "$RR" ] || return 0
-  DB="$RR/.clagentic/audit.db"
+  DB="$RR/.clagentic/lite/audit.db"
   [ -f "$DB" ] || return 0
   G_ESC=$(ds_sql_escape "$GATE")
   O_ESC=$(ds_sql_escape "$OUTCOME")
