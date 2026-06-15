@@ -31,7 +31,7 @@ TOOL_HOME="$(dirname "$SCRIPTS_DIR")"
 
 # Project root: CLAGENTIC_PROJECT_ROOT wins, then git show-toplevel.
 # llm-client.sh writes LLM call audit rows to the enrolled project's audit.db,
-# not to $CLAGENTIC_HOME. See gates.sh header for the full rationale.
+# not to $CLAGENTIC_LITE_HOME. See gates.sh header for the full rationale.
 if [ -n "${CLAGENTIC_PROJECT_ROOT:-}" ]; then
   REPO_ROOT="$CLAGENTIC_PROJECT_ROOT"
 else

@@ -24,7 +24,7 @@ ds_load_env
 
 # Tool home: the directory containing scripts/ — resolved from this script's
 # own location so it's correct whether invoked via PATH, symlink, or directly.
-# This is the install tree ($CLAGENTIC_HOME), not the enrolled project root.
+# This is the install tree ($CLAGENTIC_LITE_HOME), not the enrolled project root.
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOL_HOME="$(dirname "$SCRIPTS_DIR")"
 

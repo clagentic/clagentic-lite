@@ -252,9 +252,16 @@ if command -v python3 >/dev/null 2>&1; then
     git -C "$SMOKE_TMPDIR" config user.email "smoke@clagentic.test"
     git -C "$SMOKE_TMPDIR" config user.name "smoke"
 
-    # Enroll with CLAGENTIC_HOME pointing at our tool checkout.
-    if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" enroll "$SMOKE_TMPDIR" >/tmp/clagentic-smoke-enroll.log 2>&1; then
+    # Enroll with CLAGENTIC_LITE_HOME pointing at our tool checkout.
+    if CLAGENTIC_LITE_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" enroll "$SMOKE_TMPDIR" >/tmp/clagentic-smoke-enroll.log 2>&1; then
       ok "clagentic-lite enroll succeeded on a fresh repo"
+
+      # Verify the canonical var produces no deprecation warning.
+      if grep -q 'CLAGENTIC_HOME is deprecated' /tmp/clagentic-smoke-enroll.log 2>/dev/null; then
+        bad "deprecation warning present when using canonical CLAGENTIC_LITE_HOME"
+      else
+        ok "no deprecation warning with CLAGENTIC_LITE_HOME (canonical var verified)"
+      fi
 
       # Verify DBs were created in the enrolled repo, NOT in $TOOL_HOME.
       if [ -f "$SMOKE_TMPDIR/.clagentic/lite/audit.db" ]; then
@@ -278,9 +285,9 @@ if command -v python3 >/dev/null 2>&1; then
             bad "hook shim $_hook missing managed-by marker"
           fi
           if grep -q "$TOOL_HOME" "$_hdir/$_hook"; then
-            ok "hook shim $_hook points to CLAGENTIC_HOME"
+            ok "hook shim $_hook points to CLAGENTIC_LITE_HOME"
           else
-            bad "hook shim $_hook does not reference CLAGENTIC_HOME=$TOOL_HOME"
+            bad "hook shim $_hook does not reference CLAGENTIC_LITE_HOME=$TOOL_HOME"
           fi
         else
           bad "hook shim $_hook missing in enrolled repo"
@@ -291,7 +298,7 @@ if command -v python3 >/dev/null 2>&1; then
       # gates.sh secrets with no staged files should pass (or at least not crash)
       # and write a row to the enrolled repo's audit.db — not to $TOOL_HOME's DB.
       _tool_db_before=$(sqlite3 "$TOOL_HOME/.clagentic/lite/audit.db" "SELECT COUNT(*) FROM gate_runs;" 2>/dev/null || echo "0")
-      (cd "$SMOKE_TMPDIR" && CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/scripts/gates.sh" secrets) >/dev/null 2>&1 || true
+      (cd "$SMOKE_TMPDIR" && CLAGENTIC_LITE_HOME="$TOOL_HOME" "$TOOL_HOME/scripts/gates.sh" secrets) >/dev/null 2>&1 || true
       _tool_db_after=$(sqlite3 "$TOOL_HOME/.clagentic/lite/audit.db" "SELECT COUNT(*) FROM gate_runs;" 2>/dev/null || echo "0")
       _enroll_db_count=$(sqlite3 "$SMOKE_TMPDIR/.clagentic/lite/audit.db" "SELECT COUNT(*) FROM gate_runs;" 2>/dev/null || echo "0")
       if [ "${_enroll_db_count:-0}" -gt 0 ]; then
@@ -302,18 +309,18 @@ if command -v python3 >/dev/null 2>&1; then
       if [ "${_tool_db_before}" = "${_tool_db_after}" ]; then
         ok "gate run did NOT write to tool's own audit.db (per-repo isolation confirmed)"
       else
-        bad "gate run wrote a row to \$CLAGENTIC_HOME's audit.db (isolation failure)"
+        bad "gate run wrote a row to \$CLAGENTIC_LITE_HOME's audit.db (isolation failure)"
       fi
 
       # Re-enroll without --force should refuse.
-      if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" enroll "$SMOKE_TMPDIR" >/dev/null 2>&1; then
+      if CLAGENTIC_LITE_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" enroll "$SMOKE_TMPDIR" >/dev/null 2>&1; then
         bad "second enroll without --force should have been refused"
       else
         ok "second enroll without --force correctly refused"
       fi
 
       # Unenroll: hooks removed, .clagentic/ left intact.
-      if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" unenroll "$SMOKE_TMPDIR" >/tmp/clagentic-smoke-unenroll.log 2>&1; then
+      if CLAGENTIC_LITE_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" unenroll "$SMOKE_TMPDIR" >/tmp/clagentic-smoke-unenroll.log 2>&1; then
         ok "clagentic-lite unenroll succeeded"
         if [ ! -f "$_hdir/pre-commit" ] && [ ! -f "$_hdir/pre-push" ]; then
           ok "clagentic-owned hooks removed by unenroll"
@@ -340,12 +347,12 @@ else
   printf '  SKIP  python3 not found (needed for tempdir management in enroll test)\n'
 fi
 
-# Refuse to enroll $CLAGENTIC_HOME without --self.
+# Refuse to enroll $CLAGENTIC_LITE_HOME without --self.
 step "8b. enroll refuses to self-enroll without --self"
-if CLAGENTIC_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" enroll "$TOOL_HOME" >/dev/null 2>&1; then
+if CLAGENTIC_LITE_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" enroll "$TOOL_HOME" >/dev/null 2>&1; then
   bad "enroll allowed $TOOL_HOME without --self (snake's-head check failed)"
 else
-  ok "enroll refused to enroll \$CLAGENTIC_HOME without --self (AC4)"
+  ok "enroll refused to enroll \$CLAGENTIC_LITE_HOME without --self (AC4)"
 fi
 
 # ---------------------------------------------------- 9. audit.db row check
@@ -361,7 +368,7 @@ fi
 # ----------------------------------------- 10. remember verb (source=manual)
 
 step "10. clagentic-lite remember inserts a source=manual row"
-if CLAGENTIC_HOME="$TOOL_HOME" CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
+if CLAGENTIC_LITE_HOME="$TOOL_HOME" CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
     "$TOOL_HOME/bin/clagentic-lite" remember "smoke test manual note" "smoke manual" >/dev/null 2>&1; then
   _manual_count=$(sqlite3 "$REPO_ROOT/.clagentic/lite/memory.db" \
     "SELECT COUNT(*) FROM turns WHERE source='manual' AND summary='smoke test manual note';" 2>/dev/null || echo 0)
