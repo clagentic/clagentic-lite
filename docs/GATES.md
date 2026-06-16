@@ -72,6 +72,33 @@ Write rules:
 | **Per-call timeout** | `${CLAGENTIC_LLM_TIMEOUT_SEC}` seconds (default 180). Hung CLI → step failure → chain advances. |
 | **Required-role enforcement** | `CLAGENTIC_REVIEWER_REQUIRED=1` makes a full-chain failure a hard gate error (non-zero exit) instead of a degraded envelope. Use when the cross-vendor property is non-negotiable and a same-vendor fallback must be a visible failure rather than a silent degradation. Applies to any role: `CLAGENTIC_<ROLE>_REQUIRED=1`. |
 
+### Exit-code contract for `gates.sh review` and `gates.sh ship`
+
+`gates.sh review` distinguishes two failure classes with separate exit codes. CI and operator scripts should branch on these:
+
+| Exit code | Constant | Meaning | Action |
+|---|---|---|---|
+| `0` | — | Clean review, no findings at or above severity threshold | Proceed |
+| `1` | `REVIEW_BLOCKED` | Reviewer returned real findings at or above `${CLAGENTIC_BLOCK_SEVERITY}` | Fix the code, re-run review |
+| `2` | `INFRA_DEGRADED` | Every Reviewer chain step failed; degraded envelope returned; no real review occurred | Check LLM CLI config/auth and retry; do not ship |
+
+`gates.sh ship` propagates these codes at the ship level when the review gate fires:
+
+- Ship exits `2` when the review gate returns `INFRA_DEGRADED`.
+- Ship exits `1` for all other blocking gate failures (secrets, deps, sast, review-blocked, merge-gate).
+
+**Audit trail:** the `gate_runs` table records the failure class in the `details` column:
+
+- `infra-degraded: all reviewer chain steps failed` — for degraded envelope path
+- `review-blocked: N finding(s) at >= THRESHOLD` — for real findings path
+
+Example query to distinguish failure classes:
+
+```sh
+sqlite3 .clagentic/lite/audit.db \
+  "SELECT ts, outcome, details FROM gate_runs WHERE gate='review' ORDER BY ts DESC LIMIT 5;"
+```
+
 Reviewer prompt and JSON schema are pinned in `.claude/agents/reviewer.md` (Pre-Report Gate + Common False Positives list). Output is persisted at `.clagentic/lite/last-review.json` and into `audit.db.gate_runs`. Per-step LLM-call attempts are logged separately (`gate=llm-call`) with a one-line error hint from stderr.
 
 The Reviewer never has write tools. The Builder never sees its own review pre-graded. The Reviewer prompt forbids "looks good to me" outputs without specific evidence.
