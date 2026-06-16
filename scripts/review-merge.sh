@@ -576,13 +576,18 @@ _dedup_findings_jq() {
       fi
     fi
     if [ -z "$_dfj_key" ]; then
-      # location key fallback (also the primary path for strategy=location).
+      # location key (primary path for strategy=location; fallback for content-hash).
+      # Surface jq errors to stderr — silent failures hide broken filters.
       _dfj_raw=$(printf '%s' "$_dfj_finding" \
-        | jq -r '[.file // "", (.line // "") | tostring, .category // "", (.message // "" | ascii_downcase)] | join(":")' 2>/dev/null)
-      if [ -n "$_dfj_raw" ]; then
+        | jq -r '[(.file // ""), ((.line // 0) | tostring), (.category // ""), ((.message // "") | ascii_downcase)] | join(":")' 2>&1)
+      _dfj_jq_rc=$?
+      if [ "$_dfj_jq_rc" -ne 0 ]; then
+        printf '[review-merge/dedup_findings] jq key-extraction failed (idx=%d): %s\n' "$_dfj_idx" "$_dfj_raw" 1>&2
+        _dfj_key=""
+      elif [ -n "$_dfj_raw" ]; then
         _dfj_key=$(printf '%s' "$_dfj_raw" | _rm_sha256)
       else
-        # Cannot compute key — write empty sentinel; loop below retains finding.
+        # Empty output despite rc=0 — conservative retain.
         _dfj_key=""
       fi
     fi
@@ -641,12 +646,17 @@ _dedup_findings_jq() {
       }
     }
     END {
-      # Print winning indices in order. Emit retains first (no-key findings).
+      # Print winning indices in order.
+      # retain[i] is set for no-key findings (conservative retain);
+      # order[i] is set for keyed findings (winner tracking).
+      # Both arrays share the same index n — only one is set per slot.
       for (i = 0; i < n; i++) {
-        k = retain[i]
-        if (k != "") { print k; next }
-        k2 = order[i]
-        if (k2 in winner_idx) print winner_idx[k2]
+        if (i in retain) {
+          print retain[i]
+        } else {
+          k2 = order[i]
+          if (k2 in winner_idx) print winner_idx[k2]
+        }
       }
     }
   ' "$_dfj_combined")
