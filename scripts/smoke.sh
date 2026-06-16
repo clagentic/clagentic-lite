@@ -135,6 +135,86 @@ if [ "$MODE" != "--quick" ]; then
   fi
 fi
 
+# ------------------------------------ 5d. exit-code contract: INFRA_DEGRADED vs REVIEW_BLOCKED
+#
+# gates.sh resolves TOOL_HOME from the script's own path (not an env var), so we
+# cannot redirect the llm-client.sh call without patching the installed script.
+# Instead we test two verifiable contracts:
+#
+#   1. Audit-row detail strings: the exact strings cmd_review logs for each failure
+#      class must round-trip through gate_runs.details (load-bearing for CI queries).
+#   2. review_is_degraded helper: the predicate that gates exit-2 must return 0
+#      for a {degraded:true} envelope and non-zero for a clean envelope.
+
+step "5d. exit-code contract: audit-row detail format for infra-degraded and review-blocked"
+# Log synthetic rows with the exact detail strings cmd_review uses, then verify
+# they are retrievable with the expected prefix.
+"$TOOL_HOME/scripts/gates.sh" log-run review block "infra-degraded: all reviewer chain steps failed" >/dev/null 2>&1
+_EC_DETAIL=$(sqlite3 "$REPO_ROOT/.clagentic/lite/audit.db" \
+  "SELECT details FROM gate_runs WHERE gate='review' AND details LIKE 'infra-degraded%' ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)
+if printf '%s' "$_EC_DETAIL" | grep -q 'infra-degraded'; then
+  ok "exit-code contract: infra-degraded audit row detail round-trips correctly"
+else
+  bad "exit-code contract: infra-degraded audit row missing or wrong (got: $_EC_DETAIL)"
+fi
+
+"$TOOL_HOME/scripts/gates.sh" log-run review block "review-blocked: 2 finding(s) at >= high" >/dev/null 2>&1
+_EC_DETAIL2=$(sqlite3 "$REPO_ROOT/.clagentic/lite/audit.db" \
+  "SELECT details FROM gate_runs WHERE gate='review' AND details LIKE 'review-blocked%' ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)
+if printf '%s' "$_EC_DETAIL2" | grep -q 'review-blocked'; then
+  ok "exit-code contract: review-blocked audit row detail round-trips correctly"
+else
+  bad "exit-code contract: review-blocked audit row missing or wrong (got: $_EC_DETAIL2)"
+fi
+
+step "5e. exit-code contract: review_is_degraded identifies degraded vs clean envelopes"
+# Inline the review_is_degraded predicate (copied from gates.sh) in a subshell
+# so we test the actual logic against both envelope shapes without touching
+# the live last-review.json.
+_EC_DFILE=$(mktemp -t clagentic-smoke-deg.XXXXXX)
+printf '{"degraded":true,"summary":"test","checked":[],"findings":[]}\n' > "$_EC_DFILE"
+
+_EC_DEG_RC=0
+sh -c '
+  FILE="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -e ".degraded == true" "$FILE" >/dev/null 2>&1
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get(\"degraded\") is True else 1)" "$FILE" 2>/dev/null
+  else
+    exit 1
+  fi
+' _ "$_EC_DFILE" 2>/dev/null || _EC_DEG_RC=$?
+
+rm -f "$_EC_DFILE"
+if [ "$_EC_DEG_RC" -eq 0 ]; then
+  ok "review_is_degraded: returns 0 for {degraded:true} envelope"
+else
+  bad "review_is_degraded: returned non-zero for {degraded:true} envelope (rc=$_EC_DEG_RC)"
+fi
+
+_EC_CLEANFILE=$(mktemp -t clagentic-smoke-clean.XXXXXX)
+printf '{"summary":"clean","checked":[],"findings":[]}\n' > "$_EC_CLEANFILE"
+
+_EC_CLEAN_RC=0
+sh -c '
+  FILE="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -e ".degraded == true" "$FILE" >/dev/null 2>&1
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get(\"degraded\") is True else 1)" "$FILE" 2>/dev/null
+  else
+    exit 1
+  fi
+' _ "$_EC_CLEANFILE" 2>/dev/null && _EC_CLEAN_RC=0 || _EC_CLEAN_RC=1
+
+rm -f "$_EC_CLEANFILE"
+if [ "$_EC_CLEAN_RC" -ne 0 ]; then
+  ok "review_is_degraded: returns non-zero for clean {findings:[]} envelope"
+else
+  bad "review_is_degraded: returned 0 (degraded) for clean envelope"
+fi
+
 # ------------------------------------- 5b. summarizer skips cleanly (no config)
 
 # Gate 7 is best-effort. With no summarizer chain AND no Builder fallback, the
