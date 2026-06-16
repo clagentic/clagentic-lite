@@ -1498,6 +1498,6 @@ case "${1:-}" in
   log-run)        shift; cmd_log_run "$@" ;;
   digest)         cmd_digest ;;
   status)         shift; cmd_status "$@" ;;
-  tail)           cmd_tail ;;
+  tail)           shift; cmd_tail "$@" ;;
   *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
 esac
