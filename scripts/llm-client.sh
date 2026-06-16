@@ -149,6 +149,32 @@ EOF
 }
 
 ds_review_prompt() {
+  # Load operator deferrals from .clagentic/deferrals.json in the enrolled repo.
+  # Fail-open: if the file is absent or unparseable, the review continues
+  # without deferrals. Suppression happens inside model judgment — the gate
+  # does NOT post-filter findings based on this file.
+  _drp_deferrals=""
+  _drp_dfile="$REPO_ROOT/.clagentic/deferrals.json"
+  if [ -f "$_drp_dfile" ]; then
+    _drp_deferrals=$(cat "$_drp_dfile" 2>/dev/null) || _drp_deferrals=""
+    # Validate that the content is non-empty after read; a read error yields "".
+    # We do not parse/validate the JSON here — the LLM receives it verbatim.
+    # If cat produced an empty string (empty file or read error), treat as no deferrals.
+  fi
+
+  if [ -n "$_drp_deferrals" ]; then
+    # Write deferrals to a temp file so arbitrary JSON (including single-quotes)
+    # is never interpolated into a shell string — the file is cat'd directly.
+    _drp_tmp=$(mktemp -t clagentic-deferrals-prompt.XXXXXX)
+    printf '%s' "$_drp_deferrals" > "$_drp_tmp"
+    printf '%s\n\n' "The following findings have been reviewed and deferred by the operator. For each, use your judgment about whether the deferral still applies given the file, category, description, and expiry context provided. If a finding matches a valid active deferral, do not re-report it. If the deferral appears expired or the finding does not match, report it normally.
+
+DEFERRED FINDINGS:"
+    cat "$_drp_tmp"
+    printf '\n\n'
+    rm -f "$_drp_tmp"
+  fi
+
   cat <<'EOF'
 You are the clagentic-lite Reviewer. Read the staged git diff on stdin.
 

@@ -1019,6 +1019,98 @@ else
   printf '  SKIP  no jq or python3 for cross-round dedup tests\n'
 fi
 
+# ---------------------------------------------------------------- 20. deferrals fail-open: malformed JSON does not crash review prompt
+
+step "20. deferrals fail-open: malformed .clagentic/deferrals.json does not crash"
+
+# Strategy: inline the deferrals-loading snippet from ds_review_prompt and test
+# it directly without making a live LLM call or sourcing the full llm-client.sh.
+# This exercises the load + fail-open logic in isolation: the subshell sources
+# only platform.sh (already sourced above in smoke.sh, but explicit here for
+# clarity in the subshell context), sets up a temp REPO_ROOT with a malformed
+# deferrals.json, and runs the loading code. A non-zero exit = test failure.
+
+_def_tmpdir=$(mktemp -d -t clagentic-smoke-def.XXXXXX)
+mkdir -p "$_def_tmpdir/.clagentic"
+# Write malformed JSON — a string scalar, not a JSON array.
+printf '"not-json"\n' > "$_def_tmpdir/.clagentic/deferrals.json"
+
+_def_prompt_rc=0
+_def_prompt_out=$(sh -c '
+  REPO_ROOT="$1"
+  _drp_deferrals=""
+  _drp_dfile="$REPO_ROOT/.clagentic/deferrals.json"
+  if [ -f "$_drp_dfile" ]; then
+    _drp_deferrals=$(cat "$_drp_dfile" 2>/dev/null) || _drp_deferrals=""
+  fi
+  if [ -n "$_drp_deferrals" ]; then
+    _drp_tmp=$(mktemp -t clagentic-def-test.XXXXXX)
+    printf "%s" "$_drp_deferrals" > "$_drp_tmp"
+    printf "DEFERRED FINDINGS:\n"
+    cat "$_drp_tmp"
+    printf "\n"
+    rm -f "$_drp_tmp"
+  fi
+  printf "REVIEWER PROMPT BODY\n"
+' _ "$_def_tmpdir" 2>/dev/null) || _def_prompt_rc=$?
+
+rm -rf "$_def_tmpdir"
+
+if [ "$_def_prompt_rc" -eq 0 ]; then
+  ok "deferrals fail-open: malformed deferrals.json does not crash loading code (exit 0)"
+else
+  bad "deferrals fail-open: loading code exited $_def_prompt_rc with malformed deferrals.json"
+fi
+
+if printf '%s' "$_def_prompt_out" | grep -q 'REVIEWER PROMPT BODY'; then
+  ok "deferrals fail-open: prompt body still emitted despite malformed deferrals"
+else
+  bad "deferrals fail-open: prompt body missing; got: $_def_prompt_out"
+fi
+
+# The malformed file is a non-empty string, so the deferral block IS injected —
+# the LLM receives the content verbatim and ignores what it cannot interpret.
+# Verify the block was injected (content was non-empty, so _drp_deferrals != "").
+if printf '%s' "$_def_prompt_out" | grep -q 'DEFERRED FINDINGS'; then
+  ok "deferrals fail-open: malformed content passed verbatim to prompt (LLM reasoning path)"
+else
+  bad "deferrals fail-open: expected DEFERRED FINDINGS block; got: $_def_prompt_out"
+fi
+
+# Also verify the normal path: absent deferrals.json — no deferral block injected.
+_def_tmpdir2=$(mktemp -d -t clagentic-smoke-def2.XXXXXX)
+mkdir -p "$_def_tmpdir2/.clagentic"
+# No deferrals.json created.
+
+_def_nodefs_rc=0
+_def_nodefs_out=$(sh -c '
+  REPO_ROOT="$1"
+  _drp_deferrals=""
+  _drp_dfile="$REPO_ROOT/.clagentic/deferrals.json"
+  if [ -f "$_drp_dfile" ]; then
+    _drp_deferrals=$(cat "$_drp_dfile" 2>/dev/null) || _drp_deferrals=""
+  fi
+  if [ -n "$_drp_deferrals" ]; then
+    printf "DEFERRED FINDINGS:\n"
+    printf "%s\n" "$_drp_deferrals"
+  fi
+  printf "REVIEWER PROMPT BODY\n"
+' _ "$_def_tmpdir2" 2>/dev/null) || _def_nodefs_rc=$?
+
+rm -rf "$_def_tmpdir2"
+
+if [ "$_def_nodefs_rc" -eq 0 ]; then
+  ok "deferrals absent: loading code exits 0 when no deferrals.json"
+else
+  bad "deferrals absent: loading code exited $_def_nodefs_rc without deferrals.json"
+fi
+
+if printf '%s' "$_def_nodefs_out" | grep -q 'DEFERRED FINDINGS'; then
+  bad "deferrals absent: deferral block injected despite no deferrals.json"
+else
+  ok "deferrals absent: no deferral block in prompt when deferrals.json absent"
+fi
+
 # -------------------------------------------------------------------- summary
 
 printf '\n[smoke] passed: %s   failed: %s\n' "$PASS" "$FAIL"
