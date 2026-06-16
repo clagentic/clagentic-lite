@@ -204,3 +204,22 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # working tree). Without this flag, build_gate_summary refuses to feed a
 # stale payload to the merge-gate LLM.
 # CLAGENTIC_ALLOW_STALE_PAYLOAD=1
+
+# ---------- chunked review ----------
+# Opt-in diff chunking for the review gate. When enabled (=1) and the diff
+# exceeds the threshold, the diff is split into chunks and reviewed per-chunk.
+# Per-chunk audit rows use gate='review-chunk'. A merged envelope is assembled
+# from all chunks and stamped as the final last-review.json output.
+# Warning: N chunks = N LLM calls. For large diffs this can be costly.
+# Opt-in default: off (0). Enable when single-pass review times out on very
+# large diffs where per-chunk context is sufficient.
+# CLAGENTIC_REVIEW_CHUNKING=1
+
+# Chunking threshold in bytes. When CLAGENTIC_REVIEW_CHUNKING=1 and the diff
+# is larger than this value, the chunking path is taken. Default: 262144 (256 KB).
+# CLAGENTIC_REVIEW_CHUNK_BYTES=262144
+
+# Operator-facing alias for the chunking threshold (in KB, not bytes).
+# When set, overrides CLAGENTIC_REVIEW_CHUNK_BYTES. Use whichever unit is more
+# natural for your workflow.
+# CLAGENTIC_REVIEWER_MAX_DIFF_KB=256

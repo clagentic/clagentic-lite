@@ -1265,6 +1265,19 @@ cmd_doctor() {
     fi
   done
 
+  # 5b. sha256 soft dependency (used by review-merge.sh for finding dedup keys).
+  # Warn-only: the identity fallback works but dedup keys become less robust.
+  printf '\nsha256 (soft dep, chunked-review dedup):\n'
+  if command -v sha256sum >/dev/null 2>&1; then
+    _ok "sha256sum found (GNU coreutils — preferred)"
+  elif command -v shasum >/dev/null 2>&1; then
+    _ok "shasum found (BSD/macOS — will use shasum -a 256)"
+  else
+    printf '  WARN sha256sum and shasum both missing — chunked-review dedup will use identity fallback\n'
+    printf '       Install: brew install coreutils (macOS) | usually pre-installed on Linux (coreutils)\n'
+    printf '       The gate still works but findings with different whitespace may not deduplicate.\n'
+  fi
+
   # 6. Registry + enrolled repos.
   printf '\nenrolled repos:\n'
   if [ ! -f "$REGISTRY" ]; then
