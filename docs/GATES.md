@@ -72,6 +72,75 @@ Write rules:
 | **Per-call timeout** | `${CLAGENTIC_LLM_TIMEOUT_SEC}` seconds (default 180). Hung CLI → step failure → chain advances. |
 | **Required-role enforcement** | `CLAGENTIC_REVIEWER_REQUIRED=1` makes a full-chain failure a hard gate error (non-zero exit) instead of a degraded envelope. Use when the cross-vendor property is non-negotiable and a same-vendor fallback must be a visible failure rather than a silent degradation. Applies to any role: `CLAGENTIC_<ROLE>_REQUIRED=1`. |
 
+### Reviewer-consulted deferrals
+
+When an operator has reviewed a finding and decided to defer it — because it is
+a known fixture, an intentional design choice, or a false positive they have
+accepted — they can record that decision in `.clagentic/deferrals.json`. The
+file is read at review time and injected into the reviewer system prompt as
+context before the diff is reviewed.
+
+**File location:** `.clagentic/deferrals.json` in the enrolled repo. The
+`.clagentic/` directory is gitignored by the gate orchestrator, so this file is
+local state — it is not committed. Do not commit deferrals to version control;
+use `.clagentic/adversarial-acks.json` or `.clagentic/accepted-risks.md` for
+committed, audited suppression.
+
+**Schema (JSON array):**
+
+```json
+[
+  {
+    "id": "def-001",
+    "category": "sql",
+    "file": "scripts/seed-demo.sh",
+    "description": "Planted demo credential — intentional fixture, not production code.",
+    "expires": "2026-12-31",
+    "acknowledged_by": "akuehner"
+  }
+]
+```
+
+Fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `id` | yes | Stable identifier for the deferral |
+| `category` | no | Finding category this deferral applies to |
+| `file` | no | Exact path or path glob this deferral applies to |
+| `description` | yes | Human-readable reason for the deferral |
+| `expires` | no | ISO date after which the deferral should be reconsidered |
+| `acknowledged_by` | no | Who approved the deferral |
+
+**Suppression is inside model judgment, not gate code.** The deferrals file is
+injected verbatim into the reviewer system prompt. The gate does NOT parse
+finding output to post-filter based on deferrals. If the LLM still emits a
+finding despite a deferral entry, the finding stands. This is intentional:
+the LLM is better placed to reason about whether a deferral is still applicable
+than a regex or equality match in shell code.
+
+**`expires` field semantics:** the gate does not parse or compute expiry dates.
+The expiry text is passed to the LLM verbatim so the model can reason about
+whether the deferral is still valid given the current context. The gate has no
+date arithmetic.
+
+**Fail-open:** if `.clagentic/deferrals.json` is absent, empty, or unreadable,
+the review runs as if no deferrals exist. The gate never blocks on a missing
+deferrals file. A malformed file (non-JSON) is treated the same as an absent
+file — the content is injected as-is and the LLM will ignore text it cannot
+interpret as a deferral list.
+
+**Deferrals vs. `accepted-risks.md`:**
+
+| Mechanism | Location | Read by | Suppression path |
+|---|---|---|---|
+| `deferrals.json` | `.clagentic/deferrals.json` (gitignored) | Gate 3 reviewer prompt | LLM judgment |
+| `accepted-risks.md` | `.clagentic/accepted-risks.md` (committed) | Gate 6 merge-gate | Gate plumbing reads the doc; merge-gate LLM classifies covered findings as acknowledged |
+
+Use deferrals for local, ephemeral, or per-session suppression guidance. Use
+`accepted-risks.md` for committed, audited architectural decisions that persist
+in the repo history.
+
 ### Cross-round finding dedup (opt-in)
 
 | | |

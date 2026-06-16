@@ -205,6 +205,41 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # stale payload to the merge-gate LLM.
 # CLAGENTIC_ALLOW_STALE_PAYLOAD=1
 
+# ---------- reviewer-consulted deferrals ----------
+# File: .clagentic/deferrals.json in the enrolled repo (gitignored — already
+# under .clagentic/ which gates.sh gitignores, so no extra config needed).
+#
+# When present, the file is injected verbatim into the reviewer system prompt
+# before the diff is reviewed. The LLM uses its judgment to decide whether
+# each deferral still applies — suppression happens inside model reasoning,
+# not in gate code. The gate does NOT post-filter findings based on this file.
+#
+# Fail-open: if the file is absent, empty, or unreadable, the review proceeds
+# as if no deferrals exist. The gate never blocks on a missing deferrals file.
+#
+# Schema (JSON array):
+# [
+#   {
+#     "id": "def-001",              # stable identifier (required)
+#     "category": "sql",            # finding category this applies to (optional)
+#     "file": "scripts/seed.sh",   # exact path or path glob (optional)
+#     "description": "...",         # human-readable reason (required)
+#     "expires": "2026-12-31",      # ISO date — LLM reasons about expiry; gate does not parse (optional)
+#     "acknowledged_by": "you"      # who approved the deferral (optional)
+#   }
+# ]
+#
+# The `expires` field is passed verbatim to the LLM. The gate does not compute
+# or enforce expiry dates — the LLM reasons about whether the deferral is still
+# valid given its expiry and the diff under review.
+#
+# Deferrals vs. accepted-risks.md:
+#   accepted-risks.md  — architectural risk decisions; read by the merge-gate
+#                        (Gate 6); deterministic gate plumbing post-filters.
+#   deferrals.json     — operator guidance injected into the reviewer prompt
+#                        (Gate 3); suppression is inside LLM judgment, not code.
+# No new env var is needed — the feature is always active when the file exists.
+
 # ---------- cross-round finding dedup ----------
 # Opt-in: suppress findings already reported in a prior review round when the
 # relevant diff lines are unchanged since. Key strategy is content-hash (sha256
