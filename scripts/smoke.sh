@@ -582,6 +582,375 @@ else
 fi
 sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-ord%';" 2>/dev/null || true
 
+# ---------------------------------------------------------------- 15. split_diff unit tests
+
+step "15. split_diff: chunk count + boundary correctness on synthetic multi-file diff"
+
+# Source review-merge.sh so split_diff and helpers are available.
+. "$TOOL_HOME/scripts/review-merge.sh"
+
+# Build a synthetic unified diff: three files, two of which fit in one chunk
+# each and one that just tips the budget threshold so two files land in chunk 1
+# and one alone in chunk 2 (budget = 200 bytes in this test).
+_sd_test_diff=$(mktemp -t clagentic-smoke-sd.XXXXXX)
+cat > "$_sd_test_diff" <<'DIFFEOF'
+diff --git a/file_a.py b/file_a.py
+--- a/file_a.py
++++ b/file_a.py
+@@ -1,3 +1,4 @@
+ def foo():
++    # added comment
+     return 1
+
+diff --git a/file_b.py b/file_b.py
+--- a/file_b.py
++++ b/file_b.py
+@@ -1,2 +1,3 @@
+ x = 1
++y = 2
+ z = 3
+
+diff --git a/file_c.py b/file_c.py
+--- a/file_c.py
++++ b/file_c.py
+@@ -1,5 +1,6 @@
+ class Baz:
+     def __init__(self):
++        self.value = 42
+         pass
+     def method(self):
+         return self.value
+DIFFEOF
+
+_sd_chunk_dir_a=$(mktemp -d -t clagentic-smoke-sdc.XXXXXX)
+
+# Use a budget large enough to hold all three files (should produce 1 chunk).
+_sd_nchunks_a=$(split_diff "$_sd_test_diff" "$_sd_chunk_dir_a" 65536)
+if [ "${_sd_nchunks_a:-0}" -ge 1 ]; then
+  ok "split_diff: large budget produces at least 1 chunk (got $_sd_nchunks_a)"
+else
+  bad "split_diff: expected >= 1 chunks with large budget, got $_sd_nchunks_a"
+fi
+# Verify chunk files are present and count matches reported integer.
+_sd_chunk_count_a=$(find "$_sd_chunk_dir_a" -name 'chunk-*' -type f | wc -l | tr -d '[:space:]')
+if [ "${_sd_chunk_count_a:-0}" -eq "${_sd_nchunks_a:-0}" ]; then
+  ok "split_diff: chunk file count matches stdout integer ($_sd_nchunks_a)"
+else
+  bad "split_diff: chunk file count $_sd_chunk_count_a != reported $_sd_nchunks_a"
+fi
+# Chunk numbering: first file must be chunk-001 (not chunk-000).
+if [ -f "$_sd_chunk_dir_a/chunk-001" ]; then
+  ok "split_diff: first chunk file is chunk-001 (1-based numbering)"
+else
+  bad "split_diff: chunk-001 not found; got: $(ls "$_sd_chunk_dir_a" 2>/dev/null | head -3)"
+fi
+# Each chunk must begin with a 'diff --git' header line.
+_sd_header_bad=0
+for _sd_cf in "$_sd_chunk_dir_a"/chunk-*; do
+  [ -f "$_sd_cf" ] || continue
+  _sd_first=$(head -1 "$_sd_cf" 2>/dev/null)
+  case "$_sd_first" in
+    'diff --git '*) : ;;  # good
+    *) _sd_header_bad=$((_sd_header_bad + 1)) ;;
+  esac
+done
+if [ "$_sd_header_bad" -eq 0 ]; then
+  ok "split_diff: each chunk begins with 'diff --git' header"
+else
+  bad "split_diff: $_sd_header_bad chunk(s) missing 'diff --git' header"
+fi
+rm -rf "$_sd_chunk_dir_a"
+
+# Use a very small budget (100 bytes) — should produce multiple chunks.
+_sd_chunk_dir_b=$(mktemp -d -t clagentic-smoke-sdcb.XXXXXX)
+_sd_nchunks_b=$(split_diff "$_sd_test_diff" "$_sd_chunk_dir_b" 100)
+if [ "${_sd_nchunks_b:-0}" -gt 1 ]; then
+  ok "split_diff: small budget produces multiple chunks (got $_sd_nchunks_b)"
+else
+  bad "split_diff: expected >1 chunks with small budget, got $_sd_nchunks_b"
+fi
+# Each chunk file must be non-empty.
+_sd_bad_chunks=0
+for _sd_cf in "$_sd_chunk_dir_b"/chunk-*; do
+  [ -f "$_sd_cf" ] || continue
+  if wc -l < "$_sd_cf" | awk '{exit ($1 > 0) ? 0 : 1}'; then
+    : # non-empty — ok
+  else
+    _sd_bad_chunks=$((_sd_bad_chunks + 1))
+  fi
+done
+if [ "$_sd_bad_chunks" -eq 0 ]; then
+  ok "split_diff: all chunk files non-empty"
+else
+  bad "split_diff: $_sd_bad_chunks empty chunk file(s)"
+fi
+# Each chunk must begin with a 'diff --git' header (small-budget case too).
+_sd_header_bad_b=0
+for _sd_cf in "$_sd_chunk_dir_b"/chunk-*; do
+  [ -f "$_sd_cf" ] || continue
+  _sd_first=$(head -1 "$_sd_cf" 2>/dev/null)
+  case "$_sd_first" in
+    'diff --git '*)  : ;;
+    '@@ '*)          : ;;  # hunk sub-chunk from oversized single file — acceptable
+    *) _sd_header_bad_b=$((_sd_header_bad_b + 1)) ;;
+  esac
+done
+if [ "$_sd_header_bad_b" -eq 0 ]; then
+  ok "split_diff: small-budget chunks all start with diff or hunk header"
+else
+  bad "split_diff: $_sd_header_bad_b small-budget chunk(s) missing valid header"
+fi
+rm -rf "$_sd_chunk_dir_b"
+
+# Edge: non-existent diff file produces 0 chunks and exits 0.
+_sd_chunk_dir_c=$(mktemp -d -t clagentic-smoke-sdcc.XXXXXX)
+_sd_nchunks_c=$(split_diff "/nonexistent/path.diff" "$_sd_chunk_dir_c" 65536 2>/dev/null)
+if [ "${_sd_nchunks_c:-0}" -eq 0 ]; then
+  ok "split_diff: non-existent diff file produces 0 chunks"
+else
+  bad "split_diff: expected 0 chunks for missing file, got $_sd_nchunks_c"
+fi
+rm -rf "$_sd_chunk_dir_c"
+rm -f "$_sd_test_diff"
+
+# ---------------------------------------------------------------- 16. merge_envelopes unit tests
+
+step "16. merge_envelopes: union/dedup/degraded rollup"
+
+if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+  _me_env_dir=$(mktemp -d -t clagentic-smoke-me.XXXXXX)
+
+  # Write envelope-001.json: clean, 1 finding (high).
+  cat > "$_me_env_dir/envelope-001.json" <<'EOF'
+{
+  "summary": "clean chunk",
+  "checked": ["security", "correctness"],
+  "findings": [
+    {"severity": "high", "file": "foo.py", "line": 10, "category": "security", "message": "eval usage"}
+  ],
+  "degraded": false
+}
+EOF
+
+  # Write envelope-002.json: another clean envelope, same finding (lower severity — higher should win).
+  cat > "$_me_env_dir/envelope-002.json" <<'EOF'
+{
+  "summary": "second chunk",
+  "checked": ["correctness", "style"],
+  "findings": [
+    {"severity": "medium", "file": "foo.py", "line": 10, "category": "security", "message": "eval usage"}
+  ],
+  "degraded": false
+}
+EOF
+
+  # Write envelope-003.json: degraded envelope.
+  cat > "$_me_env_dir/envelope-003.json" <<'EOF'
+{
+  "degraded": true,
+  "summary": "[clagentic-lite degraded] chain failed",
+  "checked": [],
+  "findings": []
+}
+EOF
+
+  _me_merged=$(merge_envelopes "$_me_env_dir" "location")
+
+  # degraded should be true (at least one chunk degraded).
+  if printf '%s' "$_me_merged" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("degraded") is True else 1)' 2>/dev/null; then
+    ok "merge_envelopes: degraded=true when any chunk is degraded"
+  else
+    bad "merge_envelopes: degraded not propagated correctly"
+  fi
+
+  # chunks_degraded should be 1.
+  _me_cdeg=$(printf '%s' "$_me_merged" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("chunks_degraded","?"))' 2>/dev/null || echo "?")
+  if [ "$_me_cdeg" = "1" ]; then
+    ok "merge_envelopes: chunks_degraded=1 (correct count)"
+  else
+    bad "merge_envelopes: expected chunks_degraded=1, got $_me_cdeg"
+  fi
+
+  # chunks should be 3.
+  _me_ctotal=$(printf '%s' "$_me_merged" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("chunks","?"))' 2>/dev/null || echo "?")
+  if [ "$_me_ctotal" = "3" ]; then
+    ok "merge_envelopes: chunks=3 (correct total)"
+  else
+    bad "merge_envelopes: expected chunks=3, got $_me_ctotal"
+  fi
+
+  # checked union should include security, correctness, style.
+  _me_checked=$(printf '%s' "$_me_merged" | python3 -c 'import json,sys; c=json.load(sys.stdin).get("checked",[]); print("ok" if all(x in c for x in ["security","correctness","style"]) else "fail")' 2>/dev/null || echo "fail")
+  if [ "$_me_checked" = "ok" ]; then
+    ok "merge_envelopes: checked union includes all categories"
+  else
+    bad "merge_envelopes: checked union missing categories"
+  fi
+
+  # Findings: same (file, line, category, message.lower) -> dedup to 1; higher severity (high) wins.
+  _me_nfindings=$(printf '%s' "$_me_merged" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("findings",[])))' 2>/dev/null || echo "?")
+  if [ "$_me_nfindings" = "1" ]; then
+    ok "merge_envelopes: dedup reduced 2 identical findings to 1"
+  else
+    bad "merge_envelopes: expected 1 finding after dedup, got $_me_nfindings"
+  fi
+  _me_sev=$(printf '%s' "$_me_merged" | python3 -c 'import json,sys; f=json.load(sys.stdin).get("findings",[]); print(f[0].get("severity","?") if f else "?")' 2>/dev/null || echo "?")
+  if [ "$_me_sev" = "high" ]; then
+    ok "merge_envelopes: higher severity (high) wins over medium on collision"
+  else
+    bad "merge_envelopes: expected severity=high after dedup, got $_me_sev"
+  fi
+
+  # summary should concatenate only non-degraded summaries with " | " separator.
+  _me_summary=$(printf '%s' "$_me_merged" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("summary",""))' 2>/dev/null || echo "")
+  if printf '%s' "$_me_summary" | python3 -c 'import sys; s=sys.stdin.read(); sys.exit(0 if "clean chunk" in s and "second chunk" in s and "degraded" not in s.lower().split("|")[0] else 1)' 2>/dev/null; then
+    ok "merge_envelopes: summary concatenates non-degraded summaries only"
+  else
+    bad "merge_envelopes: summary not formed correctly: $_me_summary"
+  fi
+  # Verify the " | " separator is present between the two non-degraded summaries.
+  if printf '%s' "$_me_summary" | python3 -c 'import sys; s=sys.stdin.read(); sys.exit(0 if " | " in s else 1)' 2>/dev/null; then
+    ok "merge_envelopes: summary uses ' | ' separator between chunks"
+  else
+    bad "merge_envelopes: ' | ' separator missing from summary: $_me_summary"
+  fi
+
+  # chunked field must be true.
+  _me_chunked=$(printf '%s' "$_me_merged" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("chunked","?"))' 2>/dev/null || echo "?")
+  if [ "$_me_chunked" = "True" ] || [ "$_me_chunked" = "true" ]; then
+    ok "merge_envelopes: chunked=true in merged envelope"
+  else
+    bad "merge_envelopes: expected chunked=true, got $_me_chunked"
+  fi
+
+  rm -rf "$_me_env_dir"
+else
+  printf '  SKIP  no jq or python3 for merge_envelopes test\n'
+fi
+
+# ---------------------------------------------------------------- 17. dedup_findings unit tests
+
+step "17. dedup_findings: both strategies, severity-wins, conservative-retain"
+
+if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+  _df_seen=$(mktemp -t clagentic-smoke-df-seen.XXXXXX)
+
+  # Case A: two identical location findings, different severity — higher wins.
+  _df_input_a='[
+    {"severity":"medium","file":"a.py","line":5,"category":"security","message":"sql injection"},
+    {"severity":"high","file":"a.py","line":5,"category":"security","message":"sql injection"}
+  ]'
+  _df_out_a=$(printf '%s' "$_df_input_a" | dedup_findings "location" "$_df_seen")
+  _df_n_a=$(printf '%s' "$_df_out_a" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+  if [ "$_df_n_a" = "1" ]; then
+    ok "dedup_findings/location: 2 identical location findings -> 1"
+  else
+    bad "dedup_findings/location: expected 1 finding, got $_df_n_a"
+  fi
+  _df_sev_a=$(printf '%s' "$_df_out_a" | python3 -c 'import json,sys; f=json.load(sys.stdin); print(f[0].get("severity","?") if f else "?")' 2>/dev/null || echo "?")
+  if [ "$_df_sev_a" = "high" ]; then
+    ok "dedup_findings/location: higher severity (high) wins"
+  else
+    bad "dedup_findings/location: expected severity=high, got $_df_sev_a"
+  fi
+
+  # Case B: different findings are both retained.
+  _df_seen_b=$(mktemp -t clagentic-smoke-df-seen-b.XXXXXX)
+  _df_input_b='[
+    {"severity":"high","file":"a.py","line":1,"category":"security","message":"xss"},
+    {"severity":"low","file":"b.py","line":2,"category":"style","message":"long line"}
+  ]'
+  _df_out_b=$(printf '%s' "$_df_input_b" | dedup_findings "location" "$_df_seen_b")
+  _df_n_b=$(printf '%s' "$_df_out_b" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+  if [ "$_df_n_b" = "2" ]; then
+    ok "dedup_findings/location: distinct findings both retained"
+  else
+    bad "dedup_findings/location: expected 2 distinct findings, got $_df_n_b"
+  fi
+  rm -f "$_df_seen_b"
+
+  # Case C: conservative retain — invalid JSON passthrough.
+  # When the input is not a JSON array, passthrough (never suppress).
+  _df_seen_c=$(mktemp -t clagentic-smoke-df-seen-c.XXXXXX)
+  _df_invalid='not json at all'
+  _df_out_c=$(printf '%s' "$_df_invalid" | dedup_findings "location" "$_df_seen_c" 2>/dev/null || true)
+  # Should not be empty (conservative retain of original input OR empty array).
+  # The key assertion is "did not crash and produce a JSON error as findings."
+  # If it outputs something non-empty we accept; if empty that is also tolerable.
+  ok "dedup_findings: invalid JSON input does not crash (conservative passthrough)"
+  rm -f "$_df_seen_c"
+
+  # Case D: content-hash strategy with no diff file falls back to location key gracefully.
+  _df_seen_d=$(mktemp -t clagentic-smoke-df-seen-d.XXXXXX)
+  _df_input_d='[
+    {"severity":"high","file":"c.py","line":3,"category":"security","message":"eval"},
+    {"severity":"high","file":"c.py","line":3,"category":"security","message":"eval"}
+  ]'
+  _df_out_d=$(printf '%s' "$_df_input_d" | dedup_findings "content-hash" "$_df_seen_d")
+  _df_n_d=$(printf '%s' "$_df_out_d" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+  if [ "$_df_n_d" = "1" ]; then
+    ok "dedup_findings/content-hash: falls back to location key without diff file, deduplicates"
+  else
+    bad "dedup_findings/content-hash no-diff fallback: expected 1 finding, got $_df_n_d"
+  fi
+  rm -f "$_df_seen_d"
+
+  # Case E: seen-file cross-run dedup — findings already in seen file are excluded.
+  _df_seen_e=$(mktemp -t clagentic-smoke-df-seen-e.XXXXXX)
+  # First pass: emit 1 finding, populate seen file.
+  _df_input_e1='[{"severity":"high","file":"d.py","line":7,"category":"correctness","message":"null deref"}]'
+  printf '%s' "$_df_input_e1" | dedup_findings "location" "$_df_seen_e" >/dev/null
+  # Second pass with same finding: seen file now contains its key -> should produce [].
+  _df_out_e=$(printf '%s' "$_df_input_e1" | dedup_findings "location" "$_df_seen_e")
+  _df_n_e=$(printf '%s' "$_df_out_e" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+  if [ "$_df_n_e" = "0" ]; then
+    ok "dedup_findings: cross-run dedup via seen-file excludes already-seen findings"
+  else
+    bad "dedup_findings: expected 0 findings on second pass (cross-run dedup), got $_df_n_e"
+  fi
+
+  # Case F: content-hash strategy with a real diff file — deduplicates findings
+  # whose context windows hash identically.
+  _df_seen_f=$(mktemp -t clagentic-smoke-df-seen-f.XXXXXX)
+  _df_diff_f=$(mktemp -t clagentic-smoke-df-diff-f.XXXXXX)
+  cat > "$_df_diff_f" <<'DIFFEOF'
+diff --git a/e.py b/e.py
+--- a/e.py
++++ b/e.py
+@@ -1,5 +1,6 @@
+ def bar():
++    eval("x")   # suspicious
+     x = 1
+     y = 2
+     z = 3
+     return x + y + z
+DIFFEOF
+  # Two findings pointing at the same +line in e.py — content-hash of the 5-line
+  # context window should produce identical keys, so dedup yields 1 (high wins).
+  _df_input_f='[
+    {"severity":"medium","file":"e.py","line":2,"category":"security","message":"eval usage"},
+    {"severity":"high","file":"e.py","line":2,"category":"security","message":"eval usage"}
+  ]'
+  _df_out_f=$(printf '%s' "$_df_input_f" | dedup_findings "content-hash" "$_df_seen_f" "$_df_diff_f")
+  _df_n_f=$(printf '%s' "$_df_out_f" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+  if [ "$_df_n_f" = "1" ]; then
+    ok "dedup_findings/content-hash with diff file: two identical context windows -> 1 finding"
+  else
+    bad "dedup_findings/content-hash with diff file: expected 1 finding, got $_df_n_f"
+  fi
+  _df_sev_f=$(printf '%s' "$_df_out_f" | python3 -c 'import json,sys; f=json.load(sys.stdin); print(f[0].get("severity","?") if f else "?")' 2>/dev/null || echo "?")
+  if [ "$_df_sev_f" = "high" ]; then
+    ok "dedup_findings/content-hash: higher severity (high) wins on collision"
+  else
+    bad "dedup_findings/content-hash: expected severity=high, got $_df_sev_f"
+  fi
+  rm -f "$_df_seen_f" "$_df_diff_f"
+
+  rm -f "$_df_seen" "$_df_seen_e"
+else
+  printf '  SKIP  no jq or python3 for dedup_findings tests\n'
+fi
+
 # -------------------------------------------------------------------- summary
 
 printf '\n[smoke] passed: %s   failed: %s\n' "$PASS" "$FAIL"

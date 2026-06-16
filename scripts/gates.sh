@@ -21,6 +21,7 @@
 set -e
 . "$(dirname "$0")/platform.sh"
 ds_load_env
+. "$(dirname "$0")/review-merge.sh"
 
 # Tool home: the directory containing scripts/ — resolved from this script's
 # own location so it's correct whether invoked via PATH, symlink, or directly.
@@ -439,9 +440,14 @@ cmd_sast() {
 #
 # Priority:
 #   1. Staged diff (git diff --cached) — normal pre-commit path.
-#   2. Branch diff against origin/<default_branch> — PR path when index is
+#   2. --since-last-review: when REVIEW_SINCE_LAST=1 is set (by cmd_review
+#      parsing the --since-last-review flag) AND .clagentic/lite/last-review.json
+#      contains a _clagentic_diff_sha, diff <that-sha>..HEAD instead of the
+#      full origin/<default>..HEAD branch diff. This is the structural fix for
+#      the death-spiral (many fix-commits accumulating into an unreviewed diff).
+#   3. Branch diff against origin/<default_branch> — PR path when index is
 #      clean but we are on a feature branch with committed changes.
-#   3. Empty — on the default branch with no staged changes; review will see
+#   4. Empty — on the default branch with no staged changes; review will see
 #      an empty diff (the merge-gate has an explicit null-review rule for this).
 #
 # Prints one diagnostic line to stderr indicating which mode is active.
@@ -453,6 +459,29 @@ get_review_diff() {
     printf '[gates/review] using staged diff\n' 1>&2
     git diff --cached --unified=3 2>/dev/null
     return 0
+  fi
+
+  # --since-last-review: diff from the SHA in last-review.json..HEAD.
+  # Activated only when REVIEW_SINCE_LAST=1 (set by cmd_review's flag parsing).
+  if [ "${REVIEW_SINCE_LAST:-0}" = "1" ]; then
+    _grd_last_json="$REPO_ROOT/.clagentic/lite/last-review.json"
+    _grd_last_sha=""
+    if [ -f "$_grd_last_json" ]; then
+      if command -v jq >/dev/null 2>&1; then
+        _grd_last_sha=$(jq -r '._clagentic_diff_sha // ""' "$_grd_last_json" 2>/dev/null)
+      elif command -v python3 >/dev/null 2>&1; then
+        _grd_last_sha=$(python3 -c \
+          'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("_clagentic_diff_sha",""))' \
+          "$_grd_last_json" 2>/dev/null)
+      fi
+    fi
+    if [ -n "$_grd_last_sha" ]; then
+      printf '[gates/review] --since-last-review: diffing %s..HEAD\n' "$_grd_last_sha" 1>&2
+      git diff "${_grd_last_sha}..HEAD" --unified=3 2>/dev/null
+      return 0
+    else
+      printf '[gates/review] --since-last-review: no prior review SHA found; falling through to branch diff\n' 1>&2
+    fi
   fi
 
   if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ] && [ "$CURRENT_BRANCH" != "HEAD" ]; then
@@ -468,39 +497,139 @@ get_review_diff() {
 }
 
 cmd_review() {
+  # Parse --since-last-review flag; all other args are consumed by the subcommand dispatcher.
+  REVIEW_SINCE_LAST=0
+  for _crv_arg in "$@"; do
+    case "$_crv_arg" in
+      --since-last-review) REVIEW_SINCE_LAST=1 ;;
+    esac
+  done
+  export REVIEW_SINCE_LAST
+
   OUT="$REPO_ROOT/.clagentic/lite/last-review.json"
-  get_review_diff | "$TOOL_HOME/scripts/llm-client.sh" review > "$OUT"
+
+  # Collect the diff into a temp file so we can measure its size for the
+  # chunking threshold check and pass it to split_diff without re-running git.
+  _crv_diff_tmp=$(mktemp -t clagentic-review-diff.XXXXXX)
+  get_review_diff > "$_crv_diff_tmp"
+  _crv_diff_bytes=$(ds_file_size "$_crv_diff_tmp")
+
+  # Chunking threshold: CLAGENTIC_REVIEWER_MAX_DIFF_KB (operator-facing alias,
+  # in KB) takes precedence; CLAGENTIC_REVIEW_CHUNK_BYTES (in bytes) is the
+  # secondary alias; default 262144 bytes (256 KB).
+  _crv_chunk_bytes="${CLAGENTIC_REVIEW_CHUNK_BYTES:-262144}"
+  if [ -n "${CLAGENTIC_REVIEWER_MAX_DIFF_KB:-}" ]; then
+    case "$CLAGENTIC_REVIEWER_MAX_DIFF_KB" in
+      ''|*[!0-9]*) : ;;
+      *) _crv_chunk_bytes=$(( CLAGENTIC_REVIEWER_MAX_DIFF_KB * 1024 )) ;;
+    esac
+  fi
+  case "$_crv_chunk_bytes" in
+    ''|*[!0-9]*) _crv_chunk_bytes=262144 ;;
+  esac
+
+  # Squash hint: warn the operator when the diff is large, before the chunking decision.
+  if [ "$_crv_diff_bytes" -gt "$_crv_chunk_bytes" ]; then
+    printf '[gates/review] diff is %d bytes (threshold %d) — consider --since-last-review or squashing commits to reduce review scope\n' \
+      "$_crv_diff_bytes" "$_crv_chunk_bytes" 1>&2
+  fi
+
+  # Chunking path: CLAGENTIC_REVIEW_CHUNKING=1 AND diff > threshold.
+  if [ "${CLAGENTIC_REVIEW_CHUNKING:-0}" = "1" ] && [ "$_crv_diff_bytes" -gt "$_crv_chunk_bytes" ]; then
+    _crv_chunk_dir=$(mktemp -d -t clagentic-review-chunks.XXXXXX)
+    _crv_env_dir=$(mktemp -d -t clagentic-review-envs.XXXXXX)
+
+    printf '[gates/review] chunked review: cross-file analysis may be incomplete\n' 1>&2
+
+    _crv_nchunks=$(split_diff "$_crv_diff_tmp" "$_crv_chunk_dir" "$_crv_chunk_bytes")
+    case "$_crv_nchunks" in
+      ''|*[!0-9]*) _crv_nchunks=0 ;;
+    esac
+
+    if [ "$_crv_nchunks" -eq 0 ]; then
+      printf '[gates/review] split_diff produced 0 chunks — falling back to single-pass review\n' 1>&2
+      rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
+    else
+      _crv_cidx=0
+      for _crv_chunk in "$_crv_chunk_dir"/chunk-*; do
+        [ -f "$_crv_chunk" ] || continue
+        _crv_cidx=$((_crv_cidx + 1))
+        _crv_cbytes=$(ds_file_size "$_crv_chunk")
+        _crv_env_file=$(printf '%s/envelope-%03d.json' "$_crv_env_dir" "$_crv_cidx")
+        printf '[gates/review] reviewing chunk %d/%d (%d bytes)\n' "$_crv_cidx" "$_crv_nchunks" "$_crv_cbytes" 1>&2
+        "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_chunk" > "$_crv_env_file" 2>/dev/null || true
+        # Audit one row per chunk.
+        _crv_chunk_outcome="pass"
+        if review_is_degraded "$_crv_env_file" 2>/dev/null; then
+          _crv_chunk_outcome="degraded"
+        fi
+        cmd_log_run review-chunk "$_crv_chunk_outcome" \
+          "chunk=${_crv_cidx}/${_crv_nchunks} bytes=${_crv_cbytes}"
+      done
+
+      # Merge all chunk envelopes into the final output.
+      _crv_merged=$(merge_envelopes "$_crv_env_dir" "location")
+      printf '%s\n' "$_crv_merged" > "$OUT"
+
+      # Stamp the merged envelope with the current HEAD SHA — same logic as
+      # the single-chunk path below.
+      _review_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+      if [ -n "$_review_sha" ]; then
+        _stamp_envelope "$OUT" "$_review_sha"
+      fi
+
+      # Aggregate audit row for the merged result.
+      _crv_merged_outcome="pass"
+      if review_is_degraded "$OUT" 2>/dev/null; then
+        _crv_merged_outcome="block"
+      fi
+      cmd_log_run review "$_crv_merged_outcome" \
+        "chunked: ${_crv_nchunks} chunks reviewed"
+
+      # Partial-degradation surfacing.
+      if review_is_degraded "$OUT"; then
+        _crv_chunks_deg=$(_review_chunks_degraded "$OUT")
+        _crv_total=$(_review_chunks_total "$OUT")
+        if [ "$_crv_chunks_deg" -lt "$_crv_total" ]; then
+          echo "[gates/review] INFRA_DEGRADED: ${_crv_chunks_deg}/${_crv_total} chunks degraded — partial review only." 1>&2
+        else
+          echo "[gates/review] INFRA_DEGRADED: all chunks degraded — no real review occurred." 1>&2
+        fi
+        echo "[gates/review] Check LLM CLI config/auth. Set CLAGENTIC_REVIEWER_REQUIRED=1 to make this a hard gate error." 1>&2
+        echo "[gates/review] full details: $OUT  |  scripts/gates.sh digest" 1>&2
+        rm -f "$_crv_diff_tmp"
+        rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
+        return 2
+      fi
+
+      THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
+      BLOCKERS=$(severity_blockers "$OUT" "$THRESHOLD")
+      if [ "${BLOCKERS:-0}" -gt 0 ]; then
+        cmd_log_run review block "review-blocked: $BLOCKERS finding(s) at >= $THRESHOLD"
+        echo "[gates/review] REVIEW_BLOCKED: $BLOCKERS finding(s) at or above severity '$THRESHOLD'." 1>&2
+        cmd_render_review "$OUT" 1>&2
+        rm -f "$_crv_diff_tmp"
+        rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
+        return 1
+      fi
+      cmd_log_run review pass "0 findings at >= $THRESHOLD (chunked)"
+      cmd_render_review "$OUT"
+      rm -f "$_crv_diff_tmp"
+      rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
+      return 0
+    fi
+  fi
+
+  # Single-pass path (original behavior).
+  "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_diff_tmp" > "$OUT"
+  rm -f "$_crv_diff_tmp"
+
   # Stamp the output with the current HEAD SHA so build_gate_summary can
   # detect stale payloads (file written against a different branch/commit).
   # Best-effort: if git or jq/python3 are unavailable, skip silently.
   _review_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
   if [ -n "$_review_sha" ]; then
-    if command -v jq >/dev/null 2>&1; then
-      _review_tmp=$(mktemp -t clagentic-review-stamp.XXXXXX)
-      if jq --arg sha "$_review_sha" '. + {_clagentic_diff_sha: $sha}' "$OUT" > "$_review_tmp" 2>/dev/null; then
-        mv "$_review_tmp" "$OUT"
-      else
-        rm -f "$_review_tmp"
-      fi
-    elif command -v python3 >/dev/null 2>&1; then
-      _review_tmp=$(mktemp -t clagentic-review-stamp.XXXXXX)
-      if python3 - "$OUT" "$_review_sha" "$_review_tmp" <<'PYEOF' 2>/dev/null
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        d = json.load(f)
-    d["_clagentic_diff_sha"] = sys.argv[2]
-    with open(sys.argv[3], "w") as f:
-        json.dump(d, f)
-except Exception:
-    sys.exit(1)
-PYEOF
-      then
-        mv "$_review_tmp" "$OUT"
-      else
-        rm -f "$_review_tmp"
-      fi
-    fi
+    _stamp_envelope "$OUT" "$_review_sha"
   fi
   # Reject degraded envelopes outright. An LLM wrapper that failed every
   # chain step emits valid JSON with findings:[] — schema-valid but
@@ -538,6 +667,66 @@ PYEOF
   fi
   cmd_log_run review pass "0 findings at >= $THRESHOLD"
   cmd_render_review "$OUT"
+}
+
+# _stamp_envelope FILE SHA — add _clagentic_diff_sha to a JSON envelope file.
+# Best-effort: silently skips if no JSON tool or if jq/python3 fail.
+_stamp_envelope() {
+  _se_file="$1"
+  _se_sha="$2"
+  if command -v jq >/dev/null 2>&1; then
+    _se_tmp=$(mktemp -t clagentic-review-stamp.XXXXXX)
+    if jq --arg sha "$_se_sha" '. + {_clagentic_diff_sha: $sha}' "$_se_file" > "$_se_tmp" 2>/dev/null; then
+      mv "$_se_tmp" "$_se_file"
+    else
+      rm -f "$_se_tmp"
+    fi
+  elif command -v python3 >/dev/null 2>&1; then
+    _se_tmp=$(mktemp -t clagentic-review-stamp.XXXXXX)
+    if python3 - "$_se_file" "$_se_sha" "$_se_tmp" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    d["_clagentic_diff_sha"] = sys.argv[2]
+    with open(sys.argv[3], "w") as f:
+        json.dump(d, f)
+except Exception:
+    sys.exit(1)
+PYEOF
+    then
+      mv "$_se_tmp" "$_se_file"
+    else
+      rm -f "$_se_tmp"
+    fi
+  fi
+}
+
+# _review_chunks_degraded FILE — extract chunks_degraded from a merged envelope.
+# Returns 0 on parse error (conservative: assume none degraded for counting).
+_review_chunks_degraded() {
+  _rcd_file="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.chunks_degraded // 0' "$_rcd_file" 2>/dev/null || echo 0
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("chunks_degraded",0))' \
+      "$_rcd_file" 2>/dev/null || echo 0
+  else
+    echo 0
+  fi
+}
+
+# _review_chunks_total FILE — extract chunks from a merged envelope.
+_review_chunks_total() {
+  _rct_file="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.chunks // 0' "$_rct_file" 2>/dev/null || echo 0
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("chunks",0))' \
+      "$_rct_file" 2>/dev/null || echo 0
+  else
+    echo 0
+  fi
 }
 
 # Detect the "degraded": true marker written by emit_degraded in llm-client.sh.
@@ -1106,7 +1295,7 @@ case "${1:-}" in
   secrets)        cmd_secrets ;;
   deps)           cmd_deps ;;
   sast)           cmd_sast ;;
-  review)         cmd_review ;;
+  review)         shift; cmd_review "$@" ;;
   adversarial)    cmd_adversarial ;;
   merge-gate)     cmd_merge_gate ;;
   render-review)  shift; cmd_render_review "$@" ;;
@@ -1116,5 +1305,5 @@ case "${1:-}" in
   digest)         cmd_digest ;;
   status)         shift; cmd_status "$@" ;;
   tail)           cmd_tail ;;
-  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest|status|tail}" 1>&2; exit 1 ;;
+  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review]|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest|status|tail}" 1>&2; exit 1 ;;
 esac
