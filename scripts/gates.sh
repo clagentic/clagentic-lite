@@ -14,7 +14,7 @@
 #   render-review    pretty-print .clagentic/lite/last-review.json
 #   digest           summarize today's audit rows
 #   status           last N runs per gate (default N=10) with color outcomes
-#   tail             follow audit.db, render new gate_runs rows as they land
+#   tail             follow audit.db, render new gate_runs rows as they land; --no-follow exits after one poll
 #   pre-push         hook entry point (deps + sast + optional review)
 #   log-run          internal: insert one row into gate_runs
 
@@ -1417,10 +1417,47 @@ cmd_status() {
 cmd_tail() {
   cmd_init
   _color_init
+
+  # Parse flags.
+  _tail_no_follow=0
+  for _tail_arg in "$@"; do
+    case "$_tail_arg" in
+      --no-follow) _tail_no_follow=1 ;;
+    esac
+  done
+
   # Start from the current max id so we only render NEW rows. A fresh tail
   # session shouldn't dump history — use `status` or `digest` for that.
-  LAST_ID=$(sqlite3 "$AUDIT_DB" "SELECT COALESCE(MAX(id),0) FROM gate_runs;" 2>/dev/null)
-  LAST_ID=${LAST_ID:-0}
+  # CLAGENTIC_TAIL_WATERMARK: when set, use the provided id as the start
+  # watermark instead of computing MAX(id). Used by smoke.sh step 6c so the
+  # watermark is captured before the sentinel row is logged — ensuring the new
+  # row is visible on the first (and only) poll in --no-follow mode.
+  if [ -n "${CLAGENTIC_TAIL_WATERMARK:-}" ]; then
+    LAST_ID="$CLAGENTIC_TAIL_WATERMARK"
+    case "$LAST_ID" in ''|*[!0-9]*) LAST_ID=0 ;; esac
+  else
+    LAST_ID=$(sqlite3 "$AUDIT_DB" "SELECT COALESCE(MAX(id),0) FROM gate_runs;" 2>/dev/null)
+    LAST_ID=${LAST_ID:-0}
+  fi
+
+  if [ "$_tail_no_follow" = "1" ]; then
+    # --no-follow: emit rows since the watermark and exit 0.
+    # Used by smoke.sh (step 6c) to avoid the indefinite-follow hang that
+    # occurs inside a Claude Code session.
+    printf '== clagentic-lite gate tail (--no-follow, one-shot) ==\n'
+    printf '   rows with gate_runs.id > %s\n\n' "$LAST_ID"
+    NEW=$(sqlite3 -separator '|' "$AUDIT_DB" \
+      "SELECT id, ts, gate, outcome, substr(coalesce(details,''),1,80)
+       FROM gate_runs WHERE id > $LAST_ID ORDER BY id ASC;" 2>/dev/null)
+    if [ -n "$NEW" ]; then
+      printf '%s\n' "$NEW" | while IFS='|' read -r ID TS GATE OUTCOME DETAILS; do
+        COLORED=$(_color_outcome "$OUTCOME")
+        printf '  %s  %-12s  %-7s  %s\n' "$TS" "$GATE" "$COLORED" "$DETAILS"
+      done
+    fi
+    return 0
+  fi
+
   INTERVAL="${CLAGENTIC_TAIL_INTERVAL_SEC:-1}"
   printf '== clagentic-lite gate tail (Ctrl-C to quit, polling every %ss) ==\n' "$INTERVAL"
   printf '   starting from gate_runs.id > %s\n\n' "$LAST_ID"
@@ -1462,5 +1499,5 @@ case "${1:-}" in
   digest)         cmd_digest ;;
   status)         shift; cmd_status "$@" ;;
   tail)           cmd_tail ;;
-  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest|status|tail}" 1>&2; exit 1 ;;
+  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
 esac

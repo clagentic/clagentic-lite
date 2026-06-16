@@ -266,3 +266,9 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # When set, overrides CLAGENTIC_REVIEW_CHUNK_BYTES. Use whichever unit is more
 # natural for your workflow.
 # CLAGENTIC_REVIEWER_MAX_DIFF_KB=256
+
+# ---------- smoke test ----------
+# CLAGENTIC_SMOKE_NO_LLM=1
+# When set, smoke.sh skips live LLM calls and substitutes a stub JSON envelope.
+# Use for in-session smoke runs or CI environments without LLM access.
+# Default: unset (live LLM calls enabled).
