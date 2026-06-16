@@ -98,6 +98,7 @@ split_diff() {
   # Each block = one file. Writes one numbered file per block.
   # POSIX awk — no gensub, no arrays needed beyond the accumulator.
   awk -v outdir="$_sd_tmp_dir" '
+    BEGIN { buf = ""; idx = 0 }
     /^diff --git / {
       if (buf != "") {
         idx++
@@ -164,6 +165,7 @@ ${_sd_fcontent}"
       # Write hunks to temp files using awk.
       _sd_hunk_dir=$(mktemp -d -t clagentic-sd-hunks.XXXXXX)
       awk -v outdir="$_sd_hunk_dir" -v header="$_sd_file_header" '
+        BEGIN { hbuf = ""; hidx = 0 }
         /^@@/ {
           if (hbuf != "") {
             hidx++
@@ -342,14 +344,21 @@ _merge_envelopes_py() {
   _mep_strategy="$2"
   _mep_seen="$3"
 
-  python3 - "$_mep_dir" "$_mep_strategy" "$_mep_seen" <<'PYEOF'
-import json, os, sys, subprocess, hashlib
+  # Phase 1: python aggregates envelopes (no inline dedup — dedup_findings owns that).
+  # Emits a JSON object with raw (undeduped) findings plus aggregated metadata.
+  # Phase 2: shell pipes raw findings through dedup_findings (same path as jq branch).
+  # Phase 3: python splices deduped findings back into the result envelope.
 
-env_dir   = sys.argv[1]
-strategy  = sys.argv[2]
-seen_file = sys.argv[3]
+  _mep_raw=$(mktemp -t clagentic-me-raw.XXXXXX)
+  _mep_dedup_in=$(mktemp -t clagentic-me-din.XXXXXX)
+  _mep_dedup_out=$(mktemp -t clagentic-me-dout.XXXXXX)
+  _mep_final_rc=0
 
-# Collect envelope files in lexicographic order.
+  python3 - "$_mep_dir" > "$_mep_raw" <<'PYEOF'
+import json, os, sys
+
+env_dir = sys.argv[1]
+
 files = sorted(
     f for f in os.listdir(env_dir)
     if f.startswith("envelope-") and f.endswith(".json")
@@ -357,7 +366,8 @@ files = sorted(
 
 if not files:
     print(json.dumps({
-        "degraded": True, "chunked": True, "chunks": 0, "chunks_degraded": 0,
+        "_no_envelopes": True, "degraded": True, "chunked": True,
+        "chunks": 0, "chunks_degraded": 0,
         "summary": "[clagentic-lite] no valid envelopes found",
         "checked": [], "findings": []
     }))
@@ -394,79 +404,10 @@ for fname in files:
 
     all_findings.extend(env.get("findings", []))
 
-# Dedup findings inline (mirrors dedup_findings location strategy).
-severity_rank = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-
-def finding_key(f, strat):
-    if strat == "location":
-        raw = "{}:{}:{}:{}".format(
-            f.get("file", ""),
-            f.get("line", ""),
-            f.get("category", ""),
-            str(f.get("message", "")).lower()
-        )
-        return hashlib.sha256(raw.encode()).hexdigest()
-    # content-hash: implemented via sha256 of 5-line context window
-    # (same logic as dedup_findings; without diff_file we fall back to location).
-    raw = "{}:{}:{}:{}".format(
-        f.get("file", ""),
-        f.get("line", ""),
-        f.get("category", ""),
-        str(f.get("message", "")).lower()
-    )
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-# Load seen keys.
-seen = {}
-try:
-    with open(seen_file) as sf:
-        for line in sf:
-            line = line.strip()
-            if line:
-                seen[line] = True
-except Exception:
-    pass
-
-deduped = []
-for f in all_findings:
-    try:
-        key = finding_key(f, strategy)
-    except Exception:
-        # Conservative: cannot compute key -> retain finding.
-        deduped.append(f)
-        continue
-
-    if key not in seen:
-        seen[key] = True
-        deduped.append(f)
-    else:
-        # Key collision: higher severity wins.
-        for i, existing in enumerate(deduped):
-            try:
-                ek = finding_key(existing, strategy)
-            except Exception:
-                continue
-            if ek == key:
-                er = severity_rank.get(str(existing.get("severity", "")).lower(), 0)
-                nr = severity_rank.get(str(f.get("severity", "")).lower(), 0)
-                if nr > er:
-                    deduped[i] = f
-                break
-
-# Update seen file.
-try:
-    with open(seen_file, "a") as sf:
-        for k in seen:
-            sf.write(k + "\n")
-except Exception:
-    pass
-
-merged_summary = " | ".join(summaries)
-
 result = {
-    "summary": merged_summary,
+    "summary": " | ".join(summaries),
     "checked": checked_set,
-    "findings": deduped,
+    "findings": all_findings,   # raw; will be replaced by dedup_findings output
     "degraded": any_degraded,
     "chunked": True,
     "chunks": total,
@@ -474,7 +415,45 @@ result = {
 }
 print(json.dumps(result))
 PYEOF
-  return $?
+  _mep_py1_rc=$?
+
+  if [ "$_mep_py1_rc" -ne 0 ]; then
+    cat "$_mep_raw"
+    rm -f "$_mep_raw" "$_mep_dedup_in" "$_mep_dedup_out"
+    return "$_mep_py1_rc"
+  fi
+
+  # Extract raw findings array and pass through dedup_findings.
+  python3 -c "import json,sys; d=json.load(open('$_mep_raw')); print(json.dumps(d.get('findings',[])))" \
+    > "$_mep_dedup_in" 2>/dev/null
+  dedup_findings "$_mep_strategy" "$_mep_seen" < "$_mep_dedup_in" > "$_mep_dedup_out"
+
+  # Splice deduped findings back into the envelope.
+  python3 - "$_mep_raw" "$_mep_dedup_out" <<'PYEOF2'
+import json, sys
+
+raw_path   = sys.argv[1]
+dedup_path = sys.argv[2]
+
+with open(raw_path) as f:
+    envelope = json.load(f)
+
+try:
+    with open(dedup_path) as f:
+        deduped = json.load(f)
+    if not isinstance(deduped, list):
+        raise ValueError("not a list")
+except Exception:
+    # Conservative: keep raw findings if dedup output is unreadable.
+    deduped = envelope.get("findings", [])
+
+envelope["findings"] = deduped
+print(json.dumps(envelope))
+PYEOF2
+  _mep_final_rc=$?
+
+  rm -f "$_mep_raw" "$_mep_dedup_in" "$_mep_dedup_out"
+  return $_mep_final_rc
 }
 
 # ------------------------------------------------------------- dedup_findings --
@@ -611,41 +590,7 @@ _dedup_findings_jq() {
     _dfj_idx=$((_dfj_idx + 1))
   done
 
-  # Now perform dedup: build output array in awk using key+severity tracking.
-  # We pass: the input JSON (one finding per line via jq), the keys file, and
-  # the seen-keys file. awk tracks seen keys and applies severity-wins.
-  # Because awk cannot build JSON safely, we do the final selection in jq.
-
-  # Build selection index: for each finding, decide if it should be included
-  # and whether it replaces an earlier finding with the same key.
-  # Output: space-separated list of original indices to keep (winner per key).
-
-  _dfj_select=$(awk -v seen_file="$_dfj_seen" '
-    BEGIN {
-      # Load already-seen keys.
-      while ((getline line < seen_file) > 0) {
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-        if (line != "") seen[line] = 1
-      }
-      close(seen_file)
-      rank["low"]      = 1
-      rank["medium"]   = 2
-      rank["high"]     = 3
-      rank["critical"] = 4
-    }
-    {
-      # Each line: "IDX KEY SEVERITY" — but we read from a temp combined file.
-      idx = $1
-      key = $2
-      sev = $3
-      r = (key in rank) ? rank[key] : 0
-      sev_lower = sev
-      gsub(/[A-Z]/, "", sev_lower)
-    }
-  ' /dev/null)
-  # The above awk skeleton is a placeholder; implement properly below.
-
-  # Simpler approach: build a combined input for awk (idx, key, severity per line).
+  # Now perform dedup: build a combined input for awk (idx, key, severity per line).
   _dfj_combined=$(mktemp -t clagentic-df-comb.XXXXXX)
   _dfj_idx=0
   while IFS= read -r _dfj_k; do

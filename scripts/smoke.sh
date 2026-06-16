@@ -631,12 +631,33 @@ if [ "${_sd_nchunks_a:-0}" -ge 1 ]; then
 else
   bad "split_diff: expected >= 1 chunks with large budget, got $_sd_nchunks_a"
 fi
-# Verify chunk files are present.
+# Verify chunk files are present and count matches reported integer.
 _sd_chunk_count_a=$(find "$_sd_chunk_dir_a" -name 'chunk-*' -type f | wc -l | tr -d '[:space:]')
 if [ "${_sd_chunk_count_a:-0}" -eq "${_sd_nchunks_a:-0}" ]; then
-  ok "split_diff: chunk file count matches stdout integer ($SD_NCHUNKS_A)"
+  ok "split_diff: chunk file count matches stdout integer ($_sd_nchunks_a)"
 else
   bad "split_diff: chunk file count $_sd_chunk_count_a != reported $_sd_nchunks_a"
+fi
+# Chunk numbering: first file must be chunk-001 (not chunk-000).
+if [ -f "$_sd_chunk_dir_a/chunk-001" ]; then
+  ok "split_diff: first chunk file is chunk-001 (1-based numbering)"
+else
+  bad "split_diff: chunk-001 not found; got: $(ls "$_sd_chunk_dir_a" 2>/dev/null | head -3)"
+fi
+# Each chunk must begin with a 'diff --git' header line.
+_sd_header_bad=0
+for _sd_cf in "$_sd_chunk_dir_a"/chunk-*; do
+  [ -f "$_sd_cf" ] || continue
+  _sd_first=$(head -1 "$_sd_cf" 2>/dev/null)
+  case "$_sd_first" in
+    'diff --git '*) : ;;  # good
+    *) _sd_header_bad=$((_sd_header_bad + 1)) ;;
+  esac
+done
+if [ "$_sd_header_bad" -eq 0 ]; then
+  ok "split_diff: each chunk begins with 'diff --git' header"
+else
+  bad "split_diff: $_sd_header_bad chunk(s) missing 'diff --git' header"
 fi
 rm -rf "$_sd_chunk_dir_a"
 
@@ -648,8 +669,7 @@ if [ "${_sd_nchunks_b:-0}" -gt 1 ]; then
 else
   bad "split_diff: expected >1 chunks with small budget, got $_sd_nchunks_b"
 fi
-# Each chunk file must contain at least one diff --git line or @@ header
-# (boundary correctness: no intra-hunk splits producing malformed fragments).
+# Each chunk file must be non-empty.
 _sd_bad_chunks=0
 for _sd_cf in "$_sd_chunk_dir_b"/chunk-*; do
   [ -f "$_sd_cf" ] || continue
@@ -663,6 +683,22 @@ if [ "$_sd_bad_chunks" -eq 0 ]; then
   ok "split_diff: all chunk files non-empty"
 else
   bad "split_diff: $_sd_bad_chunks empty chunk file(s)"
+fi
+# Each chunk must begin with a 'diff --git' header (small-budget case too).
+_sd_header_bad_b=0
+for _sd_cf in "$_sd_chunk_dir_b"/chunk-*; do
+  [ -f "$_sd_cf" ] || continue
+  _sd_first=$(head -1 "$_sd_cf" 2>/dev/null)
+  case "$_sd_first" in
+    'diff --git '*)  : ;;
+    '@@ '*)          : ;;  # hunk sub-chunk from oversized single file — acceptable
+    *) _sd_header_bad_b=$((_sd_header_bad_b + 1)) ;;
+  esac
+done
+if [ "$_sd_header_bad_b" -eq 0 ]; then
+  ok "split_diff: small-budget chunks all start with diff or hunk header"
+else
+  bad "split_diff: $_sd_header_bad_b small-budget chunk(s) missing valid header"
 fi
 rm -rf "$_sd_chunk_dir_b"
 
@@ -765,12 +801,26 @@ EOF
     bad "merge_envelopes: expected severity=high after dedup, got $_me_sev"
   fi
 
-  # summary should concatenate only non-degraded summaries.
+  # summary should concatenate only non-degraded summaries with " | " separator.
   _me_summary=$(printf '%s' "$_me_merged" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("summary",""))' 2>/dev/null || echo "")
   if printf '%s' "$_me_summary" | python3 -c 'import sys; s=sys.stdin.read(); sys.exit(0 if "clean chunk" in s and "second chunk" in s and "degraded" not in s.lower().split("|")[0] else 1)' 2>/dev/null; then
     ok "merge_envelopes: summary concatenates non-degraded summaries only"
   else
     bad "merge_envelopes: summary not formed correctly: $_me_summary"
+  fi
+  # Verify the " | " separator is present between the two non-degraded summaries.
+  if printf '%s' "$_me_summary" | python3 -c 'import sys; s=sys.stdin.read(); sys.exit(0 if " | " in s else 1)' 2>/dev/null; then
+    ok "merge_envelopes: summary uses ' | ' separator between chunks"
+  else
+    bad "merge_envelopes: ' | ' separator missing from summary: $_me_summary"
+  fi
+
+  # chunked field must be true.
+  _me_chunked=$(printf '%s' "$_me_merged" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("chunked","?"))' 2>/dev/null || echo "?")
+  if [ "$_me_chunked" = "True" ] || [ "$_me_chunked" = "true" ]; then
+    ok "merge_envelopes: chunked=true in merged envelope"
+  else
+    bad "merge_envelopes: expected chunked=true, got $_me_chunked"
   fi
 
   rm -rf "$_me_env_dir"
@@ -858,6 +908,43 @@ if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
   else
     bad "dedup_findings: expected 0 findings on second pass (cross-run dedup), got $_df_n_e"
   fi
+
+  # Case F: content-hash strategy with a real diff file — deduplicates findings
+  # whose context windows hash identically.
+  _df_seen_f=$(mktemp -t clagentic-smoke-df-seen-f.XXXXXX)
+  _df_diff_f=$(mktemp -t clagentic-smoke-df-diff-f.XXXXXX)
+  cat > "$_df_diff_f" <<'DIFFEOF'
+diff --git a/e.py b/e.py
+--- a/e.py
++++ b/e.py
+@@ -1,5 +1,6 @@
+ def bar():
++    eval("x")   # suspicious
+     x = 1
+     y = 2
+     z = 3
+     return x + y + z
+DIFFEOF
+  # Two findings pointing at the same +line in e.py — content-hash of the 5-line
+  # context window should produce identical keys, so dedup yields 1 (high wins).
+  _df_input_f='[
+    {"severity":"medium","file":"e.py","line":2,"category":"security","message":"eval usage"},
+    {"severity":"high","file":"e.py","line":2,"category":"security","message":"eval usage"}
+  ]'
+  _df_out_f=$(printf '%s' "$_df_input_f" | dedup_findings "content-hash" "$_df_seen_f" "$_df_diff_f")
+  _df_n_f=$(printf '%s' "$_df_out_f" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+  if [ "$_df_n_f" = "1" ]; then
+    ok "dedup_findings/content-hash with diff file: two identical context windows -> 1 finding"
+  else
+    bad "dedup_findings/content-hash with diff file: expected 1 finding, got $_df_n_f"
+  fi
+  _df_sev_f=$(printf '%s' "$_df_out_f" | python3 -c 'import json,sys; f=json.load(sys.stdin); print(f[0].get("severity","?") if f else "?")' 2>/dev/null || echo "?")
+  if [ "$_df_sev_f" = "high" ]; then
+    ok "dedup_findings/content-hash: higher severity (high) wins on collision"
+  else
+    bad "dedup_findings/content-hash: expected severity=high, got $_df_sev_f"
+  fi
+  rm -f "$_df_seen_f" "$_df_diff_f"
 
   rm -f "$_df_seen" "$_df_seen_e"
 else
