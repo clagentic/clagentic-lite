@@ -951,6 +951,74 @@ else
   printf '  SKIP  no jq or python3 for dedup_findings tests\n'
 fi
 
+# ---------------------------------------------------------------- 18. cross-round dedup: first round passes through, seeds keys
+#
+# review-merge.sh was sourced at step 15. dedup_findings is available.
+# These steps test the CLAGENTIC_CROSS_ROUND_DEDUP mechanism via direct
+# function calls — not via gates.sh (known hang in session; per spec).
+
+step "18. cross-round dedup: first round passes findings through and seeds seen-keys"
+
+if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+  _crd_seen_18=$(mktemp -t clagentic-smoke-crd18.XXXXXX)
+  _crd_findings_18='[{"file":"foo.py","line":10,"category":"sql","message":"injection","severity":"high"}]'
+
+  # Round 1: seen-keys file is empty (just created). Finding is unknown — must pass through.
+  _crd_r1=$(printf '%s' "$_crd_findings_18" | dedup_findings content-hash "$_crd_seen_18")
+  _crd_n1=$(printf '%s' "$_crd_r1" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+  if [ "$_crd_n1" = "1" ]; then
+    ok "cross-round dedup: round 1 passes finding through (not yet in seen-keys)"
+  else
+    bad "cross-round dedup: round 1 expected 1 finding, got $_crd_n1"
+  fi
+
+  # Seen-keys file must be non-empty after round 1 (key was appended).
+  if [ -s "$_crd_seen_18" ]; then
+    ok "cross-round dedup: seen-keys file populated after round 1"
+  else
+    bad "cross-round dedup: seen-keys file is empty after round 1"
+  fi
+
+  rm -f "$_crd_seen_18"
+else
+  printf '  SKIP  no jq or python3 for cross-round dedup tests\n'
+fi
+
+# ---------------------------------------------------------------- 19. cross-round dedup: second round suppresses already-seen findings
+
+step "19. cross-round dedup: second round suppresses finding already in seen-keys"
+
+if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+  _crd_seen_19=$(mktemp -t clagentic-smoke-crd19.XXXXXX)
+  _crd_findings_19='[{"file":"foo.py","line":10,"category":"sql","message":"injection","severity":"high"}]'
+
+  # Round 1: populate the seen-keys file (finding passes through; key appended).
+  printf '%s' "$_crd_findings_19" | dedup_findings content-hash "$_crd_seen_19" >/dev/null
+
+  # Round 2: same finding, same seen-keys file. Key is known — must be suppressed.
+  _crd_r2=$(printf '%s' "$_crd_findings_19" | dedup_findings content-hash "$_crd_seen_19")
+  _crd_n2=$(printf '%s' "$_crd_r2" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+  if [ "$_crd_n2" = "0" ]; then
+    ok "cross-round dedup: round 2 suppresses finding already in seen-keys"
+  else
+    bad "cross-round dedup: round 2 expected 0 findings (suppressed), got $_crd_n2"
+  fi
+
+  # Distinct finding on round 2 must still pass through.
+  _crd_new_19='[{"file":"bar.py","line":5,"category":"xss","message":"unsafe output","severity":"medium"}]'
+  _crd_r2b=$(printf '%s' "$_crd_new_19" | dedup_findings content-hash "$_crd_seen_19")
+  _crd_n2b=$(printf '%s' "$_crd_r2b" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?")
+  if [ "$_crd_n2b" = "1" ]; then
+    ok "cross-round dedup: new finding on round 2 is not suppressed"
+  else
+    bad "cross-round dedup: new finding on round 2 expected 1, got $_crd_n2b"
+  fi
+
+  rm -f "$_crd_seen_19"
+else
+  printf '  SKIP  no jq or python3 for cross-round dedup tests\n'
+fi
+
 # -------------------------------------------------------------------- summary
 
 printf '\n[smoke] passed: %s   failed: %s\n' "$PASS" "$FAIL"
