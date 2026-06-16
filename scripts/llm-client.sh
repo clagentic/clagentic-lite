@@ -413,15 +413,23 @@ invoke_claude() {
   # Tell the inner Claude session NOT to inject recall summaries —
   # this is the recursion-avoidance path that doesn't require --bare.
   export CLAGENTIC_DISABLE_RECALL=1
+  # Unset CLAUDE_CODE_SESSION_ID in a subshell before spawning claude --print.
+  # When this wrapper is invoked from inside an active Claude Code session,
+  # Claude Code detects the nested invocation via CLAUDE_CODE_SESSION_ID and
+  # backgrounds the subprocess — which prevents output capture and forces a
+  # second manual run. Clearing the var in the subshell suppresses that
+  # detection without requiring --bare (which breaks OAuth auth).
   if [ -n "$MODEL" ]; then
     # shellcheck disable=SC2086
-    cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $BARE_FLAG --model "$MODEL" \
-      --append-system-prompt "$(cat "$PROMPT_FILE")" \
+    ( unset CLAUDE_CODE_SESSION_ID
+      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $BARE_FLAG --model "$MODEL" \
+        --append-system-prompt "$(cat "$PROMPT_FILE")" ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   else
     # shellcheck disable=SC2086
-    cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $BARE_FLAG \
-      --append-system-prompt "$(cat "$PROMPT_FILE")" \
+    ( unset CLAUDE_CODE_SESSION_ID
+      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $BARE_FLAG \
+        --append-system-prompt "$(cat "$PROMPT_FILE")" ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   fi
 }
