@@ -506,9 +506,12 @@ PYEOF
   # chain step emits valid JSON with findings:[] — schema-valid but
   # meaningless. Without this check, a misconfigured / auth-broken /
   # network-out Reviewer chain reports "clean review" and the ship passes.
+  # Exit 2 = INFRA_DEGRADED: distinct from exit 1 (REVIEW_BLOCKED) so callers
+  # and CI can distinguish "retry — infra flaked" from "fix your code."
   if review_is_degraded "$OUT"; then
-    cmd_log_run review block "review degraded (all chain steps failed)"
-    echo "[gates/review] BLOCKED: reviewer chain returned degraded envelope — no real review occurred." 1>&2
+    cmd_log_run review block "infra-degraded: all reviewer chain steps failed"
+    echo "[gates/review] INFRA_DEGRADED: reviewer chain returned degraded envelope — no real review occurred." 1>&2
+    echo "[gates/review] Check LLM CLI config/auth. Set CLAGENTIC_REVIEWER_REQUIRED=1 to make this a hard gate error." 1>&2
     # Pull the per-step failure reasons from the audit DB so the user sees them
     # in the terminal without having to run `digest` or open last-review.json.
     ADB="$REPO_ROOT/.clagentic/lite/audit.db"
@@ -522,13 +525,14 @@ PYEOF
       fi
     fi
     echo "[gates/review] full details: $OUT  |  scripts/gates.sh digest" 1>&2
-    return 1
+    return 2
   fi
   # Severity gate: count findings >= configured threshold.
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
   BLOCKERS=$(severity_blockers "$OUT" "$THRESHOLD")
   if [ "${BLOCKERS:-0}" -gt 0 ]; then
-    cmd_log_run review block "$BLOCKERS finding(s) at >= $THRESHOLD"
+    cmd_log_run review block "review-blocked: $BLOCKERS finding(s) at >= $THRESHOLD"
+    echo "[gates/review] REVIEW_BLOCKED: $BLOCKERS finding(s) at or above severity '$THRESHOLD'." 1>&2
     cmd_render_review "$OUT" 1>&2
     return 1
   fi
@@ -926,7 +930,21 @@ cmd_ship() {
   if gate_enabled secrets;     then cmd_secrets     || { echo "[gates/ship] BLOCKED at secrets";    exit 1; }; else ship_step_skip secrets;     fi
   if gate_enabled deps;        then cmd_deps        || { echo "[gates/ship] BLOCKED at deps";       exit 1; }; else ship_step_skip deps;        fi
   if gate_enabled sast;        then cmd_sast        || { echo "[gates/ship] BLOCKED at sast";       exit 1; }; else ship_step_skip sast;        fi
-  if gate_enabled review;      then cmd_review      || { echo "[gates/ship] BLOCKED at review (severity threshold ${CLAGENTIC_BLOCK_SEVERITY:-high})"; exit 1; }; else ship_step_skip review;      fi
+  if gate_enabled review; then
+    _review_rc=0
+    cmd_review || _review_rc=$?
+    if [ "$_review_rc" -eq 2 ]; then
+      echo "[gates/ship] INFRA_DEGRADED at review — reviewer infrastructure failed, no real review occurred"
+      cmd_log_run ship block "infra-degraded at review"
+      exit 2
+    elif [ "$_review_rc" -ne 0 ]; then
+      echo "[gates/ship] REVIEW_BLOCKED at review (severity threshold ${CLAGENTIC_BLOCK_SEVERITY:-high})"
+      cmd_log_run ship block "review-blocked at review"
+      exit 1
+    fi
+  else
+    ship_step_skip review
+  fi
   if gate_enabled adversarial; then cmd_adversarial || true; else ship_step_skip adversarial; fi
   if gate_enabled merge-gate;  then cmd_merge_gate  || { echo "[gates/ship] BLOCKED at merge-gate"; exit 1; }; else ship_step_skip merge-gate;  fi
 
