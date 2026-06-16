@@ -205,6 +205,14 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # stale payload to the merge-gate LLM.
 # CLAGENTIC_ALLOW_STALE_PAYLOAD=1
 
+# ---------- cross-round finding dedup ----------
+# Opt-in: suppress findings already reported in a prior review round when the
+# relevant diff lines are unchanged since. Key strategy is content-hash (sha256
+# of a 5-line context window), so the key survives line shifts. Default: off.
+# Seen-keys are persisted in .clagentic/lite/review-seen-keys (gitignored).
+# Reset with: clagentic-lite gates review --reset-dedup
+# CLAGENTIC_CROSS_ROUND_DEDUP=0
+
 # ---------- chunked review ----------
 # Opt-in diff chunking for the review gate. When enabled (=1) and the diff
 # exceeds the threshold, the diff is split into chunks and reviewed per-chunk.

@@ -496,15 +496,150 @@ get_review_diff() {
   printf '[gates/review] no staged changes and on default branch — empty diff\n' 1>&2
 }
 
+# _cross_round_dedup ENVELOPE_FILE DIFF_FILE SEEN_FILE
+#
+# Reads the findings array from ENVELOPE_FILE, pipes it through dedup_findings
+# content-hash (from review-merge.sh) with SEEN_FILE as the persisted key store
+# and DIFF_FILE as the context source, splices the deduped findings back into
+# ENVELOPE_FILE in place, and logs a gate_runs audit row with the suppression count.
+#
+# Conservative by design: dedup_findings retains findings when the key cannot be
+# computed (no diff window, no sha256 tool) — wrong suppressions are worse than
+# missed dedups. Seen-file absent on first call is a no-op (fail-open).
+#
+# Called only when CLAGENTIC_CROSS_ROUND_DEDUP=1. Not called on degraded envelopes
+# (caller checks degraded state after this function returns).
+_cross_round_dedup() {
+  _crd_envelope="$1"
+  _crd_diff="$2"
+  _crd_seen="$3"
+
+  # Absent seen-file: no prior keys; dedup_findings will populate it from this run.
+  # This is the correct first-run behavior — no-op suppression, but keys are seeded.
+
+  # Snapshot the count before dedup to compute suppression delta.
+  _crd_before=0
+  if command -v jq >/dev/null 2>&1; then
+    _crd_before=$(jq -r '.findings | length // 0' "$_crd_envelope" 2>/dev/null || echo 0)
+  elif command -v python3 >/dev/null 2>&1; then
+    _crd_before=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("findings",[])))' \
+      "$_crd_envelope" 2>/dev/null || echo 0)
+  fi
+  case "$_crd_before" in ''|*[!0-9]*) _crd_before=0 ;; esac
+
+  # Extract findings, pipe through dedup_findings, splice result back.
+  _crd_raw_findings=$(mktemp -t clagentic-crd-raw.XXXXXX)
+  _crd_deduped_findings=$(mktemp -t clagentic-crd-dedup.XXXXXX)
+  _crd_ok=0
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -c '.findings // []' "$_crd_envelope" > "$_crd_raw_findings" 2>/dev/null && _crd_ok=1
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("findings",[])))' \
+      "$_crd_envelope" > "$_crd_raw_findings" 2>/dev/null && _crd_ok=1
+  fi
+
+  if [ "$_crd_ok" = "1" ]; then
+    # dedup_findings appends new keys to _crd_seen in-place and writes deduped array to stdout.
+    dedup_findings "content-hash" "$_crd_seen" "$_crd_diff" \
+      < "$_crd_raw_findings" > "$_crd_deduped_findings" 2>/dev/null || _crd_ok=0
+  fi
+
+  if [ "$_crd_ok" = "1" ]; then
+    # Splice the deduped findings array back into the envelope JSON.
+    _crd_tmp=$(mktemp -t clagentic-crd-env.XXXXXX)
+    _crd_spliced=0
+    if command -v jq >/dev/null 2>&1; then
+      _crd_deduped_json=$(cat "$_crd_deduped_findings")
+      if jq --argjson df "$_crd_deduped_json" '.findings = $df' "$_crd_envelope" > "$_crd_tmp" 2>/dev/null; then
+        mv "$_crd_tmp" "$_crd_envelope"
+        _crd_spliced=1
+      else
+        rm -f "$_crd_tmp"
+      fi
+    elif command -v python3 >/dev/null 2>&1; then
+      if python3 - "$_crd_envelope" "$_crd_deduped_findings" "$_crd_tmp" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        env = json.load(f)
+    with open(sys.argv[2]) as f:
+        deduped = json.load(f)
+    if not isinstance(deduped, list):
+        raise ValueError("not a list")
+    env["findings"] = deduped
+    with open(sys.argv[3], "w") as f:
+        json.dump(env, f)
+except Exception:
+    sys.exit(1)
+PYEOF
+      then
+        mv "$_crd_tmp" "$_crd_envelope"
+        _crd_spliced=1
+      else
+        rm -f "$_crd_tmp"
+      fi
+    fi
+
+    if [ "$_crd_spliced" = "1" ]; then
+      # Compute suppression count and surface to operator.
+      _crd_after=0
+      if command -v jq >/dev/null 2>&1; then
+        _crd_after=$(jq -r '.findings | length // 0' "$_crd_envelope" 2>/dev/null || echo 0)
+      elif command -v python3 >/dev/null 2>&1; then
+        _crd_after=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("findings",[])))' \
+          "$_crd_envelope" 2>/dev/null || echo 0)
+      fi
+      case "$_crd_after" in ''|*[!0-9]*) _crd_after=0 ;; esac
+      _crd_suppressed=$((_crd_before - _crd_after))
+      [ "$_crd_suppressed" -lt 0 ] && _crd_suppressed=0
+      if [ "$_crd_suppressed" -gt 0 ]; then
+        printf '[dedup] suppressed %d finding(s) seen in prior run(s)\n' \
+          "$_crd_suppressed" 1>&2
+      fi
+      ds_audit_log "review-dedup" "pass" \
+        "suppressed:${_crd_suppressed}/total:${_crd_before}"
+    else
+      # Conservative: splice failed, retain original findings.
+      printf '[gates/review] cross-round dedup: splice failed — retaining all findings (conservative)\n' 1>&2
+      cmd_log_run review warn "cross-round dedup: splice failed; original findings retained"
+    fi
+  else
+    # Conservative: extraction or dedup failed, retain original findings.
+    printf '[gates/review] cross-round dedup: key computation failed — retaining all findings (conservative)\n' 1>&2
+    cmd_log_run review warn "cross-round dedup: key computation failed; original findings retained"
+  fi
+
+  rm -f "$_crd_raw_findings" "$_crd_deduped_findings"
+}
+
 cmd_review() {
-  # Parse --since-last-review flag; all other args are consumed by the subcommand dispatcher.
+  # Parse flags; all args consumed by the subcommand dispatcher.
   REVIEW_SINCE_LAST=0
+  _crv_reset_dedup=0
   for _crv_arg in "$@"; do
     case "$_crv_arg" in
       --since-last-review) REVIEW_SINCE_LAST=1 ;;
+      --reset-dedup)       _crv_reset_dedup=1 ;;
     esac
   done
   export REVIEW_SINCE_LAST
+
+  # --reset-dedup: delete the persisted seen-keys file and exit.
+  # Operator calls this to clear cross-round dedup state (e.g. after a major
+  # rebase or when they want the next review to re-report all findings).
+  _crv_seen_file="$REPO_ROOT/.clagentic/lite/review-seen-keys"
+  if [ "$_crv_reset_dedup" = "1" ]; then
+    if [ -f "$_crv_seen_file" ]; then
+      rm -f "$_crv_seen_file"
+      echo "[gates/review] cross-round dedup state reset (review-seen-keys deleted)"
+      cmd_log_run review pass "cross-round dedup reset by --reset-dedup"
+    else
+      echo "[gates/review] cross-round dedup state already empty (review-seen-keys not found)"
+      cmd_log_run review pass "cross-round dedup reset by --reset-dedup (file was absent)"
+    fi
+    return 0
+  fi
 
   OUT="$REPO_ROOT/.clagentic/lite/last-review.json"
 
@@ -578,6 +713,16 @@ cmd_review() {
         _stamp_envelope "$OUT" "$_review_sha"
       fi
 
+      # Cross-round dedup (opt-in). Suppresses findings already seen in a prior
+      # round when the relevant diff lines are unchanged (content-hash strategy).
+      # CLAGENTIC_CROSS_ROUND_DEDUP=1 enables; default is OFF.
+      if [ "${CLAGENTIC_CROSS_ROUND_DEDUP:-0}" = "1" ]; then
+        # Initialize seen-keys file on first run so dedup_findings never sees
+        # a missing file (created empty; appended to by dedup_findings).
+        [ -f "$_crv_seen_file" ] || touch "$_crv_seen_file"
+        _cross_round_dedup "$OUT" "$_crv_diff_tmp" "$_crv_seen_file"
+      fi
+
       # Aggregate audit row for the merged result.
       _crv_merged_outcome="pass"
       if review_is_degraded "$OUT" 2>/dev/null; then
@@ -622,7 +767,7 @@ cmd_review() {
 
   # Single-pass path (original behavior).
   "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_diff_tmp" > "$OUT"
-  rm -f "$_crv_diff_tmp"
+  # Note: _crv_diff_tmp is NOT deleted yet — cross-round dedup needs it below.
 
   # Stamp the output with the current HEAD SHA so build_gate_summary can
   # detect stale payloads (file written against a different branch/commit).
@@ -631,6 +776,18 @@ cmd_review() {
   if [ -n "$_review_sha" ]; then
     _stamp_envelope "$OUT" "$_review_sha"
   fi
+
+  # Cross-round dedup (opt-in). Suppresses findings already seen in a prior
+  # round when the relevant diff lines are unchanged (content-hash strategy).
+  # CLAGENTIC_CROSS_ROUND_DEDUP=1 enables; default is OFF.
+  if [ "${CLAGENTIC_CROSS_ROUND_DEDUP:-0}" = "1" ]; then
+    # Initialize seen-keys file on first run so dedup_findings never sees
+    # a missing file (created empty; appended to by dedup_findings).
+    [ -f "$_crv_seen_file" ] || touch "$_crv_seen_file"
+    _cross_round_dedup "$OUT" "$_crv_diff_tmp" "$_crv_seen_file"
+  fi
+  rm -f "$_crv_diff_tmp"
+
   # Reject degraded envelopes outright. An LLM wrapper that failed every
   # chain step emits valid JSON with findings:[] — schema-valid but
   # meaningless. Without this check, a misconfigured / auth-broken /
@@ -1305,5 +1462,5 @@ case "${1:-}" in
   digest)         cmd_digest ;;
   status)         shift; cmd_status "$@" ;;
   tail)           cmd_tail ;;
-  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review]|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest|status|tail}" 1>&2; exit 1 ;;
+  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest|status|tail}" 1>&2; exit 1 ;;
 esac

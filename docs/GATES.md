@@ -72,6 +72,20 @@ Write rules:
 | **Per-call timeout** | `${CLAGENTIC_LLM_TIMEOUT_SEC}` seconds (default 180). Hung CLI → step failure → chain advances. |
 | **Required-role enforcement** | `CLAGENTIC_REVIEWER_REQUIRED=1` makes a full-chain failure a hard gate error (non-zero exit) instead of a degraded envelope. Use when the cross-vendor property is non-negotiable and a same-vendor fallback must be a visible failure rather than a silent degradation. Applies to any role: `CLAGENTIC_<ROLE>_REQUIRED=1`. |
 
+### Cross-round finding dedup (opt-in)
+
+| | |
+|---|---|
+| **Feature flag** | `CLAGENTIC_CROSS_ROUND_DEDUP=1` (default: `0` — off) |
+| **Seen-keys file** | `.clagentic/lite/review-seen-keys` (gitignored, local gate state) |
+| **Key strategy** | `content-hash`: sha256 of a 5-line `+`-line context window around the finding from the diff. Survives line shifts (a line that moves without changing its content has the same key). If the window cannot be computed (no sha256 tool, no diff file), the finding is retained conservatively — wrong suppressions are worse than missed dedups. |
+| **Effect** | Findings reported in a prior round on lines the diff shows unchanged since are suppressed. Suppression is annotated: a `gate_runs` audit row (`gate=review-dedup`) records `suppressed:N/total:M` and the operator sees a stderr notice (`[dedup] suppressed N finding(s) seen in prior run(s)`). Silently dropped findings are not possible — every suppression is logged. |
+| **Reset** | `clagentic-lite gates review --reset-dedup` deletes `.clagentic/lite/review-seen-keys`. The next review run re-seeds the file from scratch. |
+| **Conservative bias** | Bias is toward showing. A finding on changed lines will always re-show (the diff window changes → different hash → not suppressed). A finding where the key cannot be computed (parse error, no diff file, no sha256) is retained. |
+| **First run** | Seen-keys file absent → no-op: all findings pass through; keys for this run's findings are appended for use by the next round. |
+
+Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/config` (global). See `share/config.example` for the full entry.
+
 ### Exit-code contract for `gates.sh review` and `gates.sh ship`
 
 `gates.sh review` distinguishes two failure classes with separate exit codes. CI and operator scripts should branch on these:
