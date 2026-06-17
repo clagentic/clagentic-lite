@@ -1141,10 +1141,88 @@ fi
 # The function is inlined from session-start.sh so the test runs against the
 # actual implementation without sourcing the full hook (which has side effects).
 
-step "21. _json_escape: control chars escaped correctly (lr-d8f1)"
+step "21a. _json_escape fallback: control chars escaped (lr-d8f1)"
+
+# Inline the fallback pipeline from session-start.sh (sed+awk+tr path only --
+# does NOT call python3 regardless of availability, so this always exercises
+# the fallback code path).
+_json_escape_fallback() {
+  printf '%s' "$1" \
+    | sed 's/\\/\\\\/g; s/"/\\"/g' \
+    | sed 's/'"$(printf '\t')"'/\\t/g' \
+    | sed 's/'"$(printf '\r')"'/\\r/g' \
+    | awk '{if(NR>1)printf "\\n"; printf "%s", $0} END{printf ""}' \
+    | tr -d '\001-\010\013-\014\016-\037\177'
+}
+
+# Test input: backslash, double-quote, tab, CR, SOH, two lines (to test \n).
+# printf octal escapes: \011=HT, \012=LF, \015=CR, \001=SOH.
+_jef_input=$(printf 'hello\\world\t"quoted"\015CR\001SOH\012line2')
+_jef_got=$(_json_escape_fallback "$_jef_input")
+
+# 1. backslash doubled
+_jef_bs=$(printf '%s' "$_jef_got" | grep -c '\\\\')
+if [ "${_jef_bs:-0}" -ge 1 ]; then
+  ok "_json_escape fallback: backslash is doubled"
+else
+  bad "_json_escape fallback: backslash not doubled in output"
+fi
+
+# 2. double-quote escaped
+_jef_dq=$(printf '%s' "$_jef_got" | grep -c '\\"')
+if [ "${_jef_dq:-0}" -ge 1 ]; then
+  ok "_json_escape fallback: double-quote is escaped"
+else
+  bad "_json_escape fallback: double-quote not escaped in output"
+fi
+
+# 3. tab escaped as \t (literal backslash + t)
+_jef_tab=$(printf '%s' "$_jef_got" | grep -cF '\t')
+if [ "${_jef_tab:-0}" -ge 1 ]; then
+  ok "_json_escape fallback: tab (0x09) escaped as \\t"
+else
+  bad "_json_escape fallback: tab (0x09) not escaped as \\t"
+fi
+
+# 4. CR escaped as \r (literal backslash + r)
+_jef_cr=$(printf '%s' "$_jef_got" | grep -cF '\r')
+if [ "${_jef_cr:-0}" -ge 1 ]; then
+  ok "_json_escape fallback: CR (0x0D) escaped as \\r"
+else
+  bad "_json_escape fallback: CR (0x0D) not escaped as \\r"
+fi
+
+# 5. newline between lines becomes \n sequence
+_jef_nl=$(printf '%s' "$_jef_got" | grep -cF '\n')
+if [ "${_jef_nl:-0}" -ge 1 ]; then
+  ok "_json_escape fallback: newline becomes \\n sequence"
+else
+  bad "_json_escape fallback: newline not converted to \\n"
+fi
+
+# 6. no raw control bytes 0x00-0x1F remain (gate on python3 for byte-level check)
+if command -v python3 >/dev/null 2>&1; then
+  _jef_clean=$(printf '%s' "$_jef_got" | python3 -c '
+import sys
+raw = sys.stdin.buffer.read()
+bad = [b for b in raw if 0x00 <= b <= 0x1f]
+print("0" if bad else "1")
+' 2>/dev/null)
+  if [ "${_jef_clean:-0}" -eq 1 ]; then
+    ok "_json_escape fallback: no raw control chars (0x00-0x1F) remain"
+  else
+    bad "_json_escape fallback: raw control char(s) still present in output"
+  fi
+else
+  printf '  NOTE  python3 absent -- skipping byte-level control-char assertion for fallback\n'
+fi
+
+# ---------------------------------------- 21b. python3 branch (gates on python3)
+
+step "21b. _json_escape python3: control chars escaped (lr-d8f1)"
 
 if command -v python3 >/dev/null 2>&1; then
-  # Inline the _json_escape implementation from session-start.sh.
+  # Inline the full _json_escape function (python3 branch wins when available).
   _json_escape() {
     if command -v python3 >/dev/null 2>&1; then
       printf '%s' "$1" | python3 -c '
@@ -1156,8 +1234,10 @@ sys.stdout.write(encoded[1:-1])
     else
       printf '%s' "$1" \
         | sed 's/\\/\\\\/g; s/"/\\"/g' \
+        | sed 's/'"$(printf '\t')"'/\\t/g' \
+        | sed 's/'"$(printf '\r')"'/\\r/g' \
         | awk '{if(NR>1)printf "\\n"; printf "%s", $0} END{printf ""}' \
-        | tr -d '\001-\011\013-\037\177'
+        | tr -d '\001-\010\013-\014\016-\037\177'
     fi
   }
 
@@ -1242,7 +1322,7 @@ print(" ".join(results))
   fi
 
 else
-  printf '  SKIP  python3 not available for _json_escape control-char test (lr-d8f1)\n'
+  printf '  SKIP  python3 not available -- skipping 21b python3 branch test (lr-d8f1)\n'
 fi
 
 # -------------------------------------------------------------------- summary

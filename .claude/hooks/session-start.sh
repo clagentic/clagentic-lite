@@ -125,9 +125,10 @@ fi
 # Must produce spec-compliant output: RFC 8259 §7 requires escaping U+0000-U+001F.
 # Strategy: python3 (already a project dependency via ds_json_field) handles the
 # full control-character range correctly in one pass. The sed+tr fallback (for
-# environments without python3) handles \\ and \" correctly; remaining control
-# characters 0x00-0x1F are stripped with tr rather than escaped — safe here
-# because session-start output is advisory context, not a security boundary.
+# environments without python3) escapes: \\ \" \t (0x09) \r (0x0D), converts
+# literal newlines to \n via awk, then strips the remaining obscure control chars
+# (0x01-0x08, 0x0B-0x0C, 0x0E-0x1F) that are near-impossible in session context
+# and have no standard single-letter JSON escape sequence.
 _json_escape() {
   if command -v python3 >/dev/null 2>&1; then
     printf '%s' "$1" | python3 -c '
@@ -138,13 +139,17 @@ encoded = json.dumps(raw)
 sys.stdout.write(encoded[1:-1])
 '
   else
-    # Fallback: escape backslash and double-quote; convert literal newlines to
-    # \n escape sequences; strip any remaining 0x00-0x1F control bytes. The tr
-    # call uses octal ranges which are POSIX-portable.
+    # Fallback: escape backslash and double-quote; escape tab (0x09) as \t and
+    # CR (0x0D) as \r; convert literal newlines to \n escape sequences via awk;
+    # strip remaining 0x01-0x08, 0x0B-0x0C, 0x0E-0x1F control bytes. The tr
+    # ranges exclude 0x09 (already \t), 0x0A (handled by awk), and 0x0D
+    # (already \r). Uses octal ranges which are POSIX-portable.
     printf '%s' "$1" \
       | sed 's/\\/\\\\/g; s/"/\\"/g' \
+      | sed 's/'"$(printf '\t')"'/\\t/g' \
+      | sed 's/'"$(printf '\r')"'/\\r/g' \
       | awk '{if(NR>1)printf "\\n"; printf "%s", $0} END{printf ""}' \
-      | tr -d '\001-\011\013-\037\177'
+      | tr -d '\001-\010\013-\014\016-\037\177'
   fi
 }
 CONTEXT_JSON=$(_json_escape "$CONTEXT")
