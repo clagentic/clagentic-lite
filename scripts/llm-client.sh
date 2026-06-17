@@ -471,6 +471,49 @@ invoke_claude() {
         $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   fi
+  # Post-process OUTPUT_FILE for json mode:
+  # 1. Unwrap --output-format json envelope: extract .result if top-level "type"=="result".
+  # 2. Strip markdown code fences (```json...``` or ```...```) from the extracted content.
+  # Both steps are needed: --output-format json wraps the response; the model may still
+  # fence its JSON output even with --system-prompt. Fall through without error if
+  # python3 is unavailable or the file is not an envelope (already bare JSON).
+  if [ "$CALL_MODE" = "json" ] && [ -s "$OUTPUT_FILE" ] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$OUTPUT_FILE" <<'PY'
+import json, re, sys
+
+path = sys.argv[1]
+try:
+    raw = open(path).read()
+    d = json.loads(raw)
+except Exception:
+    sys.exit(0)  # not JSON or unreadable — leave as-is
+
+# Unwrap --output-format json envelope.
+inner = raw
+if isinstance(d, dict) and d.get("type") == "result" and "result" in d:
+    inner = d["result"]
+    if not isinstance(inner, str):
+        # result is already a dict/list — write it back as JSON and exit.
+        open(path, "w").write(json.dumps(inner))
+        sys.exit(0)
+else:
+    sys.exit(0)  # not an envelope — leave as-is
+
+# Strip markdown code fence if present.
+inner = inner.strip()
+fence_re = re.compile(r'^```[a-z]*\n?(.*?)\n?```$', re.DOTALL)
+m = fence_re.match(inner)
+if m:
+    inner = m.group(1).strip()
+
+# Write back only if the stripped content is valid JSON.
+try:
+    json.loads(inner)
+    open(path, "w").write(inner)
+except Exception:
+    pass  # not valid JSON after stripping — leave original envelope so validate_output rejects it
+PY
+  fi
 }
 
 # Codex non-interactive.
