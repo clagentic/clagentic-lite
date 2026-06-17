@@ -438,6 +438,17 @@ invoke_claude() {
   [ "$CALL_MODE" = "json" ] && OUTPUT_FORMAT_FLAG="--output-format json"
   BARE_FLAG=""
   [ "${CLAGENTIC_CLAUDE_BARE:-0}" = "1" ] && BARE_FLAG="--bare"
+  # JSON roles (reviewer, gate) use --system-prompt to replace the entire system
+  # prompt. --append-system-prompt competes with the ambient session system prompt
+  # when invoked from inside an active Claude Code session, causing the model to
+  # return prose markdown inside .result instead of the required JSON object.
+  # --system-prompt wins unconditionally. Prose roles (auditor, builder, summarizer)
+  # keep --append-system-prompt — ambient context is neutral-to-helpful for prose.
+  if [ "$CALL_MODE" = "json" ]; then
+    SYSTEM_PROMPT_FLAG="--system-prompt"
+  else
+    SYSTEM_PROMPT_FLAG="--append-system-prompt"
+  fi
   # Tell the inner Claude session NOT to inject recall summaries —
   # this is the recursion-avoidance path that doesn't require --bare.
   export CLAGENTIC_DISABLE_RECALL=1
@@ -451,13 +462,13 @@ invoke_claude() {
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
       cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG --model "$MODEL" \
-        --append-system-prompt "$(cat "$PROMPT_FILE")" ) \
+        $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   else
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
       cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG \
-        --append-system-prompt "$(cat "$PROMPT_FILE")" ) \
+        $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   fi
 }

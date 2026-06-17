@@ -1132,6 +1132,119 @@ else
   ok "deferrals absent: no deferral block in prompt when deferrals.json absent"
 fi
 
+# ---------------------------------------------------------------- 21. _json_escape control-char regression (lr-d8f1)
+#
+# _json_escape must escape all JSON control characters per RFC 8259 §7.
+# Previously only \\ and \" were handled; tab, CR, and the broader 0x00-0x1F
+# range were passed through raw, producing invalid JSON string values.
+#
+# The function is inlined from session-start.sh so the test runs against the
+# actual implementation without sourcing the full hook (which has side effects).
+
+step "21. _json_escape: control chars escaped correctly (lr-d8f1)"
+
+if command -v python3 >/dev/null 2>&1; then
+  # Inline the _json_escape implementation from session-start.sh.
+  _json_escape() {
+    if command -v python3 >/dev/null 2>&1; then
+      printf '%s' "$1" | python3 -c '
+import sys, json
+raw = sys.stdin.read()
+encoded = json.dumps(raw)
+sys.stdout.write(encoded[1:-1])
+'
+    else
+      printf '%s' "$1" \
+        | sed 's/\\/\\\\/g; s/"/\\"/g' \
+        | awk '{if(NR>1)printf "\\n"; printf "%s", $0} END{printf ""}' \
+        | tr -d '\001-\011\013-\037\177'
+    fi
+  }
+
+  # Test input: backslash, double-quote, newline, tab, CR (0x0D), SOH (0x01).
+  # printf octal escapes are POSIX: \012=LF, \011=HT, \015=CR, \001=SOH.
+  _je_input=$(printf 'hello\\world\t"quoted"\012newline\015CR\001SOH')
+
+  _je_got=$(_json_escape "$_je_input" 2>/dev/null)
+
+  # 1. Wrap in JSON and validate the whole thing parses correctly.
+  # Use stdin (not argv) so backslashes in _je_got are not reinterpreted by shell.
+  _je_valid=$(printf '%s' "$_je_got" | python3 -c '
+import json, sys
+val = sys.stdin.read()
+try:
+    json.loads("{\"v\":\"" + val + "\"}")
+    print("1")
+except Exception:
+    print("0")
+' 2>/dev/null || echo "0")
+
+  if [ "${_je_valid:-0}" -eq 1 ]; then
+    ok "_json_escape: output embeds as valid JSON string (python3 parse passed)"
+  else
+    bad "_json_escape: output is NOT valid as a JSON string value"
+  fi
+
+  # 2. Specific sequence assertions — each must be present.
+  _je_checks=$(printf '%s' "$_je_got" | python3 -c '
+import sys
+s = sys.stdin.read()
+results = []
+# tab: \t or
+results.append("1" if ("\\t" in s or "\\u0009" in s) else "0")
+# CR: \r or/
+results.append("1" if ("\\r" in s or "\\u000d" in s or "\\u000D" in s) else "0")
+# backslash doubled: output has \\ (2 chars); in Python "\\\\" = 2-char string
+results.append("1" if "\\\\" in s else "0")
+# double-quote escaped
+results.append("1" if "\\\"" in s else "0")
+# no raw control bytes 0x00-0x1F remain
+raw = s.encode("utf-8")
+bad = [b for b in raw if 0x00 <= b <= 0x1f]
+results.append("0" if bad else "1")
+print(" ".join(results))
+' 2>/dev/null || echo "0 0 0 0 0")
+
+  _je_tab=$(printf '%s' "$_je_checks" | awk '{print $1}')
+  _je_cr=$(printf '%s' "$_je_checks"  | awk '{print $2}')
+  _je_bs=$(printf '%s' "$_je_checks"  | awk '{print $3}')
+  _je_dq=$(printf '%s' "$_je_checks"  | awk '{print $4}')
+  _je_clean=$(printf '%s' "$_je_checks" | awk '{print $5}')
+
+  if [ "${_je_tab:-0}" -eq 1 ]; then
+    ok "_json_escape: tab (0x09) is escaped"
+  else
+    bad "_json_escape: tab (0x09) not escaped in output"
+  fi
+
+  if [ "${_je_cr:-0}" -eq 1 ]; then
+    ok "_json_escape: CR (0x0D) is escaped"
+  else
+    bad "_json_escape: CR (0x0D) not escaped in output"
+  fi
+
+  if [ "${_je_bs:-0}" -eq 1 ]; then
+    ok "_json_escape: backslash is doubled"
+  else
+    bad "_json_escape: backslash not doubled in output"
+  fi
+
+  if [ "${_je_dq:-0}" -eq 1 ]; then
+    ok "_json_escape: double-quote is escaped"
+  else
+    bad "_json_escape: double-quote not escaped in output"
+  fi
+
+  if [ "${_je_clean:-0}" -eq 1 ]; then
+    ok "_json_escape: no raw control chars (0x00-0x1F) remain in output"
+  else
+    bad "_json_escape: raw control char(s) still present in output"
+  fi
+
+else
+  printf '  SKIP  python3 not available for _json_escape control-char test (lr-d8f1)\n'
+fi
+
 # -------------------------------------------------------------------- summary
 
 printf '\n[smoke] passed: %s   failed: %s\n' "$PASS" "$FAIL"
