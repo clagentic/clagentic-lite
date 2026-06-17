@@ -1,0 +1,78 @@
+# .crew/naomi.yaml — NAOMI per-project configuration template
+#
+# Generated from: examples/starter-naomi.yaml (crew-manifest lr-e247)
+# Schema: schemas/crew-config.schema.json
+#
+# DROP THIS FILE AT: <project-root>/.crew/naomi.yaml
+# Then customize the sections below for your project.
+#
+# What this file does:
+#   - Controls whether NAOMI may autonomously merge PRs in this project
+#   - Declares what pre-checks must pass before NAOMI merges
+#   - Sets reviewer requirements (must PEACHES have reviewed first?)
+#   - Sets optional post-merge steps
+#
+# What this file does NOT do:
+#   - Grant NAOMI authority (that comes from clagentic-directory merge-authority label)
+#   - Change NAOMI's hard contract (AGENT.md governs that)
+#   - Override the namespace guard (clagentic/* only; andy/* refused)
+
+schema_version: 1
+
+# -----------------------------------------------------------------------
+# merge_allowed
+# -----------------------------------------------------------------------
+# NAOMI requires this to be true to execute autonomous merges in this project.
+#
+#   merge_allowed: false  — NAOMI will refuse to merge in this project.
+#     Use this during onboarding to keep human oversight until you trust
+#     the pre-check suite.
+#
+#   merge_allowed: true   — NAOMI may merge after all pre-checks pass.
+#     Requires: NAOMI holds merge-authority in clagentic-directory AND
+#     all pre_checks below pass AND (if reviewer_required) PEACHES is clean.
+#
+merge_allowed: true
+
+# -----------------------------------------------------------------------
+# merge_requirements  (optional — additional merge gates)
+# -----------------------------------------------------------------------
+# Extra conditions NAOMI checks before merging. The default is:
+#   tests_pass: true (NAOMI requires a clean test run)
+#   ci_pass:    true (require green CI — set to false if you have no CI)
+#
+merge_requirements:
+  tests_pass: true
+  ci_pass: true
+  # max_files_changed: 50   # Escalate if a PR touches more than N files
+
+# -----------------------------------------------------------------------
+# reviewer_required  (optional — PEACHES review gate)
+# -----------------------------------------------------------------------
+# Whether NAOMI requires a PEACHES review.status: "clean" before merging.
+#
+#   true  (RECOMMENDED): NAOMI refuses if PEACHES returned blocking or if
+#         no PEACHES review is present. This is the safe default.
+#
+#   false: NAOMI may merge without a prior PEACHES review. Only appropriate
+#          for automated / no-PR repos or projects with full test coverage.
+#
+# NOTE: this field is not in the schema yet (tracked per lr-e247 followup).
+# NAOMI honors it by convention; schema validation does not enforce it.
+# reviewer_required: true
+
+# -----------------------------------------------------------------------
+# focus / avoid  (optional — prose guidance)
+# -----------------------------------------------------------------------
+# focus:
+#   - "Only merge when CI is green — do not override"
+# avoid:
+#   - "Do not merge PRs that touch migration files without schema review"
+
+# -----------------------------------------------------------------------
+# post_merge_steps  (optional — post-merge automation)
+# -----------------------------------------------------------------------
+# post_merge_steps:
+#   - cmd: "make deploy-staging"
+#     description: "Deploy to staging after merge"
+#     on_failure: warn

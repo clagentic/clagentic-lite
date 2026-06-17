@@ -1,0 +1,11 @@
+# AMoS write-scope for the clagentic-lite repo.
+# AMoS owns this repo end-to-end: he must be able to edit any file and run the
+# repo's own scripts. Scope is open-within-this-repo (allow_all) MINUS the
+# audit/security plumbing he must never silently rewrite. The blocked_paths list
+# is the security boundary; widen it, never narrow it without reason.
+schema_version: 1
+scope:
+  allow_all: true
+  blocked_paths:
+    - ".gitleaks.toml"
+    - ".clagentic/**"
