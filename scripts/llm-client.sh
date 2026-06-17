@@ -433,7 +433,9 @@ llm_timeout_for() {
 # Set CLAGENTIC_CLAUDE_BARE=1 if you authenticate via API key and
 # prefer the tighter --bare invocation surface.
 invoke_claude() {
-  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"
+  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"; CALL_MODE="${7:-}"
+  OUTPUT_FORMAT_FLAG=""
+  [ "$CALL_MODE" = "json" ] && OUTPUT_FORMAT_FLAG="--output-format json"
   BARE_FLAG=""
   [ "${CLAGENTIC_CLAUDE_BARE:-0}" = "1" ] && BARE_FLAG="--bare"
   # Tell the inner Claude session NOT to inject recall summaries —
@@ -448,13 +450,13 @@ invoke_claude() {
   if [ -n "$MODEL" ]; then
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
-      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $BARE_FLAG --model "$MODEL" \
+      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG --model "$MODEL" \
         --append-system-prompt "$(cat "$PROMPT_FILE")" ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   else
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
-      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $BARE_FLAG \
+      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG \
         --append-system-prompt "$(cat "$PROMPT_FILE")" ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   fi
@@ -538,13 +540,13 @@ invoke_generic() {
 }
 
 # Dispatch a single chain step.
-# Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE CALL_TIMEOUT
+# Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE CALL_TIMEOUT [MODE]
 # Fails with exit 127 if the CLI binary is not on PATH.
 invoke_step() {
-  CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"
+  CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"; CALL_MODE="${8:-}"
   command -v "$CLI" >/dev/null 2>&1 || return 127
   case "$CLI" in
-    claude)  invoke_claude  "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
+    claude)  invoke_claude  "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" "$CALL_MODE" ;;
     codex)   invoke_codex   "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
     *)       invoke_generic "$CLI" "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
   esac
@@ -738,7 +740,7 @@ walk_chain() {
     : > "$TMP_ERR"
     : > "$TMP_OUT"
     EXIT_CODE=0
-    invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" \
+    invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" "$MODE" \
       || EXIT_CODE=$?
     if [ "$EXIT_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
       if [ "$ATTEMPT" -eq 1 ]; then
