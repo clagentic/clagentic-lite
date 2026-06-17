@@ -22,6 +22,7 @@
 schema_version: 1
 
 reviewer:
+  reviewer_bot_login: clagentic-reviewer[bot]
   rules:
     # ------------------------------------------------------------------
     # EXAMPLE: blocking rule — a pattern that must never appear
