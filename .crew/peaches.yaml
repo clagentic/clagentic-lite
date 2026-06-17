@@ -1,0 +1,55 @@
+# .crew/peaches.yaml — PEACHES per-project configuration template
+#
+# Generated from: examples/starter-peaches.yaml (crew-manifest lr-e247)
+# Schema: schemas/crew-config.schema.json (reviewer block, lr-840a)
+#
+# DROP THIS FILE AT: <project-root>/.crew/peaches.yaml
+# Then customize the sections below for your project.
+#
+# What this file does:
+#   - Adds project-specific review rules ON TOP of the AMoS code-craft
+#     defaults (amos.code-craft.1-13) and path-choice defaults
+#   - PEACHES will cite your rules as <project>.<rule> in findings
+#
+# What this file does NOT do:
+#   - Replace the baseline rulebook (code-craft + path-choice always apply)
+#   - Grant PEACHES write access (it remains read-only on code)
+#   - Configure which PRs get reviewed (that is the dispatch layer)
+#
+# Convention: rule id namespace = project name. E.g. for project "lore",
+# use ids like "lore.no-sdk-direct" or "lore.engram-attribution-required".
+
+schema_version: 1
+
+reviewer:
+  rules:
+    # ------------------------------------------------------------------
+    # EXAMPLE: blocking rule — a pattern that must never appear
+    # ------------------------------------------------------------------
+    # - id: <project>.no-hardcoded-env-names
+    #   severity: blocking
+    #   description: >-
+    #     Machine names and environment-specific strings must not appear in
+    #     source files. Use env vars or config files instead.
+    #   pattern: "(claude-main|claude-dev|staging\\.akuehner)"
+    #   applies_to:
+    #     - "**/*.py"
+    #     - "**/*.go"
+
+    # ------------------------------------------------------------------
+    # EXAMPLE: nit rule — style guidance for a specific path
+    # ------------------------------------------------------------------
+    # - id: <project>.public-api-changelog
+    #   severity: nit
+    #   description: >-
+    #     Changes under src/api/public/ should add a CHANGELOG entry.
+    #     Nit because PEACHES cannot always tell intent from the diff alone.
+    #   applies_to:
+    #     - "src/api/public/**"
+
+    # ------------------------------------------------------------------
+    # MINIMAL STARTER: no project rules — PEACHES applies only the defaults
+    # ------------------------------------------------------------------
+    # Leave rules: [] (empty array) or remove the key entirely to get
+    # baseline-only behavior. Add rules above the closing bracket as needed.
+    []
