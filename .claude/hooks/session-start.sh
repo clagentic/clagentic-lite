@@ -122,10 +122,30 @@ fi
 [ -z "$CONTEXT" ] && exit 0
 
 # Escape the context string for safe embedding in a JSON string value.
-# sed handles backslash and double-quote; tr collapses literal newlines to
-# spaces so the JSON remains single-line. jq is not assumed to be present.
+# Must produce spec-compliant output: RFC 8259 §7 requires escaping U+0000-U+001F.
+# Strategy: python3 (already a project dependency via ds_json_field) handles the
+# full control-character range correctly in one pass. The sed+tr fallback (for
+# environments without python3) handles \\ and \" correctly; remaining control
+# characters 0x00-0x1F are stripped with tr rather than escaped — safe here
+# because session-start output is advisory context, not a security boundary.
 _json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 -c '
+import sys, json
+raw = sys.stdin.read()
+# json.dumps produces a quoted string; strip the surrounding quotes.
+encoded = json.dumps(raw)
+sys.stdout.write(encoded[1:-1])
+'
+  else
+    # Fallback: escape backslash and double-quote; convert literal newlines to
+    # \n escape sequences; strip any remaining 0x00-0x1F control bytes. The tr
+    # call uses octal ranges which are POSIX-portable.
+    printf '%s' "$1" \
+      | sed 's/\\/\\\\/g; s/"/\\"/g' \
+      | awk '{if(NR>1)printf "\\n"; printf "%s", $0} END{printf ""}' \
+      | tr -d '\001-\011\013-\037\177'
+  fi
 }
 CONTEXT_JSON=$(_json_escape "$CONTEXT")
 
