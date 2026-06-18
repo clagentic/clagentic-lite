@@ -216,6 +216,15 @@ diff on stdin. Argue, concretely, how a hostile user could exploit each
 new or modified input surface. Cite file:line. Name the threat (CWE if
 obvious). If nothing is exploitable, say so in one sentence and list the
 surfaces you considered. Output is markdown. Non-blocking by design.
+
+CWE and ordering discipline (follow exactly to ensure stable output across runs):
+- Assign exactly one CWE ID per finding using the most specific applicable
+  CWE Base-level ID from the CWE taxonomy. Do not use category or pillar IDs
+  when a more specific Base-level ID applies.
+- Do not vary CWE assignments across runs for the same code pattern. Use the
+  same CWE ID every time you encounter the same vulnerability class.
+- Output findings in a consistent order: sorted by file path (alphabetically),
+  then by line number (ascending) within each file.
 EOF
 }
 
@@ -438,7 +447,7 @@ llm_timeout_for() {
 # Set CLAGENTIC_CLAUDE_BARE=1 if you authenticate via API key and
 # prefer the tighter --bare invocation surface.
 invoke_claude() {
-  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"; CALL_MODE="${7:-}"
+  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"; CALL_MODE="${7:-}"; CALL_ROLE="${8:-}"
   OUTPUT_FORMAT_FLAG=""
   [ "$CALL_MODE" = "json" ] && OUTPUT_FORMAT_FLAG="--output-format json"
   BARE_FLAG=""
@@ -454,6 +463,13 @@ invoke_claude() {
   else
     SYSTEM_PROMPT_FLAG="--append-system-prompt"
   fi
+  # Adversarial (auditor) calls use temperature=0 to reduce output variance
+  # across runs. Without this, the LLM reframes the same CWE with different
+  # wording each run, causing acked findings to resurface as new on every PR
+  # iteration. Temperature is not set for reviewer or merge-gate roles — those
+  # benefit from natural variance in a cross-vendor review context.
+  TEMP_FLAG=""
+  [ "$CALL_ROLE" = "auditor" ] && TEMP_FLAG="--temperature 0"
   # Tell the inner Claude session NOT to inject recall summaries —
   # this is the recursion-avoidance path that doesn't require --bare.
   export CLAGENTIC_DISABLE_RECALL=1
@@ -466,13 +482,13 @@ invoke_claude() {
   if [ -n "$MODEL" ]; then
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
-      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG --model "$MODEL" \
+      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG $TEMP_FLAG --model "$MODEL" \
         $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   else
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
-      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG \
+      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG $TEMP_FLAG \
         $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   fi
@@ -544,6 +560,9 @@ PY
 #           validate_output see empty TMP_RAW and fail cleanly.
 invoke_codex() {
   MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"
+  # Note: codex CLI does not expose a --temperature flag in its exec subcommand.
+  # Determinism for adversarial calls is achieved via the CWE prompt discipline
+  # and cross-round dedup; it cannot be reinforced at the CLI level for codex.
   TMP_COMBINED=$(mktemp -t clagentic-codex-combined.XXXXXX)
   TMP_RAW=$(mktemp -t clagentic-codex-raw.XXXXXX)
   { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } > "$TMP_COMBINED"
@@ -599,13 +618,13 @@ invoke_generic() {
 }
 
 # Dispatch a single chain step.
-# Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE CALL_TIMEOUT [MODE]
+# Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE CALL_TIMEOUT [MODE] [ROLE]
 # Fails with exit 127 if the CLI binary is not on PATH.
 invoke_step() {
-  CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"; CALL_MODE="${8:-}"
+  CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"; CALL_MODE="${8:-}"; CALL_ROLE="${9:-}"
   command -v "$CLI" >/dev/null 2>&1 || return 127
   case "$CLI" in
-    claude)  invoke_claude  "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" "$CALL_MODE" ;;
+    claude)  invoke_claude  "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" "$CALL_MODE" "$CALL_ROLE" ;;
     codex)   invoke_codex   "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
     *)       invoke_generic "$CLI" "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
   esac
@@ -799,7 +818,7 @@ walk_chain() {
     : > "$TMP_ERR"
     : > "$TMP_OUT"
     EXIT_CODE=0
-    invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" "$MODE" \
+    invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" "$MODE" "$ROLE_L" \
       || EXIT_CODE=$?
     if [ "$EXIT_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
       if [ "$ATTEMPT" -eq 1 ]; then

@@ -241,12 +241,13 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # No new env var is needed — the feature is always active when the file exists.
 
 # ---------- cross-round finding dedup ----------
-# Opt-in: suppress findings already reported in a prior review round when the
+# Default-on: suppress findings already reported in a prior review round when the
 # relevant diff lines are unchanged since. Key strategy is content-hash (sha256
-# of a 5-line context window), so the key survives line shifts. Default: off.
+# of a 5-line context window), so the key survives line shifts. Default: on (1).
 # Seen-keys are persisted in .clagentic/lite/review-seen-keys (gitignored).
 # Reset with: clagentic-lite gates review --reset-dedup
-# CLAGENTIC_CROSS_ROUND_DEDUP=0
+# Set =0 to opt out and see all findings on every round.
+# CLAGENTIC_CROSS_ROUND_DEDUP=1
 
 # ---------- chunked review ----------
 # Opt-in diff chunking for the review gate. When enabled (=1) and the diff

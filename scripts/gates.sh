@@ -713,10 +713,10 @@ cmd_review() {
         _stamp_envelope "$OUT" "$_review_sha"
       fi
 
-      # Cross-round dedup (opt-in). Suppresses findings already seen in a prior
+      # Cross-round dedup (default-on). Suppresses findings already seen in a prior
       # round when the relevant diff lines are unchanged (content-hash strategy).
-      # CLAGENTIC_CROSS_ROUND_DEDUP=1 enables; default is OFF.
-      if [ "${CLAGENTIC_CROSS_ROUND_DEDUP:-0}" = "1" ]; then
+      # CLAGENTIC_CROSS_ROUND_DEDUP=0 disables; default is ON.
+      if [ "${CLAGENTIC_CROSS_ROUND_DEDUP:-1}" = "1" ]; then
         # Initialize seen-keys file on first run so dedup_findings never sees
         # a missing file (created empty; appended to by dedup_findings).
         [ -f "$_crv_seen_file" ] || touch "$_crv_seen_file"
@@ -777,10 +777,10 @@ cmd_review() {
     _stamp_envelope "$OUT" "$_review_sha"
   fi
 
-  # Cross-round dedup (opt-in). Suppresses findings already seen in a prior
+  # Cross-round dedup (default-on). Suppresses findings already seen in a prior
   # round when the relevant diff lines are unchanged (content-hash strategy).
-  # CLAGENTIC_CROSS_ROUND_DEDUP=1 enables; default is OFF.
-  if [ "${CLAGENTIC_CROSS_ROUND_DEDUP:-0}" = "1" ]; then
+  # CLAGENTIC_CROSS_ROUND_DEDUP=0 disables; default is ON.
+  if [ "${CLAGENTIC_CROSS_ROUND_DEDUP:-1}" = "1" ]; then
     # Initialize seen-keys file on first run so dedup_findings never sees
     # a missing file (created empty; appended to by dedup_findings).
     [ -f "$_crv_seen_file" ] || touch "$_crv_seen_file"
