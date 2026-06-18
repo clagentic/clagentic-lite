@@ -944,6 +944,36 @@ cmd_merge_gate() {
       cmd_log_run "merge-gate recheck" block "gate-summary.json not found"
       return 1
     fi
+
+    # SHA-staleness guard: --recheck is for retrying a transient LLM failure,
+    # not for replaying an old summary against a new commit. Read the SHA
+    # stamped inside gate-summary.json (review._clagentic_diff_sha, written by
+    # _stamp_envelope via build_gate_summary) and compare it to HEAD. Refuse
+    # if the SHA is missing or mismatches — the caller must rebuild first.
+    _mg_summary_sha=""
+    _mg_head_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+    if [ -n "$_mg_head_sha" ]; then
+      if command -v jq >/dev/null 2>&1; then
+        _mg_summary_sha=$(jq -r '.review._clagentic_diff_sha // ""' "$IN" 2>/dev/null || echo "")
+      elif command -v python3 >/dev/null 2>&1; then
+        _mg_summary_sha=$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    rv = d.get("review") or {}
+    print(rv.get("_clagentic_diff_sha", ""))
+except Exception:
+    print("")
+' "$IN" 2>/dev/null || echo "")
+      fi
+      if [ -z "$_mg_summary_sha" ] || [ "$_mg_summary_sha" != "$_mg_head_sha" ]; then
+        printf '[gates/merge-gate] --recheck refused: gate-summary.json is for %s, HEAD is %s. Run '"'"'gates review'"'"' then '"'"'gates merge-gate'"'"', or '"'"'gates ship'"'"' to rebuild.\n' \
+          "${_mg_summary_sha:-<no sha>}" "$_mg_head_sha" 1>&2
+        cmd_log_run "merge-gate recheck" block "SHA mismatch: summary=${_mg_summary_sha:-<absent>} head=${_mg_head_sha}"
+        return 1
+      fi
+    fi
+
     printf '[gates/merge-gate] --recheck: re-feeding existing gate-summary.json to LLM\n' 1>&2
   else
     build_gate_summary > "$IN"
