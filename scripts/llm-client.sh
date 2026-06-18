@@ -232,6 +232,11 @@ the configured severity threshold, or on contradictions between gates
 (e.g. review says clean but sast errored). Approve only when every
 blocking gate passed AND the adversarial output, if present, contains no
 unmitigated CWE-cited attack.
+
+If the "adversarial" field is null or "adversarial_missing" is true, no
+adversarial pass was run for this commit. Treat as no adversarial
+findings: approve on that axis alone. Do not refuse solely because
+adversarial is absent.
 EOF
 }
 

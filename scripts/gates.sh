@@ -922,14 +922,47 @@ cmd_merge_gate() {
   # Final LLM sanity check: feed gate outputs back through the merge-gate
   # role, which decides approve/refuse. BLOCKING BY DEFAULT — set
   # CLAGENTIC_MERGE_GATE_BLOCKING=0 to make a 'refuse' decision advisory only.
+  #
+  # --recheck: skip build_gate_summary and re-feed the existing gate-summary.json
+  # directly to the LLM. Use after a transient LLM failure when the summary was
+  # already built fresh in the same session and you do not need to re-run review
+  # or adversarial. Does NOT bypass CLAGENTIC_MERGE_GATE_BLOCKING.
+  _mg_recheck=0
+  for _mg_arg in "$@"; do
+    case "$_mg_arg" in
+      --recheck) _mg_recheck=1 ;;
+    esac
+  done
+
   IN="$REPO_ROOT/.clagentic/lite/gate-summary.json"
   OUT="$REPO_ROOT/.clagentic/lite/last-merge-gate.json"
-  build_gate_summary > "$IN"
+
+  if [ "$_mg_recheck" = "1" ]; then
+    # Recheck path: gate-summary.json must already exist.
+    if [ ! -f "$IN" ]; then
+      printf '[gates/merge-gate] no gate-summary.json found — run gates merge-gate without --recheck first\n' 1>&2
+      cmd_log_run "merge-gate recheck" block "gate-summary.json not found"
+      return 1
+    fi
+    printf '[gates/merge-gate] --recheck: re-feeding existing gate-summary.json to LLM\n' 1>&2
+  else
+    build_gate_summary > "$IN"
+  fi
+
+  # Use a distinct gate name in audit rows so the trail shows recheck vs fresh run.
+  if [ "$_mg_recheck" = "1" ]; then
+    _mg_gate_name="merge-gate recheck"
+  else
+    _mg_gate_name="merge-gate"
+  fi
 
   # Detect a stale-payload envelope emitted by build_gate_summary.
   # A stale payload means gate artifacts describe a different commit — skip
   # the LLM call entirely (deterministic refusal, no token burn) and write a
   # synthetic refusal to last-merge-gate.json.
+  # Note: --recheck skips build_gate_summary entirely, so stale_payload will
+  # not be set in the existing gate-summary.json; this check is a no-op on
+  # the recheck path but is preserved for safety.
   _stale_check=""
   if command -v jq >/dev/null 2>&1; then
     _stale_check=$(jq -r '.stale_payload // "false"' "$IN" 2>/dev/null || echo "false")
@@ -938,7 +971,7 @@ cmd_merge_gate() {
   fi
   if [ "${_stale_check}" = "true" ]; then
     printf '{"decision": "refuse", "reason": "stale gate payload — re-run clagentic-lite gates review and gates adversarial first"}\n' > "$OUT"
-    cmd_log_run merge-gate block "stale payload — re-run review + adversarial (SHA mismatch)"
+    cmd_log_run "$_mg_gate_name" block "stale payload — re-run review + adversarial (SHA mismatch)"
     cat "$OUT"
     if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
       return 1
@@ -947,6 +980,7 @@ cmd_merge_gate() {
   fi
 
   "$TOOL_HOME/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT"
+
   DECISION=""
   if command -v jq >/dev/null 2>&1; then
     DECISION=$(jq -r '.decision // "unknown"' "$OUT" 2>/dev/null)
@@ -977,13 +1011,13 @@ print("; ".join(parts))
         fi
       fi
       if [ "${ACK_COUNT:-0}" -gt 0 ]; then
-        cmd_log_run merge-gate pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL"
+        cmd_log_run "$_mg_gate_name" pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL"
       else
-        cmd_log_run merge-gate pass "approve"
+        cmd_log_run "$_mg_gate_name" pass "approve"
       fi
       ;;
     refuse)
-      cmd_log_run merge-gate block "refuse"
+      cmd_log_run "$_mg_gate_name" block "refuse"
       cat "$OUT"
       # Default blocking; set CLAGENTIC_MERGE_GATE_BLOCKING=0 to override.
       if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
@@ -994,7 +1028,7 @@ print("; ".join(parts))
       # An unparseable decision is a failure of the merge gate itself.
       # Fail closed unless explicitly opted out — same rationale as missing
       # security tools above.
-      cmd_log_run merge-gate block "decision=$DECISION (unparseable)"
+      cmd_log_run "$_mg_gate_name" block "decision=$DECISION (unparseable)"
       cat "$OUT" 1>&2
       if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
         return 1
@@ -1074,6 +1108,7 @@ build_gate_summary() {
   # Skip the check when CLAGENTIC_ALLOW_STALE_PAYLOAD=1 (e.g. CI pipelines
   # that write gate artifacts in a prior step, or air-gapped environments).
   CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+  ADVERSARIAL_MISSING=false
   if [ -n "$CURRENT_SHA" ]; then
     if [ "${CLAGENTIC_ALLOW_STALE_PAYLOAD:-0}" = "1" ]; then
       cmd_log_run merge-gate warn "CLAGENTIC_ALLOW_STALE_PAYLOAD=1: proceeding with potentially stale gate payload"
@@ -1097,7 +1132,11 @@ build_gate_summary() {
       fi
 
       # Extract SHA from last-adversarial.md (first-line comment).
+      # Distinguish two cases:
+      #   - File absent: not stale; set ADVERSARIAL_MISSING=true and continue.
+      #   - File exists but SHA mismatches: stale payload — block.
       _ad_sha=""
+      ADVERSARIAL_MISSING=false
       if [ -f "$AD" ]; then
         _ad_sha=$(sed -n '1s/<!-- clagentic-diff-sha: \(.*\) -->/\1/p' "$AD" 2>/dev/null || echo "")
         if [ -z "$_ad_sha" ] || [ "$_ad_sha" != "$CURRENT_SHA" ]; then
@@ -1108,6 +1147,10 @@ build_gate_summary() {
             STALE_GATES="adversarial"
           fi
         fi
+      else
+        # File absent: warn, do not treat as stale. The LLM decides.
+        ADVERSARIAL_MISSING=true
+        printf '[gates/build-gate-summary] last-adversarial.md not found — proceeding with adversarial=null\n' 1>&2
       fi
 
       if [ "$STALE_PAYLOAD" = "true" ]; then
@@ -1157,7 +1200,7 @@ build_gate_summary() {
   # a JSON encoder).
   if command -v jq >/dev/null 2>&1; then
     RV_PAYLOAD='null'
-    AD_PAYLOAD='""'
+    AD_PAYLOAD='null'
     ACKS_PAYLOAD='[]'
     AR_PAYLOAD='""'
     [ -f "$RV" ] && jq -e . "$RV" >/dev/null 2>&1 && RV_PAYLOAD=$(cat "$RV")
@@ -1168,6 +1211,7 @@ build_gate_summary() {
 {
   "review": $RV_PAYLOAD,
   "adversarial": $AD_PAYLOAD,
+  "adversarial_missing": $ADVERSARIAL_MISSING,
   "adversarial_acks": $ACKS_PAYLOAD,
   "accepted_risks": $AR_PAYLOAD,
   "introduces_ack_file": $INTRODUCES_ACK_FILE,
@@ -1186,14 +1230,15 @@ EOF
     [ -f "$AD" ] && AD_ARG="$AD"
     [ -f "$ACKS_FILE" ] && ACKS_ARG="$ACKS_FILE"
     [ -f "$AR_FILE" ] && AR_ARG="$AR_FILE"
-    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" <<'PY'
+    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" <<'PY'
 import json, sys
-threshold       = sys.argv[1]
-introduces_ack  = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
-rv_path         = sys.argv[3] if len(sys.argv) > 3 else ""
-ad_path         = sys.argv[4] if len(sys.argv) > 4 else ""
-acks_path       = sys.argv[5] if len(sys.argv) > 5 else ""
-ar_path         = sys.argv[6] if len(sys.argv) > 6 else ""
+threshold           = sys.argv[1]
+introduces_ack      = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
+adversarial_missing = sys.argv[3].lower() == "true" if len(sys.argv) > 3 else False
+rv_path             = sys.argv[4] if len(sys.argv) > 4 else ""
+ad_path             = sys.argv[5] if len(sys.argv) > 5 else ""
+acks_path           = sys.argv[6] if len(sys.argv) > 6 else ""
+ar_path             = sys.argv[7] if len(sys.argv) > 7 else ""
 review = None
 if rv_path:
     try:
@@ -1201,13 +1246,15 @@ if rv_path:
             review = json.load(f)
     except Exception:
         review = None
-adv = ""
-if ad_path:
+adv = None
+if adversarial_missing:
+    adv = None
+elif ad_path:
     try:
         with open(ad_path) as f:
             adv = f.read()
     except Exception:
-        adv = ""
+        adv = None
 acks = []
 if acks_path:
     try:
@@ -1222,7 +1269,7 @@ if ar_path:
             ar = f.read()
     except Exception:
         ar = ""
-print(json.dumps({"review": review, "adversarial": adv, "adversarial_acks": acks, "accepted_risks": ar, "introduces_ack_file": introduces_ack, "threshold": threshold}))
+print(json.dumps({"review": review, "adversarial": adv, "adversarial_missing": adversarial_missing, "adversarial_acks": acks, "accepted_risks": ar, "introduces_ack_file": introduces_ack, "threshold": threshold}))
 PY
     return 0
   fi
@@ -1233,10 +1280,10 @@ PY
   # (conservative — no bootstrap exemption in degraded mode).
   if [ -f "$RV" ]; then
     cat <<EOF
-{"review": $(cat "$RV"), "adversarial": "", "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
+{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
 EOF
   else
-    echo "{\"review\": null, \"adversarial\": \"\", \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
+    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
   fi
 }
 
@@ -1491,7 +1538,7 @@ case "${1:-}" in
   sast)           cmd_sast ;;
   review)         shift; cmd_review "$@" ;;
   adversarial)    cmd_adversarial ;;
-  merge-gate)     cmd_merge_gate ;;
+  merge-gate)     shift; cmd_merge_gate "$@" ;;
   render-review)  shift; cmd_render_review "$@" ;;
   ship)           cmd_ship ;;
   pre-push)       cmd_pre_push ;;
@@ -1499,5 +1546,5 @@ case "${1:-}" in
   digest)         cmd_digest ;;
   status)         shift; cmd_status "$@" ;;
   tail)           shift; cmd_tail "$@" ;;
-  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate|render-review|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
 esac
