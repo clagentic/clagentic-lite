@@ -2,6 +2,7 @@
 Regression tests for the --recheck flag in cmd_merge_gate (gates.sh).
 
 Tests added in lr-291d: PEACHES found no coverage for the --recheck path.
+Test 4-5 added in lr-23c2: SHA-mismatch staleness guard for --recheck.
 
 Scenarios:
   1. --recheck exits 1 with a clear error message when gate-summary.json is absent.
@@ -9,6 +10,9 @@ Scenarios:
      returns {"decision":"approve","reason":"test"}.
   3. The audit trail records "merge-gate recheck" (not "merge-gate") when
      --recheck is passed and gate-summary.json exists.
+  4. --recheck exits 1 when gate-summary.json exists but its embedded SHA does
+     not match HEAD (staleness guard added in lr-23c2).
+  5. --recheck succeeds when gate-summary.json SHA matches HEAD exactly.
 
 Run with:
   python3 -m unittest scripts/test_merge_gate_recheck.py -v
@@ -143,6 +147,35 @@ def _setup_project(tmpdir):
     return tmpdir
 
 
+def _init_git_repo(project_root):
+    """Initialize a minimal git repo in project_root and return the HEAD SHA.
+
+    Creates one commit so git rev-parse HEAD succeeds.  The SHA is used by
+    tests that exercise the SHA-staleness guard in --recheck.
+    """
+    env = os.environ.copy()
+    env["GIT_AUTHOR_NAME"] = "test"
+    env["GIT_AUTHOR_EMAIL"] = "test@example.com"
+    env["GIT_COMMITTER_NAME"] = "test"
+    env["GIT_COMMITTER_EMAIL"] = "test@example.com"
+
+    subprocess.run(["git", "init", "-q", project_root], check=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-q", "-m", "initial"],
+        check=True,
+        env=env,
+        cwd=project_root,
+    )
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=project_root,
+    )
+    return result.stdout.strip()
+
+
 class TestMergeGateRecheck(unittest.TestCase):
     """Regression tests for gates.sh merge-gate --recheck."""
 
@@ -239,6 +272,79 @@ class TestMergeGateRecheck(unittest.TestCase):
         self.assertNotIn("merge-gate", [g for g in gate_names if g != "merge-gate recheck"],
                          f"Unexpected bare 'merge-gate' row logged during --recheck; "
                          f"rows: {rows}")
+
+    # ------------------------------------------------------------------ test 4
+    def test_recheck_refuses_on_sha_mismatch(self):
+        """--recheck exits 1 when gate-summary.json SHA does not match HEAD (lr-23c2)."""
+        head_sha = _init_git_repo(self._project)
+
+        # Write a gate-summary.json whose review._clagentic_diff_sha is a
+        # deliberately wrong SHA (all zeros — not a real commit object).
+        stale_sha = "0" * 40
+        self.assertNotEqual(stale_sha, head_sha,
+                            "stale_sha must differ from HEAD for this test to be meaningful")
+
+        summary_path = os.path.join(self._project, ".clagentic", "lite", "gate-summary.json")
+        summary = {
+            "review": {
+                "findings": [],
+                "summary": "clean",
+                "_clagentic_diff_sha": stale_sha,
+            },
+            "adversarial": None,
+            "adversarial_missing": True,
+            "adversarial_acks": [],
+            "accepted_risks": "",
+            "introduces_ack_file": False,
+            "threshold": "high",
+        }
+        with open(summary_path, "w") as f:
+            json.dump(summary, f)
+
+        result = _run_merge_gate(["--recheck"], self._fake_tool_home, self._project)
+
+        self.assertEqual(result.returncode, 1,
+                         f"Expected exit 1 on SHA mismatch; got {result.returncode}\n"
+                         f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        self.assertIn(stale_sha, result.stderr,
+                      f"Error must include the stale SHA; stderr: {result.stderr}")
+        self.assertIn(head_sha, result.stderr,
+                      f"Error must include HEAD SHA; stderr: {result.stderr}")
+
+    # ------------------------------------------------------------------ test 5
+    def test_recheck_succeeds_on_sha_match(self):
+        """--recheck exits 0 when gate-summary.json SHA matches HEAD (lr-23c2)."""
+        head_sha = _init_git_repo(self._project)
+
+        summary_path = os.path.join(self._project, ".clagentic", "lite", "gate-summary.json")
+        summary = {
+            "review": {
+                "findings": [],
+                "summary": "clean",
+                "_clagentic_diff_sha": head_sha,
+            },
+            "adversarial": None,
+            "adversarial_missing": True,
+            "adversarial_acks": [],
+            "accepted_risks": "",
+            "introduces_ack_file": False,
+            "threshold": "high",
+        }
+        with open(summary_path, "w") as f:
+            json.dump(summary, f)
+
+        result = _run_merge_gate(["--recheck"], self._fake_tool_home, self._project)
+
+        self.assertEqual(result.returncode, 0,
+                         f"Expected exit 0 when SHA matches HEAD; got {result.returncode}\n"
+                         f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        output_path = os.path.join(self._project, ".clagentic", "lite", "last-merge-gate.json")
+        self.assertTrue(os.path.exists(output_path),
+                        "last-merge-gate.json must be written on SHA-matching recheck")
+        with open(output_path) as f:
+            out_json = json.load(f)
+        self.assertEqual(out_json.get("decision"), "approve",
+                         f"Expected decision=approve; got: {out_json}")
 
 
 if __name__ == "__main__":
