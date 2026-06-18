@@ -145,7 +145,7 @@ in the repo history.
 
 | | |
 |---|---|
-| **Feature flag** | `CLAGENTIC_CROSS_ROUND_DEDUP=1` (default: `0` — off) |
+| **Feature flag** | `CLAGENTIC_CROSS_ROUND_DEDUP` (default: `1` — on; set `=0` to opt out) |
 | **Seen-keys file** | `.clagentic/lite/review-seen-keys` (gitignored, local gate state) |
 | **Key strategy** | `content-hash`: sha256 of a 5-line `+`-line context window around the finding from the diff. Survives line shifts (a line that moves without changing its content has the same key). If the window cannot be computed (no sha256 tool, no diff file), the finding is retained conservatively — wrong suppressions are worse than missed dedups. |
 | **Effect** | Findings reported in a prior round on lines the diff shows unchanged since are suppressed. Suppression is annotated: a `gate_runs` audit row (`gate=review-dedup`) records `suppressed:N/total:M` and the operator sees a stderr notice (`[dedup] suppressed N finding(s) seen in prior run(s)`). Silently dropped findings are not possible — every suppression is logged. |
