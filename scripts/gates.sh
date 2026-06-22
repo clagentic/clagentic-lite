@@ -43,6 +43,12 @@ else
 fi
 [ -n "$REPO_ROOT" ] || { echo "gates.sh: not in a git repo" 1>&2; exit 1; }
 
+# _git — run git against REPO_ROOT, not $PWD. In wrapper/repo layouts $PWD may
+# be the (non-git) wrapper directory or an unrelated outer repo whose HEAD has
+# nothing to do with REPO_ROOT. All git operations that inspect history, staged
+# state, or branch identity must be keyed to the enrolled project root.
+_git() { git -C "$REPO_ROOT" "$@"; }
+
 AUDIT_DB="$REPO_ROOT/.clagentic/lite/audit.db"
 mkdir -p "$REPO_ROOT/.clagentic/lite"
 
@@ -66,7 +72,7 @@ cmd_log_run() {
   GATE="$1"
   OUTCOME="$2"
   DETAILS="${3:-}"
-  BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
   TS=$(ds_date_iso)
   # Every interpolated value must go through the same escape helper. A branch
   # named `feat/o'hare` would otherwise corrupt the INSERT under set -e.
@@ -101,9 +107,9 @@ cmd_secrets() {
   # we are on a feature branch, scan the full branch history instead — staged-
   # only mode is a no-op on a clean index and would silently miss committed
   # secrets in a PR workflow.
-  _SECRETS_STAGED=$(git diff --cached --name-only 2>/dev/null)
+  _SECRETS_STAGED=$(_git diff --cached --name-only 2>/dev/null)
   _SECRETS_DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
-  _SECRETS_CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  _SECRETS_CURRENT_BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
   _SECRETS_ON_FEATURE=0
   if [ -z "$_SECRETS_STAGED" ] && [ -n "$_SECRETS_CURRENT_BRANCH" ] && [ "$_SECRETS_CURRENT_BRANCH" != "$_SECRETS_DEFAULT_BRANCH" ] && [ "$_SECRETS_CURRENT_BRANCH" != "HEAD" ]; then
     _SECRETS_ON_FEATURE=1
@@ -453,11 +459,11 @@ cmd_sast() {
 # Prints one diagnostic line to stderr indicating which mode is active.
 get_review_diff() {
   DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
-  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  CURRENT_BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 
-  if git diff --cached --name-only 2>/dev/null | grep -q .; then
+  if _git diff --cached --name-only 2>/dev/null | grep -q .; then
     printf '[gates/review] using staged diff\n' 1>&2
-    git diff --cached --unified=3 2>/dev/null
+    _git diff --cached --unified=3 2>/dev/null
     return 0
   fi
 
@@ -477,7 +483,7 @@ get_review_diff() {
     fi
     if [ -n "$_grd_last_sha" ]; then
       printf '[gates/review] --since-last-review: diffing %s..HEAD\n' "$_grd_last_sha" 1>&2
-      git diff "${_grd_last_sha}..HEAD" --unified=3 2>/dev/null
+      _git diff "${_grd_last_sha}..HEAD" --unified=3 2>/dev/null
       return 0
     else
       printf '[gates/review] --since-last-review: no prior review SHA found; falling through to branch diff\n' 1>&2
@@ -487,9 +493,9 @@ get_review_diff() {
   if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ] && [ "$CURRENT_BRANCH" != "HEAD" ]; then
     # Fetch the base ref so the comparison is accurate even in a fresh clone.
     # Failure here is non-fatal — git diff will simply fall back to local state.
-    git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+    _git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
     printf '[gates/review] no staged changes — using branch diff vs origin/%s\n' "$DEFAULT_BRANCH" 1>&2
-    git diff "origin/${DEFAULT_BRANCH}...HEAD" --unified=3 2>/dev/null
+    _git diff "origin/${DEFAULT_BRANCH}...HEAD" --unified=3 2>/dev/null
     return 0
   fi
 
@@ -708,7 +714,7 @@ cmd_review() {
 
       # Stamp the merged envelope with the current HEAD SHA — same logic as
       # the single-chunk path below.
-      _review_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+      _review_sha=$(_git rev-parse HEAD 2>/dev/null || echo "")
       if [ -n "$_review_sha" ]; then
         _stamp_envelope "$OUT" "$_review_sha"
       fi
@@ -772,7 +778,7 @@ cmd_review() {
   # Stamp the output with the current HEAD SHA so build_gate_summary can
   # detect stale payloads (file written against a different branch/commit).
   # Best-effort: if git or jq/python3 are unavailable, skip silently.
-  _review_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+  _review_sha=$(_git rev-parse HEAD 2>/dev/null || echo "")
   if [ -n "$_review_sha" ]; then
     _stamp_envelope "$OUT" "$_review_sha"
   fi
@@ -907,7 +913,7 @@ cmd_adversarial() {
   get_review_diff | "$TOOL_HOME/scripts/llm-client.sh" adversarial > "$OUT"
   # Prepend a SHA stamp comment as the first line so build_gate_summary can
   # detect stale payloads. Best-effort: skip if git unavailable or SHA empty.
-  _adv_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+  _adv_sha=$(_git rev-parse HEAD 2>/dev/null || echo "")
   if [ -n "$_adv_sha" ]; then
     _adv_tmp=$(mktemp -t clagentic-adv-stamp.XXXXXX)
     printf '<!-- clagentic-diff-sha: %s -->\n' "$_adv_sha" > "$_adv_tmp"
@@ -1107,9 +1113,19 @@ build_gate_summary() {
   #
   # Skip the check when CLAGENTIC_ALLOW_STALE_PAYLOAD=1 (e.g. CI pipelines
   # that write gate artifacts in a prior step, or air-gapped environments).
-  CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+  CURRENT_SHA=$(_git rev-parse HEAD 2>/dev/null || echo "")
   ADVERSARIAL_MISSING=false
-  if [ -n "$CURRENT_SHA" ]; then
+  # Fail-closed when REPO_ROOT is a valid git repo but CURRENT_SHA is empty:
+  # treat as stale so the merge-gate refuses on incomplete data. Only the
+  # genuine non-git case (rev-parse --git-dir fails) may skip the check.
+  # Consistent with the "missing stamp = stale" philosophy at line ~1105.
+  _git_dir_ok=0
+  if _git rev-parse --git-dir >/dev/null 2>&1; then _git_dir_ok=1; fi
+  if [ -z "$CURRENT_SHA" ] && [ "$_git_dir_ok" = "1" ] && [ "${CLAGENTIC_ALLOW_STALE_PAYLOAD:-0}" != "1" ]; then
+    printf '{"stale_payload": true, "stale_gates": ["review","adversarial"], "current_sha": "", "review_sha": "", "adversarial_sha": ""}\n'
+    return 0
+  fi
+  if [ -n "$CURRENT_SHA" ] || [ "$_git_dir_ok" = "0" ]; then
     if [ "${CLAGENTIC_ALLOW_STALE_PAYLOAD:-0}" = "1" ]; then
       cmd_log_run merge-gate warn "CLAGENTIC_ALLOW_STALE_PAYLOAD=1: proceeding with potentially stale gate payload"
     else
@@ -1183,12 +1199,12 @@ build_gate_summary() {
   _ar_rel=".clagentic/accepted-risks.md"
   INTRODUCES_ACK_FILE="false"
   _diff_status=""
-  if git diff --cached --name-status 2>/dev/null | grep -q .; then
-    _diff_status=$(git diff --cached --name-status 2>/dev/null)
+  if _git diff --cached --name-status 2>/dev/null | grep -q .; then
+    _diff_status=$(_git diff --cached --name-status 2>/dev/null || true)
   else
-    _DEFAULT_BRANCH=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | tr -d ' \n')
+    _DEFAULT_BRANCH=$(_git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | tr -d ' \n')
     [ -z "$_DEFAULT_BRANCH" ] && _DEFAULT_BRANCH="main"
-    _diff_status=$(git diff "origin/${_DEFAULT_BRANCH}...HEAD" --name-status 2>/dev/null)
+    _diff_status=$(_git diff "origin/${_DEFAULT_BRANCH}...HEAD" --name-status 2>/dev/null || true)
   fi
   if printf '%s\n' "$_diff_status" | grep -qE "^A[[:space:]]+(\\.clagentic/adversarial-acks\\.json|\\.clagentic/accepted-risks\\.md)$"; then
     INTRODUCES_ACK_FILE="true"
@@ -1342,7 +1358,7 @@ cmd_ship() {
   if gate_enabled merge-gate;  then cmd_merge_gate  || { echo "[gates/ship] BLOCKED at merge-gate"; exit 1; }; else ship_step_skip merge-gate;  fi
 
   echo "[gates/ship] all blocking gates passed"
-  BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
   DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
   if [ "$BRANCH" = "$DEFAULT_BRANCH" ] || [ -z "$BRANCH" ]; then
     echo "[gates/ship] on '$BRANCH' — not pushing or opening a PR; create a feature branch first"
@@ -1351,8 +1367,8 @@ cmd_ship() {
   fi
 
   # Push + open PR if gh is available, else print a template.
-  if git remote get-url origin >/dev/null 2>&1; then
-    git push -u origin "$BRANCH" || { echo "[gates/ship] push failed"; cmd_log_run ship block "push failed"; exit 1; }
+  if _git remote get-url origin >/dev/null 2>&1; then
+    _git push -u origin "$BRANCH" || { echo "[gates/ship] push failed"; cmd_log_run ship block "push failed"; exit 1; }
   fi
   if command -v gh >/dev/null 2>&1; then
     if gh pr view "$BRANCH" >/dev/null 2>&1; then
@@ -1362,7 +1378,7 @@ cmd_ship() {
         echo "[gates/ship] gh pr create failed — open the PR manually"
     fi
   else
-    REMOTE=$(git remote get-url origin 2>/dev/null || echo "<remote>")
+    REMOTE=$(_git remote get-url origin 2>/dev/null || echo "<remote>")
     echo "[gates/ship] gh not installed — open a PR manually:"
     echo "  base=$DEFAULT_BRANCH head=$BRANCH remote=$REMOTE"
   fi
