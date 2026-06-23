@@ -52,9 +52,10 @@ def compute_key(f, strategy, diff_file=""):
             ctx = find_context_window(diff_file, fname, line)
             if ctx:
                 return hashlib.sha256("\n".join(ctx).encode()).hexdigest()
+        # Use `or 0` to match jq's `// 0` — null/absent line becomes "0", not "".
         raw = "{}:{}:{}:{}".format(
             f.get("file", ""),
-            str(f.get("line", "")),
+            str(f.get("line") or 0),
             f.get("category", ""),
             str(f.get("message", "")).lower()
         )
@@ -197,6 +198,22 @@ class TestDedupFindingsPy(unittest.TestCase):
         findings = [{}]
         result, _ = dedup_findings_py(findings, strategy="location")
         self.assertEqual(len(result), 1)  # retained (key computed from empty strings)
+
+    def test_null_line_matches_absent_line_key(self):
+        """Regression: lr-000c — null line and absent line must produce the same key.
+
+        jq uses `(.line // 0)` which collapses both null and absent to integer 0,
+        then stringifies to "0".  The python path must match: `str(f.get("line") or 0)`
+        likewise yields "0" for both None and missing.  A prior bug used
+        `f.get("line", "")` which yielded "" instead, causing key mismatch between
+        jq and python paths and breaking cross-round dedup.
+        """
+        import scripts.test_review_merge_py as me
+        key_null   = me.compute_key({"file": "f.py", "line": None,   "category": "c", "message": "m"}, "location")
+        key_absent = me.compute_key({"file": "f.py",                  "category": "c", "message": "m"}, "location")
+        key_zero   = me.compute_key({"file": "f.py", "line": 0,      "category": "c", "message": "m"}, "location")
+        self.assertEqual(key_null, key_absent, "null line and absent line must hash identically")
+        self.assertEqual(key_null, key_zero,   "null line and 0 line must hash identically (matches jq // 0)")
 
 
 class TestSplitDiffLogic(unittest.TestCase):

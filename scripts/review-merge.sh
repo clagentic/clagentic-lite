@@ -747,9 +747,10 @@ def compute_key(f, strategy, diff_file):
             if ctx:
                 return hashlib.sha256("\n".join(ctx).encode()).hexdigest()
         # location key (primary or fallback).
+        # Use `or 0` to match jq's `// 0` — null/absent line becomes "0", not "".
         raw = "{}:{}:{}:{}".format(
             f.get("file", ""),
-            str(f.get("line", "")),
+            str(f.get("line") or 0),
             f.get("category", ""),
             str(f.get("message", "")).lower()
         )
