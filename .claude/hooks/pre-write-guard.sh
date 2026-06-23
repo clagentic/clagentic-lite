@@ -136,4 +136,22 @@ case "$PATH_TARGET" in
   *.pem|*id_rsa*|*.key) block W-004 "writes to credential-shaped files are forbidden" ;;
 esac
 
+# W-005 (warn-only, non-blocking): editing a cache-prefix artifact mid-session
+# invalidates Claude's prompt cache. Claude's cache is a prefix over:
+#   tool definitions → system prompt → messages
+# Any change to CLAUDE.md, hook scripts, settings.json, or MCP config causes the
+# next LLM call to pay full input cost (the 1.25x write cost is wasted too).
+warn_cache() {
+  printf '[clagentic-lite/pre-write-guard] WARN W-005: editing a cache-prefix artifact mid-session invalidates the prompt cache — next turn will pay full input cost\n' 1>&2
+  ds_audit_log write-guard warn "W-005: cache-prefix artifact edit: $PATH_TARGET"
+}
+
+case "$PATH_TARGET" in
+  */CLAUDE.md) warn_cache ;;
+  */.claude/settings.json) warn_cache ;;
+  */.claude/settings.local.json) warn_cache ;;
+  */.claude/hooks/*.sh) warn_cache ;;
+  */.claude/*mcp*|*/.claude/*MCP*) warn_cache ;;
+esac
+
 exit 0
