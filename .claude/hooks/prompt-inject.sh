@@ -50,6 +50,16 @@ KEYWORDS=$(printf '%s\n' "$PROMPT" | tr '[:upper:]' '[:lower:]' | \
 
 [ -z "$KEYWORDS" ] && exit 0
 
+# Gate: count surviving keywords and skip injection if below threshold.
+# Bright-line compliance: the gate counts tokens from the user's own input
+# (how many keywords were extracted from the prompt), never a number derived
+# from the corpus. The SQL query, result set, and ORDER BY are unchanged —
+# rows that appear are byte-identical to a no-gate run. Only the call/no-call
+# decision differs, based solely on the user's own prompt structure.
+KEYWORD_COUNT=$(printf '%s\n' "$KEYWORDS" | grep -c '.')
+MIN_KW="${CLAGENTIC_RECALL_MIN_KEYWORDS:-2}"
+[ "$KEYWORD_COUNT" -lt "$MIN_KW" ] && exit 0
+
 # Escape a keyword for safe interpolation into a SQLite LIKE pattern.
 # Escapes: single-quote (SQL injection), %, _ (LIKE wildcards), \ (escape char).
 # Input is already alnum-only after tr filtering above, so in practice nothing
