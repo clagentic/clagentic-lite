@@ -11,6 +11,9 @@
       { "matcher": "Bash",       "hooks": [{ "type": "command", "command": ".claude/hooks/pre-bash-guard.sh" }] },
       { "matcher": "Write|Edit", "hooks": [{ "type": "command", "command": ".claude/hooks/pre-write-guard.sh" }] }
     ],
+    "PostToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": ".claude/hooks/post-tool-nudge.sh" }] }
+    ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": ".claude/hooks/stop-summarize.sh" }] }
     ]

@@ -147,6 +147,15 @@ CLAGENTIC_DISABLE_HANDOFF=0
 # or the network fetch is unwanted — e.g. air-gapped environments).
 CLAGENTIC_SKIP_UPDATE_ALERT=0
 
+# Context-budget monitor (PostToolUse hook).
+# Estimates token cost of each tool result (4 bytes ≈ 1 token) and warns via
+# additionalContext when a single result or the cumulative session total crosses
+# the configured threshold. Totals are persisted in audit.db (context_budget table).
+# Set CLAGENTIC_DISABLE_BUDGET=1 to opt out entirely.
+# CLAGENTIC_DISABLE_BUDGET=0
+# CLAGENTIC_RESULT_TOKEN_WARN=8000    # warn if a single tool result exceeds ~N tokens (default 8000, ~32 KB)
+# CLAGENTIC_SESSION_TOKEN_WARN=50000  # warn if cumulative session tool output exceeds ~N tokens (default 50000, ~200 KB)
+
 # Memory recall row limit: max turns returned by recall (default 5).
 # CLAGENTIC_RECALL_LIMIT=5
 
