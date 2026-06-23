@@ -68,20 +68,52 @@ _sql_like_escape() {
   printf '%s' "$1" | sed "s/'/\\''/g; s/\\\\/\\\\\\\\/g; s/%/\\\\%/g; s/_/\\\\_/g"
 }
 
-# Build a SQL LIKE clause; bounded to 3 results.
-WHERE=""
-for kw in $KEYWORDS; do
-  _ekw=$(_sql_like_escape "$kw")
-  _clause="(summary LIKE '%${_ekw}%' ESCAPE '\\' OR tags LIKE '%${_ekw}%' ESCAPE '\\')"
-  if [ -z "$WHERE" ]; then
-    WHERE="$_clause"
-  else
-    WHERE="$WHERE OR $_clause"
+# FTS5 path: use MATCH for filtering when turns_fts exists and FTS is not
+# disabled via CLAGENTIC_DISABLE_FTS=1. ORDER BY remains recency-only —
+# never by BM25 rank. Bright-line: FTS5 changes the candidate set, not
+# the visible ordering. (AGENTS.md hc-2026-06-01-litemem, tome #552.)
+MATCHES=""
+_use_fts=0
+if [ "${CLAGENTIC_DISABLE_FTS:-0}" != "1" ]; then
+  _fts_exists=$(sqlite3 "$MEMORY_DB" \
+    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turns_fts';" 2>/dev/null || echo 0)
+  if [ "${_fts_exists:-0}" = "1" ]; then
+    _use_fts=1
   fi
-done
+fi
 
-MATCHES=$(sqlite3 "$MEMORY_DB" \
-  "SELECT '[' || ts || '] ' || summary FROM turns WHERE $WHERE ORDER BY ts DESC LIMIT 3;" 2>/dev/null || true)
+if [ "$_use_fts" = "1" ]; then
+  # Build FTS5 MATCH expression: each keyword double-quoted to prevent FTS5
+  # from treating user words as operators (AND/OR/NOT/NEAR). Embedded
+  # double-quotes are escaped by doubling. Space between terms = implicit OR.
+  FTS_QUERY=""
+  for kw in $KEYWORDS; do
+    _fkw=$(printf '%s' "$kw" | sed 's/"/""/g')
+    if [ -z "$FTS_QUERY" ]; then
+      FTS_QUERY="\"$_fkw\""
+    else
+      # Explicit OR between terms: FTS5 uses AND by default for adjacent
+      # quoted phrases; explicit OR gives correct multi-keyword recall.
+      FTS_QUERY="$FTS_QUERY OR \"$_fkw\""
+    fi
+  done
+  MATCHES=$(sqlite3 "$MEMORY_DB" \
+    "SELECT '[' || t.ts || '] ' || t.summary FROM turns t JOIN turns_fts f ON t.id = f.rowid WHERE turns_fts MATCH '$FTS_QUERY' ORDER BY t.ts DESC LIMIT 3;" 2>/dev/null || true)
+else
+  # LIKE fallback: used when FTS5 is unavailable or CLAGENTIC_DISABLE_FTS=1.
+  WHERE=""
+  for kw in $KEYWORDS; do
+    _ekw=$(_sql_like_escape "$kw")
+    _clause="(summary LIKE '%${_ekw}%' ESCAPE '\\' OR tags LIKE '%${_ekw}%' ESCAPE '\\')"
+    if [ -z "$WHERE" ]; then
+      WHERE="$_clause"
+    else
+      WHERE="$WHERE OR $_clause"
+    fi
+  done
+  MATCHES=$(sqlite3 "$MEMORY_DB" \
+    "SELECT '[' || ts || '] ' || summary FROM turns WHERE $WHERE ORDER BY ts DESC LIMIT 3;" 2>/dev/null || true)
+fi
 
 [ -z "$MATCHES" ] && exit 0
 

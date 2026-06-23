@@ -45,6 +45,39 @@ CREATE TABLE IF NOT EXISTS turns (
 CREATE INDEX IF NOT EXISTS idx_turns_ts   ON turns(ts);
 CREATE INDEX IF NOT EXISTS idx_turns_tags ON turns(tags);
 SQL
+  # FTS5 virtual table + triggers: created only when SQLite was compiled with
+  # FTS5 support (3.9+, 2015) and CLAGENTIC_DISABLE_FTS is not set.
+  # Detection uses CREATE VIRTUAL TABLE on a probe table (fts5_probe), which
+  # fails cleanly when FTS5 is not compiled in. The probe is deleted immediately
+  # after. fts5_version() is not a global function and cannot be used for detection.
+  # Failure is silent — callers fall back to LIKE.
+  if [ "${CLAGENTIC_DISABLE_FTS:-0}" != "1" ]; then
+    _fts5_ok=$(sqlite3 "$DB" \
+      "CREATE VIRTUAL TABLE IF NOT EXISTS fts5_probe USING fts5(x); DROP TABLE IF EXISTS fts5_probe;" \
+      2>/dev/null && echo 1 || echo 0)
+    if [ "${_fts5_ok:-0}" = "1" ]; then
+      sqlite3 "$DB" <<'SQL'
+CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(summary, tags, content=turns, content_rowid=id);
+CREATE TRIGGER IF NOT EXISTS turns_fts_insert AFTER INSERT ON turns BEGIN
+  INSERT INTO turns_fts(rowid, summary, tags) VALUES (new.id, new.summary, new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS turns_fts_delete AFTER DELETE ON turns BEGIN
+  INSERT INTO turns_fts(turns_fts, rowid, summary, tags) VALUES ('delete', old.id, old.summary, old.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS turns_fts_update AFTER UPDATE ON turns BEGIN
+  INSERT INTO turns_fts(turns_fts, rowid, summary, tags) VALUES ('delete', old.id, old.summary, old.tags);
+  INSERT INTO turns_fts(rowid, summary, tags) VALUES (new.id, new.summary, new.tags);
+END;
+SQL
+      # Backfill: if turns_fts is empty but turns has rows, populate from turns.
+      # This covers existing installations where rows predate FTS5 schema creation.
+      _fts_count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM turns_fts;" 2>/dev/null || echo 0)
+      _turns_count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
+      if [ "${_fts_count:-0}" = "0" ] && [ "${_turns_count:-0}" != "0" ]; then
+        sqlite3 "$DB" "INSERT INTO turns_fts(rowid, summary, tags) SELECT id, summary, tags FROM turns;" 2>/dev/null || true
+      fi
+    fi
+  fi
 }
 
 cmd_log_turn() {
@@ -110,25 +143,64 @@ cmd_recall() {
        ORDER BY (t1.source='manual') DESC, t1.ts DESC
        LIMIT $RECALL_LIMIT;")
   else
-    WHERE=""
-    for kw in $KW; do
-      # Quote-escape (for SQL injection) AND escape LIKE wildcards % and _
-      # (so a user prompt like "auth_check" doesn't match "authxcheck" etc.).
-      # The ESCAPE '\' clause on each LIKE tells SQLite to treat backslash as
-      # the wildcard-escape character.
-      KW_ESC=$(ds_sql_escape "$kw" | sed 's/\\/\\\\/g; s/%/\\%/g; s/_/\\_/g')
-      if [ -z "$WHERE" ]; then
-        WHERE="(t1.summary LIKE '%$KW_ESC%' ESCAPE '\\' OR t1.tags LIKE '%$KW_ESC%' ESCAPE '\\')"
-      else
-        WHERE="$WHERE OR (t1.summary LIKE '%$KW_ESC%' ESCAPE '\\' OR t1.tags LIKE '%$KW_ESC%' ESCAPE '\\')"
+    # FTS5 path: use MATCH for filtering when turns_fts exists and FTS is not
+    # disabled. ORDER BY remains recency+intent only — never by BM25 rank.
+    # Bright-line: FTS5 changes which rows are candidates, not their visible
+    # ordering. (AGENTS.md hc-2026-06-01-litemem, tome #552.)
+    _use_fts=0
+    if [ "${CLAGENTIC_DISABLE_FTS:-0}" != "1" ]; then
+      _fts_exists=$(sqlite3 "$DB" \
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turns_fts';" 2>/dev/null || echo 0)
+      if [ "${_fts_exists:-0}" = "1" ]; then
+        _use_fts=1
       fi
-    done
-    RAW=$(sqlite3 -separator ' | ' "$DB" \
-      "SELECT t1.ts, $_DISP_EXPR
-       FROM turns t1
-       WHERE $WHERE
-       ORDER BY (t1.source='manual') DESC, t1.ts DESC
-       LIMIT $RECALL_LIMIT;")
+    fi
+    if [ "$_use_fts" = "1" ]; then
+      # Build FTS5 MATCH expression: each keyword double-quoted to prevent
+      # FTS5 from interpreting user text as operator syntax (AND/OR/NOT/NEAR).
+      # Double-quote chars inside the keyword are escaped by doubling ("").
+      # Space between terms = implicit OR in FTS5.
+      FTS_QUERY=""
+      for kw in $KW; do
+        # Escape any embedded double-quote by doubling it (FTS5 convention).
+        _fkw=$(printf '%s' "$kw" | sed 's/"/""/g')
+        if [ -z "$FTS_QUERY" ]; then
+          FTS_QUERY="\"$_fkw\""
+        else
+          # Explicit OR between terms: FTS5 uses AND by default for adjacent
+          # quoted phrases; explicit OR gives correct multi-keyword recall.
+          FTS_QUERY="$FTS_QUERY OR \"$_fkw\""
+        fi
+      done
+      RAW=$(sqlite3 -separator ' | ' "$DB" \
+        "SELECT t1.ts, $_DISP_EXPR
+         FROM turns t1
+         JOIN turns_fts f ON t1.id = f.rowid
+         WHERE turns_fts MATCH '$FTS_QUERY'
+         ORDER BY (t1.source='manual') DESC, t1.ts DESC
+         LIMIT $RECALL_LIMIT;" 2>/dev/null || true)
+    else
+      # LIKE fallback: used when FTS5 is unavailable or CLAGENTIC_DISABLE_FTS=1.
+      WHERE=""
+      for kw in $KW; do
+        # Quote-escape (for SQL injection) AND escape LIKE wildcards % and _
+        # (so a user prompt like "auth_check" doesn't match "authxcheck" etc.).
+        # The ESCAPE '\' clause on each LIKE tells SQLite to treat backslash as
+        # the wildcard-escape character.
+        KW_ESC=$(ds_sql_escape "$kw" | sed 's/\\/\\\\/g; s/%/\\%/g; s/_/\\_/g')
+        if [ -z "$WHERE" ]; then
+          WHERE="(t1.summary LIKE '%$KW_ESC%' ESCAPE '\\' OR t1.tags LIKE '%$KW_ESC%' ESCAPE '\\')"
+        else
+          WHERE="$WHERE OR (t1.summary LIKE '%$KW_ESC%' ESCAPE '\\' OR t1.tags LIKE '%$KW_ESC%' ESCAPE '\\')"
+        fi
+      done
+      RAW=$(sqlite3 -separator ' | ' "$DB" \
+        "SELECT t1.ts, $_DISP_EXPR
+         FROM turns t1
+         WHERE $WHERE
+         ORDER BY (t1.source='manual') DESC, t1.ts DESC
+         LIMIT $RECALL_LIMIT;")
+    fi
   fi
   # Apply RECALL_MAX_CHARS: accumulate lines until the budget is exhausted,
   # then drop trailing rows whole (never split mid-row).

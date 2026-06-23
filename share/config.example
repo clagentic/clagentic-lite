@@ -123,6 +123,13 @@ CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC=20
 # Disable memory recall injection entirely (UserPromptSubmit hook).
 CLAGENTIC_DISABLE_RECALL=0
 
+# Disable FTS5 full-text search for recall and force the LIKE fallback.
+# Set =1 on platforms where SQLite was compiled without FTS5 (rare; most SQLite
+# builds since 2015 include it), or if you prefer the simpler LIKE behavior.
+# When unset or 0, recall uses FTS5 MATCH for filtering if turns_fts exists,
+# falling back to LIKE silently when FTS5 is unavailable.
+# CLAGENTIC_DISABLE_FTS=0
+
 # Disable on-disk handoff frame: Stop hook will not write .clagentic/lite/handoff.md
 # and SessionStart hook will not inject it. Set =1 if you prefer auto-compact only,
 # or if the handoff file is causing noise in your workflow.
