@@ -35,6 +35,22 @@ if [ -f "$MEMORY_DB" ]; then
     "SELECT '[' || ts || '] ' || summary FROM turns ORDER BY ts DESC LIMIT 3;" 2>/dev/null || true)
 fi
 
+# ---- 1a. Handoff frame injection -------------------------------------------
+# Read the most recent handoff frame written by the Stop hook, if present.
+# Best-effort: missing or unreadable file is not an error.
+# Disabled by CLAGENTIC_DISABLE_HANDOFF=1.
+
+HANDOFF_MD="${PWD}/.clagentic/lite/handoff.md"
+if [ ! -f "$HANDOFF_MD" ] && [ -f "${PWD}/.clagentic-project" ]; then
+  _hs_primary=$(head -n 1 "${PWD}/.clagentic-project" 2>/dev/null || true)
+  [ -n "$_hs_primary" ] && HANDOFF_MD="${_hs_primary}/.clagentic/lite/handoff.md"
+fi
+
+HANDOFF_CONTENT=""
+if [ "${CLAGENTIC_DISABLE_HANDOFF:-0}" != "1" ] && [ -f "$HANDOFF_MD" ]; then
+  HANDOFF_CONTENT=$(cat "$HANDOFF_MD" 2>/dev/null || true)
+fi
+
 # ---- 1b. Builder contract injection ----------------------------------------
 # Inject .clagentic/lite/builder-contract.md so Claude Code receives the full
 # builder rules, agent table, and gate reference at session open. The contract
@@ -108,6 +124,15 @@ if [ -n "$RECENT" ]; then
     CONTEXT="${CONTEXT}\n\n${_recall_block}"
   else
     CONTEXT="$_recall_block"
+  fi
+fi
+
+if [ -n "$HANDOFF_CONTENT" ]; then
+  _handoff_block="CLAGENTIC HANDOFF · prior session state:\n${HANDOFF_CONTENT}"
+  if [ -n "$CONTEXT" ]; then
+    CONTEXT="${CONTEXT}\n\n${_handoff_block}"
+  else
+    CONTEXT="$_handoff_block"
   fi
 fi
 
