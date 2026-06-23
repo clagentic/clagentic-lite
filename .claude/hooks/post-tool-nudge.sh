@@ -1,6 +1,6 @@
 #!/bin/sh
 # clagentic-lite :: PostToolUse hook
-# Two responsibilities (both non-blocking — always exits 0):
+# Three responsibilities (all non-blocking — always exits 0):
 #
 # 1. Git-workflow nudge: reminds the session to run /review after git commit
 #    or git add (advisory only).
@@ -12,6 +12,13 @@
 #    Opt-out: CLAGENTIC_DISABLE_BUDGET=1
 #    Per-result threshold: CLAGENTIC_RESULT_TOKEN_WARN (default 8000, ~32 KB)
 #    Session total threshold: CLAGENTIC_SESSION_TOKEN_WARN (default 50000, ~200 KB)
+#
+# 3. Auto-summarize: when a tool result exceeds CLAGENTIC_AUTOSUMMARIZE_BYTES
+#    (default 32768 = 32 KB), pipes it through the Summarizer role via
+#    llm-client.sh and stores a digest in memory.db. Also emits the first 100
+#    chars of the digest via additionalContext so the session sees a hint.
+#    Opt-out: CLAGENTIC_DISABLE_AUTOSUMMARIZE=1
+#    Threshold: CLAGENTIC_AUTOSUMMARIZE_BYTES (default 32768)
 
 set +e
 
@@ -147,21 +154,79 @@ if [ -n "$CMD" ]; then
   esac
 fi
 
-# ---- emit combined additionalContext ----
+# ---- section 3: auto-summarize large tool results ----
 
-# Exit silently when neither section produced output.
-[ -z "$BUDGET_MSG" ] && [ -z "$GIT_MSG" ] && exit 0
+AUTOSUMMARIZE_MSG=""
 
-# Build the combined JSON-escaped context string.
-if [ -n "$BUDGET_MSG" ] && [ -n "$GIT_MSG" ]; then
-  GIT_JSON=$(_json_escape "$GIT_MSG")
-  COMBINED="${BUDGET_MSG}\\n\\n${GIT_JSON}"
-elif [ -n "$BUDGET_MSG" ]; then
-  COMBINED="$BUDGET_MSG"
-else
-  COMBINED=$(_json_escape "$GIT_MSG")
+if [ "${CLAGENTIC_DISABLE_AUTOSUMMARIZE:-0}" != "1" ] && [ -n "$REPO_ROOT" ]; then
+  AUTOSUMMARIZE_BYTES="${CLAGENTIC_AUTOSUMMARIZE_BYTES:-32768}"
+  # Integer guard: reject non-integer values; fall back to default.
+  case "$AUTOSUMMARIZE_BYTES" in ''|*[!0-9]*) AUTOSUMMARIZE_BYTES=32768 ;; esac
+
+  # RESULT_BYTES may already be set by the budget monitor; re-derive if empty.
+  # OUTPUT was extracted above (budget monitor section). Both are in scope because
+  # they share the same shell, not a subshell.
+  if [ -z "${RESULT_BYTES:-}" ]; then
+    OUTPUT=$(printf '%s' "$PAYLOAD" | ds_json_field output 2>/dev/null) || OUTPUT=""
+    RESULT_BYTES=$(printf '%s' "$OUTPUT" | wc -c | tr -d '[:space:]')
+  fi
+
+  # Only proceed when RESULT_BYTES is a plain integer.
+  case "${RESULT_BYTES:-}" in
+    ''|*[!0-9]*) : ;;  # not numeric — skip silently
+    *)
+      if [ "$RESULT_BYTES" -gt "$AUTOSUMMARIZE_BYTES" ] 2>/dev/null; then
+        # Summarize: pipe result through Summarizer; best-effort, 10s timeout.
+        # Use $DS_TIMEOUT_CMD if available (from platform.sh), fall back to plain exec.
+        _summarize_cmd="$REPO_ROOT/scripts/llm-client.sh"
+        if [ -x "$_summarize_cmd" ]; then
+          if [ -n "${DS_TIMEOUT_CMD:-}" ]; then
+            DIGEST=$(printf '%s' "$OUTPUT" | $DS_TIMEOUT_CMD 10 "$_summarize_cmd" summarize 2>/dev/null | head -c 300) || DIGEST=""
+          else
+            DIGEST=$(printf '%s' "$OUTPUT" | "$_summarize_cmd" summarize 2>/dev/null | head -c 300) || DIGEST=""
+          fi
+          if [ -n "$DIGEST" ]; then
+            # Store digest in memory.db — best-effort, failures are silent.
+            "$REPO_ROOT/scripts/memory.sh" log-turn "$DIGEST" "autosummarize tool-result" "autosummarize" >/dev/null 2>&1 || true
+            # Build the additionalContext hint: first 100 chars of the digest.
+            _digest_hint=$(printf '%s' "$DIGEST" | head -c 100)
+            _approx_tokens=$(( RESULT_BYTES / 4 ))
+            _raw_autosummarize=$(printf 'CLAGENTIC AUTOSUMMARIZE \302\267 large result (~%s tokens) stored as digest: %s...' \
+              "$_approx_tokens" "$_digest_hint")
+            AUTOSUMMARIZE_MSG=$(_json_escape "$_raw_autosummarize")
+          fi
+        fi
+      fi
+      ;;
+  esac
 fi
 
-printf '{"additionalContext": "%s"}\n' "$COMBINED"
+# ---- emit combined additionalContext ----
+
+# Accumulate all non-empty message parts, separated by \n\n in the JSON string.
+CONTEXT=""
+
+_append_context() {
+  _part="$1"
+  if [ -n "$_part" ]; then
+    if [ -n "$CONTEXT" ]; then
+      CONTEXT="${CONTEXT}\\n\\n${_part}"
+    else
+      CONTEXT="$_part"
+    fi
+  fi
+}
+
+_append_context "$BUDGET_MSG"
+_append_context "$AUTOSUMMARIZE_MSG"
+# GIT_MSG needs JSON-escaping (BUDGET_MSG and AUTOSUMMARIZE_MSG are pre-escaped).
+if [ -n "$GIT_MSG" ]; then
+  _append_context "$(_json_escape "$GIT_MSG")"
+fi
+
+# Exit silently when no section produced output.
+[ -z "$CONTEXT" ] && exit 0
+
+printf '{"additionalContext": "%s"}\n' "$CONTEXT"
 
 exit 0
