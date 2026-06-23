@@ -52,7 +52,7 @@ cmd_log_turn() {
   SUMMARY="$1"
   TAGS="${2:-}"
   SOURCE="${3:-manual}"
-  BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")  # pin to enrolled repo root, not $PWD
   TS=$(ds_date_iso)
   # CLAGENTIC_MEMORY_MAX_ROWS: opportunistic row cap (default 5000).
   # After each INSERT, oldest rows beyond the cap are silently pruned.
