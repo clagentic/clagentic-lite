@@ -95,6 +95,58 @@ PY
   # Log to audit trail. ds_audit_log escapes both details and session_id.
   ds_audit_log summarize pass "stop-summarize: session=$SESSION_ID" "$SESSION_ID"
 
+  # Write handoff frame — best-effort, must not block or error.
+  # Disabled by CLAGENTIC_DISABLE_HANDOFF=1.
+  if [ "${CLAGENTIC_DISABLE_HANDOFF:-0}" != "1" ]; then
+    HANDOFF_FILE="$REPO_ROOT/.clagentic/lite/handoff.md"
+    HANDOFF_TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown")
+    python3 - "$HANDOFF_FILE" "$HANDOFF_TS" "$SESSION_ID" "$SUMMARY" "$LAST_TURN" <<'PY' 2>/dev/null || true
+import sys, re, os
+
+handoff_file = sys.argv[1]
+ts           = sys.argv[2]
+session_id   = sys.argv[3]
+summary      = sys.argv[4]
+last_turn    = sys.argv[5]
+
+# Active task: last 1-2 sentences of summary.
+sentences = re.split(r'(?<=[.!?])\s+', summary.strip())
+active_task = ' '.join(sentences[-2:]) if len(sentences) >= 2 else summary.strip()
+
+# Open threads: lines from summary containing "next:" / "TODO:" / unresolved markers.
+thread_lines = []
+for line in summary.splitlines():
+    low = line.lower().strip()
+    if low.startswith(('next:', 'todo:', 'follow-up:', 'followup:', '- [ ]', '* [ ]')):
+        thread_lines.append(line.strip())
+open_threads = '\n'.join(thread_lines) if thread_lines else '(none extracted)'
+
+# Key files: path-like tokens from the last assistant turn.
+path_pattern = re.compile(
+    r'(?:^|[\s`\'"])(/[\w./\-]+[\w./\-]|[\w./\-]+(?:/[\w./\-]+)+\.\w+)',
+    re.MULTILINE,
+)
+paths_seen = []
+for m in path_pattern.finditer(last_turn):
+    p = m.group(1)
+    if p not in paths_seen:
+        paths_seen.append(p)
+key_files = '\n'.join(paths_seen[:20]) if paths_seen else '(none extracted)'
+
+content = (
+    f"## Handoff Frame — {session_id} — {ts}\n\n"
+    f"### Active task\n{active_task}\n\n"
+    f"### Open threads\n{open_threads}\n\n"
+    f"### Key files touched\n{key_files}\n\n"
+    f"### Session notes\n{summary}\n"
+)
+
+os.makedirs(os.path.dirname(handoff_file), exist_ok=True)
+with open(handoff_file, 'w', encoding='utf-8') as fh:
+    fh.write(content)
+PY
+  fi
+
   # Clean up lock file (best-effort).
   rm -f "$LOCK" 2>/dev/null || true
 ) >/dev/null 2>&1 &

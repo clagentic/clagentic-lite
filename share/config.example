@@ -123,6 +123,11 @@ CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC=20
 # Disable memory recall injection entirely (UserPromptSubmit hook).
 CLAGENTIC_DISABLE_RECALL=0
 
+# Disable on-disk handoff frame: Stop hook will not write .clagentic/lite/handoff.md
+# and SessionStart hook will not inject it. Set =1 if you prefer auto-compact only,
+# or if the handoff file is causing noise in your workflow.
+CLAGENTIC_DISABLE_HANDOFF=0
+
 # Minimum keyword count required to trigger recall injection (UserPromptSubmit hook).
 # If fewer than this many keywords survive prompt extraction (after stopword filtering
 # and dedup), injection is skipped entirely for that turn. Gating is on the count of
