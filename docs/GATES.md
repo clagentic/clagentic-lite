@@ -231,6 +231,29 @@ Rationale: deterministic tools, well-understood, no LLM in the security path. Th
 
 The Auditor argues, in concrete terms, how a hostile user could exploit each new or modified input surface. Cites file:line. Names threats with CWE if obvious. If nothing is exploitable, says so in one sentence and lists the surfaces considered.
 
+### Finding format (prose-primary with structured header)
+
+Each finding in the adversarial output begins with a compact header line, followed by a prose explanation:
+
+```
+[FINDING] CWE-XXX | file.ext:line | severity: high | title: Short description phrase
+
+Prose explanation (1-3 paragraphs): what the vulnerability is, how an
+attacker exploits it, and what a minimal fix looks like.
+```
+
+Header fields:
+
+| Field | Values |
+|---|---|
+| `[FINDING]` | Literal tag; always the first token on the header line |
+| CWE | Most specific CWE Base-level ID (e.g. `CWE-78`); `CWE-unknown` if not applicable |
+| file:line | Specific file and line number (e.g. `scripts/gates.sh:42`); `general` if not file-specific |
+| severity | `critical` / `high` / `medium` / `low` |
+| title | One short phrase, eight words or fewer |
+
+This is a "prose-primary with structured header" format: the header makes the output scannable at a glance; the prose below it preserves the full adversarial explanation. If the model does not emit `[FINDING]` headers (format mismatch, older model), the prose output is still valid and usable — the format is additive, not a schema enforcement.
+
 For a heavier, structured threat-model pass, use the `/infosec-rt` skill instead — multi-persona chained attack scenarios with hardening priority list.
 
 ## Gate 6 — Merge Gate
