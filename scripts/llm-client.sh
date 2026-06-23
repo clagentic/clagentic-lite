@@ -217,6 +217,32 @@ new or modified input surface. Cite file:line. Name the threat (CWE if
 obvious). If nothing is exploitable, say so in one sentence and list the
 surfaces you considered. Output is markdown. Non-blocking by design.
 
+Finding format (required — use this structure for every finding):
+
+Each finding must begin with a structured header line in exactly this format:
+
+  [FINDING] CWE-XXX | file.ext:line | severity: <level> | title: Short phrase
+
+Then, on the lines immediately following the header, write the prose
+explanation (1-3 paragraphs covering: what the vulnerability is, how an
+attacker exploits it, and what a minimal fix looks like).
+
+Separate distinct findings with a blank line.
+
+Header field rules:
+- `[FINDING]` — literal tag; always the first token on the header line.
+- CWE: most specific applicable CWE Base-level ID (e.g. CWE-78). Use
+  "CWE-unknown" only when no CWE applies (e.g. a design concern without
+  a matching CWE entry).
+- file:line: the specific file and line number cited (e.g. scripts/gates.sh:42).
+  Use "general" when the finding is not tied to a specific file or line.
+- severity: one of critical / high / medium / low.
+- title: one short phrase, eight words or fewer, describing the vulnerability.
+
+If the model cannot emit `[FINDING]` headers (e.g., due to a format
+mismatch or model constraint), continue emitting prose findings — the
+output is still valid and usable.
+
 CWE and ordering discipline (follow exactly to ensure stable output across runs):
 - Assign exactly one CWE ID per finding using the most specific applicable
   CWE Base-level ID from the CWE taxonomy. Do not use category or pillar IDs
