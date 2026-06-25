@@ -1748,18 +1748,24 @@ _restamp_repo_artifacts() {
   _ra_wrapper_dir=$(dirname "$_ra_path")
   _ra_wrapper_ptr="$_ra_wrapper_dir/.clagentic-project"
   _ra_wrapper_cm="$_ra_wrapper_dir/CLAUDE.md"
-  if [ -f "$_ra_wrapper_ptr" ] && [ -f "$_ra_wrapper_cm" ] && \
-     grep -q 'managed-by: clagentic' "$_ra_wrapper_cm" 2>/dev/null; then
-    _ra_wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
-    if [ -f "$_ra_wcm_template" ]; then
-      # Re-build the project table from the pointer file.
-      _ra_wcm_repos=$(tr '\n' ' ' < "$_ra_wrapper_ptr" 2>/dev/null || true)
-      ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_ra_wrapper_dir" "$_ra_wcm_repos" && {
-        say "re-stamped wrapper${_ra_label}: $_ra_wrapper_cm" >&2
-        _ra_count=$((_ra_count+1))
-      }
+  if [ -f "$_ra_wrapper_ptr" ]; then
+    # Re-stamp wrapper CLAUDE.md only when it is clagentic-managed.
+    if [ -f "$_ra_wrapper_cm" ] && grep -q 'managed-by: clagentic' "$_ra_wrapper_cm" 2>/dev/null; then
+      _ra_wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
+      if [ -f "$_ra_wcm_template" ]; then
+        # Re-build the project table from the pointer file.
+        _ra_wcm_repos=$(tr '\n' ' ' < "$_ra_wrapper_ptr" 2>/dev/null || true)
+        ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_ra_wrapper_dir" "$_ra_wcm_repos" && {
+          say "re-stamped wrapper${_ra_label}: $_ra_wrapper_cm" >&2
+          _ra_count=$((_ra_count+1))
+        }
+      fi
     fi
-    # Re-stamp wrapper .claude/settings.json alongside CLAUDE.md.
+    # Re-stamp wrapper .claude/settings.json whenever the pointer exists —
+    # independent of whether wrapper CLAUDE.md is managed.  Wrappers enrolled
+    # before wrapper CLAUDE.md stamping was introduced have no managed CLAUDE.md
+    # but still need hook wiring; gating on CLAUDE.md caused the restamp to be
+    # silently skipped for those installs.
     ENROLL_FORCE=1 _stamp_wrapper_settings "$_ra_wrapper_dir" && {
       say "re-stamped wrapper settings${_ra_label}: $_ra_wrapper_dir/.claude/settings.json" >&2
       _ra_count=$((_ra_count+1))
@@ -2036,11 +2042,15 @@ cmd_update() {
     _vck_wrapper_dir=$(dirname "$_rpath")
     _vck_wrapper_ptr="$_vck_wrapper_dir/.clagentic-project"
     _vck_wrapper_cm="$_vck_wrapper_dir/CLAUDE.md"
-    if [ -f "$_vck_wrapper_ptr" ] && [ -f "$_vck_wrapper_cm" ] && \
-       grep -q 'managed-by: clagentic' "$_vck_wrapper_cm" 2>/dev/null; then
-      _wcm_ver=$(claude_wrapper_version "$_vck_wrapper_cm")
-      [ "$_wcm_ver" != "$CLAUDE_WRAPPER_VERSION" ] && _need_restamp=1
-      # Also check wrapper settings.json version.
+    if [ -f "$_vck_wrapper_ptr" ]; then
+      # Check wrapper CLAUDE.md version only when it is clagentic-managed.
+      if [ -f "$_vck_wrapper_cm" ] && grep -q 'managed-by: clagentic' "$_vck_wrapper_cm" 2>/dev/null; then
+        _wcm_ver=$(claude_wrapper_version "$_vck_wrapper_cm")
+        [ "$_wcm_ver" != "$CLAUDE_WRAPPER_VERSION" ] && _need_restamp=1
+      fi
+      # Check wrapper settings.json version independent of wrapper CLAUDE.md —
+      # wrappers enrolled before wrapper CLAUDE.md stamping existed have no
+      # managed CLAUDE.md but still need hook wiring detected and restamped.
       _vck_wrapper_sj="$_vck_wrapper_dir/.claude/settings.json"
       _wsj_ver=$(claude_wrapper_settings_version "$_vck_wrapper_sj")
       [ "$_wsj_ver" != "$CLAUDE_WRAPPER_SETTINGS_VERSION" ] && _need_restamp=1
