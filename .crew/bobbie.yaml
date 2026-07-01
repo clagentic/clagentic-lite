@@ -1,0 +1,36 @@
+# .crew/bobbie.yaml — BOBBIE per-project configuration for clagentic-lite
+#
+# Generated from: examples/starter-bobbie.yaml (crew-manifest lr-c65e)
+# Schema: schemas/crew-config.schema.json (security block, lr-4d7c)
+#
+# What this file does:
+#   - Adds project-specific security rules ON TOP of BOBBIE's default
+#     RULEBOOK.md namespaces (bobbie.secret, bobbie.bleed, bobbie.dep,
+#     bobbie.sast)
+#   - Optionally overrides scanner defaults (secret/sast/dependency)
+#   - BOBBIE will cite project rules as clagentic-lite.<rule> in findings
+#
+# What this file does NOT do:
+#   - Replace the baseline RULEBOOK (default namespaces always apply)
+#   - Grant BOBBIE write access to code (it is read-only on code)
+#   - Gate merges itself (NAOMI is the merge gate; BOBBIE informs NAOMI)
+#
+# NOTE (gap, not addressed by this file — see PR body for followup):
+# NAOMI logged on PR #119 that BOBBIE "would be required if enforced on
+# GitHub" and that comment-only .crew/*.yaml changes tripped a doc/test-
+# extension allowlist gap in dispatch's security-sensitivity classifier.
+# The crew-config schema's `security` block (this file) only supports
+# `rules` (pattern-based findings) and `scanners` (secret/sast/dependency
+# overrides) — there is no knob here to exempt doc/config-only diffs from
+# being flagged security-sensitive; that classification happens upstream
+# in dispatch, not in this per-project file. Filing the gap as a followup
+# rather than inventing an unsupported schema field.
+
+schema_version: 1
+
+security:
+  rules: []
+
+  # No scanner overrides — use BOBBIE's defaults (gitleaks / semgrep /
+  # osv-scanner). clagentic-lite is a shell+Python CLI tool with no
+  # additional secret/dependency surface warranting an override.

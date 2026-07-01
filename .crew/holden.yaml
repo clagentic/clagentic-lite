@@ -1,0 +1,22 @@
+# .crew/holden.yaml — HOLDEN per-project configuration for clagentic-lite
+#
+# Generated from: examples/starter-holden.yaml (crew-manifest lr-c65e)
+# Schema: schemas/holden.schema.json
+#
+# What this file does:
+#   - Specializes HOLDEN as the project lead for clagentic-lite:
+#     project identity and LORE project slug.
+#   - All other fields are optional and omitted here; HOLDEN falls back
+#     to vanilla defaults (read-only, generic status, standard loop) for
+#     anything not set below.
+#
+# What this file does NOT do:
+#   - Grant HOLDEN write access (HOLDEN is read-only on code by contract)
+#   - Dispatch crew agents (dispatch requires explicit Andy authorization)
+#   - Configure AMoS, NAOMI, PEACHES, or BOBBIE (those use their own
+#     .crew/*.yaml)
+
+schema_version: 1
+
+project: clagentic-lite
+home_project: clagentic-lite
