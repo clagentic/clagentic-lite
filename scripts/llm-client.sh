@@ -489,13 +489,15 @@ invoke_claude() {
   else
     SYSTEM_PROMPT_FLAG="--append-system-prompt"
   fi
-  # Adversarial (auditor) calls use temperature=0 to reduce output variance
-  # across runs. Without this, the LLM reframes the same CWE with different
-  # wording each run, causing acked findings to resurface as new on every PR
-  # iteration. Temperature is not set for reviewer or merge-gate roles — those
-  # benefit from natural variance in a cross-vendor review context.
-  TEMP_FLAG=""
-  [ "$CALL_ROLE" = "auditor" ] && TEMP_FLAG="--temperature 0"
+  # Adversarial (auditor) output variance across runs is reduced via prompt
+  # discipline instead of a CLI flag: ds_adversarial_prompt() (see prompts
+  # section above) fixes CWE assignment and finding ordering explicitly,
+  # mirroring the approach invoke_codex already uses (see the note near
+  # invoke_codex). The claude CLI (verified against 2.1.197) does not expose
+  # a --temperature flag on `claude --print` — passing one made every
+  # auditor call fail outright, which is worse than no determinism control
+  # at all. Do not reintroduce a --temperature (or similar) flag here without
+  # first confirming `claude --help` actually lists it.
   # Tell the inner Claude session NOT to inject recall summaries —
   # this is the recursion-avoidance path that doesn't require --bare.
   export CLAGENTIC_DISABLE_RECALL=1
@@ -508,13 +510,13 @@ invoke_claude() {
   if [ -n "$MODEL" ]; then
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
-      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG $TEMP_FLAG --model "$MODEL" \
+      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG --model "$MODEL" \
         $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   else
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
-      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG $TEMP_FLAG \
+      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG \
         $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE"
   fi
