@@ -11,10 +11,9 @@ scope:
     - ".clagentic/**"
 
 # Builder bot identity for commit re-authoring on the GitHub clagentic/* path (lr-66c2).
-# Provisioned as a per-repo fallback because the lr-2422 org-default path (GET /user
-# with the minted installation token) is currently failing on this host — the token
-# is minted successfully but the /user lookup returns non-200. Remove this block once
-# the org-default path is confirmed working; crew_push.py will then derive it automatically.
+# Standard per-repo commit-author pinning per lr-2422 (DONE 2026-06-17) — this is the
+# intended resolution across all clagentic/* repos, not a temporary fallback. Removing
+# this block would regress commit identity to the operator, the split-brain lr-2422 fixed.
 builder_identity:
   name: "clagentic-builder[bot]"
   email: "290147524+clagentic-builder[bot]@users.noreply.github.com"
