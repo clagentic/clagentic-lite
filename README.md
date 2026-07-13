@@ -51,7 +51,7 @@ All capabilities below are per-project and activate only in enrolled repos (`cla
 | **Session memory** | Stop-hook pipes the last assistant turn through the Summarizer, writes one row to `.clagentic/lite/memory.db`. UserPromptSubmit hook recalls relevant rows into the next prompt's context. |
 | **Safe-by-default tool use** | PreToolUse hooks (`pre-bash-guard.sh`, `pre-write-guard.sh`) block 20 dangerous patterns and writes to the default branch / outside repo / to credential-shaped paths. |
 | **Audit trail** | Every gate decision, every LLM call attempt, every block — one row in `.clagentic/lite/audit.db`. `scripts/gates.sh digest` is the readout. |
-| **Commentary skills** | `/eng-consult` (multi-voice consulting panel: Principal + PM + Security/QA/SRE/UX) and `/infosec-rt` (structured red-team threat model with chained attack scenarios). User-invocable any time; Claude Code may also auto-select on relevant prompts. Commentary only — neither blocks `/ship`. |
+| **Commentary skills** | `/eng-consult` (multi-voice consulting panel: Principal + PM + Security/QA/SRE/UX) and `/infosec-rt` (structured red-team threat model with chained attack scenarios). User-invocable any time; Claude Code may also auto-select on relevant prompts. Commentary only — neither blocks `clagentic-lite gates ship`. |
 
 ---
 
@@ -135,7 +135,7 @@ Nice-to-have:
 
 | Tool      | Why                                                     |
 |-----------|---------------------------------------------------------|
-| `gh`      | `/ship` opens the PR for you; falls back to a URL template |
+| `gh`      | `clagentic-lite gates ship` opens the PR for you; falls back to a URL template |
 | `timeout` / `gtimeout` | per-call LLM timeout; auto-detected. macOS users: `brew install coreutils` for `gtimeout` |
 
 ### Minimal install (just the harness, no security gates)
@@ -202,7 +202,7 @@ Two layers — the shell harness, then Claude Code's view of it.
 clagentic-lite doctor      # diagnostics: symlink, prereqs, every enrolled repo's hook status
 ```
 
-Note: `scripts/` lives in `$CLAGENTIC_LITE_HOME`, not in your enrolled project. Always use the absolute path form (`"$CLAGENTIC_LITE_HOME/scripts/gates.sh"`) when running gate scripts directly from inside a project. The `clagentic-lite` CLI and `/ship`, `/review` slash commands use the correct path automatically.
+Note: `scripts/` lives in `$CLAGENTIC_LITE_HOME`, not in your enrolled project. Always use the absolute path form (`"$CLAGENTIC_LITE_HOME/scripts/gates.sh"`) when running gate scripts directly from inside a project. The `clagentic-lite` CLI and its `gates review`/`gates ship` subcommands use the correct path automatically.
 
 Smoke covers: DB init, seed + recall, gitleaks blocks a planted token, `llm-client.sh review` emits parseable JSON, audit-DB has fresh rows. If smoke passes, the harness is wired correctly.
 
@@ -212,10 +212,15 @@ Open the repo in Claude Code and type each of these. If any are "command not fou
 
 ```text
 /recall            → prints recent session summaries (empty on fresh install)
-/review            → prints the review-gate doc (no diff staged yet, so it'll say so)
-/ship              → prints the ship gate sequence (won't actually push on main)
 /infosec-rt        → convenes the red-team threat model
 /eng-consult       → convenes the multi-voice engineering consulting panel
+```
+
+For review/ship, use the subagent or gates subcommands directly (no slash command exists for these anymore):
+
+```sh
+clagentic-lite gates review   # cross-CLI review of the staged diff (no diff staged yet, so it'll say so)
+clagentic-lite gates ship     # runs the full gate sequence (won't actually push on main)
 ```
 
 If `/infosec-rt` or `/eng-consult` aren't recognized, the `clagentic-lite` plugin may not be installed or may have failed to load. Run `claude plugin list` and check for `clagentic-lite` with status `✔ active`. If it shows failed, re-run `clagentic-lite init`. Skills are discovered by Claude Code from the plugin's `skills/` directory — no per-repo files are needed.
@@ -319,7 +324,7 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
 │   └── PORTABILITY.md                          GNU vs BSD tool table
 ├── .claude/
 │   ├── settings.json                           hook wiring
-│   ├── commands/{review,ship,recall}.md
+│   ├── commands/recall.md
 │   └── hooks/{session-start,prompt-inject,stop-summarize,pre-bash-guard,pre-write-guard}.sh
 ├── plugins/
 │   └── clagentic-lite/
@@ -376,11 +381,11 @@ Each role is a markdown file under `.claude/agents/` with the role contract in t
 |---|------|---------|----------|
 | 1 | Memory recall | UserPromptSubmit | no |
 | 2 | Safe Bash + writes | PreToolUse (Bash, Write, Edit) | yes |
-| 3 | Cross-CLI review | `/review` or pre-push (opt-in) | yes if findings ≥ `CLAGENTIC_BLOCK_SEVERITY` |
+| 3 | Cross-CLI review | `clagentic-lite gates review` or pre-push (opt-in) | yes if findings ≥ `CLAGENTIC_BLOCK_SEVERITY` |
 | 4 | Local security scan | pre-commit (gitleaks), pre-push (osv-scanner, semgrep) | yes |
 | 5 | Session summarize | Stop | no (best-effort) |
-| 6 | Adversarial pass | `/review --adversarial` | no |
-| 7 | Merge Gate | `/ship` | yes by default, set `CLAGENTIC_MERGE_GATE_BLOCKING=0` to make advisory |
+| 6 | Adversarial pass | `clagentic-lite gates adversarial` | no |
+| 7 | Merge Gate | `clagentic-lite gates ship` | yes by default, set `CLAGENTIC_MERGE_GATE_BLOCKING=0` to make advisory |
 
 Details in `docs/GATES.md`.
 
@@ -389,10 +394,10 @@ Details in `docs/GATES.md`.
 ## Daily commands
 
 ```sh
-/review                  # cross-CLI review of staged diff (single Reviewer pass)
-/review --adversarial    # plus an attacker-perspective markdown pass
-/ship                    # run all gates; if green, push and open PR
-/recall <keywords>       # grep session memory
+clagentic-lite gates review        # cross-CLI review of staged diff (single Reviewer pass)
+clagentic-lite gates adversarial   # attacker-perspective markdown pass
+clagentic-lite gates ship          # run all gates; if green, push and open PR
+/recall <keywords>                 # grep session memory
 
 /eng-consult             # multi-voice consulting panel (Principal + PM + specialists)
 /infosec-rt              # structured red-team threat model
