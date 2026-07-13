@@ -25,7 +25,7 @@ This is not for quick questions. Convening the panel means you want the full tre
 **Decision tree — which tool?**
 - "Is this code good enough to ship?" → `/eng-consult`
 - "How would someone break this?" → `/infosec-rt`
-- "Quick cross-CLI review of the staged diff" → `/review` (single-Reviewer pass, not a panel)
+- "Quick cross-CLI review of the staged diff" → `clagentic-lite gates review` (single-Reviewer pass, not a panel)
 
 ---
 
@@ -46,7 +46,7 @@ Output lands in `.clagentic/audit.db.gate_runs` and `.clagentic/last-review.json
 `/eng-consult` is commentary. It does not block, gate, or merge anything.
 
 - Deterministic-gate findings (gitleaks/semgrep/osv-scanner) remain blocking at their gates. The panel may discuss them but cannot mark them resolved.
-- The LLM Merge Gate (configured by `.claude/agents/merge-gate.md`) is the final pre-merge LLM check inside `/ship`. The panel's Recommendations do not feed into the Merge Gate automatically — they inform the operator, who decides whether to address each item before invoking `/ship`.
+- The LLM Merge Gate (configured by `.claude/agents/merge-gate.md`) is the final pre-merge LLM check inside `clagentic-lite gates ship`. The panel's Recommendations do not feed into the Merge Gate automatically — they inform the operator, who decides whether to address each item before invoking `clagentic-lite gates ship`.
 - Severity tags here (Critical/High/Medium/Low) are the panel's judgment. The operator decides which of those become commits, which become followup tasks, and which become accepted risks.
 
 ---
@@ -242,6 +242,6 @@ The Principal writes the Recommendations — specialists produce findings and ma
 
 Optional members do not persist across sessions. They must be invoked explicitly or auto-invoked by The Principal based on artifact scope.
 
-The Recommendations are **commentary**, not a gate. They do not pass or fail a `/ship` run; they inform the operator's backlog. The deterministic gates (gitleaks/semgrep/osv-scanner) and the LLM Merge Gate are the only blocking surfaces.
+The Recommendations are **commentary**, not a gate. They do not pass or fail a `clagentic-lite gates ship` run; they inform the operator's backlog. The deterministic gates (gitleaks/semgrep/osv-scanner) and the LLM Merge Gate are the only blocking surfaces.
 
 Never reuse `/eng-consult` member names for other purposes. Note: "The Supply Chain Lead" (this skill) is distinct from "The Supply Chain Analyst" in `/infosec-rt` — different roles, different sessions, different scope. The Supply Chain Lead audits dependency manifests for hygiene. The Supply Chain Analyst models dependency compromise as an attack vector.

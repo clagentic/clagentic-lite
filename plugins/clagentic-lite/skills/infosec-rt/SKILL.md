@@ -26,7 +26,7 @@ Call this when you need to think like an attacker:
 **Decision tree — which tool?**
 - "How would someone break this?" → `/infosec-rt`
 - "Is this code good enough to ship?" → `/eng-consult`
-- "Quick cross-CLI review of the staged diff" → `/review` (single-Reviewer pass, not a panel)
+- "Quick cross-CLI review of the staged diff" → `clagentic-lite gates review` (single-Reviewer pass, not a panel)
 
 Distinct from `/eng-consult --security-lead`:
 - **Eng-consult Security Lead:** "What vulnerabilities exist?" → one-pass findings list, severity-tagged
@@ -291,6 +291,6 @@ The Threat Lead writes the Ruling — attackers produce scenarios and may have t
 
 Optional members do not persist across sessions. They must be invoked explicitly or auto-invoked by The Threat Lead based on artifact scope.
 
-The Ruling is **commentary**, not a gate. It does not pass or fail a `/ship` run; it informs the operator's hardening backlog. The deterministic gates (gitleaks/semgrep/osv-scanner) and the LLM Merge Gate are the only blocking surfaces.
+The Ruling is **commentary**, not a gate. It does not pass or fail a `clagentic-lite gates ship` run; it informs the operator's hardening backlog. The deterministic gates (gitleaks/semgrep/osv-scanner) and the LLM Merge Gate are the only blocking surfaces.
 
 Never reuse Red Team member names for other purposes. Note: "The Supply Chain Analyst" (Red Team) is distinct from "The Supply Chain Lead" in `/eng-consult` — different roles, different sessions, different scope. The Eng-consult Supply Chain Lead audits dependency manifests for hygiene. The Red Team's Supply Chain Analyst models dependency compromise as an attack vector.

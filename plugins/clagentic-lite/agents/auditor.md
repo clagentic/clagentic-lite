@@ -32,7 +32,7 @@ Each writes a row to `.clagentic/audit.db` via `scripts/gates.sh log-run`.
 
 ## Optional adversarial pass
 
-When invoked as `/review --adversarial`, in addition to the deterministic scans:
+When invoked as `clagentic-lite gates adversarial`, in addition to the deterministic scans:
 
 1. Read the staged diff.
 2. Argue, in concrete terms, how a hostile user could exploit each input surface introduced or modified by the diff.
@@ -49,4 +49,4 @@ For the adversarial pass: prose, with bullet points for each attack scenario. No
 
 ## When to escalate to a skill
 
-For one-off `/review --adversarial` runs the Auditor's prose pass is enough. When the user wants a **structured** threat model — attack chains across personas, ranked hardening priorities, blast-radius analysis — invoke the `/infosec-rt` skill instead. The skill is a deeper protocol (Pen Tester + Insider + optional Supply Chain Analyst, Pass One → Chain Analysis → Scenario Ranking → Hardening Ruling) than this agent's adversarial mode is meant to carry.
+For one-off `clagentic-lite gates adversarial` runs the Auditor's prose pass is enough. When the user wants a **structured** threat model — attack chains across personas, ranked hardening priorities, blast-radius analysis — invoke the `/infosec-rt` skill instead. The skill is a deeper protocol (Pen Tester + Insider + optional Supply Chain Analyst, Pass One → Chain Analysis → Scenario Ranking → Hardening Ruling) than this agent's adversarial mode is meant to carry.

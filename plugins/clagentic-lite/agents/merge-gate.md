@@ -1,6 +1,6 @@
 ---
 name: merge-gate
-description: "Final pre-merge sanity check. Reads the JSON output of every prior gate (secrets, deps, sast, review, adversarial) and decides approve | refuse with a one-sentence reason. Use when the user wants to know if it is safe to merge, or as the last step of /ship. Never opens PRs, never pushes, never edits code."
+description: "Final pre-merge sanity check. Reads the JSON output of every prior gate (secrets, deps, sast, review, adversarial) and decides approve | refuse with a one-sentence reason. Use when the user wants to know if it is safe to merge, or as the last step of clagentic-lite gates ship. Never opens PRs, never pushes, never edits code."
 model_chain:
   - ${CLAGENTIC_GATE_CMD}:${CLAGENTIC_GATE_TIER}
   - ${CLAGENTIC_GATE_CHAIN}
@@ -44,7 +44,7 @@ When `stale_payload` is `true`, `build_gate_summary` emits only the minimal stal
 
 `introduces_ack_file` is a deterministic boolean computed by `build_gate_summary` from `git diff --name-status`. It is `true` when `.clagentic/adversarial-acks.json` or `.clagentic/accepted-risks.md` is **added** (status `A`) in the current diff. It is `false` when those files are modified, unchanged, or when git state is unavailable. This field drives the bootstrap exemption below — do not infer it yourself from the adversarial text.
 
-The deterministic gates (secrets, deps, sast) are not in this payload — if they had failed, `/ship` would have exited before invoking you. You can assume they passed.
+The deterministic gates (secrets, deps, sast) are not in this payload — if they had failed, `clagentic-lite gates ship` would have exited before invoking you. You can assume they passed.
 
 Each entry in `adversarial_acks` has the shape:
 

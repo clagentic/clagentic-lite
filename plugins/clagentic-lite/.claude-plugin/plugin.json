@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "clagentic-lite",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "The five clagentic-lite role agents (builder, reviewer, auditor, merge-gate, troubleshooter) plus commentary skills (/infosec-rt, /eng-consult). Install once via clagentic-lite init; Claude Code discovers agents and skills globally via the plugin directory structure.",
   "author": {
     "name": "andy",
