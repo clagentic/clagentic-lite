@@ -17,7 +17,7 @@
 #   - Change NAOMI's hard contract (AGENT.md governs that)
 #   - Override the namespace guard (clagentic/* only; andy/* refused)
 
-schema_version: 2
+schema_version: 1
 
 # -----------------------------------------------------------------------
 # merge_allowed
