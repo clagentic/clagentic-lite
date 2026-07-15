@@ -680,12 +680,18 @@ _invariant_feed_max_field_chars() {
 #     reader. Newline (0x0A) and tab (0x09) are preserved — legitimate
 #     structure in a multi-line finding message, not a control sequence.
 #   - Collapses the delimiter label a hostile finding could forge to fake a
-#     new INVARIANTS:/DEFERRED FINDINGS:/end-of-data marker and smuggle a
+#     new INVARIANTS:/DEFERRED FINDINGS:/end-of-data marker — including the
+#     literal fenced ===BEGIN INVARIANTS DATA===/===END INVARIANTS DATA===
+#     markers ds_adversarial_prompt now emits (llm-client.sh) — and smuggle a
 #     bare instruction after it: case-insensitively replaces any of those
 #     literal label strings with a defanged spaced-out form. This does not
 #     make the text nonsensical to a human reviewer (the words are still
 #     legible) but prevents it from being byte-identical to the real
-#     delimiter the model was told to trust.
+#     delimiter the model was told to trust. Without this, a finding
+#     containing the literal fence string survives verbatim into
+#     invariants.json and can forge a fake "===END INVARIANTS DATA==="
+#     inside the block, escaping the fence entirely (BOBBIE, lr-cda4b9
+#     follow-up).
 #   - Caps length at _invariant_feed_max_field_chars, truncating rather than
 #     rejecting — a merely-too-long finding is not attacker behavior, and
 #     rejecting it would silently drop a real resolved-finding invariant
@@ -721,17 +727,26 @@ text = re.sub(r'\x1b.', '', text)                   # any remaining ESC + one by
 text = ''.join(ch for ch in text if ch in ('\t', '\n') or 0x20 <= ord(ch) != 0x7f)
 
 # Defang forged delimiter labels: a hostile finding message could contain
-# the literal string "INVARIANTS:" or "DEFERRED FINDINGS:" to try to spoof a
-# fresh data-block boundary once re-injected into a future prompt. Insert a
-# zero-width-safe space so the string is still legible to a human but no
-# longer byte-identical to the real delimiter.
+# the literal string "INVARIANTS:" or "DEFERRED FINDINGS:" -- or the fenced
+# ===BEGIN/END INVARIANTS DATA=== markers ds_adversarial_prompt wraps this
+# content in (llm-client.sh) -- to try to spoof a fresh data-block boundary
+# once re-injected into a future prompt. Insert a zero-width-safe space so
+# the string is still legible to a human but no longer byte-identical to the
+# real delimiter.
 for label in ("INVARIANTS:", "DEFERRED FINDINGS:", "END INVARIANTS",
-              "END DEFERRED FINDINGS"):
+              "END DEFERRED FINDINGS",
+              "===BEGIN INVARIANTS DATA===", "===END INVARIANTS DATA==="):
     pattern = re.compile(re.escape(label), re.IGNORECASE)
     text = pattern.sub(lambda m: ' '.join(m.group(0)), text)
 
+# Truncate so the FINAL string (content + suffix) fits within max_chars --
+# slicing to max_chars and then appending the suffix would let the suffix
+# push the total length past the configured cap (PEACHES, lr-cda4b9
+# follow-up).
+suffix = "...[truncated]"
 if len(text) > max_chars:
-    text = text[:max_chars] + "...[truncated]"
+    keep = max(max_chars - len(suffix), 0)
+    text = text[:keep] + suffix
 
 sys.stdout.write(text)
 PYEOF
@@ -742,13 +757,20 @@ PYEOF
 
   # No python3: best-effort POSIX fallback. tr strips the bulk of control
   # bytes (octal escapes for 0x01-0x08, 0x0B-0x1F, 0x7F; 0x00 cannot appear
-  # in a shell string so no explicit strip needed); cut caps length. This
-  # path does not defang forged delimiter labels (no portable case-
-  # insensitive substitution without sed extensions that vary GNU/BSD) —
-  # acceptable degradation given no-python3 already means jq is the active
-  # JSON tool and the field is still control-char-clean and length-capped.
+  # in a shell string so no explicit strip needed); sed defangs the fenced
+  # ===BEGIN/END INVARIANTS DATA=== markers specifically (literal, fixed-case
+  # substitution — no GNU/BSD sed extension needed, unlike a general case-
+  # insensitive label match); cut caps length. This path does NOT defang the
+  # case-insensitive INVARIANTS:/DEFERRED FINDINGS: labels the python3 path
+  # covers (no portable case-insensitive substitution without sed extensions
+  # that vary GNU/BSD) — acceptable degradation given no-python3 already
+  # means jq is the active JSON tool elsewhere in this codepath. The fenced
+  # markers ARE covered here because they are the one label an attacker could
+  # use to escape the fence entirely (BOBBIE, lr-cda4b9 follow-up), so this
+  # path closes that specific gap even though it cannot close the general one.
   printf '%s' "$_ifsf_text" \
     | tr -d '\001-\010\013-\037\177' \
+    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g' \
     | cut -c "1-${_ifsf_max}"
 }
 
