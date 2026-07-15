@@ -1,5 +1,8 @@
 # clagentic-lite local state
 .clagentic/
+# loadout enrollment config is tracked repo config, not local runtime state
+!.clagentic/loadout/
+!.clagentic/loadout/config.yaml
 .env
 .env.local
 
