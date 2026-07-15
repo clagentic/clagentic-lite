@@ -264,7 +264,7 @@ For a heavier, structured threat-model pass, use the `/infosec-rt` skill instead
 | **File location** | `.clagentic/lite/invariants.json` (gitignored, local gate state — same convention as `last-review.json` and `review-seen-keys`) |
 | **Effect** | When present and the flag is set, the file is injected verbatim into the adversarial system prompt with an inverted instruction relative to reviewer deferrals: "these invariants must still hold — verify the diff against each" instead of "these findings are deferred, do not re-report." |
 | **Fail-open** | Absent, empty, or unreadable file → the pass proceeds with no invariants. Never blocks — Gate 5 is non-blocking regardless. |
-| **Population** | Manual/operator-maintained. When a finding resolves, distill its message + category into an invariant statement and append it to the file. |
+| **Population** | Automatic. When a finding resolves — present in one round, absent from the next round's diff-covered findings — the writer distills its message + category into an invariant statement and appends it to the file. See "Invariant-feed writer" below. |
 
 **Why this exists:** the adversarial gate is context-free by construction — each round re-derives threats from scratch off the diff alone, with no memory of what a prior round already found and fixed. Cross-round dedup (`CLAGENTIC_CROSS_ROUND_DEDUP`, above) is *suppression* memory: it hushes a finding already reported. The invariant-feed is the opposite polarity — *assertion* memory: it actively re-checks the diff against previously-resolved issues, including reintroduction at a wider scope than where the issue was originally fixed (e.g. a fail-open sentinel fixed at item scope recurring at fleet scope two rounds later). The two mechanisms are independent and can be used together.
 
@@ -287,6 +287,23 @@ For a heavier, structured threat-model pass, use the `/infosec-rt` skill instead
 | `category` | no | Finding category this invariant applies to |
 | `file` | no | Exact path or path glob this invariant applies to |
 | `statement` | yes | The property that must still hold, stated as a check the Auditor can verify against the diff |
+
+### Invariant-feed writer — auto-population (lr-63359e)
+
+The writer is the counterpart to the read/injection half above: it populates `invariants.json` automatically as findings resolve, so the feed does not require operator hand-authoring to be useful end-to-end.
+
+**Resolve signal — reused, not reinvented.** The writer does not maintain an independent notion of "this finding is fixed." It reuses the content-hash key space `dedup_findings`/`_cross_round_dedup` already persist (`.clagentic/lite/review-seen-keys` for the review gate; a new `.clagentic/lite/adversarial-seen-keys` for the adversarial gate, since adversarial did not otherwise participate in cross-round key tracking). Each round, the writer snapshots the seen-keys file *before* that round's `dedup_findings` call adds the round's own keys, runs the same content-hash key derivation (`finding_content_keys` in `scripts/review-merge.sh`) against this round's live findings, and treats any key present in the snapshot but absent from the live set as resolved. This does not change `_cross_round_dedup`'s suppression behavior — it is a read-only comparison that runs after dedup completes, against a separate snapshot, and the file it writes (`invariants.json`) is never read back by `dedup_findings`.
+
+**Two input shapes, one key space:**
+
+- **Review findings** — already structured JSON (`severity`/`file`/`line`/`category`/`message`); no parsing needed.
+- **Adversarial findings** — unstructured markdown `[FINDING] CWE-XXX | file:line | severity: <level> | title: <phrase>` headers; loose-parsed into the same `{file,line,category,message}` shape (`category` becomes the CWE id) before running through the identical key derivation.
+
+**Distillation is mechanical, not an LLM call.** The writer is gate plumbing, not a role — it prefixes the resolved finding's message with a fixed "must not recur, including at a wider scope" framing rather than asking a model to paraphrase. The Auditor's own prompt instructions (in `ds_adversarial_prompt`) already tell it how to use an invariant statement; the writer's job is just to get the original finding text into the file.
+
+**Gating.** The writer only runs when `CLAGENTIC_ADVERSARIAL_INVARIANTS=1` — the same flag that gates the read half. Writing invariants nobody reads would be dead state.
+
+**Unbounded-growth guard.** `invariants.json` dedupes on `(file, statement)` at append time — resolving the same finding class again in a later round is a no-op, not a duplicate entry — and is capped at `CLAGENTIC_INVARIANT_FEED_MAX` total entries (default 200), dropping the oldest entries first. This is a deliberate irony guard: the invariant-feed exists partly to catch unbounded-growth findings (see the round-4/round-6 fail-open-scope-widening case in the synthetic replay test), so its own storage must not grow without bound.
 
 ## Gate 6 — Merge Gate
 

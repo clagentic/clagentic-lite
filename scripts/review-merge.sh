@@ -1,12 +1,14 @@
 #!/bin/sh
 # clagentic-lite :: review-merge helper
 #
-# Sourced (not executed) by gates.sh. Provides three pure POSIX-sh functions
-# for diff chunking and per-chunk envelope merging:
+# Sourced (not executed) by gates.sh. Provides four pure POSIX-sh functions
+# for diff chunking, per-chunk envelope merging, and cross-round key tracking:
 #
 #   split_diff   DIFF_FILE CHUNK_DIR CHUNK_BYTES
 #   merge_envelopes ENVELOPE_DIR DEDUP_KEY_STRATEGY
 #   dedup_findings  KEY_STRATEGY SEEN_FILE [DIFF_FILE]  (reads stdin, writes stdout)
+#   finding_content_keys DIFF_FILE  (reads stdin JSON findings array, writes stdout
+#                                    TSV: key<TAB>file<TAB>category<TAB>message)
 #
 # Dependencies:
 #   Required: git, awk, sed (via platform.sh shims), wc
@@ -826,4 +828,148 @@ except Exception:
 print(json.dumps(deduped))
 PYEOF
   return $?
+}
+
+# ------------------------------------------------------------ finding_content_keys --
+#
+# finding_content_keys DIFF_FILE
+#
+# stdin:  JSON array of findings (reviewer schema: file/line/category/message,
+#         or the same shape produced by loose-parsing adversarial [FINDING]
+#         markdown headers)
+# stdout: one TSV row per finding that yields a non-empty content-hash key:
+#         key<TAB>file<TAB>category<TAB>message
+#         Findings whose key cannot be computed (no diff window, no sha256
+#         tool, missing file/line) are silently omitted — conservative in the
+#         other direction from dedup_findings: a key we cannot compute is a
+#         key we cannot use as an invariant-writer resolve signal, so it is
+#         dropped from THIS output only. It has no effect on dedup_findings'
+#         own conservative-retain behavior, which this function does not touch.
+#
+# Uses the IDENTICAL content-hash key algorithm as dedup_findings' content-hash
+# strategy (5-line +-context window around file:line in DIFF_FILE) so keys
+# computed here are directly comparable against keys already persisted in a
+# dedup_findings SEEN_FILE (e.g. review-seen-keys) -- this is the reuse point:
+# the invariant-writer resolve signal is "a key present in a prior seen-keys
+# snapshot but absent from this round's finding_content_keys output", not a
+# second, independently-derived notion of sameness.
+finding_content_keys() {
+  _fck_difffile="$1"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$_fck_difffile" <<'PYEOF'
+import json, sys, hashlib, os
+
+diff_file = sys.argv[1] if len(sys.argv) > 1 else ""
+
+def find_context_window(diff_file, fname, target_line):
+    result = []
+    cur_file = ""
+    diff_line = 0
+    try:
+        with open(diff_file) as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if line.startswith("+++ "):
+                    cur_file = line[4:]
+                    if cur_file.startswith("b/"):
+                        cur_file = cur_file[2:]
+                    diff_line = 0
+                elif line.startswith("@@ "):
+                    import re
+                    m = re.search(r'\+(\d+)', line)
+                    diff_line = int(m.group(1)) - 1 if m else 0
+                elif line.startswith("+") and cur_file == fname:
+                    diff_line += 1
+                    if abs(diff_line - target_line) <= 2:
+                        result.append(line)
+    except Exception:
+        pass
+    return result
+
+try:
+    findings = json.load(sys.stdin)
+    if not isinstance(findings, list):
+        findings = []
+except Exception:
+    findings = []
+
+have_diff = bool(diff_file) and os.path.isfile(diff_file)
+
+for f in findings:
+    try:
+        fname = f.get("file", "") or ""
+        line = int(f.get("line", 0) or 0)
+        category = f.get("category", "") or ""
+        message = f.get("message", "") or ""
+        key = ""
+        if have_diff:
+            ctx = find_context_window(diff_file, fname, line)
+            if ctx:
+                key = hashlib.sha256("\n".join(ctx).encode()).hexdigest()
+        if key:
+            # Tabs/newlines cannot appear in a TSV field; strip defensively.
+            def clean(s):
+                return str(s).replace("\t", " ").replace("\n", " ").replace("\r", " ")
+            print("{}\t{}\t{}\t{}".format(clean(key), clean(fname), clean(category), clean(message)))
+    except Exception:
+        continue
+PYEOF
+  elif command -v jq >/dev/null 2>&1; then
+    # jq path: reuse the same shell-loop-plus-awk-context-window technique
+    # dedup_findings' jq branch uses, restricted to key + metadata emission
+    # (no severity-wins merge logic needed here -- this is a read-only key
+    # derivation, not a dedup pass).
+    _fck_in=$(mktemp -t clagentic-fck-in.XXXXXX)
+    cat > "$_fck_in"
+    if ! jq -e '. | type == "array"' "$_fck_in" >/dev/null 2>&1; then
+      rm -f "$_fck_in"
+      return 0
+    fi
+    _fck_count=$(jq 'length' "$_fck_in" 2>/dev/null)
+    case "$_fck_count" in ''|*[!0-9]*) _fck_count=0 ;; esac
+    _fck_idx=0
+    while [ "$_fck_idx" -lt "$_fck_count" ]; do
+      _fck_finding=$(jq -c ".[$_fck_idx]" "$_fck_in" 2>/dev/null)
+      _fck_file=$(printf '%s' "$_fck_finding" | jq -r '.file // ""' 2>/dev/null)
+      _fck_line=$(printf '%s' "$_fck_finding" | jq -r '.line // 0' 2>/dev/null)
+      _fck_category=$(printf '%s' "$_fck_finding" | jq -r '.category // ""' 2>/dev/null)
+      _fck_message=$(printf '%s' "$_fck_finding" | jq -r '.message // ""' 2>/dev/null)
+      _fck_context=""
+      if [ -f "$_fck_difffile" ]; then
+        _fck_context=$(awk -v fname="$_fck_file" -v target="$_fck_line" '
+          /^\+\+\+ / {
+            cur_file = substr($0, 5)
+            sub(/^b\//, "", cur_file)
+            diff_line = 0
+          }
+          /^@@ / {
+            match($0, /\+([0-9]+)/, arr)
+            diff_line = arr[1] + 0 - 1
+          }
+          /^\+/ && cur_file == fname {
+            diff_line++
+            if (diff_line >= target - 2 && diff_line <= target + 2) {
+              print
+            }
+          }
+        ' "$_fck_difffile" 2>/dev/null)
+      fi
+      if [ -n "$_fck_context" ]; then
+        _fck_key=$(printf '%s' "$_fck_context" | _rm_sha256)
+        if [ -n "$_fck_key" ]; then
+          _fck_clean_file=$(printf '%s' "$_fck_file" | tr '\t\n\r' '   ')
+          _fck_clean_cat=$(printf '%s' "$_fck_category" | tr '\t\n\r' '   ')
+          _fck_clean_msg=$(printf '%s' "$_fck_message" | tr '\t\n\r' '   ')
+          printf '%s\t%s\t%s\t%s\n' "$_fck_key" "$_fck_clean_file" "$_fck_clean_cat" "$_fck_clean_msg"
+        fi
+      fi
+      _fck_idx=$((_fck_idx + 1))
+    done
+    rm -f "$_fck_in"
+  fi
+  # No jq, no python3: no JSON tool available. Emit nothing -- the caller
+  # (invariant writer) treats empty output as "no resolve signal this round,"
+  # which is the same fail-open posture as the rest of the invariant-feed.
+  return 0
 }
