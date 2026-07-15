@@ -1,0 +1,58 @@
+# .clagentic/loadout/config.yaml — clagentic-lite repo-local loadout config
+#
+# Initialized via /loadout-init (ad-hoc, no LORE task id — Archivist down at
+# time of authoring). Values below are elicited for THIS repo, not copied
+# from another deployment's config (loadout-init rule 1).
+#
+# One sectioned file, one top-level key per verb/feature.
+
+# ---------------------------------------------------------------------------
+# roles: -- which loadout verbs each ROLE may invoke. Role names are
+# vocabulary only (builder/reviewer/security/merger/lead), never an agent
+# identity.
+# ---------------------------------------------------------------------------
+roles:
+  builder:
+    - push
+  reviewer:
+    - git-host-api
+    - review-post
+    - stage-body
+  merger:
+    - merge
+    - push
+    - release-dispatch
+    - release-detect
+  lead:
+    - git-host-api
+
+# ---------------------------------------------------------------------------
+# merge: -- merge-gate declarations. Every key here is repo-tier policy.
+# ---------------------------------------------------------------------------
+merge:
+  merge_requirements:
+    # ci_pass: false -- clagentic-lite registers zero CI by design (see
+    # AGENTS.md "Build / test / run": gates run locally via git hooks; a
+    # hosted CI surface would contradict the no-server contract). Mirrors
+    # this repo's own .crew/naomi.yaml, which sets ci_pass: false for the
+    # same reason. Zero commit-status entries at HEAD is expected
+    # pass/no-signal, not red.
+    ci_pass: false
+    tests_pass: true
+
+  # required_reviewer_roles: this repo's crew session runs both PEACHES
+  # and BOBBIE on every PR -- both gate merges.
+  required_reviewer_roles:
+    - peaches
+    - bobbie
+
+  # authorized_roles: NAOMI is the sole merge authority; loadout-merge is
+  # the only entrypoint.
+  authorized_roles:
+    - merger
+
+  # pre_checks: none supplied beyond the reviewer-role gate above -- no
+  # additional pre-merge validation commands configured for this repo.
+
+  # post_merge_steps: none -- this project has no post-merge deployment
+  # steps.

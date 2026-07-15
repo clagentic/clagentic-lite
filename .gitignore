@@ -1,5 +1,12 @@
 # clagentic-lite local state
-.clagentic/
+# NOTE: .clagentic/* (not .clagentic/) so git still descends into the
+# directory to evaluate the loadout carve-out below -- a trailing-slash
+# .clagentic/ pattern excludes the directory from traversal entirely and
+# negation patterns for paths inside it are never evaluated.
+.clagentic/*
+# loadout enrollment config is tracked repo config, not local runtime state
+!.clagentic/loadout
+!.clagentic/loadout/config.yaml
 .env
 .env.local
 
