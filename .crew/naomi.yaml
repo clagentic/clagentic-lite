@@ -17,7 +17,7 @@
 #   - Change NAOMI's hard contract (AGENT.md governs that)
 #   - Override the namespace guard (clagentic/* only; andy/* refused)
 
-schema_version: 1
+schema_version: 2
 
 # -----------------------------------------------------------------------
 # merge_allowed
@@ -41,9 +41,16 @@ merge_allowed: true
 #   tests_pass: true (NAOMI requires a clean test run)
 #   ci_pass:    true (require green CI — set to false if you have no CI)
 #
+# lr-a218d8: clagentic-lite registers zero GitHub Actions workflows and
+# never has (AGENTS.md "Build / test / run" — "There is intentionally no
+# CI. The gates run on the user's machine via git hooks ... Re-running the
+# same gates in a hosted CI surface would contradict the no-server
+# contract"). Correctness is enforced locally by scripts/test_*.py, gated
+# by tests_pass below. ci_pass set to false per operator decision (Andy) —
+# there is no CI signal for NAOMI to require.
 merge_requirements:
   tests_pass: true
-  ci_pass: true
+  ci_pass: false
   # max_files_changed: 50   # Escalate if a PR touches more than N files
 
 # -----------------------------------------------------------------------
