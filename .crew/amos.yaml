@@ -3,12 +3,27 @@
 # repo's own scripts. Scope is open-within-this-repo (allow_all) MINUS the
 # audit/security plumbing he must never silently rewrite. The blocked_paths list
 # is the security boundary; widen it, never narrow it without reason.
+#
+# blocked_paths is precise, not a blanket glob: ".gitleaks.toml" protects the
+# tracked security-scanner config. The former ".clagentic/**" entry was
+# over-broad -- it swallowed .clagentic/loadout/config.yaml, tracked repo
+# config AMoS is meant to own, along with the actual audit/security state it
+# was written to protect. The runtime state files/dirs below are gitignored
+# (.gitignore: ".clagentic/") and stay explicitly blocked here anyway, as a
+# second layer against silent rewrite even though git itself won't commit
+# them; .clagentic/loadout/config.yaml is deliberately NOT listed, since it
+# is tracked config, not audit/security plumbing.
 schema_version: 1
 scope:
   allow_all: true
   blocked_paths:
     - ".gitleaks.toml"
-    - ".clagentic/**"
+    - ".clagentic/audit.db"
+    - ".clagentic/memory.db"
+    - ".clagentic/last-review.json"
+    - ".clagentic/adversarial-acks.json.example"
+    - ".clagentic/stop-summarize.lock"
+    - ".clagentic/lite/**"
 
 # Builder bot identity for commit re-authoring on the GitHub clagentic/* path (lr-66c2).
 # Standard per-repo commit-author pinning per lr-2422 (DONE 2026-06-17) — this is the
