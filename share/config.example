@@ -329,6 +329,13 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # "Invariant-feed writer" for the full resolve-signal mechanics.
 # CLAGENTIC_INVARIANT_FEED_MAX=200
 
+# Per-field length cap (chars) applied at the write boundary, before a
+# category/file/statement field is written to invariants.json (lr-cda4b9).
+# All three fields trace back to adversarial/review LLM finding text, so this
+# guards against a single planted finding ballooning invariants.json or the
+# prompt it is later re-injected into. Truncates rather than drops the entry.
+# CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS=500
+
 # ---------- chunked review ----------
 # Opt-in diff chunking for the review gate. When enabled (=1) and the diff
 # exceeds the threshold, the diff is split into chunks and reviewed per-chunk.

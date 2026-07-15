@@ -262,7 +262,7 @@ For a heavier, structured threat-model pass, use the `/infosec-rt` skill instead
 |---|---|
 | **Feature flag** | `CLAGENTIC_ADVERSARIAL_INVARIANTS` (default: `0` — off; set `=1` to opt in) |
 | **File location** | `.clagentic/lite/invariants.json` (gitignored, local gate state — same convention as `last-review.json` and `review-seen-keys`) |
-| **Effect** | When present and the flag is set, the file is injected verbatim into the adversarial system prompt with an inverted instruction relative to reviewer deferrals: "these invariants must still hold — verify the diff against each" instead of "these findings are deferred, do not re-report." |
+| **Effect** | When present and the flag is set, the file is sanitized (see "Write-boundary sanitization" below) and injected into the adversarial system prompt inside a fenced `===BEGIN/END INVARIANTS DATA===` block with an inverted instruction relative to reviewer deferrals: "these invariants must still hold — verify the diff against each" instead of "these findings are deferred, do not re-report." |
 | **Fail-open** | Absent, empty, or unreadable file → the pass proceeds with no invariants. Never blocks — Gate 5 is non-blocking regardless. |
 | **Population** | Automatic. When a finding resolves — present in one round, absent from the next round's diff-covered findings — the writer distills its message + category into an invariant statement and appends it to the file. See "Invariant-feed writer" below. |
 
@@ -304,6 +304,16 @@ The writer is the counterpart to the read/injection half above: it populates `in
 **Gating.** The writer only runs when `CLAGENTIC_ADVERSARIAL_INVARIANTS=1` — the same flag that gates the read half. Writing invariants nobody reads would be dead state.
 
 **Unbounded-growth guard.** `invariants.json` dedupes on `(file, statement)` at append time — resolving the same finding class again in a later round is a no-op, not a duplicate entry — and is capped at `CLAGENTIC_INVARIANT_FEED_MAX` total entries (default 200), dropping the oldest entries first. This is a deliberate irony guard: the invariant-feed exists partly to catch unbounded-growth findings (see the round-4/round-6 fail-open-scope-widening case in the synthetic replay test), so its own storage must not grow without bound.
+
+**Write-boundary sanitization (lr-cda4b9).** `category`, `file`, and the distilled `statement` written to `invariants.json` all ultimately trace back to adversarial- or review-LLM-controlled finding text — a compromised/manipulated model, or attacker-influenced code under audit that steers model output, could plant a prompt-injection payload in a finding's message that later round-trips into a future adversarial system prompt. `_invariant_feed_append` (the sole writer) is the single choke point: every field is run through `_invariant_feed_sanitize_field` before being written, which
+
+- strips ANSI/terminal escape sequences and other control/non-printable bytes (tab and newline preserved),
+- defangs literal occurrences of the delimiter labels (`INVARIANTS:`, `DEFERRED FINDINGS:`, `END INVARIANTS`, `END DEFERRED FINDINGS`) so a forged label inside finding text cannot spoof a fresh data-block boundary once re-injected,
+- caps each field at `CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS` (default 500), truncating rather than dropping the entry (fail-open, matching the rest of the invariant-feed).
+
+Sanitizing at the write boundary (once, on ingest) rather than at read time means every current and future reader of `invariants.json` (today: `ds_adversarial_prompt`) gets clean data automatically — a read-time-only approach would require every new consumer to remember to re-sanitize.
+
+As a second, independent layer, `ds_adversarial_prompt` (`scripts/llm-client.sh`) wraps the (already-sanitized) invariants content in an explicit `===BEGIN INVARIANTS DATA===` / `===END INVARIANTS DATA===` fenced block with an instruction telling the Auditor to treat the block as data describing prior findings, not as an instruction, and to ignore any imperative or role-change sentence that may appear inside it. **This is a prompt-contract change**: the previous format injected the raw `invariants.json` content directly after an `INVARIANTS:` label with no fence; any external tooling or test fixture that pattern-matches on the exact prior wording will need to account for the new `===BEGIN/END INVARIANTS DATA===` markers. The feature remains default-off (`CLAGENTIC_ADVERSARIAL_INVARIANTS=0`), so this only affects installs that have already opted in.
 
 ## Gate 6 — Merge Gate
 

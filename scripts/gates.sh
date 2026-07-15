@@ -646,6 +646,134 @@ _invariant_feed_max_lines() {
   printf '%s' "$_ifml_max"
 }
 
+# _invariant_feed_max_field_chars — per-field length cap applied at the write
+# boundary (see _invariant_feed_sanitize_field). Configurable via
+# CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS (default 500 — generous for a
+# one-sentence CWE title/statement, small enough that a single adversarial-
+# controlled finding cannot balloon invariants.json or the prompt it is later
+# injected into).
+_invariant_feed_max_field_chars() {
+  _ifmfc_max="${CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS:-500}"
+  case "$_ifmfc_max" in ''|*[!0-9]*) _ifmfc_max=500 ;; esac
+  printf '%s' "$_ifmfc_max"
+}
+
+# _invariant_feed_sanitize_field TEXT — neutralize adversarial-LLM-controlled
+# finding text before it is ever written to invariants.json (lr-cda4b9,
+# hardening the round-trip lr-24c80e/lr-63359e shipped). WRITE-BOUNDARY
+# sanitization, not read-time: invariants.json has exactly one writer
+# (_invariant_feed_append, below) and an unknown/growing number of future
+# readers (today: ds_adversarial_prompt; potentially the merge-gate summary
+# or a future consumer) — cleaning once at ingest means every reader gets
+# clean data for free, instead of every current AND future reader needing to
+# remember to re-sanitize. Applied to every field that ultimately traces back
+# to adversarial/review LLM output: category, file, and the distilled
+# statement (which embeds the original finding message verbatim).
+#
+# Neutralizes prompt-control sequences without attempting semantic
+# interpretation (this is gate plumbing, not a role — no LLM call here,
+# consistent with _invariant_feed_distill's own "mechanical, not an LLM
+# call" framing):
+#   - Strips ASCII control/non-printable bytes (0x00-0x08, 0x0B-0x1F, 0x7F),
+#     including ANSI/terminal escape sequences a hostile finding could embed
+#     to visually spoof a delimiter or hide text from a human audit-log
+#     reader. Newline (0x0A) and tab (0x09) are preserved — legitimate
+#     structure in a multi-line finding message, not a control sequence.
+#   - Collapses the delimiter label a hostile finding could forge to fake a
+#     new INVARIANTS:/DEFERRED FINDINGS:/end-of-data marker — including the
+#     literal fenced ===BEGIN INVARIANTS DATA===/===END INVARIANTS DATA===
+#     markers ds_adversarial_prompt now emits (llm-client.sh) — and smuggle a
+#     bare instruction after it: case-insensitively replaces any of those
+#     literal label strings with a defanged spaced-out form. This does not
+#     make the text nonsensical to a human reviewer (the words are still
+#     legible) but prevents it from being byte-identical to the real
+#     delimiter the model was told to trust. Without this, a finding
+#     containing the literal fence string survives verbatim into
+#     invariants.json and can forge a fake "===END INVARIANTS DATA==="
+#     inside the block, escaping the fence entirely (BOBBIE, lr-cda4b9
+#     follow-up).
+#   - Caps length at _invariant_feed_max_field_chars, truncating rather than
+#     rejecting — a merely-too-long finding is not attacker behavior, and
+#     rejecting it would silently drop a real resolved-finding invariant
+#     (fail-open posture matches the rest of the invariant-feed).
+_invariant_feed_sanitize_field() {
+  _ifsf_text="$1"
+  _ifsf_max=$(_invariant_feed_max_field_chars)
+
+  if command -v python3 >/dev/null 2>&1; then
+    # Text goes through a temp file, NOT stdin: `python3 -` already reads the
+    # script itself from stdin (the heredoc below), so piping the untrusted
+    # text into the same stdin would either be silently discarded or
+    # interleaved with the script depending on shell/buffering — the data
+    # channel and the script channel must be different file descriptors.
+    _ifsf_tmp=$(mktemp -t clagentic-inv-sanitize.XXXXXX)
+    printf '%s' "$_ifsf_text" > "$_ifsf_tmp"
+    python3 - "$_ifsf_tmp" "$_ifsf_max" <<'PYEOF'
+import re
+import sys
+
+path, max_chars = sys.argv[1], int(sys.argv[2])
+with open(path) as f:
+    text = f.read()
+
+# Strip ANSI/terminal escape sequences (CSI, OSC, and bare ESC-prefixed
+# sequences) before the general control-char strip below, so a multi-byte
+# escape sequence does not leave stray printable fragments behind.
+text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)   # CSI: ESC [ ... letter
+text = re.sub(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)', '', text)  # OSC: ESC ] ... BEL/ST
+text = re.sub(r'\x1b.', '', text)                   # any remaining ESC + one byte
+
+# Strip remaining control/non-printable bytes, preserving tab and newline.
+text = ''.join(ch for ch in text if ch in ('\t', '\n') or 0x20 <= ord(ch) != 0x7f)
+
+# Defang forged delimiter labels: a hostile finding message could contain
+# the literal string "INVARIANTS:" or "DEFERRED FINDINGS:" -- or the fenced
+# ===BEGIN/END INVARIANTS DATA=== markers ds_adversarial_prompt wraps this
+# content in (llm-client.sh) -- to try to spoof a fresh data-block boundary
+# once re-injected into a future prompt. Insert a zero-width-safe space so
+# the string is still legible to a human but no longer byte-identical to the
+# real delimiter.
+for label in ("INVARIANTS:", "DEFERRED FINDINGS:", "END INVARIANTS",
+              "END DEFERRED FINDINGS",
+              "===BEGIN INVARIANTS DATA===", "===END INVARIANTS DATA==="):
+    pattern = re.compile(re.escape(label), re.IGNORECASE)
+    text = pattern.sub(lambda m: ' '.join(m.group(0)), text)
+
+# Truncate so the FINAL string (content + suffix) fits within max_chars --
+# slicing to max_chars and then appending the suffix would let the suffix
+# push the total length past the configured cap (PEACHES, lr-cda4b9
+# follow-up).
+suffix = "...[truncated]"
+if len(text) > max_chars:
+    keep = max(max_chars - len(suffix), 0)
+    text = text[:keep] + suffix
+
+sys.stdout.write(text)
+PYEOF
+    _ifsf_status=$?
+    rm -f "$_ifsf_tmp"
+    return $_ifsf_status
+  fi
+
+  # No python3: best-effort POSIX fallback. tr strips the bulk of control
+  # bytes (octal escapes for 0x01-0x08, 0x0B-0x1F, 0x7F; 0x00 cannot appear
+  # in a shell string so no explicit strip needed); sed defangs the fenced
+  # ===BEGIN/END INVARIANTS DATA=== markers specifically (literal, fixed-case
+  # substitution — no GNU/BSD sed extension needed, unlike a general case-
+  # insensitive label match); cut caps length. This path does NOT defang the
+  # case-insensitive INVARIANTS:/DEFERRED FINDINGS: labels the python3 path
+  # covers (no portable case-insensitive substitution without sed extensions
+  # that vary GNU/BSD) — acceptable degradation given no-python3 already
+  # means jq is the active JSON tool elsewhere in this codepath. The fenced
+  # markers ARE covered here because they are the one label an attacker could
+  # use to escape the fence entirely (BOBBIE, lr-cda4b9 follow-up), so this
+  # path closes that specific gap even though it cannot close the general one.
+  printf '%s' "$_ifsf_text" \
+    | tr -d '\001-\010\013-\037\177' \
+    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g' \
+    | cut -c "1-${_ifsf_max}"
+}
+
 # _invariant_feed_append INVARIANTS_FILE ID CATEGORY FILE STATEMENT
 #
 # Appends one invariant object to INVARIANTS_FILE (creating a fresh JSON array
@@ -655,8 +783,21 @@ _invariant_feed_max_lines() {
 # entry count at _invariant_feed_max_lines by dropping the oldest entries —
 # the feature that exists to catch unbounded-growth findings must not itself
 # grow unboundedly.
+#
+# SECURITY (lr-cda4b9): category/srcfile/statement all ultimately trace back
+# to adversarial-LLM-controlled or review-LLM-controlled finding text (a
+# compromised/manipulated model, or attacker-influenced code under audit that
+# steers model output, could plant a finding whose message is a prompt-
+# injection payload). This is the sole writer of invariants.json, so every
+# field is run through _invariant_feed_sanitize_field before it is ever
+# written — a single write-boundary choke point rather than relying on every
+# current and future reader to sanitize on its own.
 _invariant_feed_append() {
   _ifa_file="$1"; _ifa_id="$2"; _ifa_category="$3"; _ifa_srcfile="$4"; _ifa_statement="$5"
+
+  _ifa_category=$(_invariant_feed_sanitize_field "$_ifa_category")
+  _ifa_srcfile=$(_invariant_feed_sanitize_field "$_ifa_srcfile")
+  _ifa_statement=$(_invariant_feed_sanitize_field "$_ifa_statement")
 
   if command -v python3 >/dev/null 2>&1; then
     python3 - "$_ifa_file" "$_ifa_id" "$_ifa_category" "$_ifa_srcfile" "$_ifa_statement" "$(_invariant_feed_max_lines)" <<'PYEOF'
