@@ -1,5 +1,20 @@
 """
-Acceptance replay for lr-24c80e: adversarial gate invariant-feed.
+Acceptance replay for lr-63359e: adversarial invariant-feed WRITER.
+
+Follow-up to lr-24c80e, which shipped the read/injection half only
+(ds_adversarial_prompt injecting .clagentic/lite/invariants.json into the
+adversarial prompt, gated by CLAGENTIC_ADVERSARIAL_INVARIANTS). That PR's
+version of this file hand-seeded invariants.json with a static INVARIANTS
+list at the top of every round -- there was no writer, so the read half could
+never be exercised end-to-end without an operator hand-authoring the file.
+
+This version removes ALL hand-seeding. invariants.json now starts absent and
+is populated ONLY by _invariant_feed_write (gates.sh), which fires when a
+finding present in one round's adversarial output is absent from the next
+round's output on changed lines -- the exact resolve signal is the content-hash
+key space _cross_round_dedup/dedup_findings already persist (review-merge.sh's
+finding_content_keys), applied to the adversarial modality via a dedicated
+adversarial-seen-keys file.
 
 Root problem (verdict ef-2026-07-15-deduploop): the adversarial gate
 (cmd_adversarial in gates.sh -> ds_adversarial_prompt in llm-client.sh) is
@@ -20,33 +35,45 @@ project/host names) modeling that failure mode as an abstract CWE trace:
   R6 -> CWE-798 (hardcoded key fallback) + CWE-770 recurring at a wider
        aggregation scope
 
-The two reintroductions under test:
-  (a) R4's diff re-violates the invariant established when R2 was fixed
-      (dedup key coarseness).
-  (b) R6's diff re-violates the invariant established when R4 was fixed
-      (unbounded-growth fail-open), but at a wider (fleet/aggregate) scope.
+The two reintroductions under test, both now driven by AUTO-WRITTEN invariants:
+  (a) R2's fresh CWE-697 finding ("dedup key too coarse") is resolved when R3
+      fixes it -- the writer sees it present in R2's adversarial output,
+      absent from R3's, and auto-writes the corresponding invariant. R4's
+      diff then re-violates that auto-written invariant (at item scope).
+  (b) R4's fresh CWE-770 finding ("item-scope fail-open") is resolved when R5
+      fixes it -- the writer auto-writes THAT invariant. R6's diff then
+      re-violates it at a wider (fleet/aggregate) scope.
+
+Zero manual invariants.json authoring anywhere in this test: the file is
+either absent (feed off) or written exclusively by gates.sh's real writer
+code path (feed on).
 
 We do not have a real LLM in the test harness, so we cannot literally ask a
 model to "notice" these. Instead we exercise the REAL prompt-construction and
-REAL gate-invocation code paths (ds_adversarial_prompt, cmd_adversarial) with a
-stub CLI standing in for the LLM. The stub's canned behavior is a deterministic
-proxy for "the model was shown the invariant text and correctly matched it
-against the diff": it only reports a reintroduction finding for round N when
-the exact invariant statement text for the violated round appears somewhere in
-its stdin (prompt + diff). This proves the invariant text actually reaches the
-model call in the code path that matters, without requiring a live model in CI.
+REAL gate-invocation code paths (ds_adversarial_prompt, cmd_adversarial,
+_invariant_feed_write) with a stub CLI standing in for the LLM. The stub's
+canned behavior is a deterministic proxy for "the model was shown the
+invariant text and correctly matched it against the diff": it only reports a
+reintroduction finding for round N when the resolved finding's ORIGINAL TITLE
+TEXT (the same text the writer distilled into the invariant statement) appears
+somewhere in its stdin (prompt + diff). This proves the auto-written
+invariant text actually reaches the model call in the code path that matters,
+without requiring a live model in CI.
 
 Assertions:
-  - feed ON: round 4 output flags a re-violation of the round-2 invariant,
-    AND round 6 output flags a re-violation of the round-4 invariant at wider
-    scope, BEFORE those changes would ship (i.e. the adversarial pass would
-    have surfaced them). No unrelated/false-violation flooding: rounds 1, 2,
-    3, 5 must not spuriously claim a reintroduction they don't contain, and
-    the flagged rounds must not claim MORE reintroductions than the two real
-    ones.
+  - feed ON: round 4 output flags a re-violation of the auto-written round-2
+    invariant, AND round 6 output flags a re-violation of the auto-written
+    round-4 invariant at wider scope, BEFORE those changes would ship (i.e.
+    the adversarial pass would have surfaced them). No unrelated/false-
+    violation flooding: rounds 1, 2, 3, 5 must not spuriously claim a
+    reintroduction they don't contain, and the flagged rounds must not claim
+    MORE reintroductions than the two real ones.
   - feed OFF: rounds 4 and 6 do NOT flag the reintroductions (demonstrating
-    the regression this feature closes -- the stub has no invariant text to
+    the regression this feature closes -- with the feed off, the writer never
+    runs, invariants.json never exists, and the stub has no invariant text to
     match against, mirroring the context-free status quo).
+  - invariants.json is inspected directly after the feed-ON replay to confirm
+    the writer, not the test, put the two expected entries there.
 
 Run with: python3 -m unittest scripts.test_adversarial_invariant_feed -v
 """
@@ -60,47 +87,15 @@ import unittest
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-# One invariant statement per resolved round, matching the schema documented
-# in docs/GATES.md / share/config.example. Statements are generic — no
-# external project or host names, per the operator correction on lr-24c80e.
-INVARIANTS = [
-    {
-        "id": "inv-r2",
-        "category": "correctness",
-        "file": "app/dedup.py",
-        "statement": "The dedup key must be granular enough that two distinct "
-                      "input items never collapse onto the same key (CWE-697 "
-                      "dedup-key-too-coarse class).",
-    },
-    {
-        "id": "inv-r3",
-        "category": "correctness",
-        "file": "app/dedup.py",
-        "statement": "Key normalization must not lossily collide distinct "
-                      "inputs onto the same normalized form (CWE-354 class).",
-    },
-    {
-        "id": "inv-r4",
-        "category": "security",
-        "file": "app/dedup.py",
-        "statement": "The fail-open sentinel path must bound the number of "
-                      "rows it can affect; it must never fail open across an "
-                      "unbounded or wider-than-originally-scoped set of items "
-                      "(CWE-770 uncontrolled-resource-consumption class).",
-    },
-    {
-        "id": "inv-r5",
-        "category": "security",
-        "file": "app/dedup.py",
-        "statement": "Any hash of a sensitive value used in the dedup key must "
-                      "be salted; an unsalted hash is brute-forceable "
-                      "(CWE-759 class).",
-    },
-]
-
-
-def _invariant_text():
-    return json.dumps(INVARIANTS)
+# The exact title text the fake claude CLI emits for the CWE-697 and CWE-770
+# fresh findings (see _FAKE_CLAUDE_SCRIPT below). These are the ONLY strings
+# this test hand-authors related to invariants -- they are markers the STUB
+# uses to recognize its own prior output; the actual invariants.json content
+# is produced exclusively by gates.sh's _invariant_feed_write, distilled from
+# these same title strings via [FINDING] markdown headers the stub emits.
+# No invariant statement, id, or JSON is hand-seeded anywhere in this test.
+_CWE_697_TITLE = "dedup key too coarse"
+_CWE_770_ITEM_SCOPE_TITLE = "item-scope fail-open"
 
 
 # ------------------------------------------------------------ fixture snapshots
@@ -240,42 +235,60 @@ DIFF_TEXT=$(cat)
 ADDED=$(printf '%s\n' "$DIFF_TEXT" | grep -E '^\+' | grep -vF '+++ ')
 
 emit() {
-    printf '[FINDING] %s | app/dedup.py:1 | severity: high | title: %s\n\n%s\n\n' "$1" "$2" "$3"
+    # Args: CWE LINE TITLE BODY. LINE matters: distinct findings in the same
+    # round must cite distinct file:line pairs, because the invariant-feed's
+    # resolve signal keys on a content-hash of the diff context window AROUND
+    # file:line (finding_content_keys / dedup_findings content-hash strategy,
+    # review-merge.sh) -- two findings that both cite the same file:line hash
+    # to the SAME key and collide, even though they are different findings.
+    # A real Auditor cites the specific line the vulnerable code is on; this
+    # fake mirrors that by using the actual line number of the bug comment in
+    # each round's snapshot, rather than a constant placeholder line.
+    printf '[FINDING] %s | app/dedup.py:%s | severity: high | title: %s\n\n%s\n\n' "$1" "$2" "$3" "$4"
 }
 
 # Fresh-this-round CWE markers: content-derived from ADDED diff lines only.
 # Every round's diff literally names the CWE it introduces in a `+` line,
 # standing in for what a competent adversarial pass would derive from the
-# code alone.
-case "$ADDED" in *"NEW BUG (CWE-807)"*) emit "CWE-807" "trusts client flag" "fresh finding" ;; esac
-case "$ADDED" in *"NEW BUG (CWE-697)"*) emit "CWE-697" "dedup key too coarse" "fresh finding" ;; esac
-case "$ADDED" in *"NEW BUG (CWE-354)"*) emit "CWE-354" "lossy normalization collision" "fresh finding" ;; esac
-case "$ADDED" in *"NEW BUG: fail-open sentinel collapses"*) emit "CWE-770" "item-scope fail-open" "fresh finding" ;; esac
-case "$ADDED" in *"NEW BUG (CWE-759)"*) emit "CWE-759" "unsalted hash" "fresh finding" ;; esac
-case "$ADDED" in *"NEW BUG (CWE-798)"*) emit "CWE-798" "hardcoded fallback salt" "fresh finding" ;; esac
-case "$ADDED" in *"NEW BUG: fail-open now spans the ENTIRE batch"*) emit "CWE-770" "fleet-wide fail-open" "fresh finding" ;; esac
+# code alone. Line numbers match the actual snapshot line the bug comment
+# sits on (see SNAPSHOT_R1..R6 in this file).
+case "$ADDED" in *"NEW BUG (CWE-807)"*) emit "CWE-807" 2 "trusts client flag" "fresh finding" ;; esac
+case "$ADDED" in *"NEW BUG (CWE-697)"*) emit "CWE-697" 3 "dedup key too coarse" "fresh finding" ;; esac
+case "$ADDED" in *"NEW BUG (CWE-354)"*) emit "CWE-354" 3 "lossy normalization collision" "fresh finding" ;; esac
+case "$ADDED" in *"NEW BUG: fail-open sentinel collapses"*) emit "CWE-770" 5 "item-scope fail-open" "fresh finding" ;; esac
+case "$ADDED" in *"NEW BUG (CWE-759)"*) emit "CWE-759" 8 "unsalted hash" "fresh finding" ;; esac
+case "$ADDED" in *"NEW BUG (CWE-798)"*) emit "CWE-798" 8 "hardcoded fallback salt" "fresh finding" ;; esac
+case "$ADDED" in *"NEW BUG: fail-open now spans the ENTIRE batch"*) emit "CWE-770" 15 "fleet-wide fail-open" "fresh finding" ;; esac
 
-# Invariant-feed reintroduction checks -- ONLY fire if (a) the invariant's own
-# statement text (injected into argv by ds_adversarial_prompt) is present,
-# AND (b) the diff's ADDED lines (not the whole combined text) contain the
-# marker for that specific reintroduction. (a) proves the invariant text
-# from invariants.json actually reaches the model-call input; (b) proves the
-# reintroduction is really being added this round, not just referenced in
-# text a prior round removed.
+# Invariant-feed reintroduction checks -- ONLY fire if (a) the AUTO-WRITTEN
+# invariant's distilled text (injected into argv by ds_adversarial_prompt,
+# written by _invariant_feed_write from THIS SAME stub's own prior-round
+# [FINDING] title output -- never hand-seeded by the test) is present, AND
+# (b) the diff's ADDED lines (not the whole combined text) contain the marker
+# for that specific reintroduction. (a) proves the auto-written invariant
+# text actually reaches the model-call input; (b) proves the reintroduction
+# is really being added this round, not just referenced in text a prior round
+# removed. The matched substring is the ORIGINAL FINDING TITLE TEXT
+# (_invariant_feed_distill in gates.sh embeds the resolved finding's message
+# verbatim inside a fixed "must not recur" framing), not a hand-authored
+# invariant statement. Line 1 (the function signature) is used for
+# reintroduction findings -- distinct from the fresh-finding's own line in
+# the same round's diff, since a reintroduction is reported against the
+# function's overall contract, not the specific new line that broke it.
 case "$ARGV_STR" in
-  *"never collapse onto the same key"*)
+  *"dedup key too coarse"*)
     case "$ADDED" in
       *"collapses ALL items of this type back onto one coarse key"*)
-        emit "CWE-697" "REINTRODUCES inv-r2: dedup key too coarse (item scope)" "reintroduction finding"
+        emit "CWE-697" 1 "REINTRODUCES inv-r2: dedup key too coarse (item scope)" "reintroduction finding"
         ;;
     esac
     ;;
 esac
 case "$ARGV_STR" in
-  *"must never fail open across an unbounded or wider-than-originally-scoped set"*)
+  *"item-scope fail-open"*)
     case "$ADDED" in
       *"fail-open now spans the ENTIRE batch"*)
-        emit "CWE-770" "REINTRODUCES inv-r4: unbounded fail-open (wider fleet-aggregate scope)" "reintroduction finding"
+        emit "CWE-770" 1 "REINTRODUCES inv-r4: unbounded fail-open (wider fleet-aggregate scope)" "reintroduction finding"
         ;;
     esac
     ;;
@@ -365,20 +378,19 @@ def _run_adversarial_round(snapshot_text, fake_tool_home, bin_dir, project_root,
     the previously committed snapshot -- not a cumulative diff across all
     rounds seen so far. After running the gate, the round is committed so the
     next round's staged diff is clean.
+
+    invariants.json is NOT touched here -- unlike the lr-24c80e version of
+    this harness, there is no hand-seeding. When invariants_on, the real
+    _invariant_feed_write (gates.sh) is the only thing that ever creates or
+    appends to the file, across the whole 6-round sequence. When not
+    invariants_on, CLAGENTIC_ADVERSARIAL_INVARIANTS=0 means both the read
+    half (ds_adversarial_prompt) and the write half (_invariant_feed_write)
+    are inert, so the file is never created at all.
     """
     target = os.path.join(project_root, "app", "dedup.py")
     with open(target, "w") as f:
         f.write(snapshot_text)
     subprocess.run(["git", "add", "app/dedup.py"], check=True, cwd=project_root)
-
-    invariants_dir = os.path.join(project_root, ".clagentic", "lite")
-    os.makedirs(invariants_dir, exist_ok=True)
-    invariants_path = os.path.join(invariants_dir, "invariants.json")
-    if invariants_on:
-        with open(invariants_path, "w") as f:
-            f.write(_invariant_text())
-    elif os.path.exists(invariants_path):
-        os.remove(invariants_path)
 
     fake_gates = os.path.join(fake_tool_home, "scripts", "gates.sh")
     env = os.environ.copy()
@@ -405,7 +417,8 @@ def _run_adversarial_round(snapshot_text, fake_tool_home, bin_dir, project_root,
 
 
 class TestAdversarialInvariantFeedReplay(unittest.TestCase):
-    """Acceptance test for lr-24c80e: replay the 6-round synthetic CWE trace."""
+    """Acceptance test for lr-63359e: replay the 6-round synthetic CWE trace
+    with invariants.json populated EXCLUSIVELY by the writer, never hand-seeded."""
 
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp(prefix="clagentic-test-invfeed-")
@@ -422,6 +435,19 @@ class TestAdversarialInvariantFeedReplay(unittest.TestCase):
     def tearDown(self):
         import shutil
         shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _invariants_path(self):
+        return os.path.join(self._project, ".clagentic", "lite", "invariants.json")
+
+    def _read_invariants(self):
+        path = self._invariants_path()
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            content = f.read()
+        if not content.strip():
+            return []
+        return json.loads(content)
 
     def _run_all_rounds(self, invariants_on):
         outputs = {}
@@ -473,10 +499,44 @@ class TestAdversarialInvariantFeedReplay(unittest.TestCase):
             "round 6 must report exactly one reintroduction, not more",
         )
 
+        # Direct inspection of invariants.json: the WRITER, not this test,
+        # must have put these entries there. Confirms end-to-end population --
+        # round 2's resolved finding (fixed in round 3) produced the entry
+        # that round 4 re-violates, and round 4's resolved finding (fixed in
+        # round 5) produced the entry round 6 re-violates.
+        invariants = self._read_invariants()
+        self.assertTrue(
+            invariants,
+            "invariants.json must be non-empty after the feed-ON replay -- "
+            "the writer must have populated it as findings resolved",
+        )
+        statements = [inv.get("statement", "") for inv in invariants]
+        self.assertTrue(
+            any(_CWE_697_TITLE in s for s in statements),
+            f"invariants.json must contain an auto-written entry distilled "
+            f"from the round-2 CWE-697 finding ('{_CWE_697_TITLE}'); "
+            f"got: {invariants!r}",
+        )
+        self.assertTrue(
+            any(_CWE_770_ITEM_SCOPE_TITLE in s for s in statements),
+            f"invariants.json must contain an auto-written entry distilled "
+            f"from the round-4 CWE-770 finding ('{_CWE_770_ITEM_SCOPE_TITLE}'); "
+            f"got: {invariants!r}",
+        )
+        # Every entry must carry the required schema fields (docs/GATES.md /
+        # share/config.example) -- id + statement required, category/file
+        # populated since the writer always has them for these findings.
+        for inv in invariants:
+            self.assertIn("id", inv)
+            self.assertIn("statement", inv)
+            self.assertTrue(inv["id"], "id must be non-empty")
+            self.assertTrue(inv["statement"], "statement must be non-empty")
+
     def test_feed_off_lets_reintroductions_pass(self):
         """Demonstrates the regression this feature closes: with the feed
-        off, the adversarial pass has no memory of prior invariants and the
-        two reintroductions ship undetected."""
+        off, the writer never runs, invariants.json is never created, and
+        the adversarial pass has no memory of prior findings -- the two
+        reintroductions ship undetected."""
         outputs = self._run_all_rounds(invariants_on=False)
 
         self.assertNotIn(
@@ -488,6 +548,11 @@ class TestAdversarialInvariantFeedReplay(unittest.TestCase):
             "REINTRODUCES", outputs[6],
             "feed OFF: round 6's reintroduction must NOT be caught "
             "(demonstrates the closed regression)",
+        )
+        self.assertFalse(
+            os.path.exists(self._invariants_path()),
+            "feed OFF: invariants.json must never be created -- the writer "
+            "is gated identically to the read half (CLAGENTIC_ADVERSARIAL_INVARIANTS)",
         )
 
     def test_feed_on_still_reports_fresh_findings_each_round(self):

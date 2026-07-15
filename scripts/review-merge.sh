@@ -1,12 +1,14 @@
 #!/bin/sh
 # clagentic-lite :: review-merge helper
 #
-# Sourced (not executed) by gates.sh. Provides three pure POSIX-sh functions
-# for diff chunking and per-chunk envelope merging:
+# Sourced (not executed) by gates.sh. Provides four pure POSIX-sh functions
+# for diff chunking, per-chunk envelope merging, and cross-round key tracking:
 #
 #   split_diff   DIFF_FILE CHUNK_DIR CHUNK_BYTES
 #   merge_envelopes ENVELOPE_DIR DEDUP_KEY_STRATEGY
 #   dedup_findings  KEY_STRATEGY SEEN_FILE [DIFF_FILE]  (reads stdin, writes stdout)
+#   finding_content_keys DIFF_FILE  (reads stdin JSON findings array, writes stdout
+#                                    TSV: key<TAB>file<TAB>category<TAB>message)
 #
 # Dependencies:
 #   Required: git, awk, sed (via platform.sh shims), wc
@@ -552,6 +554,20 @@ _dedup_findings_jq() {
       _dfj_file=$(printf '%s' "$_dfj_finding" | jq -r '.file // ""' 2>/dev/null)
       _dfj_line=$(printf '%s' "$_dfj_finding" | jq -r '.line // 0' 2>/dev/null)
       # Extract the window from the diff file using awk.
+      #
+      # PORTABILITY FIX (lr-63359e): the hunk-header line-number parse below
+      # used to read `match($0, /\+([0-9]+)/, arr)` -- the 3-arg match() form
+      # with a capture-array is a gawk extension, not POSIX awk. On mawk
+      # (the Debian/Ubuntu `awk` alternative default), this errors at runtime,
+      # so `_dfj_context` was always empty and every content-hash key silently
+      # fell back to the location key -- the content-hash strategy has never
+      # actually worked on a mawk host. Discovered while building the
+      # invariant-feed writer (lr-63359e), which needs `dedup_findings`
+      # content-hash keys and the new finding_content_keys() (this file) to
+      # agree on the SAME key for the SAME finding -- they must draw from one
+      # key space for the writer's resolve signal to be meaningful. The
+      # replacement below is plain POSIX awk (split()-free even: field access
+      # + sub()), portable across gawk/mawk/BSD awk.
       _dfj_context=$(awk -v fname="$_dfj_file" -v target="$_dfj_line" '
         /^\+\+\+ / {
           cur_file = substr($0, 5)
@@ -560,9 +576,11 @@ _dedup_findings_jq() {
           diff_line = 0
         }
         /^@@ / {
-          # Parse hunk header: @@ -a,b +c,d @@
-          match($0, /\+([0-9]+)/, arr)
-          diff_line = arr[1] + 0 - 1
+          # Field 3 of "@@ -a,b +c,d @@" is "+c,d" (or "+c" with no comma).
+          plus = $3
+          sub(/^\+/, "", plus)
+          sub(/,.*/, "", plus)
+          diff_line = plus + 0 - 1
         }
         /^\+/ && cur_file == fname {
           diff_line++
@@ -826,4 +844,173 @@ except Exception:
 print(json.dumps(deduped))
 PYEOF
   return $?
+}
+
+# ------------------------------------------------------------ finding_content_keys --
+#
+# finding_content_keys DIFF_FILE
+#
+# stdin:  JSON array of findings (reviewer schema: file/line/category/message,
+#         or the same shape produced by loose-parsing adversarial [FINDING]
+#         markdown headers)
+# stdout: one TSV row per finding that yields a non-empty content-hash key:
+#         key<TAB>file<TAB>category<TAB>message
+#         Findings whose key cannot be computed (no diff window, no sha256
+#         tool, missing file/line) are silently omitted — conservative in the
+#         other direction from dedup_findings: a key we cannot compute is a
+#         key we cannot use as an invariant-writer resolve signal, so it is
+#         dropped from THIS output only. It has no effect on dedup_findings'
+#         own conservative-retain behavior, which this function does not touch.
+#
+# Uses the IDENTICAL content-hash key algorithm as dedup_findings' content-hash
+# strategy (5-line +-context window around file:line in DIFF_FILE) so keys
+# computed here are directly comparable against keys already persisted in a
+# dedup_findings SEEN_FILE (e.g. review-seen-keys) -- this is the reuse point:
+# the invariant-writer resolve signal is "a key present in a prior seen-keys
+# snapshot but absent from this round's finding_content_keys output", not a
+# second, independently-derived notion of sameness.
+finding_content_keys() {
+  _fck_difffile="$1"
+
+  # Read stdin into a temp file up front, before dispatching to either JSON
+  # tool. This is REQUIRED, not a style choice: `python3 - ARGS <<'PYEOF'`
+  # feeds the heredoc itself as the interpreter's stdin, so a script that
+  # both reads piped findings AND uses `python3 - <<'PYEOF'` would have its
+  # findings silently replaced by the heredoc's own source text. Passing a
+  # filename argument instead of relying on inherited stdin sidesteps that
+  # clash entirely.
+  _fck_in=$(mktemp -t clagentic-fck-in.XXXXXX)
+  cat > "$_fck_in"
+
+  if command -v jq >/dev/null 2>&1; then
+    # jq path: reuse the same shell-loop-plus-awk-context-window technique
+    # dedup_findings' jq branch uses, restricted to key + metadata emission
+    # (no severity-wins merge logic needed here -- this is a read-only key
+    # derivation, not a dedup pass).
+    if ! jq -e '. | type == "array"' "$_fck_in" >/dev/null 2>&1; then
+      rm -f "$_fck_in"
+      return 0
+    fi
+    _fck_count=$(jq 'length' "$_fck_in" 2>/dev/null)
+    case "$_fck_count" in ''|*[!0-9]*) _fck_count=0 ;; esac
+    _fck_idx=0
+    while [ "$_fck_idx" -lt "$_fck_count" ]; do
+      _fck_finding=$(jq -c ".[$_fck_idx]" "$_fck_in" 2>/dev/null)
+      _fck_file=$(printf '%s' "$_fck_finding" | jq -r '.file // ""' 2>/dev/null)
+      _fck_line=$(printf '%s' "$_fck_finding" | jq -r '.line // 0' 2>/dev/null)
+      _fck_category=$(printf '%s' "$_fck_finding" | jq -r '.category // ""' 2>/dev/null)
+      _fck_message=$(printf '%s' "$_fck_finding" | jq -r '.message // ""' 2>/dev/null)
+      _fck_context=""
+      if [ -f "$_fck_difffile" ]; then
+        # POSIX-portable hunk-header line-number parse: the 3-arg match($0, re,
+        # arr) form used elsewhere in this file (dedup_findings' jq branch) is
+        # a gawk extension unavailable on mawk (this project's portability
+        # baseline targets GNU/BSD awk per docs/PORTABILITY.md, but mawk is the
+        # Debian/Ubuntu default `awk` alternative and a real deployment target).
+        # split()+substr() on the "@@ -a,b +c,d @@" line is plain POSIX awk.
+        _fck_context=$(awk -v fname="$_fck_file" -v target="$_fck_line" '
+          /^\+\+\+ / {
+            cur_file = substr($0, 5)
+            sub(/^b\//, "", cur_file)
+            diff_line = 0
+          }
+          /^@@ / {
+            # Field 3 of "@@ -a,b +c,d @@" is "+c,d" (or "+c" with no comma).
+            plus = $3
+            sub(/^\+/, "", plus)
+            sub(/,.*/, "", plus)
+            diff_line = plus + 0 - 1
+          }
+          /^\+/ && cur_file == fname {
+            diff_line++
+            if (diff_line >= target - 2 && diff_line <= target + 2) {
+              print
+            }
+          }
+        ' "$_fck_difffile" 2>/dev/null)
+      fi
+      if [ -n "$_fck_context" ]; then
+        _fck_key=$(printf '%s' "$_fck_context" | _rm_sha256)
+        if [ -n "$_fck_key" ]; then
+          _fck_clean_file=$(printf '%s' "$_fck_file" | tr '\t\n\r' '   ')
+          _fck_clean_cat=$(printf '%s' "$_fck_category" | tr '\t\n\r' '   ')
+          _fck_clean_msg=$(printf '%s' "$_fck_message" | tr '\t\n\r' '   ')
+          printf '%s\t%s\t%s\t%s\n' "$_fck_key" "$_fck_clean_file" "$_fck_clean_cat" "$_fck_clean_msg"
+        fi
+      fi
+      _fck_idx=$((_fck_idx + 1))
+    done
+    rm -f "$_fck_in"
+    return 0
+  elif command -v python3 >/dev/null 2>&1; then
+    # python3 path: pass the findings file as an ARGV path, never as inherited
+    # stdin -- see the comment above _fck_in for why.
+    python3 - "$_fck_in" "$_fck_difffile" <<'PYEOF'
+import json, sys, hashlib, os
+
+findings_file = sys.argv[1]
+diff_file = sys.argv[2] if len(sys.argv) > 2 else ""
+
+def find_context_window(diff_file, fname, target_line):
+    result = []
+    cur_file = ""
+    diff_line = 0
+    try:
+        with open(diff_file) as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if line.startswith("+++ "):
+                    cur_file = line[4:]
+                    if cur_file.startswith("b/"):
+                        cur_file = cur_file[2:]
+                    diff_line = 0
+                elif line.startswith("@@ "):
+                    import re
+                    m = re.search(r'\+(\d+)', line)
+                    diff_line = int(m.group(1)) - 1 if m else 0
+                elif line.startswith("+") and cur_file == fname:
+                    diff_line += 1
+                    if abs(diff_line - target_line) <= 2:
+                        result.append(line)
+    except Exception:
+        pass
+    return result
+
+try:
+    with open(findings_file) as f:
+        findings = json.load(f)
+    if not isinstance(findings, list):
+        findings = []
+except Exception:
+    findings = []
+
+have_diff = bool(diff_file) and os.path.isfile(diff_file)
+
+for f in findings:
+    try:
+        fname = f.get("file", "") or ""
+        line = int(f.get("line", 0) or 0)
+        category = f.get("category", "") or ""
+        message = f.get("message", "") or ""
+        key = ""
+        if have_diff:
+            ctx = find_context_window(diff_file, fname, line)
+            if ctx:
+                key = hashlib.sha256("\n".join(ctx).encode()).hexdigest()
+        if key:
+            # Tabs/newlines cannot appear in a TSV field; strip defensively.
+            def clean(s):
+                return str(s).replace("\t", " ").replace("\n", " ").replace("\r", " ")
+            print("{}\t{}\t{}\t{}".format(clean(key), clean(fname), clean(category), clean(message)))
+    except Exception:
+        continue
+PYEOF
+    rm -f "$_fck_in"
+    return 0
+  fi
+  # No jq, no python3: no JSON tool available. Emit nothing -- the caller
+  # (invariant writer) treats empty output as "no resolve signal this round,"
+  # which is the same fail-open posture as the rest of the invariant-feed.
+  rm -f "$_fck_in"
+  return 0
 }

@@ -619,6 +619,255 @@ PYEOF
   rm -f "$_crd_raw_findings" "$_crd_deduped_findings"
 }
 
+# _extract_findings_json FILE — print FILE's .findings array (or "[]" on any
+# failure). jq-then-python3 fallback, matching the pattern used throughout
+# this file (e.g. _cross_round_dedup's own findings extraction) rather than
+# introducing a third way to read the same shape.
+_extract_findings_json() {
+  _efj_file="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -c '.findings // []' "$_efj_file" 2>/dev/null || printf '[]'
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("findings",[])))' \
+      "$_efj_file" 2>/dev/null || printf '[]'
+  else
+    printf '[]'
+  fi
+}
+
+# _invariant_feed_max_lines — line cap on invariants.json entries. Guards
+# against unbounded growth: the invariant-feed exists to CATCH unbounded-growth
+# findings, so its own storage must not be the thing that grows without bound.
+# Configurable via CLAGENTIC_INVARIANT_FEED_MAX (default 200 — generous for a
+# single branch's review lifetime; oldest entries are dropped first on cap).
+_invariant_feed_max_lines() {
+  _ifml_max="${CLAGENTIC_INVARIANT_FEED_MAX:-200}"
+  case "$_ifml_max" in ''|*[!0-9]*) _ifml_max=200 ;; esac
+  printf '%s' "$_ifml_max"
+}
+
+# _invariant_feed_append INVARIANTS_FILE ID CATEGORY FILE STATEMENT
+#
+# Appends one invariant object to INVARIANTS_FILE (creating a fresh JSON array
+# if the file is absent/empty/unparseable — same fail-open posture as the
+# rest of the invariant-feed). Dedupes on (file, statement): re-resolving the
+# same finding class in a later round does not grow the file. Caps the total
+# entry count at _invariant_feed_max_lines by dropping the oldest entries —
+# the feature that exists to catch unbounded-growth findings must not itself
+# grow unboundedly.
+_invariant_feed_append() {
+  _ifa_file="$1"; _ifa_id="$2"; _ifa_category="$3"; _ifa_srcfile="$4"; _ifa_statement="$5"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$_ifa_file" "$_ifa_id" "$_ifa_category" "$_ifa_srcfile" "$_ifa_statement" "$(_invariant_feed_max_lines)" <<'PYEOF'
+import json, sys
+
+path, new_id, category, srcfile, statement, max_n = sys.argv[1:7]
+max_n = int(max_n)
+
+try:
+    with open(path) as f:
+        invariants = json.load(f)
+    if not isinstance(invariants, list):
+        invariants = []
+except Exception:
+    invariants = []
+
+# Dedupe on (file, statement) — the same resolved-finding class re-appearing
+# in a later round (e.g. resolved again after a partial regression) must not
+# duplicate the entry.
+for existing in invariants:
+    if existing.get("file") == srcfile and existing.get("statement") == statement:
+        sys.exit(0)  # already present — no-op, no growth
+
+invariants.append({
+    "id": new_id,
+    "category": category,
+    "file": srcfile,
+    "statement": statement,
+})
+
+# Cap: drop oldest entries first (list is append-ordered).
+if len(invariants) > max_n:
+    invariants = invariants[-max_n:]
+
+with open(path, "w") as f:
+    json.dump(invariants, f, indent=2)
+    f.write("\n")
+PYEOF
+    return $?
+  elif command -v jq >/dev/null 2>&1; then
+    _ifa_tmp=$(mktemp -t clagentic-inv-append.XXXXXX)
+    _ifa_current='[]'
+    if [ -f "$_ifa_file" ] && jq -e '. | type == "array"' "$_ifa_file" >/dev/null 2>&1; then
+      _ifa_current=$(cat "$_ifa_file")
+    fi
+    # Dedupe check via jq: does an entry with this (file, statement) already exist?
+    _ifa_dup=$(printf '%s' "$_ifa_current" | jq --arg f "$_ifa_srcfile" --arg s "$_ifa_statement" \
+      'any(.[]; .file == $f and .statement == $s)' 2>/dev/null)
+    if [ "$_ifa_dup" = "true" ]; then
+      return 0
+    fi
+    printf '%s' "$_ifa_current" | jq --arg id "$_ifa_id" --arg cat "$_ifa_category" \
+      --arg f "$_ifa_srcfile" --arg s "$_ifa_statement" --argjson max "$(_invariant_feed_max_lines)" \
+      '. + [{"id": $id, "category": $cat, "file": $f, "statement": $s}] | if length > $max then .[-$max:] else . end' \
+      > "$_ifa_tmp" 2>/dev/null
+    if [ -s "$_ifa_tmp" ]; then
+      mv "$_ifa_tmp" "$_ifa_file"
+    else
+      rm -f "$_ifa_tmp"
+      return 1
+    fi
+    return 0
+  fi
+  # No JSON tool — cannot safely append (writing raw text risks corrupting
+  # the JSON array). Fail silently; the invariant-feed remains empty/stale,
+  # which is the same fail-open posture as ds_adversarial_prompt reading it.
+  return 0
+}
+
+# _key_lookup_line FILE KEY — print the first TSV line in FILE whose first
+# field exactly equals KEY, or nothing if no such line exists.
+#
+# Exact-match via awk field comparison, NOT grep with the key interpolated
+# into a pattern: KEY is a content-hash (normally a sha256 hex digest, but
+# review-merge.sh's sha256 shim falls back to an IDENTITY function — the raw
+# content itself — when neither sha256sum nor shasum is on PATH). An
+# identity-fallback "key" can contain BRE metacharacters (., *, ^, $, [, \),
+# which would corrupt a `grep "^${key}..."` pattern match (BOBBIE finding,
+# lr-63359e review). awk -F'\t' with a literal string comparison ($1 == k)
+# never treats KEY as a pattern, so this is correct regardless of key
+# strategy or content. Match-correctness fix only — the identity-fallback
+# path has no untrusted-input execution surface, just an incorrect match.
+_key_lookup_line() {
+  _kll_file="$1"
+  _kll_key="$2"
+  [ -f "$_kll_file" ] || return 0
+  awk -F'\t' -v k="$_kll_key" '$1 == k { print; exit }' "$_kll_file" 2>/dev/null
+}
+
+# _invariant_feed_write ROLE FINDINGS_JSON DIFF_FILE PRIOR_SEEN_SNAPSHOT SEEN_FILE
+#
+# Writer half of the adversarial invariant-feed (lr-63359e, follow-up to
+# lr-24c80e's read/injection half). Detects "a finding present in a prior
+# round is absent this round on changed lines" using the SAME content-hash
+# key space _cross_round_dedup/dedup_findings already persists — this is the
+# resolve signal, not a new one: PRIOR_SEEN_SNAPSHOT is a copy of SEEN_FILE
+# taken BEFORE this round's dedup_findings call added this round's keys to
+# it, so (PRIOR_SEEN_SNAPSHOT - this round's live finding keys) is exactly
+# "keys the prior round(s) saw that this round's findings no longer contain."
+#
+# This does NOT alter _cross_round_dedup's suppression behavior — it is a
+# read-only comparison run after dedup completes, against a separate snapshot
+# file, and the invariants.json file it writes is never consulted by dedup_findings.
+#
+# ROLE: "review" (structured JSON findings, clean distill) or "adversarial"
+# (findings already normalized to the same {file,line,category,message} shape
+# by the caller via loose [FINDING]-header parsing — see cmd_adversarial).
+#
+# Gated the same as the read half: only runs when CLAGENTIC_ADVERSARIAL_INVARIANTS=1.
+# Writing invariants nobody reads (feed off) would be dead state; keeping the
+# gate identical for read and write keeps the feature's on/off behavior
+# consistent end-to-end, per the task's "keep gating consistent" constraint.
+_invariant_feed_write() {
+  _ifw_role="$1"
+  _ifw_findings_json="$2"
+  _ifw_diff="$3"
+  _ifw_prior_seen="$4"
+  _ifw_seen_file="$5"
+
+  [ "${CLAGENTIC_ADVERSARIAL_INVARIANTS:-0}" = "1" ] || return 0
+  [ -f "$_ifw_prior_seen" ] || return 0  # first round ever — nothing to resolve against
+
+  _ifw_invariants_file="$REPO_ROOT/.clagentic/lite/invariants.json"
+  mkdir -p "$REPO_ROOT/.clagentic/lite"
+
+  # This round's live finding keys (with metadata), via the shared key
+  # derivation in review-merge.sh — identical algorithm to what SEEN_FILE
+  # already contains, so the two sets are directly comparable.
+  _ifw_live_keys=$(mktemp -t clagentic-inv-live.XXXXXX)
+  printf '%s' "$_ifw_findings_json" | finding_content_keys "$_ifw_diff" > "$_ifw_live_keys" 2>/dev/null
+
+  # Resolved keys: present in the prior snapshot, absent from this round's
+  # live keys. Conservative: a key with no metadata line this round (i.e. not
+  # in _ifw_live_keys at all) is the resolve candidate; we do not guess why
+  # it disappeared (fixed vs. diff not touching that file this round) beyond
+  # what the existing content-hash semantics already encode (a key persists
+  # only while the 5-line context window it hashed remains unchanged).
+  _ifw_resolved_count=0
+  while IFS= read -r _ifw_prior_key; do
+    [ -z "$_ifw_prior_key" ] && continue
+    if [ -z "$(_key_lookup_line "$_ifw_live_keys" "$_ifw_prior_key")" ]; then
+      # This key is gone from the live set. We don't have its metadata (the
+      # prior seen-keys file is key-only by design, matching dedup_findings'
+      # SEEN_FILE format) unless it also appears in the metadata side-cache
+      # written by a prior _invariant_feed_write call — see below.
+      _ifw_meta_file="${_ifw_seen_file}.meta"
+      if [ -f "$_ifw_meta_file" ]; then
+        _ifw_meta_line=$(_key_lookup_line "$_ifw_meta_file" "$_ifw_prior_key")
+        if [ -n "$_ifw_meta_line" ]; then
+          _ifw_meta_srcfile=$(printf '%s' "$_ifw_meta_line" | cut -f2)
+          _ifw_meta_category=$(printf '%s' "$_ifw_meta_line" | cut -f3)
+          _ifw_meta_message=$(printf '%s' "$_ifw_meta_line" | cut -f4)
+          _ifw_new_id="inv-${_ifw_role}-$(printf '%s' "$_ifw_prior_key" | cut -c1-12)"
+          _ifw_statement=$(_invariant_feed_distill "$_ifw_meta_category" "$_ifw_meta_message")
+          if _invariant_feed_append "$_ifw_invariants_file" "$_ifw_new_id" "$_ifw_meta_category" "$_ifw_meta_srcfile" "$_ifw_statement"; then
+            _ifw_resolved_count=$((_ifw_resolved_count + 1))
+          fi
+        fi
+      fi
+    fi
+  done < "$_ifw_prior_seen"
+
+  if [ "$_ifw_resolved_count" -gt 0 ]; then
+    printf '[invariant-feed] wrote %d resolved-finding invariant(s) to %s\n' \
+      "$_ifw_resolved_count" "$_ifw_invariants_file" 1>&2
+    ds_audit_log "invariant-feed-write" "pass" "role:${_ifw_role} resolved:${_ifw_resolved_count}"
+  fi
+
+  # Update the metadata side-cache with THIS round's live keys, so a finding
+  # resolved in the round AFTER NEXT can still be distilled. The side-cache
+  # is metadata for the SAME key space dedup_findings maintains (SEEN_FILE) —
+  # not an independent tracker: every key in it also exists (or existed) in
+  # SEEN_FILE, and it carries no suppression/dedup semantics of its own.
+  _ifw_meta_file="${_ifw_seen_file}.meta"
+  if [ -s "$_ifw_live_keys" ]; then
+    cat "$_ifw_live_keys" >> "$_ifw_meta_file"
+    # Keep the side-cache from growing unboundedly too: dedupe by key,
+    # keeping the most recent metadata line for each key.
+    if command -v awk >/dev/null 2>&1; then
+      _ifw_meta_dedup=$(mktemp -t clagentic-inv-meta.XXXXXX)
+      awk -F'\t' '{ line[$1] = $0 } END { for (k in line) print line[k] }' "$_ifw_meta_file" > "$_ifw_meta_dedup" 2>/dev/null
+      if [ -s "$_ifw_meta_dedup" ]; then
+        mv "$_ifw_meta_dedup" "$_ifw_meta_file"
+      else
+        rm -f "$_ifw_meta_dedup"
+      fi
+    fi
+  fi
+
+  rm -f "$_ifw_live_keys"
+  return 0
+}
+
+# _invariant_feed_distill CATEGORY MESSAGE — turn a resolved finding's
+# category+message into a forward-looking invariant statement. Deliberately
+# mechanical (no LLM call in the writer path — the writer is gate plumbing,
+# not a role): prefix the original message with a standing "must still hold"
+# framing so ds_adversarial_prompt's existing instruction text (which already
+# tells the Auditor how to use invariant statements) does the interpretive work.
+_invariant_feed_distill() {
+  _ifd_category="$1"
+  _ifd_message="$2"
+  if [ -n "$_ifd_category" ]; then
+    printf 'Resolved %s finding must not recur, including at a wider scope: %s' \
+      "$_ifd_category" "$_ifd_message"
+  else
+    printf 'Resolved finding must not recur, including at a wider scope: %s' \
+      "$_ifd_message"
+  fi
+}
+
 cmd_review() {
   # Parse flags; all args consumed by the subcommand dispatcher.
   REVIEW_SINCE_LAST=0
@@ -726,7 +975,17 @@ cmd_review() {
         # Initialize seen-keys file on first run so dedup_findings never sees
         # a missing file (created empty; appended to by dedup_findings).
         [ -f "$_crv_seen_file" ] || touch "$_crv_seen_file"
+        # Invariant-feed writer (lr-63359e): snapshot seen-keys BEFORE this
+        # round's dedup call adds this round's keys, so the writer can diff
+        # "keys the prior round(s) saw" against "keys still live this round."
+        _crv_prior_seen_snap=$(mktemp -t clagentic-inv-prior.XXXXXX)
+        cp "$_crv_seen_file" "$_crv_prior_seen_snap" 2>/dev/null || : > "$_crv_prior_seen_snap"
         _cross_round_dedup "$OUT" "$_crv_diff_tmp" "$_crv_seen_file"
+        if [ "${CLAGENTIC_ADVERSARIAL_INVARIANTS:-0}" = "1" ]; then
+          _crv_live_findings=$(_extract_findings_json "$OUT")
+          _invariant_feed_write review "$_crv_live_findings" "$_crv_diff_tmp" "$_crv_prior_seen_snap" "$_crv_seen_file"
+        fi
+        rm -f "$_crv_prior_seen_snap"
       fi
 
       # Aggregate audit row for the merged result.
@@ -790,7 +1049,17 @@ cmd_review() {
     # Initialize seen-keys file on first run so dedup_findings never sees
     # a missing file (created empty; appended to by dedup_findings).
     [ -f "$_crv_seen_file" ] || touch "$_crv_seen_file"
+    # Invariant-feed writer (lr-63359e): snapshot seen-keys BEFORE this
+    # round's dedup call adds this round's keys — see the chunked-path
+    # comment above for the full rationale (same logic, single-pass path).
+    _crv_prior_seen_snap=$(mktemp -t clagentic-inv-prior.XXXXXX)
+    cp "$_crv_seen_file" "$_crv_prior_seen_snap" 2>/dev/null || : > "$_crv_prior_seen_snap"
     _cross_round_dedup "$OUT" "$_crv_diff_tmp" "$_crv_seen_file"
+    if [ "${CLAGENTIC_ADVERSARIAL_INVARIANTS:-0}" = "1" ]; then
+      _crv_live_findings=$(_extract_findings_json "$OUT")
+      _invariant_feed_write review "$_crv_live_findings" "$_crv_diff_tmp" "$_crv_prior_seen_snap" "$_crv_seen_file"
+    fi
+    rm -f "$_crv_prior_seen_snap"
   fi
   rm -f "$_crv_diff_tmp"
 
@@ -908,9 +1177,72 @@ review_is_degraded() {
   fi
 }
 
+# _parse_adversarial_findings MARKDOWN_FILE
+#
+# Loose-parses [FINDING] header lines from adversarial markdown output into
+# the same {file,line,category,message} JSON shape review findings use, so
+# they can be run through the EXISTING finding_content_keys / dedup_findings
+# machinery unmodified. Header format (ds_adversarial_prompt, llm-client.sh):
+#   [FINDING] CWE-XXX | file.ext:line | severity: <level> | title: <phrase>
+# "category" is set to the CWE id (e.g. "CWE-770") — adversarial findings
+# have no review-style category, and the CWE id IS the class identity that
+# matters for invariant re-derivation. "message" is the title field. A
+# missing/malformed line number degrades to line 0 (finding_content_keys then
+# fails to compute a context window and the finding is simply omitted from
+# the key set — same conservative-drop behavior documented there).
+_parse_adversarial_findings() {
+  _paf_file="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$_paf_file" <<'PYEOF'
+import json, re, sys
+
+path = sys.argv[1]
+findings = []
+header_re = re.compile(
+    r'^\[FINDING\]\s*([^|]+)\|\s*([^|]+)\|\s*severity:\s*([^|]+)\|\s*title:\s*(.+)$'
+)
+try:
+    with open(path) as f:
+        lines = f.readlines()
+except Exception:
+    lines = []
+
+for line in lines:
+    line = line.rstrip("\n")
+    m = header_re.match(line.strip())
+    if not m:
+        continue
+    cwe = m.group(1).strip()
+    fileline = m.group(2).strip()
+    severity = m.group(3).strip().lower()
+    title = m.group(4).strip()
+    if ":" in fileline:
+        fname, _, lineno = fileline.rpartition(":")
+        try:
+            lineno = int(lineno)
+        except ValueError:
+            fname, lineno = fileline, 0
+    else:
+        fname, lineno = fileline, 0
+    findings.append({
+        "file": fname,
+        "line": lineno,
+        "category": cwe,
+        "message": title,
+        "severity": severity,
+    })
+print(json.dumps(findings))
+PYEOF
+  else
+    printf '[]'
+  fi
+}
+
 cmd_adversarial() {
   OUT="$REPO_ROOT/.clagentic/lite/last-adversarial.md"
-  get_review_diff | "$TOOL_HOME/scripts/llm-client.sh" adversarial > "$OUT"
+  _adv_diff_tmp=$(mktemp -t clagentic-adv-diff.XXXXXX)
+  get_review_diff > "$_adv_diff_tmp"
+  "$TOOL_HOME/scripts/llm-client.sh" adversarial < "$_adv_diff_tmp" > "$OUT"
   # Prepend a SHA stamp comment as the first line so build_gate_summary can
   # detect stale payloads. Best-effort: skip if git unavailable or SHA empty.
   _adv_sha=$(_git rev-parse HEAD 2>/dev/null || echo "")
@@ -920,6 +1252,32 @@ cmd_adversarial() {
     cat "$OUT" >> "$_adv_tmp"
     mv "$_adv_tmp" "$OUT"
   fi
+
+  # Invariant-feed writer (lr-63359e), adversarial half. Loose-parses
+  # [FINDING] headers into the same shape the writer already knows how to
+  # key, then reuses dedup_findings' content-hash key derivation via a
+  # dedicated seen-keys file for the adversarial modality (adversarial does
+  # not otherwise participate in cross-round dedup — CLAGENTIC_CROSS_ROUND_DEDUP
+  # only wires into cmd_review — so this is the first time an adversarial
+  # round's findings are content-hash-keyed at all, not a second dedup layer
+  # competing with an existing one).
+  if [ "${CLAGENTIC_ADVERSARIAL_INVARIANTS:-0}" = "1" ]; then
+    _adv_seen_file="$REPO_ROOT/.clagentic/lite/adversarial-seen-keys"
+    [ -f "$_adv_seen_file" ] || touch "$_adv_seen_file"
+    _adv_prior_seen_snap=$(mktemp -t clagentic-inv-adv-prior.XXXXXX)
+    cp "$_adv_seen_file" "$_adv_prior_seen_snap" 2>/dev/null || : > "$_adv_prior_seen_snap"
+
+    _adv_findings_json=$(_parse_adversarial_findings "$OUT")
+    # dedup_findings' return value is unused here — we only want it to
+    # persist this round's keys into _adv_seen_file (same side effect
+    # _cross_round_dedup relies on for the review path); the deduped
+    # markdown stdout is never re-derived from JSON, so we discard it.
+    printf '%s' "$_adv_findings_json" | dedup_findings "content-hash" "$_adv_seen_file" "$_adv_diff_tmp" >/dev/null 2>&1 || true
+    _invariant_feed_write adversarial "$_adv_findings_json" "$_adv_diff_tmp" "$_adv_prior_seen_snap" "$_adv_seen_file"
+    rm -f "$_adv_prior_seen_snap"
+  fi
+  rm -f "$_adv_diff_tmp"
+
   cmd_log_run adversarial warn "wrote $OUT (non-blocking)"
   cat "$OUT"
 }

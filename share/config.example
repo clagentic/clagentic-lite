@@ -319,9 +319,15 @@ CLAGENTIC_DEFAULT_BRANCH=main
 #   }
 # ]
 #
-# Population is manual/operator-maintained for now — there is no automatic
-# writer. When a finding resolves, distill its message+category into an
-# invariant line and append it to the file.
+# Population is automatic (lr-63359e). When a finding resolves -- present in
+# one round's findings, absent from the next round's on the same content-hash
+# key the review/adversarial cross-round dedup machinery already tracks --
+# the writer distills its message+category into an invariant line and appends
+# it to the file. Dedupes on (file, statement) at append time and caps total
+# entries at CLAGENTIC_INVARIANT_FEED_MAX (default 200, oldest dropped first)
+# so the feed's own storage cannot grow unboundedly. See docs/GATES.md
+# "Invariant-feed writer" for the full resolve-signal mechanics.
+# CLAGENTIC_INVARIANT_FEED_MAX=200
 
 # ---------- chunked review ----------
 # Opt-in diff chunking for the review gate. When enabled (=1) and the diff
