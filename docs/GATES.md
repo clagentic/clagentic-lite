@@ -256,6 +256,38 @@ This is a "prose-primary with structured header" format: the header makes the ou
 
 For a heavier, structured threat-model pass, use the `/infosec-rt` skill instead — multi-persona chained attack scenarios with hardening priority list.
 
+### Invariant-feed (opt-in) — forward-invariant memory across rounds
+
+| | |
+|---|---|
+| **Feature flag** | `CLAGENTIC_ADVERSARIAL_INVARIANTS` (default: `0` — off; set `=1` to opt in) |
+| **File location** | `.clagentic/lite/invariants.json` (gitignored, local gate state — same convention as `last-review.json` and `review-seen-keys`) |
+| **Effect** | When present and the flag is set, the file is injected verbatim into the adversarial system prompt with an inverted instruction relative to reviewer deferrals: "these invariants must still hold — verify the diff against each" instead of "these findings are deferred, do not re-report." |
+| **Fail-open** | Absent, empty, or unreadable file → the pass proceeds with no invariants. Never blocks — Gate 5 is non-blocking regardless. |
+| **Population** | Manual/operator-maintained. When a finding resolves, distill its message + category into an invariant statement and append it to the file. |
+
+**Why this exists:** the adversarial gate is context-free by construction — each round re-derives threats from scratch off the diff alone, with no memory of what a prior round already found and fixed. Cross-round dedup (`CLAGENTIC_CROSS_ROUND_DEDUP`, above) is *suppression* memory: it hushes a finding already reported. The invariant-feed is the opposite polarity — *assertion* memory: it actively re-checks the diff against previously-resolved issues, including reintroduction at a wider scope than where the issue was originally fixed (e.g. a fail-open sentinel fixed at item scope recurring at fleet scope two rounds later). The two mechanisms are independent and can be used together.
+
+**Schema (JSON array):**
+
+```json
+[
+  {
+    "id": "inv-001",
+    "category": "security",
+    "file": "scripts/example.sh",
+    "statement": "Dedup-key derivation must not trust client-settable input."
+  }
+]
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `id` | yes | Stable identifier for the invariant |
+| `category` | no | Finding category this invariant applies to |
+| `file` | no | Exact path or path glob this invariant applies to |
+| `statement` | yes | The property that must still hold, stated as a check the Auditor can verify against the diff |
+
 ## Gate 6 — Merge Gate
 
 | | |

@@ -287,6 +287,42 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # Set =0 to opt out and see all findings on every round.
 # CLAGENTIC_CROSS_ROUND_DEDUP=1
 
+# ---------- adversarial invariant-feed ----------
+# File: .clagentic/lite/invariants.json in the enrolled repo (gitignored —
+# already under .clagentic/lite/, same convention as last-review.json,
+# review-seen-keys, and audit.db).
+#
+# When present AND CLAGENTIC_ADVERSARIAL_INVARIANTS=1, the file is injected
+# verbatim into the adversarial (Auditor) system prompt before the diff is
+# analyzed, with an instruction to verify the diff against each invariant —
+# the inverse of the reviewer deferrals injection above ("must still hold and
+# be re-checked" instead of "already reviewed, do not re-report"). This gives
+# the adversarial pass forward-invariant memory across rounds: findings
+# resolved in an earlier round become invariants the Auditor actively checks
+# for reintroduction, including at a wider scope than where they were
+# originally fixed.
+#
+# Opt-in default: off (0). Set =1 to enable.
+# CLAGENTIC_ADVERSARIAL_INVARIANTS=0
+#
+# Fail-open: if the file is absent, empty, or unreadable, the adversarial
+# pass proceeds as if no invariants exist. The gate never blocks on a missing
+# invariants file — the adversarial pass is non-blocking by design regardless.
+#
+# Schema (JSON array):
+# [
+#   {
+#     "id": "inv-001",                    # stable identifier (required)
+#     "category": "security",             # finding category (optional)
+#     "file": "scripts/example.sh",       # exact path or path glob (optional)
+#     "statement": "..."                  # the invariant to verify (required)
+#   }
+# ]
+#
+# Population is manual/operator-maintained for now — there is no automatic
+# writer. When a finding resolves, distill its message+category into an
+# invariant line and append it to the file.
+
 # ---------- chunked review ----------
 # Opt-in diff chunking for the review gate. When enabled (=1) and the diff
 # exceeds the threshold, the diff is split into chunks and reviewed per-chunk.

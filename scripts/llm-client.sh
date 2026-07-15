@@ -210,6 +210,48 @@ EOF
 }
 
 ds_adversarial_prompt() {
+  # Load resolved-finding invariants from .clagentic/lite/invariants.json in the
+  # enrolled repo. Fail-open: if the file is absent or unparseable, the pass
+  # continues without invariants. Mirrors ds_review_prompt's deferrals
+  # injection (above) with an inverted instruction: deferrals tell the
+  # Reviewer to stop reporting a finding; invariants tell the Auditor to
+  # actively re-check the diff against each previously-resolved issue.
+  #
+  # Gated by CLAGENTIC_ADVERSARIAL_INVARIANTS=1 (default-off, consistent with
+  # other opt-in gate behaviors such as REVIEW_SINCE_LAST and
+  # CLAGENTIC_CROSS_ROUND_DEDUP). Off by default so existing installs see no
+  # behavior change until the operator opts in.
+  _dap_invariants=""
+  if [ "${CLAGENTIC_ADVERSARIAL_INVARIANTS:-0}" = "1" ]; then
+    _dap_ifile="$REPO_ROOT/.clagentic/lite/invariants.json"
+    if [ -f "$_dap_ifile" ]; then
+      _dap_invariants=$(cat "$_dap_ifile" 2>/dev/null) || _dap_invariants=""
+      # Validate that the content is non-empty after read; a read error yields "".
+      # We do not parse/validate the JSON here — the LLM receives it verbatim.
+    fi
+  fi
+
+  if [ -n "$_dap_invariants" ]; then
+    # Write invariants to a temp file so arbitrary JSON (including single-quotes)
+    # is never interpolated into a shell string — the file is cat'd directly.
+    _dap_tmp=$(mktemp -t clagentic-invariants-prompt.XXXXXX)
+    printf '%s' "$_dap_invariants" > "$_dap_tmp"
+    printf '%s\n\n' "The following invariants were established by resolving findings in
+prior rounds of review or adversarial analysis on this branch. These
+invariants MUST STILL HOLD. Verify the current diff against each one:
+if the diff reintroduces a violation of an invariant below — including
+at a wider scope than where it was originally fixed — report it as a
+finding using the normal [FINDING] format. Do not re-derive these as new
+discoveries; treat each as a known regression class to check for
+specifically. If an invariant clearly does not apply to this diff (the
+surface it covers was not touched), do not report anything for it.
+
+INVARIANTS:"
+    cat "$_dap_tmp"
+    printf '\n\n'
+    rm -f "$_dap_tmp"
+  fi
+
   cat <<'EOF'
 You are the clagentic-lite Auditor in adversarial mode. Read the staged
 diff on stdin. Argue, concretely, how a hostile user could exploit each
