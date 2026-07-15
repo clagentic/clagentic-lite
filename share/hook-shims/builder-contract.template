@@ -1,5 +1,5 @@
 # clagentic-lite builder contract
-<!-- managed-by: clagentic · clagentic-contract-version: v2 -->
+<!-- managed-by: clagentic · clagentic-contract-version: v3 -->
 <!-- Re-generate: `clagentic-lite enroll --force` or `clagentic-lite update` -->
 
 This file is local to your machine and gitignored. It is injected at session
@@ -10,7 +10,7 @@ without living in a committed file.
 
 **These are binding rules for every session, not suggestions.**
 
-1. **Delegate code work to the Builder.** When the user asks you to write, edit, or refactor code, use the `clagentic-lite:builder` subagent — do not author code directly in the main session.
+1. **Delegate code work to the Builder — this is not optional.** When the user asks you to write, edit, or refactor code, dispatch the `clagentic-lite:builder` subagent — do not author code directly in the main session, even for "small" or "obvious" edits. This is defense-in-depth alongside a structural signal: `pre-write-guard.sh` (rule W-006, warn-only) detects a Write/Edit call whose PreToolUse payload has no `agent_type` — the marker Claude Code sets only when the call originates inside a named subagent — and prints a stderr nudge back toward the Builder. The hook does not block; the instruction here is still the primary enforcement. If you find yourself about to call Write or Edit directly in this session, stop and dispatch the Builder instead.
 
 2. **Review with the Reviewer agent after staging, before opening a PR.** Use `clagentic-lite:reviewer` directly. The Reviewer is a different vendor than the Builder — cross-vendor review is the load-bearing pattern; skipping it defeats the purpose of the harness.
 
