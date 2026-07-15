@@ -726,6 +726,26 @@ PYEOF
   return 0
 }
 
+# _key_lookup_line FILE KEY — print the first TSV line in FILE whose first
+# field exactly equals KEY, or nothing if no such line exists.
+#
+# Exact-match via awk field comparison, NOT grep with the key interpolated
+# into a pattern: KEY is a content-hash (normally a sha256 hex digest, but
+# review-merge.sh's sha256 shim falls back to an IDENTITY function — the raw
+# content itself — when neither sha256sum nor shasum is on PATH). An
+# identity-fallback "key" can contain BRE metacharacters (., *, ^, $, [, \),
+# which would corrupt a `grep "^${key}..."` pattern match (BOBBIE finding,
+# lr-63359e review). awk -F'\t' with a literal string comparison ($1 == k)
+# never treats KEY as a pattern, so this is correct regardless of key
+# strategy or content. Match-correctness fix only — the identity-fallback
+# path has no untrusted-input execution surface, just an incorrect match.
+_key_lookup_line() {
+  _kll_file="$1"
+  _kll_key="$2"
+  [ -f "$_kll_file" ] || return 0
+  awk -F'\t' -v k="$_kll_key" '$1 == k { print; exit }' "$_kll_file" 2>/dev/null
+}
+
 # _invariant_feed_write ROLE FINDINGS_JSON DIFF_FILE PRIOR_SEEN_SNAPSHOT SEEN_FILE
 #
 # Writer half of the adversarial invariant-feed (lr-63359e, follow-up to
@@ -774,18 +794,17 @@ _invariant_feed_write() {
   # it disappeared (fixed vs. diff not touching that file this round) beyond
   # what the existing content-hash semantics already encode (a key persists
   # only while the 5-line context window it hashed remains unchanged).
-  _ifw_tab=$(printf '\t')
   _ifw_resolved_count=0
   while IFS= read -r _ifw_prior_key; do
     [ -z "$_ifw_prior_key" ] && continue
-    if ! grep -q "^${_ifw_prior_key}${_ifw_tab}" "$_ifw_live_keys" 2>/dev/null; then
+    if [ -z "$(_key_lookup_line "$_ifw_live_keys" "$_ifw_prior_key")" ]; then
       # This key is gone from the live set. We don't have its metadata (the
       # prior seen-keys file is key-only by design, matching dedup_findings'
       # SEEN_FILE format) unless it also appears in the metadata side-cache
       # written by a prior _invariant_feed_write call — see below.
       _ifw_meta_file="${_ifw_seen_file}.meta"
       if [ -f "$_ifw_meta_file" ]; then
-        _ifw_meta_line=$(grep "^${_ifw_prior_key}${_ifw_tab}" "$_ifw_meta_file" 2>/dev/null | head -1)
+        _ifw_meta_line=$(_key_lookup_line "$_ifw_meta_file" "$_ifw_prior_key")
         if [ -n "$_ifw_meta_line" ]; then
           _ifw_meta_srcfile=$(printf '%s' "$_ifw_meta_line" | cut -f2)
           _ifw_meta_category=$(printf '%s' "$_ifw_meta_line" | cut -f3)
