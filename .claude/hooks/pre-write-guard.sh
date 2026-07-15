@@ -33,6 +33,20 @@ INPUT=$(cat 2>/dev/null || true)
 JF_EXIT=0
 RAW_PATH=$(printf '%s' "$INPUT" | ds_json_field file_path) || JF_EXIT=$?
 
+# W-006 signal capture (warn-only, non-blocking): Claude Code populates
+# agent_type in the PreToolUse payload only when the tool call fires inside a
+# named subagent (verified precedent: lr-2a51, Claude Code docs
+# https://code.claude.com/docs/en/hooks). Its ABSENCE is the verified signal
+# that this Write/Edit was authored by the main/orchestrator loop rather than
+# a dispatched subagent — we do not hardcode a specific builder agent_type
+# string here because the exact value the `clagentic-lite:builder` subagent
+# emits (namespaced vs bare) has not been empirically confirmed; keying on
+# absence is the only signal confirmed safe to use. A JSON-parse failure on
+# this best-effort read must NOT escalate to a W-006 warning or affect the
+# fail-closed JF_EXIT handling below — AGENT_TYPE simply stays empty and W-006
+# treats that the same as "absent".
+AGENT_TYPE=$(printf '%s' "$INPUT" | ds_json_field agent_type 2>/dev/null || true)
+
 # Fail closed on ANY non-zero ds_json_field exit. See pre-bash-guard.sh.
 if [ "$JF_EXIT" -ne 0 ]; then
   case "$JF_EXIT" in
@@ -153,5 +167,21 @@ case "$PATH_TARGET" in
   */.claude/hooks/*.sh) warn_cache ;;
   */.claude/*mcp*|*/.claude/*MCP*) warn_cache ;;
 esac
+
+# W-006 (warn-only, non-blocking, AGGRESSIVE): the orchestrator (main Claude
+# Code loop) is authoring code directly instead of delegating to the
+# clagentic-lite:builder subagent. Detected by the ABSENCE of agent_type in
+# the PreToolUse payload — see the AGENT_TYPE capture above for why absence,
+# not a specific subagent string, is the signal. Decision (Andy, 2026-07-15):
+# warn-only, no hard-block, exit 0 always. Subagent calls (agent_type present)
+# pass through untouched — no message, no audit row.
+warn_delegate() {
+  printf '[clagentic-lite/pre-write-guard] WARN W-006: this Write/Edit was authored by the orchestrator, not a subagent — DELEGATE to the clagentic-lite:builder subagent for code changes. The orchestrator should not author code directly; use the Builder role so cross-vendor review and the gate chain apply as designed.\n  path: %s\n' "$PATH_TARGET" 1>&2
+  ds_audit_log write-guard warn "W-006: orchestrator authored write (no agent_type): $PATH_TARGET"
+}
+
+if [ -z "$AGENT_TYPE" ]; then
+  warn_delegate
+fi
 
 exit 0

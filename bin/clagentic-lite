@@ -81,7 +81,7 @@ CLAUDE_MD_VERSION="v9"
 CLAUDE_NOTICE_VERSION="v2"
 # Local .clagentic/lite/builder-contract.md — full builder rules, never committed.
 # Bump on any content change; cheap restamp (gitignored).
-CLAUDE_CONTRACT_VERSION="v2"
+CLAUDE_CONTRACT_VERSION="v3"
 # Local wrapper CLAUDE.md — rich local dashboard, never committed.
 # Bump on any template change; cheap restamp (local).
 CLAUDE_WRAPPER_VERSION="v2"
