@@ -7,6 +7,11 @@
 # loadout enrollment config is tracked repo config, not local runtime state
 !.clagentic/loadout
 !.clagentic/loadout/config.yaml
+
+# adversarial-acks.json is committed, audited suppression (docs/GATES.md
+# "adversarial-acks.json" section) -- it must be un-ignored the same way the
+# loadout config above is, or it can never be committed to the repo.
+!.clagentic/adversarial-acks.json
 .env
 .env.local
 
