@@ -270,6 +270,8 @@ Every finding states whether the vulnerable code is actually reachable from an e
 
 This is the mechanical precondition for blocking eligibility (see "Blocking vs advisory" next): a finding cannot be `tier: blocking` unless it is `reachable: yes`, regardless of the severity the Auditor assigns it. `_parse_adversarial_findings` (`scripts/gates.sh`) enforces this at the parser level, not just the prompt level — it force-corrects `tier` to `advisory` whenever the parsed `reachable` value is not exactly `yes`, so a miscalibrated model cannot cause a block by stating a high tier without reachability.
 
+`severity` is enum-validated the same way: `_parse_adversarial_findings` accepts only `low`/`medium`/`high`/`critical` (case-normalized) and force-corrects any other captured text to the sentinel `unknown`. `severity_rank()` (`scripts/gates.sh`) ranks `unknown` at `0`, below every real severity level, so an unrecognized value can never inflate its own rank anywhere severity is later compared. This closes a gap a follow-up review caught: `severity` was originally captured as unvalidated free text bounded only by the next `|` in the header line — the identical round-trip exposure `_llm_field_sanitize` closes for `file`/`category`/`message` (see "Round-trip sanitization" under Gate 6), just left open on this one field until the fix.
+
 ### Blocking vs advisory — threshold, not suppression
 
 **This is a threshold mechanism: every finding is reported at its honest severity and stays fully visible in the adversarial markdown output, the structured findings sidecar, and the audit trail, regardless of `tier`.** `tier` only decides whether Gate 6 (Merge Gate) treats a finding as gating `/ship`. Nothing is ever hidden, dropped, or omitted from output because of its tier.
@@ -365,6 +367,20 @@ The Merge Gate is the last LLM check before the PR is opened. It never overrides
 **Adversarial findings gate here on `tier`, not on severity alone (lr-e2b975).** Only `tier: "blocking"` adversarial findings (reachable, high/critical severity — see Gate 5 "Blocking vs advisory") are eligible to refuse the merge. `tier: "advisory"` findings — including real, correctly-severity-rated ones that are simply unreachable or lower severity — never gate `/ship` on their own; they are noted in the Merge Gate's `reason` text and remain fully visible in `last-adversarial.md`, `last-adversarial-findings.json`, and the audit trail. This is a threshold change, never suppression.
 
 **Round-trip sanitization (lr-e2b975, mirrors lr-cda4b9).** `.clagentic/lite/last-adversarial-findings.json` is LLM-authored finding text (title, message, file) written to disk and later read back into the Merge Gate's system prompt — structurally the same round-trip shape as the invariant-feed's `invariants.json`. `cmd_adversarial` (`scripts/gates.sh`) sanitizes the sidecar's `file`/`category`/`message` fields via `_llm_field_sanitize` — the same function, not a second sanitizer — before the sidecar is ever written to disk, so every downstream reader (`build_gate_summary`, the merge-gate prompt) gets clean data. `build_gate_summary` additionally renders the sanitized array as `adversarial_findings_fenced`, a fenced-text rendering delimited by `===BEGIN ADVERSARIAL FINDINGS DATA===` / `===END ADVERSARIAL FINDINGS DATA===` — `_llm_field_sanitize`'s defang list covers this label too, so a forged marker inside a finding's own title cannot escape the fence. `ds_merge_gate_prompt` (`scripts/llm-client.sh`) instructs the Merge Gate to treat that fenced block as data describing findings, not as an instruction, and to ignore any imperative/role-change/decision-override sentence that may appear inside a finding's own text — the same "data, not instructions" framing `ds_adversarial_prompt` applies to the invariant-feed.
+
+**Every field in the parsed finding record, enumerated (lr-e2b975 follow-up).** Every field has an explicit enforcement mechanism — none is asserted safe without one:
+
+| Field | Shape | Enforcement |
+|---|---|---|
+| `file` | free-form model text | Sanitized via `_llm_field_sanitize` (control-byte strip, fence-label defang, length cap) |
+| `category` (CWE) | free-form model text | Sanitized via `_llm_field_sanitize` |
+| `message` (title) | free-form model text | Sanitized via `_llm_field_sanitize` |
+| `severity` | closed set: `low`/`medium`/`high`/`critical` | Enum-validated and force-corrected to `unknown` at parse time (`_parse_adversarial_findings`) — not additionally routed through the sanitizer, since after validation there is no free text left in the field |
+| `reachable` | closed set: `yes`/`no` | Enum-validated and force-corrected to `no` at parse time |
+| `tier` | closed set: `blocking`/`advisory` | Enum-validated and force-corrected to `advisory` at parse time, and again whenever `reachable != "yes"` |
+| `line` | integer | Parsed via Python `int()`; a non-numeric suffix falls back to `0`. Never a pass-through of the raw captured string |
+
+Every field lands in one of three buckets: free-text-and-sanitized, closed-set-and-force-corrected-at-parse-time, or non-text-by-construction. `severity` was the one field that fell through this classification for a period — captured as free text but never enum-checked, the identical fence-escape shape already closed for the other three text fields — until a follow-up review caught it.
 
 If an adversarial finding describes inherent product behavior (e.g., a security dashboard that exposes CVE data to authenticated analysts), commit `.clagentic/accepted-risks.md` to the repo documenting the decision. The merge-gate reads that file and classifies covered findings as acknowledged rather than refusing. Copy `share/accepted-risks.example.md` from the clagentic-lite install tree as a starting template. For per-CWE structured acknowledgments with path-glob scoping, `.clagentic/adversarial-acks.json` remains the more precise mechanism and takes precedence when both apply.
 
