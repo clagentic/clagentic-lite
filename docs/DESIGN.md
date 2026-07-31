@@ -23,8 +23,8 @@ clagentic-lite is the smallest credible expression of that thesis. It is built t
 | 2 | **Safe Bash + writes** | `PreToolUse` (Bash, Write, Edit) | regex deny-list on dangerous commands; path-scope check; default-branch protection; hooks fail closed when no JSON validator (jq/python3) available | yes |
 | 3 | **Cross-CLI review** | `/review` slash command, optional pre-push | Builder's staged diff piped to Reviewer; schema-validated JSON findings | findings ≥ `BLOCK_SEVERITY` block `/ship`; degraded envelopes also block |
 | 4 | **Local security scan** | git `pre-commit` (secrets) and `pre-push` (deps, SAST) | gitleaks; osv-scanner; semgrep --error --severity=ERROR. Missing tool fails closed unless `CLAGENTIC_ALLOW_MISSING_*=1` | yes |
-| 5 | **Adversarial pass** | `/review --adversarial` | Auditor role plays attacker on the diff | no (commentary) |
-| 6 | **Merge Gate** | `/ship` | LLM reads every prior gate's structured output and returns `{decision, reason}` JSON | yes by default (`CLAGENTIC_MERGE_GATE_BLOCKING=1`) |
+| 5 | **Adversarial pass** | `/review --adversarial` | Auditor role plays attacker on the diff; each finding is tagged `reachable: yes/no` and `tier: blocking/advisory` | no on its own (commentary); `tier: blocking` findings are what Gate 6 can refuse on |
+| 6 | **Merge Gate** | `/ship` | LLM reads every prior gate's structured output and returns `{decision, reason}` JSON | yes by default (`CLAGENTIC_MERGE_GATE_BLOCKING=1`); only `tier: blocking` adversarial findings are refusal-eligible, `tier: advisory` findings are never gating |
 | 7 | **Session summarize** | `Stop` | async, debounced: Summarizer reads transcript → one-line summary → SQLite | no (best-effort) |
 
 ## The five roles

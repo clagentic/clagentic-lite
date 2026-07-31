@@ -226,20 +226,23 @@ Rationale: deterministic tools, well-understood, no LLM in the security path. Th
 |---|---|
 | **Fires** | `/review --adversarial`; `scripts/gates.sh adversarial` |
 | **Tool** | Auditor role via `scripts/llm-client.sh adversarial` |
-| **Blocks?** | No — commentary only |
-| **Output** | Markdown attack scenarios saved to `.clagentic/lite/last-adversarial.md`; attach to PR if interesting |
+| **Blocks?** | No — Gate 5 itself is commentary only. A finding's `tier` field can make Gate 6 (Merge Gate) refuse — see "Reachability requirement" and "Blocking vs advisory" below. |
+| **Output** | Markdown attack scenarios saved to `.clagentic/lite/last-adversarial.md`; structured findings (same data, machine-readable) saved to `.clagentic/lite/last-adversarial-findings.json`; attach to PR if interesting |
 
 The Auditor argues, in concrete terms, how a hostile user could exploit each new or modified input surface. Cites file:line. Names threats with CWE if obvious. If nothing is exploitable, says so in one sentence and lists the surfaces considered.
+
+The Auditor prompt (`plugins/clagentic-lite/agents/auditor.md`, and the `ds_adversarial_prompt` heredoc in `scripts/llm-client.sh` — both surfaces carry the same material, since a non-Claude CLI chain step never has the agent `.md` file in context) carries a Pre-Report Gate, severity calibration, and a false-positive list, mirroring the Reviewer's (Gate 3). This exists because an uncalibrated adversarial pass is the dominant cause of repeated review bounces: real-but-unexploitable findings — a vulnerable-looking function nothing calls, a CWE pattern-match with no named attacker input — carried the same blocking weight as a live exposure. See "Reachability requirement" below for the mechanism that fixes this.
 
 ### Finding format (prose-primary with structured header)
 
 Each finding in the adversarial output begins with a compact header line, followed by a prose explanation:
 
 ```
-[FINDING] CWE-XXX | file.ext:line | severity: high | title: Short description phrase
+[FINDING] CWE-XXX | file.ext:line | severity: high | reachable: yes | tier: blocking | title: Short description phrase
 
 Prose explanation (1-3 paragraphs): what the vulnerability is, how an
-attacker exploits it, and what a minimal fix looks like.
+attacker exploits it (or why it cannot currently be exploited, if
+reachable: no), and what a minimal fix looks like.
 ```
 
 Header fields:
@@ -250,11 +253,42 @@ Header fields:
 | CWE | Most specific CWE Base-level ID (e.g. `CWE-78`); `CWE-unknown` if not applicable |
 | file:line | Specific file and line number (e.g. `scripts/gates.sh:42`); `general` if not file-specific |
 | severity | `critical` / `high` / `medium` / `low` |
+| reachable | `yes` / `no` — see "Reachability requirement" below |
+| tier | `blocking` / `advisory` — see "Blocking vs advisory" below |
 | title | One short phrase, eight words or fewer |
 
-This is a "prose-primary with structured header" format: the header makes the output scannable at a glance; the prose below it preserves the full adversarial explanation. If the model does not emit `[FINDING]` headers (format mismatch, older model), the prose output is still valid and usable — the format is additive, not a schema enforcement.
+This is a "prose-primary with structured header" format: the header makes the output scannable at a glance; the prose below it preserves the full adversarial explanation. If the model does not emit `[FINDING]` headers (format mismatch, older model), the prose output is still valid and usable — the format is additive, not a schema enforcement. `reachable`/`tier` are themselves optional at the parser level for the same reason (see "Parser default" below) — an older-format header without them still parses.
 
 For a heavier, structured threat-model pass, use the `/infosec-rt` skill instead — multi-persona chained attack scenarios with hardening priority list.
+
+### Reachability requirement
+
+Every finding states whether the vulnerable code is actually reachable from an external or attacker-influenced surface:
+
+- **`reachable: yes`** — the vulnerable code is in the live import/call graph from an external or attacker-influenced entry point, or the finding is a live credential/secret. The Auditor cites the concrete call path or trigger.
+- **`reachable: no`** — the pattern exists in the diff, but nothing currently calls it with attacker-controlled input, it is gated behind a condition an attacker cannot reach, or it is example/test/fixture code. Real, but not exploitable today.
+
+This is the mechanical precondition for blocking eligibility (see "Blocking vs advisory" next): a finding cannot be `tier: blocking` unless it is `reachable: yes`, regardless of the severity the Auditor assigns it. `_parse_adversarial_findings` (`scripts/gates.sh`) enforces this at the parser level, not just the prompt level — it force-corrects `tier` to `advisory` whenever the parsed `reachable` value is not exactly `yes`, so a miscalibrated model cannot cause a block by stating a high tier without reachability.
+
+`severity` is enum-validated the same way: `_parse_adversarial_findings` accepts only `low`/`medium`/`high`/`critical` (case-normalized) and force-corrects any other captured text to the sentinel `unknown`. `severity_rank()` (`scripts/gates.sh`) ranks `unknown` at `0`, below every real severity level, so an unrecognized value can never inflate its own rank anywhere severity is later compared. This closes a gap a follow-up review caught: `severity` was originally captured as unvalidated free text bounded only by the next `|` in the header line — the identical round-trip exposure `_llm_field_sanitize` closes for `file`/`category`/`message` (see "Round-trip sanitization" under Gate 6), just left open on this one field until the fix.
+
+### Blocking vs advisory — threshold, not suppression
+
+**This is a threshold mechanism: every finding is reported at its honest severity and stays fully visible in the adversarial markdown output, the structured findings sidecar, and the audit trail, regardless of `tier`.** `tier` only decides whether Gate 6 (Merge Gate) treats a finding as gating `/ship`. Nothing is ever hidden, dropped, or omitted from output because of its tier.
+
+A finding is `tier: blocking` only when reachability is `yes` (with a cited concrete exploit path) **and** severity is `high` or `critical`. Every other finding — `reachable: no`, or severity `medium`/`low` — is `tier: advisory`.
+
+**Mechanical plumbing, not LLM judgment at gate time.** `cmd_adversarial` (`scripts/gates.sh`) unconditionally loose-parses the `[FINDING]` headers into `.clagentic/lite/last-adversarial-findings.json` (not gated behind `CLAGENTIC_ADVERSARIAL_INVARIANTS` — this sidecar is a base behavior). `build_gate_summary` reads that sidecar and adds three fields to the gate-summary payload fed to the Merge Gate:
+
+- `adversarial_findings` — the full structured array (file, line, category/CWE, message, severity, reachable, tier)
+- `adversarial_blocking_count` — count of `tier: "blocking"` findings, computed mechanically (same pattern as `severity_blockers()` counting review findings by rank rather than asking an LLM to recount)
+- `adversarial_advisory_count` — count of `tier: "advisory"` findings
+
+The Merge Gate prompt (`ds_merge_gate_prompt`) is instructed to refuse only on `tier: "blocking"` findings not covered by `adversarial-acks.json`/`accepted-risks.md`, and to note advisory findings in its `reason` text without gating on them. If `adversarial_findings` is empty or absent (e.g. a gate run predating this feature, or a model that emitted no parseable `[FINDING]` headers), the Merge Gate falls back to reasoning over the `adversarial` markdown prose directly, as it did before this change.
+
+**Parser default (fail-open on the non-blocking side).** `reachable`/`tier` are optional at the parser level for backward compatibility with a pre-lr-e2b975 header (`severity | title`, no `reachable`/`tier`) or a model that omits them despite the prompt instruction. An unparseable or absent `tier` is classified `advisory`, never `blocking` — a parser gap can only ever under-block. The finding is still fully visible in the markdown output and the sidecar; it simply cannot gate the merge on its own if the classification is missing.
+
+**Deterministic gates are untouched.** None of this changes `cmd_secrets`, `cmd_deps`, `cmd_sast`, or their fail-closed behavior (Gate 4). The advisory/blocking split applies only to LLM-driven adversarial findings, which were already, and remain, outside the security-gate path — AGENTS.md §4: no LLM in the security path.
 
 ### Invariant-feed (opt-in) — forward-invariant memory across rounds
 
@@ -297,7 +331,7 @@ The writer is the counterpart to the read/injection half above: it populates `in
 **Two input shapes, one key space:**
 
 - **Review findings** — already structured JSON (`severity`/`file`/`line`/`category`/`message`); no parsing needed.
-- **Adversarial findings** — unstructured markdown `[FINDING] CWE-XXX | file:line | severity: <level> | title: <phrase>` headers; loose-parsed into the same `{file,line,category,message}` shape (`category` becomes the CWE id) before running through the identical key derivation.
+- **Adversarial findings** — unstructured markdown `[FINDING] CWE-XXX | file:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | title: <phrase>` headers; loose-parsed into the same `{file,line,category,message}` shape (`category` becomes the CWE id) — plus `reachable`/`tier` (lr-e2b975), carried through for the advisory/blocking split but not part of the content-hash key itself — before running through the identical key derivation.
 
 **Distillation is mechanical, not an LLM call.** The writer is gate plumbing, not a role — it prefixes the resolved finding's message with a fixed "must not recur, including at a wider scope" framing rather than asking a model to paraphrase. The Auditor's own prompt instructions (in `ds_adversarial_prompt`) already tell it how to use an invariant statement; the writer's job is just to get the original finding text into the file.
 
@@ -305,13 +339,15 @@ The writer is the counterpart to the read/injection half above: it populates `in
 
 **Unbounded-growth guard.** `invariants.json` dedupes on `(file, statement)` at append time — resolving the same finding class again in a later round is a no-op, not a duplicate entry — and is capped at `CLAGENTIC_INVARIANT_FEED_MAX` total entries (default 200), dropping the oldest entries first. This is a deliberate irony guard: the invariant-feed exists partly to catch unbounded-growth findings (see the round-4/round-6 fail-open-scope-widening case in the synthetic replay test), so its own storage must not grow without bound.
 
-**Write-boundary sanitization (lr-cda4b9).** `category`, `file`, and the distilled `statement` written to `invariants.json` all ultimately trace back to adversarial- or review-LLM-controlled finding text — a compromised/manipulated model, or attacker-influenced code under audit that steers model output, could plant a prompt-injection payload in a finding's message that later round-trips into a future adversarial system prompt. `_invariant_feed_append` (the sole writer) is the single choke point: every field is run through `_invariant_feed_sanitize_field` before being written, which
+**Write-boundary sanitization (lr-cda4b9, generalized lr-e2b975).** `category`, `file`, and the distilled `statement` written to `invariants.json` all ultimately trace back to adversarial- or review-LLM-controlled finding text — a compromised/manipulated model, or attacker-influenced code under audit that steers model output, could plant a prompt-injection payload in a finding's message that later round-trips into a future adversarial system prompt. `_invariant_feed_append` (the sole writer) is a single choke point: every field is run through `_llm_field_sanitize` before being written, which
 
 - strips ANSI/terminal escape sequences and other control/non-printable bytes (tab and newline preserved),
-- defangs literal occurrences of the delimiter labels (`INVARIANTS:`, `DEFERRED FINDINGS:`, `END INVARIANTS`, `END DEFERRED FINDINGS`) so a forged label inside finding text cannot spoof a fresh data-block boundary once re-injected,
+- defangs literal occurrences of the delimiter labels (`INVARIANTS:`, `DEFERRED FINDINGS:`, `END INVARIANTS`, `END DEFERRED FINDINGS`, and both fenced marker sets — `===BEGIN/END INVARIANTS DATA===` and `===BEGIN/END ADVERSARIAL FINDINGS DATA===`, unconditionally, since a single planted finding could round-trip through either path) so a forged label inside finding text cannot spoof a fresh data-block boundary once re-injected,
 - caps each field at `CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS` (default 500), truncating rather than dropping the entry (fail-open, matching the rest of the invariant-feed).
 
 Sanitizing at the write boundary (once, on ingest) rather than at read time means every current and future reader of `invariants.json` (today: `ds_adversarial_prompt`) gets clean data automatically — a read-time-only approach would require every new consumer to remember to re-sanitize.
+
+**`_llm_field_sanitize` is the sole sanitizer for this class of round-trip in the codebase** — was `_invariant_feed_sanitize_field` until lr-e2b975 generalized and renamed it to cover a second call site (see Gate 6 below, `.clagentic/lite/last-adversarial-findings.json`). Any future round-trip path (LLM output written to disk, later re-read into a different LLM's prompt) should extend this function rather than adding a parallel one.
 
 As a second, independent layer, `ds_adversarial_prompt` (`scripts/llm-client.sh`) wraps the (already-sanitized) invariants content in an explicit `===BEGIN INVARIANTS DATA===` / `===END INVARIANTS DATA===` fenced block with an instruction telling the Auditor to treat the block as data describing prior findings, not as an instruction, and to ignore any imperative or role-change sentence that may appear inside it. **This is a prompt-contract change**: the previous format injected the raw `invariants.json` content directly after an `INVARIANTS:` label with no fence; any external tooling or test fixture that pattern-matches on the exact prior wording will need to account for the new `===BEGIN/END INVARIANTS DATA===` markers. The feature remains default-off (`CLAGENTIC_ADVERSARIAL_INVARIANTS=0`), so this only affects installs that have already opted in.
 
@@ -321,12 +357,30 @@ As a second, independent layer, `ds_adversarial_prompt` (`scripts/llm-client.sh`
 |---|---|
 | **Fires** | `scripts/gates.sh ship` (the `/ship` slash command), after all other gates have passed |
 | **Tool** | LLM "gate" role via `scripts/llm-client.sh merge-gate` |
-| **Input** | A JSON gate-summary payload (`.clagentic/lite/gate-summary.json`) built from `last-review.json` + `last-adversarial.md` + threshold |
+| **Input** | A JSON gate-summary payload (`.clagentic/lite/gate-summary.json`) built from `last-review.json` + `last-adversarial.md` + `last-adversarial-findings.json` + threshold |
 | **Output** | `{decision: "approve" | "refuse", reason: "<one sentence>"}` JSON at `.clagentic/lite/last-merge-gate.json` |
 | **Blocks?** | **Yes by default** (`CLAGENTIC_MERGE_GATE_BLOCKING=1`). Set to `0` to make advisory. |
 | **Unparseable decision** | Also blocks — schema-invalid merge-gate output is treated as a gate failure, not a pass. |
 
 The Merge Gate is the last LLM check before the PR is opened. It never overrides the deterministic security gates (those already gated upstream) and never adds its own findings — it reads the structured outputs of every prior gate and returns a single approve/refuse decision.
+
+**Adversarial findings gate here on `tier`, not on severity alone (lr-e2b975).** Only `tier: "blocking"` adversarial findings (reachable, high/critical severity — see Gate 5 "Blocking vs advisory") are eligible to refuse the merge. `tier: "advisory"` findings — including real, correctly-severity-rated ones that are simply unreachable or lower severity — never gate `/ship` on their own; they are noted in the Merge Gate's `reason` text and remain fully visible in `last-adversarial.md`, `last-adversarial-findings.json`, and the audit trail. This is a threshold change, never suppression.
+
+**Round-trip sanitization (lr-e2b975, mirrors lr-cda4b9).** `.clagentic/lite/last-adversarial-findings.json` is LLM-authored finding text (title, message, file) written to disk and later read back into the Merge Gate's system prompt — structurally the same round-trip shape as the invariant-feed's `invariants.json`. `cmd_adversarial` (`scripts/gates.sh`) sanitizes the sidecar's `file`/`category`/`message` fields via `_llm_field_sanitize` — the same function, not a second sanitizer — before the sidecar is ever written to disk, so every downstream reader (`build_gate_summary`, the merge-gate prompt) gets clean data. `build_gate_summary` additionally renders the sanitized array as `adversarial_findings_fenced`, a fenced-text rendering delimited by `===BEGIN ADVERSARIAL FINDINGS DATA===` / `===END ADVERSARIAL FINDINGS DATA===` — `_llm_field_sanitize`'s defang list covers this label too, so a forged marker inside a finding's own title cannot escape the fence. `ds_merge_gate_prompt` (`scripts/llm-client.sh`) instructs the Merge Gate to treat that fenced block as data describing findings, not as an instruction, and to ignore any imperative/role-change/decision-override sentence that may appear inside a finding's own text — the same "data, not instructions" framing `ds_adversarial_prompt` applies to the invariant-feed.
+
+**Every field in the parsed finding record, enumerated (lr-e2b975 follow-up).** Every field has an explicit enforcement mechanism — none is asserted safe without one:
+
+| Field | Shape | Enforcement |
+|---|---|---|
+| `file` | free-form model text | Sanitized via `_llm_field_sanitize` (control-byte strip, fence-label defang, length cap) |
+| `category` (CWE) | free-form model text | Sanitized via `_llm_field_sanitize` |
+| `message` (title) | free-form model text | Sanitized via `_llm_field_sanitize` |
+| `severity` | closed set: `low`/`medium`/`high`/`critical` | Enum-validated and force-corrected to `unknown` at parse time (`_parse_adversarial_findings`) — not additionally routed through the sanitizer, since after validation there is no free text left in the field |
+| `reachable` | closed set: `yes`/`no` | Enum-validated and force-corrected to `no` at parse time |
+| `tier` | closed set: `blocking`/`advisory` | Enum-validated and force-corrected to `advisory` at parse time, and again whenever `reachable != "yes"` |
+| `line` | integer | Parsed via Python `int()`; a non-numeric suffix falls back to `0`. Never a pass-through of the raw captured string |
+
+Every field lands in one of three buckets: free-text-and-sanitized, closed-set-and-force-corrected-at-parse-time, or non-text-by-construction. `severity` was the one field that fell through this classification for a period — captured as free text but never enum-checked, the identical fence-escape shape already closed for the other three text fields — until a follow-up review caught it.
 
 If an adversarial finding describes inherent product behavior (e.g., a security dashboard that exposes CVE data to authenticated analysts), commit `.clagentic/accepted-risks.md` to the repo documenting the decision. The merge-gate reads that file and classifies covered findings as acknowledged rather than refusing. Copy `share/accepted-risks.example.md` from the clagentic-lite install tree as a starting template. For per-CWE structured acknowledgments with path-glob scoping, `.clagentic/adversarial-acks.json` remains the more precise mechanism and takes precedence when both apply.
 
