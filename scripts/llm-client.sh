@@ -127,6 +127,46 @@ else
 fi
 AUDIT_DB="$REPO_ROOT/.clagentic/lite/audit.db"
 
+# _change_class_hint — extract the Builder-declared change-class trailer
+# (lr-4f8316), if present, from the tip commit message on the current
+# branch. Prints the raw (unvalidated) trailer VALUE on stdout, or nothing
+# if absent/unparseable.
+#
+# WHY commit message, not PR body: clagentic-lite is zero-server by design
+# (AGENTS.md/docs/DESIGN.md non-goals) — there is no GitHub/Forgejo API call
+# anywhere in this codebase, and the review/adversarial pipeline already
+# only ever sees `git diff` output on stdin, never a hosted PR's metadata.
+# A trailer in the tip commit message is the only hint channel that is
+# git-native, requires no network call, and is visible to `gates review`/
+# `gates adversarial` run locally exactly the same way a PR-hosted trailer
+# would be once that commit lands on the PR. cmd_ship (gates.sh) does open
+# the PR via `gh pr create`, so operators who prefer to write the trailer in
+# the PR body/title instead can carry it into a commit message trailer on a
+# follow-up commit (e.g. an empty `--allow-empty` commit) and it is picked
+# up the same way — no special-casing needed here.
+#
+# Trailer format: a line "Change-class: <value>" anywhere in the message
+# body (git trailer convention — case-sensitive key, colon, single-line
+# value). Only the LAST matching line wins if more than one appears (matches
+# git's own trailer semantics: last write wins). No enum validation here —
+# this function is a pure extraction step; the Reviewer/Auditor prompts
+# below state the closed vocabulary and are told explicitly that an
+# unrecognized value is itself worth flagging, and _parse_adversarial_findings/
+# the merge-gate prompt (gates.sh) independently enum-validate whatever the
+# Auditor resolves and writes back into the [FINDING] header's class field
+# — the raw hint text extracted here never round-trips into a stored
+# artifact unvalidated.
+_change_class_hint() {
+  if ! command -v git >/dev/null 2>&1; then
+    return 0
+  fi
+  git -C "$REPO_ROOT" log -1 --format=%B 2>/dev/null \
+    | grep -i '^Change-class:' \
+    | tail -1 \
+    | cut -d: -f2- \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
 # ---------------------------------------------------------------- prompts -----
 
 ds_build_prompt() {
@@ -175,6 +215,18 @@ DEFERRED FINDINGS:"
     rm -f "$_drp_tmp"
   fi
 
+  # Change-class hint (lr-4f8316): the Builder MAY declare durable/ephemeral
+  # as a one-line "Change-class: <value>" trailer in the tip commit message
+  # (see _change_class_hint above for why commit message, not PR body). It
+  # is a CLAIM to weigh against the diff, never the source of truth — see
+  # "Change class" in the fixed instructions below for the full vocabulary
+  # and the diff-wins/mismatch-is-a-finding rule.
+  _drp_class_hint=$(_change_class_hint)
+  if [ -n "$_drp_class_hint" ]; then
+    printf 'BUILDER-DECLARED CHANGE-CLASS HINT: %s\n(A claim to weigh against the diff — see "Change class" below.)\n\n' \
+      "$_drp_class_hint"
+  fi
+
   cat <<'EOF'
 You are the clagentic-lite Reviewer. Read the staged git diff on stdin.
 
@@ -198,6 +250,26 @@ Return STRICT JSON matching this schema, no prose before or after:
 Apply the Pre-Report Gate from .claude/agents/reviewer.md: only report
 findings you are >80% confident about. Empty findings is valid and expected
 for clean diffs. Do not pad. No emojis. No "looks good to me" filler.
+
+Change class — durability vocabulary (lr-4f8316): every diff has a
+change class, durable (default) or ephemeral (a one-shot / time-boxed
+change with a documented decommission path — a migration script, a k8s Job
+rather than a Deployment, a `tests/` or `migrations/`-scoped change, a
+one-shot main() that exits, code the diff or commit message says is
+scheduled for removal). Infer the class from the diff itself — path,
+structure, and any stated decommission date are the signal; you already
+read the diff for every other finding. If a "BUILDER-DECLARED CHANGE-CLASS
+HINT" appears above, weigh it against what the diff actually shows: if the
+diff contradicts the declared class (e.g. declared "ephemeral" but the diff
+adds a long-lived Deployment with no decommission path, or touches
+non-test/non-migration production code with no one-shot exit), THE DIFF
+WINS and you must report the mismatch itself as a `maintainability`
+category finding (e.g. "declared change-class 'ephemeral' does not match
+the diff: <what the diff actually shows>") — an implausible declaration
+must never silently pass. Class affects the Auditor's blocking threshold
+(ephemeral relaxes durability-dependent findings to advisory — see the
+Auditor's prompt); it does not change anything about your severity
+findings above, which report the code's honest quality regardless of class.
 EOF
 }
 
@@ -275,6 +347,17 @@ class to check the diff against, exactly as instructed above.
     rm -f "$_dap_tmp"
   fi
 
+  # Change-class hint (lr-4f8316): same extraction as ds_review_prompt above
+  # — a "Change-class: <value>" trailer in the tip commit message, a claim
+  # to weigh against the diff, never the source of truth. See "Change
+  # class" in the fixed instructions below for the full vocabulary, the
+  # diff-wins/mismatch-is-a-finding rule, and the security-floor carve-out.
+  _dap_class_hint=$(_change_class_hint)
+  if [ -n "$_dap_class_hint" ]; then
+    printf 'BUILDER-DECLARED CHANGE-CLASS HINT: %s\n(A claim to weigh against the diff — see "Change class" below.)\n\n' \
+      "$_dap_class_hint"
+  fi
+
   cat <<'EOF'
 You are the clagentic-lite Auditor in adversarial mode. Read the staged
 diff on stdin. Argue, concretely, how a hostile user could exploit each
@@ -314,9 +397,63 @@ Blocking vs advisory — this is a threshold mechanism, never suppression:
 every finding is reported at its honest severity and stays fully visible in
 the output and the audit trail regardless of tier. A finding is
 tier: blocking only when ALL of: reachable: yes with a cited exploit path,
-AND severity is high or critical. Every other finding (reachable: no, or
-severity medium/low) is tier: advisory. Do not inflate severity or
+AND severity is high or critical, AND (see "Change class" below) the
+finding is not a durability-dependent concern excused by an ephemeral
+class. Every other finding (reachable: no, or severity medium/low, or
+excused by class) is tier: advisory. Do not inflate severity or
 reachability to force a finding into tier: blocking.
+
+Change class — durability vocabulary (lr-4f8316): gates review all code as
+if it ships forever by default, and that is usually right — but a one-shot
+migration script or a k8s Job stood up for a single task and documented for
+decommission is not a durable service, and holding it to the identical bar
+is a category error, not rigor. Two classes:
+- durable (default) — ships and stays. Full bar applies; nothing about this
+  class relaxes any threshold.
+- ephemeral — one-shot, time-boxed, or throwaway: a migration script, a k8s
+  Job (not a Deployment) with a documented decommission path, a change
+  confined to tests/ or migrations/, a one-shot main() that exits and does
+  not run as a persistent process. Infer this from the diff itself — path,
+  structure, lifecycle shape, any stated decommission date — the same way
+  you already infer reachability. There is no operator-maintained context
+  file for this; you already read the diff for every other finding, and
+  that is the only signal that cannot go stale the moment the ephemeral
+  thing is decommissioned.
+
+If a "BUILDER-DECLARED CHANGE-CLASS HINT" appeared above stdin, it is a
+CLAIM to weigh against the diff, never the source of truth. If the diff
+contradicts the declared class (e.g. declared ephemeral but the diff adds a
+long-lived Deployment, or touches broad production surface with no
+documented decommission path and no one-shot exit), THE DIFF WINS: resolve
+the class from the diff and additionally report the mismatch itself as a
+finding (CWE-unknown is fine; category is the mismatch, not a
+vulnerability) — a wrong declaration must never silently buy a pass. An
+absent hint is not a problem: infer durable vs ephemeral from the diff
+exactly as you would with a hint present.
+
+Threshold implication — the ONLY thing class does: when the resolved class
+is ephemeral, a finding whose sole basis is a durability-dependent concern
+(unbounded resource growth in a process that runs once and exits, missing
+retry/backoff/observability hardening that only matters across a long
+service lifetime, missing long-term maintainability polish) rides as
+tier: advisory instead of blocking, even if reachable: yes and severity is
+high/critical — state the reason in the finding's prose (e.g. "advisory
+under ephemeral class: unbounded growth in a job that runs once and exits
+is not a durability defect here"). Class NEVER suppresses a finding and
+NEVER changes its reported severity — an ephemeral high is still reported
+as high, fully visible, just not gating. Class also never lowers
+reachability; a finding you would call reachable: no anyway stays
+reachable: no regardless of class.
+
+SECURITY FLOOR IS ABSOLUTE regardless of class: a live credential/secret, a
+reachable injection sink, or any real exploit path with a concrete
+attacker-controlled trigger is tier: blocking in EVERY class, ephemeral
+included. Ephemeral does not mean unsafe — it means a job that runs once
+and dies does not need the same durability hardening a persistent service
+does. Never use class to excuse anything that would independently qualify
+as tier: blocking on reachability + severity alone; class only relaxes
+threshold for findings whose entire basis is durability, never for findings
+whose basis is exploitability.
 
 HIGH/CRITICAL findings require: the exact snippet and line, the specific
 exploit scenario (attacker-controlled input, sink, outcome), why existing
@@ -348,12 +485,13 @@ Finding format (required — use this structure for every finding):
 
 Each finding must begin with a structured header line in exactly this format:
 
-  [FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | title: Short phrase
+  [FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | class: <durable|ephemeral> | title: Short phrase
 
 Then, on the lines immediately following the header, write the prose
 explanation (1-3 paragraphs covering: what the vulnerability is, how an
 attacker exploits it — or why it cannot currently be exploited if
-reachable: no — and what a minimal fix looks like).
+reachable: no — and what a minimal fix looks like; if class relaxed this
+finding to advisory, say so explicitly per "Change class" above).
 
 Separate distinct findings with a blank line.
 
@@ -361,14 +499,21 @@ Header field rules:
 - `[FINDING]` — literal tag; always the first token on the header line.
 - CWE: most specific applicable CWE Base-level ID (e.g. CWE-78). Use
   "CWE-unknown" only when no CWE applies (e.g. a design concern without
-  a matching CWE entry).
+  a matching CWE entry, including a change-class mismatch finding).
 - file:line: the specific file and line number cited (e.g. scripts/gates.sh:42).
   Use "general" when the finding is not tied to a specific file or line.
 - severity: one of critical / high / medium / low.
 - reachable: yes or no. See "Reachability requirement" above.
-- tier: blocking or advisory. See "Blocking vs advisory" above. Required —
-  do not omit; the gate parses this field mechanically and does not
-  re-derive it from prose.
+- tier: blocking or advisory. See "Blocking vs advisory" and "Change class"
+  above. Required — do not omit; the gate parses this field mechanically
+  and does not re-derive it from prose.
+- class: durable or ephemeral — your resolved judgment for the WHOLE DIFF
+  (see "Change class" above), repeated on every finding's header even
+  though one diff has one resolved class; do not vary it finding-to-finding
+  within the same pass. Required — do not omit; an absent value is parsed
+  as durable (the class that does not relax anything), so omitting it can
+  only ever cost you a downgrade you were entitled to, never grant one you
+  were not.
 - title: one short phrase, eight words or fewer, describing the vulnerability.
 
 If the model cannot emit `[FINDING]` headers (e.g., due to a format
@@ -446,6 +591,22 @@ If the "adversarial" field is null or "adversarial_missing" is true, no
 adversarial pass was run for this commit. Treat as no adversarial
 findings: approve on that axis alone. Do not refuse solely because
 adversarial is absent.
+
+Change class (lr-4f8316): "resolved_change_class" is the Auditor's own
+durable/ephemeral judgment for this diff (see the Auditor's prompt for the
+full vocabulary), already folded into each finding's "tier" field before you
+ever see it — do not re-derive it yourself, and do not let the class widen
+what "tier":"blocking" means; it only ever narrows which findings reach
+blocking in the first place. "adversarial_downgraded_by_class_count" is a
+mechanical count, already reflected in "adversarial_advisory_count" above,
+not an additional signal to act on. Note the resolved class in your
+"reason" text when it is "ephemeral" and downgraded_by_class_count is
+greater than 0 (e.g. "approved; ephemeral class, 1 advisory finding
+downgraded from the durable bar"), the same way you already note advisory
+findings. The security floor is unaffected: a finding the Auditor tagged
+tier:"blocking" is never eligible for a class-based pass — class never
+suppresses a blocking finding, it only ever explains why a reachable
+high/critical finding is riding as advisory instead of blocking.
 EOF
 }
 
