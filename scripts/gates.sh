@@ -619,10 +619,278 @@ PYEOF
   rm -f "$_crd_raw_findings" "$_crd_deduped_findings"
 }
 
+# _review_recurrence_threshold — round count at which a recurring finding is
+# demoted from blocking to advisory. Configurable via
+# CLAGENTIC_RECURRENCE_THRESHOLD (default 2 — "reported in a prior round AND
+# reported again" is what "recurs" means; a finding seen for the first time
+# is never demotable no matter how confident the model is). Same
+# integer-guard pattern as _invariant_feed_max_lines.
+_review_recurrence_threshold() {
+  _rrt_n="${CLAGENTIC_RECURRENCE_THRESHOLD:-2}"
+  case "$_rrt_n" in ''|*[!0-9]*) _rrt_n=2 ;; esac
+  # A threshold of 0 or 1 would demote a finding on its FIRST report ever,
+  # which is not "recurs" by any reading of the task -- floor at 2 so the
+  # configured value can only ever raise the bar for demotion, never make a
+  # brand-new finding demotable.
+  [ "$_rrt_n" -lt 2 ] && _rrt_n=2
+  printf '%s' "$_rrt_n"
+}
+
+# _review_recurrence_demote ENVELOPE_FILE DIFF_FILE COUNTS_FILE
+#
+# Third pass over ENVELOPE_FILE's findings, run AFTER _cross_round_dedup: for
+# every finding that SURVIVED dedup (i.e. is still in .findings — a finding
+# dedup suppressed was never reported this round and cannot recur by
+# definition), compute its content-hash key (finding_content_keys,
+# review-merge.sh — the SAME key space _cross_round_dedup/dedup_findings
+# already persists in SEEN_FILE, applied here to a SEPARATE counts file so
+# recurrence tracking never mutates dedup's own seen-keys semantics) and bump
+# its persisted round-count (finding_recurrence_bump, review-merge.sh).
+#
+# THRESHOLD SEMANTICS: "recurs" means this finding has now been reported in
+# at least _review_recurrence_threshold DISTINCT rounds, counting this one --
+# a finding on its first-ever reported round always has count 1 and is never
+# demotable. When count >= threshold, the finding's SEVERITY IS NEVER
+# TOUCHED (docs/GATES.md "wrong suppressions are worse than missed dedups"
+# — the same posture forbids silently rewriting a finding's own reported
+# severity). Instead two fields are added to the finding object:
+#   _recurrence_count    — integer, rounds this key has been reported in
+#   _recurrence_demoted  — boolean, true when count >= threshold
+# severity_blockers() (this file) excludes _recurrence_demoted findings from
+# its block count — this is the mechanism that makes demotion a THRESHOLD
+# change, not suppression: the finding stays in .findings, fully visible in
+# cmd_render_review's output and in the audit trail, with its honest severity
+# unchanged; only its eligibility to gate /ship is affected.
+#
+# SECURITY-FLOOR INTERACTION: this function has no notion of a security floor
+# on its own — review findings do not carry reachable/tier fields (those are
+# adversarial-pass concepts, Gate 5). The floor this repo actually enforces
+# for review findings is severity_blockers()'s threshold comparison itself:
+# a review finding blocks solely because its severity rank meets
+# CLAGENTIC_BLOCK_SEVERITY. Demotion here can exempt a recurring finding from
+# THAT count, same as it does for any other review finding — there is no
+# separate reachable/tier-based floor to bypass on this path (that floor only
+# exists on the adversarial parser, _parse_adversarial_findings, which this
+# function does not touch and which is NOT wired into _review_recurrence_demote
+# at all). See the test suite for an explicit adversarial-floor-is-never-
+# demotable regression case covering the gate that DOES have a floor.
+#
+# CONSERVATIVE BIAS (mirrors _cross_round_dedup exactly, per task constraint
+# (d)): a finding whose key cannot be computed (empty key, no diff window, no
+# sha256 tool) is retained AND left un-demoted (finding_recurrence_bump gives
+# it a fresh count of 1, never eligible). Extraction or splice failure at any
+# step leaves the original findings untouched, un-annotated, un-demoted —
+# same fail-open direction as _cross_round_dedup's own failure paths. No JSON
+# tool at all is a full passthrough — ENVELOPE_FILE is left byte-identical.
+#
+# SECURITY PRECONDITION (lr-66e598 follow-up, BOBBIE-caught): this function
+# ASSUMES ENVELOPE_FILE's findings have already been reduced to the closed
+# review-finding schema by _sanitize_review_findings_envelope (this file),
+# which every caller runs immediately after the raw LLM write and before
+# this function ever sees the file. Before that fix existed, a finding whose
+# triple did NOT match a row in this round's bumped TSV was `continue`d over
+# UNTOUCHED below -- so a model that emitted _recurrence_demoted:true in its
+# OWN raw JSON response had that self-forged value survive verbatim, and a
+# first-ever-reported finding could self-exempt from blocking with zero
+# actual repetition. The splice below now explicitly OWNS the field for
+# every finding it processes (sets a definite _recurrence_count/
+# _recurrence_demoted even on the unmatched branch) as a second, independent
+# layer -- but the real closure point is the upstream ingest strip; this
+# function's own defense-in-depth does not substitute for it, since a
+# forged field on a MATCHED finding would still need the ingest strip to
+# have never let non-schema fields (or a spoofed value this splice
+# overwrites correctly, by coincidence, only on the matched path) reach this
+# function's other, non-recurrence-related reads of the object in the first
+# place.
+_review_recurrence_demote() {
+  _rrd_envelope="$1"
+  _rrd_diff="$2"
+  _rrd_counts="$3"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    # The splice step (matching bumped TSV rows back to finding objects and
+    # rewriting the array) needs a real JSON encoder/decoder pair operating
+    # on the same data structure; python3 is used for that regardless of
+    # whether jq is also present (only jq's FINAL `.findings = $nf` merge
+    # differs between the two branches below). No python3 at all — full
+    # passthrough, matching dedup_findings' own posture on missing tools.
+    return 0
+  fi
+
+  _rrd_threshold=$(_review_recurrence_threshold)
+
+  _rrd_findings=$(_extract_findings_json "$_rrd_envelope")
+  [ -n "$_rrd_findings" ] || _rrd_findings='[]'
+
+  # Compute content-hash keys for this round's SURVIVING findings and bump
+  # their persisted round-counts. finding_content_keys emits one TSV row
+  # PER FINDING WITH A COMPUTABLE KEY ONLY (uncomputable-key findings are
+  # silently omitted from its output by design — see its own doc comment) —
+  # so downstream matching is done BY VALUE (file/category/message), never
+  # by array position, which would misalign the moment any finding in this
+  # round lacks a computable key.
+  _rrd_keyed_tsv=$(mktemp -t clagentic-rrd-keyed.XXXXXX)
+  printf '%s' "$_rrd_findings" | finding_content_keys "$_rrd_diff" > "$_rrd_keyed_tsv" 2>/dev/null
+
+  if [ ! -s "$_rrd_keyed_tsv" ]; then
+    # No finding in this round had a computable key (empty diff window, no
+    # sha256 tool, or genuinely zero findings) — nothing to bump or demote.
+    # Conservative: leave ENVELOPE_FILE untouched.
+    rm -f "$_rrd_keyed_tsv"
+    return 0
+  fi
+
+  _rrd_bumped_tsv=$(mktemp -t clagentic-rrd-bumped.XXXXXX)
+  finding_recurrence_bump "$_rrd_counts" < "$_rrd_keyed_tsv" > "$_rrd_bumped_tsv" 2>/dev/null
+  rm -f "$_rrd_keyed_tsv"
+
+  if [ ! -s "$_rrd_bumped_tsv" ]; then
+    rm -f "$_rrd_bumped_tsv"
+    return 0
+  fi
+
+  # Splice _recurrence_count/_recurrence_demoted into every finding matched
+  # BY VALUE (file/category/message triple) against the bumped TSV — the
+  # content-hash key itself has no independent meaning to a splice step
+  # outside review-merge.sh's own derivation, and a finding object does not
+  # carry its own key, so matching on the triple that identifies a finding
+  # row in finding_content_keys' TSV output is the natural join key here. A
+  # genuine triple collision between two DISTINCT findings in the same round
+  # would only ever mis-share a recurrence count between them — no worse
+  # than dedup_findings' own "location" strategy already treats an identical
+  # file/line/category/message as one finding by design.
+  #
+  # Emits the demoted-count on its own final line (stdout) so the caller can
+  # log it to the audit trail without a second read of ENVELOPE_FILE — this
+  # is the ONLY output contract of the python step; the spliced findings
+  # array is written directly to a temp file, not printed, so the two
+  # results never interleave on one stream.
+  _rrd_spliced_file=$(mktemp -t clagentic-rrd-spliced.XXXXXX)
+  _rrd_demoted_count=$(python3 - "$_rrd_findings" "$_rrd_bumped_tsv" "$_rrd_threshold" "$_rrd_spliced_file" <<'PYEOF'
+import json, sys
+
+findings_json, tsv_path, threshold, out_path = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+
+try:
+    findings = json.loads(findings_json)
+    if not isinstance(findings, list):
+        raise ValueError("not a list")
+except Exception:
+    print(0)
+    sys.exit(0)
+
+counts_by_triple = {}
+try:
+    with open(tsv_path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 5:
+                continue
+            fname, category, message, count_s = parts[1], parts[2], parts[3], parts[4]
+            try:
+                count = int(count_s)
+            except ValueError:
+                continue
+            counts_by_triple[(fname, category, message)] = count
+except Exception:
+    print(0)
+    sys.exit(0)
+
+demoted = 0
+for f in findings:
+    if not isinstance(f, dict):
+        continue
+    # OWN THE FIELD, DO NOT MERELY OVERWRITE-ON-MATCH (BOBBIE, lr-66e598
+    # follow-up): every finding this loop touches gets an EXPLICIT,
+    # definite _recurrence_demoted/_recurrence_count this function itself
+    # decided -- never a value left over from whatever the object already
+    # carried (in-band ingest is stripped upstream by
+    # _sanitize_review_findings_envelope, but this is the second,
+    # independent layer: even if that upstream strip were ever bypassed,
+    # skipped, or a future refactor moved this call before it, an
+    # unmatched finding still gets a definite False here, not a `continue`
+    # that leaves whatever pre-existing value untouched).
+    triple = (str(f.get("file", "")), str(f.get("category", "")), str(f.get("message", "")))
+    count = counts_by_triple.get(triple)
+    if count is None:
+        f["_recurrence_count"] = 0
+        f["_recurrence_demoted"] = False
+        continue
+    f["_recurrence_count"] = count
+    f["_recurrence_demoted"] = bool(count >= threshold)
+    if count >= threshold:
+        demoted += 1
+
+try:
+    with open(out_path, "w") as f:
+        json.dump(findings, f)
+except Exception:
+    print(0)
+    sys.exit(0)
+
+print(demoted)
+PYEOF
+)
+  case "$_rrd_demoted_count" in ''|*[!0-9]*) _rrd_demoted_count=0 ;; esac
+
+  if [ -s "$_rrd_spliced_file" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      _rrd_tmp=$(mktemp -t clagentic-rrd-env.XXXXXX)
+      if jq --slurpfile nf "$_rrd_spliced_file" '.findings = $nf[0]' "$_rrd_envelope" > "$_rrd_tmp" 2>/dev/null; then
+        mv "$_rrd_tmp" "$_rrd_envelope"
+      else
+        rm -f "$_rrd_tmp"
+      fi
+    else
+      # No jq: python3-only merge-back, same "read envelope, replace
+      # .findings, write back" shape as the jq branch above.
+      _rrd_tmp=$(mktemp -t clagentic-rrd-env.XXXXXX)
+      if python3 - "$_rrd_envelope" "$_rrd_spliced_file" "$_rrd_tmp" <<'PYEOF2' 2>/dev/null
+import json, sys
+env_path, spliced_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(env_path) as f:
+        env = json.load(f)
+    with open(spliced_path) as f:
+        spliced = json.load(f)
+    if not isinstance(spliced, list):
+        raise ValueError("not a list")
+    env["findings"] = spliced
+    with open(out_path, "w") as f:
+        json.dump(env, f)
+except Exception:
+    sys.exit(1)
+PYEOF2
+      then
+        mv "$_rrd_tmp" "$_rrd_envelope"
+      else
+        rm -f "$_rrd_tmp"
+      fi
+    fi
+  fi
+
+  if [ "$_rrd_demoted_count" -gt 0 ]; then
+    printf '[recurrence] %d finding(s) demoted to advisory (reported >= %d rounds running)\n' \
+      "$_rrd_demoted_count" "$_rrd_threshold" 1>&2
+  fi
+  ds_audit_log "review-recurrence" "pass" \
+    "demoted:${_rrd_demoted_count} threshold:${_rrd_threshold}"
+
+  rm -f "$_rrd_bumped_tsv" "$_rrd_spliced_file"
+  return 0
+}
+
 # _extract_findings_json FILE — print FILE's .findings array (or "[]" on any
 # failure). jq-then-python3 fallback, matching the pattern used throughout
 # this file (e.g. _cross_round_dedup's own findings extraction) rather than
 # introducing a third way to read the same shape.
+#
+# NOT a validation point: this is a pure read, matching every caller's
+# expectation that FILE has already been sanitized by
+# _sanitize_review_findings_envelope (below) BEFORE any of them ever see it.
 _extract_findings_json() {
   _efj_file="$1"
   if command -v jq >/dev/null 2>&1; then
@@ -633,6 +901,116 @@ _extract_findings_json() {
   else
     printf '[]'
   fi
+}
+
+# _sanitize_review_findings_envelope FILE
+#
+# SECURITY (lr-66e598 follow-up, BOBBIE-caught). Reduces FILE's .findings
+# array in place to EXACTLY the closed review-finding schema
+# (ds_review_prompt, llm-client.sh: severity/file/line/category/message/
+# evidence/suggestion) via _llm_json_array_allowlist_fields
+# (scripts/platform.sh), DROPPING every other key -- including, critically,
+# any `_recurrence_demoted` / `_recurrence_count` (or any other future
+# internal `_`-prefixed control field) the MODEL ITSELF may have emitted in
+# its raw JSON response.
+#
+# WHY THIS EXISTS: last-review.json is written directly from LLM output
+# (llm-client.sh's `review` role) with no field allowlist anywhere on that
+# write path -- validate_output (llm-client.sh) checks only that .findings
+# is an array and that .severity, if present, is a legal enum value. Nothing
+# stopped a model (compromised, manipulated by attacker-influenced code
+# under review, or simply miscalibrated) from emitting
+# {"severity":"critical", ..., "_recurrence_demoted": true} in its
+# structured JSON on the FIRST-EVER round. Before this fix,
+# _review_recurrence_demote's splice step only OVERWRITES
+# _recurrence_demoted/_recurrence_count on a finding whose (file,category,
+# message) triple matches a row in this round's bumped TSV (i.e. whose line
+# falls inside finding_content_keys' diff-context window); a finding whose
+# triple does NOT match is `continue`d over UNTOUCHED (see
+# _review_recurrence_demote), so a self-forged _recurrence_demoted:true
+# survived verbatim into last-review.json and severity_blockers (which reads
+# ._recurrence_demoted with no provenance check) excluded it from the block
+# count -- a first-ever-reported finding could self-exempt from blocking
+# with zero actual repetition. Overwrite-on-match is not the same as
+# owning the field.
+#
+# THE FIX IS AT INGEST, THE SAME CHOKE-POINT PATTERN THIS CODEBASE ALREADY
+# USES: _sanitize_adversarial_findings_json sanitizes immediately after
+# _parse_adversarial_findings and before the sidecar is EVER written to
+# disk (docs/GATES.md "Round-trip sanitization"); ds_review_prompt
+# allowlists deferrals.json before it is EVER interpolated into a prompt.
+# This function is the equivalent choke point for review findings: it MUST
+# run immediately after every raw LLM write to an envelope file (both the
+# single-pass path and each per-chunk envelope in the chunked path, BEFORE
+# merge_envelopes ever unions them -- merge_envelopes/dedup_findings are
+# pure concatenation/dedup with no field validation of their own, so an
+# unsanitized chunk would carry a forged field through the merge
+# untouched), and BEFORE _cross_round_dedup, _review_recurrence_demote,
+# severity_blockers, or cmd_render_review ever read the file. Once this
+# runs, there is no field left on any finding object for
+# _review_recurrence_demote or severity_blockers to trust-by-accident --
+# the ONLY way _recurrence_demoted/_recurrence_count can exist on a finding
+# from this point forward is if THIS repo's own code (the recurrence
+# splice) put it there this round.
+#
+# NUMERIC `line` FIELD: _llm_json_array_allowlist_fields' base contract
+# keeps only STRING-valued fields (safe for deferrals.json, an all-string
+# schema) -- review findings legitimately define `line` as a JSON number
+# (ds_review_prompt). Rather than write a second, parallel stripper for
+# this one schema (which would violate "reuse the existing allowlist
+# helper, do not grow a parallel one" the same way _llm_json_array_
+# sanitize_fields' own docstring warns against), _llm_json_array_
+# allowlist_fields was widened to accept a "fieldname:number" suffix that
+# ALSO permits a plain JSON number under that one key (still dropping an
+# object/array/bool/null there, never coercing) -- see that function's
+# updated docstring in platform.sh for the exact contract and why bool is
+# explicitly excluded from the numeric-accepted branch.
+#
+# CONSERVATIVE BIAS, matching every other on-disk-envelope helper in this
+# file: if FILE is missing, unparseable, has no .findings array, or
+# _llm_json_array_allowlist_fields' own fail-open path is hit (no jq/
+# python3), the function makes NO changes and returns 0 -- a strip failure
+# must never turn into "findings vanish" (that would be an over-suppression,
+# the exact failure direction docs/GATES.md:150 forbids) or "findings block
+# on a synthetic error" (severity_blockers' own sentinel-99 path already
+# owns fail-closed for genuinely unparseable JSON; this function's job is
+# narrower than that and must not duplicate or fight it).
+_sanitize_review_findings_envelope() {
+  _srfe_file="$1"
+  [ -f "$_srfe_file" ] || return 0
+
+  _srfe_findings=$(_extract_findings_json "$_srfe_file")
+  [ -n "$_srfe_findings" ] || return 0
+
+  _srfe_clean=$(_llm_json_array_allowlist_fields "$_srfe_findings" \
+    severity file "line:number" category message evidence suggestion)
+  [ -n "$_srfe_clean" ] || return 0
+
+  if command -v jq >/dev/null 2>&1; then
+    _srfe_tmp=$(mktemp -t clagentic-srfe-env.XXXXXX)
+    if jq --argjson nf "$_srfe_clean" '.findings = $nf' "$_srfe_file" > "$_srfe_tmp" 2>/dev/null; then
+      mv "$_srfe_tmp" "$_srfe_file"
+    else
+      rm -f "$_srfe_tmp"
+    fi
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$_srfe_file" "$_srfe_clean" <<'PYEOF' 2>/dev/null
+import json, sys
+env_path, clean_json = sys.argv[1], sys.argv[2]
+try:
+    with open(env_path) as f:
+        env = json.load(f)
+    clean = json.loads(clean_json)
+    if not isinstance(clean, list):
+        raise ValueError("not a list")
+    env["findings"] = clean
+    with open(env_path, "w") as f:
+        json.dump(env, f)
+except Exception:
+    sys.exit(1)
+PYEOF
+  fi
+  return 0
 }
 
 # _invariant_feed_max_lines — line cap on invariants.json entries. Guards
@@ -909,18 +1287,22 @@ cmd_review() {
   done
   export REVIEW_SINCE_LAST
 
-  # --reset-dedup: delete the persisted seen-keys file and exit.
-  # Operator calls this to clear cross-round dedup state (e.g. after a major
-  # rebase or when they want the next review to re-report all findings).
+  # --reset-dedup: delete the persisted seen-keys file (and the recurrence
+  # counts file, which is derived from the same content-hash key space and
+  # would otherwise still remember round counts from before the reset) and
+  # exit. Operator calls this to clear cross-round dedup state (e.g. after a
+  # major rebase or when they want the next review to re-report all findings
+  # AND treat every finding as fresh, not "already reported N rounds").
   _crv_seen_file="$REPO_ROOT/.clagentic/lite/review-seen-keys"
+  _crv_recurrence_file="$REPO_ROOT/.clagentic/lite/review-recurrence.json"
   if [ "$_crv_reset_dedup" = "1" ]; then
-    if [ -f "$_crv_seen_file" ]; then
-      rm -f "$_crv_seen_file"
-      echo "[gates/review] cross-round dedup state reset (review-seen-keys deleted)"
-      cmd_log_run review pass "cross-round dedup reset by --reset-dedup"
+    if [ -f "$_crv_seen_file" ] || [ -f "$_crv_recurrence_file" ]; then
+      rm -f "$_crv_seen_file" "$_crv_recurrence_file"
+      echo "[gates/review] cross-round dedup state reset (review-seen-keys and review-recurrence.json deleted)"
+      cmd_log_run review pass "cross-round dedup reset by --reset-dedup (recurrence counts cleared)"
     else
-      echo "[gates/review] cross-round dedup state already empty (review-seen-keys not found)"
-      cmd_log_run review pass "cross-round dedup reset by --reset-dedup (file was absent)"
+      echo "[gates/review] cross-round dedup state already empty (review-seen-keys and review-recurrence.json not found)"
+      cmd_log_run review pass "cross-round dedup reset by --reset-dedup (files were absent)"
     fi
     return 0
   fi
@@ -977,6 +1359,16 @@ cmd_review() {
         _crv_env_file=$(printf '%s/envelope-%03d.json' "$_crv_env_dir" "$_crv_cidx")
         printf '[gates/review] reviewing chunk %d/%d (%d bytes)\n' "$_crv_cidx" "$_crv_nchunks" "$_crv_cbytes" 1>&2
         "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_chunk" > "$_crv_env_file" 2>/dev/null || true
+        # SECURITY (lr-66e598 follow-up): strip every finding in THIS chunk's
+        # raw envelope to the closed review-finding schema BEFORE
+        # merge_envelopes ever unions it with the other chunks --
+        # merge_envelopes/dedup_findings are pure concatenation/dedup with
+        # no field validation of their own, so an unsanitized chunk would
+        # carry a model-forged internal field (e.g. a self-set
+        # _recurrence_demoted) straight through the merge. See
+        # _sanitize_review_findings_envelope's own doc comment for the full
+        # rationale.
+        _sanitize_review_findings_envelope "$_crv_env_file"
         # Audit one row per chunk.
         _crv_chunk_outcome="pass"
         if review_is_degraded "$_crv_env_file" 2>/dev/null; then
@@ -1010,6 +1402,13 @@ cmd_review() {
         _crv_prior_seen_snap=$(mktemp -t clagentic-inv-prior.XXXXXX)
         cp "$_crv_seen_file" "$_crv_prior_seen_snap" 2>/dev/null || : > "$_crv_prior_seen_snap"
         _cross_round_dedup "$OUT" "$_crv_diff_tmp" "$_crv_seen_file"
+        # Recurrence demotion (lr-66e598): a finding that survived dedup and
+        # keeps reappearing across rounds is demoted to advisory (excluded
+        # from severity_blockers' count) rather than re-litigated forever.
+        # Second use of the same content-hash key space, per its own
+        # threshold (CLAGENTIC_RECURRENCE_THRESHOLD, default 2) — see
+        # _review_recurrence_demote for the full mechanics.
+        _review_recurrence_demote "$OUT" "$_crv_diff_tmp" "$_crv_recurrence_file"
         if [ "${CLAGENTIC_ADVERSARIAL_INVARIANTS:-0}" = "1" ]; then
           _crv_live_findings=$(_extract_findings_json "$OUT")
           _invariant_feed_write review "$_crv_live_findings" "$_crv_diff_tmp" "$_crv_prior_seen_snap" "$_crv_seen_file"
@@ -1063,6 +1462,15 @@ cmd_review() {
   "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_diff_tmp" > "$OUT"
   # Note: _crv_diff_tmp is NOT deleted yet — cross-round dedup needs it below.
 
+  # SECURITY (lr-66e598 follow-up): strip every finding to the closed
+  # review-finding schema IMMEDIATELY after the raw LLM write and BEFORE
+  # anything else (stamp, dedup, recurrence, severity_blockers,
+  # cmd_render_review) ever reads $OUT. See _sanitize_review_findings_envelope's
+  # own doc comment for the full rationale — this is the choke point that
+  # closes the self-exempting-suppression gap a raw, unallowlisted model
+  # finding could otherwise use.
+  _sanitize_review_findings_envelope "$OUT"
+
   # Stamp the output with the current HEAD SHA so build_gate_summary can
   # detect stale payloads (file written against a different branch/commit).
   # Best-effort: if git or jq/python3 are unavailable, skip silently.
@@ -1084,6 +1492,9 @@ cmd_review() {
     _crv_prior_seen_snap=$(mktemp -t clagentic-inv-prior.XXXXXX)
     cp "$_crv_seen_file" "$_crv_prior_seen_snap" 2>/dev/null || : > "$_crv_prior_seen_snap"
     _cross_round_dedup "$OUT" "$_crv_diff_tmp" "$_crv_seen_file"
+    # Recurrence demotion (lr-66e598) — see the chunked-path comment above
+    # for the full rationale (same logic, single-pass path).
+    _review_recurrence_demote "$OUT" "$_crv_diff_tmp" "$_crv_recurrence_file"
     if [ "${CLAGENTIC_ADVERSARIAL_INVARIANTS:-0}" = "1" ]; then
       _crv_live_findings=$(_extract_findings_json "$OUT")
       _invariant_feed_write review "$_crv_live_findings" "$_crv_diff_tmp" "$_crv_prior_seen_snap" "$_crv_seen_file"
@@ -1735,6 +2146,16 @@ severity_blockers() {
   # Severity strings are normalized case-insensitively. LLM models routinely
   # return "HIGH" or "CRITICAL" uppercase — without normalization these rank
   # 0 (unknown) and blocking findings silently pass.
+  #
+  # _recurrence_demoted exclusion (lr-66e598): a finding _review_recurrence_demote
+  # annotated with _recurrence_demoted: true is excluded from this count —
+  # this IS the mechanism that makes recurrence demotion a threshold change
+  # rather than suppression: the finding stays in .findings (still counted,
+  # still rendered by cmd_render_review, still in the audit trail) with its
+  # honest severity untouched; it simply no longer contributes to whether
+  # /ship blocks. A finding without the annotation (feature off, or key
+  # uncomputable that round) is counted exactly as before — the exclusion is
+  # additive and only ever REDUCES the blocker count, never increases it.
   if command -v jq >/dev/null 2>&1; then
     R=$(jq -r --argjson tr "$TR" '
       def rank(s):
@@ -1744,7 +2165,7 @@ severity_blockers() {
         elif $s == "medium" then 2
         elif $s == "low" then 1
         else 0 end;
-      [(.findings // [])[] | select(rank(.severity) >= $tr)] | length
+      [(.findings // [])[] | select(rank(.severity) >= $tr and (._recurrence_demoted // false) != true)] | length
     ' "$FILE" 2>/dev/null)
     if [ -z "$R" ]; then echo 99; else echo "$R"; fi
   elif command -v python3 >/dev/null 2>&1; then
@@ -1756,7 +2177,11 @@ try:
 except Exception:
     print(99); sys.exit(0)
 tr = int(sys.argv[2])
-print(sum(1 for f in d.get("findings", []) if ranks.get(str(f.get("severity","")).lower(),0) >= tr))
+print(sum(
+    1 for f in d.get("findings", [])
+    if ranks.get(str(f.get("severity","")).lower(),0) >= tr
+    and f.get("_recurrence_demoted") is not True
+))
 PY
   else
     # No validator at all — fail closed. Sentinel 99 makes the audit-row
@@ -2143,8 +2568,19 @@ cmd_render_review() {
   FILE="${1:-$REPO_ROOT/.clagentic/lite/last-review.json}"
   [ -f "$FILE" ] || { echo "no review file at $FILE" 1>&2; return 1; }
   if command -v jq >/dev/null 2>&1; then
+    # A recurrence-demoted finding (lr-66e598: _review_recurrence_demote,
+    # gates.sh) gets a "reported N rounds running — decide" suffix so the
+    # operator sees WHY a finding that looks blocking-severity did not gate
+    # /ship, rather than the demotion being silent. Task constraint (c):
+    # "surface the recurrence count in the rendered review output ... so a
+    # repeated bounce is legible to the operator." Findings without the
+    # annotation (feature off, or first report) render exactly as before —
+    # this is purely additive text on the same line.
     jq -r '"== clagentic-lite review ==\nsummary: " + .summary + "\nfindings: " + (.findings | length | tostring) + "\n",
-           (.findings[] | "[" + .severity + "] " + .file + ":" + (.line|tostring) + " " + .message)' \
+           (.findings[] | "[" + .severity + "] " + .file + ":" + (.line|tostring) + " " + .message +
+             (if ._recurrence_demoted == true
+              then " (reported " + (._recurrence_count | tostring) + " rounds running — decide)"
+              else "" end))' \
       "$FILE"
   else
     cat "$FILE"

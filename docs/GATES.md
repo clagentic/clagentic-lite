@@ -219,6 +219,66 @@ in the repo history.
 
 Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/config` (global). See `share/config.example` for the full entry.
 
+### Cross-round finding recurrence demotion (lr-66e598)
+
+Backstop for the general case of "no loop state exists anywhere in
+clagentic-lite" — round N+1's reviewer prompt has no record of round N's
+findings, so the same class of concern can be reported, argued about, and
+re-reported indefinitely with nothing counting the rounds. Recurrence
+demotion is a second use of the same content-hash key space
+`finding_content_keys` (`scripts/review-merge.sh`) cross-round dedup already
+computes — where dedup only tests membership ("have we seen this key
+before" → suppress), recurrence tracking counts occurrences ("how many
+rounds has this key been reported in" → demote at a threshold).
+
+**Relationship to cross-round dedup.** The two mechanisms compose, in this
+order, every round: dedup runs first and can suppress a finding outright
+(same content-hash key seen before → dropped from `.findings` entirely, per
+"Cross-round finding dedup" above); recurrence demotion then runs only
+against whatever survived dedup. This means a finding whose content-hash key
+is byte-identical round to round is dedup's job — it is suppressed starting
+round 2 and recurrence demotion never gets a second round to count. Where
+recurrence demotion actually matters is when dedup is off
+(`CLAGENTIC_CROSS_ROUND_DEDUP=0`, in which case a finding's own occurrence
+count still accrues every round it is reported) — the mechanism inherits the
+SAME "survives line shifts, not content edits" key-stability property dedup
+has (see "Cross-round finding dedup" above); it does not invent a fuzzier
+notion of sameness.
+
+| | |
+|---|---|
+| **Feature flag** | Same as cross-round dedup — runs only when `CLAGENTIC_CROSS_ROUND_DEDUP=1` (default on). Recurrence tracking depends on the same per-round content-hash-keying pass dedup performs on the diff, so the two share one on/off switch. |
+| **Threshold** | `CLAGENTIC_RECURRENCE_THRESHOLD` (default `2`, floored at `2` — a finding can only be demoted after being reported before AND reported again; a first-ever report is never demotable regardless of configuration). |
+| **Counts file** | `.clagentic/lite/review-recurrence.json` (gitignored, local gate state — same directory convention as `review-seen-keys` and `invariants.json`). A JSON object mapping content-hash key → integer round-count, maintained by `finding_recurrence_bump` (`scripts/review-merge.sh`). |
+| **Effect** | A review finding that survives cross-round dedup (i.e. is still reported this round) AND whose content-hash key has now recurred at or above the threshold is annotated `_recurrence_count` (integer) and `_recurrence_demoted: true` on the finding object. `severity_blockers()` (`scripts/gates.sh`) excludes `_recurrence_demoted` findings from its block count. **Threshold only, never suppression**: the finding remains in `.findings`, fully visible in `last-review.json`, `cmd_render_review`'s terminal output (rendered with a `(reported N rounds running — decide)` suffix), and the audit trail — only its eligibility to gate `/ship` changes. |
+| **Audit trail** | Every recurrence pass logs a `gate_runs` row (`gate=review-recurrence`) recording `demoted:N threshold:T`, and the operator sees a stderr notice (`[recurrence] N finding(s) demoted to advisory ...`) when N > 0. |
+| **Reset** | `clagentic-lite gates review --reset-dedup` deletes BOTH `.clagentic/lite/review-seen-keys` AND `.clagentic/lite/review-recurrence.json` — a reset means every finding is treated as fresh in both senses (not suppressed by dedup, and not recurrence-demoted). |
+| **Conservative bias** | Identical posture to cross-round dedup, applied to demotion instead of suppression: empty key → retained, un-demoted. Splice failure → original findings retained untouched. No JSON tool at all → full passthrough, `last-review.json` unmodified. A finding is annotated only when its key was actually computable this round; an uncomputable key never accrues a count and can never be demoted. |
+| **Scope** | Review findings only (Gate 3). Adversarial findings (Gate 5) already have their own two-tier `reachable`/`tier` mechanism (see "Blocking vs advisory" above) with its own mechanical security-floor clamp; recurrence demotion does not read or write adversarial findings and has no interaction with that clamp — a finding held `tier: blocking` by the security floor is a Gate 5 concept entirely outside this function's reach. |
+
+Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/config` (global). See `share/config.example` for the full entry.
+
+**Ingest sanitization — closing a self-exempting-suppression gap (BOBBIE-caught follow-up).** `last-review.json` is written directly from the LLM's raw structured JSON output; the only pre-write validation (`validate_output`, `scripts/llm-client.sh`) checks that `.findings` is an array and that each `.severity`, if present, is a legal enum value — it does not allowlist the object's field set. Before this fix, a model (compromised, manipulated by attacker-influenced code under review, or simply emitting whatever the prompt schema loosely tolerates) could include `_recurrence_demoted: true` directly in its own JSON response. `_review_recurrence_demote`'s splice only *overwrites* `_recurrence_count`/`_recurrence_demoted` on a finding whose `(file, category, message)` triple matches a row in the current round's content-hash-keyed TSV (i.e. whose cited line falls inside `finding_content_keys`' diff-context window); a finding outside that window was left untouched, so a self-forged `_recurrence_demoted: true` on a **first-ever-reported** finding survived verbatim into `last-review.json`, and `severity_blockers()` (which reads `._recurrence_demoted` with no provenance check) excluded it from the block count — a finding could self-exempt from blocking with zero actual repetition.
+
+The fix has two independent layers:
+
+1. **Ingest strip (the actual closure point).** `_sanitize_review_findings_envelope` (`scripts/gates.sh`) reduces every finding to the closed review-finding schema — `severity`, `file`, `line`, `category`, `message`, `evidence`, `suggestion` (the exact fields `ds_review_prompt`, `scripts/llm-client.sh`, documents) — via `_llm_json_array_allowlist_fields` (`scripts/platform.sh`), dropping every other key including any `_recurrence_demoted`/`_recurrence_count` the model itself supplied. It runs immediately after **every** raw LLM write to an envelope file: the single-pass path's `$OUT`, and each per-chunk envelope in the chunked path *before* `merge_envelopes` ever unions chunks (`merge_envelopes`/`dedup_findings` are pure concatenation/dedup with no field validation of their own, so an unsanitized chunk would have carried a forged field through the merge untouched). This mirrors the established choke-point pattern `_sanitize_adversarial_findings_json` and the deferrals allowlist already use elsewhere in this codebase — sanitize once at the one true ingest boundary, not at every reader.
+2. **Own-the-field in the splice (defense in depth).** `_review_recurrence_demote`'s unmatched branch (a finding whose triple has no match in this round's bumped TSV) now sets `_recurrence_count: 0` / `_recurrence_demoted: false` explicitly rather than leaving the finding object untouched — so even if the ingest strip were ever bypassed, skipped, or reordered by a future change, this function still writes a definite, function-decided value for every finding it processes rather than trusting whatever the object already carried.
+
+**`line` field type widening.** `_llm_json_array_allowlist_fields`'s base contract keeps only string-valued fields (correct for `deferrals.json`, an all-string schema). Review findings' `line` field is legitimately a JSON number, so the function now accepts a `"fieldname:number"` suffix that declares that ONE field's type as number instead of string (a type declaration, not an added alternative — a string value under a `:number` field is dropped, never coerced; a JSON boolean is explicitly excluded from the numeric type even though Python's `bool` is an `int` subclass). See `scripts/platform.sh`'s updated docstring for the full contract.
+
+**Field-provenance enumeration (why this fix is sufficient and complete).** Every field that can influence a blocking decision across Gate 3 and Gate 5, enumerated with its origin and validation mechanism:
+
+| Field | Object | Origin | Validation before a blocking read | Forgeable |
+|---|---|---|---|---|
+| `severity` | review finding | raw LLM JSON | Enum-checked in `validate_output` (`scripts/llm-client.sh`); re-normalized case-insensitively by `severity_rank`/`rank()` (`scripts/gates.sh`) | No (closed enum) |
+| `_recurrence_demoted`, `_recurrence_count` | review finding | raw LLM JSON (before this fix) / gates.sh-only (after) | `_sanitize_review_findings_envelope` strips both unconditionally at ingest; `_review_recurrence_demote` additionally owns both explicitly for every finding it touches | No (closed by ingest strip + own-the-field) |
+| `file`, `line`, `category`, `message`, `evidence`, `suggestion` | review finding | raw LLM JSON | Reduced to exactly these seven keys (closed schema) by `_sanitize_review_findings_envelope`; `line` type-restricted to number, the rest to string | Not a blocking lever on their own; free text is unsanitized on this path (no `_llm_field_sanitize` call — this schema is not currently interpolated into a later prompt the way invariants/deferrals are, so the round-trip-injection concern that motivates `_llm_field_sanitize` elsewhere does not apply here; if a future change ever feeds review findings back into a prompt, that call site must add sanitization at that point) |
+| `severity`, `reachable`, `tier`, `class`, `line` | adversarial finding | constructed by `_parse_adversarial_findings` from named regex capture groups into a fixed Python dict literal with exactly 8 keys (`scripts/gates.sh`) | Each enum-validated and force-corrected at parse time; the security-floor clamp (`reachable=="yes"` and severity high/critical → `tier` forced `"blocking"`) runs unconditionally after `class` resolves | No — this object is never a decode of attacker-supplied JSON, so no extra key (forged or otherwise) can exist on it at all; see "Every field in the parsed finding record, enumerated" under Gate 6 for the field-by-field detail |
+| `file`, `category`, `message` (title) | adversarial finding | same fixed dict literal (free text from regex capture) | `_llm_field_sanitize` via `_sanitize_adversarial_findings_json` | No (sanitized; and, per above, no extra key can exist regardless) |
+
+The structural reason the two gates needed different treatment: the adversarial-findings path never decodes attacker-supplied JSON — it builds each finding as a code-controlled dict literal with a fixed key set, so an extra key cannot exist on the object at all (the `_llm_json_array_sanitize_fields`-only treatment `_sanitize_adversarial_findings_json` uses is safe *because* of this). The review-findings path decodes the model's own raw JSON response directly — a field set an attacker (or a manipulated/miscalibrated model) can freely add to — which is exactly the shape `_llm_json_array_allowlist_fields` exists to close (the same reasoning `docs/GATES.md` "Reviewer-consulted deferrals" already documents for `deferrals.json`, a different attacker-influenced-field-set case). Before this fix, review findings were the one remaining consumer of externally-authored JSON with no allowlist step — a third state alongside "closed code-controlled field set" (adversarial findings) and "allowlist-then-sanitize" (deferrals) that the standing invariant does not permit.
+
 ### Exit-code contract for `gates.sh review` and `gates.sh ship`
 
 `gates.sh review` distinguishes two failure classes with separate exit codes. CI and operator scripts should branch on these:
