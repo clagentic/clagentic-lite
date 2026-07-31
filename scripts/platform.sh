@@ -533,6 +533,129 @@ PYEOF
     | cut -c "1-${_lfs_max}"
 }
 
+# _llm_json_array_allowlist_fields JSON FIELD1 [FIELD2 ...] — decompose a
+# JSON array of objects and reduce EVERY object to ONLY the named fields,
+# DROPPING every other key entirely (lr-4f8316 second follow-up). This is
+# the schema-validation step that MUST run before
+# _llm_json_array_sanitize_fields (below) whenever the array's field set is
+# attacker-influenced, not code-controlled -- see that function's own
+# "SAFE ONLY for callers with a closed, code-controlled field set" warning.
+#
+# WHY THIS IS A SEPARATE FUNCTION, NOT A CHANGE TO
+# _llm_json_array_sanitize_fields: the adversarial-findings caller
+# (_sanitize_adversarial_findings_json, gates.sh) depends on
+# _llm_json_array_sanitize_fields' CURRENT contract -- pass through every
+# field not named in the sanitize call (line/severity/reachable/tier/class
+# survive untouched). That caller is safe leaving those fields alone
+# because _parse_adversarial_findings constructs each finding from named
+# regex capture groups: an attacker cannot introduce an arbitrary key at
+# all, the field set is fixed by the parser's own code. Deferrals reads an
+# arbitrary JSON object off disk -- an attacker who can write
+# .clagentic/deferrals.json can add any key they like, and sanitizing only
+# the SIX NAMED schema fields left every other key riding through
+# byte-identical: undefanged, unstripped, uncapped. Same helper, different
+# input model, and that difference is the whole bug (BOBBIE, lr-4f8316
+# third follow-up). Changing _llm_json_array_sanitize_fields to allowlist
+# by default would silently break the adversarial-findings caller's
+# reliance on "unnamed fields pass through" -- so the fix is a NEW function
+# callers with an attacker-influenced field set call FIRST, not a change to
+# the existing one.
+#
+# Also coerces every RETAINED value to a plain string, dropping (not
+# stringifying) any field whose value is not a JSON string -- an object,
+# array, number, bool, or null. The deferrals schema (docs/GATES.md
+# "Reviewer-consulted deferrals") defines every field as free-form text;
+# a legitimate field holding a nested object/array has no defined meaning
+# either, and passing one through as an embedded JSON blob (even under a
+# real field name) would smuggle attacker content one level deep, past a
+# sanitizer that only inspects the field it was told to look at as a flat
+# string. Dropping is correct here, matching the "unknown key -> drop, not
+# merely sanitize" posture for the field set itself: there is no defined
+# meaning to forward in any form.
+#
+# Fail-open: a non-array or malformed JSON input, or the complete absence
+# of jq AND python3, returns the ORIGINAL input unchanged -- identical
+# fail-open posture to _llm_json_array_sanitize_fields, so the caller's own
+# fail-open contract (deferrals: absent/empty/malformed does not break
+# review) composes cleanly across both steps.
+#
+# Args: JSON (a JSON array of objects), FIELD1..FIELDN (the CLOSED set of
+# field names this array's schema defines).
+# stdout: the reduced JSON array (or the original JSON, on any failure).
+_llm_json_array_allowlist_fields() {
+  _ljaaf_json="$1"
+  shift
+  _ljaaf_fields="$*"
+  if [ -z "$_ljaaf_fields" ]; then
+    # No fields named at all: every key would be dropped from every
+    # object. That is very likely a caller bug (an empty allowlist is
+    # never a real schema), not an intentional "keep nothing" -- fail open
+    # with the original input rather than silently emptying every object,
+    # matching this function's fail-open posture on every other error path.
+    printf '%s' "$_ljaaf_json"
+    return 0
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    if ! printf '%s' "$_ljaaf_json" | jq -e '. | type == "array"' >/dev/null 2>&1; then
+      printf '%s' "$_ljaaf_json"
+      return 0
+    fi
+    # Build a jq array-literal of the allowed field names once, then apply
+    # a single filter: for each object, keep only entries whose key is in
+    # the allowlist AND whose value is a string (drop non-string values
+    # under an allowed key name too -- see docstring above).
+    _ljaaf_fields_json="[]"
+    for _ljaaf_field in $_ljaaf_fields; do
+      _ljaaf_fields_json=$(printf '%s' "$_ljaaf_fields_json" | jq -c --arg f "$_ljaaf_field" '. + [$f]' 2>/dev/null)
+      [ -n "$_ljaaf_fields_json" ] || { printf '%s' "$_ljaaf_json"; return 0; }
+    done
+    _ljaaf_out=$(printf '%s' "$_ljaaf_json" | jq -c --argjson allowed "$_ljaaf_fields_json" \
+      '[.[] | (if type == "object" then with_entries(select(([.key] | inside($allowed)) and (.value | type == "string"))) else {} end)]' \
+      2>/dev/null)
+    [ -n "$_ljaaf_out" ] || { printf '%s' "$_ljaaf_json"; return 0; }
+    printf '%s' "$_ljaaf_out"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    _ljaaf_out=$(python3 - "$_ljaaf_json" $_ljaaf_fields <<'PYEOF'
+import json, sys
+
+raw = sys.argv[1]
+allowed = set(sys.argv[2:])
+
+try:
+    arr = json.loads(raw)
+    if not isinstance(arr, list):
+        raise ValueError("not a list")
+except Exception:
+    print(raw)
+    sys.exit(0)
+
+reduced = []
+for item in arr:
+    if not isinstance(item, dict):
+        reduced.append({})
+        continue
+    # Keep only allowed keys whose value is a plain string -- drop unknown
+    # keys entirely, and drop (do not stringify) a known key holding a
+    # non-string (object/array/number/bool/null) value.
+    reduced.append({k: v for k, v in item.items() if k in allowed and isinstance(v, str)})
+
+print(json.dumps(reduced))
+PYEOF
+)
+    [ -n "$_ljaaf_out" ] || { printf '%s' "$_ljaaf_json"; return 0; }
+    printf '%s' "$_ljaaf_out"
+    return 0
+  fi
+
+  # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open: same
+  # posture as _llm_json_array_sanitize_fields' own no-JSON-tool path.
+  printf '%s' "$_ljaaf_json"
+}
+
 # _llm_json_array_sanitize_fields JSON FIELD1 [FIELD2 ...] — decompose a
 # JSON array of objects, run _llm_field_sanitize over each named string
 # field on every object, rebuild, and print the sanitized array. Generic
@@ -545,10 +668,24 @@ PYEOF
 # array-of-objects round-trip in this codebase should extend this function
 # rather than growing a parallel decompose/sanitize/rebuild loop.
 #
-# Fields not named in FIELD... pass through unchanged (e.g. non-text or
-# already-enum-validated fields elsewhere in this codebase, though this
-# function itself does not special-case those — callers name exactly the
-# string fields they want sanitized).
+# Fields not named in FIELD... pass through UNCHANGED, undefanged, uncapped
+# -- this function sanitizes exactly the fields it is told to and nothing
+# else; it does not know or enforce a schema. That is SAFE ONLY when the
+# caller controls the object's field set in code -- e.g.
+# _sanitize_adversarial_findings_json (gates.sh), where
+# _parse_adversarial_findings constructs every finding from named regex
+# capture groups, so no key outside file/line/category/message/severity/
+# reachable/tier/class can ever exist on the object in the first place.
+#
+# It is UNSAFE to call this function alone on a JSON array whose field set
+# an attacker can influence (e.g. an on-disk file an attacker can write) --
+# any key not in FIELD... rides through byte-identical: undefanged,
+# unstripped, uncapped (BOBBIE, lr-4f8316 third follow-up). A caller in
+# that position MUST run _llm_json_array_allowlist_fields (above) FIRST, to
+# reduce every object to the closed schema before this function ever sees
+# it -- see that function's docstring for why this is a separate function
+# rather than a change to this one's contract (this contract is depended
+# on by the adversarial-findings caller and must not change).
 #
 # Fail-open, matching every other JSON-tool-dependent helper in this
 # codebase: an empty/malformed JSON array, or the complete absence of jq

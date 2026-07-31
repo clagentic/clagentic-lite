@@ -220,12 +220,25 @@ ds_review_prompt() {
   # an injection here does not just confuse the Reviewer, it can silence
   # it. This was previously the one remaining unsanitized, unfenced
   # interpolation site in llm-client.sh -- structurally identical to the
-  # change-class hint before its own lr-4f8316 fix. Same treatment now
-  # applies: decompose the array, sanitize each model-facing string field
-  # via _llm_json_array_sanitize_fields (platform.sh, the same
-  # decompose/sanitize/rebuild machinery the adversarial findings sidecar
-  # uses -- not a hand-rolled variant), fence the result, and frame it as
-  # data, not instructions.
+  # change-class hint before its own lr-4f8316 fix. Treatment: allowlist
+  # the six documented schema fields (dropping any other key entirely --
+  # see _llm_json_array_allowlist_fields, platform.sh), THEN sanitize what
+  # survives, fence the result, and frame it as data, not instructions.
+  #
+  # SECURITY (lr-4f8316 third follow-up, BOBBIE-caught): the allowlist step
+  # is NOT optional and must run BEFORE sanitization, not instead of it or
+  # after. _llm_json_array_sanitize_fields only sanitizes the fields it is
+  # told to sanitize -- an attacker who can write deferrals.json could add
+  # an arbitrary extra key to a deferral object, and that key would ride
+  # through the sanitizer byte-identical: undefanged, unstripped, uncapped.
+  # Deferrals reads an arbitrary JSON object off disk, unlike the
+  # adversarial-findings caller of the same sanitize function, whose field
+  # set is fixed by _parse_adversarial_findings' own regex capture groups
+  # and cannot contain an attacker-introduced key at all -- that is the
+  # whole reason the two callers need different treatment. Reducing to the
+  # closed schema FIRST (_llm_json_array_allowlist_fields) is what makes
+  # "only six named fields get sanitized" safe here: after the reduction,
+  # there is no seventh field left to have skipped.
   _drp_deferrals=""
   _drp_dfile="$REPO_ROOT/.clagentic/deferrals.json"
   if [ -f "$_drp_dfile" ]; then
@@ -235,28 +248,94 @@ ds_review_prompt() {
   fi
 
   if [ -n "$_drp_deferrals" ]; then
-    # Sanitize each of the six schema fields (docs/GATES.md "Reviewer-
-    # consulted deferrals"): id/category/file/description/expires/
-    # acknowledged_by -- all free-form operator text, all model-facing.
-    # _llm_json_array_sanitize_fields fails open (returns the input
-    # unchanged) if the content is not a valid JSON array or no JSON tool
-    # is available; run one further best-effort text-level sanitize pass
-    # in that case rather than interpolating the raw blob completely
-    # unsanitized -- a malformed-JSON deferrals file must still degrade
-    # cleanly (fail-open on WHETHER deferrals apply), but "cleanly" does
-    # not mean "unsanitized" when a sanitize pass is still possible on
-    # whatever text is actually there.
-    _drp_deferrals_clean=$(_llm_json_array_sanitize_fields "$_drp_deferrals" \
-      id category file description expires acknowledged_by)
-    if [ "$_drp_deferrals_clean" = "$_drp_deferrals" ]; then
-      # Decompose/rebuild made no change -- either genuinely already clean,
-      # or (more likely, given untrusted input) decompose failed and the
-      # helper fell back to returning the original. Either way, run the
-      # plain text-level sanitize pass as a second layer: idempotent on
-      # already-clean content, and closes the gap on content the JSON
-      # decomposer could not parse.
+    # Two-stage pipeline, in this exact order (lr-4f8316 third follow-up):
+    #
+    #   1. ALLOWLIST first: reduce every deferral object to ONLY the six
+    #      documented schema fields (docs/GATES.md "Reviewer-consulted
+    #      deferrals"): id/category/file/description/expires/
+    #      acknowledged_by. Any other key an attacker-writable
+    #      deferrals.json might carry is DROPPED entirely here, before
+    #      sanitization ever sees it -- _llm_json_array_sanitize_fields
+    #      only sanitizes the fields it is told to, so a key outside this
+    #      list would otherwise ride through byte-identical (undefanged,
+    #      unstripped, uncapped) if sanitize ran on the raw object.
+    #   2. SANITIZE second: only after every surviving field is a known,
+    #      schema-legal string does _llm_field_sanitize run over each one.
+    #
+    # Both steps fail open with the input UNCHANGED on non-array/malformed
+    # JSON (same posture, same "identical to input" signal). Use jq's own
+    # array-validity check as the decompose-succeeded signal instead of a
+    # same-as-input string comparison against the allowlist step's own
+    # output -- an allowlist reduction can legitimately equal its input's
+    # formatting in edge cases (e.g. a single-entry array with only the six
+    # allowed fields, no drops needed), so "changed vs unchanged" is not a
+    # reliable proxy for "did decompose succeed" the way it was for the
+    # single-stage sanitize-only pipeline this replaces.
+    _drp_deferrals_is_array=0
+    if command -v jq >/dev/null 2>&1; then
+      if printf '%s' "$_drp_deferrals" | jq -e '. | type == "array"' >/dev/null 2>&1; then
+        _drp_deferrals_is_array=1
+      fi
+    elif command -v python3 >/dev/null 2>&1; then
+      _drp_deferrals_is_array=$(python3 -c 'import json,sys
+try:
+    print("1" if isinstance(json.loads(sys.argv[1]), list) else "0")
+except Exception:
+    print("0")' "$_drp_deferrals" 2>/dev/null)
+      case "$_drp_deferrals_is_array" in 1) : ;; *) _drp_deferrals_is_array=0 ;; esac
+    fi
+
+    if [ "$_drp_deferrals_is_array" = "1" ]; then
+      _drp_deferrals_allowlisted=$(_llm_json_array_allowlist_fields "$_drp_deferrals" \
+        id category file description expires acknowledged_by)
+      _drp_deferrals_clean=$(_llm_json_array_sanitize_fields "$_drp_deferrals_allowlisted" \
+        id category file description expires acknowledged_by)
+    else
+      # Not a JSON array at all (malformed deferrals.json) -- the
+      # allowlist/sanitize pipeline has nothing to decompose. Run the
+      # plain text-level sanitize pass on the raw blob as the fallback
+      # layer instead of interpolating it completely unsanitized: a
+      # malformed-JSON deferrals file must still degrade cleanly
+      # (fail-open on WHETHER deferrals apply), but "cleanly" does not
+      # mean "unsanitized" when a sanitize pass is still possible on
+      # whatever text is actually there. This path structurally cannot
+      # carry attacker-controlled EXTRA KEYS (there is no object to
+      # decompose), so the allowlist step has nothing to add here — see
+      # the non-JSON-fallback audit note below for why this path is not
+      # weaker than the field-level path despite skipping the allowlist.
       _drp_deferrals_clean=$(_llm_field_sanitize "$_drp_deferrals")
     fi
+
+    # AUDIT CONCLUSION (lr-4f8316 third follow-up, re-audit of the
+    # non-JSON fallback per BOBBIE's request): an attacker CANNOT obtain
+    # weaker treatment by deliberately malforming deferrals.json to route
+    # onto the whole-blob _llm_field_sanitize fallback instead of the
+    # allowlist+sanitize field-level path. Reasoning:
+    #   - Defang coverage is IDENTICAL: both paths call the same
+    #     _llm_field_sanitize function with no custom max, so both get the
+    #     same control-byte strip and the same fence-label defang list.
+    #     There is no second, weaker sanitizer on the fallback path.
+    #   - Length cap is STRICTER on the fallback, not weaker: the
+    #     field-level path caps EACH of up to N*6 fields independently at
+    #     _invariant_feed_max_field_chars (default 500 chars) -- an
+    #     N-entry array can carry up to N*6*500 chars of aggregate content
+    #     through the fence. The fallback caps the ENTIRE raw blob at that
+    #     same 500-char default in one pass -- an attacker gains nothing
+    #     size-wise by malforming the file; they lose capacity.
+    #   - The "six known fields" SCHEMA FRAMING is not weakened either: the
+    #     fixed prompt text below tells the Reviewer to use only the
+    #     id/category/file/description/expires/acknowledged_by fields as
+    #     deferral data regardless of which path produced the fenced
+    #     content, and on the fallback path there is no object structure
+    #     at all for the model to misread as having MORE fields than it
+    #     does -- the content is presented as opaque text, not as JSON
+    #     claiming a field it doesn't have.
+    # Net: deliberately malforming the file trades "structured deferral
+    # data" for "opaque sanitized text, capped shorter" -- strictly worse
+    # for an attacker's payload capacity, never a downgrade in defang
+    # coverage. This conclusion should be re-verified if either sanitizer
+    # call site's arguments (custom max, defang list) ever diverge between
+    # the two paths.
 
     # Write to a temp file and cat it directly -- never interpolate
     # untrusted content into a double-quoted shell string (same discipline
