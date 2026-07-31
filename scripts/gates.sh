@@ -1984,8 +1984,22 @@ cmd_merge_gate() {
     # stamped inside gate-summary.json (review._clagentic_diff_sha, written by
     # _stamp_envelope via build_gate_summary) and compare it to HEAD. Refuse
     # if the SHA is missing or mismatches — the caller must rebuild first.
+    #
+    # `_git rev-parse HEAD` alone is not enough: `git -C <dir> ...` only
+    # changes cwd before git's own repo discovery runs, so it still walks up
+    # the filesystem looking for a `.git` directory. On a host where an
+    # ancestor of REPO_ROOT happens to be a git repo (or is itself REPO_ROOT's
+    # own ancestor, as with the wrapper/.clagentic-project layout REPO_ROOT
+    # can legitimately resolve to without being a git repo — see
+    # ds_repo_root, platform.sh), that walk-up would incorrectly resolve a
+    # real SHA belonging to a different repo. Guard against this by requiring
+    # the resolved toplevel to equal REPO_ROOT itself before trusting the SHA.
     _mg_summary_sha=""
-    _mg_head_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+    _mg_head_sha=""
+    _mg_git_toplevel=$(_git rev-parse --show-toplevel 2>/dev/null || echo "")
+    if [ "$_mg_git_toplevel" = "$REPO_ROOT" ]; then
+      _mg_head_sha=$(_git rev-parse HEAD 2>/dev/null || echo "")
+    fi
     if [ -n "$_mg_head_sha" ]; then
       if command -v jq >/dev/null 2>&1; then
         _mg_summary_sha=$(jq -r '.review._clagentic_diff_sha // ""' "$IN" 2>/dev/null || echo "")
