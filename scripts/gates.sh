@@ -682,6 +682,26 @@ _review_recurrence_threshold() {
 # step leaves the original findings untouched, un-annotated, un-demoted —
 # same fail-open direction as _cross_round_dedup's own failure paths. No JSON
 # tool at all is a full passthrough — ENVELOPE_FILE is left byte-identical.
+#
+# SECURITY PRECONDITION (lr-66e598 follow-up, BOBBIE-caught): this function
+# ASSUMES ENVELOPE_FILE's findings have already been reduced to the closed
+# review-finding schema by _sanitize_review_findings_envelope (this file),
+# which every caller runs immediately after the raw LLM write and before
+# this function ever sees the file. Before that fix existed, a finding whose
+# triple did NOT match a row in this round's bumped TSV was `continue`d over
+# UNTOUCHED below -- so a model that emitted _recurrence_demoted:true in its
+# OWN raw JSON response had that self-forged value survive verbatim, and a
+# first-ever-reported finding could self-exempt from blocking with zero
+# actual repetition. The splice below now explicitly OWNS the field for
+# every finding it processes (sets a definite _recurrence_count/
+# _recurrence_demoted even on the unmatched branch) as a second, independent
+# layer -- but the real closure point is the upstream ingest strip; this
+# function's own defense-in-depth does not substitute for it, since a
+# forged field on a MATCHED finding would still need the ingest strip to
+# have never let non-schema fields (or a spoofed value this splice
+# overwrites correctly, by coincidence, only on the matched path) reach this
+# function's other, non-recurrence-related reads of the object in the first
+# place.
 _review_recurrence_demote() {
   _rrd_envelope="$1"
   _rrd_diff="$2"
@@ -783,9 +803,21 @@ demoted = 0
 for f in findings:
     if not isinstance(f, dict):
         continue
+    # OWN THE FIELD, DO NOT MERELY OVERWRITE-ON-MATCH (BOBBIE, lr-66e598
+    # follow-up): every finding this loop touches gets an EXPLICIT,
+    # definite _recurrence_demoted/_recurrence_count this function itself
+    # decided -- never a value left over from whatever the object already
+    # carried (in-band ingest is stripped upstream by
+    # _sanitize_review_findings_envelope, but this is the second,
+    # independent layer: even if that upstream strip were ever bypassed,
+    # skipped, or a future refactor moved this call before it, an
+    # unmatched finding still gets a definite False here, not a `continue`
+    # that leaves whatever pre-existing value untouched).
     triple = (str(f.get("file", "")), str(f.get("category", "")), str(f.get("message", "")))
     count = counts_by_triple.get(triple)
     if count is None:
+        f["_recurrence_count"] = 0
+        f["_recurrence_demoted"] = False
         continue
     f["_recurrence_count"] = count
     f["_recurrence_demoted"] = bool(count >= threshold)
@@ -855,6 +887,10 @@ PYEOF2
 # failure). jq-then-python3 fallback, matching the pattern used throughout
 # this file (e.g. _cross_round_dedup's own findings extraction) rather than
 # introducing a third way to read the same shape.
+#
+# NOT a validation point: this is a pure read, matching every caller's
+# expectation that FILE has already been sanitized by
+# _sanitize_review_findings_envelope (below) BEFORE any of them ever see it.
 _extract_findings_json() {
   _efj_file="$1"
   if command -v jq >/dev/null 2>&1; then
@@ -865,6 +901,116 @@ _extract_findings_json() {
   else
     printf '[]'
   fi
+}
+
+# _sanitize_review_findings_envelope FILE
+#
+# SECURITY (lr-66e598 follow-up, BOBBIE-caught). Reduces FILE's .findings
+# array in place to EXACTLY the closed review-finding schema
+# (ds_review_prompt, llm-client.sh: severity/file/line/category/message/
+# evidence/suggestion) via _llm_json_array_allowlist_fields
+# (scripts/platform.sh), DROPPING every other key -- including, critically,
+# any `_recurrence_demoted` / `_recurrence_count` (or any other future
+# internal `_`-prefixed control field) the MODEL ITSELF may have emitted in
+# its raw JSON response.
+#
+# WHY THIS EXISTS: last-review.json is written directly from LLM output
+# (llm-client.sh's `review` role) with no field allowlist anywhere on that
+# write path -- validate_output (llm-client.sh) checks only that .findings
+# is an array and that .severity, if present, is a legal enum value. Nothing
+# stopped a model (compromised, manipulated by attacker-influenced code
+# under review, or simply miscalibrated) from emitting
+# {"severity":"critical", ..., "_recurrence_demoted": true} in its
+# structured JSON on the FIRST-EVER round. Before this fix,
+# _review_recurrence_demote's splice step only OVERWRITES
+# _recurrence_demoted/_recurrence_count on a finding whose (file,category,
+# message) triple matches a row in this round's bumped TSV (i.e. whose line
+# falls inside finding_content_keys' diff-context window); a finding whose
+# triple does NOT match is `continue`d over UNTOUCHED (see
+# _review_recurrence_demote), so a self-forged _recurrence_demoted:true
+# survived verbatim into last-review.json and severity_blockers (which reads
+# ._recurrence_demoted with no provenance check) excluded it from the block
+# count -- a first-ever-reported finding could self-exempt from blocking
+# with zero actual repetition. Overwrite-on-match is not the same as
+# owning the field.
+#
+# THE FIX IS AT INGEST, THE SAME CHOKE-POINT PATTERN THIS CODEBASE ALREADY
+# USES: _sanitize_adversarial_findings_json sanitizes immediately after
+# _parse_adversarial_findings and before the sidecar is EVER written to
+# disk (docs/GATES.md "Round-trip sanitization"); ds_review_prompt
+# allowlists deferrals.json before it is EVER interpolated into a prompt.
+# This function is the equivalent choke point for review findings: it MUST
+# run immediately after every raw LLM write to an envelope file (both the
+# single-pass path and each per-chunk envelope in the chunked path, BEFORE
+# merge_envelopes ever unions them -- merge_envelopes/dedup_findings are
+# pure concatenation/dedup with no field validation of their own, so an
+# unsanitized chunk would carry a forged field through the merge
+# untouched), and BEFORE _cross_round_dedup, _review_recurrence_demote,
+# severity_blockers, or cmd_render_review ever read the file. Once this
+# runs, there is no field left on any finding object for
+# _review_recurrence_demote or severity_blockers to trust-by-accident --
+# the ONLY way _recurrence_demoted/_recurrence_count can exist on a finding
+# from this point forward is if THIS repo's own code (the recurrence
+# splice) put it there this round.
+#
+# NUMERIC `line` FIELD: _llm_json_array_allowlist_fields' base contract
+# keeps only STRING-valued fields (safe for deferrals.json, an all-string
+# schema) -- review findings legitimately define `line` as a JSON number
+# (ds_review_prompt). Rather than write a second, parallel stripper for
+# this one schema (which would violate "reuse the existing allowlist
+# helper, do not grow a parallel one" the same way _llm_json_array_
+# sanitize_fields' own docstring warns against), _llm_json_array_
+# allowlist_fields was widened to accept a "fieldname:number" suffix that
+# ALSO permits a plain JSON number under that one key (still dropping an
+# object/array/bool/null there, never coercing) -- see that function's
+# updated docstring in platform.sh for the exact contract and why bool is
+# explicitly excluded from the numeric-accepted branch.
+#
+# CONSERVATIVE BIAS, matching every other on-disk-envelope helper in this
+# file: if FILE is missing, unparseable, has no .findings array, or
+# _llm_json_array_allowlist_fields' own fail-open path is hit (no jq/
+# python3), the function makes NO changes and returns 0 -- a strip failure
+# must never turn into "findings vanish" (that would be an over-suppression,
+# the exact failure direction docs/GATES.md:150 forbids) or "findings block
+# on a synthetic error" (severity_blockers' own sentinel-99 path already
+# owns fail-closed for genuinely unparseable JSON; this function's job is
+# narrower than that and must not duplicate or fight it).
+_sanitize_review_findings_envelope() {
+  _srfe_file="$1"
+  [ -f "$_srfe_file" ] || return 0
+
+  _srfe_findings=$(_extract_findings_json "$_srfe_file")
+  [ -n "$_srfe_findings" ] || return 0
+
+  _srfe_clean=$(_llm_json_array_allowlist_fields "$_srfe_findings" \
+    severity file "line:number" category message evidence suggestion)
+  [ -n "$_srfe_clean" ] || return 0
+
+  if command -v jq >/dev/null 2>&1; then
+    _srfe_tmp=$(mktemp -t clagentic-srfe-env.XXXXXX)
+    if jq --argjson nf "$_srfe_clean" '.findings = $nf' "$_srfe_file" > "$_srfe_tmp" 2>/dev/null; then
+      mv "$_srfe_tmp" "$_srfe_file"
+    else
+      rm -f "$_srfe_tmp"
+    fi
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$_srfe_file" "$_srfe_clean" <<'PYEOF' 2>/dev/null
+import json, sys
+env_path, clean_json = sys.argv[1], sys.argv[2]
+try:
+    with open(env_path) as f:
+        env = json.load(f)
+    clean = json.loads(clean_json)
+    if not isinstance(clean, list):
+        raise ValueError("not a list")
+    env["findings"] = clean
+    with open(env_path, "w") as f:
+        json.dump(env, f)
+except Exception:
+    sys.exit(1)
+PYEOF
+  fi
+  return 0
 }
 
 # _invariant_feed_max_lines — line cap on invariants.json entries. Guards
@@ -1213,6 +1359,16 @@ cmd_review() {
         _crv_env_file=$(printf '%s/envelope-%03d.json' "$_crv_env_dir" "$_crv_cidx")
         printf '[gates/review] reviewing chunk %d/%d (%d bytes)\n' "$_crv_cidx" "$_crv_nchunks" "$_crv_cbytes" 1>&2
         "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_chunk" > "$_crv_env_file" 2>/dev/null || true
+        # SECURITY (lr-66e598 follow-up): strip every finding in THIS chunk's
+        # raw envelope to the closed review-finding schema BEFORE
+        # merge_envelopes ever unions it with the other chunks --
+        # merge_envelopes/dedup_findings are pure concatenation/dedup with
+        # no field validation of their own, so an unsanitized chunk would
+        # carry a model-forged internal field (e.g. a self-set
+        # _recurrence_demoted) straight through the merge. See
+        # _sanitize_review_findings_envelope's own doc comment for the full
+        # rationale.
+        _sanitize_review_findings_envelope "$_crv_env_file"
         # Audit one row per chunk.
         _crv_chunk_outcome="pass"
         if review_is_degraded "$_crv_env_file" 2>/dev/null; then
@@ -1305,6 +1461,15 @@ cmd_review() {
   # Single-pass path (original behavior).
   "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_diff_tmp" > "$OUT"
   # Note: _crv_diff_tmp is NOT deleted yet — cross-round dedup needs it below.
+
+  # SECURITY (lr-66e598 follow-up): strip every finding to the closed
+  # review-finding schema IMMEDIATELY after the raw LLM write and BEFORE
+  # anything else (stamp, dedup, recurrence, severity_blockers,
+  # cmd_render_review) ever reads $OUT. See _sanitize_review_findings_envelope's
+  # own doc comment for the full rationale — this is the choke point that
+  # closes the self-exempting-suppression gap a raw, unallowlisted model
+  # finding could otherwise use.
+  _sanitize_review_findings_envelope "$OUT"
 
   # Stamp the output with the current HEAD SHA so build_gate_summary can
   # detect stale payloads (file written against a different branch/commit).
