@@ -1387,14 +1387,22 @@ import json, re, sys
 path = sys.argv[1]
 findings = []
 # CWE and file:line are mandatory leading fields. severity is mandatory.
-# reachable/tier are optional (may be absent entirely, in either order
-# relative to each other, as long as both precede title when present) so a
-# model still emitting the old 4-field header keeps parsing. title remains
-# the final field, capturing to end-of-line.
+# reachable/tier/class are optional (may be absent entirely, in any order
+# relative to each other, as long as all precede title when present) so a
+# model still emitting an older header keeps parsing. title remains the
+# final field, capturing to end-of-line.
+#
+# `class` (lr-4f8316) is the Auditor's own resolved change-class judgment
+# for the diff this finding lives in -- durable|ephemeral, see
+# ds_adversarial_prompt for the vocabulary and threshold implications. It is
+# a per-finding field (like reachable/tier) purely so it rides the same
+# parse loop and sanitize path; in practice one diff has one resolved class,
+# so every finding from the same adversarial pass carries the same value.
 header_re = re.compile(
     r'^\[FINDING\]\s*([^|]+)\|\s*([^|]+)\|\s*severity:\s*([^|]+?)\s*'
     r'(?:\|\s*reachable:\s*([^|]+?)\s*)?'
     r'(?:\|\s*tier:\s*([^|]+?)\s*)?'
+    r'(?:\|\s*class:\s*([^|]+?)\s*)?'
     r'\|\s*title:\s*(.+)$'
 )
 try:
@@ -1413,7 +1421,8 @@ for line in lines:
     severity_raw = m.group(3).strip().lower()
     reachable_raw = (m.group(4) or "").strip().lower()
     tier_raw = (m.group(5) or "").strip().lower()
-    title = m.group(6).strip()
+    class_raw = (m.group(6) or "").strip().lower()
+    title = m.group(7).strip()
     if ":" in fileline:
         fname, _, lineno = fileline.rpartition(":")
         try:
@@ -1422,7 +1431,7 @@ for line in lines:
             fname, lineno = fileline, 0
     else:
         fname, lineno = fileline, 0
-    # severity is a closed set, same as reachable/tier below -- enum-check
+    # severity is a closed set, same as reachable/tier/class below -- enum-check
     # and force-correct rather than pass the raw captured text through.
     # Before this (lr-e2b975 follow-up), severity was free text bounded only
     # by the next "|" in the header line: model- or attacker-authored text
@@ -1449,6 +1458,18 @@ for line in lines:
         tier = "advisory"
     if reachable != "yes":
         tier = "advisory"
+    # class (lr-4f8316): closed set durable|ephemeral, absent/unparseable
+    # defaults to "durable" -- fail-closed on the SAME axis severity/
+    # reachable/tier fail-open on (never-under-block), because durable is
+    # the class that does NOT relax the blocking threshold. A parser gap in
+    # this field can therefore only ever leave the full bar in place, never
+    # silently grant a downgrade. Unlike tier, class is never force-corrected
+    # from another field here -- whether an ephemeral class actually excuses
+    # THIS finding (vs. it being a security-floor item that blocks
+    # regardless of class) is the Auditor's own judgment call, made before
+    # it ever writes the tier field; the parser only records what the model
+    # declared, it does not re-derive the class/tier interaction.
+    change_class = class_raw if class_raw in ("durable", "ephemeral") else "durable"
     findings.append({
         "file": fname,
         "line": lineno,
@@ -1457,6 +1478,7 @@ for line in lines:
         "severity": severity,
         "reachable": reachable,
         "tier": tier,
+        "class": change_class,
     })
 print(json.dumps(findings))
 PYEOF
@@ -1510,6 +1532,17 @@ PYEOF
 #     FORCE-CORRECTED at parse time (unrecognized/absent -> "advisory", and
 #     force-corrected again to "advisory" whenever reachable != "yes").
 #     Same reasoning as severity/reachable.
+#   class     — closed set (durable/ephemeral, lr-4f8316). ENUM-VALIDATED AND
+#     FORCE-CORRECTED at parse time (unrecognized/absent -> "durable" — the
+#     class that does NOT relax the blocking threshold, so a parser gap can
+#     only ever leave the full bar in place, never silently grant a
+#     downgrade). Same reasoning as severity/reachable/tier: after
+#     validation there is no free text left in the field. NOT re-derived
+#     into tier here or in the parser — whether ephemeral excuses a given
+#     finding (vs. it being a security-floor item that blocks regardless of
+#     class) is the Auditor's own judgment, already folded into the tier
+#     field it wrote; this function and the parser only record the
+#     declared class, they do not recompute tier from it.
 #   line      — always an int (parse failure on the numeric suffix falls
 #     back to 0 in _parse_adversarial_findings). Not text; nothing to
 #     sanitize; not enum-shaped either, so "validated" isn't quite the right
@@ -1517,12 +1550,12 @@ PYEOF
 #     pass-through of the captured string).
 #
 # Net: every field is either free-text-and-sanitized (file/category/message)
-# or closed-set-and-force-corrected-at-parse-time (severity/reachable/tier)
-# or non-text-by-construction (line). There is no field in this record that
-# is "probably fine" or asserted-safe-without-a-mechanism — each one has an
-# actual enforcement point, named above, that a future change to this
-# function or to _parse_adversarial_findings should re-verify still holds
-# before relying on this comment again.
+# or closed-set-and-force-corrected-at-parse-time (severity/reachable/tier/
+# class) or non-text-by-construction (line). There is no field in this
+# record that is "probably fine" or asserted-safe-without-a-mechanism — each
+# one has an actual enforcement point, named above, that a future change to
+# this function or to _parse_adversarial_findings should re-verify still
+# holds before relying on this comment again.
 _sanitize_adversarial_findings_json() {
   _safj_json="$1"
 
@@ -1758,6 +1791,28 @@ except Exception:
 
   "$TOOL_HOME/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT"
 
+  # Resolved change class + downgrade count (lr-4f8316): read back from the
+  # gate-summary payload ($IN, the exact input build_gate_summary produced)
+  # so the audit trail records which class applied to this ship attempt and
+  # how many findings it downgraded — independent of the merge-gate's own
+  # decision, since the class is gate plumbing, not a merge-gate judgment
+  # call. Empty/unparseable is silently treated as "no class info" (fail-open,
+  # matching the rest of this codepath); a missing class never blocks.
+  _mg_class=""
+  _mg_class_downgraded=0
+  if command -v jq >/dev/null 2>&1; then
+    _mg_class=$(jq -r '.resolved_change_class // ""' "$IN" 2>/dev/null || echo "")
+    _mg_class_downgraded=$(jq -r '.adversarial_downgraded_by_class_count // 0' "$IN" 2>/dev/null || echo 0)
+  elif command -v python3 >/dev/null 2>&1; then
+    _mg_class=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d.get("resolved_change_class"); print(v if v else "")' "$IN" 2>/dev/null || echo "")
+    _mg_class_downgraded=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("adversarial_downgraded_by_class_count",0))' "$IN" 2>/dev/null || echo 0)
+  fi
+  case "$_mg_class_downgraded" in ''|*[!0-9]*) _mg_class_downgraded=0 ;; esac
+  _mg_class_suffix=""
+  if [ -n "$_mg_class" ]; then
+    _mg_class_suffix=" [class=$_mg_class downgraded=$_mg_class_downgraded]"
+  fi
+
   DECISION=""
   if command -v jq >/dev/null 2>&1; then
     DECISION=$(jq -r '.decision // "unknown"' "$OUT" 2>/dev/null)
@@ -1788,13 +1843,13 @@ print("; ".join(parts))
         fi
       fi
       if [ "${ACK_COUNT:-0}" -gt 0 ]; then
-        cmd_log_run "$_mg_gate_name" pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL"
+        cmd_log_run "$_mg_gate_name" pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL$_mg_class_suffix"
       else
-        cmd_log_run "$_mg_gate_name" pass "approve"
+        cmd_log_run "$_mg_gate_name" pass "approve$_mg_class_suffix"
       fi
       ;;
     refuse)
-      cmd_log_run "$_mg_gate_name" block "refuse"
+      cmd_log_run "$_mg_gate_name" block "refuse$_mg_class_suffix"
       cat "$OUT"
       # Default blocking; set CLAGENTIC_MERGE_GATE_BLOCKING=0 to override.
       if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
@@ -2041,6 +2096,39 @@ build_gate_summary() {
     ADV_ADVISORY_COUNT=$(printf '%s' "$ADF_PAYLOAD" | jq '[.[] | select(.tier == "advisory")] | length' 2>/dev/null || echo 0)
     case "$ADV_BLOCKING_COUNT" in ''|*[!0-9]*) ADV_BLOCKING_COUNT=0 ;; esac
     case "$ADV_ADVISORY_COUNT" in ''|*[!0-9]*) ADV_ADVISORY_COUNT=0 ;; esac
+    # Resolved change class (lr-4f8316): the Auditor states its own class
+    # judgment per finding (see _parse_adversarial_findings); one diff has
+    # one resolved class in practice, so "any finding says ephemeral" is the
+    # mechanical resolution rule -- a single ephemeral-classified finding
+    # means the Auditor read the diff as ephemeral overall. null when there
+    # are no findings at all (nothing to resolve; the merge-gate and audit
+    # trail should not fabricate a class for a clean pass).
+    RESOLVED_CHANGE_CLASS='null'
+    ADF_LEN=$(printf '%s' "$ADF_PAYLOAD" | jq 'length' 2>/dev/null || echo 0)
+    case "$ADF_LEN" in ''|*[!0-9]*) ADF_LEN=0 ;; esac
+    if [ "$ADF_LEN" -gt 0 ]; then
+      if printf '%s' "$ADF_PAYLOAD" | jq -e 'any(.[]; .class == "ephemeral")' >/dev/null 2>&1; then
+        RESOLVED_CHANGE_CLASS='"ephemeral"'
+      else
+        RESOLVED_CHANGE_CLASS='"durable"'
+      fi
+    fi
+    # Mechanical proxy for "downgraded because of class" (lr-4f8316): a
+    # finding that met the blocking-eligible bar on reachability+severity
+    # (reachable:yes, severity high/critical -- the same two conditions
+    # "Blocking vs advisory" requires) but still rode as tier:advisory,
+    # while class:ephemeral. This is an approximation, not a claim that
+    # class was necessarily the deciding factor -- a security-floor
+    # override (live credential, real exploit path) also forces
+    # tier:advisory to never apply per the prompt contract, so those never
+    # match this shape in the first place; nothing else currently could
+    # produce reachable:yes + high/critical + tier:advisory. Recorded in the
+    # audit trail so a human can see how many findings the class shifted,
+    # not just what the resolved class was.
+    ADV_DOWNGRADED_BY_CLASS_COUNT=$(printf '%s' "$ADF_PAYLOAD" | jq \
+      '[.[] | select(.class == "ephemeral" and .tier == "advisory" and .reachable == "yes" and (.severity == "high" or .severity == "critical"))] | length' \
+      2>/dev/null || echo 0)
+    case "$ADV_DOWNGRADED_BY_CLASS_COUNT" in ''|*[!0-9]*) ADV_DOWNGRADED_BY_CLASS_COUNT=0 ;; esac
     # Fenced, explicit-data-block rendering of the (already sanitized)
     # adversarial findings, mirroring the invariant-feed's
     # ===BEGIN/END INVARIANTS DATA=== treatment (lr-e2b975, matches
@@ -2060,6 +2148,8 @@ build_gate_summary() {
   "adversarial_findings_fenced": $ADF_FENCED_PAYLOAD,
   "adversarial_blocking_count": $ADV_BLOCKING_COUNT,
   "adversarial_advisory_count": $ADV_ADVISORY_COUNT,
+  "resolved_change_class": $RESOLVED_CHANGE_CLASS,
+  "adversarial_downgraded_by_class_count": $ADV_DOWNGRADED_BY_CLASS_COUNT,
   "adversarial_acks": $ACKS_PAYLOAD,
   "accepted_risks": $AR_PAYLOAD,
   "introduces_ack_file": $INTRODUCES_ACK_FILE,
@@ -2117,6 +2207,29 @@ if adf_path:
         adv_findings = []
 adv_blocking_count = sum(1 for f in adv_findings if isinstance(f, dict) and f.get("tier") == "blocking")
 adv_advisory_count = sum(1 for f in adv_findings if isinstance(f, dict) and f.get("tier") == "advisory")
+# Resolved change class + downgrade count (lr-4f8316) -- same rules as the
+# jq branch above: resolved class is "ephemeral" if any finding declares
+# class:ephemeral, else "durable" if there is at least one finding, else
+# null (nothing to resolve on a clean pass). The downgrade count is a
+# mechanical proxy -- reachable:yes + severity high/critical + tier:advisory
+# + class:ephemeral -- for "this finding met the blocking bar and rode as
+# advisory under an ephemeral class"; see the jq branch's comment for why
+# this cannot double as a claim that class was necessarily the deciding
+# factor (a security-floor override produces the same never-advisory
+# outcome regardless of class, so it never reaches this shape either way).
+resolved_change_class = None
+if adv_findings:
+    resolved_change_class = "ephemeral" if any(
+        isinstance(f, dict) and f.get("class") == "ephemeral" for f in adv_findings
+    ) else "durable"
+adv_downgraded_by_class_count = sum(
+    1 for f in adv_findings
+    if isinstance(f, dict)
+    and f.get("class") == "ephemeral"
+    and f.get("tier") == "advisory"
+    and f.get("reachable") == "yes"
+    and f.get("severity") in ("high", "critical")
+)
 # Fenced, explicit-data-block rendering (lr-e2b975) -- same
 # ===BEGIN/END ADVERSARIAL FINDINGS DATA=== fence the jq branch above emits
 # via _fence_adversarial_findings, mirroring ds_adversarial_prompt's
@@ -2151,6 +2264,8 @@ print(json.dumps({
     "adversarial_findings_fenced": adv_findings_fenced,
     "adversarial_blocking_count": adv_blocking_count,
     "adversarial_advisory_count": adv_advisory_count,
+    "resolved_change_class": resolved_change_class,
+    "adversarial_downgraded_by_class_count": adv_downgraded_by_class_count,
     "adversarial_acks": acks,
     "accepted_risks": ar,
     "introduces_ack_file": introduces_ack,
@@ -2169,10 +2284,10 @@ PY
   # limitation the adversarial markdown field already has above.
   if [ -f "$RV" ]; then
     cat <<EOF
-{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
+{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "resolved_change_class": null, "adversarial_downgraded_by_class_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
 EOF
   else
-    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
+    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
   fi
 }
 
