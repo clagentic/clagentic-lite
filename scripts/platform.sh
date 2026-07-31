@@ -350,3 +350,181 @@ ds_pending_reset() {
   DS_PENDING_INSTALLS=""
   export DS_PENDING_INSTALLS
 }
+
+# ------------------------------------------------ LLM-text sanitization ------
+#
+# Moved here from gates.sh (lr-4f8316 follow-up). Both functions are
+# unchanged behavior from their original gates.sh bodies — this is a
+# relocation, not a rewrite. WHY HERE: llm-client.sh interpolates external
+# text (a change-class hint read from a commit message) directly into a
+# system prompt, but llm-client.sh does not source gates.sh — only
+# platform.sh, which every prompt-constructing script in this codebase
+# already sources. The gap that shipped an unsanitized interpolation (the
+# change-class hint had no sanitizer call, no fence, no data-vs-instruction
+# framing, unlike the adjacent invariants block) was structurally forced by
+# _llm_field_sanitize living in a file llm-client.sh could not reach — not
+# a call site that merely forgot to use it. Moving the sanitizer to the one
+# file both gates.sh and llm-client.sh already source makes that omission
+# impossible for the next round-trip path, rather than merely fixing this
+# one instance.
+
+# _invariant_feed_max_field_chars — per-field length cap applied at the write
+# boundary (see _llm_field_sanitize). Configurable via
+# CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS (default 500 — generous for a
+# one-sentence CWE title/statement, small enough that a single adversarial-
+# controlled finding cannot balloon invariants.json or the prompt it is later
+# injected into).
+_invariant_feed_max_field_chars() {
+  _ifmfc_max="${CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS:-500}"
+  case "$_ifmfc_max" in ''|*[!0-9]*) _ifmfc_max=500 ;; esac
+  printf '%s' "$_ifmfc_max"
+}
+
+# _llm_field_sanitize TEXT [MAX_CHARS] — neutralize LLM-controlled OR
+# otherwise externally-sourced text before it is ever written to a file or
+# interpolated into a prompt block that a LATER LLM call reads (lr-cda4b9,
+# generalized under lr-e2b975, relocated to platform.sh under lr-4f8316 so
+# every prompt-constructing file can reach it). WRITE-BOUNDARY/
+# INTERPOLATION-BOUNDARY sanitization, not read-time: every known round-trip
+# or interpolation path — the invariant-feed (_invariant_feed_append,
+# gates.sh), the adversarial findings sidecar consumed by
+# build_gate_summary/ds_merge_gate_prompt, and the change-class
+# commit-message hint (_change_class_hint, llm-client.sh) — has exactly one
+# ingest point and an unknown/growing number of future readers. Cleaning
+# once at ingest means every reader gets clean data for free, instead of
+# every current AND future reader needing to remember to re-sanitize. This
+# is the SOLE sanitizer for externally-sourced text that lands in a prompt
+# in this codebase — do not add a second one; if a new round-trip or
+# interpolation path needs different behavior, extend this function.
+#
+# Applied to every field that ultimately traces back to adversarial/review
+# LLM output or other external text a prompt interpolates: for the
+# invariant-feed, category/file/the distilled statement (which embeds the
+# original finding message verbatim); for the adversarial findings sidecar,
+# each finding's title/message and any other model-authored string field;
+# for the change-class hint, the raw commit-message trailer value before it
+# is surfaced to the Reviewer/Auditor prompts.
+#
+# Args: TEXT (required), MAX_CHARS (optional — falls back to
+# _invariant_feed_max_field_chars's default/config value when omitted, since
+# every current caller wants the same cap; a future caller needing a
+# different cap can pass one explicitly rather than this function growing a
+# second knob).
+#
+# Neutralizes prompt-control sequences without attempting semantic
+# interpretation (this is gate plumbing, not a role — no LLM call here,
+# consistent with _invariant_feed_distill's own "mechanical, not an LLM
+# call" framing):
+#   - Strips ASCII control/non-printable bytes (0x00-0x08, 0x0B-0x1F, 0x7F),
+#     including ANSI/terminal escape sequences a hostile finding could embed
+#     to visually spoof a delimiter or hide text from a human audit-log
+#     reader. Newline (0x0A) and tab (0x09) are preserved — legitimate
+#     structure in a multi-line finding message, not a control sequence.
+#   - Collapses the delimiter label a hostile finding could forge to fake a
+#     new data-block boundary once re-injected into a future prompt — both
+#     the invariant-feed fence (===BEGIN/END INVARIANTS DATA===,
+#     ds_adversarial_prompt in llm-client.sh) and the adversarial-findings
+#     fence the merge-gate prompt uses (===BEGIN/END ADVERSARIAL FINDINGS
+#     DATA===) are defanged unconditionally, regardless of which pipeline a
+#     given finding is travelling through — a payload could be planted once
+#     and land in either round-trip. Case-insensitively replaces each
+#     literal label string with a defanged spaced-out form. This does not
+#     make the text nonsensical to a human reviewer (the words are still
+#     legible) but prevents it from being byte-identical to the real
+#     delimiter the model was told to trust. Without this, a finding
+#     containing a literal fence string survives verbatim into the written
+#     artifact and can forge a fake end-of-data marker inside the block,
+#     escaping the fence entirely (BOBBIE, lr-cda4b9 follow-up).
+#   - Caps length at MAX_CHARS, truncating rather than rejecting — a
+#     merely-too-long finding is not attacker behavior, and rejecting it
+#     would silently drop a real finding (fail-open posture matches the
+#     rest of the invariant-feed and the advisory/blocking split).
+_llm_field_sanitize() {
+  _lfs_text="$1"
+  _lfs_max="${2:-$(_invariant_feed_max_field_chars)}"
+  case "$_lfs_max" in ''|*[!0-9]*) _lfs_max=$(_invariant_feed_max_field_chars) ;; esac
+
+  if command -v python3 >/dev/null 2>&1; then
+    # Text goes through a temp file, NOT stdin: `python3 -` already reads the
+    # script itself from stdin (the heredoc below), so piping the untrusted
+    # text into the same stdin would either be silently discarded or
+    # interleaved with the script depending on shell/buffering — the data
+    # channel and the script channel must be different file descriptors.
+    _lfs_tmp=$(mktemp -t clagentic-llm-sanitize.XXXXXX)
+    printf '%s' "$_lfs_text" > "$_lfs_tmp"
+    python3 - "$_lfs_tmp" "$_lfs_max" <<'PYEOF'
+import re
+import sys
+
+path, max_chars = sys.argv[1], int(sys.argv[2])
+with open(path) as f:
+    text = f.read()
+
+# Strip ANSI/terminal escape sequences (CSI, OSC, and bare ESC-prefixed
+# sequences) before the general control-char strip below, so a multi-byte
+# escape sequence does not leave stray printable fragments behind.
+text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)   # CSI: ESC [ ... letter
+text = re.sub(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)', '', text)  # OSC: ESC ] ... BEL/ST
+text = re.sub(r'\x1b.', '', text)                   # any remaining ESC + one byte
+
+# Strip remaining control/non-printable bytes, preserving tab and newline.
+text = ''.join(ch for ch in text if ch in ('\t', '\n') or 0x20 <= ord(ch) != 0x7f)
+
+# Defang forged delimiter labels: a hostile finding message (or, as of
+# lr-4f8316, a hostile commit-message change-class trailer) could contain
+# the literal string "INVARIANTS:" or "DEFERRED FINDINGS:" -- or any of the
+# fenced data-block marker sets this codebase uses (===BEGIN/END INVARIANTS
+# DATA===, the invariant-feed fence in ds_adversarial_prompt; ===BEGIN/END
+# ADVERSARIAL FINDINGS DATA===, the merge-gate fence in
+# ds_merge_gate_prompt; ===BEGIN/END CHANGE-CLASS HINT DATA===, the
+# change-class hint fence in both ds_review_prompt and ds_adversarial_prompt
+# -- all llm-client.sh) -- to try to spoof a fresh data-block boundary once
+# re-injected into a future prompt. Insert a zero-width-safe space so the
+# string is still legible to a human but no longer byte-identical to the
+# real delimiter. All fence sets are defanged unconditionally here (not
+# gated by which caller invoked this function) since a single planted
+# payload could round-trip through any path.
+for label in ("INVARIANTS:", "DEFERRED FINDINGS:", "END INVARIANTS",
+              "END DEFERRED FINDINGS",
+              "===BEGIN INVARIANTS DATA===", "===END INVARIANTS DATA===",
+              "===BEGIN ADVERSARIAL FINDINGS DATA===",
+              "===END ADVERSARIAL FINDINGS DATA===",
+              "===BEGIN CHANGE-CLASS HINT DATA===",
+              "===END CHANGE-CLASS HINT DATA==="):
+    pattern = re.compile(re.escape(label), re.IGNORECASE)
+    text = pattern.sub(lambda m: ' '.join(m.group(0)), text)
+
+# Truncate so the FINAL string (content + suffix) fits within max_chars --
+# slicing to max_chars and then appending the suffix would let the suffix
+# push the total length past the configured cap (PEACHES, lr-cda4b9
+# follow-up).
+suffix = "...[truncated]"
+if len(text) > max_chars:
+    keep = max(max_chars - len(suffix), 0)
+    text = text[:keep] + suffix
+
+sys.stdout.write(text)
+PYEOF
+    _lfs_status=$?
+    rm -f "$_lfs_tmp"
+    return $_lfs_status
+  fi
+
+  # No python3: best-effort POSIX fallback. tr strips the bulk of control
+  # bytes (octal escapes for 0x01-0x08, 0x0B-0x1F, 0x7F; 0x00 cannot appear
+  # in a shell string so no explicit strip needed); sed defangs all fenced
+  # marker sets specifically (literal, fixed-case substitution — no GNU/BSD
+  # sed extension needed, unlike a general case-insensitive label match);
+  # cut caps length. This path does NOT defang the case-insensitive
+  # INVARIANTS:/DEFERRED FINDINGS: labels the python3 path covers (no
+  # portable case-insensitive substitution without sed extensions that vary
+  # GNU/BSD) — acceptable degradation given no-python3 already means jq is
+  # the active JSON tool elsewhere in this codepath. The fenced markers ARE
+  # covered here because they are the labels an attacker could use to
+  # escape a fence entirely (BOBBIE, lr-cda4b9 follow-up), so this path
+  # closes that specific gap even though it cannot close the general one.
+  printf '%s' "$_lfs_text" \
+    | tr -d '\001-\010\013-\037\177' \
+    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g; s|===BEGIN ADVERSARIAL FINDINGS DATA===|= = =BEGIN ADVERSARIAL FINDINGS DATA= = =|g; s|===END ADVERSARIAL FINDINGS DATA===|= = =END ADVERSARIAL FINDINGS DATA= = =|g; s|===BEGIN CHANGE-CLASS HINT DATA===|= = =BEGIN CHANGE-CLASS HINT DATA= = =|g; s|===END CHANGE-CLASS HINT DATA===|= = =END CHANGE-CLASS HINT DATA= = =|g' \
+    | cut -c "1-${_lfs_max}"
+}
