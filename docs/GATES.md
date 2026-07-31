@@ -112,17 +112,19 @@ Fields:
 | `expires` | no | ISO date after which the deferral should be reconsidered |
 | `acknowledged_by` | no | Who approved the deferral |
 
-**Suppression is inside model judgment, not gate code.** The deferrals file is
-injected verbatim into the reviewer system prompt. The gate does NOT parse
+**Suppression is inside model judgment, not gate code.** The deferrals file's
+six documented schema fields reach the reviewer system prompt as claims to
+weigh (see "Round-trip sanitization and fencing" below for how the transport
+is hardened — the semantics here are unchanged). The gate does NOT parse
 finding output to post-filter based on deferrals. If the LLM still emits a
 finding despite a deferral entry, the finding stands. This is intentional:
 the LLM is better placed to reason about whether a deferral is still applicable
 than a regex or equality match in shell code.
 
 **`expires` field semantics:** the gate does not parse or compute expiry dates.
-The expiry text is passed to the LLM verbatim so the model can reason about
-whether the deferral is still valid given the current context. The gate has no
-date arithmetic.
+The expiry text is passed to the LLM (sanitized, see below) so the model can
+reason about whether the deferral is still valid given the current context.
+The gate has no date arithmetic.
 
 **Fail-open:** if `.clagentic/deferrals.json` is absent or empty, the review
 runs as if no deferrals exist. The gate never blocks on a missing deferrals
@@ -133,31 +135,64 @@ surfaced to the Reviewer — fail-open on *whether deferrals apply*, not on
 text-level sanitize pass and the LLM will ignore text it cannot interpret
 as a deferral list.
 
-**Round-trip sanitization and fencing (lr-4f8316 follow-up).** `.clagentic/deferrals.json`
-is gitignored, but gitignored means *untracked and unreviewed*, not
-*write-restricted* — it is not an enforced property, it is an assumption.
-Any process with filesystem write access to the working tree (a compromised
-dependency, a build step, an agent with Write access) can populate this
-file, and because the content never appears in a diff, it is never
-code-reviewed — weaker provenance than the change-class commit-message
-hint (which at least travels through git history), not stronger. Deferrals
-also carry the highest payoff of any prompt-interpolation site in this
-codebase: a deferral literally suppresses a finding, so a forged or
-injected entry does not just confuse the Reviewer, it can silence it.
+**Round-trip sanitization and fencing (lr-4f8316 follow-up, hardened in a
+second follow-up pass).** `.clagentic/deferrals.json` is gitignored, but
+gitignored means *untracked and unreviewed*, not *write-restricted* — it is
+not an enforced property, it is an assumption. Any process with filesystem
+write access to the working tree (a compromised dependency, a build step,
+an agent with Write access) can populate this file, and because the
+content never appears in a diff, it is never code-reviewed — weaker
+provenance than the change-class commit-message hint (which at least
+travels through git history), not stronger. Deferrals also carry the
+highest payoff of any prompt-interpolation site in this codebase: a
+deferral literally suppresses a finding, so a forged or injected entry
+does not just confuse the Reviewer, it can silence it.
 
-`ds_review_prompt` (`scripts/llm-client.sh`) now decomposes the deferrals
-array and sanitizes each of the six schema fields
-(`id`/`category`/`file`/`description`/`expires`/`acknowledged_by`) via
-`_llm_json_array_sanitize_fields` (`scripts/platform.sh`) — the same
-shared decompose/sanitize/rebuild machinery `_sanitize_adversarial_findings_json`
-(`scripts/gates.sh`) uses for the adversarial findings sidecar, reused
-rather than reimplemented — before wrapping the result in a
-`===BEGIN/END DEFERRED FINDINGS DATA===` fence with the same
-treat-as-data framing the invariants and change-class-hint blocks use. If
-the content is not valid JSON (so it cannot be decomposed field-by-field),
-the whole blob still goes through one `_llm_field_sanitize` pass — control
-bytes stripped, forged fence labels defanged — rather than being
-interpolated completely raw.
+`ds_review_prompt` (`scripts/llm-client.sh`) runs a two-stage pipeline, in
+this order:
+
+1. **Allowlist** — `_llm_json_array_allowlist_fields` (`scripts/platform.sh`)
+   reduces every deferral object to ONLY the six documented schema fields
+   (`id`/`category`/`file`/`description`/`expires`/`acknowledged_by`).
+   Any other key is DROPPED entirely, not sanitized-and-kept — an
+   unrecognized key has no defined meaning to the Reviewer. A known field
+   name holding a non-string value (a nested object or array) is also
+   dropped, not stringified: the schema defines every field as plain
+   text, so a nested structure under a real key name has no defined
+   meaning either, and passing it through would smuggle attacker content
+   one level deep past a sanitizer that inspects a field as flat text.
+2. **Sanitize** — only after every surviving field is a known, schema-legal
+   string does `_llm_json_array_sanitize_fields` (the same shared
+   decompose/sanitize/rebuild machinery `_sanitize_adversarial_findings_json`,
+   `scripts/gates.sh`, uses for the adversarial findings sidecar) run
+   `_llm_field_sanitize` over each one.
+
+**Why the allowlist step exists as a separate function, not a change to the
+sanitize step's contract:** `_llm_json_array_sanitize_fields` sanitizes
+only the fields it is told to and passes every other key through
+unchanged — safe for the adversarial-findings caller (its field set is
+fixed by `_parse_adversarial_findings`' own regex capture groups; an
+attacker cannot introduce a key at all) but unsafe for deferrals, which
+reads an arbitrary JSON object off disk. The first version of this fix
+sanitized only the six named fields without first reducing the object to
+that schema — any extra key an attacker added rode through byte-identical,
+undefanged, unstripped, uncapped. The allowlist step closes that gap by
+running BEFORE sanitization, so there is no seventh field left for the
+sanitizer to have skipped.
+
+The result is wrapped in a `===BEGIN/END DEFERRED FINDINGS DATA===` fence
+with the same treat-as-data framing the invariants and change-class-hint
+blocks use. If the content is not valid JSON (so there is no object to
+decompose), the whole blob still goes through one `_llm_field_sanitize`
+pass — control bytes stripped, forged fence labels defanged — rather than
+being interpolated completely raw. This non-JSON fallback path is not
+weaker than the field-level path: both call the same sanitizer with the
+same defang list, and the whole-blob cap (`CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS`,
+default 500 chars) is stricter in aggregate than the field-level path's
+per-field cap applied across up to six fields per entry. Deliberately
+malforming the file to route onto this path trades structured deferral
+data for shorter, opaquely-sanitized text — never a downgrade in defang
+coverage.
 
 **Deferrals vs. `accepted-risks.md`:**
 

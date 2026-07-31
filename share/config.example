@@ -247,17 +247,22 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # File: .clagentic/deferrals.json in the enrolled repo (gitignored — already
 # under .clagentic/ which gates.sh gitignores, so no extra config needed).
 #
-# When present, the file's entries are sanitized field-by-field (control
+# When present, every deferral object is first reduced to ONLY the six
+# documented schema fields below — any other key is DROPPED entirely, not
+# forwarded in any form (see _llm_json_array_allowlist_fields in
+# scripts/platform.sh) — then each surviving field is sanitized (control
 # bytes stripped, forged fence-label markers defanged — see
-# _llm_json_array_sanitize_fields in scripts/platform.sh) and injected,
-# fenced as data, into the reviewer system prompt before the diff is
-# reviewed. Content and semantics survive (the LLM still uses its judgment
-# to decide whether each deferral still applies — suppression happens
-# inside model reasoning, not in gate code; the gate does NOT post-filter
-# findings based on this file) — only the transport into the prompt is
-# hardened. Treat this file as untrusted, external text even though it is
-# operator-facing: gitignored means untracked and unreviewed, not
-# write-restricted.
+# _llm_json_array_sanitize_fields, same file) and injected, fenced as data,
+# into the reviewer system prompt before the diff is reviewed. Content and
+# semantics survive (the LLM still uses its judgment to decide whether each
+# deferral still applies — suppression happens inside model reasoning, not
+# in gate code; the gate does NOT post-filter findings based on this file)
+# — only the transport into the prompt is hardened. Treat this file as
+# untrusted, external text even though it is operator-facing: gitignored
+# means untracked and unreviewed, not write-restricted, and an attacker
+# who can write this file could otherwise smuggle an arbitrary extra key
+# (or a non-string value under a real key name) past a sanitizer that only
+# inspects the fields it is told to look at.
 #
 # Fail-open: if the file is absent, empty, or unreadable, the review proceeds
 # as if no deferrals exist. The gate never blocks on a missing deferrals file.
