@@ -647,7 +647,7 @@ _invariant_feed_max_lines() {
 }
 
 # _invariant_feed_max_field_chars — per-field length cap applied at the write
-# boundary (see _invariant_feed_sanitize_field). Configurable via
+# boundary (see _llm_field_sanitize). Configurable via
 # CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS (default 500 — generous for a
 # one-sentence CWE title/statement, small enough that a single adversarial-
 # controlled finding cannot balloon invariants.json or the prompt it is later
@@ -658,17 +658,30 @@ _invariant_feed_max_field_chars() {
   printf '%s' "$_ifmfc_max"
 }
 
-# _invariant_feed_sanitize_field TEXT — neutralize adversarial-LLM-controlled
-# finding text before it is ever written to invariants.json (lr-cda4b9,
-# hardening the round-trip lr-24c80e/lr-63359e shipped). WRITE-BOUNDARY
-# sanitization, not read-time: invariants.json has exactly one writer
-# (_invariant_feed_append, below) and an unknown/growing number of future
-# readers (today: ds_adversarial_prompt; potentially the merge-gate summary
-# or a future consumer) — cleaning once at ingest means every reader gets
-# clean data for free, instead of every current AND future reader needing to
-# remember to re-sanitize. Applied to every field that ultimately traces back
-# to adversarial/review LLM output: category, file, and the distilled
-# statement (which embeds the original finding message verbatim).
+# _llm_field_sanitize TEXT [MAX_CHARS] — neutralize LLM-controlled text
+# before it is ever written to a file or prompt block that a LATER LLM call
+# reads back (lr-cda4b9, generalized under lr-e2b975). WRITE-BOUNDARY
+# sanitization, not read-time: every known round-trip path — the
+# invariant-feed (_invariant_feed_append, below) and the adversarial
+# findings sidecar consumed by build_gate_summary/ds_merge_gate_prompt — has
+# exactly one writer and an unknown/growing number of future readers.
+# Cleaning once at ingest means every reader gets clean data for free,
+# instead of every current AND future reader needing to remember to
+# re-sanitize. This is the SOLE sanitizer for LLM-authored text that
+# round-trips into a later prompt — do not add a second one; if a new
+# round-trip path needs different behavior, extend this function.
+#
+# Applied to every field that ultimately traces back to adversarial/review
+# LLM output: for the invariant-feed, category/file/the distilled statement
+# (which embeds the original finding message verbatim); for the adversarial
+# findings sidecar, each finding's title/message and any other
+# model-authored string field.
+#
+# Args: TEXT (required), MAX_CHARS (optional — falls back to
+# _invariant_feed_max_field_chars's default/config value when omitted, since
+# every current caller wants the same cap; a future caller needing a
+# different cap can pass one explicitly rather than this function growing a
+# second knob).
 #
 # Neutralizes prompt-control sequences without attempting semantic
 # interpretation (this is gate plumbing, not a role — no LLM call here,
@@ -680,25 +693,28 @@ _invariant_feed_max_field_chars() {
 #     reader. Newline (0x0A) and tab (0x09) are preserved — legitimate
 #     structure in a multi-line finding message, not a control sequence.
 #   - Collapses the delimiter label a hostile finding could forge to fake a
-#     new INVARIANTS:/DEFERRED FINDINGS:/end-of-data marker — including the
-#     literal fenced ===BEGIN INVARIANTS DATA===/===END INVARIANTS DATA===
-#     markers ds_adversarial_prompt now emits (llm-client.sh) — and smuggle a
-#     bare instruction after it: case-insensitively replaces any of those
-#     literal label strings with a defanged spaced-out form. This does not
+#     new data-block boundary once re-injected into a future prompt — both
+#     the invariant-feed fence (===BEGIN/END INVARIANTS DATA===,
+#     ds_adversarial_prompt in llm-client.sh) and the adversarial-findings
+#     fence the merge-gate prompt uses (===BEGIN/END ADVERSARIAL FINDINGS
+#     DATA===) are defanged unconditionally, regardless of which pipeline a
+#     given finding is travelling through — a payload could be planted once
+#     and land in either round-trip. Case-insensitively replaces each
+#     literal label string with a defanged spaced-out form. This does not
 #     make the text nonsensical to a human reviewer (the words are still
 #     legible) but prevents it from being byte-identical to the real
 #     delimiter the model was told to trust. Without this, a finding
-#     containing the literal fence string survives verbatim into
-#     invariants.json and can forge a fake "===END INVARIANTS DATA==="
-#     inside the block, escaping the fence entirely (BOBBIE, lr-cda4b9
-#     follow-up).
-#   - Caps length at _invariant_feed_max_field_chars, truncating rather than
-#     rejecting — a merely-too-long finding is not attacker behavior, and
-#     rejecting it would silently drop a real resolved-finding invariant
-#     (fail-open posture matches the rest of the invariant-feed).
-_invariant_feed_sanitize_field() {
-  _ifsf_text="$1"
-  _ifsf_max=$(_invariant_feed_max_field_chars)
+#     containing a literal fence string survives verbatim into the written
+#     artifact and can forge a fake end-of-data marker inside the block,
+#     escaping the fence entirely (BOBBIE, lr-cda4b9 follow-up).
+#   - Caps length at MAX_CHARS, truncating rather than rejecting — a
+#     merely-too-long finding is not attacker behavior, and rejecting it
+#     would silently drop a real finding (fail-open posture matches the
+#     rest of the invariant-feed and the advisory/blocking split).
+_llm_field_sanitize() {
+  _lfs_text="$1"
+  _lfs_max="${2:-$(_invariant_feed_max_field_chars)}"
+  case "$_lfs_max" in ''|*[!0-9]*) _lfs_max=$(_invariant_feed_max_field_chars) ;; esac
 
   if command -v python3 >/dev/null 2>&1; then
     # Text goes through a temp file, NOT stdin: `python3 -` already reads the
@@ -706,9 +722,9 @@ _invariant_feed_sanitize_field() {
     # text into the same stdin would either be silently discarded or
     # interleaved with the script depending on shell/buffering — the data
     # channel and the script channel must be different file descriptors.
-    _ifsf_tmp=$(mktemp -t clagentic-inv-sanitize.XXXXXX)
-    printf '%s' "$_ifsf_text" > "$_ifsf_tmp"
-    python3 - "$_ifsf_tmp" "$_ifsf_max" <<'PYEOF'
+    _lfs_tmp=$(mktemp -t clagentic-llm-sanitize.XXXXXX)
+    printf '%s' "$_lfs_text" > "$_lfs_tmp"
+    python3 - "$_lfs_tmp" "$_lfs_max" <<'PYEOF'
 import re
 import sys
 
@@ -727,15 +743,21 @@ text = re.sub(r'\x1b.', '', text)                   # any remaining ESC + one by
 text = ''.join(ch for ch in text if ch in ('\t', '\n') or 0x20 <= ord(ch) != 0x7f)
 
 # Defang forged delimiter labels: a hostile finding message could contain
-# the literal string "INVARIANTS:" or "DEFERRED FINDINGS:" -- or the fenced
-# ===BEGIN/END INVARIANTS DATA=== markers ds_adversarial_prompt wraps this
-# content in (llm-client.sh) -- to try to spoof a fresh data-block boundary
-# once re-injected into a future prompt. Insert a zero-width-safe space so
-# the string is still legible to a human but no longer byte-identical to the
-# real delimiter.
+# the literal string "INVARIANTS:" or "DEFERRED FINDINGS:" -- or either
+# fenced data-block marker set (===BEGIN/END INVARIANTS DATA===, the
+# invariant-feed fence in ds_adversarial_prompt; ===BEGIN/END ADVERSARIAL
+# FINDINGS DATA===, the merge-gate fence in ds_merge_gate_prompt, both
+# llm-client.sh) -- to try to spoof a fresh data-block boundary once
+# re-injected into a future prompt. Insert a zero-width-safe space so the
+# string is still legible to a human but no longer byte-identical to the
+# real delimiter. Both fence sets are defanged unconditionally here (not
+# gated by which caller invoked this function) since a single planted
+# finding could round-trip through either path.
 for label in ("INVARIANTS:", "DEFERRED FINDINGS:", "END INVARIANTS",
               "END DEFERRED FINDINGS",
-              "===BEGIN INVARIANTS DATA===", "===END INVARIANTS DATA==="):
+              "===BEGIN INVARIANTS DATA===", "===END INVARIANTS DATA===",
+              "===BEGIN ADVERSARIAL FINDINGS DATA===",
+              "===END ADVERSARIAL FINDINGS DATA==="):
     pattern = re.compile(re.escape(label), re.IGNORECASE)
     text = pattern.sub(lambda m: ' '.join(m.group(0)), text)
 
@@ -750,28 +772,28 @@ if len(text) > max_chars:
 
 sys.stdout.write(text)
 PYEOF
-    _ifsf_status=$?
-    rm -f "$_ifsf_tmp"
-    return $_ifsf_status
+    _lfs_status=$?
+    rm -f "$_lfs_tmp"
+    return $_lfs_status
   fi
 
   # No python3: best-effort POSIX fallback. tr strips the bulk of control
   # bytes (octal escapes for 0x01-0x08, 0x0B-0x1F, 0x7F; 0x00 cannot appear
-  # in a shell string so no explicit strip needed); sed defangs the fenced
-  # ===BEGIN/END INVARIANTS DATA=== markers specifically (literal, fixed-case
-  # substitution — no GNU/BSD sed extension needed, unlike a general case-
-  # insensitive label match); cut caps length. This path does NOT defang the
-  # case-insensitive INVARIANTS:/DEFERRED FINDINGS: labels the python3 path
-  # covers (no portable case-insensitive substitution without sed extensions
-  # that vary GNU/BSD) — acceptable degradation given no-python3 already
-  # means jq is the active JSON tool elsewhere in this codepath. The fenced
-  # markers ARE covered here because they are the one label an attacker could
-  # use to escape the fence entirely (BOBBIE, lr-cda4b9 follow-up), so this
-  # path closes that specific gap even though it cannot close the general one.
-  printf '%s' "$_ifsf_text" \
+  # in a shell string so no explicit strip needed); sed defangs both fenced
+  # marker sets specifically (literal, fixed-case substitution — no GNU/BSD
+  # sed extension needed, unlike a general case-insensitive label match);
+  # cut caps length. This path does NOT defang the case-insensitive
+  # INVARIANTS:/DEFERRED FINDINGS: labels the python3 path covers (no
+  # portable case-insensitive substitution without sed extensions that vary
+  # GNU/BSD) — acceptable degradation given no-python3 already means jq is
+  # the active JSON tool elsewhere in this codepath. The fenced markers ARE
+  # covered here because they are the labels an attacker could use to
+  # escape a fence entirely (BOBBIE, lr-cda4b9 follow-up), so this path
+  # closes that specific gap even though it cannot close the general one.
+  printf '%s' "$_lfs_text" \
     | tr -d '\001-\010\013-\037\177' \
-    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g' \
-    | cut -c "1-${_ifsf_max}"
+    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g; s|===BEGIN ADVERSARIAL FINDINGS DATA===|= = =BEGIN ADVERSARIAL FINDINGS DATA= = =|g; s|===END ADVERSARIAL FINDINGS DATA===|= = =END ADVERSARIAL FINDINGS DATA= = =|g' \
+    | cut -c "1-${_lfs_max}"
 }
 
 # _invariant_feed_append INVARIANTS_FILE ID CATEGORY FILE STATEMENT
@@ -789,15 +811,19 @@ PYEOF
 # compromised/manipulated model, or attacker-influenced code under audit that
 # steers model output, could plant a finding whose message is a prompt-
 # injection payload). This is the sole writer of invariants.json, so every
-# field is run through _invariant_feed_sanitize_field before it is ever
-# written — a single write-boundary choke point rather than relying on every
-# current and future reader to sanitize on its own.
+# field is run through _llm_field_sanitize before it is ever written — a
+# single write-boundary choke point rather than relying on every current and
+# future reader to sanitize on its own. (lr-e2b975 generalized this function
+# — was _invariant_feed_sanitize_field — to a second call site: the
+# adversarial-findings sidecar build_gate_summary feeds into the merge-gate
+# prompt has the identical round-trip shape, so it reuses the same
+# choke point rather than growing a parallel sanitizer.)
 _invariant_feed_append() {
   _ifa_file="$1"; _ifa_id="$2"; _ifa_category="$3"; _ifa_srcfile="$4"; _ifa_statement="$5"
 
-  _ifa_category=$(_invariant_feed_sanitize_field "$_ifa_category")
-  _ifa_srcfile=$(_invariant_feed_sanitize_field "$_ifa_srcfile")
-  _ifa_statement=$(_invariant_feed_sanitize_field "$_ifa_statement")
+  _ifa_category=$(_llm_field_sanitize "$_ifa_category")
+  _ifa_srcfile=$(_llm_field_sanitize "$_ifa_srcfile")
+  _ifa_statement=$(_llm_field_sanitize "$_ifa_statement")
 
   if command -v python3 >/dev/null 2>&1; then
     python3 - "$_ifa_file" "$_ifa_id" "$_ifa_category" "$_ifa_srcfile" "$_ifa_statement" "$(_invariant_feed_max_lines)" <<'PYEOF'
@@ -1414,6 +1440,110 @@ PYEOF
   fi
 }
 
+# _sanitize_adversarial_findings_json JSON_ARRAY
+#
+# SECURITY (lr-e2b975, mirrors lr-cda4b9): _parse_adversarial_findings above
+# is purely structural (header-field extraction) and does not sanitize.
+# This is the write-boundary control for the round-trip path
+# _parse_adversarial_findings feeds: LLM-authored finding text ->
+# last-adversarial-findings.json -> build_gate_summary -> the merge-gate
+# system prompt (ds_merge_gate_prompt, llm-client.sh) -- the same shape
+# lr-cda4b9 closed for the invariant-feed's file/category/statement fields.
+# Without this, a finding whose title contained a forged
+# "===END ADVERSARIAL FINDINGS DATA===" marker could survive verbatim into
+# the sidecar and attempt to escape the merge-gate prompt's fenced data
+# block.
+#
+# Calls _llm_field_sanitize itself, once per finding per string field — the
+# exact same function _invariant_feed_append calls, invoked as a normal
+# shell function call (not a reimplementation, not a copy of its logic).
+# JSON decomposition/rebuild is jq (this codebase's primary JSON tool
+# everywhere else in gates.sh); python3 is the documented fallback the rest
+# of the file already uses for JSON when jq is absent.
+#
+# file/category/message are the model-authored string fields (the same set
+# _invariant_feed_append sanitizes: file/category/statement). severity/
+# reachable/tier/line are left untouched: severity and reachable are already
+# normalized to a fixed enum (or forced to a safe default) by
+# _parse_adversarial_findings, tier is likewise constrained to
+# blocking/advisory, and line is an integer -- none of these carry free-form
+# model prose.
+_sanitize_adversarial_findings_json() {
+  _safj_json="$1"
+
+  if command -v jq >/dev/null 2>&1; then
+    _safj_count=$(printf '%s' "$_safj_json" | jq 'length' 2>/dev/null)
+    case "$_safj_count" in ''|*[!0-9]*) printf '%s' "$_safj_json"; return 0 ;; esac
+    _safj_out="[]"
+    _safj_i=0
+    while [ "$_safj_i" -lt "$_safj_count" ]; do
+      _safj_finding=$(printf '%s' "$_safj_json" | jq -c ".[$_safj_i]" 2>/dev/null) || break
+      _safj_raw_file=$(printf '%s' "$_safj_finding" | jq -r '.file // ""' 2>/dev/null)
+      _safj_raw_category=$(printf '%s' "$_safj_finding" | jq -r '.category // ""' 2>/dev/null)
+      _safj_raw_message=$(printf '%s' "$_safj_finding" | jq -r '.message // ""' 2>/dev/null)
+
+      _safj_clean_file=$(_llm_field_sanitize "$_safj_raw_file")
+      _safj_clean_category=$(_llm_field_sanitize "$_safj_raw_category")
+      _safj_clean_message=$(_llm_field_sanitize "$_safj_raw_message")
+
+      _safj_finding_clean=$(printf '%s' "$_safj_finding" | jq -c \
+        --arg f "$_safj_clean_file" --arg c "$_safj_clean_category" --arg m "$_safj_clean_message" \
+        '.file = $f | .category = $c | .message = $m' 2>/dev/null)
+      [ -n "$_safj_finding_clean" ] || _safj_finding_clean="$_safj_finding"
+
+      _safj_out=$(printf '%s' "$_safj_out" | jq -c --argjson item "$_safj_finding_clean" '. + [$item]' 2>/dev/null)
+      [ -n "$_safj_out" ] || { printf '%s' "$_safj_json"; return 0; }
+      _safj_i=$((_safj_i + 1))
+    done
+    printf '%s' "$_safj_out"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    # No jq: decompose/rebuild via python3 (this file's documented
+    # jq-then-python3 fallback order everywhere else), but each field still
+    # goes through the real _llm_field_sanitize shell function — one call
+    # per field, same as the jq branch above — not a python reimplementation
+    # of the sanitizer.
+    _safj_count=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(len(d) if isinstance(d, list) else 0)' "$_safj_json" 2>/dev/null)
+    case "$_safj_count" in ''|*[!0-9]*) printf '%s' "$_safj_json"; return 0 ;; esac
+    _safj_out="[]"
+    _safj_i=0
+    while [ "$_safj_i" -lt "$_safj_count" ]; do
+      _safj_finding=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(json.dumps(d[int(sys.argv[2])]))' "$_safj_json" "$_safj_i" 2>/dev/null) || break
+      _safj_raw_file=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("file",""))' "$_safj_finding" 2>/dev/null)
+      _safj_raw_category=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("category",""))' "$_safj_finding" 2>/dev/null)
+      _safj_raw_message=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("message",""))' "$_safj_finding" 2>/dev/null)
+
+      _safj_clean_file=$(_llm_field_sanitize "$_safj_raw_file")
+      _safj_clean_category=$(_llm_field_sanitize "$_safj_raw_category")
+      _safj_clean_message=$(_llm_field_sanitize "$_safj_raw_message")
+
+      _safj_finding_clean=$(python3 -c '
+import json, sys
+finding = json.loads(sys.argv[1])
+finding["file"] = sys.argv[2]
+finding["category"] = sys.argv[3]
+finding["message"] = sys.argv[4]
+print(json.dumps(finding))
+' "$_safj_finding" "$_safj_clean_file" "$_safj_clean_category" "$_safj_clean_message" 2>/dev/null)
+      [ -n "$_safj_finding_clean" ] || _safj_finding_clean="$_safj_finding"
+
+      _safj_out=$(python3 -c 'import json,sys; arr=json.loads(sys.argv[1]); arr.append(json.loads(sys.argv[2])); print(json.dumps(arr))' "$_safj_out" "$_safj_finding_clean" 2>/dev/null)
+      [ -n "$_safj_out" ] || { printf '%s' "$_safj_json"; return 0; }
+      _safj_i=$((_safj_i + 1))
+    done
+    printf '%s' "$_safj_out"
+    return 0
+  fi
+
+  # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open: return
+  # the original (unsanitized) content, consistent with the rest of this
+  # codepath's no-JSON-tool degradation (e.g. _parse_adversarial_findings
+  # itself returns "[]" with no python3).
+  printf '%s' "$_safj_json"
+}
+
 cmd_adversarial() {
   OUT="$REPO_ROOT/.clagentic/lite/last-adversarial.md"
   FINDINGS_OUT="$REPO_ROOT/.clagentic/lite/last-adversarial-findings.json"
@@ -1439,7 +1569,16 @@ cmd_adversarial() {
   # re-derive the split from markdown prose. The markdown in $OUT remains
   # the full human-readable record either way — this sidecar never replaces
   # it, only adds a structured view for gate plumbing.
-  _adv_findings_json=$(_parse_adversarial_findings "$OUT")
+  #
+  # SECURITY (lr-e2b975): sanitize immediately after parsing, before the
+  # sidecar is written to disk or handed to dedup/invariant-feed below —
+  # every downstream consumer of $_adv_findings_json then gets clean data
+  # for free, matching _llm_field_sanitize's own write-boundary-not-
+  # read-time design rationale. The unsanitized $OUT markdown file is
+  # untouched (still the full raw record); only the structured sidecar that
+  # round-trips into a later system prompt is sanitized.
+  _adv_findings_json_raw=$(_parse_adversarial_findings "$OUT")
+  _adv_findings_json=$(_sanitize_adversarial_findings_json "$_adv_findings_json_raw")
   printf '%s\n' "$_adv_findings_json" > "$FINDINGS_OUT"
 
   # Invariant-feed writer (lr-63359e), adversarial half. Reuses the same
@@ -1675,6 +1814,42 @@ PY
   fi
 }
 
+# _fence_adversarial_findings JSON_ARRAY — render an (already sanitized)
+# adversarial-findings JSON array as a JSON string value, human-readable and
+# wrapped in the ===BEGIN/END ADVERSARIAL FINDINGS DATA=== fence
+# ds_merge_gate_prompt (llm-client.sh) instructs the Merge Gate to treat as
+# data, not instructions. Mirrors ds_adversarial_prompt's own
+# ===BEGIN/END INVARIANTS DATA=== fence framing (lr-cda4b9) for the
+# equivalent round-trip shape. Assumes the input is already sanitized
+# (_sanitize_adversarial_findings_json, called by cmd_adversarial before the
+# sidecar is ever written) — this function only renders and fences, it does
+# not sanitize a second time.
+_fence_adversarial_findings() {
+  _faf_json="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -Rs '.' <<EOF
+===BEGIN ADVERSARIAL FINDINGS DATA===
+$(printf '%s' "$_faf_json" | jq '.' 2>/dev/null || printf '%s' "$_faf_json")
+===END ADVERSARIAL FINDINGS DATA===
+EOF
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, sys
+raw = sys.argv[1]
+try:
+    pretty = json.dumps(json.loads(raw), indent=2)
+except Exception:
+    pretty = raw
+block = "===BEGIN ADVERSARIAL FINDINGS DATA===\n" + pretty + "\n===END ADVERSARIAL FINDINGS DATA==="
+print(json.dumps(block))
+' "$_faf_json"
+    return 0
+  fi
+  printf '""'
+}
+
 build_gate_summary() {
   RV="$REPO_ROOT/.clagentic/lite/last-review.json"
   AD="$REPO_ROOT/.clagentic/lite/last-adversarial.md"
@@ -1811,12 +1986,23 @@ build_gate_summary() {
     ADV_ADVISORY_COUNT=$(printf '%s' "$ADF_PAYLOAD" | jq '[.[] | select(.tier == "advisory")] | length' 2>/dev/null || echo 0)
     case "$ADV_BLOCKING_COUNT" in ''|*[!0-9]*) ADV_BLOCKING_COUNT=0 ;; esac
     case "$ADV_ADVISORY_COUNT" in ''|*[!0-9]*) ADV_ADVISORY_COUNT=0 ;; esac
+    # Fenced, explicit-data-block rendering of the (already sanitized)
+    # adversarial findings, mirroring the invariant-feed's
+    # ===BEGIN/END INVARIANTS DATA=== treatment (lr-e2b975, matches
+    # lr-cda4b9). adversarial_findings above is the machine-readable JSON
+    # array a caller may want to inspect programmatically; this string field
+    # is the SAME (sanitized) content wrapped in the fence
+    # ds_merge_gate_prompt instructs the model to treat as data, not
+    # instructions — belt-and-suspenders alongside the stdin/system-prompt
+    # channel separation the wrapper already provides.
+    ADF_FENCED_PAYLOAD=$(_fence_adversarial_findings "$ADF_PAYLOAD")
     cat <<EOF
 {
   "review": $RV_PAYLOAD,
   "adversarial": $AD_PAYLOAD,
   "adversarial_missing": $ADVERSARIAL_MISSING,
   "adversarial_findings": $ADF_PAYLOAD,
+  "adversarial_findings_fenced": $ADF_FENCED_PAYLOAD,
   "adversarial_blocking_count": $ADV_BLOCKING_COUNT,
   "adversarial_advisory_count": $ADV_ADVISORY_COUNT,
   "adversarial_acks": $ACKS_PAYLOAD,
@@ -1876,6 +2062,18 @@ if adf_path:
         adv_findings = []
 adv_blocking_count = sum(1 for f in adv_findings if isinstance(f, dict) and f.get("tier") == "blocking")
 adv_advisory_count = sum(1 for f in adv_findings if isinstance(f, dict) and f.get("tier") == "advisory")
+# Fenced, explicit-data-block rendering (lr-e2b975) -- same
+# ===BEGIN/END ADVERSARIAL FINDINGS DATA=== fence the jq branch above emits
+# via _fence_adversarial_findings, mirroring ds_adversarial_prompt's
+# ===BEGIN/END INVARIANTS DATA=== treatment (lr-cda4b9). adv_findings here
+# is already sanitized (cmd_adversarial calls
+# _sanitize_adversarial_findings_json before ever writing the sidecar this
+# was read from) -- this only renders and fences, no second sanitize pass.
+adv_findings_fenced = (
+    "===BEGIN ADVERSARIAL FINDINGS DATA===\n"
+    + json.dumps(adv_findings, indent=2)
+    + "\n===END ADVERSARIAL FINDINGS DATA==="
+)
 acks = []
 if acks_path:
     try:
@@ -1895,6 +2093,7 @@ print(json.dumps({
     "adversarial": adv,
     "adversarial_missing": adversarial_missing,
     "adversarial_findings": adv_findings,
+    "adversarial_findings_fenced": adv_findings_fenced,
     "adversarial_blocking_count": adv_blocking_count,
     "adversarial_advisory_count": adv_advisory_count,
     "adversarial_acks": acks,
@@ -1915,10 +2114,10 @@ PY
   # limitation the adversarial markdown field already has above.
   if [ -f "$RV" ]; then
     cat <<EOF
-{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_findings": [], "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
+{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
 EOF
   else
-    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_findings\": [], \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
+    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
   fi
 }
 
