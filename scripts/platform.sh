@@ -471,26 +471,30 @@ text = re.sub(r'\x1b.', '', text)                   # any remaining ESC + one by
 text = ''.join(ch for ch in text if ch in ('\t', '\n') or 0x20 <= ord(ch) != 0x7f)
 
 # Defang forged delimiter labels: a hostile finding message (or, as of
-# lr-4f8316, a hostile commit-message change-class trailer) could contain
-# the literal string "INVARIANTS:" or "DEFERRED FINDINGS:" -- or any of the
-# fenced data-block marker sets this codebase uses (===BEGIN/END INVARIANTS
-# DATA===, the invariant-feed fence in ds_adversarial_prompt; ===BEGIN/END
-# ADVERSARIAL FINDINGS DATA===, the merge-gate fence in
-# ds_merge_gate_prompt; ===BEGIN/END CHANGE-CLASS HINT DATA===, the
-# change-class hint fence in both ds_review_prompt and ds_adversarial_prompt
-# -- all llm-client.sh) -- to try to spoof a fresh data-block boundary once
-# re-injected into a future prompt. Insert a zero-width-safe space so the
-# string is still legible to a human but no longer byte-identical to the
-# real delimiter. All fence sets are defanged unconditionally here (not
-# gated by which caller invoked this function) since a single planted
-# payload could round-trip through any path.
+# lr-4f8316, a hostile commit-message change-class trailer, or a hostile
+# deferrals.json entry) could contain the literal string "INVARIANTS:" or
+# "DEFERRED FINDINGS:" -- or any of the fenced data-block marker sets this
+# codebase uses (===BEGIN/END INVARIANTS DATA===, the invariant-feed fence
+# in ds_adversarial_prompt; ===BEGIN/END ADVERSARIAL FINDINGS DATA===, the
+# merge-gate fence in ds_merge_gate_prompt; ===BEGIN/END CHANGE-CLASS HINT
+# DATA===, the change-class hint fence in both ds_review_prompt and
+# ds_adversarial_prompt; ===BEGIN/END DEFERRED FINDINGS DATA===, the
+# deferrals fence in ds_review_prompt -- all llm-client.sh) -- to try to
+# spoof a fresh data-block boundary once re-injected into a future prompt.
+# Insert a zero-width-safe space so the string is still legible to a human
+# but no longer byte-identical to the real delimiter. All fence sets are
+# defanged unconditionally here (not gated by which caller invoked this
+# function) since a single planted payload could round-trip through any
+# path.
 for label in ("INVARIANTS:", "DEFERRED FINDINGS:", "END INVARIANTS",
               "END DEFERRED FINDINGS",
               "===BEGIN INVARIANTS DATA===", "===END INVARIANTS DATA===",
               "===BEGIN ADVERSARIAL FINDINGS DATA===",
               "===END ADVERSARIAL FINDINGS DATA===",
               "===BEGIN CHANGE-CLASS HINT DATA===",
-              "===END CHANGE-CLASS HINT DATA==="):
+              "===END CHANGE-CLASS HINT DATA===",
+              "===BEGIN DEFERRED FINDINGS DATA===",
+              "===END DEFERRED FINDINGS DATA==="):
     pattern = re.compile(re.escape(label), re.IGNORECASE)
     text = pattern.sub(lambda m: ' '.join(m.group(0)), text)
 
@@ -525,6 +529,126 @@ PYEOF
   # closes that specific gap even though it cannot close the general one.
   printf '%s' "$_lfs_text" \
     | tr -d '\001-\010\013-\037\177' \
-    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g; s|===BEGIN ADVERSARIAL FINDINGS DATA===|= = =BEGIN ADVERSARIAL FINDINGS DATA= = =|g; s|===END ADVERSARIAL FINDINGS DATA===|= = =END ADVERSARIAL FINDINGS DATA= = =|g; s|===BEGIN CHANGE-CLASS HINT DATA===|= = =BEGIN CHANGE-CLASS HINT DATA= = =|g; s|===END CHANGE-CLASS HINT DATA===|= = =END CHANGE-CLASS HINT DATA= = =|g' \
+    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g; s|===BEGIN ADVERSARIAL FINDINGS DATA===|= = =BEGIN ADVERSARIAL FINDINGS DATA= = =|g; s|===END ADVERSARIAL FINDINGS DATA===|= = =END ADVERSARIAL FINDINGS DATA= = =|g; s|===BEGIN CHANGE-CLASS HINT DATA===|= = =BEGIN CHANGE-CLASS HINT DATA= = =|g; s|===END CHANGE-CLASS HINT DATA===|= = =END CHANGE-CLASS HINT DATA= = =|g; s|===BEGIN DEFERRED FINDINGS DATA===|= = =BEGIN DEFERRED FINDINGS DATA= = =|g; s|===END DEFERRED FINDINGS DATA===|= = =END DEFERRED FINDINGS DATA= = =|g' \
     | cut -c "1-${_lfs_max}"
+}
+
+# _llm_json_array_sanitize_fields JSON FIELD1 [FIELD2 ...] — decompose a
+# JSON array of objects, run _llm_field_sanitize over each named string
+# field on every object, rebuild, and print the sanitized array. Generic
+# extraction of the decompose/sanitize/rebuild shape
+# _sanitize_adversarial_findings_json (scripts/gates.sh) already used for
+# the adversarial findings sidecar (file/category/message), so a second
+# caller with a different field set — the deferrals array
+# (id/category/file/description/expires/acknowledged_by), lr-4f8316 follow-
+# up — reuses the same machinery instead of hand-rolling a variant. Any
+# array-of-objects round-trip in this codebase should extend this function
+# rather than growing a parallel decompose/sanitize/rebuild loop.
+#
+# Fields not named in FIELD... pass through unchanged (e.g. non-text or
+# already-enum-validated fields elsewhere in this codebase, though this
+# function itself does not special-case those — callers name exactly the
+# string fields they want sanitized).
+#
+# Fail-open, matching every other JSON-tool-dependent helper in this
+# codebase: an empty/malformed JSON array, or the complete absence of jq
+# AND python3, returns the ORIGINAL input unchanged rather than dropping
+# entries or raising — the caller's own fail-open posture (e.g. "absent/
+# unreadable deferrals file must not break review") is preserved by never
+# turning a decompose failure into an empty result.
+#
+# Args: JSON (a JSON array of objects, as a single string), FIELD1..FIELDN
+# (one or more field names to sanitize on every object in the array).
+# stdout: the sanitized JSON array (or the original JSON, on any failure).
+_llm_json_array_sanitize_fields() {
+  _ljasf_json="$1"
+  shift
+  _ljasf_fields="$*"
+  if [ -z "$_ljasf_fields" ]; then
+    # No fields named — nothing to sanitize; pass through unchanged rather
+    # than silently no-op-ing in a way that could be mistaken for "sanitized".
+    printf '%s' "$_ljasf_json"
+    return 0
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    # Type check FIRST, not just "length parses as a number" -- jq's
+    # `length` returns a number for strings/objects too (e.g. a JSON string
+    # scalar's character count), which would otherwise silently pass the
+    # numeric guard below and then fail differently (indexing a non-array
+    # with .[$i] and producing garbage/empty results) instead of hitting
+    # the fail-open path. A non-array input must return the ORIGINAL input
+    # unchanged, never an empty array -- an empty array is indistinguishable
+    # from "genuinely no entries" and would silently make malformed-but-
+    # non-empty content disappear instead of degrading visibly.
+    if ! printf '%s' "$_ljasf_json" | jq -e '. | type == "array"' >/dev/null 2>&1; then
+      printf '%s' "$_ljasf_json"
+      return 0
+    fi
+    _ljasf_count=$(printf '%s' "$_ljasf_json" | jq 'length' 2>/dev/null)
+    case "$_ljasf_count" in ''|*[!0-9]*) printf '%s' "$_ljasf_json"; return 0 ;; esac
+    _ljasf_out="[]"
+    _ljasf_i=0
+    while [ "$_ljasf_i" -lt "$_ljasf_count" ]; do
+      _ljasf_item=$(printf '%s' "$_ljasf_json" | jq -c ".[$_ljasf_i]" 2>/dev/null) || break
+      _ljasf_jq_args=""
+      for _ljasf_field in $_ljasf_fields; do
+        _ljasf_raw=$(printf '%s' "$_ljasf_item" | jq -r --arg f "$_ljasf_field" '.[$f] // ""' 2>/dev/null)
+        _ljasf_clean=$(_llm_field_sanitize "$_ljasf_raw")
+        _ljasf_item=$(printf '%s' "$_ljasf_item" | jq -c --arg f "$_ljasf_field" --arg v "$_ljasf_clean" \
+          'if has($f) then .[$f] = $v else . end' 2>/dev/null)
+      done
+      _ljasf_out=$(printf '%s' "$_ljasf_out" | jq -c --argjson item "$_ljasf_item" '. + [$item]' 2>/dev/null)
+      [ -n "$_ljasf_out" ] || { printf '%s' "$_ljasf_json"; return 0; }
+      _ljasf_i=$((_ljasf_i + 1))
+    done
+    printf '%s' "$_ljasf_out"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    # Same type check as the jq branch above: distinguish "valid JSON but
+    # not an array" (fail open with the ORIGINAL input) from "a genuine
+    # empty array" (both would otherwise produce _ljasf_count=0 and fall
+    # through to the same code path, but only one of them should return the
+    # original text unchanged).
+    _ljasf_is_array=$(python3 -c 'import json,sys
+try:
+    d = json.loads(sys.argv[1])
+    print("1" if isinstance(d, list) else "0")
+except Exception:
+    print("0")' "$_ljasf_json" 2>/dev/null)
+    if [ "$_ljasf_is_array" != "1" ]; then
+      printf '%s' "$_ljasf_json"
+      return 0
+    fi
+    _ljasf_count=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(len(d))' "$_ljasf_json" 2>/dev/null)
+    case "$_ljasf_count" in ''|*[!0-9]*) printf '%s' "$_ljasf_json"; return 0 ;; esac
+    _ljasf_out="[]"
+    _ljasf_i=0
+    while [ "$_ljasf_i" -lt "$_ljasf_count" ]; do
+      _ljasf_item=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(json.dumps(d[int(sys.argv[2])]))' "$_ljasf_json" "$_ljasf_i" 2>/dev/null) || break
+      for _ljasf_field in $_ljasf_fields; do
+        _ljasf_raw=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); v=d.get(sys.argv[2], ""); print(v if isinstance(v, str) else "")' "$_ljasf_item" "$_ljasf_field" 2>/dev/null)
+        _ljasf_clean=$(_llm_field_sanitize "$_ljasf_raw")
+        _ljasf_item=$(python3 -c '
+import json, sys
+item = json.loads(sys.argv[1])
+field = sys.argv[2]
+if field in item:
+    item[field] = sys.argv[3]
+print(json.dumps(item))
+' "$_ljasf_item" "$_ljasf_field" "$_ljasf_clean" 2>/dev/null)
+      done
+      _ljasf_out=$(python3 -c 'import json,sys; arr=json.loads(sys.argv[1]); arr.append(json.loads(sys.argv[2])); print(json.dumps(arr))' "$_ljasf_out" "$_ljasf_item" 2>/dev/null)
+      [ -n "$_ljasf_out" ] || { printf '%s' "$_ljasf_json"; return 0; }
+      _ljasf_i=$((_ljasf_i + 1))
+    done
+    printf '%s' "$_ljasf_out"
+    return 0
+  fi
+
+  # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open: same
+  # posture as _sanitize_adversarial_findings_json's own no-JSON-tool path.
+  printf '%s' "$_ljasf_json"
 }

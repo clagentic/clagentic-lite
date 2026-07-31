@@ -1464,78 +1464,15 @@ PYEOF
 # holds before relying on this comment again.
 _sanitize_adversarial_findings_json() {
   _safj_json="$1"
-
-  if command -v jq >/dev/null 2>&1; then
-    _safj_count=$(printf '%s' "$_safj_json" | jq 'length' 2>/dev/null)
-    case "$_safj_count" in ''|*[!0-9]*) printf '%s' "$_safj_json"; return 0 ;; esac
-    _safj_out="[]"
-    _safj_i=0
-    while [ "$_safj_i" -lt "$_safj_count" ]; do
-      _safj_finding=$(printf '%s' "$_safj_json" | jq -c ".[$_safj_i]" 2>/dev/null) || break
-      _safj_raw_file=$(printf '%s' "$_safj_finding" | jq -r '.file // ""' 2>/dev/null)
-      _safj_raw_category=$(printf '%s' "$_safj_finding" | jq -r '.category // ""' 2>/dev/null)
-      _safj_raw_message=$(printf '%s' "$_safj_finding" | jq -r '.message // ""' 2>/dev/null)
-
-      _safj_clean_file=$(_llm_field_sanitize "$_safj_raw_file")
-      _safj_clean_category=$(_llm_field_sanitize "$_safj_raw_category")
-      _safj_clean_message=$(_llm_field_sanitize "$_safj_raw_message")
-
-      _safj_finding_clean=$(printf '%s' "$_safj_finding" | jq -c \
-        --arg f "$_safj_clean_file" --arg c "$_safj_clean_category" --arg m "$_safj_clean_message" \
-        '.file = $f | .category = $c | .message = $m' 2>/dev/null)
-      [ -n "$_safj_finding_clean" ] || _safj_finding_clean="$_safj_finding"
-
-      _safj_out=$(printf '%s' "$_safj_out" | jq -c --argjson item "$_safj_finding_clean" '. + [$item]' 2>/dev/null)
-      [ -n "$_safj_out" ] || { printf '%s' "$_safj_json"; return 0; }
-      _safj_i=$((_safj_i + 1))
-    done
-    printf '%s' "$_safj_out"
-    return 0
-  fi
-
-  if command -v python3 >/dev/null 2>&1; then
-    # No jq: decompose/rebuild via python3 (this file's documented
-    # jq-then-python3 fallback order everywhere else), but each field still
-    # goes through the real _llm_field_sanitize shell function — one call
-    # per field, same as the jq branch above — not a python reimplementation
-    # of the sanitizer.
-    _safj_count=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(len(d) if isinstance(d, list) else 0)' "$_safj_json" 2>/dev/null)
-    case "$_safj_count" in ''|*[!0-9]*) printf '%s' "$_safj_json"; return 0 ;; esac
-    _safj_out="[]"
-    _safj_i=0
-    while [ "$_safj_i" -lt "$_safj_count" ]; do
-      _safj_finding=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(json.dumps(d[int(sys.argv[2])]))' "$_safj_json" "$_safj_i" 2>/dev/null) || break
-      _safj_raw_file=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("file",""))' "$_safj_finding" 2>/dev/null)
-      _safj_raw_category=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("category",""))' "$_safj_finding" 2>/dev/null)
-      _safj_raw_message=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("message",""))' "$_safj_finding" 2>/dev/null)
-
-      _safj_clean_file=$(_llm_field_sanitize "$_safj_raw_file")
-      _safj_clean_category=$(_llm_field_sanitize "$_safj_raw_category")
-      _safj_clean_message=$(_llm_field_sanitize "$_safj_raw_message")
-
-      _safj_finding_clean=$(python3 -c '
-import json, sys
-finding = json.loads(sys.argv[1])
-finding["file"] = sys.argv[2]
-finding["category"] = sys.argv[3]
-finding["message"] = sys.argv[4]
-print(json.dumps(finding))
-' "$_safj_finding" "$_safj_clean_file" "$_safj_clean_category" "$_safj_clean_message" 2>/dev/null)
-      [ -n "$_safj_finding_clean" ] || _safj_finding_clean="$_safj_finding"
-
-      _safj_out=$(python3 -c 'import json,sys; arr=json.loads(sys.argv[1]); arr.append(json.loads(sys.argv[2])); print(json.dumps(arr))' "$_safj_out" "$_safj_finding_clean" 2>/dev/null)
-      [ -n "$_safj_out" ] || { printf '%s' "$_safj_json"; return 0; }
-      _safj_i=$((_safj_i + 1))
-    done
-    printf '%s' "$_safj_out"
-    return 0
-  fi
-
-  # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open: return
-  # the original (unsanitized) content, consistent with the rest of this
-  # codepath's no-JSON-tool degradation (e.g. _parse_adversarial_findings
-  # itself returns "[]" with no python3).
-  printf '%s' "$_safj_json"
+  # Thin wrapper over the shared decompose/sanitize/rebuild helper
+  # (_llm_json_array_sanitize_fields, platform.sh, lr-4f8316 follow-up) --
+  # this function used to carry its own duplicated jq/python3
+  # decompose-sanitize-rebuild loop; that loop is now the shared machinery
+  # a second caller (the deferrals array, ds_review_prompt in llm-client.sh)
+  # reuses instead of hand-rolling a variant. Behavior is unchanged: every
+  # finding's file/category/message field is sanitized via
+  # _llm_field_sanitize, exactly as before.
+  _llm_json_array_sanitize_fields "$_safj_json" file category message
 }
 
 cmd_adversarial() {
@@ -2023,14 +1960,19 @@ build_gate_summary() {
     # finding that met the blocking-eligible bar on reachability+severity
     # (reachable:yes, severity high/critical -- the same two conditions
     # "Blocking vs advisory" requires) but still rode as tier:advisory,
-    # while class:ephemeral. This is an approximation, not a claim that
-    # class was necessarily the deciding factor -- a security-floor
-    # override (live credential, real exploit path) also forces
-    # tier:advisory to never apply per the prompt contract, so those never
-    # match this shape in the first place; nothing else currently could
-    # produce reachable:yes + high/critical + tier:advisory. Recorded in the
-    # audit trail so a human can see how many findings the class shifted,
-    # not just what the resolved class was.
+    # while class:ephemeral. Since the lr-4f8316 follow-up's mechanical
+    # security-floor clamp (_parse_adversarial_findings, this file) forces
+    # tier:blocking to ALWAYS apply for exactly this shape (reachable:yes +
+    # severity high/critical), regardless of class, a finding produced by
+    # the real parser can never actually match this select() -- this count
+    # is computed independently by reading whatever JSON is on disk in
+    # last-adversarial-findings.json, as a defense-in-depth cross-check
+    # that should always read 0 for any sidecar the real parser wrote. A
+    # nonzero value here is itself a signal worth investigating: either the
+    # sidecar was populated by something other than
+    # _parse_adversarial_findings, or the clamp has regressed. Recorded in
+    # the audit trail so a human can see how many findings the class
+    # shifted, not just what the resolved class was.
     ADV_DOWNGRADED_BY_CLASS_COUNT=$(printf '%s' "$ADF_PAYLOAD" | jq \
       '[.[] | select(.class == "ephemeral" and .tier == "advisory" and .reachable == "yes" and (.severity == "high" or .severity == "critical"))] | length' \
       2>/dev/null || echo 0)
