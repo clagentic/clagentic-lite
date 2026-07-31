@@ -646,155 +646,17 @@ _invariant_feed_max_lines() {
   printf '%s' "$_ifml_max"
 }
 
-# _invariant_feed_max_field_chars — per-field length cap applied at the write
-# boundary (see _llm_field_sanitize). Configurable via
-# CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS (default 500 — generous for a
-# one-sentence CWE title/statement, small enough that a single adversarial-
-# controlled finding cannot balloon invariants.json or the prompt it is later
-# injected into).
-_invariant_feed_max_field_chars() {
-  _ifmfc_max="${CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS:-500}"
-  case "$_ifmfc_max" in ''|*[!0-9]*) _ifmfc_max=500 ;; esac
-  printf '%s' "$_ifmfc_max"
-}
-
-# _llm_field_sanitize TEXT [MAX_CHARS] — neutralize LLM-controlled text
-# before it is ever written to a file or prompt block that a LATER LLM call
-# reads back (lr-cda4b9, generalized under lr-e2b975). WRITE-BOUNDARY
-# sanitization, not read-time: every known round-trip path — the
-# invariant-feed (_invariant_feed_append, below) and the adversarial
-# findings sidecar consumed by build_gate_summary/ds_merge_gate_prompt — has
-# exactly one writer and an unknown/growing number of future readers.
-# Cleaning once at ingest means every reader gets clean data for free,
-# instead of every current AND future reader needing to remember to
-# re-sanitize. This is the SOLE sanitizer for LLM-authored text that
-# round-trips into a later prompt — do not add a second one; if a new
-# round-trip path needs different behavior, extend this function.
-#
-# Applied to every field that ultimately traces back to adversarial/review
-# LLM output: for the invariant-feed, category/file/the distilled statement
-# (which embeds the original finding message verbatim); for the adversarial
-# findings sidecar, each finding's title/message and any other
-# model-authored string field.
-#
-# Args: TEXT (required), MAX_CHARS (optional — falls back to
-# _invariant_feed_max_field_chars's default/config value when omitted, since
-# every current caller wants the same cap; a future caller needing a
-# different cap can pass one explicitly rather than this function growing a
-# second knob).
-#
-# Neutralizes prompt-control sequences without attempting semantic
-# interpretation (this is gate plumbing, not a role — no LLM call here,
-# consistent with _invariant_feed_distill's own "mechanical, not an LLM
-# call" framing):
-#   - Strips ASCII control/non-printable bytes (0x00-0x08, 0x0B-0x1F, 0x7F),
-#     including ANSI/terminal escape sequences a hostile finding could embed
-#     to visually spoof a delimiter or hide text from a human audit-log
-#     reader. Newline (0x0A) and tab (0x09) are preserved — legitimate
-#     structure in a multi-line finding message, not a control sequence.
-#   - Collapses the delimiter label a hostile finding could forge to fake a
-#     new data-block boundary once re-injected into a future prompt — both
-#     the invariant-feed fence (===BEGIN/END INVARIANTS DATA===,
-#     ds_adversarial_prompt in llm-client.sh) and the adversarial-findings
-#     fence the merge-gate prompt uses (===BEGIN/END ADVERSARIAL FINDINGS
-#     DATA===) are defanged unconditionally, regardless of which pipeline a
-#     given finding is travelling through — a payload could be planted once
-#     and land in either round-trip. Case-insensitively replaces each
-#     literal label string with a defanged spaced-out form. This does not
-#     make the text nonsensical to a human reviewer (the words are still
-#     legible) but prevents it from being byte-identical to the real
-#     delimiter the model was told to trust. Without this, a finding
-#     containing a literal fence string survives verbatim into the written
-#     artifact and can forge a fake end-of-data marker inside the block,
-#     escaping the fence entirely (BOBBIE, lr-cda4b9 follow-up).
-#   - Caps length at MAX_CHARS, truncating rather than rejecting — a
-#     merely-too-long finding is not attacker behavior, and rejecting it
-#     would silently drop a real finding (fail-open posture matches the
-#     rest of the invariant-feed and the advisory/blocking split).
-_llm_field_sanitize() {
-  _lfs_text="$1"
-  _lfs_max="${2:-$(_invariant_feed_max_field_chars)}"
-  case "$_lfs_max" in ''|*[!0-9]*) _lfs_max=$(_invariant_feed_max_field_chars) ;; esac
-
-  if command -v python3 >/dev/null 2>&1; then
-    # Text goes through a temp file, NOT stdin: `python3 -` already reads the
-    # script itself from stdin (the heredoc below), so piping the untrusted
-    # text into the same stdin would either be silently discarded or
-    # interleaved with the script depending on shell/buffering — the data
-    # channel and the script channel must be different file descriptors.
-    _lfs_tmp=$(mktemp -t clagentic-llm-sanitize.XXXXXX)
-    printf '%s' "$_lfs_text" > "$_lfs_tmp"
-    python3 - "$_lfs_tmp" "$_lfs_max" <<'PYEOF'
-import re
-import sys
-
-path, max_chars = sys.argv[1], int(sys.argv[2])
-with open(path) as f:
-    text = f.read()
-
-# Strip ANSI/terminal escape sequences (CSI, OSC, and bare ESC-prefixed
-# sequences) before the general control-char strip below, so a multi-byte
-# escape sequence does not leave stray printable fragments behind.
-text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)   # CSI: ESC [ ... letter
-text = re.sub(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)', '', text)  # OSC: ESC ] ... BEL/ST
-text = re.sub(r'\x1b.', '', text)                   # any remaining ESC + one byte
-
-# Strip remaining control/non-printable bytes, preserving tab and newline.
-text = ''.join(ch for ch in text if ch in ('\t', '\n') or 0x20 <= ord(ch) != 0x7f)
-
-# Defang forged delimiter labels: a hostile finding message could contain
-# the literal string "INVARIANTS:" or "DEFERRED FINDINGS:" -- or either
-# fenced data-block marker set (===BEGIN/END INVARIANTS DATA===, the
-# invariant-feed fence in ds_adversarial_prompt; ===BEGIN/END ADVERSARIAL
-# FINDINGS DATA===, the merge-gate fence in ds_merge_gate_prompt, both
-# llm-client.sh) -- to try to spoof a fresh data-block boundary once
-# re-injected into a future prompt. Insert a zero-width-safe space so the
-# string is still legible to a human but no longer byte-identical to the
-# real delimiter. Both fence sets are defanged unconditionally here (not
-# gated by which caller invoked this function) since a single planted
-# finding could round-trip through either path.
-for label in ("INVARIANTS:", "DEFERRED FINDINGS:", "END INVARIANTS",
-              "END DEFERRED FINDINGS",
-              "===BEGIN INVARIANTS DATA===", "===END INVARIANTS DATA===",
-              "===BEGIN ADVERSARIAL FINDINGS DATA===",
-              "===END ADVERSARIAL FINDINGS DATA==="):
-    pattern = re.compile(re.escape(label), re.IGNORECASE)
-    text = pattern.sub(lambda m: ' '.join(m.group(0)), text)
-
-# Truncate so the FINAL string (content + suffix) fits within max_chars --
-# slicing to max_chars and then appending the suffix would let the suffix
-# push the total length past the configured cap (PEACHES, lr-cda4b9
-# follow-up).
-suffix = "...[truncated]"
-if len(text) > max_chars:
-    keep = max(max_chars - len(suffix), 0)
-    text = text[:keep] + suffix
-
-sys.stdout.write(text)
-PYEOF
-    _lfs_status=$?
-    rm -f "$_lfs_tmp"
-    return $_lfs_status
-  fi
-
-  # No python3: best-effort POSIX fallback. tr strips the bulk of control
-  # bytes (octal escapes for 0x01-0x08, 0x0B-0x1F, 0x7F; 0x00 cannot appear
-  # in a shell string so no explicit strip needed); sed defangs both fenced
-  # marker sets specifically (literal, fixed-case substitution — no GNU/BSD
-  # sed extension needed, unlike a general case-insensitive label match);
-  # cut caps length. This path does NOT defang the case-insensitive
-  # INVARIANTS:/DEFERRED FINDINGS: labels the python3 path covers (no
-  # portable case-insensitive substitution without sed extensions that vary
-  # GNU/BSD) — acceptable degradation given no-python3 already means jq is
-  # the active JSON tool elsewhere in this codepath. The fenced markers ARE
-  # covered here because they are the labels an attacker could use to
-  # escape a fence entirely (BOBBIE, lr-cda4b9 follow-up), so this path
-  # closes that specific gap even though it cannot close the general one.
-  printf '%s' "$_lfs_text" \
-    | tr -d '\001-\010\013-\037\177' \
-    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g; s|===BEGIN ADVERSARIAL FINDINGS DATA===|= = =BEGIN ADVERSARIAL FINDINGS DATA= = =|g; s|===END ADVERSARIAL FINDINGS DATA===|= = =END ADVERSARIAL FINDINGS DATA= = =|g' \
-    | cut -c "1-${_lfs_max}"
-}
+# _invariant_feed_max_field_chars and _llm_field_sanitize moved to
+# platform.sh (lr-4f8316 follow-up): llm-client.sh needed to sanitize a
+# THIRD round-trip field (the change-class commit-message hint) and could
+# not reach this sanitizer because llm-client.sh does not source gates.sh —
+# the omission that shipped the un-sanitized hint was structurally forced,
+# not an oversight at the call site. platform.sh is the one file both
+# gates.sh and llm-client.sh already source, so it is the shared home for
+# any sanitizer that must be reachable from both prompt-construction paths.
+# See platform.sh for the full function bodies and rationale; both are
+# available here unchanged (gates.sh sources platform.sh at the top of the
+# file, before any function body in this file runs).
 
 # _invariant_feed_append INVARIANTS_FILE ID CATEGORY FILE STATEMENT
 #
@@ -1349,10 +1211,10 @@ review_is_degraded() {
 # Loose-parses [FINDING] header lines from adversarial markdown output into
 # the same {file,line,category,message} JSON shape review findings use, so
 # they can be run through the EXISTING finding_content_keys / dedup_findings
-# machinery unmodified, plus two gate-plumbing fields (reachable, tier) added
-# for the advisory/blocking split (lr-e2b975). Header format
-# (ds_adversarial_prompt, llm-client.sh):
-#   [FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | title: <phrase>
+# machinery unmodified, plus gate-plumbing fields (reachable, tier, class)
+# added for the advisory/blocking split (lr-e2b975) and the change-class
+# threshold (lr-4f8316). Header format (ds_adversarial_prompt, llm-client.sh):
+#   [FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | class: <durable|ephemeral> | title: <phrase>
 # "category" is set to the CWE id (e.g. "CWE-770") — adversarial findings
 # have no review-style category, and the CWE id IS the class identity that
 # matters for invariant re-derivation. "message" is the title field. A
@@ -1369,15 +1231,26 @@ review_is_degraded() {
 # task's "never suppression" constraint from the other direction: silence in
 # a gate-plumbing field must not manufacture a block that was never earned.
 #
-# Every enum-shaped field (severity, reachable, tier) is validated and
+# Every enum-shaped field (severity, reachable, tier, class) is validated and
 # force-corrected here, at parse time, to a member of its closed set — none
-# of the three is ever passed through as raw captured text. This was a real
+# of the four is ever passed through as raw captured text. This was a real
 # gap for severity specifically until a follow-up review caught it: severity
 # was captured as free text bounded only by the next "|" with no enum check,
 # so model- or attacker-authored text in the severity position reached the
 # JSON sidecar and the merge-gate prompt's fenced data block completely
 # unvalidated — see the inline comment at the severity assignment below for
 # the fix and its rationale.
+#
+# TWO MECHANICAL CLAMPS on tier (lr-4f8316 follow-up), same posture, legible
+# as a pair: (1) reachable != "yes" forces tier to "advisory" — reachability
+# is the mechanical precondition for blocking, never a judgment call tier
+# alone can override. (2) reachable == "yes" AND severity in (high,critical)
+# forces tier to "blocking" — this is the security floor, and it is NOT
+# LLM self-restraint: a finding meeting this bar cannot be downgraded to
+# advisory by class or by anything else the model writes in the tier field.
+# See the inline comment at the floor-clamp assignment below for exactly
+# what "the security floor" is mechanically defined as (and is NOT) given
+# the fields this parser actually has.
 _parse_adversarial_findings() {
   _paf_file="$1"
   if command -v python3 >/dev/null 2>&1; then
@@ -1387,14 +1260,22 @@ import json, re, sys
 path = sys.argv[1]
 findings = []
 # CWE and file:line are mandatory leading fields. severity is mandatory.
-# reachable/tier are optional (may be absent entirely, in either order
-# relative to each other, as long as both precede title when present) so a
-# model still emitting the old 4-field header keeps parsing. title remains
-# the final field, capturing to end-of-line.
+# reachable/tier/class are optional (may be absent entirely, in any order
+# relative to each other, as long as all precede title when present) so a
+# model still emitting an older header keeps parsing. title remains the
+# final field, capturing to end-of-line.
+#
+# `class` (lr-4f8316) is the Auditor's own resolved change-class judgment
+# for the diff this finding lives in -- durable|ephemeral, see
+# ds_adversarial_prompt for the vocabulary and threshold implications. It is
+# a per-finding field (like reachable/tier) purely so it rides the same
+# parse loop and sanitize path; in practice one diff has one resolved class,
+# so every finding from the same adversarial pass carries the same value.
 header_re = re.compile(
     r'^\[FINDING\]\s*([^|]+)\|\s*([^|]+)\|\s*severity:\s*([^|]+?)\s*'
     r'(?:\|\s*reachable:\s*([^|]+?)\s*)?'
     r'(?:\|\s*tier:\s*([^|]+?)\s*)?'
+    r'(?:\|\s*class:\s*([^|]+?)\s*)?'
     r'\|\s*title:\s*(.+)$'
 )
 try:
@@ -1413,7 +1294,8 @@ for line in lines:
     severity_raw = m.group(3).strip().lower()
     reachable_raw = (m.group(4) or "").strip().lower()
     tier_raw = (m.group(5) or "").strip().lower()
-    title = m.group(6).strip()
+    class_raw = (m.group(6) or "").strip().lower()
+    title = m.group(7).strip()
     if ":" in fileline:
         fname, _, lineno = fileline.rpartition(":")
         try:
@@ -1422,7 +1304,7 @@ for line in lines:
             fname, lineno = fileline, 0
     else:
         fname, lineno = fileline, 0
-    # severity is a closed set, same as reachable/tier below -- enum-check
+    # severity is a closed set, same as reachable/tier/class below -- enum-check
     # and force-correct rather than pass the raw captured text through.
     # Before this (lr-e2b975 follow-up), severity was free text bounded only
     # by the next "|" in the header line: model- or attacker-authored text
@@ -1449,6 +1331,46 @@ for line in lines:
         tier = "advisory"
     if reachable != "yes":
         tier = "advisory"
+    # class (lr-4f8316): closed set durable|ephemeral, absent/unparseable
+    # defaults to "durable" -- fail-closed on the SAME axis severity/
+    # reachable/tier fail-open on (never-under-block), because durable is
+    # the class that does NOT relax the blocking threshold. A parser gap in
+    # this field can therefore only ever leave the full bar in place, never
+    # silently grant a downgrade.
+    change_class = class_raw if class_raw in ("durable", "ephemeral") else "durable"
+    # SECURITY FLOOR CLAMP (lr-4f8316 follow-up, MECHANICAL, mirrors the
+    # reachability clamp immediately above -- same function, same posture,
+    # legible as a pair): before this fix, whether an ephemeral-classed,
+    # reachable, high/critical finding stayed tier:blocking was ENTIRELY
+    # LLM self-restraint -- the parser recorded the declared class but never
+    # independently verified the Auditor actually honored "the security
+    # floor is absolute regardless of class" from its own prompt. Docs and
+    # the prompt asserted that floor as absolute; nothing in code enforced
+    # it. That is the identical failure shape lr-e2b975 fixed for severity:
+    # a documented safety property with no corresponding mechanical check.
+    #
+    # The floor as documented (live credentials, reachable injection sinks,
+    # real exploit paths) is not fully expressible from the fields available
+    # to this parser -- there is no structured "is this a credential" or
+    # "is this a real exploit path" signal, only file/line/category/message/
+    # severity/reachable/tier/class. The mechanically enforceable subset of
+    # that intent, translated into the fields actually available: reachable
+    # (a cited concrete exploit path/trigger, per the Auditor's own
+    # Pre-Report Gate) AND severity high/critical (the Auditor's own
+    # judgment that this is a live, serious exposure) together are the
+    # closed-form proxy for "this is the kind of finding the floor
+    # protects." class can never downgrade a finding meeting that bar,
+    # regardless of what tier the model wrote. This does NOT independently
+    # verify "is a live credential" or "is a real exploit path" beyond what
+    # reachable+severity already encode -- those are represented via the
+    # Auditor's severity/reachable judgment, not via a separate mechanical
+    # signal this parser has no field to check. If that distinction matters
+    # to a future reader: reachable+high/critical is the enforced floor;
+    # "live credential" / "real exploit path" specifically is prompt-level
+    # instruction to the Auditor for HOW to set reachable/severity, not a
+    # second mechanical predicate over different fields.
+    if reachable == "yes" and severity in ("high", "critical"):
+        tier = "blocking"
     findings.append({
         "file": fname,
         "line": lineno,
@@ -1457,6 +1379,7 @@ for line in lines:
         "severity": severity,
         "reachable": reachable,
         "tier": tier,
+        "class": change_class,
     })
 print(json.dumps(findings))
 PYEOF
@@ -1507,9 +1430,25 @@ PYEOF
 #     parse time (unrecognized/absent -> "no"). Same reasoning as severity:
 #     no free text left after parsing, nothing for this function to do.
 #   tier      — closed set (blocking/advisory). ENUM-VALIDATED AND
-#     FORCE-CORRECTED at parse time (unrecognized/absent -> "advisory", and
-#     force-corrected again to "advisory" whenever reachable != "yes").
-#     Same reasoning as severity/reachable.
+#     FORCE-CORRECTED at parse time: (unrecognized/absent -> "advisory");
+#     forced to "advisory" whenever reachable != "yes"; and, as of the
+#     lr-4f8316 follow-up, forced to "blocking" whenever reachable == "yes"
+#     AND severity is high/critical, REGARDLESS of class or of whatever tier
+#     value the model wrote — this is the mechanical security-floor clamp,
+#     not LLM self-restraint. Same reasoning as severity/reachable on the
+#     "no free text left, nothing for this function to do" point.
+#   class     — closed set (durable/ephemeral, lr-4f8316). ENUM-VALIDATED AND
+#     FORCE-CORRECTED at parse time (unrecognized/absent -> "durable" — the
+#     class that does NOT relax the blocking threshold, so a parser gap can
+#     only ever leave the full bar in place, never silently grant a
+#     downgrade). Same reasoning as severity/reachable/tier: after
+#     validation there is no free text left in the field. class CAN
+#     influence tier (a durability-only finding at reachable:yes but
+#     medium/low severity may legitimately stay advisory under either
+#     class), but it can never OVERRIDE the security-floor clamp above —
+#     the clamp runs unconditionally after class is resolved, so an
+#     ephemeral declaration cannot buy a downgrade on a finding the clamp's
+#     predicate already caught.
 #   line      — always an int (parse failure on the numeric suffix falls
 #     back to 0 in _parse_adversarial_findings). Not text; nothing to
 #     sanitize; not enum-shaped either, so "validated" isn't quite the right
@@ -1517,86 +1456,23 @@ PYEOF
 #     pass-through of the captured string).
 #
 # Net: every field is either free-text-and-sanitized (file/category/message)
-# or closed-set-and-force-corrected-at-parse-time (severity/reachable/tier)
-# or non-text-by-construction (line). There is no field in this record that
-# is "probably fine" or asserted-safe-without-a-mechanism — each one has an
-# actual enforcement point, named above, that a future change to this
-# function or to _parse_adversarial_findings should re-verify still holds
-# before relying on this comment again.
+# or closed-set-and-force-corrected-at-parse-time (severity/reachable/tier/
+# class) or non-text-by-construction (line). There is no field in this
+# record that is "probably fine" or asserted-safe-without-a-mechanism — each
+# one has an actual enforcement point, named above, that a future change to
+# this function or to _parse_adversarial_findings should re-verify still
+# holds before relying on this comment again.
 _sanitize_adversarial_findings_json() {
   _safj_json="$1"
-
-  if command -v jq >/dev/null 2>&1; then
-    _safj_count=$(printf '%s' "$_safj_json" | jq 'length' 2>/dev/null)
-    case "$_safj_count" in ''|*[!0-9]*) printf '%s' "$_safj_json"; return 0 ;; esac
-    _safj_out="[]"
-    _safj_i=0
-    while [ "$_safj_i" -lt "$_safj_count" ]; do
-      _safj_finding=$(printf '%s' "$_safj_json" | jq -c ".[$_safj_i]" 2>/dev/null) || break
-      _safj_raw_file=$(printf '%s' "$_safj_finding" | jq -r '.file // ""' 2>/dev/null)
-      _safj_raw_category=$(printf '%s' "$_safj_finding" | jq -r '.category // ""' 2>/dev/null)
-      _safj_raw_message=$(printf '%s' "$_safj_finding" | jq -r '.message // ""' 2>/dev/null)
-
-      _safj_clean_file=$(_llm_field_sanitize "$_safj_raw_file")
-      _safj_clean_category=$(_llm_field_sanitize "$_safj_raw_category")
-      _safj_clean_message=$(_llm_field_sanitize "$_safj_raw_message")
-
-      _safj_finding_clean=$(printf '%s' "$_safj_finding" | jq -c \
-        --arg f "$_safj_clean_file" --arg c "$_safj_clean_category" --arg m "$_safj_clean_message" \
-        '.file = $f | .category = $c | .message = $m' 2>/dev/null)
-      [ -n "$_safj_finding_clean" ] || _safj_finding_clean="$_safj_finding"
-
-      _safj_out=$(printf '%s' "$_safj_out" | jq -c --argjson item "$_safj_finding_clean" '. + [$item]' 2>/dev/null)
-      [ -n "$_safj_out" ] || { printf '%s' "$_safj_json"; return 0; }
-      _safj_i=$((_safj_i + 1))
-    done
-    printf '%s' "$_safj_out"
-    return 0
-  fi
-
-  if command -v python3 >/dev/null 2>&1; then
-    # No jq: decompose/rebuild via python3 (this file's documented
-    # jq-then-python3 fallback order everywhere else), but each field still
-    # goes through the real _llm_field_sanitize shell function — one call
-    # per field, same as the jq branch above — not a python reimplementation
-    # of the sanitizer.
-    _safj_count=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(len(d) if isinstance(d, list) else 0)' "$_safj_json" 2>/dev/null)
-    case "$_safj_count" in ''|*[!0-9]*) printf '%s' "$_safj_json"; return 0 ;; esac
-    _safj_out="[]"
-    _safj_i=0
-    while [ "$_safj_i" -lt "$_safj_count" ]; do
-      _safj_finding=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(json.dumps(d[int(sys.argv[2])]))' "$_safj_json" "$_safj_i" 2>/dev/null) || break
-      _safj_raw_file=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("file",""))' "$_safj_finding" 2>/dev/null)
-      _safj_raw_category=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("category",""))' "$_safj_finding" 2>/dev/null)
-      _safj_raw_message=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("message",""))' "$_safj_finding" 2>/dev/null)
-
-      _safj_clean_file=$(_llm_field_sanitize "$_safj_raw_file")
-      _safj_clean_category=$(_llm_field_sanitize "$_safj_raw_category")
-      _safj_clean_message=$(_llm_field_sanitize "$_safj_raw_message")
-
-      _safj_finding_clean=$(python3 -c '
-import json, sys
-finding = json.loads(sys.argv[1])
-finding["file"] = sys.argv[2]
-finding["category"] = sys.argv[3]
-finding["message"] = sys.argv[4]
-print(json.dumps(finding))
-' "$_safj_finding" "$_safj_clean_file" "$_safj_clean_category" "$_safj_clean_message" 2>/dev/null)
-      [ -n "$_safj_finding_clean" ] || _safj_finding_clean="$_safj_finding"
-
-      _safj_out=$(python3 -c 'import json,sys; arr=json.loads(sys.argv[1]); arr.append(json.loads(sys.argv[2])); print(json.dumps(arr))' "$_safj_out" "$_safj_finding_clean" 2>/dev/null)
-      [ -n "$_safj_out" ] || { printf '%s' "$_safj_json"; return 0; }
-      _safj_i=$((_safj_i + 1))
-    done
-    printf '%s' "$_safj_out"
-    return 0
-  fi
-
-  # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open: return
-  # the original (unsanitized) content, consistent with the rest of this
-  # codepath's no-JSON-tool degradation (e.g. _parse_adversarial_findings
-  # itself returns "[]" with no python3).
-  printf '%s' "$_safj_json"
+  # Thin wrapper over the shared decompose/sanitize/rebuild helper
+  # (_llm_json_array_sanitize_fields, platform.sh, lr-4f8316 follow-up) --
+  # this function used to carry its own duplicated jq/python3
+  # decompose-sanitize-rebuild loop; that loop is now the shared machinery
+  # a second caller (the deferrals array, ds_review_prompt in llm-client.sh)
+  # reuses instead of hand-rolling a variant. Behavior is unchanged: every
+  # finding's file/category/message field is sanitized via
+  # _llm_field_sanitize, exactly as before.
+  _llm_json_array_sanitize_fields "$_safj_json" file category message
 }
 
 cmd_adversarial() {
@@ -1758,6 +1634,28 @@ except Exception:
 
   "$TOOL_HOME/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT"
 
+  # Resolved change class + downgrade count (lr-4f8316): read back from the
+  # gate-summary payload ($IN, the exact input build_gate_summary produced)
+  # so the audit trail records which class applied to this ship attempt and
+  # how many findings it downgraded — independent of the merge-gate's own
+  # decision, since the class is gate plumbing, not a merge-gate judgment
+  # call. Empty/unparseable is silently treated as "no class info" (fail-open,
+  # matching the rest of this codepath); a missing class never blocks.
+  _mg_class=""
+  _mg_class_downgraded=0
+  if command -v jq >/dev/null 2>&1; then
+    _mg_class=$(jq -r '.resolved_change_class // ""' "$IN" 2>/dev/null || echo "")
+    _mg_class_downgraded=$(jq -r '.adversarial_downgraded_by_class_count // 0' "$IN" 2>/dev/null || echo 0)
+  elif command -v python3 >/dev/null 2>&1; then
+    _mg_class=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d.get("resolved_change_class"); print(v if v else "")' "$IN" 2>/dev/null || echo "")
+    _mg_class_downgraded=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("adversarial_downgraded_by_class_count",0))' "$IN" 2>/dev/null || echo 0)
+  fi
+  case "$_mg_class_downgraded" in ''|*[!0-9]*) _mg_class_downgraded=0 ;; esac
+  _mg_class_suffix=""
+  if [ -n "$_mg_class" ]; then
+    _mg_class_suffix=" [class=$_mg_class downgraded=$_mg_class_downgraded]"
+  fi
+
   DECISION=""
   if command -v jq >/dev/null 2>&1; then
     DECISION=$(jq -r '.decision // "unknown"' "$OUT" 2>/dev/null)
@@ -1788,13 +1686,13 @@ print("; ".join(parts))
         fi
       fi
       if [ "${ACK_COUNT:-0}" -gt 0 ]; then
-        cmd_log_run "$_mg_gate_name" pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL"
+        cmd_log_run "$_mg_gate_name" pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL$_mg_class_suffix"
       else
-        cmd_log_run "$_mg_gate_name" pass "approve"
+        cmd_log_run "$_mg_gate_name" pass "approve$_mg_class_suffix"
       fi
       ;;
     refuse)
-      cmd_log_run "$_mg_gate_name" block "refuse"
+      cmd_log_run "$_mg_gate_name" block "refuse$_mg_class_suffix"
       cat "$OUT"
       # Default blocking; set CLAGENTIC_MERGE_GATE_BLOCKING=0 to override.
       if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
@@ -2041,6 +1939,44 @@ build_gate_summary() {
     ADV_ADVISORY_COUNT=$(printf '%s' "$ADF_PAYLOAD" | jq '[.[] | select(.tier == "advisory")] | length' 2>/dev/null || echo 0)
     case "$ADV_BLOCKING_COUNT" in ''|*[!0-9]*) ADV_BLOCKING_COUNT=0 ;; esac
     case "$ADV_ADVISORY_COUNT" in ''|*[!0-9]*) ADV_ADVISORY_COUNT=0 ;; esac
+    # Resolved change class (lr-4f8316): the Auditor states its own class
+    # judgment per finding (see _parse_adversarial_findings); one diff has
+    # one resolved class in practice, so "any finding says ephemeral" is the
+    # mechanical resolution rule -- a single ephemeral-classified finding
+    # means the Auditor read the diff as ephemeral overall. null when there
+    # are no findings at all (nothing to resolve; the merge-gate and audit
+    # trail should not fabricate a class for a clean pass).
+    RESOLVED_CHANGE_CLASS='null'
+    ADF_LEN=$(printf '%s' "$ADF_PAYLOAD" | jq 'length' 2>/dev/null || echo 0)
+    case "$ADF_LEN" in ''|*[!0-9]*) ADF_LEN=0 ;; esac
+    if [ "$ADF_LEN" -gt 0 ]; then
+      if printf '%s' "$ADF_PAYLOAD" | jq -e 'any(.[]; .class == "ephemeral")' >/dev/null 2>&1; then
+        RESOLVED_CHANGE_CLASS='"ephemeral"'
+      else
+        RESOLVED_CHANGE_CLASS='"durable"'
+      fi
+    fi
+    # Mechanical proxy for "downgraded because of class" (lr-4f8316): a
+    # finding that met the blocking-eligible bar on reachability+severity
+    # (reachable:yes, severity high/critical -- the same two conditions
+    # "Blocking vs advisory" requires) but still rode as tier:advisory,
+    # while class:ephemeral. Since the lr-4f8316 follow-up's mechanical
+    # security-floor clamp (_parse_adversarial_findings, this file) forces
+    # tier:blocking to ALWAYS apply for exactly this shape (reachable:yes +
+    # severity high/critical), regardless of class, a finding produced by
+    # the real parser can never actually match this select() -- this count
+    # is computed independently by reading whatever JSON is on disk in
+    # last-adversarial-findings.json, as a defense-in-depth cross-check
+    # that should always read 0 for any sidecar the real parser wrote. A
+    # nonzero value here is itself a signal worth investigating: either the
+    # sidecar was populated by something other than
+    # _parse_adversarial_findings, or the clamp has regressed. Recorded in
+    # the audit trail so a human can see how many findings the class
+    # shifted, not just what the resolved class was.
+    ADV_DOWNGRADED_BY_CLASS_COUNT=$(printf '%s' "$ADF_PAYLOAD" | jq \
+      '[.[] | select(.class == "ephemeral" and .tier == "advisory" and .reachable == "yes" and (.severity == "high" or .severity == "critical"))] | length' \
+      2>/dev/null || echo 0)
+    case "$ADV_DOWNGRADED_BY_CLASS_COUNT" in ''|*[!0-9]*) ADV_DOWNGRADED_BY_CLASS_COUNT=0 ;; esac
     # Fenced, explicit-data-block rendering of the (already sanitized)
     # adversarial findings, mirroring the invariant-feed's
     # ===BEGIN/END INVARIANTS DATA=== treatment (lr-e2b975, matches
@@ -2060,6 +1996,8 @@ build_gate_summary() {
   "adversarial_findings_fenced": $ADF_FENCED_PAYLOAD,
   "adversarial_blocking_count": $ADV_BLOCKING_COUNT,
   "adversarial_advisory_count": $ADV_ADVISORY_COUNT,
+  "resolved_change_class": $RESOLVED_CHANGE_CLASS,
+  "adversarial_downgraded_by_class_count": $ADV_DOWNGRADED_BY_CLASS_COUNT,
   "adversarial_acks": $ACKS_PAYLOAD,
   "accepted_risks": $AR_PAYLOAD,
   "introduces_ack_file": $INTRODUCES_ACK_FILE,
@@ -2117,6 +2055,29 @@ if adf_path:
         adv_findings = []
 adv_blocking_count = sum(1 for f in adv_findings if isinstance(f, dict) and f.get("tier") == "blocking")
 adv_advisory_count = sum(1 for f in adv_findings if isinstance(f, dict) and f.get("tier") == "advisory")
+# Resolved change class + downgrade count (lr-4f8316) -- same rules as the
+# jq branch above: resolved class is "ephemeral" if any finding declares
+# class:ephemeral, else "durable" if there is at least one finding, else
+# null (nothing to resolve on a clean pass). The downgrade count is a
+# mechanical proxy -- reachable:yes + severity high/critical + tier:advisory
+# + class:ephemeral -- for "this finding met the blocking bar and rode as
+# advisory under an ephemeral class"; see the jq branch's comment for why
+# this cannot double as a claim that class was necessarily the deciding
+# factor (a security-floor override produces the same never-advisory
+# outcome regardless of class, so it never reaches this shape either way).
+resolved_change_class = None
+if adv_findings:
+    resolved_change_class = "ephemeral" if any(
+        isinstance(f, dict) and f.get("class") == "ephemeral" for f in adv_findings
+    ) else "durable"
+adv_downgraded_by_class_count = sum(
+    1 for f in adv_findings
+    if isinstance(f, dict)
+    and f.get("class") == "ephemeral"
+    and f.get("tier") == "advisory"
+    and f.get("reachable") == "yes"
+    and f.get("severity") in ("high", "critical")
+)
 # Fenced, explicit-data-block rendering (lr-e2b975) -- same
 # ===BEGIN/END ADVERSARIAL FINDINGS DATA=== fence the jq branch above emits
 # via _fence_adversarial_findings, mirroring ds_adversarial_prompt's
@@ -2151,6 +2112,8 @@ print(json.dumps({
     "adversarial_findings_fenced": adv_findings_fenced,
     "adversarial_blocking_count": adv_blocking_count,
     "adversarial_advisory_count": adv_advisory_count,
+    "resolved_change_class": resolved_change_class,
+    "adversarial_downgraded_by_class_count": adv_downgraded_by_class_count,
     "adversarial_acks": acks,
     "accepted_risks": ar,
     "introduces_ack_file": introduces_ack,
@@ -2169,10 +2132,10 @@ PY
   # limitation the adversarial markdown field already has above.
   if [ -f "$RV" ]; then
     cat <<EOF
-{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
+{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "resolved_change_class": null, "adversarial_downgraded_by_class_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
 EOF
   else
-    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
+    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
   fi
 }
 

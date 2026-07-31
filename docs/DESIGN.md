@@ -23,7 +23,7 @@ clagentic-lite is the smallest credible expression of that thesis. It is built t
 | 2 | **Safe Bash + writes** | `PreToolUse` (Bash, Write, Edit) | regex deny-list on dangerous commands; path-scope check; default-branch protection; hooks fail closed when no JSON validator (jq/python3) available | yes |
 | 3 | **Cross-CLI review** | `/review` slash command, optional pre-push | Builder's staged diff piped to Reviewer; schema-validated JSON findings | findings ≥ `BLOCK_SEVERITY` block `/ship`; degraded envelopes also block |
 | 4 | **Local security scan** | git `pre-commit` (secrets) and `pre-push` (deps, SAST) | gitleaks; osv-scanner; semgrep --error --severity=ERROR. Missing tool fails closed unless `CLAGENTIC_ALLOW_MISSING_*=1` | yes |
-| 5 | **Adversarial pass** | `/review --adversarial` | Auditor role plays attacker on the diff; each finding is tagged `reachable: yes/no` and `tier: blocking/advisory` | no on its own (commentary); `tier: blocking` findings are what Gate 6 can refuse on |
+| 5 | **Adversarial pass** | `/review --adversarial` | Auditor role plays attacker on the diff; each finding is tagged `reachable: yes/no`, `tier: blocking/advisory`, and `class: durable/ephemeral` | no on its own (commentary); `tier: blocking` findings are what Gate 6 can refuse on |
 | 6 | **Merge Gate** | `/ship` | LLM reads every prior gate's structured output and returns `{decision, reason}` JSON | yes by default (`CLAGENTIC_MERGE_GATE_BLOCKING=1`); only `tier: blocking` adversarial findings are refusal-eligible, `tier: advisory` findings are never gating |
 | 7 | **Session summarize** | `Stop` | async, debounced: Summarizer reads transcript → one-line summary → SQLite | no (best-effort) |
 
@@ -130,6 +130,25 @@ The Reviewer never edits files. The Builder never gates its own work. `/review` 
 3. Both outputs land in `.clagentic/lite/last-adversarial.md`, attached to the PR as a comment.
 
 This is the demo flourish. It's also genuinely useful, but it's not on the blocking path.
+
+## Change class — durability-aware thresholds (lr-4f8316)
+
+Gates review all code as if it ships forever by default. That is usually right, but it is a category error for a one-shot migration script or a k8s Job stood up for a single task and documented for decommission — an internal-only, run-once process does not carry the same durability risk a persistent service does, and holding it to the identical bar is a dominant cause of review bounce loops that fix nothing real.
+
+**Vocabulary — two classes, chosen to be small and defensible:**
+
+- `durable` (default) — ships and stays. Full bar applies.
+- `ephemeral` — one-shot, time-boxed, or throwaway: a migration script, a k8s Job (not a Deployment) with a documented decommission path, a change confined to `tests/`/`migrations/`, a one-shot `main()` that exits.
+
+**Inferred from the diff, not maintained in a file.** An operator-maintained context file was explicitly rejected: it is a second source of truth that goes stale the moment the thing it describes is decommissioned. The signal — path under `tests/`/`migrations/`, k8s Job vs Deployment, a one-shot `main()` that exits, a documented decommission date — is already in the diff, and the Reviewer and Auditor already read the diff for every other finding. They need a defined vocabulary and permission to reason about it, not a new input channel.
+
+**Builder hint, diff wins.** The Builder may declare a class as a `Change-class: <value>` trailer in the tip commit message (see `plugins/clagentic-lite/agents/builder.md`), read by `_change_class_hint` (`scripts/llm-client.sh`) and surfaced to the Reviewer/Auditor ahead of the diff. It is a claim to weigh, never the source of truth: if the diff contradicts the declared class, the diff wins and the mismatch itself becomes a finding. Degradation is clean by construction — no declaration infers from the diff; a wrong declaration is overridden and the override is visible — so there is no path where a bad label silently buys a pass, and no separate enforcement mechanism is needed.
+
+**Threshold only, never suppression.** Class shifts the Auditor's *blocking threshold*, nothing else, and only below the security floor (see next paragraph): it never suppresses a finding and never alters reported severity. An ephemeral `high` durability-only finding is still reported as `high`, fully visible in the markdown output, the JSON sidecar, and the audit trail — it simply rides `tier: advisory` instead of `tier: blocking`, with the reason stated in the finding's prose. One honest severity scale; the model never quietly decides something is fine.
+
+**Security floor is absolute regardless of class — mechanically enforced, not LLM self-restraint.** A live credential, a reachable injection sink, or any real exploit path with a concrete attacker-controlled trigger is `tier: blocking` in every class, ephemeral included. This is not merely a prompt instruction: `_parse_adversarial_findings` applies an unconditional parser-level clamp (see "Mechanical plumbing" below) forcing `tier: "blocking"` whenever `reachable: "yes"` and severity is high/critical, regardless of `class` or of what tier value the model wrote — the same mechanical posture as the existing reachability clamp. Ephemeral does not mean unsafe — it means unbounded resource growth in a job that runs once and dies is not a defect the same way it would be in a long-lived service, and that distinction applies only below the floor.
+
+**Mechanical plumbing.** `_parse_adversarial_findings` (`scripts/gates.sh`) enum-validates the Auditor's stated `class` field the same way it already validates `severity`/`reachable`/`tier` (unrecognized/absent → `durable`, the class that never relaxes anything — a parser gap can only ever leave the full bar in place). It then applies TWO mechanical clamps to `tier`, in order: `reachable != "yes"` forces `advisory`; `reachable == "yes"` AND severity high/critical forces `blocking`, regardless of class — this second clamp is the security floor made real, not aspirational. `build_gate_summary` derives `resolved_change_class` (the diff's resolved class, mechanically: `ephemeral` if any finding declares it, else `durable`, else `null` on a clean pass with no findings) and `adversarial_downgraded_by_class_count` (a defense-in-depth cross-check over whatever is on disk in the sidecar — see `docs/GATES.md` for why this should always read `0` given the parser's clamp) and threads both into the merge-gate payload and the `merge-gate`/`merge-gate recheck` audit row. See `docs/GATES.md` § "Change class" for the full per-field enumeration.
 
 ## LLM role-call wrapper
 

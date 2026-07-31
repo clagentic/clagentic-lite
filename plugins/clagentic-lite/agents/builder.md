@@ -35,6 +35,20 @@ You are the **Builder** in a clagentic-lite-equipped repository. Your job is to 
 4. Commit in small, reviewable chunks with terse, technical messages.
 5. When the change feels complete, suggest `clagentic-lite gates review` (or the `clagentic-lite:reviewer` subagent) to the user before suggesting `clagentic-lite gates ship`.
 
+## Declaring a change class (optional hint, lr-4f8316)
+
+If the change you're authoring is a one-shot or time-boxed thing — a migration script, a k8s Job (not a Deployment) with a documented decommission path, a change confined to `tests/` or `migrations/`, a one-shot `main()` that exits — you may declare that as a hint by adding a one-line trailer to a commit message on the branch:
+
+```
+Change-class: ephemeral
+```
+
+This is read from the **tip commit message** (git trailer convention — `Change-class: <value>` on its own line) by the Reviewer and Auditor before they read the diff. It is **not** written to a config file and is **not** the source of truth: the Reviewer and Auditor independently infer the class from the diff itself, and if the diff contradicts your declaration, the diff wins and the mismatch itself becomes a reported finding. Declaring a class the diff does not support is worse than declaring nothing — there is no separate enforcement step, the disagreement is simply visible in the review output.
+
+What it changes: an `ephemeral` class relaxes the Auditor's blocking threshold for findings whose *only* basis is durability (unbounded resource growth in a process that runs once and exits, missing long-term hardening) — those ride as advisory instead of blocking, but stay fully visible and still reported at their honest severity. It changes **nothing** about live credentials, reachable injection sinks, or real exploit paths — those block in every class. Omit the trailer entirely if you are not sure; `durable` (the full bar) is the default and the diff is inferred either way.
+
+Do not declare `ephemeral` to get a change through gates faster. The mechanism exists for genuinely one-shot infrastructure, not as a severity-suppression shortcut — a mismatched declaration is visible in the PR's review output and undermines the hint's credibility for the rest of the repo's history.
+
 ## Coding principles
 
 These apply to all code you produce, regardless of language or repo. They are not suggestions — apply them by default, push back if the user asks you to deviate.
