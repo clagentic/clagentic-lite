@@ -46,10 +46,10 @@ Output goes to `.clagentic/last-adversarial.md`. It is non-blocking on its own �
 Each finding begins with a structured header line, followed by prose:
 
 ```
-[FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | title: Short phrase
+[FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | class: <durable|ephemeral> | title: Short phrase
 ```
 
-Then the prose explanation (1-3 paragraphs: what the vulnerability is, how an attacker exploits it — or why it currently cannot be exploited if `reachable: no` — and what a minimal fix looks like). See "Reachability requirement" and "Blocking vs advisory" below for how `reachable` and `tier` are decided; both are required fields, not optional annotations.
+Then the prose explanation (1-3 paragraphs: what the vulnerability is, how an attacker exploits it — or why it currently cannot be exploited if `reachable: no` — and what a minimal fix looks like; if `class` relaxed this finding to advisory, say so explicitly). See "Reachability requirement", "Blocking vs advisory", and "Change class" below for how `reachable`, `tier`, and `class` are decided; all three are required fields, not optional annotations.
 
 ### Pre-Report Gate
 
@@ -79,9 +79,26 @@ A finding is `tier: blocking` only when **all** of the following hold:
 - Severity is `high` or `critical`.
 - No `.clagentic/adversarial-acks.json` entry or `.clagentic/accepted-risks.md` entry already covers it (Gate 6 applies these; you do not need to check them yourself, but do not inflate severity to compensate for a finding you suspect will be acknowledged).
 
-Every other finding — unreachable, no concrete trigger, or severity `medium`/`low` — is `tier: advisory`. Advisory findings are never a reason for the Merge Gate to refuse; they are read by the operator and the invariant-feed exactly as before.
+Every other finding — unreachable, no concrete trigger, or severity `medium`/`low`, or excused by change class (see below) — is `tier: advisory`. Advisory findings are never a reason for the Merge Gate to refuse; they are read by the operator and the invariant-feed exactly as before.
 
 State `tier` explicitly in the header (see "Finding format" above). Do not leave it to be inferred — the gate parses this field mechanically and does not re-derive it from prose.
+
+### Change class
+
+Gates review all code as if it ships forever by default — usually right, but a one-shot migration script or a k8s Job stood up for a single task and documented for decommission is not a durable service, and holding it to the identical bar is a category error, not rigor.
+
+**Vocabulary** — two classes:
+
+- **`durable`** (default) — ships and stays. Full bar applies; nothing about this class relaxes any threshold.
+- **`ephemeral`** — one-shot, time-boxed, or throwaway: a migration script, a k8s Job (not a Deployment) with a documented decommission path, a change confined to `tests/` or `migrations/`, a one-shot `main()` that exits and does not run as a persistent process.
+
+**Inference, not a file.** Infer the class from the diff itself — path, structure, lifecycle shape, any stated decommission date — the same way you already infer reachability. There is deliberately no operator-maintained context file for this: it is a second source of truth that goes stale the moment the ephemeral thing is decommissioned. You already read the diff for every other finding; that is the only signal that cannot go stale.
+
+**Builder hint, diff wins.** The Builder may declare a class as a one-line `Change-class: <value>` trailer in the tip commit message (see `scripts/llm-client.sh`'s `_change_class_hint` — surfaced to you as a `BUILDER-DECLARED CHANGE-CLASS HINT` note ahead of the diff, when present). It is a **claim to weigh against the diff, never the source of truth**. If the diff contradicts the declared class (e.g. declared `ephemeral` but the diff adds a long-lived Deployment, or touches broad production surface with no documented decommission path and no one-shot exit), **the diff wins**: resolve the class from the diff and additionally report the mismatch itself as a finding (`CWE-unknown` is fine — the mismatch is the finding, not a vulnerability). A wrong declaration must never silently buy a pass; this is what makes an implausible declaration worse for the Builder than no declaration at all, with no separate enforcement mechanism needed. An absent hint is not a problem — infer durable vs ephemeral from the diff exactly as you would with a hint present.
+
+**Threshold implication — the only thing class does.** When the resolved class is `ephemeral`, a finding whose *sole* basis is a durability-dependent concern (unbounded resource growth in a process that runs once and exits, missing retry/backoff/observability hardening that only matters across a long service lifetime, missing long-term maintainability polish) rides as `tier: advisory` instead of blocking, even if `reachable: yes` and severity is high/critical — state the reason in the finding's prose. Class **never** suppresses a finding and **never** changes its reported severity: an ephemeral high is still reported as high, fully visible, just not gating. Class also never lowers reachability.
+
+**Security floor is absolute regardless of class.** A live credential/secret, a reachable injection sink, or any real exploit path with a concrete attacker-controlled trigger is `tier: blocking` in every class, ephemeral included. Ephemeral does not mean unsafe — it means a job that runs once and dies does not need the same durability hardening a persistent service does. Never use class to excuse anything that would independently qualify as `tier: blocking` on reachability + severity alone.
 
 ### HIGH / CRITICAL require proof
 

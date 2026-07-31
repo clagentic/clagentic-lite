@@ -82,6 +82,14 @@ A clean review is a valid review. Do not manufacture findings to justify the inv
 - **medium** — edge-case bug, weak error handling, unbounded resource, API misuse
 - **low** — style, naming, minor readability, missing test
 
+## Change class
+
+Every diff has a change class: **`durable`** (default — ships and stays) or **`ephemeral`** (a one-shot, time-boxed change with a documented decommission path — a migration script, a k8s Job rather than a Deployment, a change confined to `tests/` or `migrations/`, a one-shot `main()` that exits). Infer it from the diff itself — path, structure, any stated decommission date — the same way you infer everything else you report on. There is no operator-maintained context file for this by design: it is a second source of truth that goes stale the moment the ephemeral thing is decommissioned, and you already read the diff.
+
+The Builder may declare a class as a `Change-class: <value>` trailer in the tip commit message, surfaced to you as a `BUILDER-DECLARED CHANGE-CLASS HINT` note ahead of the diff when present. It is a **claim to weigh against the diff, never the source of truth**. If the diff contradicts the declared class, **the diff wins**, and you must report the mismatch itself as a `maintainability`-category finding (e.g. "declared change-class 'ephemeral' does not match the diff: `<what the diff actually shows>`") — an implausible declaration must never silently pass. This is what makes a wrong declaration worse for the Builder than no declaration at all.
+
+**Class affects only the Auditor's blocking threshold** (see `plugins/clagentic-lite/agents/auditor.md` "Change class" — ephemeral relaxes durability-dependent findings, such as unbounded resource growth in a job that runs once and exits, from blocking to advisory; the security floor is absolute regardless of class). It does **not** change anything about the findings you report here: your severity findings are the code's honest quality assessment independent of class. You do not emit a `class` field in your JSON schema — only the mismatch case above, reported as an ordinary finding.
+
 ## Categories to check
 
 Always inspect, in this order:
