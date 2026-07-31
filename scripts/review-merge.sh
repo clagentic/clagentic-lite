@@ -1014,3 +1014,148 @@ PYEOF
   rm -f "$_fck_in"
   return 0
 }
+
+# ------------------------------------------------------- finding_recurrence_bump --
+#
+# finding_recurrence_bump COUNTS_FILE
+#
+# stdin:  TSV, one row per finding, SAME shape finding_content_keys emits:
+#         key<TAB>file<TAB>category<TAB>message
+# stdout: the SAME TSV, with a 5th column appended: the UPDATED recurrence
+#         count for that key (an integer >= 1) after this call increments it.
+#
+# COUNTS_FILE: a JSON object mapping content-hash key -> integer count,
+# persisted across rounds (e.g. .clagentic/lite/review-recurrence.json).
+# Created fresh (as "{}") if absent, empty, or unparseable -- same fail-open
+# posture as every other on-disk gate-state file in this codebase (seen-keys,
+# invariants.json). A key not yet present starts at count 1 on its first
+# call here (this call itself counts as the first occurrence), not 0 --
+# "recurrence count" means "rounds this content has been reported in,
+# including this one."
+#
+# Conservative bias, matching dedup_findings/finding_content_keys exactly:
+#   - A row with an empty key (first TSV field) is passed through with
+#     column 5 = 1 and is NOT written to COUNTS_FILE -- an empty key has no
+#     stable identity to count occurrences of, so it is treated as always-
+#     fresh, never eligible for demotion. Mirrors dedup_findings' own
+#     "empty key -> conservative retain" rule.
+#   - If COUNTS_FILE cannot be written back (no jq/python3, or a write
+#     failure), the function still emits every input row with column 5 = 1
+#     (fail-open: "never seen before" is the safe default for a demotion
+#     decision -- undercounting recurrence can only ever under-demote,
+#     never wrongly hide a finding).
+#   - This function does not decide demotion or read CLAGENTIC_* thresholds
+#     -- it only maintains the count. The caller (gates.sh) compares the
+#     returned count against the configured threshold.
+#
+# Untrusted-on-read: COUNTS_FILE is derived state (this codebase's own
+# content-hash keys and integer counts, never LLM-authored free text), but
+# is still read back from disk on every call. A non-object JSON value, a
+# non-integer count under a key, or a corrupt file are all treated as "no
+# prior count for that key" (defaults to 0 before incrementing) rather than
+# aborting -- fail-open, matching the rest of this file's on-disk-state
+# handling.
+finding_recurrence_bump() {
+  _frb_counts_file="$1"
+
+  _frb_in=$(mktemp -t clagentic-frb-in.XXXXXX)
+  cat > "$_frb_in"
+
+  if command -v jq >/dev/null 2>&1; then
+    _frb_current='{}'
+    if [ -f "$_frb_counts_file" ] && jq -e '. | type == "object"' "$_frb_counts_file" >/dev/null 2>&1; then
+      _frb_current=$(cat "$_frb_counts_file")
+    fi
+    while IFS= read -r _frb_row; do
+      [ -z "$_frb_row" ] && continue
+      _frb_key=$(printf '%s' "$_frb_row" | cut -f1)
+      if [ -z "$_frb_key" ]; then
+        printf '%s\t1\n' "$_frb_row" >> "$_frb_in.annotated"
+        continue
+      fi
+      # Read-then-increment: a non-integer or absent value under this key
+      # defaults to 0 before incrementing (fail-open on a corrupt/foreign
+      # entry -- treated as "first time seen," never aborts).
+      _frb_prior=$(printf '%s' "$_frb_current" | jq -r --arg k "$_frb_key" \
+        '.[$k] | if type == "number" then . else 0 end' 2>/dev/null)
+      case "$_frb_prior" in ''|*[!0-9]*) _frb_prior=0 ;; esac
+      _frb_new=$((_frb_prior + 1))
+      _frb_current=$(printf '%s' "$_frb_current" | jq -c --arg k "$_frb_key" --argjson v "$_frb_new" \
+        '.[$k] = $v' 2>/dev/null)
+      [ -n "$_frb_current" ] || _frb_current='{}'
+      printf '%s\t%d\n' "$_frb_row" "$_frb_new" >> "$_frb_in.annotated"
+    done < "$_frb_in"
+    if [ -f "$_frb_in.annotated" ]; then
+      cat "$_frb_in.annotated"
+      rm -f "$_frb_in.annotated"
+    fi
+    # Best-effort persist. A write failure here means the NEXT call starts
+    # from the pre-this-call counts (undercounts, never overcounts) --
+    # fail-open in the direction that can only ever under-demote.
+    printf '%s' "$_frb_current" > "$_frb_counts_file" 2>/dev/null || true
+    rm -f "$_frb_in"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$_frb_counts_file" "$_frb_in" <<'PYEOF'
+import json, sys
+
+counts_path, rows_path = sys.argv[1], sys.argv[2]
+
+counts = {}
+try:
+    with open(counts_path) as f:
+        loaded = json.load(f)
+    if isinstance(loaded, dict):
+        counts = loaded
+except Exception:
+    counts = {}
+
+out_lines = []
+try:
+    with open(rows_path) as f:
+        rows = f.read().split("\n")
+except Exception:
+    rows = []
+
+for row in rows:
+    if not row:
+        continue
+    fields = row.split("\t")
+    key = fields[0] if fields else ""
+    if not key:
+        out_lines.append(row + "\t1")
+        continue
+    prior = counts.get(key, 0)
+    if not isinstance(prior, int):
+        prior = 0
+    new = prior + 1
+    counts[key] = new
+    out_lines.append(row + "\t{}".format(new))
+
+sys.stdout.write("\n".join(out_lines))
+if out_lines:
+    sys.stdout.write("\n")
+
+try:
+    with open(counts_path, "w") as f:
+        json.dump(counts, f)
+except Exception:
+    pass
+PYEOF
+    rm -f "$_frb_in"
+    return 0
+  fi
+
+  # No JSON tool: fail-open passthrough. Every row gets count=1 (never seen
+  # before is always a safe default for a demotion decision -- it can only
+  # ever under-demote, never wrongly hide a finding), and COUNTS_FILE is
+  # left untouched.
+  while IFS= read -r _frb_row; do
+    [ -z "$_frb_row" ] && continue
+    printf '%s\t1\n' "$_frb_row"
+  done < "$_frb_in"
+  rm -f "$_frb_in"
+  return 0
+}
