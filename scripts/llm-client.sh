@@ -398,9 +398,32 @@ Return STRICT JSON: {"decision":"approve|refuse","reason":"<one sentence>"}
 
 Refuse on any blocking gate failure, on any review finding at or above
 the configured severity threshold, or on contradictions between gates
-(e.g. review says clean but sast errored). Approve only when every
-blocking gate passed AND the adversarial output, if present, contains no
-unmitigated CWE-cited attack.
+(e.g. review says clean but sast errored).
+
+Adversarial findings — advisory/blocking split (lr-e2b975): the payload's
+"adversarial_findings" array holds each adversarial finding already
+classified by the Auditor with a "tier" field ("blocking" or "advisory")
+and a "reachable" field. Use "adversarial_blocking_count" and
+"adversarial_advisory_count" as the mechanical summary of that array — do
+not recompute the split yourself from the "adversarial" markdown prose,
+and do not treat a high/critical severity alone as grounds to refuse if
+its tier is "advisory". Only tier:"blocking" findings are eligible to
+refuse the merge; this is a threshold change, not suppression — advisory
+findings must still be acknowledged in your "reason" text when present
+(e.g. "approved; N advisory finding(s) noted, no blocking findings"), they
+are simply not gating on their own.
+
+For each tier:"blocking" finding, check whether it is covered by
+"adversarial_acks" (per-CWE, path-glob scoped) or "accepted_risks"
+(freetext architectural risk doc) per the existing acknowledgment rules.
+Approve only when every blocking gate passed AND every tier:"blocking"
+adversarial finding is either covered by an ack/accepted-risk or absent.
+Uncovered tier:"blocking" findings refuse the merge.
+
+If "adversarial_findings" is empty or absent (e.g. an older gate run before
+this field existed, or a model that emitted no parseable [FINDING]
+headers), fall back to treating the "adversarial" markdown prose itself as
+the source of truth for unmitigated CWE-cited attacks, as before.
 
 If the "adversarial" field is null or "adversarial_missing" is true, no
 adversarial pass was run for this commit. Treat as no adversarial

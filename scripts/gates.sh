@@ -1323,14 +1323,25 @@ review_is_degraded() {
 # Loose-parses [FINDING] header lines from adversarial markdown output into
 # the same {file,line,category,message} JSON shape review findings use, so
 # they can be run through the EXISTING finding_content_keys / dedup_findings
-# machinery unmodified. Header format (ds_adversarial_prompt, llm-client.sh):
-#   [FINDING] CWE-XXX | file.ext:line | severity: <level> | title: <phrase>
+# machinery unmodified, plus two gate-plumbing fields (reachable, tier) added
+# for the advisory/blocking split (lr-e2b975). Header format
+# (ds_adversarial_prompt, llm-client.sh):
+#   [FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | title: <phrase>
 # "category" is set to the CWE id (e.g. "CWE-770") — adversarial findings
 # have no review-style category, and the CWE id IS the class identity that
 # matters for invariant re-derivation. "message" is the title field. A
 # missing/malformed line number degrades to line 0 (finding_content_keys then
 # fails to compute a context window and the finding is simply omitted from
 # the key set — same conservative-drop behavior documented there).
+#
+# Parser default (fail-open, non-blocking side): reachable/tier are OPTIONAL
+# fields for backward compatibility with a model that emits the pre-lr-e2b975
+# header shape (severity | title, no reachable/tier), or that omits them
+# despite the prompt instruction. A finding with no parseable tier is
+# classified "advisory" — never "blocking" — so a parser gap can only ever
+# under-block (findings still fully visible in output/audit), matching the
+# task's "never suppression" constraint from the other direction: silence in
+# a gate-plumbing field must not manufacture a block that was never earned.
 _parse_adversarial_findings() {
   _paf_file="$1"
   if command -v python3 >/dev/null 2>&1; then
@@ -1339,8 +1350,16 @@ import json, re, sys
 
 path = sys.argv[1]
 findings = []
+# CWE and file:line are mandatory leading fields. severity is mandatory.
+# reachable/tier are optional (may be absent entirely, in either order
+# relative to each other, as long as both precede title when present) so a
+# model still emitting the old 4-field header keeps parsing. title remains
+# the final field, capturing to end-of-line.
 header_re = re.compile(
-    r'^\[FINDING\]\s*([^|]+)\|\s*([^|]+)\|\s*severity:\s*([^|]+)\|\s*title:\s*(.+)$'
+    r'^\[FINDING\]\s*([^|]+)\|\s*([^|]+)\|\s*severity:\s*([^|]+?)\s*'
+    r'(?:\|\s*reachable:\s*([^|]+?)\s*)?'
+    r'(?:\|\s*tier:\s*([^|]+?)\s*)?'
+    r'\|\s*title:\s*(.+)$'
 )
 try:
     with open(path) as f:
@@ -1356,7 +1375,9 @@ for line in lines:
     cwe = m.group(1).strip()
     fileline = m.group(2).strip()
     severity = m.group(3).strip().lower()
-    title = m.group(4).strip()
+    reachable_raw = (m.group(4) or "").strip().lower()
+    tier_raw = (m.group(5) or "").strip().lower()
+    title = m.group(6).strip()
     if ":" in fileline:
         fname, _, lineno = fileline.rpartition(":")
         try:
@@ -1365,12 +1386,26 @@ for line in lines:
             fname, lineno = fileline, 0
     else:
         fname, lineno = fileline, 0
+    reachable = reachable_raw if reachable_raw in ("yes", "no") else "no"
+    # tier defaults to advisory when absent/unparseable (fail-open, see
+    # docstring above) and is force-corrected to advisory when the model's
+    # own reachable field says "no" -- reachability is the mechanical
+    # precondition for blocking, not a judgment call the tier field alone
+    # can override.
+    if tier_raw in ("blocking", "advisory"):
+        tier = tier_raw
+    else:
+        tier = "advisory"
+    if reachable != "yes":
+        tier = "advisory"
     findings.append({
         "file": fname,
         "line": lineno,
         "category": cwe,
         "message": title,
         "severity": severity,
+        "reachable": reachable,
+        "tier": tier,
     })
 print(json.dumps(findings))
 PYEOF
@@ -1381,6 +1416,7 @@ PYEOF
 
 cmd_adversarial() {
   OUT="$REPO_ROOT/.clagentic/lite/last-adversarial.md"
+  FINDINGS_OUT="$REPO_ROOT/.clagentic/lite/last-adversarial-findings.json"
   _adv_diff_tmp=$(mktemp -t clagentic-adv-diff.XXXXXX)
   get_review_diff > "$_adv_diff_tmp"
   "$TOOL_HOME/scripts/llm-client.sh" adversarial < "$_adv_diff_tmp" > "$OUT"
@@ -1394,21 +1430,33 @@ cmd_adversarial() {
     mv "$_adv_tmp" "$OUT"
   fi
 
-  # Invariant-feed writer (lr-63359e), adversarial half. Loose-parses
-  # [FINDING] headers into the same shape the writer already knows how to
-  # key, then reuses dedup_findings' content-hash key derivation via a
-  # dedicated seen-keys file for the adversarial modality (adversarial does
-  # not otherwise participate in cross-round dedup — CLAGENTIC_CROSS_ROUND_DEDUP
-  # only wires into cmd_review — so this is the first time an adversarial
-  # round's findings are content-hash-keyed at all, not a second dedup layer
-  # competing with an existing one).
+  # Structured findings sidecar (lr-e2b975): loose-parse [FINDING] headers
+  # into {file,line,category,message,severity,reachable,tier} JSON,
+  # unconditionally (not gated behind CLAGENTIC_ADVERSARIAL_INVARIANTS — the
+  # advisory/blocking split is a base behavior, not opt-in). This is what
+  # build_gate_summary reads to give the merge-gate a mechanical count of
+  # tier:blocking vs tier:advisory findings instead of asking the LLM to
+  # re-derive the split from markdown prose. The markdown in $OUT remains
+  # the full human-readable record either way — this sidecar never replaces
+  # it, only adds a structured view for gate plumbing.
+  _adv_findings_json=$(_parse_adversarial_findings "$OUT")
+  printf '%s\n' "$_adv_findings_json" > "$FINDINGS_OUT"
+
+  # Invariant-feed writer (lr-63359e), adversarial half. Reuses the same
+  # parsed findings above (previously re-parsed only inside this if-block;
+  # now shared with the sidecar write above). Reuses dedup_findings'
+  # content-hash key derivation via a dedicated seen-keys file for the
+  # adversarial modality (adversarial does not otherwise participate in
+  # cross-round dedup — CLAGENTIC_CROSS_ROUND_DEDUP only wires into
+  # cmd_review — so this is the first time an adversarial round's findings
+  # are content-hash-keyed at all, not a second dedup layer competing with
+  # an existing one).
   if [ "${CLAGENTIC_ADVERSARIAL_INVARIANTS:-0}" = "1" ]; then
     _adv_seen_file="$REPO_ROOT/.clagentic/lite/adversarial-seen-keys"
     [ -f "$_adv_seen_file" ] || touch "$_adv_seen_file"
     _adv_prior_seen_snap=$(mktemp -t clagentic-inv-adv-prior.XXXXXX)
     cp "$_adv_seen_file" "$_adv_prior_seen_snap" 2>/dev/null || : > "$_adv_prior_seen_snap"
 
-    _adv_findings_json=$(_parse_adversarial_findings "$OUT")
     # dedup_findings' return value is unused here — we only want it to
     # persist this round's keys into _adv_seen_file (same side effect
     # _cross_round_dedup relies on for the review path); the deduped
@@ -1630,6 +1678,7 @@ PY
 build_gate_summary() {
   RV="$REPO_ROOT/.clagentic/lite/last-review.json"
   AD="$REPO_ROOT/.clagentic/lite/last-adversarial.md"
+  ADF="$REPO_ROOT/.clagentic/lite/last-adversarial-findings.json"
   ACKS_FILE="$REPO_ROOT/.clagentic/adversarial-acks.json"
   AR_FILE="$REPO_ROOT/.clagentic/accepted-risks.md"
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
@@ -1746,17 +1795,30 @@ build_gate_summary() {
   if command -v jq >/dev/null 2>&1; then
     RV_PAYLOAD='null'
     AD_PAYLOAD='null'
+    ADF_PAYLOAD='[]'
     ACKS_PAYLOAD='[]'
     AR_PAYLOAD='""'
     [ -f "$RV" ] && jq -e . "$RV" >/dev/null 2>&1 && RV_PAYLOAD=$(cat "$RV")
     [ -f "$AD" ] && AD_PAYLOAD=$(jq -Rs . < "$AD")
+    [ -f "$ADF" ] && ADF_PAYLOAD=$(jq -c '. // []' "$ADF" 2>/dev/null || echo '[]')
     [ -f "$ACKS_FILE" ] && ACKS_PAYLOAD=$(jq -c . "$ACKS_FILE" 2>/dev/null || echo '[]')
     [ -f "$AR_FILE" ] && AR_PAYLOAD=$(jq -Rs . < "$AR_FILE")
+    # Mechanical counts (lr-e2b975): the merge-gate does not have to re-derive
+    # the blocking/advisory split from prose — it's computed here from the
+    # same structured sidecar, identical in spirit to severity_blockers()
+    # counting review findings mechanically rather than asking the LLM.
+    ADV_BLOCKING_COUNT=$(printf '%s' "$ADF_PAYLOAD" | jq '[.[] | select(.tier == "blocking")] | length' 2>/dev/null || echo 0)
+    ADV_ADVISORY_COUNT=$(printf '%s' "$ADF_PAYLOAD" | jq '[.[] | select(.tier == "advisory")] | length' 2>/dev/null || echo 0)
+    case "$ADV_BLOCKING_COUNT" in ''|*[!0-9]*) ADV_BLOCKING_COUNT=0 ;; esac
+    case "$ADV_ADVISORY_COUNT" in ''|*[!0-9]*) ADV_ADVISORY_COUNT=0 ;; esac
     cat <<EOF
 {
   "review": $RV_PAYLOAD,
   "adversarial": $AD_PAYLOAD,
   "adversarial_missing": $ADVERSARIAL_MISSING,
+  "adversarial_findings": $ADF_PAYLOAD,
+  "adversarial_blocking_count": $ADV_BLOCKING_COUNT,
+  "adversarial_advisory_count": $ADV_ADVISORY_COUNT,
   "adversarial_acks": $ACKS_PAYLOAD,
   "accepted_risks": $AR_PAYLOAD,
   "introduces_ack_file": $INTRODUCES_ACK_FILE,
@@ -1769,13 +1831,15 @@ EOF
   if command -v python3 >/dev/null 2>&1; then
     RV_ARG=""
     AD_ARG=""
+    ADF_ARG=""
     ACKS_ARG=""
     AR_ARG=""
     [ -f "$RV" ] && RV_ARG="$RV"
     [ -f "$AD" ] && AD_ARG="$AD"
+    [ -f "$ADF" ] && ADF_ARG="$ADF"
     [ -f "$ACKS_FILE" ] && ACKS_ARG="$ACKS_FILE"
     [ -f "$AR_FILE" ] && AR_ARG="$AR_FILE"
-    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" <<'PY'
+    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" <<'PY'
 import json, sys
 threshold           = sys.argv[1]
 introduces_ack      = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
@@ -1784,6 +1848,7 @@ rv_path             = sys.argv[4] if len(sys.argv) > 4 else ""
 ad_path             = sys.argv[5] if len(sys.argv) > 5 else ""
 acks_path           = sys.argv[6] if len(sys.argv) > 6 else ""
 ar_path             = sys.argv[7] if len(sys.argv) > 7 else ""
+adf_path            = sys.argv[8] if len(sys.argv) > 8 else ""
 review = None
 if rv_path:
     try:
@@ -1800,6 +1865,17 @@ elif ad_path:
             adv = f.read()
     except Exception:
         adv = None
+adv_findings = []
+if adf_path:
+    try:
+        with open(adf_path) as f:
+            loaded = json.load(f)
+        if isinstance(loaded, list):
+            adv_findings = loaded
+    except Exception:
+        adv_findings = []
+adv_blocking_count = sum(1 for f in adv_findings if isinstance(f, dict) and f.get("tier") == "blocking")
+adv_advisory_count = sum(1 for f in adv_findings if isinstance(f, dict) and f.get("tier") == "advisory")
 acks = []
 if acks_path:
     try:
@@ -1814,7 +1890,18 @@ if ar_path:
             ar = f.read()
     except Exception:
         ar = ""
-print(json.dumps({"review": review, "adversarial": adv, "adversarial_missing": adversarial_missing, "adversarial_acks": acks, "accepted_risks": ar, "introduces_ack_file": introduces_ack, "threshold": threshold}))
+print(json.dumps({
+    "review": review,
+    "adversarial": adv,
+    "adversarial_missing": adversarial_missing,
+    "adversarial_findings": adv_findings,
+    "adversarial_blocking_count": adv_blocking_count,
+    "adversarial_advisory_count": adv_advisory_count,
+    "adversarial_acks": acks,
+    "accepted_risks": ar,
+    "introduces_ack_file": introduces_ack,
+    "threshold": threshold,
+}))
 PY
     return 0
   fi
@@ -1822,13 +1909,16 @@ PY
   # No JSON encoder available — emit a minimal envelope with adversarial
   # and accepted_risks dropped. The Merge Gate will see this and may choose
   # to refuse on incomplete context. introduces_ack_file is included as false
-  # (conservative — no bootstrap exemption in degraded mode).
+  # (conservative — no bootstrap exemption in degraded mode). Structured
+  # adversarial_findings/counts are also dropped in this degraded path —
+  # same "cannot safely encode arbitrary content without a JSON encoder"
+  # limitation the adversarial markdown field already has above.
   if [ -f "$RV" ]; then
     cat <<EOF
-{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
+{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_findings": [], "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
 EOF
   else
-    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
+    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_findings\": [], \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
   fi
 }
 
