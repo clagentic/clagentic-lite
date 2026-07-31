@@ -646,155 +646,17 @@ _invariant_feed_max_lines() {
   printf '%s' "$_ifml_max"
 }
 
-# _invariant_feed_max_field_chars — per-field length cap applied at the write
-# boundary (see _llm_field_sanitize). Configurable via
-# CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS (default 500 — generous for a
-# one-sentence CWE title/statement, small enough that a single adversarial-
-# controlled finding cannot balloon invariants.json or the prompt it is later
-# injected into).
-_invariant_feed_max_field_chars() {
-  _ifmfc_max="${CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS:-500}"
-  case "$_ifmfc_max" in ''|*[!0-9]*) _ifmfc_max=500 ;; esac
-  printf '%s' "$_ifmfc_max"
-}
-
-# _llm_field_sanitize TEXT [MAX_CHARS] — neutralize LLM-controlled text
-# before it is ever written to a file or prompt block that a LATER LLM call
-# reads back (lr-cda4b9, generalized under lr-e2b975). WRITE-BOUNDARY
-# sanitization, not read-time: every known round-trip path — the
-# invariant-feed (_invariant_feed_append, below) and the adversarial
-# findings sidecar consumed by build_gate_summary/ds_merge_gate_prompt — has
-# exactly one writer and an unknown/growing number of future readers.
-# Cleaning once at ingest means every reader gets clean data for free,
-# instead of every current AND future reader needing to remember to
-# re-sanitize. This is the SOLE sanitizer for LLM-authored text that
-# round-trips into a later prompt — do not add a second one; if a new
-# round-trip path needs different behavior, extend this function.
-#
-# Applied to every field that ultimately traces back to adversarial/review
-# LLM output: for the invariant-feed, category/file/the distilled statement
-# (which embeds the original finding message verbatim); for the adversarial
-# findings sidecar, each finding's title/message and any other
-# model-authored string field.
-#
-# Args: TEXT (required), MAX_CHARS (optional — falls back to
-# _invariant_feed_max_field_chars's default/config value when omitted, since
-# every current caller wants the same cap; a future caller needing a
-# different cap can pass one explicitly rather than this function growing a
-# second knob).
-#
-# Neutralizes prompt-control sequences without attempting semantic
-# interpretation (this is gate plumbing, not a role — no LLM call here,
-# consistent with _invariant_feed_distill's own "mechanical, not an LLM
-# call" framing):
-#   - Strips ASCII control/non-printable bytes (0x00-0x08, 0x0B-0x1F, 0x7F),
-#     including ANSI/terminal escape sequences a hostile finding could embed
-#     to visually spoof a delimiter or hide text from a human audit-log
-#     reader. Newline (0x0A) and tab (0x09) are preserved — legitimate
-#     structure in a multi-line finding message, not a control sequence.
-#   - Collapses the delimiter label a hostile finding could forge to fake a
-#     new data-block boundary once re-injected into a future prompt — both
-#     the invariant-feed fence (===BEGIN/END INVARIANTS DATA===,
-#     ds_adversarial_prompt in llm-client.sh) and the adversarial-findings
-#     fence the merge-gate prompt uses (===BEGIN/END ADVERSARIAL FINDINGS
-#     DATA===) are defanged unconditionally, regardless of which pipeline a
-#     given finding is travelling through — a payload could be planted once
-#     and land in either round-trip. Case-insensitively replaces each
-#     literal label string with a defanged spaced-out form. This does not
-#     make the text nonsensical to a human reviewer (the words are still
-#     legible) but prevents it from being byte-identical to the real
-#     delimiter the model was told to trust. Without this, a finding
-#     containing a literal fence string survives verbatim into the written
-#     artifact and can forge a fake end-of-data marker inside the block,
-#     escaping the fence entirely (BOBBIE, lr-cda4b9 follow-up).
-#   - Caps length at MAX_CHARS, truncating rather than rejecting — a
-#     merely-too-long finding is not attacker behavior, and rejecting it
-#     would silently drop a real finding (fail-open posture matches the
-#     rest of the invariant-feed and the advisory/blocking split).
-_llm_field_sanitize() {
-  _lfs_text="$1"
-  _lfs_max="${2:-$(_invariant_feed_max_field_chars)}"
-  case "$_lfs_max" in ''|*[!0-9]*) _lfs_max=$(_invariant_feed_max_field_chars) ;; esac
-
-  if command -v python3 >/dev/null 2>&1; then
-    # Text goes through a temp file, NOT stdin: `python3 -` already reads the
-    # script itself from stdin (the heredoc below), so piping the untrusted
-    # text into the same stdin would either be silently discarded or
-    # interleaved with the script depending on shell/buffering — the data
-    # channel and the script channel must be different file descriptors.
-    _lfs_tmp=$(mktemp -t clagentic-llm-sanitize.XXXXXX)
-    printf '%s' "$_lfs_text" > "$_lfs_tmp"
-    python3 - "$_lfs_tmp" "$_lfs_max" <<'PYEOF'
-import re
-import sys
-
-path, max_chars = sys.argv[1], int(sys.argv[2])
-with open(path) as f:
-    text = f.read()
-
-# Strip ANSI/terminal escape sequences (CSI, OSC, and bare ESC-prefixed
-# sequences) before the general control-char strip below, so a multi-byte
-# escape sequence does not leave stray printable fragments behind.
-text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)   # CSI: ESC [ ... letter
-text = re.sub(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)', '', text)  # OSC: ESC ] ... BEL/ST
-text = re.sub(r'\x1b.', '', text)                   # any remaining ESC + one byte
-
-# Strip remaining control/non-printable bytes, preserving tab and newline.
-text = ''.join(ch for ch in text if ch in ('\t', '\n') or 0x20 <= ord(ch) != 0x7f)
-
-# Defang forged delimiter labels: a hostile finding message could contain
-# the literal string "INVARIANTS:" or "DEFERRED FINDINGS:" -- or either
-# fenced data-block marker set (===BEGIN/END INVARIANTS DATA===, the
-# invariant-feed fence in ds_adversarial_prompt; ===BEGIN/END ADVERSARIAL
-# FINDINGS DATA===, the merge-gate fence in ds_merge_gate_prompt, both
-# llm-client.sh) -- to try to spoof a fresh data-block boundary once
-# re-injected into a future prompt. Insert a zero-width-safe space so the
-# string is still legible to a human but no longer byte-identical to the
-# real delimiter. Both fence sets are defanged unconditionally here (not
-# gated by which caller invoked this function) since a single planted
-# finding could round-trip through either path.
-for label in ("INVARIANTS:", "DEFERRED FINDINGS:", "END INVARIANTS",
-              "END DEFERRED FINDINGS",
-              "===BEGIN INVARIANTS DATA===", "===END INVARIANTS DATA===",
-              "===BEGIN ADVERSARIAL FINDINGS DATA===",
-              "===END ADVERSARIAL FINDINGS DATA==="):
-    pattern = re.compile(re.escape(label), re.IGNORECASE)
-    text = pattern.sub(lambda m: ' '.join(m.group(0)), text)
-
-# Truncate so the FINAL string (content + suffix) fits within max_chars --
-# slicing to max_chars and then appending the suffix would let the suffix
-# push the total length past the configured cap (PEACHES, lr-cda4b9
-# follow-up).
-suffix = "...[truncated]"
-if len(text) > max_chars:
-    keep = max(max_chars - len(suffix), 0)
-    text = text[:keep] + suffix
-
-sys.stdout.write(text)
-PYEOF
-    _lfs_status=$?
-    rm -f "$_lfs_tmp"
-    return $_lfs_status
-  fi
-
-  # No python3: best-effort POSIX fallback. tr strips the bulk of control
-  # bytes (octal escapes for 0x01-0x08, 0x0B-0x1F, 0x7F; 0x00 cannot appear
-  # in a shell string so no explicit strip needed); sed defangs both fenced
-  # marker sets specifically (literal, fixed-case substitution — no GNU/BSD
-  # sed extension needed, unlike a general case-insensitive label match);
-  # cut caps length. This path does NOT defang the case-insensitive
-  # INVARIANTS:/DEFERRED FINDINGS: labels the python3 path covers (no
-  # portable case-insensitive substitution without sed extensions that vary
-  # GNU/BSD) — acceptable degradation given no-python3 already means jq is
-  # the active JSON tool elsewhere in this codepath. The fenced markers ARE
-  # covered here because they are the labels an attacker could use to
-  # escape a fence entirely (BOBBIE, lr-cda4b9 follow-up), so this path
-  # closes that specific gap even though it cannot close the general one.
-  printf '%s' "$_lfs_text" \
-    | tr -d '\001-\010\013-\037\177' \
-    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g; s|===BEGIN ADVERSARIAL FINDINGS DATA===|= = =BEGIN ADVERSARIAL FINDINGS DATA= = =|g; s|===END ADVERSARIAL FINDINGS DATA===|= = =END ADVERSARIAL FINDINGS DATA= = =|g' \
-    | cut -c "1-${_lfs_max}"
-}
+# _invariant_feed_max_field_chars and _llm_field_sanitize moved to
+# platform.sh (lr-4f8316 follow-up): llm-client.sh needed to sanitize a
+# THIRD round-trip field (the change-class commit-message hint) and could
+# not reach this sanitizer because llm-client.sh does not source gates.sh —
+# the omission that shipped the un-sanitized hint was structurally forced,
+# not an oversight at the call site. platform.sh is the one file both
+# gates.sh and llm-client.sh already source, so it is the shared home for
+# any sanitizer that must be reachable from both prompt-construction paths.
+# See platform.sh for the full function bodies and rationale; both are
+# available here unchanged (gates.sh sources platform.sh at the top of the
+# file, before any function body in this file runs).
 
 # _invariant_feed_append INVARIANTS_FILE ID CATEGORY FILE STATEMENT
 #
@@ -1349,10 +1211,10 @@ review_is_degraded() {
 # Loose-parses [FINDING] header lines from adversarial markdown output into
 # the same {file,line,category,message} JSON shape review findings use, so
 # they can be run through the EXISTING finding_content_keys / dedup_findings
-# machinery unmodified, plus two gate-plumbing fields (reachable, tier) added
-# for the advisory/blocking split (lr-e2b975). Header format
-# (ds_adversarial_prompt, llm-client.sh):
-#   [FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | title: <phrase>
+# machinery unmodified, plus gate-plumbing fields (reachable, tier, class)
+# added for the advisory/blocking split (lr-e2b975) and the change-class
+# threshold (lr-4f8316). Header format (ds_adversarial_prompt, llm-client.sh):
+#   [FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | class: <durable|ephemeral> | title: <phrase>
 # "category" is set to the CWE id (e.g. "CWE-770") — adversarial findings
 # have no review-style category, and the CWE id IS the class identity that
 # matters for invariant re-derivation. "message" is the title field. A
@@ -1369,15 +1231,26 @@ review_is_degraded() {
 # task's "never suppression" constraint from the other direction: silence in
 # a gate-plumbing field must not manufacture a block that was never earned.
 #
-# Every enum-shaped field (severity, reachable, tier) is validated and
+# Every enum-shaped field (severity, reachable, tier, class) is validated and
 # force-corrected here, at parse time, to a member of its closed set — none
-# of the three is ever passed through as raw captured text. This was a real
+# of the four is ever passed through as raw captured text. This was a real
 # gap for severity specifically until a follow-up review caught it: severity
 # was captured as free text bounded only by the next "|" with no enum check,
 # so model- or attacker-authored text in the severity position reached the
 # JSON sidecar and the merge-gate prompt's fenced data block completely
 # unvalidated — see the inline comment at the severity assignment below for
 # the fix and its rationale.
+#
+# TWO MECHANICAL CLAMPS on tier (lr-4f8316 follow-up), same posture, legible
+# as a pair: (1) reachable != "yes" forces tier to "advisory" — reachability
+# is the mechanical precondition for blocking, never a judgment call tier
+# alone can override. (2) reachable == "yes" AND severity in (high,critical)
+# forces tier to "blocking" — this is the security floor, and it is NOT
+# LLM self-restraint: a finding meeting this bar cannot be downgraded to
+# advisory by class or by anything else the model writes in the tier field.
+# See the inline comment at the floor-clamp assignment below for exactly
+# what "the security floor" is mechanically defined as (and is NOT) given
+# the fields this parser actually has.
 _parse_adversarial_findings() {
   _paf_file="$1"
   if command -v python3 >/dev/null 2>&1; then
@@ -1463,13 +1336,41 @@ for line in lines:
     # reachable/tier fail-open on (never-under-block), because durable is
     # the class that does NOT relax the blocking threshold. A parser gap in
     # this field can therefore only ever leave the full bar in place, never
-    # silently grant a downgrade. Unlike tier, class is never force-corrected
-    # from another field here -- whether an ephemeral class actually excuses
-    # THIS finding (vs. it being a security-floor item that blocks
-    # regardless of class) is the Auditor's own judgment call, made before
-    # it ever writes the tier field; the parser only records what the model
-    # declared, it does not re-derive the class/tier interaction.
+    # silently grant a downgrade.
     change_class = class_raw if class_raw in ("durable", "ephemeral") else "durable"
+    # SECURITY FLOOR CLAMP (lr-4f8316 follow-up, MECHANICAL, mirrors the
+    # reachability clamp immediately above -- same function, same posture,
+    # legible as a pair): before this fix, whether an ephemeral-classed,
+    # reachable, high/critical finding stayed tier:blocking was ENTIRELY
+    # LLM self-restraint -- the parser recorded the declared class but never
+    # independently verified the Auditor actually honored "the security
+    # floor is absolute regardless of class" from its own prompt. Docs and
+    # the prompt asserted that floor as absolute; nothing in code enforced
+    # it. That is the identical failure shape lr-e2b975 fixed for severity:
+    # a documented safety property with no corresponding mechanical check.
+    #
+    # The floor as documented (live credentials, reachable injection sinks,
+    # real exploit paths) is not fully expressible from the fields available
+    # to this parser -- there is no structured "is this a credential" or
+    # "is this a real exploit path" signal, only file/line/category/message/
+    # severity/reachable/tier/class. The mechanically enforceable subset of
+    # that intent, translated into the fields actually available: reachable
+    # (a cited concrete exploit path/trigger, per the Auditor's own
+    # Pre-Report Gate) AND severity high/critical (the Auditor's own
+    # judgment that this is a live, serious exposure) together are the
+    # closed-form proxy for "this is the kind of finding the floor
+    # protects." class can never downgrade a finding meeting that bar,
+    # regardless of what tier the model wrote. This does NOT independently
+    # verify "is a live credential" or "is a real exploit path" beyond what
+    # reachable+severity already encode -- those are represented via the
+    # Auditor's severity/reachable judgment, not via a separate mechanical
+    # signal this parser has no field to check. If that distinction matters
+    # to a future reader: reachable+high/critical is the enforced floor;
+    # "live credential" / "real exploit path" specifically is prompt-level
+    # instruction to the Auditor for HOW to set reachable/severity, not a
+    # second mechanical predicate over different fields.
+    if reachable == "yes" and severity in ("high", "critical"):
+        tier = "blocking"
     findings.append({
         "file": fname,
         "line": lineno,
@@ -1529,20 +1430,25 @@ PYEOF
 #     parse time (unrecognized/absent -> "no"). Same reasoning as severity:
 #     no free text left after parsing, nothing for this function to do.
 #   tier      — closed set (blocking/advisory). ENUM-VALIDATED AND
-#     FORCE-CORRECTED at parse time (unrecognized/absent -> "advisory", and
-#     force-corrected again to "advisory" whenever reachable != "yes").
-#     Same reasoning as severity/reachable.
+#     FORCE-CORRECTED at parse time: (unrecognized/absent -> "advisory");
+#     forced to "advisory" whenever reachable != "yes"; and, as of the
+#     lr-4f8316 follow-up, forced to "blocking" whenever reachable == "yes"
+#     AND severity is high/critical, REGARDLESS of class or of whatever tier
+#     value the model wrote — this is the mechanical security-floor clamp,
+#     not LLM self-restraint. Same reasoning as severity/reachable on the
+#     "no free text left, nothing for this function to do" point.
 #   class     — closed set (durable/ephemeral, lr-4f8316). ENUM-VALIDATED AND
 #     FORCE-CORRECTED at parse time (unrecognized/absent -> "durable" — the
 #     class that does NOT relax the blocking threshold, so a parser gap can
 #     only ever leave the full bar in place, never silently grant a
 #     downgrade). Same reasoning as severity/reachable/tier: after
-#     validation there is no free text left in the field. NOT re-derived
-#     into tier here or in the parser — whether ephemeral excuses a given
-#     finding (vs. it being a security-floor item that blocks regardless of
-#     class) is the Auditor's own judgment, already folded into the tier
-#     field it wrote; this function and the parser only record the
-#     declared class, they do not recompute tier from it.
+#     validation there is no free text left in the field. class CAN
+#     influence tier (a durability-only finding at reachable:yes but
+#     medium/low severity may legitimately stay advisory under either
+#     class), but it can never OVERRIDE the security-floor clamp above —
+#     the clamp runs unconditionally after class is resolved, so an
+#     ephemeral declaration cannot buy a downgrade on a finding the clamp's
+#     predicate already caught.
 #   line      — always an int (parse failure on the numeric suffix falls
 #     back to 0 in _parse_adversarial_findings). Not text; nothing to
 #     sanitize; not enum-shaped either, so "validated" isn't quite the right

@@ -94,8 +94,14 @@ class TestClassFieldParsing(unittest.TestCase):
         self.assertEqual(findings[0]["class"], "durable")
 
     def test_ephemeral_class_parses_as_stated(self):
+        """A legitimately class-downgradeable finding: reachable but only
+        medium severity, so it never meets the security-floor clamp's
+        reachable+high/critical predicate (see
+        TestSecurityFloorClampCannotBeDowngradedByClass below for the
+        floor-eligible shape, which must stay blocking regardless of
+        class)."""
         md = (
-            "[FINDING] CWE-770 | scripts/migrate.py:20 | severity: high | "
+            "[FINDING] CWE-770 | scripts/migrate.py:20 | severity: medium | "
             "reachable: yes | tier: advisory | class: ephemeral | "
             "title: Unbounded growth in one-shot migration job\n\n"
             "Prose body: advisory under ephemeral class.\n"
@@ -149,13 +155,11 @@ class TestClassFieldParsing(unittest.TestCase):
         findings = _parse_findings(md)
         self.assertEqual(findings[0]["class"], "ephemeral")
 
-    def test_class_never_force_corrects_tier(self):
-        """The parser records the declared class but does NOT re-derive
-        tier from it -- whether ephemeral excuses a given finding is the
-        Auditor's own judgment call, already reflected in the tier field it
-        wrote. A reachable, high-severity finding declared class:ephemeral
-        but tier:blocking (the Auditor judged this one a security-floor
-        item, not a durability-only concern) must stay tier:blocking."""
+    def test_class_agreeing_with_tier_is_unaffected(self):
+        """A reachable, critical finding declared class:ephemeral AND
+        tier:blocking (the Auditor judged this one a security-floor item,
+        not a durability-only concern) stays tier:blocking -- the clamp is
+        idempotent when the model already got it right."""
         md = (
             "[FINDING] CWE-78 | job.py:5 | severity: critical | "
             "reachable: yes | tier: blocking | class: ephemeral | "
@@ -164,19 +168,14 @@ class TestClassFieldParsing(unittest.TestCase):
         )
         findings = _parse_findings(md)
         self.assertEqual(findings[0]["class"], "ephemeral")
-        self.assertEqual(
-            findings[0]["tier"], "blocking",
-            "class must never override the Auditor's own tier judgment; "
-            "the security floor (reachable + critical) stays blocking "
-            "regardless of class",
-        )
+        self.assertEqual(findings[0]["tier"], "blocking")
 
     def test_mixed_classes_across_findings_all_present(self):
         md = (
             "[FINDING] CWE-78 | a.sh:1 | severity: critical | reachable: yes | "
             "tier: blocking | class: durable | title: RCE\n\n"
             "Body one.\n\n"
-            "[FINDING] CWE-770 | b.py:2 | severity: high | reachable: yes | "
+            "[FINDING] CWE-770 | b.py:2 | severity: low | reachable: no | "
             "tier: advisory | class: ephemeral | title: Unbounded growth\n\n"
             "Body two.\n"
         )
@@ -184,6 +183,104 @@ class TestClassFieldParsing(unittest.TestCase):
         self.assertEqual(len(findings), 2)
         classes = sorted(f["class"] for f in findings)
         self.assertEqual(classes, ["durable", "ephemeral"])
+
+
+class TestSecurityFloorClampCannotBeDowngradedByClass(unittest.TestCase):
+    """The mechanical security-floor clamp (lr-4f8316 follow-up): a finding
+    that is reachable:yes at severity high/critical MUST be tier:blocking,
+    regardless of what tier value the model wrote and regardless of class.
+    Before this fix, whether such a finding stayed blocking under an
+    ephemeral class was entirely LLM self-restraint -- docs and the prompt
+    asserted the floor as absolute, but nothing in the parser enforced it.
+    These tests prove no path -- not a miscalibrated model, not an
+    ephemeral declaration, not a durable declaration, not an absent class
+    field -- can downgrade a floor-eligible finding to advisory."""
+
+    def test_ephemeral_class_cannot_downgrade_reachable_critical_to_advisory(self):
+        """The exact defect shape: model writes tier:advisory (perhaps
+        reasoning, incorrectly, that ephemeral excuses it) on a reachable
+        critical finding under class:ephemeral. The clamp must override the
+        model's own stated tier."""
+        md = (
+            "[FINDING] CWE-78 | job.py:12 | severity: critical | "
+            "reachable: yes | tier: advisory | class: ephemeral | "
+            "title: RCE via injected job parameter, misdeclared advisory\n\n"
+            "A model incorrectly relaxing this to advisory under ephemeral "
+            "class must be mechanically overridden.\n"
+        )
+        findings = _parse_findings(md)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(
+            findings[0]["tier"], "blocking",
+            "reachable:yes + severity:critical must be tier:blocking "
+            "regardless of what the model wrote and regardless of class -- "
+            "this is the mechanical security floor, not LLM self-restraint",
+        )
+
+    def test_ephemeral_class_cannot_downgrade_reachable_high_to_advisory(self):
+        md = (
+            "[FINDING] CWE-89 | app/db.py:8 | severity: high | "
+            "reachable: yes | tier: advisory | class: ephemeral | "
+            "title: SQL injection in migration entrypoint\n\n"
+            "Misdeclared advisory under ephemeral class.\n"
+        )
+        findings = _parse_findings(md)
+        self.assertEqual(findings[0]["tier"], "blocking")
+
+    def test_durable_class_reachable_high_advisory_also_clamped(self):
+        """The clamp is unconditional on reachable+severity -- it does not
+        only apply when class is ephemeral. A durable-classed finding
+        misdeclared advisory at the floor-eligible bar must also be
+        corrected (this was already largely true via existing tier
+        force-correction paths, but the clamp now covers it explicitly and
+        the same way regardless of declared class)."""
+        md = (
+            "[FINDING] CWE-78 | a.sh:1 | severity: high | reachable: yes | "
+            "tier: advisory | class: durable | title: Command injection\n\n"
+            "body\n"
+        )
+        findings = _parse_findings(md)
+        self.assertEqual(findings[0]["tier"], "blocking")
+
+    def test_absent_class_field_floor_eligible_finding_still_clamped(self):
+        """No class field at all (defaults to "durable") must not change
+        the clamp's outcome for a floor-eligible finding."""
+        md = (
+            "[FINDING] CWE-78 | a.sh:1 | severity: critical | reachable: yes | "
+            "tier: advisory | title: RCE, no class field at all\n\n"
+            "body\n"
+        )
+        findings = _parse_findings(md)
+        self.assertEqual(findings[0]["class"], "durable")
+        self.assertEqual(findings[0]["tier"], "blocking")
+
+    def test_medium_severity_reachable_ephemeral_still_legitimately_advisory(self):
+        """Negative control: the clamp's predicate is reachable AND
+        high/critical -- a reachable but only medium-severity finding under
+        ephemeral class is NOT floor-eligible and legitimately stays
+        advisory. The clamp must not over-fire and swallow the entire
+        class-downgrade feature."""
+        md = (
+            "[FINDING] CWE-770 | job.py:9 | severity: medium | "
+            "reachable: yes | tier: advisory | class: ephemeral | "
+            "title: Unbounded retry loop in one-shot job\n\n"
+            "Legitimately advisory: reachable but not high/critical.\n"
+        )
+        findings = _parse_findings(md)
+        self.assertEqual(findings[0]["tier"], "advisory")
+
+    def test_unreachable_high_ephemeral_still_legitimately_advisory(self):
+        """Negative control: reachable:no already forces advisory via the
+        existing reachability clamp -- confirms the two clamps compose
+        correctly and neither cancels the other out incorrectly."""
+        md = (
+            "[FINDING] CWE-78 | dead.py:1 | severity: critical | "
+            "reachable: no | tier: advisory | class: ephemeral | "
+            "title: Unreachable pattern in dead code\n\n"
+            "body\n"
+        )
+        findings = _parse_findings(md)
+        self.assertEqual(findings[0]["tier"], "advisory")
 
 
 class TestSanitizeLeavesClassUntouched(unittest.TestCase):
