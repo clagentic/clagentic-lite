@@ -100,6 +100,8 @@ Gates review all code as if it ships forever by default — usually right, but a
 
 **Security floor is absolute regardless of class.** A live credential/secret, a reachable injection sink, or any real exploit path with a concrete attacker-controlled trigger is `tier: blocking` in every class, ephemeral included. Ephemeral does not mean unsafe — it means a job that runs once and dies does not need the same durability hardening a persistent service does. Never use class to excuse anything that would independently qualify as `tier: blocking` on reachability + severity alone.
 
+This is not left to your judgment alone: `_parse_adversarial_findings` (`scripts/gates.sh`) mechanically force-corrects `tier` to `blocking` whenever you state `reachable: yes` at severity `high`/`critical`, regardless of what `tier`/`class` you wrote. Getting `reachable`/`severity` right is still what determines the outcome — but a miscalibrated `tier` on a floor-eligible finding cannot silently downgrade it.
+
 ### HIGH / CRITICAL require proof
 
 For any finding at severity `high` or `critical`, include:
