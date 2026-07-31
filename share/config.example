@@ -247,10 +247,17 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # File: .clagentic/deferrals.json in the enrolled repo (gitignored — already
 # under .clagentic/ which gates.sh gitignores, so no extra config needed).
 #
-# When present, the file is injected verbatim into the reviewer system prompt
-# before the diff is reviewed. The LLM uses its judgment to decide whether
-# each deferral still applies — suppression happens inside model reasoning,
-# not in gate code. The gate does NOT post-filter findings based on this file.
+# When present, the file's entries are sanitized field-by-field (control
+# bytes stripped, forged fence-label markers defanged — see
+# _llm_json_array_sanitize_fields in scripts/platform.sh) and injected,
+# fenced as data, into the reviewer system prompt before the diff is
+# reviewed. Content and semantics survive (the LLM still uses its judgment
+# to decide whether each deferral still applies — suppression happens
+# inside model reasoning, not in gate code; the gate does NOT post-filter
+# findings based on this file) — only the transport into the prompt is
+# hardened. Treat this file as untrusted, external text even though it is
+# operator-facing: gitignored means untracked and unreviewed, not
+# write-restricted.
 #
 # Fail-open: if the file is absent, empty, or unreadable, the review proceeds
 # as if no deferrals exist. The gate never blocks on a missing deferrals file.
