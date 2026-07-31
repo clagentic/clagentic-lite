@@ -219,6 +219,45 @@ in the repo history.
 
 Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/config` (global). See `share/config.example` for the full entry.
 
+### Cross-round finding recurrence demotion (lr-66e598)
+
+Backstop for the general case of "no loop state exists anywhere in
+clagentic-lite" — round N+1's reviewer prompt has no record of round N's
+findings, so the same class of concern can be reported, argued about, and
+re-reported indefinitely with nothing counting the rounds. Recurrence
+demotion is a second use of the same content-hash key space
+`finding_content_keys` (`scripts/review-merge.sh`) cross-round dedup already
+computes — where dedup only tests membership ("have we seen this key
+before" → suppress), recurrence tracking counts occurrences ("how many
+rounds has this key been reported in" → demote at a threshold).
+
+**Relationship to cross-round dedup.** The two mechanisms compose, in this
+order, every round: dedup runs first and can suppress a finding outright
+(same content-hash key seen before → dropped from `.findings` entirely, per
+"Cross-round finding dedup" above); recurrence demotion then runs only
+against whatever survived dedup. This means a finding whose content-hash key
+is byte-identical round to round is dedup's job — it is suppressed starting
+round 2 and recurrence demotion never gets a second round to count. Where
+recurrence demotion actually matters is when dedup is off
+(`CLAGENTIC_CROSS_ROUND_DEDUP=0`, in which case a finding's own occurrence
+count still accrues every round it is reported) — the mechanism inherits the
+SAME "survives line shifts, not content edits" key-stability property dedup
+has (see "Cross-round finding dedup" above); it does not invent a fuzzier
+notion of sameness.
+
+| | |
+|---|---|
+| **Feature flag** | Same as cross-round dedup — runs only when `CLAGENTIC_CROSS_ROUND_DEDUP=1` (default on). Recurrence tracking depends on the same per-round content-hash-keying pass dedup performs on the diff, so the two share one on/off switch. |
+| **Threshold** | `CLAGENTIC_RECURRENCE_THRESHOLD` (default `2`, floored at `2` — a finding can only be demoted after being reported before AND reported again; a first-ever report is never demotable regardless of configuration). |
+| **Counts file** | `.clagentic/lite/review-recurrence.json` (gitignored, local gate state — same directory convention as `review-seen-keys` and `invariants.json`). A JSON object mapping content-hash key → integer round-count, maintained by `finding_recurrence_bump` (`scripts/review-merge.sh`). |
+| **Effect** | A review finding that survives cross-round dedup (i.e. is still reported this round) AND whose content-hash key has now recurred at or above the threshold is annotated `_recurrence_count` (integer) and `_recurrence_demoted: true` on the finding object. `severity_blockers()` (`scripts/gates.sh`) excludes `_recurrence_demoted` findings from its block count. **Threshold only, never suppression**: the finding remains in `.findings`, fully visible in `last-review.json`, `cmd_render_review`'s terminal output (rendered with a `(reported N rounds running — decide)` suffix), and the audit trail — only its eligibility to gate `/ship` changes. |
+| **Audit trail** | Every recurrence pass logs a `gate_runs` row (`gate=review-recurrence`) recording `demoted:N threshold:T`, and the operator sees a stderr notice (`[recurrence] N finding(s) demoted to advisory ...`) when N > 0. |
+| **Reset** | `clagentic-lite gates review --reset-dedup` deletes BOTH `.clagentic/lite/review-seen-keys` AND `.clagentic/lite/review-recurrence.json` — a reset means every finding is treated as fresh in both senses (not suppressed by dedup, and not recurrence-demoted). |
+| **Conservative bias** | Identical posture to cross-round dedup, applied to demotion instead of suppression: empty key → retained, un-demoted. Splice failure → original findings retained untouched. No JSON tool at all → full passthrough, `last-review.json` unmodified. A finding is annotated only when its key was actually computable this round; an uncomputable key never accrues a count and can never be demoted. |
+| **Scope** | Review findings only (Gate 3). Adversarial findings (Gate 5) already have their own two-tier `reachable`/`tier` mechanism (see "Blocking vs advisory" above) with its own mechanical security-floor clamp; recurrence demotion does not read or write adversarial findings and has no interaction with that clamp — a finding held `tier: blocking` by the security floor is a Gate 5 concept entirely outside this function's reach. |
+
+Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/config` (global). See `share/config.example` for the full entry.
+
 ### Exit-code contract for `gates.sh review` and `gates.sh ship`
 
 `gates.sh review` distinguishes two failure classes with separate exit codes. CI and operator scripts should branch on these:

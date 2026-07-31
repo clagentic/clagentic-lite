@@ -299,6 +299,37 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # Set =0 to opt out and see all findings on every round.
 # CLAGENTIC_CROSS_ROUND_DEDUP=1
 
+# ---------- cross-round finding recurrence demotion ----------
+# Second use of the same content-hash key space as cross-round dedup, above
+# (finding_content_keys, scripts/review-merge.sh): instead of only testing
+# "have we seen this key before" (dedup's boolean membership check), this
+# tracks HOW MANY rounds a finding's key has been reported in. Persisted
+# counts: .clagentic/lite/review-recurrence.json (gitignored, key -> integer
+# count, same directory convention as review-seen-keys and invariants.json).
+#
+# A finding that recurs at or above the configured threshold (default 2 --
+# "reported before AND reported again") is DEMOTED to advisory: it is
+# excluded from severity_blockers()' block count but stays fully visible in
+# the review findings array, cmd_render_review's terminal output ("reported
+# N rounds running — decide"), and the audit trail (gate='review-recurrence'
+# row with demoted:N threshold:T). This is a THRESHOLD change, never
+# suppression — nothing is hidden or dropped, only whether it can gate /ship
+# on its own.
+#
+# Runs only when CLAGENTIC_CROSS_ROUND_DEDUP=1 (the same flag gates both —
+# recurrence tracking depends on the same per-round content-hash-keying pass
+# dedup already performs on the diff). `gates review --reset-dedup` clears
+# BOTH review-seen-keys AND review-recurrence.json, so a reset means "treat
+# every finding as fresh" in both senses (not suppressed AND not
+# recurrence-demoted).
+#
+# Conservative bias, same posture as cross-round dedup: a finding whose
+# content-hash key cannot be computed (empty key, no diff window, no sha256
+# tool) is retained and never demoted; a splice failure or missing JSON tool
+# leaves the review output untouched (full passthrough).
+#
+# CLAGENTIC_RECURRENCE_THRESHOLD=2
+
 # ---------- adversarial invariant-feed ----------
 # File: .clagentic/lite/invariants.json in the enrolled repo (gitignored —
 # already under .clagentic/lite/, same convention as last-review.json,
