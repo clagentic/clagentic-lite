@@ -431,9 +431,10 @@ findings you are >80% confident about. When a finding, or a decision not to
 report one, rests on a safety claim, cite the enforcing code by line —
 prose/docs/convention alone is weaker than a mechanical guarantee, and
 "only X writes this" is not proof until you've checked the branch where
-X's guard is false; an external value with nothing shown to strip or
-validate it is a finding. Empty findings is valid and expected for clean
-diffs. Do not pad. No emojis. No "looks good to me" filler.
+X's guard is false; a value crossing a trust boundary into this code, not
+any unvalidated parameter, with nothing shown to strip or validate it is a
+finding. Empty findings is valid and expected for clean diffs. Do not pad.
+No emojis. No "looks good to me" filler.
 
 Change class — durability vocabulary (lr-4f8316): every diff has a
 change class, durable (default) or ephemeral (a one-shot / time-boxed
