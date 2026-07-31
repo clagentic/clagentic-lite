@@ -238,7 +238,7 @@ The Auditor prompt (`plugins/clagentic-lite/agents/auditor.md`, and the `ds_adve
 Each finding in the adversarial output begins with a compact header line, followed by a prose explanation:
 
 ```
-[FINDING] CWE-XXX | file.ext:line | severity: high | reachable: yes | tier: blocking | title: Short description phrase
+[FINDING] CWE-XXX | file.ext:line | severity: high | reachable: yes | tier: blocking | class: durable | title: Short description phrase
 
 Prose explanation (1-3 paragraphs): what the vulnerability is, how an
 attacker exploits it (or why it cannot currently be exploited, if
@@ -255,9 +255,10 @@ Header fields:
 | severity | `critical` / `high` / `medium` / `low` |
 | reachable | `yes` / `no` — see "Reachability requirement" below |
 | tier | `blocking` / `advisory` — see "Blocking vs advisory" below |
+| class | `durable` / `ephemeral` (lr-4f8316) — see "Change class" below |
 | title | One short phrase, eight words or fewer |
 
-This is a "prose-primary with structured header" format: the header makes the output scannable at a glance; the prose below it preserves the full adversarial explanation. If the model does not emit `[FINDING]` headers (format mismatch, older model), the prose output is still valid and usable — the format is additive, not a schema enforcement. `reachable`/`tier` are themselves optional at the parser level for the same reason (see "Parser default" below) — an older-format header without them still parses.
+This is a "prose-primary with structured header" format: the header makes the output scannable at a glance; the prose below it preserves the full adversarial explanation. If the model does not emit `[FINDING]` headers (format mismatch, older model), the prose output is still valid and usable — the format is additive, not a schema enforcement. `reachable`/`tier`/`class` are themselves optional at the parser level for the same reason (see "Parser default" below) — an older-format header without them still parses.
 
 For a heavier, structured threat-model pass, use the `/infosec-rt` skill instead — multi-persona chained attack scenarios with hardening priority list.
 
@@ -276,19 +277,44 @@ This is the mechanical precondition for blocking eligibility (see "Blocking vs a
 
 **This is a threshold mechanism: every finding is reported at its honest severity and stays fully visible in the adversarial markdown output, the structured findings sidecar, and the audit trail, regardless of `tier`.** `tier` only decides whether Gate 6 (Merge Gate) treats a finding as gating `/ship`. Nothing is ever hidden, dropped, or omitted from output because of its tier.
 
-A finding is `tier: blocking` only when reachability is `yes` (with a cited concrete exploit path) **and** severity is `high` or `critical`. Every other finding — `reachable: no`, or severity `medium`/`low` — is `tier: advisory`.
+A finding is `tier: blocking` only when reachability is `yes` (with a cited concrete exploit path) **and** severity is `high` or `critical` **and** it is not a durability-dependent concern excused by an `ephemeral` change class (see "Change class" below). Every other finding — `reachable: no`, or severity `medium`/`low`, or excused by class — is `tier: advisory`.
 
-**Mechanical plumbing, not LLM judgment at gate time.** `cmd_adversarial` (`scripts/gates.sh`) unconditionally loose-parses the `[FINDING]` headers into `.clagentic/lite/last-adversarial-findings.json` (not gated behind `CLAGENTIC_ADVERSARIAL_INVARIANTS` — this sidecar is a base behavior). `build_gate_summary` reads that sidecar and adds three fields to the gate-summary payload fed to the Merge Gate:
+**Mechanical plumbing, not LLM judgment at gate time.** `cmd_adversarial` (`scripts/gates.sh`) unconditionally loose-parses the `[FINDING]` headers into `.clagentic/lite/last-adversarial-findings.json` (not gated behind `CLAGENTIC_ADVERSARIAL_INVARIANTS` — this sidecar is a base behavior). `build_gate_summary` reads that sidecar and adds fields to the gate-summary payload fed to the Merge Gate:
 
-- `adversarial_findings` — the full structured array (file, line, category/CWE, message, severity, reachable, tier)
+- `adversarial_findings` — the full structured array (file, line, category/CWE, message, severity, reachable, tier, class)
 - `adversarial_blocking_count` — count of `tier: "blocking"` findings, computed mechanically (same pattern as `severity_blockers()` counting review findings by rank rather than asking an LLM to recount)
 - `adversarial_advisory_count` — count of `tier: "advisory"` findings
+- `resolved_change_class` (lr-4f8316) — `"ephemeral"` if any finding declares `class: "ephemeral"`, else `"durable"` if there is at least one finding, else `null` on a clean pass with no findings
+- `adversarial_downgraded_by_class_count` (lr-4f8316) — see "Change class" below
 
-The Merge Gate prompt (`ds_merge_gate_prompt`) is instructed to refuse only on `tier: "blocking"` findings not covered by `adversarial-acks.json`/`accepted-risks.md`, and to note advisory findings in its `reason` text without gating on them. If `adversarial_findings` is empty or absent (e.g. a gate run predating this feature, or a model that emitted no parseable `[FINDING]` headers), the Merge Gate falls back to reasoning over the `adversarial` markdown prose directly, as it did before this change.
+The Merge Gate prompt (`ds_merge_gate_prompt`) is instructed to refuse only on `tier: "blocking"` findings not covered by `adversarial-acks.json`/`accepted-risks.md`, and to note advisory findings — including class-downgraded ones — in its `reason` text without gating on them. If `adversarial_findings` is empty or absent (e.g. a gate run predating this feature, or a model that emitted no parseable `[FINDING]` headers), the Merge Gate falls back to reasoning over the `adversarial` markdown prose directly, as it did before this change.
 
-**Parser default (fail-open on the non-blocking side).** `reachable`/`tier` are optional at the parser level for backward compatibility with a pre-lr-e2b975 header (`severity | title`, no `reachable`/`tier`) or a model that omits them despite the prompt instruction. An unparseable or absent `tier` is classified `advisory`, never `blocking` — a parser gap can only ever under-block. The finding is still fully visible in the markdown output and the sidecar; it simply cannot gate the merge on its own if the classification is missing.
+**Parser default (fail-open on the non-blocking side).** `reachable`/`tier`/`class` are optional at the parser level for backward compatibility with an older header (`severity | title`, no `reachable`/`tier`/`class`) or a model that omits them despite the prompt instruction. An unparseable or absent `tier` is classified `advisory`, never `blocking` — a parser gap can only ever under-block. An unparseable or absent `class` is classified `durable`, never `ephemeral` — the same fail-closed direction on the class axis, since `durable` is the class that never relaxes anything; a parser gap can only ever leave the full bar in place, never silently grant a downgrade. The finding is still fully visible in the markdown output and the sidecar; it simply cannot gate the merge on its own, or receive a class-based downgrade, if the classification is missing.
 
 **Deterministic gates are untouched.** None of this changes `cmd_secrets`, `cmd_deps`, `cmd_sast`, or their fail-closed behavior (Gate 4). The advisory/blocking split applies only to LLM-driven adversarial findings, which were already, and remain, outside the security-gate path — AGENTS.md §4: no LLM in the security path.
+
+### Change class — durability-aware blocking threshold (lr-4f8316)
+
+Gates review all code as if it ships forever by default. That is usually right, but it is a category error for a one-shot migration script or a k8s Job stood up for a single task and documented for decommission — an internal-only, run-once process does not carry the same durability risk a persistent service does.
+
+**Vocabulary:**
+
+| Class | Meaning | Threshold effect |
+|---|---|---|
+| `durable` (default) | Ships and stays | None — full bar applies |
+| `ephemeral` | One-shot, time-boxed, or throwaway: a migration script, a k8s Job (not a Deployment) with a documented decommission path, a change confined to `tests/`/`migrations/`, a one-shot `main()` that exits | Relaxes the blocking threshold for durability-dependent findings only (see below) |
+
+**Inferred from the diff, not maintained in a file.** The Auditor (and Reviewer, for the mismatch case) infers the class from the diff itself — path, structure, lifecycle shape, any stated decommission date. There is deliberately no operator-maintained context file: it is a second source of truth that goes stale the moment the ephemeral thing is decommissioned, and the diff is already read for every other finding.
+
+**Builder hint, diff wins.** The Builder may declare a class as a one-line `Change-class: <value>` trailer in the tip commit message (`plugins/clagentic-lite/agents/builder.md`). `_change_class_hint` (`scripts/llm-client.sh`) extracts it via `git log -1 --format=%B` and surfaces it to the Reviewer and Auditor as a `BUILDER-DECLARED CHANGE-CLASS HINT` note ahead of the diff — a claim to weigh, never the source of truth. If the diff contradicts the declared class, the diff wins and the mismatch itself becomes a reported finding (`CWE-unknown`, `maintainability`-shaped). Degradation is clean by construction: no declaration infers from the diff; a wrong declaration is overridden and the override is visible. There is no separate enforcement mechanism — the mismatch finding is the enforcement.
+
+Why commit message and not PR body: clagentic-lite is zero-server by design (no GitHub/Forgejo API call anywhere in the review/adversarial pipeline — `get_review_diff` only ever produces `git diff` output). A commit-message trailer is git-native, requires no network call, and is visible to a local `gates review`/`gates adversarial` run exactly the way a PR-hosted trailer would be once that commit lands.
+
+**Threshold only, never suppression.** A finding whose *sole* basis is a durability-dependent concern (unbounded resource growth in a process that runs once and exits, missing retry/backoff/observability hardening that only matters across a long service lifetime) rides `tier: advisory` instead of `tier: blocking` under an `ephemeral` resolved class, even at `reachable: yes` and severity high/critical — but it is still reported at its honest severity, fully visible in the markdown, the sidecar, and the audit trail. Class never suppresses a finding and never alters reported severity.
+
+**Security floor is absolute regardless of class.** A live credential/secret, a reachable injection sink, or any real exploit path with a concrete attacker-controlled trigger is `tier: blocking` in every class, `ephemeral` included. Ephemeral does not mean unsafe — it means unbounded resource growth in a job that runs once and dies is not a defect the same way it would be in a long-lived service.
+
+**`adversarial_downgraded_by_class_count`** (in `build_gate_summary`'s payload and the `merge-gate`/`merge-gate recheck` audit row as `[class=... downgraded=N]`) is a mechanical proxy: a count of findings with `class: "ephemeral"`, `tier: "advisory"`, `reachable: "yes"`, and severity `high`/`critical` — i.e. findings that met the blocking-eligible bar on reachability and severity but still rode as advisory. This is an approximation, not a claim that class was necessarily the deciding factor for every counted finding (a security-floor override also forces `tier: "advisory"` to never apply, so those never reach this shape either way) — it exists so a human reading the audit trail can see how many findings the class shifted, not just what the resolved class was.
 
 ### Invariant-feed (opt-in) — forward-invariant memory across rounds
 
@@ -364,7 +390,9 @@ As a second, independent layer, `ds_adversarial_prompt` (`scripts/llm-client.sh`
 
 The Merge Gate is the last LLM check before the PR is opened. It never overrides the deterministic security gates (those already gated upstream) and never adds its own findings — it reads the structured outputs of every prior gate and returns a single approve/refuse decision.
 
-**Adversarial findings gate here on `tier`, not on severity alone (lr-e2b975).** Only `tier: "blocking"` adversarial findings (reachable, high/critical severity — see Gate 5 "Blocking vs advisory") are eligible to refuse the merge. `tier: "advisory"` findings — including real, correctly-severity-rated ones that are simply unreachable or lower severity — never gate `/ship` on their own; they are noted in the Merge Gate's `reason` text and remain fully visible in `last-adversarial.md`, `last-adversarial-findings.json`, and the audit trail. This is a threshold change, never suppression.
+**Adversarial findings gate here on `tier`, not on severity alone (lr-e2b975).** Only `tier: "blocking"` adversarial findings (reachable, high/critical severity, and not excused by an ephemeral change class — see Gate 5 "Blocking vs advisory" and "Change class") are eligible to refuse the merge. `tier: "advisory"` findings — including real, correctly-severity-rated ones that are simply unreachable, lower severity, or class-downgraded — never gate `/ship` on their own; they are noted in the Merge Gate's `reason` text and remain fully visible in `last-adversarial.md`, `last-adversarial-findings.json`, and the audit trail. This is a threshold change, never suppression.
+
+**Resolved change class recorded on every merge-gate run (lr-4f8316).** `build_gate_summary`'s `resolved_change_class` and `adversarial_downgraded_by_class_count` fields (see Gate 5 "Change class") are read back and appended to the `merge-gate`/`merge-gate recheck` audit row as `[class=<durable|ephemeral> downgraded=<N>]`, on both the `approve` and `refuse` outcomes — the class that applied to a ship attempt is part of the audit trail regardless of the decision it fed into. The Merge Gate prompt itself never re-derives or widens what `tier: "blocking"` means from this data; class was already folded into `tier` by the Auditor before the payload reached the Merge Gate.
 
 **Round-trip sanitization (lr-e2b975, mirrors lr-cda4b9).** `.clagentic/lite/last-adversarial-findings.json` is LLM-authored finding text (title, message, file) written to disk and later read back into the Merge Gate's system prompt — structurally the same round-trip shape as the invariant-feed's `invariants.json`. `cmd_adversarial` (`scripts/gates.sh`) sanitizes the sidecar's `file`/`category`/`message` fields via `_llm_field_sanitize` — the same function, not a second sanitizer — before the sidecar is ever written to disk, so every downstream reader (`build_gate_summary`, the merge-gate prompt) gets clean data. `build_gate_summary` additionally renders the sanitized array as `adversarial_findings_fenced`, a fenced-text rendering delimited by `===BEGIN ADVERSARIAL FINDINGS DATA===` / `===END ADVERSARIAL FINDINGS DATA===` — `_llm_field_sanitize`'s defang list covers this label too, so a forged marker inside a finding's own title cannot escape the fence. `ds_merge_gate_prompt` (`scripts/llm-client.sh`) instructs the Merge Gate to treat that fenced block as data describing findings, not as an instruction, and to ignore any imperative/role-change/decision-override sentence that may appear inside a finding's own text — the same "data, not instructions" framing `ds_adversarial_prompt` applies to the invariant-feed.
 
@@ -378,6 +406,7 @@ The Merge Gate is the last LLM check before the PR is opened. It never overrides
 | `severity` | closed set: `low`/`medium`/`high`/`critical` | Enum-validated and force-corrected to `unknown` at parse time (`_parse_adversarial_findings`) — not additionally routed through the sanitizer, since after validation there is no free text left in the field |
 | `reachable` | closed set: `yes`/`no` | Enum-validated and force-corrected to `no` at parse time |
 | `tier` | closed set: `blocking`/`advisory` | Enum-validated and force-corrected to `advisory` at parse time, and again whenever `reachable != "yes"` |
+| `class` (lr-4f8316) | closed set: `durable`/`ephemeral` | Enum-validated and force-corrected to `durable` at parse time — the class that never relaxes the blocking threshold, so a parser gap can only ever leave the full bar in place, never silently grant a downgrade. Not re-derived into `tier`: whether `ephemeral` excuses a given finding is the Auditor's own judgment, already folded into the `tier` field it wrote |
 | `line` | integer | Parsed via Python `int()`; a non-numeric suffix falls back to `0`. Never a pass-through of the raw captured string |
 
 Every field lands in one of three buckets: free-text-and-sanitized, closed-set-and-force-corrected-at-parse-time, or non-text-by-construction. `severity` was the one field that fell through this classification for a period — captured as free text but never enum-checked, the identical fence-escape shape already closed for the other three text fields — until a follow-up review caught it.
