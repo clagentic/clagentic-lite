@@ -1368,6 +1368,16 @@ review_is_degraded() {
 # under-block (findings still fully visible in output/audit), matching the
 # task's "never suppression" constraint from the other direction: silence in
 # a gate-plumbing field must not manufacture a block that was never earned.
+#
+# Every enum-shaped field (severity, reachable, tier) is validated and
+# force-corrected here, at parse time, to a member of its closed set — none
+# of the three is ever passed through as raw captured text. This was a real
+# gap for severity specifically until a follow-up review caught it: severity
+# was captured as free text bounded only by the next "|" with no enum check,
+# so model- or attacker-authored text in the severity position reached the
+# JSON sidecar and the merge-gate prompt's fenced data block completely
+# unvalidated — see the inline comment at the severity assignment below for
+# the fix and its rationale.
 _parse_adversarial_findings() {
   _paf_file="$1"
   if command -v python3 >/dev/null 2>&1; then
@@ -1400,7 +1410,7 @@ for line in lines:
         continue
     cwe = m.group(1).strip()
     fileline = m.group(2).strip()
-    severity = m.group(3).strip().lower()
+    severity_raw = m.group(3).strip().lower()
     reachable_raw = (m.group(4) or "").strip().lower()
     tier_raw = (m.group(5) or "").strip().lower()
     title = m.group(6).strip()
@@ -1412,6 +1422,21 @@ for line in lines:
             fname, lineno = fileline, 0
     else:
         fname, lineno = fileline, 0
+    # severity is a closed set, same as reachable/tier below -- enum-check
+    # and force-correct rather than pass the raw captured text through.
+    # Before this (lr-e2b975 follow-up), severity was free text bounded only
+    # by the next "|" in the header line: model- or attacker-authored text
+    # in the severity position reached the JSON sidecar and the merge-gate
+    # prompt's fenced block completely unvalidated -- the identical
+    # fence-escape shape _llm_field_sanitize closes for message/file/
+    # category, just left open on this one field. "unknown" is the sentinel
+    # for an unparseable/unrecognized value: distinguishable from a real
+    # severity in review/audit output rather than silently coercing to a
+    # specific level. severity_blockers() (this file) ranks "unknown" the
+    # same as any other unrecognized string (rank 0, below "low") when this
+    # feeds a caller that ranks severities, so an unparseable severity can
+    # never inflate itself into a blocking rank.
+    severity = severity_raw if severity_raw in ("low", "medium", "high", "critical") else "unknown"
     reachable = reachable_raw if reachable_raw in ("yes", "no") else "no"
     # tier defaults to advisory when absent/unparseable (fail-open, see
     # docstring above) and is force-corrected to advisory when the model's
@@ -1461,13 +1486,43 @@ PYEOF
 # everywhere else in gates.sh); python3 is the documented fallback the rest
 # of the file already uses for JSON when jq is absent.
 #
-# file/category/message are the model-authored string fields (the same set
-# _invariant_feed_append sanitizes: file/category/statement). severity/
-# reachable/tier/line are left untouched: severity and reachable are already
-# normalized to a fixed enum (or forced to a safe default) by
-# _parse_adversarial_findings, tier is likewise constrained to
-# blocking/advisory, and line is an integer -- none of these carry free-form
-# model prose.
+# Per-field disposition (audited lr-e2b975 follow-up — every field in the
+# parsed finding record, enumerated deliberately rather than asserted):
+#   file, category, message — free-form model text, no enum, unbounded
+#     length. SANITIZED here via _llm_field_sanitize.
+#   severity  — closed set (low/medium/high/critical). ENUM-VALIDATED AND
+#     FORCE-CORRECTED at parse time in _parse_adversarial_findings (an
+#     unrecognized value becomes "unknown", never passed through raw). NOT
+#     additionally routed through _llm_field_sanitize here, because after
+#     that fix it can only ever be one of five fixed literals — there is no
+#     free text left to sanitize. This was NOT true before the fix that
+#     accompanies this comment: severity used to be captured as unvalidated
+#     free text bounded only by the next "|" in the header line, which was a
+#     real gap (same fence-escape shape as file/category/message) that a
+#     prior version of this comment incorrectly asserted was already closed.
+#     If you are re-reading this after touching the severity regex capture,
+#     re-verify the enum check in _parse_adversarial_findings still runs
+#     before trusting this comment again.
+#   reachable — closed set (yes/no). ENUM-VALIDATED AND FORCE-CORRECTED at
+#     parse time (unrecognized/absent -> "no"). Same reasoning as severity:
+#     no free text left after parsing, nothing for this function to do.
+#   tier      — closed set (blocking/advisory). ENUM-VALIDATED AND
+#     FORCE-CORRECTED at parse time (unrecognized/absent -> "advisory", and
+#     force-corrected again to "advisory" whenever reachable != "yes").
+#     Same reasoning as severity/reachable.
+#   line      — always an int (parse failure on the numeric suffix falls
+#     back to 0 in _parse_adversarial_findings). Not text; nothing to
+#     sanitize; not enum-shaped either, so "validated" isn't quite the right
+#     word — it is type-constrained by construction (Python int(), never a
+#     pass-through of the captured string).
+#
+# Net: every field is either free-text-and-sanitized (file/category/message)
+# or closed-set-and-force-corrected-at-parse-time (severity/reachable/tier)
+# or non-text-by-construction (line). There is no field in this record that
+# is "probably fine" or asserted-safe-without-a-mechanism — each one has an
+# actual enforcement point, named above, that a future change to this
+# function or to _parse_adversarial_findings should re-verify still holds
+# before relying on this comment again.
 _sanitize_adversarial_findings_json() {
   _safj_json="$1"
 
