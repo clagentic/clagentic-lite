@@ -573,6 +573,27 @@ PYEOF
 # merely sanitize" posture for the field set itself: there is no defined
 # meaning to forward in any form.
 #
+# TYPED FIELDS (lr-66e598 follow-up): a bare field name (e.g. "file") keeps
+# ONLY a string value under that key, exactly as above and as every existing
+# caller (deferrals) already relies on. Appending ":number" to a field name
+# (e.g. "line:number") CHANGES that ONE field's accepted type to a plain
+# JSON number INSTEAD OF a string -- not in addition to it. This is a type
+# declaration, not a widening: the field's schema type is either string
+# (bare name) or number (":number" suffix), never both, so a value of the
+# wrong type for that field's declared type is dropped, never coerced and
+# never accepted under the other type. This exists because the
+# review-findings schema (docs/GATES.md, `ds_review_prompt` in
+# llm-client.sh) legitimately defines `line` as a number, and the base
+# string-only contract would silently corrupt that schema's own `line`
+# value (breaking finding_content_keys' `.line` lookup and
+# cmd_render_review's rendered line number) -- adding a type declaration to
+# this one field, rather than a second allowlist function, is what "reuse
+# the existing helper" means when a caller's own schema needs a non-string
+# field. No other type is accepted (no ":bool", no ":object"); this
+# codebase's schemas have not needed one yet, and the same "drop, never
+# coerce" fail-closed default applies if one shows up before a suffix for it
+# is added here.
+#
 # Fail-open: a non-array or malformed JSON input, or the complete absence
 # of jq AND python3, returns the ORIGINAL input unchanged -- identical
 # fail-open posture to _llm_json_array_sanitize_fields, so the caller's own
@@ -580,7 +601,8 @@ PYEOF
 # review) composes cleanly across both steps.
 #
 # Args: JSON (a JSON array of objects), FIELD1..FIELDN (the CLOSED set of
-# field names this array's schema defines).
+# field names this array's schema defines; each is a bare name for
+# string-only, or "name:number" to also accept a JSON number under that key).
 # stdout: the reduced JSON array (or the original JSON, on any failure).
 _llm_json_array_allowlist_fields() {
   _ljaaf_json="$1"
@@ -601,17 +623,28 @@ _llm_json_array_allowlist_fields() {
       printf '%s' "$_ljaaf_json"
       return 0
     fi
-    # Build a jq array-literal of the allowed field names once, then apply
-    # a single filter: for each object, keep only entries whose key is in
-    # the allowlist AND whose value is a string (drop non-string values
-    # under an allowed key name too -- see docstring above).
-    _ljaaf_fields_json="[]"
+    # Build a jq object mapping field-name -> its ONE declared jq type
+    # ("string" by default; "number" when the caller suffixed ":number" --
+    # a type declaration, not an added alternative), then apply a single
+    # filter: for each object, keep only entries whose key is in the
+    # allowlist AND whose value's jq type equals that key's declared type.
+    _ljaaf_types_json="{}"
     for _ljaaf_field in $_ljaaf_fields; do
-      _ljaaf_fields_json=$(printf '%s' "$_ljaaf_fields_json" | jq -c --arg f "$_ljaaf_field" '. + [$f]' 2>/dev/null)
-      [ -n "$_ljaaf_fields_json" ] || { printf '%s' "$_ljaaf_json"; return 0; }
+      case "$_ljaaf_field" in
+        *:number)
+          _ljaaf_name="${_ljaaf_field%:number}"
+          _ljaaf_type="number"
+          ;;
+        *)
+          _ljaaf_name="$_ljaaf_field"
+          _ljaaf_type="string"
+          ;;
+      esac
+      _ljaaf_types_json=$(printf '%s' "$_ljaaf_types_json" | jq -c --arg f "$_ljaaf_name" --arg t "$_ljaaf_type" '. + {($f): $t}' 2>/dev/null)
+      [ -n "$_ljaaf_types_json" ] || { printf '%s' "$_ljaaf_json"; return 0; }
     done
-    _ljaaf_out=$(printf '%s' "$_ljaaf_json" | jq -c --argjson allowed "$_ljaaf_fields_json" \
-      '[.[] | (if type == "object" then with_entries(select(([.key] | inside($allowed)) and (.value | type == "string"))) else {} end)]' \
+    _ljaaf_out=$(printf '%s' "$_ljaaf_json" | jq -c --argjson types "$_ljaaf_types_json" \
+      '[.[] | (if type == "object" then with_entries(select(($types[.key] // null) as $t | $t != null and (.value | type) == $t)) else {} end)]' \
       2>/dev/null)
     [ -n "$_ljaaf_out" ] || { printf '%s' "$_ljaaf_json"; return 0; }
     printf '%s' "$_ljaaf_out"
@@ -623,7 +656,21 @@ _llm_json_array_allowlist_fields() {
 import json, sys
 
 raw = sys.argv[1]
-allowed = set(sys.argv[2:])
+raw_fields = sys.argv[2:]
+
+# name -> its ONE declared python type set: (str,) by default, or
+# (int, float) if the caller suffixed ":number" -- a type DECLARATION, not
+# an added alternative, mirroring the jq branch's single-type-per-field
+# contract. bool is deliberately excluded from the numeric type set even
+# though Python's bool is an int subclass -- a JSON true/false must never
+# silently pass a numeric field check.
+allowed = {}
+for f in raw_fields:
+    if f.endswith(":number"):
+        name = f[: -len(":number")]
+        allowed[name] = (int, float)
+    else:
+        allowed[name] = (str,)
 
 try:
     arr = json.loads(raw)
@@ -638,10 +685,19 @@ for item in arr:
     if not isinstance(item, dict):
         reduced.append({})
         continue
-    # Keep only allowed keys whose value is a plain string -- drop unknown
-    # keys entirely, and drop (do not stringify) a known key holding a
-    # non-string (object/array/number/bool/null) value.
-    reduced.append({k: v for k, v in item.items() if k in allowed and isinstance(v, str)})
+    out = {}
+    for k, v in item.items():
+        types = allowed.get(k)
+        if types is None:
+            continue
+        # Reject bool explicitly even when the field's declared type is
+        # (int, float) -- isinstance(True, int) is True in Python, which
+        # would otherwise let a JSON boolean masquerade as a numeric value.
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, types):
+            out[k] = v
+    reduced.append(out)
 
 print(json.dumps(reduced))
 PYEOF
