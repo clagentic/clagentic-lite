@@ -13,6 +13,20 @@ Scenarios:
   4. --recheck exits 1 when gate-summary.json exists but its embedded SHA does
      not match HEAD (staleness guard added in lr-23c2).
   5. --recheck succeeds when gate-summary.json SHA matches HEAD exactly.
+  6. --recheck does not consult an ancestor git repo (e.g. a repo rooted above
+     the tmpdir) for HEAD when REPO_ROOT itself is not a git repo — regression
+     test for lr-4a3f88 (gates.sh:1988 used bare `git rev-parse HEAD` instead
+     of the repo-scoped `_git` helper, so a `.git` directory anywhere above
+     the tmpdir in the filesystem would incorrectly resolve a real SHA).
+  7. --recheck resolves HEAD (and enforces the SHA-staleness guard) when
+     REPO_ROOT is a real git repo but expressed as a symlinked path —
+     regression test for a lr-4a3f88 follow-up (PEACHES, PR #131): the
+     toplevel-equality check compared `git rev-parse --show-toplevel`
+     (always absolute/canonical) against REPO_ROOT via literal string
+     equality, so a REPO_ROOT that legitimately resolves to the same
+     directory but is spelled differently (e.g. via a symlink) mismatched
+     and silently no-op'd the staleness guard on a repo it should have
+     checked.
 
 Run with:
   python3 -m unittest scripts/test_merge_gate_recheck.py -v
@@ -345,6 +359,139 @@ class TestMergeGateRecheck(unittest.TestCase):
             out_json = json.load(f)
         self.assertEqual(out_json.get("decision"), "approve",
                          f"Expected decision=approve; got: {out_json}")
+
+    # ------------------------------------------------------------------ test 6
+    def test_recheck_ignores_ancestor_git_repo_when_project_root_is_not_git(self):
+        """--recheck must not resolve HEAD from a git repo above REPO_ROOT.
+
+        Regression test for lr-4a3f88: gates.sh:1988 used bare `git rev-parse
+        HEAD` instead of the repo-scoped `_git` helper (`_git() { git -C
+        "$REPO_ROOT" "$@"; }`, gates.sh:50). Bare `git` walks up the
+        filesystem from cwd looking for a `.git` directory, so if an ancestor
+        of a non-git REPO_ROOT happens to be a git repo, the SHA-staleness
+        guard would incorrectly resolve a real HEAD SHA instead of treating
+        REPO_ROOT as having no HEAD (the documented no-op escape hatch at
+        gates.sh:1989). Here we create a real git repo as the *parent* of the
+        (non-git) project root and assert --recheck still succeeds as if no
+        SHA were resolvable at all -- i.e. it must not consult the ancestor
+        repo's HEAD.
+        """
+        # self._tmpdir (== self._project) has no .git. Make its *parent*
+        # directory a git repo with a real commit, so an ancestor walk-up
+        # from a bare `git rev-parse HEAD` invoked with cwd=self._project
+        # would find and resolve it.
+        parent_dir = os.path.dirname(self._tmpdir)
+        ancestor_git_dir = os.path.join(parent_dir, ".git")
+        created_ancestor_repo = not os.path.isdir(ancestor_git_dir)
+        if created_ancestor_repo:
+            _init_git_repo(parent_dir)
+
+        try:
+            self.assertFalse(
+                os.path.isdir(os.path.join(self._project, ".git")),
+                "project root must not be a git repo for this test",
+            )
+
+            summary_path = os.path.join(
+                self._project, ".clagentic", "lite", "gate-summary.json"
+            )
+            summary = {
+                "review": {"findings": [], "summary": "clean"},
+                "adversarial": None,
+                "adversarial_missing": True,
+                "adversarial_acks": [],
+                "accepted_risks": "",
+                "introduces_ack_file": False,
+                "threshold": "high",
+            }
+            with open(summary_path, "w") as f:
+                json.dump(summary, f)
+
+            result = _run_merge_gate(["--recheck"], self._fake_tool_home, self._project)
+
+            # No SHA is resolvable for a non-git REPO_ROOT, so the staleness
+            # guard must be a no-op (gates.sh:1989) and --recheck must succeed,
+            # exactly as it does with no ancestor git repo present at all.
+            self.assertEqual(
+                result.returncode, 0,
+                f"--recheck must not consult an ancestor repo's HEAD when "
+                f"REPO_ROOT is not a git repo; got {result.returncode}\n"
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            self.assertNotIn(
+                "--recheck refused", result.stderr,
+                f"--recheck incorrectly resolved a SHA from an ancestor git "
+                f"repo instead of treating REPO_ROOT as having no HEAD; "
+                f"stderr: {result.stderr}",
+            )
+        finally:
+            if created_ancestor_repo:
+                import shutil
+                shutil.rmtree(ancestor_git_dir, ignore_errors=True)
+
+    # ------------------------------------------------------------------ test 7
+    def test_recheck_resolves_head_when_repo_root_is_symlinked(self):
+        """--recheck must still resolve HEAD when REPO_ROOT is a real git repo
+        reached through a symlink (PEACHES, PR #131 follow-up to lr-4a3f88).
+
+        `git rev-parse --show-toplevel` always returns an absolute, canonical
+        path. If REPO_ROOT is passed in as a symlink pointing at that same
+        directory, a literal string comparison between the two would
+        (incorrectly) mismatch, leaving _mg_head_sha empty and silently
+        no-op-ing the staleness guard on a repo that IS real and IS the one
+        under test — accepting a stale gate-summary.json instead of refusing
+        it. We assert the guard is *enforced*: a deliberately stale SHA in
+        gate-summary.json must still cause --recheck to refuse (exit 1),
+        proving HEAD was actually resolved through the symlinked REPO_ROOT.
+        """
+        real_project = self._project
+        head_sha = _init_git_repo(real_project)
+
+        symlink_root = os.path.join(self._tmpdir + "-symlink")
+        os.symlink(real_project, symlink_root)
+        self.addCleanup(lambda: os.path.exists(symlink_root) and os.remove(symlink_root))
+
+        self.assertNotEqual(
+            symlink_root, real_project,
+            "symlink path must be textually different from the real repo root",
+        )
+
+        stale_sha = "0" * 40
+        self.assertNotEqual(stale_sha, head_sha,
+                            "stale_sha must differ from HEAD for this test to be meaningful")
+
+        summary_path = os.path.join(real_project, ".clagentic", "lite", "gate-summary.json")
+        summary = {
+            "review": {
+                "findings": [],
+                "summary": "clean",
+                "_clagentic_diff_sha": stale_sha,
+            },
+            "adversarial": None,
+            "adversarial_missing": True,
+            "adversarial_acks": [],
+            "accepted_risks": "",
+            "introduces_ack_file": False,
+            "threshold": "high",
+        }
+        with open(summary_path, "w") as f:
+            json.dump(summary, f)
+
+        # Invoke --recheck with REPO_ROOT set to the *symlinked* path, not
+        # the real (already-canonical) one — this is the case the fix covers.
+        result = _run_merge_gate(["--recheck"], self._fake_tool_home, symlink_root)
+
+        self.assertEqual(
+            result.returncode, 1,
+            f"Expected exit 1 on SHA mismatch even with a symlinked REPO_ROOT "
+            f"(HEAD must still resolve); got {result.returncode}\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}",
+        )
+        self.assertIn(stale_sha, result.stderr,
+                      f"Error must include the stale SHA; stderr: {result.stderr}")
+        self.assertIn(head_sha, result.stderr,
+                      f"Error must include HEAD SHA (proves HEAD was resolved through "
+                      f"the symlinked REPO_ROOT); stderr: {result.stderr}")
 
 
 if __name__ == "__main__":
