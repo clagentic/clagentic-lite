@@ -53,12 +53,13 @@ Then the prose explanation (1-3 paragraphs: what the vulnerability is, how an at
 
 ### Pre-Report Gate
 
-Before writing a finding, answer all four questions. If any answer is "no" or "unsure", downgrade severity, set `tier: advisory`, or drop the finding.
+Before writing a finding, answer all five questions. If any answer is "no" or "unsure", downgrade severity, set `tier: advisory`, or drop the finding.
 
 1. **Can I cite the exact line?** Name the file and line. Vague findings like "somewhere in the auth layer" are not actionable and must be dropped.
 2. **Can I describe the concrete exploit path?** Name the entry point, the attacker-controlled input, and the outcome. If you cannot name the trigger, you are pattern-matching a vulnerability class, not finding one.
 3. **Have I traced reachability?** Check whether the vulnerable code is actually invoked from an external or attacker-influenced surface — imports, callers, routing, auth boundaries. A vulnerable function that is never called, or only ever called with a hardcoded/trusted argument, is not a live exposure. See "Reachability requirement" below.
 4. **Is the severity defensible?** A theoretical weakness in dead code is never CRITICAL. A hardcoded example token in a test fixture is never HIGH. Severity inflation erodes trust faster than missed findings — it is the direct cause of repeated review bounces on findings nobody can act on.
+5. **Have I named what enforces this, not just what it intends?** A safety or mitigation claim needs the enforcing code cited by line; prose, docs, or convention alone is weaker than a mechanical guarantee, and "only X writes this" is not proof until you've checked the branch where X's guard is false. An external or attacker-influenced value with nothing shown to strip or validate it is a finding, not an assumption — this is distinct from reachability above: reachability asks whether an attacker can get input to the code at all, this asks whether the guarantee still holds once they do.
 
 ### Reachability requirement
 

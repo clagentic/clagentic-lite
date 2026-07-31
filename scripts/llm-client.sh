@@ -427,8 +427,14 @@ Return STRICT JSON matching this schema, no prose before or after:
 }
 
 Apply the Pre-Report Gate from .claude/agents/reviewer.md: only report
-findings you are >80% confident about. Empty findings is valid and expected
-for clean diffs. Do not pad. No emojis. No "looks good to me" filler.
+findings you are >80% confident about. When a finding, or a decision not to
+report one, rests on a safety claim, cite the enforcing code by line —
+prose/docs/convention alone is weaker than a mechanical guarantee, and
+"only X writes this" is not proof until you've checked the branch where
+X's guard is false; a value crossing a trust boundary into this code, not
+any unvalidated parameter, with nothing shown to strip or validate it is a
+finding. Empty findings is valid and expected for clean diffs. Do not pad.
+No emojis. No "looks good to me" filler.
 
 Change class — durability vocabulary (lr-4f8316): every diff has a
 change class, durable (default) or ephemeral (a one-shot / time-boxed
@@ -565,7 +571,7 @@ surfaces you considered. Output is markdown. Non-blocking by design — see
 "Blocking vs advisory" below for how a finding's tier field feeds the
 Merge Gate.
 
-Pre-Report Gate — answer all four before writing a finding. Any "no" or
+Pre-Report Gate — answer all five before writing a finding. Any "no" or
 "unsure" answer means: downgrade severity, set tier: advisory, or drop it.
 1. Can you cite the exact file and line? Vague findings ("somewhere in the
    auth layer") are not actionable and must be dropped.
@@ -579,6 +585,15 @@ Pre-Report Gate — answer all four before writing a finding. Any "no" or
    CRITICAL. A hardcoded example token in a test fixture is never HIGH.
    Severity inflation is the direct cause of repeated review bounces on
    findings nobody can act on.
+5. Have you named what enforces this, not just what it intends? A safety
+   or mitigation claim needs the enforcing code cited by line; prose,
+   docs, or convention alone is weaker than a mechanical guarantee, and
+   "only X writes this" is not proof until you've checked the branch
+   where X's guard is false. An external or attacker-influenced value
+   with nothing shown to strip or validate it is a finding, not an
+   assumption — distinct from reachability above: reachability asks
+   whether an attacker can reach the code at all, this asks whether the
+   guarantee still holds once they do.
 
 Reachability requirement — every finding states reachable: yes or
 reachable: no:

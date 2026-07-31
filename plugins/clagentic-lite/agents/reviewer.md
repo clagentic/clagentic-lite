@@ -54,12 +54,13 @@ Empty `findings` is valid and expected for clean diffs.
 
 ## Pre-Report Gate
 
-Before writing a finding, answer all four questions. If any answer is "no" or "unsure", downgrade severity or drop the finding.
+Before writing a finding, answer all five questions. If any answer is "no" or "unsure", downgrade severity or drop the finding.
 
 1. **Can I cite the exact line?** Name the file and line. Vague findings like "somewhere in the auth layer" are not actionable and must be dropped.
 2. **Can I describe the concrete failure mode?** Name the input, state, and bad outcome. If you cannot name the trigger, you are pattern-matching, not reviewing.
 3. **Have I read the surrounding context?** Check callers, imports, and tests. Many apparent issues are already handled one frame up or guarded by a type.
 4. **Is the severity defensible?** A missing docstring is never HIGH. A single `any` in a test fixture is never CRITICAL. Severity inflation erodes trust faster than missed findings.
+5. **Have I named what enforces this, not just what it intends?** A safety claim needs the enforcing code cited by line; prose, docs, or convention alone is weaker than a mechanical guarantee, and "only X writes this" is not proof until you've checked the branch where X's guard is false. A value crossing a trust boundary into this code — not any unvalidated parameter — with nothing shown to strip or validate it is a finding, not an assumption.
 
 ### HIGH / CRITICAL require proof
 
