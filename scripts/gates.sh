@@ -1994,10 +1994,37 @@ cmd_merge_gate() {
     # ds_repo_root, platform.sh), that walk-up would incorrectly resolve a
     # real SHA belonging to a different repo. Guard against this by requiring
     # the resolved toplevel to equal REPO_ROOT itself before trusting the SHA.
+    #
+    # `git rev-parse --show-toplevel` always prints an absolute, canonical
+    # (symlink-resolved) path. REPO_ROOT is not guaranteed to be either: it
+    # can come verbatim from CLAGENTIC_PROJECT_ROOT, or from ds_repo_root's
+    # wrapper/.clagentic-project pointer-file fallback (platform.sh:63-66),
+    # neither of which canonicalizes the path. A literal string compare
+    # between an always-canonical toplevel and a possibly-relative/symlinked
+    # REPO_ROOT falsely mismatches on a real git repo, leaving
+    # _mg_head_sha empty and silently no-op-ing the staleness guard on a repo
+    # it should have checked — the same bug class as the ancestor-walk-up
+    # issue above, but with the polarity flipped: that one made --recheck
+    # falsely refuse, this one makes it falsely pass a stale summary (lr-4a3f88
+    # follow-up). Canonicalize REPO_ROOT using the same `cd DIR && pwd`
+    # idiom this codebase already uses elsewhere (gates.sh:29,
+    # bin/clagentic-lite) for the relative-path half of the problem, plus
+    # POSIX `pwd -P` (not plain `pwd`, which prints the logical path and
+    # would leave a symlink component unresolved) for the symlink half —
+    # both are needed to match what `git rev-parse --show-toplevel` always
+    # returns. `cd` failing (REPO_ROOT does not exist / not a directory)
+    # falls back to the raw value, which will simply continue to correctly
+    # mismatch below.
     _mg_summary_sha=""
     _mg_head_sha=""
+    # `pwd -P` (not plain `pwd`) is required: plain `pwd` prints the LOGICAL
+    # path, preserving any symlink component named in the `cd` argument —
+    # it would NOT resolve a symlinked REPO_ROOT down to the same physical
+    # path `git rev-parse --show-toplevel` (which always fully resolves
+    # symlinks) reports. `-P` is POSIX `pwd`, no portability concern.
+    _mg_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
     _mg_git_toplevel=$(_git rev-parse --show-toplevel 2>/dev/null || echo "")
-    if [ "$_mg_git_toplevel" = "$REPO_ROOT" ]; then
+    if [ "$_mg_git_toplevel" = "$_mg_repo_root_canon" ]; then
       _mg_head_sha=$(_git rev-parse HEAD 2>/dev/null || echo "")
     fi
     if [ -n "$_mg_head_sha" ]; then
