@@ -306,7 +306,7 @@ sqlite3 .clagentic/lite/audit.db \
   "SELECT ts, outcome, details FROM gate_runs WHERE gate='review' ORDER BY ts DESC LIMIT 5;"
 ```
 
-Reviewer prompt and JSON schema are pinned in `.claude/agents/reviewer.md` (Pre-Report Gate + Common False Positives list). Output is persisted at `.clagentic/lite/last-review.json` and into `audit.db.gate_runs`. Per-step LLM-call attempts are logged separately (`gate=llm-call`) with a one-line error hint from stderr.
+Reviewer prompt and JSON schema are inlined in `ds_review_prompt` (`scripts/llm-client.sh`), including its own Pre-Report Gate and Common False Positives list — matching the pattern `ds_adversarial_prompt` already uses for the Auditor's gate in the same file. The authoritative subagent doc for interactive/Claude Code use is `plugins/clagentic-lite/agents/reviewer.md`; that file lands at `.claude/agents/reviewer.md` only inside an enrolled consumer repo via plugin install, never in clagentic-lite's own working tree, so it is not a valid reference from this repo's source. Output is persisted at `.clagentic/lite/last-review.json` and into `audit.db.gate_runs`. Per-step LLM-call attempts are logged separately (`gate=llm-call`) with a one-line error hint from stderr.
 
 The Reviewer never has write tools. The Builder never sees its own review pre-graded. The Reviewer prompt forbids "looks good to me" outputs without specific evidence.
 

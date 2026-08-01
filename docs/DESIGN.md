@@ -113,7 +113,7 @@ Three env vars govern the recall and retention budget (code defaults; override i
 
 1. `git diff --cached --unified=3` → stdin to `scripts/llm-client.sh review`.
 2. The wrapper walks the Reviewer's model_chain — primary, then each fallback `(cmd, tier)` — and validates output against the reviewer schema (`.findings` must be an array). Schema-invalid output advances the chain; if every step fails, it returns a degraded envelope marked `"degraded": true`.
-3. Findings written to `.clagentic/lite/last-review.json`. The Reviewer prompt is fixed (`.claude/agents/reviewer.md`): role, JSON schema, severity scale, Pre-Report Gate, Common False Positives.
+3. Findings written to `.clagentic/lite/last-review.json`. The Reviewer prompt is fixed and inlined in `ds_review_prompt` (`scripts/llm-client.sh`): role, JSON schema, severity scale, Pre-Report Gate, Common False Positives.
 4. `gates.sh cmd_review` rejects degraded envelopes (block) and counts findings at `>= CLAGENTIC_BLOCK_SEVERITY` (block on any). Pass otherwise.
 5. Outcome row inserted into `.clagentic/lite/audit.db.gate_runs` (`gate=review`, `outcome=pass|block`).
 6. `cmd_render_review` pretty-prints the JSON to the session.
