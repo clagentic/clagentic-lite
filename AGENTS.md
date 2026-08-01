@@ -100,6 +100,12 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 
 ---
 
+## When a gate or hook fails
+
+Do not debug a failed gate, hook, or command inline as your own problem. Dispatch the **Troubleshooter** agent (`plugins/clagentic-lite/agents/troubleshooter.md`) first — it is read-only, applies a tiered diagnosis (Tier 0 fast triage → Tier 2 deep diagnosis), and returns a root cause plus a `bounce_target` (you, the Builder, or none — expected behavior). This applies to: a gate exit code that isn't 0, a hook producing an unexpected error, `clagentic-lite gates ship` reporting `BLOCKED`/`INFRA_DEGRADED`, or `clagentic-lite doctor`/`enroll` reporting broken state. The Troubleshooter never fixes — it names the cause and stops; act on its finding yourself.
+
+---
+
 ## File map (load-bearing)
 
 | Path | Purpose |

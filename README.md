@@ -418,6 +418,12 @@ clagentic-lite export --output PATH  # write report to a specific path
 
 ---
 
+## When something fails
+
+A gate returns non-zero, a hook errors, `clagentic-lite gates ship` prints `BLOCKED` or `INFRA_DEGRADED`, or `clagentic-lite doctor` reports a broken enrollment — the first move is the **Troubleshooter** agent, not fixing it inline. It is read-only, diagnoses in Tier 0→2, and hands back a root cause plus a `bounce_target` naming who should act (you, the Builder, or nobody — expected behavior). In Claude Code it auto-dispatches on failure vocabulary ("why did this fail", a pasted exit code, a gate error); you can also invoke it directly by name. See `plugins/clagentic-lite/agents/troubleshooter.md` for the full contract.
+
+---
+
 ## When you've outgrown lite
 
 Signals: you want a server; you want multi-repo memory; you want ranked or embedding-based retrieval; you want multi-agent orchestration; you want memory that learns, decays, and promotes itself automatically.
