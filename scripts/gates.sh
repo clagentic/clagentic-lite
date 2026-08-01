@@ -2648,15 +2648,25 @@ cmd_ship() {
     echo "[gates/ship] skip $1 (not in CLAGENTIC_GATES)"
     cmd_log_run "$1" skip "not in CLAGENTIC_GATES=${CLAGENTIC_GATES:-}"
   }
-  if gate_enabled bleed;        then cmd_bleed        || { echo "[gates/ship] BLOCKED at internal-bleed"; exit 1; }; else ship_step_skip bleed;        fi
-  if gate_enabled secrets;     then cmd_secrets     || { echo "[gates/ship] BLOCKED at secrets";    exit 1; }; else ship_step_skip secrets;     fi
-  if gate_enabled deps;        then cmd_deps        || { echo "[gates/ship] BLOCKED at deps";       exit 1; }; else ship_step_skip deps;        fi
-  if gate_enabled sast;        then cmd_sast        || { echo "[gates/ship] BLOCKED at sast";       exit 1; }; else ship_step_skip sast;        fi
+  # ship_step_hint: one-line pointer to the Troubleshooter agent, printed
+  # alongside every blocking failure below — same convention as the existing
+  # "set CLAGENTIC_ALLOW_MISSING_*=1 to skip" hints in cmd_secrets/cmd_deps.
+  # A gate exit code alone ("BLOCKED at secrets") tells you WHAT failed, not
+  # where to go next (lr-0c7f99): the affordance belongs where the failure
+  # lands, not only in docs a session has to go looking for.
+  ship_step_hint() {
+    echo "[gates/ship] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"
+  }
+  if gate_enabled bleed;        then cmd_bleed        || { echo "[gates/ship] BLOCKED at internal-bleed"; ship_step_hint; exit 1; }; else ship_step_skip bleed;        fi
+  if gate_enabled secrets;     then cmd_secrets     || { echo "[gates/ship] BLOCKED at secrets";    ship_step_hint; exit 1; }; else ship_step_skip secrets;     fi
+  if gate_enabled deps;        then cmd_deps        || { echo "[gates/ship] BLOCKED at deps";       ship_step_hint; exit 1; }; else ship_step_skip deps;        fi
+  if gate_enabled sast;        then cmd_sast        || { echo "[gates/ship] BLOCKED at sast";       ship_step_hint; exit 1; }; else ship_step_skip sast;        fi
   if gate_enabled review; then
     _review_rc=0
     cmd_review || _review_rc=$?
     if [ "$_review_rc" -eq 2 ]; then
       echo "[gates/ship] INFRA_DEGRADED at review — reviewer infrastructure failed, no real review occurred"
+      ship_step_hint
       cmd_log_run ship block "infra-degraded at review"
       exit 2
     elif [ "$_review_rc" -ne 0 ]; then
@@ -2668,7 +2678,7 @@ cmd_ship() {
     ship_step_skip review
   fi
   if gate_enabled adversarial; then cmd_adversarial || true; else ship_step_skip adversarial; fi
-  if gate_enabled merge-gate;  then cmd_merge_gate  || { echo "[gates/ship] BLOCKED at merge-gate"; exit 1; }; else ship_step_skip merge-gate;  fi
+  if gate_enabled merge-gate;  then cmd_merge_gate  || { echo "[gates/ship] BLOCKED at merge-gate"; ship_step_hint; exit 1; }; else ship_step_skip merge-gate;  fi
 
   echo "[gates/ship] all blocking gates passed"
   BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
@@ -2699,8 +2709,8 @@ cmd_ship() {
 }
 
 cmd_pre_push() {
-  cmd_deps || exit 1
-  cmd_sast || exit 1
+  cmd_deps || { echo "[gates/pre-push] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"; exit 1; }
+  cmd_sast || { echo "[gates/pre-push] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"; exit 1; }
   [ "${CLAGENTIC_REVIEW_ON_PUSH:-0}" = "1" ] && { cmd_review || exit 1; }
   exit 0
 }
