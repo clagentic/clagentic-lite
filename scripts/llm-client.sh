@@ -426,15 +426,60 @@ Return STRICT JSON matching this schema, no prose before or after:
   ]
 }
 
-Apply the Pre-Report Gate from .claude/agents/reviewer.md: only report
-findings you are >80% confident about. When a finding, or a decision not to
-report one, rests on a safety claim, cite the enforcing code by line —
-prose/docs/convention alone is weaker than a mechanical guarantee, and
-"only X writes this" is not proof until you've checked the branch where
-X's guard is false; a value crossing a trust boundary into this code, not
-any unvalidated parameter, with nothing shown to strip or validate it is a
-finding. Empty findings is valid and expected for clean diffs. Do not pad.
-No emojis. No "looks good to me" filler.
+Pre-Report Gate — answer all five before writing a finding. Any "no" or
+"unsure" answer means: downgrade severity or drop it.
+1. Can you cite the exact line? Name the file and line. Vague findings
+   ("somewhere in the auth layer") are not actionable and must be dropped.
+2. Can you describe the concrete failure mode? Name the input, state, and
+   bad outcome. If you cannot name the trigger, you are pattern-matching,
+   not reviewing.
+3. Have you read the surrounding context? Check callers, imports, and
+   tests. Many apparent issues are already handled one frame up or guarded
+   by a type.
+4. Is the severity defensible? A missing docstring is never HIGH. A single
+   `any` in a test fixture is never CRITICAL. Severity inflation erodes
+   trust faster than missed findings.
+5. Have you named what enforces this, not just what it intends? A safety
+   claim needs the enforcing code cited by line; prose, docs, or convention
+   alone is weaker than a mechanical guarantee, and "only X writes this" is
+   not proof until you've checked the branch where X's guard is false. A
+   value crossing a trust boundary into this code — not any unvalidated
+   parameter — with nothing shown to strip or validate it is a finding, not
+   an assumption.
+
+HIGH/CRITICAL findings require: the exact snippet and line number, the
+specific failure scenario (input, state, outcome), and why existing guards
+(types, validation, framework defaults) do not catch it. Missing any of
+these — demote to medium or drop the finding.
+
+Zero findings is a valid review. Do not manufacture findings to justify the
+invocation. If the diff is small, well-typed, tested, and follows the
+project's patterns, return a summary with findings: [] and the checked
+array populated. Manufactured findings, filler nits, speculative "consider
+using X", and hypothetical edge cases without a trigger are the primary
+failure mode of LLM reviewers and directly undermine this role's
+usefulness. Do not pad. No emojis. No "looks good to me" filler.
+
+Common false positives — skip unless you have evidence specific to this
+diff: "consider adding error handling" on a call whose error path is
+handled by the caller or framework (error middleware, error boundaries,
+top-level try/catch, Promise chains with .catch upstream); "missing input
+validation" when the function is internal and its callers already
+validate (trace at least one caller first); "magic number" for well-known
+constants (200, 404, 1000ms, 60, 24, 1024, array index 0 or -1, HTTP
+status codes, single-use local constants whose meaning is obvious from the
+name); "function too long" for exhaustive switch statements, configuration
+objects, test tables, or generated code — length is not complexity;
+"missing docstring" on single-purpose internal helpers whose name and
+signature are self-describing; "possible null dereference" when the
+preceding line narrows the type or an if guard is in scope; "N+1 query" on
+fixed-cardinality loops or paths already using batching; "missing await"
+on fire-and-forget calls intentionally detached (check for a void prefix
+or comment first); "hardcoded value" for values in test fixtures, example
+code, or documentation snippets; security theater (Math.random() in
+non-cryptographic contexts, eval/Function in a plugin system whose purpose
+is code loading). Ask: "Would a senior engineer on this team actually
+change this in review?" If no, skip.
 
 Change class — durability vocabulary (lr-4f8316): every diff has a
 change class, durable (default) or ephemeral (a one-shot / time-boxed

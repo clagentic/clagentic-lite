@@ -21,12 +21,21 @@ default = "reviewer"
 [[roles.list]]
 name = "reviewer"
 permissions = ["read"]
-prompt_file = ".claude/agents/reviewer.md"
+# No prompt_file: the Reviewer prompt (role, JSON schema, Pre-Report Gate,
+# Common False Positives) is supplied entirely by ds_review_prompt in
+# scripts/llm-client.sh, piped to `codex exec -` via stdin at call time
+# (invoke_codex). A prompt_file pointing at ".claude/agents/reviewer.md"
+# previously sat here, but that path never exists in clagentic-lite's own
+# working tree (see docs/GATES.md "Gate 3" and lr-2ec7b5) and this repo's
+# own invocation path never reads prompt_file from this config at all —
+# it was dead weight, not a behavior change to remove it.
 
 [[roles.list]]
 name = "auditor"
 permissions = ["read"]
-prompt_file = ".claude/agents/auditor.md"
+# No prompt_file: same rationale as reviewer above. The Auditor's
+# adversarial prompt (including its own inlined Pre-Report Gate) is
+# supplied by ds_adversarial_prompt in scripts/llm-client.sh.
 
 [[roles.list]]
 name = "summarizer"
