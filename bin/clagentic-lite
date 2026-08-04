@@ -37,13 +37,81 @@ set -e
 }
 export CLAGENTIC_LITE_HOME
 
+# _bootstrap_resolve_self
+# Resolve $0 to its final on-disk target, following symlinks, WITHOUT relying
+# on scripts/platform.sh (not sourced yet at this point — this function exists
+# to find platform.sh in the first place, so it cannot depend on ds_realpath).
+# Normal invocation is via the init-created symlink at ~/.local/bin/clagentic-lite,
+# which points into the checkout's bin/ dir — dirname on the raw symlink path
+# resolves to ~/.local/bin, not the checkout, breaking self-locate (lr-121496 /
+# GH #135). GNU readlink -f is not assumed (absent on macOS/BSD by default).
+# Resolution order, most to least capable:
+#   1. readlink -f (GNU coreutils, and modern macOS since it gained -f too)
+#   2. python3 os.path.realpath (present on most dev machines, symlink-safe)
+#   3. manual readlink loop (POSIX readlink with no -f; follows one hop at a
+#      time, bounded to avoid an infinite loop on a symlink cycle)
+#   4. raw $0, unresolved (last resort — matches pre-fix behavior)
+# Sets _BOOTSTRAP_SELF and _BOOTSTRAP_SELF_METHOD (used in the failure message
+# below to name which attempts were made, not just the default home).
+_bootstrap_resolve_self() {
+  _brs_target="$1"
+
+  if command -v readlink >/dev/null 2>&1 && readlink -f "$_brs_target" >/dev/null 2>&1; then
+    _BOOTSTRAP_SELF=$(readlink -f "$_brs_target" 2>/dev/null)
+    _BOOTSTRAP_SELF_METHOD="readlink -f"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    _brs_py=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$_brs_target" 2>/dev/null)
+    if [ -n "$_brs_py" ]; then
+      _BOOTSTRAP_SELF="$_brs_py"
+      _BOOTSTRAP_SELF_METHOD="python3 os.path.realpath"
+      return 0
+    fi
+  fi
+
+  if command -v readlink >/dev/null 2>&1; then
+    # No readlink -f: follow one symlink hop at a time (POSIX readlink without
+    # -f only resolves a single level). Bounded loop guards against a cycle.
+    _brs_cur="$_brs_target"
+    _brs_hops=0
+    while [ -L "$_brs_cur" ] && [ "$_brs_hops" -lt 20 ]; do
+      _brs_link=$(readlink "$_brs_cur" 2>/dev/null) || break
+      case "$_brs_link" in
+        /*) _brs_cur="$_brs_link" ;;
+        *)  _brs_cur="$(dirname "$_brs_cur")/$_brs_link" ;;
+      esac
+      _brs_hops=$((_brs_hops+1))
+    done
+    _brs_dir=$(cd "$(dirname "$_brs_cur")" 2>/dev/null && pwd) || _brs_dir=""
+    if [ -n "$_brs_dir" ]; then
+      _BOOTSTRAP_SELF="$_brs_dir/$(basename "$_brs_cur")"
+      _BOOTSTRAP_SELF_METHOD="readlink (manual hop, ${_brs_hops} hop(s))"
+      return 0
+    fi
+  fi
+
+  # Last resort: raw $0, unresolved. Still lets the plain (non-symlinked)
+  # invocation case work, and callers can tell from _BOOTSTRAP_SELF_METHOD
+  # that no symlink resolution actually happened.
+  _BOOTSTRAP_SELF="$_brs_target"
+  _BOOTSTRAP_SELF_METHOD="unresolved (no readlink -f, no python3, no readlink)"
+  return 0
+}
+
 # Source platform shims from our own install tree.
 SCRIPTS_DIR="$CLAGENTIC_LITE_HOME/scripts"
 if [ ! -f "$SCRIPTS_DIR/platform.sh" ]; then
   # Bootstrap path: being invoked before init has verified $CLAGENTIC_LITE_HOME, or
   # when the install directory has moved (e.g. ~/.clagentic-lite -> ~/.clagentic/lite
-  # migration). Try to resolve from this script's own location.
-  _SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+  # migration), or invoked through the ~/.local/bin/clagentic-lite symlink that
+  # init creates. Resolve $0 through symlinks first (see _bootstrap_resolve_self)
+  # before taking dirname — otherwise a symlinked $0 resolves against the symlink's
+  # own directory (e.g. ~/.local/bin) instead of the real checkout (lr-121496).
+  _bootstrap_resolve_self "$0"
+  _SELF_RESOLVED="$_BOOTSTRAP_SELF"
+  _SELF_DIR="$(cd "$(dirname "$_SELF_RESOLVED")" && pwd)"
   _SELF_SCRIPTS="$(dirname "$_SELF_DIR")/scripts"
   if [ -f "$_SELF_SCRIPTS/platform.sh" ]; then
     # Binary's own directory is valid — realign CLAGENTIC_LITE_HOME to match.
@@ -54,6 +122,13 @@ if [ ! -f "$SCRIPTS_DIR/platform.sh" ]; then
 fi
 if [ ! -f "$SCRIPTS_DIR/platform.sh" ]; then
   printf 'clagentic-lite: cannot find scripts/platform.sh in %s\n' "$CLAGENTIC_LITE_HOME" >&2
+  printf 'Resolution attempts made:\n' >&2
+  printf '  invoked as ($0): %s\n' "$0" >&2
+  if [ -n "${_BOOTSTRAP_SELF:-}" ]; then
+    printf '  resolved self path (%s): %s\n' "${_BOOTSTRAP_SELF_METHOD:-unknown}" "$_BOOTSTRAP_SELF" >&2
+    printf '  checked for scripts/platform.sh under: %s\n' "${_SELF_SCRIPTS:-$CLAGENTIC_LITE_HOME/scripts}" >&2
+  fi
+  printf '  default/configured CLAGENTIC_LITE_HOME: %s\n' "$CLAGENTIC_LITE_HOME" >&2
   printf 'Set CLAGENTIC_LITE_HOME to the clagentic-lite checkout directory.\n' >&2
   exit 1
 fi
