@@ -1008,6 +1008,292 @@ PYEOF2
   return 0
 }
 
+# _review_deferral_match ENVELOPE_FILE (lr-2ebc41)
+#
+# WHY THIS EXISTS: lr-c567 shipped .clagentic/deferrals.json and injected it
+# into the Reviewer's prompt as context to weigh — suppression was left
+# entirely inside model judgment (docs/GATES.md "Suppression is inside model
+# judgment, not gate code"). Field evidence (lr-2ebc41 task description):
+# a single stage-contract finding, accepted with a stable documented
+# rationale, was re-raised by the stateless Reviewer SIX times across a
+# 7-round run because nothing MECHANICALLY excluded it once accepted — the
+# Reviewer was merely asked to honor the deferral, not required to. This
+# function is the gate-code enforcement half: a finding whose (file,
+# category, message) triple matches a deferral entry AND whose named file's
+# content is byte-identical to the file's content when the deferral was
+# granted is annotated _deferral_matched: true / _deferral_id so
+# severity_blockers() (below) can exclude it from the block count — same
+# THRESHOLD-NOT-SUPPRESSION posture _recurrence_demoted already established
+# (lr-66e598): the finding stays fully visible in .findings, in
+# cmd_render_review's output, and in the audit trail with its honest
+# severity untouched. The gate does NOT drop rows or rewrite severity; it
+# only changes eligibility to block /ship. This deliberately reverses
+# lr-c567's "not in gate plumbing" call — see docs/GATES.md "Reviewer-
+# consulted deferrals" for the reversal rationale.
+#
+# MATCH KEY (the hard design question, lr-2ebc41 comment 1). Deliberately
+# NOT finding_content_keys' sha256-of-a-+-2-line-diff-window key
+# (review-merge.sh) — that key is exactly why this problem exists: it is
+# computed from SURROUNDING lines, so incidental edits nearby (a comment
+# added two lines up, a reflow) change the key and silently break the
+# match. The key here is the (file, category, message) triple instead —
+# the SAME triple _review_recurrence_demote already uses to join a bumped
+# TSV row back to a finding object (see its own doc comment above) — because
+# that triple is exactly what the model re-emits when it re-derives the
+# SAME observation about the SAME code: it is insensitive to line-number
+# drift by construction (it does not mention a line number at all), which
+# is the "survive incidental edits around the finding" property this task
+# requires. What it deliberately does NOT distinguish: two findings in
+# different files that happen to share category+message (extremely
+# unlikely for anything but a boilerplate lint rule, and even then the
+# `file` component of the triple still disambiguates); a finding whose
+# MESSAGE TEXT itself changes between rounds is a NEW finding, not a
+# re-raise, and correctly fails to match — this key does not attempt fuzzy/
+# semantic sameness (explicitly out of scope, task description).
+#
+# LAPSE (the other half of the hard design question, comment 2 and comment
+# 3). A (file, category, message) triple alone is stable enough to survive
+# incidental edits but is NOT sensitive to the deferred logic changing —
+# comment 2's field evidence is a deferral granted against round-3 behavior
+# that would still match round-6 behavior in the same file if line-window-
+# insensitivity were the ONLY property enforced. So capture (see
+# .clagentic/deferrals.json's new required `file_sha256` field,
+# scripts/llm-client.sh) pins the sha256 of the NAMED FILE's full content at
+# grant time, and matching here recomputes that same hash and requires an
+# EXACT match. Any edit anywhere in that file — not just near the finding —
+# lapses the deferral back to blocking. This correctly handles a :466-class
+# stable-contract acceptance (comment 3): the deferral's own validity
+# depends only on its own file's content, so a hash of that file is a sound
+# dependency signal.
+#
+# WHAT THIS DELIBERATELY DOES NOT SUPPORT (comment 3, outcome (b), blessed
+# by the task as a legitimate outcome rather than a failure): a deferral
+# whose validity depends on code in a DIFFERENT file or region than the one
+# it's filed against (comment 3's :139 case — a scope-boundary acceptance
+# whose truth depends on reset logic living elsewhere in a different file)
+# is NOT SUPPORTED by a single-file content hash — that dependency is
+# invisible to this mechanism by construction, since the named file's own
+# bytes can stay identical while the true dependency changes. This is a
+# DELIBERATE, DOCUMENTED restriction to the stable-contract class, not an
+# oversight: capture-time guidance (llm-client.sh's deferral schema comment,
+# docs/GATES.md, plugins/clagentic-lite/agents/builder.md) instructs the
+# capturing agent to REFUSE to write a deferral entry whose rationale
+# depends on anything outside the named file, loudly, at capture time,
+# rather than writing one this function would silently mis-honor. There is
+# no mechanical enforcement of that refusal (the shell has no way to verify
+# an English rationale is self-contained) — this is a documented boundary
+# of the feature's shape, not a false completeness claim.
+#
+# FAIL-CLOSED (the property that matters most, per the task). Any of the
+# following causes a finding to be retained as blocking, exactly as if no
+# deferral existed: deferrals.json absent/empty/malformed; a deferral entry
+# missing `file_sha256`, `scope`, `id`, `file`, or `message`; a deferral
+# entry whose `scope` is anything other than the literal string
+# "stable-contract" (only supported value — see capture-side validation);
+# the named file missing on disk; no sha256 tool available; more than one
+# LIVE (hash-matching) deferral entry claiming the same finding (ambiguous
+# match — "preserve when uncertain" per docs/GATES.md "wrong suppressions
+# are worse than missed dedups"; the task's own restated principle). No
+# JSON tool at all is a full passthrough — ENVELOPE_FILE is left untouched,
+# matching every other splice step in this file's fail-open-on-tooling,
+# fail-closed-on-ambiguity posture.
+_review_deferral_match() {
+  _rdm_envelope="$1"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    # Splicing _deferral_matched/_deferral_id into finding objects needs a
+    # real JSON encoder/decoder, matching _review_recurrence_demote's own
+    # python3-only posture. No python3 — full passthrough.
+    return 0
+  fi
+
+  _rdm_dfile="$REPO_ROOT/.clagentic/deferrals.json"
+  [ -f "$_rdm_dfile" ] || return 0
+
+  _rdm_deferrals=$(cat "$_rdm_dfile" 2>/dev/null) || return 0
+  [ -n "$_rdm_deferrals" ] || return 0
+
+  _rdm_findings=$(_extract_findings_json "$_rdm_envelope")
+  [ -n "$_rdm_findings" ] || return 0
+
+  # Build one TSV row per LIVE deferral entry: id<TAB>file<TAB>category<TAB>message
+  # A deferral is LIVE only when file_sha256 matches the named file's
+  # CURRENT on-disk content hash — computed here, in shell, via the same
+  # _rm_sha256 shim finding_content_keys uses (review-merge.sh; gates.sh
+  # sources that file, so the shim is already in scope). A file that no
+  # longer exists, or whose hash cannot be computed, yields no row for that
+  # entry (fail-closed: absent row means no match is possible for it).
+  _rdm_live_tsv=$(mktemp -t clagentic-rdm-live.XXXXXX)
+  _rdm_ids=$(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+    if not isinstance(d, list):
+        raise ValueError
+except Exception:
+    sys.exit(0)
+for e in d:
+    if not isinstance(e, dict):
+        continue
+    eid = e.get("id")
+    scope = e.get("scope")
+    fname = e.get("file")
+    fsha = e.get("file_sha256")
+    category = e.get("category", "")
+    message = e.get("message")
+    # Fail-closed schema check: id/scope/file/file_sha256/message are all
+    # required for a deferral to be eligible for MECHANICAL matching (the
+    # original six lr-c567 fields — category/description/expires/
+    # acknowledged_by — remain valid for the prompt-side path regardless;
+    # this is an ADDITIONAL, stricter gate for the gate-code path only). A
+    # deferral missing any of these is still injected into the prompt for
+    # the model to weigh (unchanged lr-c567 behavior) but is never
+    # mechanically matched here.
+    if not (isinstance(eid, str) and eid
+            and isinstance(fname, str) and fname
+            and isinstance(fsha, str) and fsha
+            and isinstance(message, str) and message
+            and scope == "stable-contract"):
+        continue
+    print("\t".join([eid, fname, str(category), message, fsha]))
+' "$_rdm_deferrals" 2>/dev/null)
+
+  if [ -z "$_rdm_ids" ]; then
+    rm -f "$_rdm_live_tsv"
+    return 0
+  fi
+
+  printf '%s\n' "$_rdm_ids" | while IFS="$(printf '\t')" read -r _rdm_id _rdm_file _rdm_cat _rdm_msg _rdm_want_sha; do
+    [ -n "$_rdm_id" ] || continue
+    _rdm_target="$REPO_ROOT/$_rdm_file"
+    [ -f "$_rdm_target" ] || continue
+    _rdm_actual_sha=$(_rm_sha256 < "$_rdm_target" 2>/dev/null)
+    [ -n "$_rdm_actual_sha" ] || continue
+    if [ "$_rdm_actual_sha" = "$_rdm_want_sha" ]; then
+      printf '%s\t%s\t%s\t%s\n' "$_rdm_id" "$_rdm_file" "$_rdm_cat" "$_rdm_msg" >> "$_rdm_live_tsv"
+    fi
+  done
+
+  if [ ! -s "$_rdm_live_tsv" ]; then
+    rm -f "$_rdm_live_tsv"
+    return 0
+  fi
+
+  # Splice: for every finding whose (file, category, message) triple
+  # matches EXACTLY ONE live deferral row, set _deferral_matched: true and
+  # _deferral_id: <id>. A triple matching MORE THAN ONE live row is
+  # AMBIGUOUS and is left unmatched — fail-closed, per "preserve when
+  # uncertain": two deferral entries independently claiming the same
+  # finding is a data-quality problem in deferrals.json, not something this
+  # function should silently resolve by picking one. OWN THE FIELD for
+  # every finding this loop touches (explicit False on no/ambiguous match),
+  # mirroring _review_recurrence_demote's own "overwrite-on-match is not
+  # own-the-field" discipline (lr-66e598 follow-up) — never leave whatever
+  # the object already carried untouched.
+  _rdm_spliced=$(mktemp -t clagentic-rdm-spliced.XXXXXX)
+  _rdm_matched_count=$(python3 - "$_rdm_findings" "$_rdm_live_tsv" "$_rdm_spliced" <<'PYEOF'
+import json, sys
+
+findings_json, tsv_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+try:
+    findings = json.loads(findings_json)
+    if not isinstance(findings, list):
+        raise ValueError("not a list")
+except Exception:
+    print(0)
+    sys.exit(0)
+
+# triple -> list of ids (collect ALL matches per triple so a triple with
+# more than one live row is detectable and treated as ambiguous below).
+ids_by_triple = {}
+try:
+    with open(tsv_path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            did, fname, category, message = parts[0], parts[1], parts[2], parts[3]
+            ids_by_triple.setdefault((fname, category, message), []).append(did)
+except Exception:
+    print(0)
+    sys.exit(0)
+
+matched = 0
+for f in findings:
+    if not isinstance(f, dict):
+        continue
+    triple = (str(f.get("file", "")), str(f.get("category", "")), str(f.get("message", "")))
+    candidates = ids_by_triple.get(triple, [])
+    if len(candidates) == 1:
+        f["_deferral_matched"] = True
+        f["_deferral_id"] = candidates[0]
+        matched += 1
+    else:
+        # Zero matches, or more than one (ambiguous) -- fail closed either
+        # way: explicit False, no id field, finding stays blocking-eligible.
+        f["_deferral_matched"] = False
+
+try:
+    with open(out_path, "w") as f:
+        json.dump(findings, f)
+except Exception:
+    print(0)
+    sys.exit(0)
+
+print(matched)
+PYEOF
+)
+  case "$_rdm_matched_count" in ''|*[!0-9]*) _rdm_matched_count=0 ;; esac
+
+  if [ -s "$_rdm_spliced" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      _rdm_tmp=$(mktemp -t clagentic-rdm-env.XXXXXX)
+      if jq --slurpfile nf "$_rdm_spliced" '.findings = $nf[0]' "$_rdm_envelope" > "$_rdm_tmp" 2>/dev/null; then
+        mv "$_rdm_tmp" "$_rdm_envelope"
+      else
+        rm -f "$_rdm_tmp"
+      fi
+    else
+      _rdm_tmp=$(mktemp -t clagentic-rdm-env.XXXXXX)
+      if python3 - "$_rdm_envelope" "$_rdm_spliced" "$_rdm_tmp" <<'PYEOF2' 2>/dev/null
+import json, sys
+env_path, spliced_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(env_path) as f:
+        env = json.load(f)
+    with open(spliced_path) as f:
+        spliced = json.load(f)
+    if not isinstance(spliced, list):
+        raise ValueError("not a list")
+    env["findings"] = spliced
+    with open(out_path, "w") as f:
+        json.dump(env, f)
+except Exception:
+    sys.exit(1)
+PYEOF2
+      then
+        mv "$_rdm_tmp" "$_rdm_envelope"
+      else
+        rm -f "$_rdm_tmp"
+      fi
+    fi
+  fi
+
+  if [ "$_rdm_matched_count" -gt 0 ]; then
+    printf '[deferral] %d finding(s) matched a live operator deferral (threshold, not suppression — see clagentic-lite render-review)\n' \
+      "$_rdm_matched_count" 1>&2
+  fi
+  ds_audit_log "review-deferral-match" "pass" \
+    "matched:${_rdm_matched_count}"
+
+  rm -f "$_rdm_live_tsv" "$_rdm_spliced"
+  return 0
+}
+
 # _extract_findings_json FILE — print FILE's .findings array (or "[]" on any
 # failure). jq-then-python3 fallback, matching the pattern used throughout
 # this file (e.g. _cross_round_dedup's own findings extraction) rather than
@@ -1541,6 +1827,14 @@ cmd_review() {
         rm -f "$_crv_prior_seen_snap"
       fi
 
+      # Operator deferral matching (lr-2ebc41): gate-code enforcement of
+      # .clagentic/deferrals.json, independent of cross-round dedup state —
+      # a deferral can match on the very first round a finding is reported,
+      # so this runs unconditionally rather than being nested inside the
+      # CLAGENTIC_CROSS_ROUND_DEDUP gate above. See _review_deferral_match's
+      # own doc comment for the full match-key/lapse/fail-closed rationale.
+      _review_deferral_match "$OUT"
+
       # Aggregate audit row for the merged result.
       _crv_merged_outcome="pass"
       if review_is_degraded "$OUT" 2>/dev/null; then
@@ -1626,6 +1920,12 @@ cmd_review() {
     fi
     rm -f "$_crv_prior_seen_snap"
   fi
+
+  # Operator deferral matching (lr-2ebc41) — see the chunked-path comment
+  # above for the full rationale (same logic, single-pass path). Runs
+  # unconditionally, outside the CLAGENTIC_CROSS_ROUND_DEDUP gate above.
+  _review_deferral_match "$OUT"
+
   rm -f "$_crv_diff_tmp"
 
   # Reject degraded envelopes outright. An LLM wrapper that failed every
@@ -2322,6 +2622,15 @@ severity_blockers() {
   # /ship blocks. A finding without the annotation (feature off, or key
   # uncomputable that round) is counted exactly as before — the exclusion is
   # additive and only ever REDUCES the blocker count, never increases it.
+  #
+  # _deferral_matched exclusion (lr-2ebc41): identical mechanism, second
+  # source. A finding _review_deferral_match annotated with
+  # _deferral_matched: true matched a LIVE (file-hash-verified) operator
+  # deferral and is likewise excluded from this count — see that function's
+  # doc comment for the full match-key/lapse/fail-closed rationale. Composes
+  # additively with the recurrence exclusion above (a finding can be
+  # excluded by either, neither, or in principle both; either annotation
+  # alone is sufficient).
   if command -v jq >/dev/null 2>&1; then
     R=$(jq -r --argjson tr "$TR" '
       def rank(s):
@@ -2331,7 +2640,7 @@ severity_blockers() {
         elif $s == "medium" then 2
         elif $s == "low" then 1
         else 0 end;
-      [(.findings // [])[] | select(rank(.severity) >= $tr and (._recurrence_demoted // false) != true)] | length
+      [(.findings // [])[] | select(rank(.severity) >= $tr and (._recurrence_demoted // false) != true and (._deferral_matched // false) != true)] | length
     ' "$FILE" 2>/dev/null)
     if [ -z "$R" ]; then echo 99; else echo "$R"; fi
   elif command -v python3 >/dev/null 2>&1; then
@@ -2347,6 +2656,7 @@ print(sum(
     1 for f in d.get("findings", [])
     if ranks.get(str(f.get("severity","")).lower(),0) >= tr
     and f.get("_recurrence_demoted") is not True
+    and f.get("_deferral_matched") is not True
 ))
 PY
   else
@@ -2739,18 +3049,157 @@ cmd_render_review() {
     # operator sees WHY a finding that looks blocking-severity did not gate
     # /ship, rather than the demotion being silent. Task constraint (c):
     # "surface the recurrence count in the rendered review output ... so a
-    # repeated bounce is legible to the operator." Findings without the
-    # annotation (feature off, or first report) render exactly as before —
-    # this is purely additive text on the same line.
+    # repeated bounce is legible to the operator." A deferral-matched
+    # finding (lr-2ebc41: _review_deferral_match, gates.sh) gets an
+    # analogous "matched deferral <id>" suffix instead, naming which
+    # .clagentic/deferrals.json entry excluded it — same "threshold, not
+    # suppression, must be legible" posture. Findings without either
+    # annotation (feature off, no match, or first report) render exactly as
+    # before — this is purely additive text on the same line.
     jq -r '"== clagentic-lite review ==\nsummary: " + .summary + "\nfindings: " + (.findings | length | tostring) + "\n",
            (.findings[] | "[" + .severity + "] " + .file + ":" + (.line|tostring) + " " + .message +
              (if ._recurrence_demoted == true
               then " (reported " + (._recurrence_count | tostring) + " rounds running — decide)"
+              else "" end) +
+             (if ._deferral_matched == true
+              then " (matched deferral " + (._deferral_id // "?") + ")"
               else "" end))' \
       "$FILE"
   else
     cat "$FILE"
   fi
+}
+
+# cmd_deferrals_lint [FILE] (lr-2ebc41)
+#
+# Validates .clagentic/deferrals.json (or FILE) against the STRICTER schema
+# _review_deferral_match requires for gate-code (mechanical) matching, and
+# refuses LOUDLY (non-zero exit, one line per problem on stderr) on any
+# entry that claims scope "stable-contract" but is not eligible — comment 3
+# (lr-2ebc41) requires conditional/scope-boundary acceptances to be
+# "explicitly declared unsupported and rejected at capture time rather than
+# silently accepted and mis-honored." This is the capture-time half of that
+# requirement: the Builder is expected to run this (or have it run for
+# them, e.g. from a commit hook or as part of the capture step itself)
+# immediately after writing a deferral entry, so a malformed grant is
+# caught in the SAME turn it was written, not discovered rounds later when
+# it silently fails to match. This does NOT validate the six lr-c567
+# prompt-context fields (category/description/expires/acknowledged_by are
+# all optional and freeform by design) — only the fields the GATE-CODE path
+# depends on: id, file, message, and, when scope=="stable-contract",
+# file_sha256 must also be present and must be a 64-hex-char sha256 digest.
+# An entry with any OTHER scope value (or no scope at all) is left alone —
+# it is not gate-code-eligible and stays purely a prompt-context hint, which
+# is a legitimate, unrestricted, always-valid use of this file (unchanged
+# lr-c567 behavior). Entries that are not JSON objects, or whose id/file/
+# message are missing/blank, are also refused for ANY scope value — a
+# deferral gate code cannot even identify is not useful in either mode.
+#
+# Does NOT compute or write file_sha256 — capture (the Builder, or the
+# operator directly) computes it themselves as part of the SAME edit that
+# adds the entry (sha256sum <file> | cut -d' ' -f1, or the platform.sh
+# _rm_sha256 shim: _rm_sha256 < <file>). This subcommand is a lint gate,
+# not a generator — see docs/GATES.md "Reviewer-consulted deferrals" for
+# why a separate "gates defer" writer subcommand is deliberately NOT
+# provided (lr-2ebc41 comment 1: a subcommand the operator must remember to
+# run is the same failure mode with a shorter path).
+cmd_deferrals_lint() {
+  _cdl_file="${1:-$REPO_ROOT/.clagentic/deferrals.json}"
+  [ -f "$_cdl_file" ] || { echo "[gates/deferrals-lint] no deferrals file at $_cdl_file — nothing to lint" ; return 0; }
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[gates/deferrals-lint] python3 not available — cannot validate; deferrals.json will still fail closed at match time on any malformed entry" 1>&2
+    return 0
+  fi
+
+  python3 - "$_cdl_file" <<'PYEOF'
+import json, re, sys
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        raw = f.read()
+except Exception as e:
+    print("[gates/deferrals-lint] cannot read {}: {}".format(path, e))
+    sys.exit(1)
+
+if not raw.strip():
+    sys.exit(0)
+
+try:
+    data = json.loads(raw)
+except Exception as e:
+    print("[gates/deferrals-lint] {} is not valid JSON: {}".format(path, e))
+    print("[gates/deferrals-lint] the reviewer prompt will still receive it (fail-open, sanitized as opaque text), but NO entry in it can be gate-code-matched until this is fixed")
+    sys.exit(1)
+
+if not isinstance(data, list):
+    print("[gates/deferrals-lint] {} must be a JSON array of deferral objects, got {}".format(path, type(data).__name__))
+    sys.exit(1)
+
+sha_re = re.compile(r'^[0-9a-f]{64}$')
+problems = []
+for i, e in enumerate(data):
+    where = "entry {}".format(i)
+    if not isinstance(e, dict):
+        problems.append("{}: not a JSON object".format(where))
+        continue
+    eid = e.get("id")
+    if isinstance(eid, str) and eid:
+        where = "entry {} (id={!r})".format(i, eid)
+    else:
+        problems.append("{}: missing or empty required field 'id'".format(where))
+
+    # 'file' and 'message' are lr-c567's own optional fields -- an entry
+    # with neither is still a valid, unrestricted, prompt-context-only
+    # deferral (e.g. a category-wide hint with no specific file). They only
+    # become REQUIRED when this entry claims gate-code eligibility via
+    # scope=="stable-contract" below, since gate-code matching keys on
+    # (file, category, message) verbatim and cannot identify a target
+    # without them.
+    scope = e.get("scope")
+    if scope is None:
+        # No scope declared at all -- valid, prompt-context-only entry.
+        # lr-c567 behavior, fully unrestricted. Not an error.
+        continue
+    if scope != "stable-contract":
+        problems.append(
+            "{}: scope={!r} is not a supported gate-code scope (only \"stable-contract\" is). "
+            "REFUSED LOUDLY per design: a conditional or scope-boundary acceptance whose validity "
+            "depends on code OUTSIDE this file (e.g. reset logic living elsewhere) is not safely "
+            "matchable by a single-file content hash -- see docs/GATES.md 'Reviewer-consulted "
+            "deferrals' for why this class is deliberately unsupported rather than silently "
+            "mis-honored. Either remove the 'scope' field (valid prompt-context-only deferral, "
+            "weighed by the model each round, never mechanically matched) or, if this acceptance's "
+            "rationale genuinely depends only on the named file's own content, set scope to "
+            "\"stable-contract\" and provide file/message/file_sha256.".format(where, scope)
+        )
+        continue
+
+    fname = e.get("file")
+    if not (isinstance(fname, str) and fname):
+        problems.append("{}: scope is \"stable-contract\" but 'file' is missing or empty -- required to identify what gate code should re-hash".format(where))
+    message = e.get("message")
+    if not (isinstance(message, str) and message):
+        problems.append("{}: scope is \"stable-contract\" but 'message' is missing or empty -- gate-code matching keys on (file, category, message) verbatim against the Reviewer's own finding text; without it this entry can never be mechanically matched".format(where))
+    fsha = e.get("file_sha256")
+    if not (isinstance(fsha, str) and sha_re.match(fsha)):
+        problems.append(
+            "{}: scope is \"stable-contract\" but file_sha256 is missing or not a 64-hex-char "
+            "sha256 digest -- required for gate-code matching to detect the named file changing "
+            "since this deferral was granted (lapse-on-edit). Compute it from the SAME file this "
+            "entry names: sha256sum <file> | cut -d' ' -f1".format(where)
+        )
+
+if problems:
+    print("[gates/deferrals-lint] {} problem(s) in {}:".format(len(problems), path))
+    for p in problems:
+        print("  - " + p)
+    sys.exit(1)
+
+print("[gates/deferrals-lint] {} entries, no problems".format(len(data)))
+PYEOF
+  return $?
 }
 
 # gate_enabled <name> — returns 0 if the named gate is in CLAGENTIC_GATES,
@@ -3004,11 +3453,12 @@ case "${1:-}" in
   adversarial)    cmd_adversarial ;;
   merge-gate)     shift; cmd_merge_gate "$@" ;;
   render-review)  shift; cmd_render_review "$@" ;;
+  deferrals-lint) shift; cmd_deferrals_lint "$@" ;;
   ship)           cmd_ship ;;
   pre-push)       cmd_pre_push ;;
   log-run)        shift; cmd_log_run "$@" ;;
   digest)         cmd_digest ;;
   status)         shift; cmd_status "$@" ;;
   tail)           shift; cmd_tail "$@" ;;
-  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
 esac
