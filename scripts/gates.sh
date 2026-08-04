@@ -432,12 +432,71 @@ cmd_sast() {
     cmd_log_run sast block "semgrep not installed (fail-closed)"
     return 1
   fi
-  # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
-  if semgrep --config=auto --error --severity=ERROR; then
-    cmd_log_run sast pass ""
+
+  # Baseline scoping: semgrep's native --baseline-commit reports only
+  # findings introduced relative to a given commit, so pre-existing
+  # findings in files the branch never touched no longer block. This is
+  # STRICTLY a narrowing of what blocks, never a widening — every
+  # resolution failure below falls back to the prior full-tree behavior.
+  #
+  # FAIL-CLOSED CONTRACT: if the merge base cannot be confidently resolved
+  # (semgrep too old for --baseline-commit, detached HEAD, on the default
+  # branch itself, shallow clone with the base not fetched, no
+  # origin/<default-branch>), scan the full tree exactly as before. Never
+  # silently narrow to an empty/partial scan on a resolution failure — a
+  # scoping bug must not become a security bypass.
+  _SAST_BASELINE=""
+  _SAST_BASELINE_SKIP_REASON=""
+
+  # Probed via `semgrep scan --help`, not bare `semgrep --help` — modern
+  # semgrep (1.x) is a command group (scan/ci/...) and --baseline-commit is
+  # a `scan` subcommand flag; it does not appear in the top-level help text.
+  if ! semgrep scan --help 2>&1 | grep -q -- '--baseline-commit'; then
+    _SAST_BASELINE_SKIP_REASON="installed semgrep does not support --baseline-commit"
   else
-    cmd_log_run sast block "semgrep reported ERROR-severity findings"
-    return 1
+    _SAST_DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+    _SAST_CURRENT_BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+
+    if [ -z "$_SAST_CURRENT_BRANCH" ] || [ "$_SAST_CURRENT_BRANCH" = "HEAD" ]; then
+      _SAST_BASELINE_SKIP_REASON="detached HEAD — no branch to diff against a base"
+    elif [ "$_SAST_CURRENT_BRANCH" = "$_SAST_DEFAULT_BRANCH" ]; then
+      _SAST_BASELINE_SKIP_REASON="on default branch $_SAST_DEFAULT_BRANCH — nothing to baseline against"
+    else
+      # Fetch the base ref so a fresh/stale clone still resolves it.
+      # Failure here is non-fatal — merge-base resolution below will
+      # simply fail too, and we fall back to full-tree.
+      _git fetch origin "$_SAST_DEFAULT_BRANCH" >/dev/null 2>&1 || true
+
+      if ! _git rev-parse --verify -q "origin/${_SAST_DEFAULT_BRANCH}" >/dev/null 2>&1; then
+        _SAST_BASELINE_SKIP_REASON="origin/${_SAST_DEFAULT_BRANCH} not resolvable (missing remote-tracking ref)"
+      else
+        _SAST_MERGE_BASE=$(_git merge-base "origin/${_SAST_DEFAULT_BRANCH}" HEAD 2>/dev/null || echo "")
+        if [ -z "$_SAST_MERGE_BASE" ]; then
+          _SAST_BASELINE_SKIP_REASON="merge-base resolution failed (shallow clone with base not fetched, or unrelated histories)"
+        else
+          _SAST_BASELINE="$_SAST_MERGE_BASE"
+        fi
+      fi
+    fi
+  fi
+
+  # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
+  if [ -n "$_SAST_BASELINE" ]; then
+    echo "[gates/sast] scoping to diff-introduced findings (baseline-commit=$_SAST_BASELINE)" 1>&2
+    if semgrep --config=auto --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE"; then
+      cmd_log_run sast pass "baseline-commit=$_SAST_BASELINE"
+    else
+      cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE"
+      return 1
+    fi
+  else
+    echo "[gates/sast] full-tree scan (baseline scoping unavailable: $_SAST_BASELINE_SKIP_REASON)" 1>&2
+    if semgrep --config=auto --error --severity=ERROR; then
+      cmd_log_run sast pass "full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"
+    else
+      cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON)"
+      return 1
+    fi
   fi
 }
 

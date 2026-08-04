@@ -337,10 +337,21 @@ Three independent sub-gates run as standard git hooks:
 
 | | |
 |---|---|
-| **Tool** | `semgrep --config=auto --error --severity=ERROR` |
+| **Tool** | `semgrep --config=auto --error --severity=ERROR`, scoped with `--baseline-commit=<merge-base>` when a baseline can be resolved (see below) |
 | **Blocks?** | Yes, on ERROR. `--error` makes semgrep exit non-zero only on ERROR-severity findings; WARNING-and-below findings still print but don't block. |
 | **Override** | `.semgrepignore` at the repo root (natively honored by semgrep — add file paths or rule IDs to suppress); `# nosemgrep: <rule-id> — <reason>` inline in source. |
 | **Missing tool** | Set `CLAGENTIC_ALLOW_MISSING_SEMGREP=1` if semgrep is not installed locally. |
+
+**Baseline scoping (lr-06b87e).** A plain `semgrep --config=auto` with no path argument scans the entire working tree on every run, so pre-existing findings in files the current branch never touched get attributed to that branch and block the gate — a full-tree scan is punished the same as a real regression. `cmd_sast` (`scripts/gates.sh`) narrows this with semgrep's own `--baseline-commit=<ref>`, which reports only findings introduced relative to that commit (semgrep, not clagentic-lite, computes the diff — this correctly follows moved/changed-context findings the way a path-restricted or full-tree-plus-filter approach cannot).
+
+The baseline is `git merge-base origin/<default-branch> HEAD`, resolved fresh each run (`origin/<default-branch>` is fetched first, non-fatally). Baseline scoping activates only when **every** one of these holds:
+
+- The installed semgrep supports `--baseline-commit` (probed via `semgrep --help`, not a version-string parse).
+- `HEAD` is not detached and not on `${CLAGENTIC_DEFAULT_BRANCH}` itself (nothing to baseline a default-branch run against).
+- `origin/<default-branch>` resolves after the fetch.
+- `git merge-base` succeeds and returns a commit (fails on a shallow clone that never fetched the base, or unrelated histories).
+
+**Fail-closed, not fail-narrow.** Any one of the above conditions failing — old semgrep, detached HEAD, on the default branch, unresolvable `origin/<default-branch>`, failed merge-base (including shallow clones) — falls back to the exact prior full-tree `semgrep --config=auto --error --severity=ERROR` behavior, and blocks on whatever it finds. The gate never silently narrows to an empty or partial scan on a resolution failure; a scoping bug degrades to "noisier, but still safe," never to "quietly stops checking." The active mode and, when full-tree, the reason baseline scoping was unavailable are both logged to stderr and the `gate_runs.details` audit column.
 
 Rationale: deterministic tools, well-understood, no LLM in the security path. The LLM-driven `adversarial` layer (Gate 5) is separate and non-blocking by design.
 
