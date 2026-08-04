@@ -49,6 +49,30 @@ What it changes: an `ephemeral` class relaxes the Auditor's blocking threshold f
 
 Do not declare `ephemeral` to get a change through gates faster. The mechanism exists for genuinely one-shot infrastructure, not as a severity-suppression shortcut — a mismatched declaration is visible in the PR's review output and undermines the hint's credibility for the rest of the repo's history.
 
+## Capturing an accepted review finding (lr-2ebc41)
+
+When the operator accepts a Reviewer finding in conversation with a stated rationale ("that's fine, it's an intentional fixture" / "accepted, the contract holds"), **write the deferral in the same turn you act on that acceptance** — the same tool call where you'd otherwise just move on (typically the commit that follows, or your next edit to `.clagentic/deferrals.json` directly). Do not treat "record the deferral" as a separate step to come back to; a step that can be deferred is a step that gets skipped, which is the exact failure this exists to close (field evidence: one finding re-raised six times because nothing was ever written down).
+
+Append an entry to `.clagentic/deferrals.json` (create the file, a JSON array, if absent):
+
+```json
+{
+  "id": "def-<short-slug>",
+  "file": "path/to/file.py",
+  "category": "<the finding's own category, verbatim>",
+  "message": "<the finding's own message, verbatim — this is the match key, it must be byte-identical to what the Reviewer reported>",
+  "description": "<why this was accepted, for a human or the model to read>",
+  "scope": "stable-contract",
+  "file_sha256": "<sha256 of the CURRENT content of `file`>"
+}
+```
+
+Compute `file_sha256` yourself as part of the same edit (`sha256sum <file> | cut -d' ' -f1` or the platform equivalent) — do not guess or omit it. Then run `clagentic-lite gates deferrals-lint` (or `scripts/gates.sh deferrals-lint` from the tool checkout) before finishing the turn; it validates the entry and exits non-zero with a specific reason on anything malformed.
+
+**Only use `scope: "stable-contract"` when the acceptance's validity depends ONLY on the named file's own content** — i.e., if that file is edited at all, the deferral should stop applying, and if it is NOT edited, the deferral should keep applying regardless of what else changes elsewhere in the repo. This is what lets gate code re-verify the deferral mechanically (a hash of the named file, checked at match time) instead of just hoping a stateless model re-derives the same judgment every round.
+
+**If the acceptance's validity depends on code somewhere ELSE** — "this is fine as long as the reset logic over in `other_file.py` stays scoped to X" — do **not** set `scope: "stable-contract"`. Either omit `scope` entirely (the entry still reaches the Reviewer as context to weigh, unchanged from before this feature existed — just not mechanically enforced), or say so explicitly to the operator: this class of acceptance cannot be safely auto-matched by this mechanism, because the file whose hash would need watching is not the file the finding is in. Silently writing a `stable-contract` entry for a conditional acceptance is worse than not writing one — it would tell the gate to stop blocking on a false premise.
+
 ## Coding principles
 
 These apply to all code you produce, regardless of language or repo. They are not suggestions — apply them by default, push back if the user asks you to deviate.

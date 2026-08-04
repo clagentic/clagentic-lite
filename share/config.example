@@ -257,47 +257,65 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # File: .clagentic/deferrals.json in the enrolled repo (gitignored — already
 # under .clagentic/ which gates.sh gitignores, so no extra config needed).
 #
-# When present, every deferral object is first reduced to ONLY the six
+# When present, every deferral object is first reduced to ONLY the nine
 # documented schema fields below — any other key is DROPPED entirely, not
 # forwarded in any form (see _llm_json_array_allowlist_fields in
 # scripts/platform.sh) — then each surviving field is sanitized (control
 # bytes stripped, forged fence-label markers defanged — see
 # _llm_json_array_sanitize_fields, same file) and injected, fenced as data,
-# into the reviewer system prompt before the diff is reviewed. Content and
-# semantics survive (the LLM still uses its judgment to decide whether each
-# deferral still applies — suppression happens inside model reasoning, not
-# in gate code; the gate does NOT post-filter findings based on this file)
-# — only the transport into the prompt is hardened. Treat this file as
-# untrusted, external text even though it is operator-facing: gitignored
-# means untracked and unreviewed, not write-restricted, and an attacker
-# who can write this file could otherwise smuggle an arbitrary extra key
-# (or a non-string value under a real key name) past a sanitizer that only
-# inspects the fields it is told to look at.
+# into the reviewer system prompt before the diff is reviewed.
 #
-# Fail-open: if the file is absent, empty, or unreadable, the review proceeds
-# as if no deferrals exist. The gate never blocks on a missing deferrals file.
+# lr-2ebc41: an entry with scope "stable-contract" and a valid file_sha256
+# is ALSO mechanically re-checked in gate code (severity_blockers(),
+# scripts/gates.sh) after the reviewer responds — matching on (file,
+# category, message) and requiring the named file's current content hash to
+# still equal file_sha256. That check does not depend on the model's
+# compliance: it excludes a matching finding from the block count whether or
+# not the model itself also chose to honor the deferral. An entry WITHOUT
+# scope "stable-contract" behaves exactly as before lr-2ebc41 — suppression
+# happens inside model reasoning only, the gate does not post-filter it.
+# Treat this file as untrusted, external text even though it is
+# operator-facing: gitignored means untracked and unreviewed, not
+# write-restricted, and an attacker who can write this file could otherwise
+# smuggle an arbitrary extra key (or a non-string value under a real key
+# name) past a sanitizer that only inspects the fields it is told to look at.
+#
+# Fail-open (prompt path): if the file is absent, empty, or unreadable, the
+# review proceeds as if no deferrals exist. Fail-closed (gate-code path,
+# lr-2ebc41): anything ambiguous, malformed, or unhashable about a
+# stable-contract entry retains the finding as blocking rather than
+# suppressing it — see docs/GATES.md "Gate-code deferral enforcement".
 #
 # Schema (JSON array):
 # [
 #   {
 #     "id": "def-001",              # stable identifier (required)
 #     "category": "sql",            # finding category this applies to (optional)
-#     "file": "scripts/seed.sh",   # exact path or path glob (optional)
+#     "file": "scripts/seed.sh",    # exact path this applies to (required for gate-code matching)
+#     "message": "...",             # the Reviewer finding's own message, VERBATIM (required for gate-code matching — the match key)
 #     "description": "...",         # human-readable reason (required)
 #     "expires": "2026-12-31",      # ISO date — LLM reasons about expiry; gate does not parse (optional)
-#     "acknowledged_by": "you"      # who approved the deferral (optional)
+#     "acknowledged_by": "you",     # who approved the deferral (optional)
+#     "scope": "stable-contract",   # ONLY supported value for gate-code matching; omit for prompt-context-only (optional)
+#     "file_sha256": "abc123..."    # sha256 of `file`'s content at grant time; required when scope is set (optional otherwise)
 #   }
 # ]
 #
 # The `expires` field is passed verbatim to the LLM. The gate does not compute
 # or enforce expiry dates — the LLM reasons about whether the deferral is still
-# valid given its expiry and the diff under review.
+# valid given its expiry and the diff under review. `expires` is unrelated to
+# the gate-code lapse mechanism, which is `file_sha256` freshness only.
+#
+# Lint an existing file (refuses loudly on a malformed stable-contract entry):
+#   clagentic-lite gates deferrals-lint
 #
 # Deferrals vs. accepted-risks.md:
 #   accepted-risks.md  — architectural risk decisions; read by the merge-gate
 #                        (Gate 6); deterministic gate plumbing post-filters.
 #   deferrals.json     — operator guidance injected into the reviewer prompt
-#                        (Gate 3); suppression is inside LLM judgment, not code.
+#                        (Gate 3); LLM-judgment-only unless scope is
+#                        "stable-contract", in which case gate code also
+#                        mechanically enforces it (lr-2ebc41).
 # No new env var is needed — the feature is always active when the file exists.
 
 # ---------- cross-round finding dedup ----------
