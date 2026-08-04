@@ -445,6 +445,16 @@ cmd_sast() {
   # origin/<default-branch>), scan the full tree exactly as before. Never
   # silently narrow to an empty/partial scan on a resolution failure — a
   # scoping bug must not become a security bypass.
+  #
+  # GOVERNING PRINCIPLE — preserve when uncertain: freshness of the
+  # resolved origin/<default-branch> ref is a PRECONDITION, not an
+  # assumption. A resolution that cannot be shown to be current (fetch
+  # failed, fetch timed out, or the local tracking ref does not match an
+  # independent `git ls-remote` read of the same remote taken in this
+  # run) is uncertain, and uncertain degrades to the full-tree fallback
+  # below — never to a narrower window silently resolved against a stale
+  # ref. See the fetch block below for why "we have some ref" is not
+  # sufficient on its own.
   _SAST_BASELINE=""
   _SAST_BASELINE_SKIP_REASON=""
 
@@ -462,19 +472,75 @@ cmd_sast() {
     elif [ "$_SAST_CURRENT_BRANCH" = "$_SAST_DEFAULT_BRANCH" ]; then
       _SAST_BASELINE_SKIP_REASON="on default branch $_SAST_DEFAULT_BRANCH — nothing to baseline against"
     else
-      # Fetch the base ref so a fresh/stale clone still resolves it.
-      # Failure here is non-fatal — merge-base resolution below will
-      # simply fail too, and we fall back to full-tree.
-      _git fetch origin "$_SAST_DEFAULT_BRANCH" >/dev/null 2>&1 || true
+      # Freshness is a PRECONDITION, not an assumption (security-audit
+      # follow-up to lr-06b87e). The original version of this code treated a
+      # non-fatal fetch failure as harmless on the theory that the later
+      # rev-parse/merge-base would "simply fail too" — but that is false:
+      # if origin/<default-branch> already exists locally from a PRIOR
+      # successful fetch, a fetch failure THIS run leaves that stale
+      # tracking ref in place, and rev-parse/merge-base both succeed
+      # against it. If the default branch was force-pushed/rewritten
+      # upstream since that last successful fetch, the stale ref can
+      # resolve to a merge-base CLOSER TO HEAD than the true one —
+      # silently narrowing the diff-introduced window while reporting a
+      # normal-looking verdict with a plausible baseline-commit=<sha>.
+      # This is a SUCCESSFUL-LOOKING WRONG RESOLUTION, not a failure, so
+      # it slips past every fallback keyed on "did the command error."
+      #
+      # The fix: fetch under a timeout (a blocking security gate must
+      # not hang indefinitely on a stalled network op — DNS timeout, TCP
+      # stall, auth-prompt hang against a private remote; scripts/platform.sh's
+      # DS_TIMEOUT_CMD is the existing mechanism for exactly this, already
+      # used for every LLM CLI invocation in llm-client.sh), and only
+      # trust the fetch as PROVABLY CURRENT when it (a) exits 0 — not
+      # timed out, not any other failure — AND (b) the resulting
+      # origin/<default-branch> tip matches a fresh, independent
+      # `git ls-remote origin <default-branch>` read of the same remote
+      # taken in this same run. (b) is what makes "we have some ref"
+      # insufficient on its own: a fetch can exit 0 against a mirror/cache
+      # that itself served stale data, or race a concurrent rewrite
+      # between the fetch and the later merge-base call. Comparing two
+      # independent reads of the remote tip is the only way to establish
+      # the resolution is current, not merely present.
+      #
+      # A fetch timeout is treated identically to a fetch failure — a
+      # timed-out fetch IS a failed fetch, not a third case.
+      _SAST_FETCH_TIMEOUT="${CLAGENTIC_SAST_FETCH_TIMEOUT_SEC:-30}"
+      case "$_SAST_FETCH_TIMEOUT" in ''|*[!0-9]*) _SAST_FETCH_TIMEOUT=30 ;; esac
 
-      if ! _git rev-parse --verify -q "origin/${_SAST_DEFAULT_BRANCH}" >/dev/null 2>&1; then
+      _SAST_FETCH_OK=0
+      if $DS_TIMEOUT_CMD "$_SAST_FETCH_TIMEOUT" git -C "$REPO_ROOT" fetch origin "$_SAST_DEFAULT_BRANCH" >/dev/null 2>&1; then
+        _SAST_FETCH_OK=1
+      fi
+
+      if [ "$_SAST_FETCH_OK" -ne 1 ]; then
+        _SAST_BASELINE_SKIP_REASON="git fetch origin ${_SAST_DEFAULT_BRANCH} failed or timed out after ${_SAST_FETCH_TIMEOUT}s — cannot establish a provably current baseline"
+      elif ! _git rev-parse --verify -q "origin/${_SAST_DEFAULT_BRANCH}" >/dev/null 2>&1; then
         _SAST_BASELINE_SKIP_REASON="origin/${_SAST_DEFAULT_BRANCH} not resolvable (missing remote-tracking ref)"
       else
-        _SAST_MERGE_BASE=$(_git merge-base "origin/${_SAST_DEFAULT_BRANCH}" HEAD 2>/dev/null || echo "")
-        if [ -z "$_SAST_MERGE_BASE" ]; then
-          _SAST_BASELINE_SKIP_REASON="merge-base resolution failed (shallow clone with base not fetched, or unrelated histories)"
+        # Independent freshness check: compare the just-fetched local
+        # tracking ref against a fresh `git ls-remote` read of the same
+        # branch on the same remote, taken in this run. A mismatch means
+        # the local ref cannot be shown to be current (stale mirror,
+        # cache, or a rewrite racing this run) — degrade to full-tree
+        # rather than trust a resolution we cannot prove is fresh.
+        _SAST_LOCAL_TIP=$(_git rev-parse "origin/${_SAST_DEFAULT_BRANCH}" 2>/dev/null || echo "")
+        _SAST_REMOTE_TIP=""
+        if [ -n "$_SAST_LOCAL_TIP" ]; then
+          _SAST_REMOTE_TIP=$($DS_TIMEOUT_CMD "$_SAST_FETCH_TIMEOUT" git -C "$REPO_ROOT" ls-remote origin "refs/heads/${_SAST_DEFAULT_BRANCH}" 2>/dev/null | awk '{print $1}')
+        fi
+
+        if [ -z "$_SAST_LOCAL_TIP" ] || [ -z "$_SAST_REMOTE_TIP" ]; then
+          _SAST_BASELINE_SKIP_REASON="could not verify origin/${_SAST_DEFAULT_BRANCH} freshness (ls-remote failed or timed out) — resolution not provably current"
+        elif [ "$_SAST_LOCAL_TIP" != "$_SAST_REMOTE_TIP" ]; then
+          _SAST_BASELINE_SKIP_REASON="origin/${_SAST_DEFAULT_BRANCH} (${_SAST_LOCAL_TIP}) does not match remote tip (${_SAST_REMOTE_TIP}) — stale ref, not provably current"
         else
-          _SAST_BASELINE="$_SAST_MERGE_BASE"
+          _SAST_MERGE_BASE=$(_git merge-base "origin/${_SAST_DEFAULT_BRANCH}" HEAD 2>/dev/null || echo "")
+          if [ -z "$_SAST_MERGE_BASE" ]; then
+            _SAST_BASELINE_SKIP_REASON="merge-base resolution failed (shallow clone with base not fetched, or unrelated histories)"
+          else
+            _SAST_BASELINE="$_SAST_MERGE_BASE"
+          fi
         fi
       fi
     fi
