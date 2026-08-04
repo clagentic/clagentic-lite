@@ -211,6 +211,16 @@ CLAGENTIC_ALLOW_MISSING_GITLEAKS=0
 CLAGENTIC_ALLOW_MISSING_OSV=0
 CLAGENTIC_ALLOW_MISSING_SEMGREP=0
 
+# SAST baseline-scoping fetch/freshness timeout (seconds). Bounds both the
+# `git fetch origin <default-branch>` and the `git ls-remote` freshness
+# check cmd_sast uses to resolve a trustworthy --baseline-commit (lr-06b87e).
+# Expiry is treated identically to a fetch failure: falls back to a
+# full-tree semgrep scan, which still blocks on findings. An unreachable
+# remote (offline/air-gapped) always falls back to full-tree regardless of
+# this value -- raising the timeout only helps a fetch that would otherwise
+# eventually succeed.
+CLAGENTIC_SAST_FETCH_TIMEOUT_SEC=30
+
 # Strict preflight: make `clagentic-lite init` exit non-zero if any required
 # tool is missing. Off by default so scripted init runs don't fail spuriously.
 CLAGENTIC_STRICT_PREFLIGHT=0

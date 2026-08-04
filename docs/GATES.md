@@ -337,10 +337,31 @@ Three independent sub-gates run as standard git hooks:
 
 | | |
 |---|---|
-| **Tool** | `semgrep --config=auto --error --severity=ERROR` |
+| **Tool** | `semgrep --config=auto --error --severity=ERROR`, scoped with `--baseline-commit=<merge-base>` when a baseline can be resolved (see below) |
 | **Blocks?** | Yes, on ERROR. `--error` makes semgrep exit non-zero only on ERROR-severity findings; WARNING-and-below findings still print but don't block. |
 | **Override** | `.semgrepignore` at the repo root (natively honored by semgrep — add file paths or rule IDs to suppress); `# nosemgrep: <rule-id> — <reason>` inline in source. |
 | **Missing tool** | Set `CLAGENTIC_ALLOW_MISSING_SEMGREP=1` if semgrep is not installed locally. |
+| **Baseline fetch timeout** | `CLAGENTIC_SAST_FETCH_TIMEOUT_SEC` (default 30). Bounds both the `git fetch` and the `git ls-remote` freshness check used to resolve the baseline commit (see below) — expiry falls back to full-tree, same as any other resolution failure. |
+
+**Baseline scoping (lr-06b87e).** A plain `semgrep --config=auto` with no path argument scans the entire working tree on every run, so pre-existing findings in files the current branch never touched get attributed to that branch and block the gate — a full-tree scan is punished the same as a real regression. `cmd_sast` (`scripts/gates.sh`) narrows this with semgrep's own `--baseline-commit=<ref>`, which reports only findings introduced relative to that commit (semgrep, not clagentic-lite, computes the diff — this correctly follows moved/changed-context findings the way a path-restricted or full-tree-plus-filter approach cannot).
+
+The baseline is `git merge-base origin/<default-branch> HEAD`. Baseline scoping activates only when **every** one of these holds:
+
+- The installed semgrep supports `--baseline-commit` (probed via `semgrep --help`, not a version-string parse).
+- `HEAD` is not detached and not on `${CLAGENTIC_DEFAULT_BRANCH}` itself (nothing to baseline a default-branch run against).
+- `git fetch origin <default-branch>` exits 0 within the configured timeout (see below) — a failed or timed-out fetch is never treated as harmless, because `origin/<default-branch>` may already exist locally from a prior run.
+- The freshly-fetched `origin/<default-branch>` tip matches an independent `git ls-remote origin <default-branch>` read of the same remote, taken in this same run.
+- `git merge-base` succeeds and returns a commit (fails on a shallow clone that never fetched the base, or unrelated histories).
+
+**Freshness is a precondition, not an assumption.** An earlier version of this gate fetched `origin/<default-branch>` non-fatally (`|| true`) on the theory that a fetch failure would simply make the later `merge-base` fail too, falling back safely. That reasoning had a gap: if `origin/<default-branch>` already existed locally from a *prior* successful fetch, this run's fetch failure left that stale tracking ref in place, and `rev-parse`/`merge-base` both succeeded against it anyway. If the default branch had been force-pushed or rewritten upstream since that last successful fetch, the stale ref could resolve to a merge-base *closer to HEAD* than the true one — silently narrowing the diff-introduced window while the gate reported a normal-looking verdict with a plausible `baseline-commit=<sha>` and no visible error. This is a **successful-looking wrong resolution**, not a failure, so it slipped past every fallback keyed on "did the command error."
+
+The fix treats a resolved `origin/<default-branch>` ref as trustworthy only when it is **provably current**: the fetch must exit 0 (not time out, not fail any other way) *and* the resulting local tip must match a fresh, independent `git ls-remote` read of the same remote taken in the same run. "We have some ref" is not sufficient on its own — a fetch can exit 0 against a stale mirror/cache, or race a concurrent upstream rewrite between the fetch and the later `merge-base` call. Comparing two independent reads of the remote tip is what establishes currency rather than mere presence.
+
+**Fetch is time-bounded.** `git fetch` and `git ls-remote` both run under `$DS_TIMEOUT_CMD` (the same portable-timeout mechanism `scripts/llm-client.sh` uses for every LLM CLI call), so a stalled network operation — DNS timeout, TCP stall, an auth prompt hanging against a private remote — cannot hang this blocking security gate indefinitely; `set -e` alone does not bound execution time. The timeout defaults to 30 seconds and is configurable via `CLAGENTIC_SAST_FETCH_TIMEOUT_SEC`. A timed-out fetch is treated identically to a failed fetch — it is not a third case with its own behavior.
+
+**Offline / air-gapped runs.** A repo with no reachable `origin` (or a fetch that consistently times out) falls back to full-tree on every run — this is the correct, intended consequence of the freshness requirement above, not a bug: a gate that cannot prove its baseline is current must not narrow the scan. A slower, full-tree gate is an acceptable outcome; a silently narrowed security gate is not.
+
+**Fail-closed, not fail-narrow.** Any one of the above conditions failing — old semgrep, detached HEAD, on the default branch, a fetch that fails or times out, a resolved ref that disagrees with the independent `ls-remote` freshness check, or a failed merge-base (including shallow clones) — falls back to the exact prior full-tree `semgrep --config=auto --error --severity=ERROR` behavior, and blocks on whatever it finds. The gate never silently narrows to an empty or partial scan on a resolution failure; a scoping bug degrades to "noisier, but still safe," never to "quietly stops checking." The active mode and, when full-tree, the reason baseline scoping was unavailable are both logged to stderr and the `gate_runs.details` audit column.
 
 Rationale: deterministic tools, well-understood, no LLM in the security path. The LLM-driven `adversarial` layer (Gate 5) is separate and non-blocking by design.
 
@@ -579,6 +600,7 @@ CLAGENTIC_TAIL_INTERVAL_SEC=2 scripts/gates.sh tail   # adjust poll interval
 | Gate 4b — deps | Pre-existing CVE you accept | Add the ID to `.clagentic/osv-ignore` (repo) or `~/.config/clagentic/osv-ignore` (global). One ID per line. |
 | Gate 4b — deps | Want to ignore below CRITICAL | Set `CLAGENTIC_OSV_SEVERITY=HIGH` (or `MEDIUM`) in `.clagentic/config`. |
 | Gate 4c — SAST | False-positive semgrep rule | Add the file path to `.semgrepignore`, or add `# nosemgrep: <rule-id> — <reason>` inline. |
+| Gate 4c — SAST | Slow/unreliable network makes the baseline fetch time out, forcing full-tree scans | Set `CLAGENTIC_SAST_FETCH_TIMEOUT_SEC=<seconds>` (default 30) in `.clagentic/config`. A longer timeout only helps if the fetch would otherwise succeed — an unreachable remote still falls back to full-tree regardless of the timeout value, by design. |
 | Gate 2 — bash guard | Legitimate command blocked by a rule | Set `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` in `.clagentic/config`. Multiple rules: comma-separated. Add a comment explaining why in the commit. |
 | Gate 2 — write guard (W-001) | Intentional work on default branch | Set `CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1` in `.clagentic/config`. This is unusual — default-branch protection exists for good reason. |
 | Gate 3 — review | Cross-vendor fallback silently taken | Set `CLAGENTIC_REVIEWER_REQUIRED=1` to make chain failure a hard error. Chain fallback becomes visible in audit trail and the gate blocks rather than emitting a degraded envelope. |

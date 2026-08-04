@@ -432,12 +432,137 @@ cmd_sast() {
     cmd_log_run sast block "semgrep not installed (fail-closed)"
     return 1
   fi
-  # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
-  if semgrep --config=auto --error --severity=ERROR; then
-    cmd_log_run sast pass ""
+
+  # Baseline scoping: semgrep's native --baseline-commit reports only
+  # findings introduced relative to a given commit, so pre-existing
+  # findings in files the branch never touched no longer block. This is
+  # STRICTLY a narrowing of what blocks, never a widening — every
+  # resolution failure below falls back to the prior full-tree behavior.
+  #
+  # FAIL-CLOSED CONTRACT: if the merge base cannot be confidently resolved
+  # (semgrep too old for --baseline-commit, detached HEAD, on the default
+  # branch itself, shallow clone with the base not fetched, no
+  # origin/<default-branch>), scan the full tree exactly as before. Never
+  # silently narrow to an empty/partial scan on a resolution failure — a
+  # scoping bug must not become a security bypass.
+  #
+  # GOVERNING PRINCIPLE — preserve when uncertain: freshness of the
+  # resolved origin/<default-branch> ref is a PRECONDITION, not an
+  # assumption. A resolution that cannot be shown to be current (fetch
+  # failed, fetch timed out, or the local tracking ref does not match an
+  # independent `git ls-remote` read of the same remote taken in this
+  # run) is uncertain, and uncertain degrades to the full-tree fallback
+  # below — never to a narrower window silently resolved against a stale
+  # ref. See the fetch block below for why "we have some ref" is not
+  # sufficient on its own.
+  _SAST_BASELINE=""
+  _SAST_BASELINE_SKIP_REASON=""
+
+  # Probed via `semgrep scan --help`, not bare `semgrep --help` — modern
+  # semgrep (1.x) is a command group (scan/ci/...) and --baseline-commit is
+  # a `scan` subcommand flag; it does not appear in the top-level help text.
+  if ! semgrep scan --help 2>&1 | grep -q -- '--baseline-commit'; then
+    _SAST_BASELINE_SKIP_REASON="installed semgrep does not support --baseline-commit"
   else
-    cmd_log_run sast block "semgrep reported ERROR-severity findings"
-    return 1
+    _SAST_DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+    _SAST_CURRENT_BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+
+    if [ -z "$_SAST_CURRENT_BRANCH" ] || [ "$_SAST_CURRENT_BRANCH" = "HEAD" ]; then
+      _SAST_BASELINE_SKIP_REASON="detached HEAD — no branch to diff against a base"
+    elif [ "$_SAST_CURRENT_BRANCH" = "$_SAST_DEFAULT_BRANCH" ]; then
+      _SAST_BASELINE_SKIP_REASON="on default branch $_SAST_DEFAULT_BRANCH — nothing to baseline against"
+    else
+      # Freshness is a PRECONDITION, not an assumption (security-audit
+      # follow-up to lr-06b87e). The original version of this code treated a
+      # non-fatal fetch failure as harmless on the theory that the later
+      # rev-parse/merge-base would "simply fail too" — but that is false:
+      # if origin/<default-branch> already exists locally from a PRIOR
+      # successful fetch, a fetch failure THIS run leaves that stale
+      # tracking ref in place, and rev-parse/merge-base both succeed
+      # against it. If the default branch was force-pushed/rewritten
+      # upstream since that last successful fetch, the stale ref can
+      # resolve to a merge-base CLOSER TO HEAD than the true one —
+      # silently narrowing the diff-introduced window while reporting a
+      # normal-looking verdict with a plausible baseline-commit=<sha>.
+      # This is a SUCCESSFUL-LOOKING WRONG RESOLUTION, not a failure, so
+      # it slips past every fallback keyed on "did the command error."
+      #
+      # The fix: fetch under a timeout (a blocking security gate must
+      # not hang indefinitely on a stalled network op — DNS timeout, TCP
+      # stall, auth-prompt hang against a private remote; scripts/platform.sh's
+      # DS_TIMEOUT_CMD is the existing mechanism for exactly this, already
+      # used for every LLM CLI invocation in llm-client.sh), and only
+      # trust the fetch as PROVABLY CURRENT when it (a) exits 0 — not
+      # timed out, not any other failure — AND (b) the resulting
+      # origin/<default-branch> tip matches a fresh, independent
+      # `git ls-remote origin <default-branch>` read of the same remote
+      # taken in this same run. (b) is what makes "we have some ref"
+      # insufficient on its own: a fetch can exit 0 against a mirror/cache
+      # that itself served stale data, or race a concurrent rewrite
+      # between the fetch and the later merge-base call. Comparing two
+      # independent reads of the remote tip is the only way to establish
+      # the resolution is current, not merely present.
+      #
+      # A fetch timeout is treated identically to a fetch failure — a
+      # timed-out fetch IS a failed fetch, not a third case.
+      _SAST_FETCH_TIMEOUT="${CLAGENTIC_SAST_FETCH_TIMEOUT_SEC:-30}"
+      case "$_SAST_FETCH_TIMEOUT" in ''|*[!0-9]*) _SAST_FETCH_TIMEOUT=30 ;; esac
+
+      _SAST_FETCH_OK=0
+      if $DS_TIMEOUT_CMD "$_SAST_FETCH_TIMEOUT" git -C "$REPO_ROOT" fetch origin "$_SAST_DEFAULT_BRANCH" >/dev/null 2>&1; then
+        _SAST_FETCH_OK=1
+      fi
+
+      if [ "$_SAST_FETCH_OK" -ne 1 ]; then
+        _SAST_BASELINE_SKIP_REASON="git fetch origin ${_SAST_DEFAULT_BRANCH} failed or timed out after ${_SAST_FETCH_TIMEOUT}s — cannot establish a provably current baseline"
+      elif ! _git rev-parse --verify -q "origin/${_SAST_DEFAULT_BRANCH}" >/dev/null 2>&1; then
+        _SAST_BASELINE_SKIP_REASON="origin/${_SAST_DEFAULT_BRANCH} not resolvable (missing remote-tracking ref)"
+      else
+        # Independent freshness check: compare the just-fetched local
+        # tracking ref against a fresh `git ls-remote` read of the same
+        # branch on the same remote, taken in this run. A mismatch means
+        # the local ref cannot be shown to be current (stale mirror,
+        # cache, or a rewrite racing this run) — degrade to full-tree
+        # rather than trust a resolution we cannot prove is fresh.
+        _SAST_LOCAL_TIP=$(_git rev-parse "origin/${_SAST_DEFAULT_BRANCH}" 2>/dev/null || echo "")
+        _SAST_REMOTE_TIP=""
+        if [ -n "$_SAST_LOCAL_TIP" ]; then
+          _SAST_REMOTE_TIP=$($DS_TIMEOUT_CMD "$_SAST_FETCH_TIMEOUT" git -C "$REPO_ROOT" ls-remote origin "refs/heads/${_SAST_DEFAULT_BRANCH}" 2>/dev/null | awk '{print $1}')
+        fi
+
+        if [ -z "$_SAST_LOCAL_TIP" ] || [ -z "$_SAST_REMOTE_TIP" ]; then
+          _SAST_BASELINE_SKIP_REASON="could not verify origin/${_SAST_DEFAULT_BRANCH} freshness (ls-remote failed or timed out) — resolution not provably current"
+        elif [ "$_SAST_LOCAL_TIP" != "$_SAST_REMOTE_TIP" ]; then
+          _SAST_BASELINE_SKIP_REASON="origin/${_SAST_DEFAULT_BRANCH} (${_SAST_LOCAL_TIP}) does not match remote tip (${_SAST_REMOTE_TIP}) — stale ref, not provably current"
+        else
+          _SAST_MERGE_BASE=$(_git merge-base "origin/${_SAST_DEFAULT_BRANCH}" HEAD 2>/dev/null || echo "")
+          if [ -z "$_SAST_MERGE_BASE" ]; then
+            _SAST_BASELINE_SKIP_REASON="merge-base resolution failed (shallow clone with base not fetched, or unrelated histories)"
+          else
+            _SAST_BASELINE="$_SAST_MERGE_BASE"
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
+  if [ -n "$_SAST_BASELINE" ]; then
+    echo "[gates/sast] scoping to diff-introduced findings (baseline-commit=$_SAST_BASELINE)" 1>&2
+    if semgrep --config=auto --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE"; then
+      cmd_log_run sast pass "baseline-commit=$_SAST_BASELINE"
+    else
+      cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE"
+      return 1
+    fi
+  else
+    echo "[gates/sast] full-tree scan (baseline scoping unavailable: $_SAST_BASELINE_SKIP_REASON)" 1>&2
+    if semgrep --config=auto --error --severity=ERROR; then
+      cmd_log_run sast pass "full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"
+    else
+      cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON)"
+      return 1
+    fi
   fi
 }
 
