@@ -217,6 +217,24 @@ class TestFailClosedFallbacks(unittest.TestCase):
         # Confirm the exact prior invocation shape is preserved byte-for-byte.
         self.assertIn("--config=auto --error --severity=ERROR", argv_lines)
 
+    def _assert_full_tree_fallback_blocks(self, work, extra_env):
+        """The property that makes every fallback reason safe: it must not
+        just be TAKEN, it must still BLOCK on findings, exactly like the
+        prior full-tree behavior. Runs semgrep with exit_code=1 (findings
+        present) and asserts cmd_sast propagates the block. Reuses argv_file
+        already populated by the caller's own exit_code=0 run -- callers
+        invoke this as a second, independent run with a fresh argv file."""
+        argv_file = os.path.join(self._tmp, "argv_block.log")
+        open(argv_file, "w").close()
+        _write_fake_semgrep(self._bin, supports_baseline=True, exit_code=1)
+        result = _run_cmd_sast(work, self._bin, argv_file, extra_env=extra_env)
+        self.assertEqual(result.returncode, 1,
+                          f"fallback reason must still BLOCK on findings: {result.stderr}")
+        self.assertIn("full-tree scan", result.stderr, result.stderr)
+        with open(argv_file) as f:
+            argv_lines = f.read()
+        self.assertNotIn("--baseline-commit", argv_lines)
+
     def test_old_semgrep_without_baseline_support_falls_back(self):
         work = os.path.join(self._tmp, "work")
         _init_repo_with_branch_setup(self._tmp, work)
@@ -264,6 +282,17 @@ class TestFailClosedFallbacks(unittest.TestCase):
         self._assert_full_tree_fallback(result)
         self.assertIn("detached HEAD", result.stderr)
 
+    def test_detached_head_still_blocks(self):
+        work = os.path.join(self._tmp, "work")
+        _init_repo_with_branch_setup(self._tmp, work)
+        env = {**os.environ, **_GIT_ENV}
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, capture_output=True,
+            text=True, cwd=work,
+        ).stdout.strip()
+        subprocess.run(["git", "checkout", "-q", head_sha], check=True, cwd=work, env=env)
+        self._assert_full_tree_fallback_blocks(work, {"CLAGENTIC_DEFAULT_BRANCH": "main"})
+
     def test_on_default_branch_falls_back(self):
         work = os.path.join(self._tmp, "work")
         _init_repo_with_branch_setup(self._tmp, work)
@@ -278,6 +307,13 @@ class TestFailClosedFallbacks(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self._assert_full_tree_fallback(result)
         self.assertIn("on default branch", result.stderr)
+
+    def test_on_default_branch_still_blocks(self):
+        work = os.path.join(self._tmp, "work")
+        _init_repo_with_branch_setup(self._tmp, work)
+        env = {**os.environ, **_GIT_ENV}
+        subprocess.run(["git", "checkout", "-q", "main"], check=True, cwd=work, env=env)
+        self._assert_full_tree_fallback_blocks(work, {"CLAGENTIC_DEFAULT_BRANCH": "main"})
 
     def test_missing_origin_remote_falls_back(self):
         """No 'origin' remote at all (e.g. a local-only repo) must not
@@ -300,7 +336,20 @@ class TestFailClosedFallbacks(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self._assert_full_tree_fallback(result)
-        self.assertIn("not resolvable", result.stderr)
+        self.assertIn("failed or timed out", result.stderr)
+
+    def test_missing_origin_remote_still_blocks(self):
+        work = os.path.join(self._tmp, "work_no_origin")
+        os.makedirs(work)
+        _init_repo(work)
+        env = {**os.environ, **_GIT_ENV}
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=work, env=env)
+        readme = os.path.join(work, "f.txt")
+        with open(readme, "w") as f:
+            f.write("x\n")
+        subprocess.run(["git", "add", "f.txt"], check=True, cwd=work, env=env)
+        subprocess.run(["git", "commit", "-q", "-m", "feature"], check=True, cwd=work, env=env)
+        self._assert_full_tree_fallback_blocks(work, {"CLAGENTIC_DEFAULT_BRANCH": "main"})
 
     def test_shallow_clone_missing_base_falls_back(self):
         """A shallow clone whose fetch of the base ref never pulls in the
@@ -365,6 +414,170 @@ class TestFailClosedFallbacks(unittest.TestCase):
         self.assertIn("merge-base resolution failed", result.stderr,
                        "the skip reason is echoed inline in the full-tree-scan "
                        "notice line, not just logged to the audit DB")
+
+    def test_shallow_clone_missing_base_still_blocks(self):
+        origin = os.path.join(self._tmp, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", origin], check=True)
+        origin_url = "file://" + origin
+
+        seed = os.path.join(self._tmp, "seed")
+        subprocess.run(["git", "clone", "-q", origin_url, seed], check=True)
+        env = {**os.environ, **_GIT_ENV}
+
+        def _commit(name, msg):
+            with open(os.path.join(seed, name), "w") as f:
+                f.write(msg + "\n")
+            subprocess.run(["git", "add", name], check=True, cwd=seed, env=env)
+            subprocess.run(["git", "commit", "-q", "-m", msg], check=True, cwd=seed, env=env)
+
+        _commit("f0.txt", "c0")
+        _commit("f1.txt", "c1")
+        _commit("f2.txt", "c2")
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=seed, env=env)
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=seed, env=env)
+        _commit("feat0.txt", "feat0")
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:feature"], check=True, cwd=seed, env=env)
+        subprocess.run(["git", "checkout", "-q", "main"], check=True, cwd=seed, env=env)
+        _commit("m3.txt", "m3")
+        _commit("m4.txt", "m4")
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=seed, env=env)
+        subprocess.run(["git", "checkout", "-q", "feature"], check=True, cwd=seed, env=env)
+        _commit("feat1.txt", "feat1")
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:feature"], check=True, cwd=seed, env=env)
+
+        work = os.path.join(self._tmp, "shallow_work_block")
+        subprocess.run(
+            ["git", "clone", "-q", "--depth", "1", "--branch", "feature",
+             "--no-single-branch", origin_url, work],
+            check=True,
+        )
+        subprocess.run(["git", "checkout", "-q", "feature"], check=True, cwd=work, env=env)
+        self._assert_full_tree_fallback_blocks(work, {"CLAGENTIC_DEFAULT_BRANCH": "main"})
+
+
+class TestFailClosedFreshness(unittest.TestCase):
+    """lr-06b87e follow-up (security-audit BLOCKING finding 1 and 2): the
+    resolved origin/<default-branch> ref must be PROVABLY CURRENT, not
+    merely present. A fetch failure/timeout, or a local tracking ref that
+    does not match an independent `git ls-remote` read of the same remote,
+    must degrade to full-tree -- never silently resolve against a stale ref
+    that could narrow the diff-introduced window below the true merge-base."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-sast-fresh-")
+        self._bin = os.path.join(self._tmp, "bin")
+        self._argv_file = os.path.join(self._tmp, "argv.log")
+        open(self._argv_file, "w").close()
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _assert_full_tree_fallback(self, result):
+        self.assertIn("full-tree scan", result.stderr, result.stderr)
+        with open(self._argv_file) as f:
+            argv_lines = f.read()
+        self.assertNotIn("--baseline-commit", argv_lines)
+        self.assertIn("--config=auto --error --severity=ERROR", argv_lines)
+
+    def _assert_full_tree_fallback_blocks(self, work, extra_env):
+        argv_file = os.path.join(self._tmp, "argv_block.log")
+        open(argv_file, "w").close()
+        _write_fake_semgrep(self._bin, supports_baseline=True, exit_code=1)
+        result = _run_cmd_sast(work, self._bin, argv_file, extra_env=extra_env)
+        self.assertEqual(result.returncode, 1,
+                          f"fallback reason must still BLOCK on findings: {result.stderr}")
+        self.assertIn("full-tree scan", result.stderr, result.stderr)
+        with open(argv_file) as f:
+            argv_lines = f.read()
+        self.assertNotIn("--baseline-commit", argv_lines)
+
+    def test_fetch_timeout_falls_back_and_still_blocks(self):
+        """A fetch that never returns must not hang a blocking security gate
+        indefinitely (finding 2) -- CLAGENTIC_SAST_FETCH_TIMEOUT_SEC bounds
+        it, and expiry is treated exactly like a fetch failure (finding 1):
+        full-tree fallback, still blocking."""
+        work = os.path.join(self._tmp, "work")
+        _init_repo_with_branch_setup(self._tmp, work)
+
+        # A remote that never answers: point origin at a URL git will hang
+        # dialing (a non-routable TEST-NET-1 address per RFC 5737, so no
+        # real host can ever respond) and set a short timeout so the test
+        # itself does not hang.
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", "git://192.0.2.1/nonexistent.git"],
+            check=True, cwd=work,
+        )
+
+        _write_fake_semgrep(self._bin, supports_baseline=True, exit_code=0)
+        result = _run_cmd_sast(
+            work, self._bin, self._argv_file,
+            extra_env={
+                "CLAGENTIC_DEFAULT_BRANCH": "main",
+                "CLAGENTIC_SAST_FETCH_TIMEOUT_SEC": "2",
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_full_tree_fallback(result)
+        self.assertIn("timed out", result.stderr)
+
+        self._assert_full_tree_fallback_blocks(work, {
+            "CLAGENTIC_DEFAULT_BRANCH": "main",
+            "CLAGENTIC_SAST_FETCH_TIMEOUT_SEC": "2",
+        })
+
+    def _write_git_shim_disagreeing_ls_remote(self, real_git, fake_sha):
+        """Write a `git` shim onto self._bin that transparently forwards
+        every subcommand to the real git binary EXCEPT `ls-remote`, which it
+        answers with a fixed, WRONG sha -- standing in for the remote having
+        moved (force-push/rewrite) between this run's `git fetch` and its
+        `git ls-remote` freshness check, or a mirror/cache serving stale
+        data despite the fetch itself exiting 0. This isolates exactly the
+        mismatch branch cmd_sast must catch, without racing a real
+        concurrent rewrite against a real remote."""
+        os.makedirs(self._bin, exist_ok=True)
+        path = os.path.join(self._bin, "git")
+        with open(path, "w") as f:
+            f.write(textwrap.dedent(f"""\
+                #!/bin/sh
+                # cmd_sast invokes `git -C <repo> ls-remote ...` -- match
+                # ls-remote anywhere in argv, not just as $1, since the -C
+                # flag/path pair precede it.
+                for _arg in "$@"; do
+                  if [ "$_arg" = "ls-remote" ]; then
+                    echo "{fake_sha}	refs/heads/main"
+                    exit 0
+                  fi
+                done
+                exec {real_git} "$@"
+            """))
+        os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+
+    def test_stale_local_ref_falls_back_and_still_blocks(self):
+        """Simulates the exact scenario from the security-audit finding: the
+        fetch exits 0 and origin/<default-branch> resolves to SOME commit,
+        but that commit cannot be shown to be the remote's actual current
+        tip -- here, the freshness check itself (`git ls-remote`) disagrees
+        with the just-fetched local tracking ref. This is the "successful-
+        looking wrong resolution" the fix targets: without the freshness
+        check, cmd_sast would proceed to merge-base and report a plausible
+        baseline-commit against a ref it can never prove is current."""
+        real_git = shutil.which("git")
+        work = os.path.join(self._tmp, "work")
+        _init_repo_with_branch_setup(self._tmp, work)
+
+        fake_sha = "1234567890abcdef1234567890abcdef12345678"
+        self._write_git_shim_disagreeing_ls_remote(real_git, fake_sha)
+
+        _write_fake_semgrep(self._bin, supports_baseline=True, exit_code=0)
+        result = _run_cmd_sast(
+            work, self._bin, self._argv_file,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_full_tree_fallback(result)
+        self.assertIn("not provably current", result.stderr)
+
+        self._assert_full_tree_fallback_blocks(work, {"CLAGENTIC_DEFAULT_BRANCH": "main"})
 
 
 def _init_repo_with_branch_setup(tmp, work):
