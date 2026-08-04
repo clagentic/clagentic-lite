@@ -78,7 +78,9 @@ When an operator has reviewed a finding and decided to defer it — because it i
 a known fixture, an intentional design choice, or a false positive they have
 accepted — they can record that decision in `.clagentic/deferrals.json`. The
 file is read at review time and injected into the reviewer system prompt as
-context before the diff is reviewed.
+context before the diff is reviewed, AND (lr-2ebc41, see "Gate-code
+enforcement" below) is mechanically re-checked in gate code after the
+Reviewer responds, independent of whether the model chose to honor it.
 
 **File location:** `.clagentic/deferrals.json` in the enrolled repo. The
 `.clagentic/` directory is gitignored by the gate orchestrator, so this file is
@@ -94,9 +96,12 @@ committed, audited suppression.
     "id": "def-001",
     "category": "sql",
     "file": "scripts/seed-demo.sh",
+    "message": "hardcoded credential in seed-demo.sh",
     "description": "Planted demo credential — intentional fixture, not production code.",
     "expires": "2026-12-31",
-    "acknowledged_by": "akuehner"
+    "acknowledged_by": "akuehner",
+    "scope": "stable-contract",
+    "file_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   }
 ]
 ```
@@ -107,24 +112,196 @@ Fields:
 |---|---|---|
 | `id` | yes | Stable identifier for the deferral |
 | `category` | no | Finding category this deferral applies to |
-| `file` | no | Exact path or path glob this deferral applies to |
+| `file` | no (yes for gate-code matching) | Exact path this deferral applies to |
+| `message` | no (yes for gate-code matching) | The Reviewer finding's own `message` text, VERBATIM — this is the gate-code match key, see below |
 | `description` | yes | Human-readable reason for the deferral |
 | `expires` | no | ISO date after which the deferral should be reconsidered |
 | `acknowledged_by` | no | Who approved the deferral |
+| `scope` | no (yes for gate-code matching) | Must be the literal string `"stable-contract"` to be gate-code-eligible at all — see "Gate-code enforcement" below. Any other value (or absent) means the entry is prompt-context-only, exactly as this feature behaved before lr-2ebc41. |
+| `file_sha256` | no (yes when `scope` is `"stable-contract"`) | sha256 (64 lowercase hex chars) of `file`'s content at the moment the deferral was granted. Gate code recomputes this at match time; any difference lapses the match. |
 
-**Suppression is inside model judgment, not gate code.** The deferrals file's
-six documented schema fields reach the reviewer system prompt as claims to
-weigh (see "Round-trip sanitization and fencing" below for how the transport
-is hardened — the semantics here are unchanged). The gate does NOT parse
-finding output to post-filter based on deferrals. If the LLM still emits a
-finding despite a deferral entry, the finding stands. This is intentional:
-the LLM is better placed to reason about whether a deferral is still applicable
-than a regex or equality match in shell code.
+lr-c567's original six fields (`id`/`category`/`file`/`description`/
+`expires`/`acknowledged_by`) remain valid on their own — a deferral with only
+those fields is a pure prompt-context hint, unchanged from before lr-2ebc41:
+the model weighs it, nothing mechanically enforces it, and it is never
+gate-code-matched. `message`/`scope`/`file_sha256` are additive fields that
+opt a specific entry into the stricter, mechanically-enforced path described
+next.
+
+**Suppression is inside model judgment for entries without `scope:
+"stable-contract"`; it is ALSO inside gate code for entries with it
+(lr-2ebc41 — see "Gate-code enforcement" below, reversal of lr-c567's
+original design).** All deferral fields still reach the reviewer system
+prompt as claims to weigh regardless of scope (see "Round-trip sanitization
+and fencing" below for how the transport is hardened — the round-trip
+mechanics are unchanged). A finding the LLM still emits despite a
+non-gate-code-eligible deferral entry stands, exactly as before. A finding
+that mechanically matches a live `stable-contract` entry is excluded from
+`severity_blockers()`'s count regardless of whether the model itself also
+honored the deferral — see below.
 
 **`expires` field semantics:** the gate does not parse or compute expiry dates.
 The expiry text is passed to the LLM (sanitized, see below) so the model can
 reason about whether the deferral is still valid given the current context.
-The gate has no date arithmetic.
+The gate has no date arithmetic. This is unchanged by lr-2ebc41's gate-code
+path — `expires` is not part of the mechanical match or lapse conditions;
+`file_sha256` freshness is the sole gate-code lapse mechanism (see below).
+
+### Gate-code deferral enforcement (lr-2ebc41)
+
+**This reverses lr-c567's original "suppression happens inside the LLM's
+judgment ... NOT in gate plumbing computing a score and dropping rows"
+decision, on purpose, for one narrow class of deferral.** Field evidence: on
+a real multi-round run, a single stage-contract finding, accepted with a
+stable documented rationale in round 2, was re-raised by the stateless
+Reviewer in rounds 3, 5, 6 (twice), and 7 — six identical rulings on the
+same accepted finding, because nothing mechanically excluded it once
+accepted; the Reviewer was only ever *asked* to honor the deferral, never
+*required* to. This is the same move this repo has already made twice
+elsewhere for the identical reason: `_parse_adversarial_findings`
+force-corrects a finding's tier in the parser rather than trusting the
+model to set it correctly, and the lr-66e598 close comment records the
+general lesson — "overwrite-on-match is not own-the-field." Deterministic
+enforcement of a model-visible hint is the pattern this codebase has
+converged on twice before lr-2ebc41 made it three.
+
+**What changed, precisely:** a review finding whose `(file, category,
+message)` triple exactly matches a `.clagentic/deferrals.json` entry with
+`scope: "stable-contract"`, AND whose named `file`'s current sha256 exactly
+equals that entry's `file_sha256`, is annotated on the finding object with
+`_deferral_matched: true` and `_deferral_id: "<id>"` by
+`_review_deferral_match` (`scripts/gates.sh`), which runs immediately after
+cross-round dedup and recurrence demotion in `cmd_review`. `severity_blockers()`
+(`scripts/gates.sh`) excludes `_deferral_matched` findings from its block
+count — **threshold only, never suppression**, the identical posture
+`_recurrence_demoted` already established (lr-66e598): the finding remains
+in `.findings`, fully visible in `last-review.json`, in
+`cmd_render_review`'s terminal output (rendered with a `(matched deferral
+<id>)` suffix), and in the audit trail (`gate_runs`, `gate=review-deferral-match`)
+— only its eligibility to gate `/ship` changes. Model compliance with the
+deferral (skipping the finding in its own output) is unaffected by, and
+independent of, this mechanism; either or both can suppress the same
+finding from blocking.
+
+**Match key.** Deliberately NOT `finding_content_keys`' sha256-of-a-±2-line
+diff-context-window key (`scripts/review-merge.sh`) — that key is
+*computed from the lines surrounding the finding*, so an incidental,
+unrelated edit two lines away changes the key and silently breaks the
+match; this is precisely why the original recurrence-only mechanism did not
+catch the six-re-raise case. The key here is the `(file, category,
+message)` triple instead — the same triple `_review_recurrence_demote`
+already uses internally to join a bumped recurrence count back to a
+finding object. It survives incidental line-number drift by construction
+(it never mentions a line number), which is the stability property this
+needs. What it deliberately does **not** distinguish: two genuinely
+different findings that happen to share `file`+`category`+`message` text —
+extremely unlikely for anything but a fixed boilerplate lint message, and
+even then `file` still disambiguates most cases. A finding whose message
+text itself changes between rounds is treated as a NEW finding and
+correctly fails to match — this key does not attempt fuzzy or semantic
+sameness (explicitly out of scope; see "Explicitly out of scope" below).
+
+**Lapse (freshness).** A `(file, category, message)` triple match alone is
+NOT sensitive to the deferred logic changing — a deferral granted against
+one round's behavior in a file would keep matching every later round even
+after that file's logic was rewritten, if the triple were the only check.
+`file_sha256`, pinned to the named file's content at grant time and
+recomputed at match time, closes that gap for the case where the
+deferral's own validity depends only on its own file: any edit anywhere in
+that file, not just near the finding's own line, lapses the match back to
+blocking. This correctly handles a *stable-contract* acceptance (one whose
+rationale is "this holds as long as this file's own contract holds") but is
+a **deliberate, documented restriction**, not a general mechanism: it
+cannot detect a dependency living in a *different* file or region than the
+one the deferral names.
+
+**What this deliberately does not support, and why (the `:139`-class
+problem).** Some accepted findings are not stable-contract acceptances at
+all — they are reasoned *scope boundaries* whose validity depends on code
+living *elsewhere*. Example (field evidence): a finding that a gate
+intentionally does not scan a certain repo shape, accepted with the
+rationale "including them would make an unrelated reset routine clobber
+another scanner's findings, a data-loss bug — that clobber risk is why the
+scope is deliberately narrow." That deferral's truth depends on the reset
+routine staying narrow, and the reset routine lives in a *different file*
+than the finding itself. A single-file content hash cannot see that
+dependency: the named file could stay byte-identical while the real
+dependency changes elsewhere, silently leaving a stale deferral in place
+exactly when it would matter most. Rather than build a mechanism that
+silently mishandles this class (or a general cross-file dependency-graph
+mechanism, which is a materially larger and riskier feature than this task
+scoped), lr-2ebc41 chose a **deliberate, documented restriction**: only
+`scope: "stable-contract"` entries are gate-code-eligible; anything whose
+acceptance rationale depends on code outside its own named file must NOT
+declare that scope. `scripts/gates.sh deferrals-lint` (see below) refuses,
+loudly, at capture time, any entry claiming `stable-contract` scope without
+the fields gate-code matching requires — the goal is that a conditional
+acceptance is either declared correctly (no `scope`, prompt-context-only,
+unchanged from pre-lr-2ebc41 behavior) or rejected outright, never silently
+accepted and mis-honored.
+
+**Fail-closed (the property that matters most).** Any of the following
+retains a finding as blocking, exactly as if no deferral existed at all: no
+`.clagentic/deferrals.json`, or it is empty/malformed; a `deferrals.json`
+entry missing `id`/`file`/`message`; a `stable-contract`-scoped entry
+missing or with a malformed `file_sha256`; the named file missing from disk
+or unreadable; no sha256 tool available; no `python3` available (the splice
+step needs a real JSON encoder/decoder, matching `_review_recurrence_demote`'s
+own python3-only posture); and — the ambiguous case — more than one live
+(hash-matching) deferral entry independently claiming the same `(file,
+category, message)` triple. Over-matching is the dangerous direction (a
+deferral bug silencing a real high/critical finding); under-matching only
+costs an operator a redundant re-report, never a missed real issue. "Wrong
+suppressions are worse than missed dedups" (above) is the same governing
+principle applied here.
+
+**Capture-time linting: `clagentic-lite gates deferrals-lint [FILE]`.**
+Validates `.clagentic/deferrals.json` (or `FILE`) against the stricter
+gate-code schema and exits non-zero with one specific reason per problem on
+stderr — most importantly, it refuses any entry that declares `scope:
+"stable-contract"` without the fields required to make that scope
+meaningful (`id`/`file`/`message`/`file_sha256`), which is the mechanical
+half of "reject a conditional acceptance loudly at capture time" (the
+prose half — recognizing that an acceptance's rationale is conditional on
+code elsewhere — is not something shell code can verify and remains the
+capturing agent's judgment call; see `plugins/clagentic-lite/agents/builder.md`
+"Capturing an accepted review finding"). This is a **lint gate, not a
+generator** — it does not write, create, or compute anything, including
+`file_sha256` itself (the capturing agent computes that from the same file
+it is deferring, in the same edit that adds the entry — see "Why there is
+no `defer` writer subcommand" below). It is not wired into `gates ship`'s
+blocking sequence; it is meant to be run by the capturing agent (or a
+commit hook, at the operator's option) immediately after writing an entry,
+so a malformed grant is caught in the same turn it was written rather than
+discovered rounds later when it silently never matches.
+
+**Why there is no `gates defer` (or similar) writer subcommand.** This was
+evaluated and deliberately rejected. The task's own framing: "capture must
+be a byproduct of the acceptance, not a separate act — if accepting a
+finding is one step and recording it is another, the second step is the
+one that gets skipped, and that is precisely the observed six-re-raise
+failure. A `defer` subcommand the operator must remember to run is the same
+failure mode with a shorter path, not a fix." There is also no interactive
+prompt loop anywhere in this codebase's review path (`cmd_review` /
+`cmd_render_review` are pure batch CLI — see their own code) for a
+subcommand to hook into as a true byproduct of the act of accepting; the
+actual acceptance happens in a Claude Code conversation between the
+operator and the Builder (or the operator directly), entirely outside any
+process boundary `gates.sh` can observe. The closest thing this codebase
+already has to "capture a verbal acceptance as a byproduct of the same
+turn" is the Builder's existing tech-debt-trailer convention (`builder.md`
+§ "When these principles conflict with the user's request," step 3: "If
+the user explicitly accepts the shortcut, note it in the commit message ...
+so it is findable later") — lr-2ebc41 extends that exact pattern to review
+findings: the Builder writes the deferral entry in the same turn it acts on
+the operator's acceptance, not as a queued follow-up. This is honestly
+still "ask an LLM to write something down," which is the thing the task
+explicitly wants to move away from — but it is the most deterministic
+capture point that exists given no mechanically-observable acceptance
+event exists in this codebase's architecture. The mechanism this task
+requires to be genuinely deterministic is Half 2 (gate-code matching,
+above): whether or not capture happens reliably, a well-formed entry is
+enforced by shell code, not by asking the Reviewer to comply.
 
 **Fail-open:** if `.clagentic/deferrals.json` is absent or empty, the review
 runs as if no deferrals exist. The gate never blocks on a missing deferrals
@@ -152,8 +329,9 @@ does not just confuse the Reviewer, it can silence it.
 this order:
 
 1. **Allowlist** — `_llm_json_array_allowlist_fields` (`scripts/platform.sh`)
-   reduces every deferral object to ONLY the six documented schema fields
-   (`id`/`category`/`file`/`description`/`expires`/`acknowledged_by`).
+   reduces every deferral object to ONLY the nine documented schema fields
+   (`id`/`category`/`file`/`message`/`description`/`expires`/`acknowledged_by`/
+   `scope`/`file_sha256`, extended from the original six by lr-2ebc41).
    Any other key is DROPPED entirely, not sanitized-and-kept — an
    unrecognized key has no defined meaning to the Reviewer. A known field
    name holding a non-string value (a nested object or array) is also
@@ -174,11 +352,14 @@ unchanged — safe for the adversarial-findings caller (its field set is
 fixed by `_parse_adversarial_findings`' own regex capture groups; an
 attacker cannot introduce a key at all) but unsafe for deferrals, which
 reads an arbitrary JSON object off disk. The first version of this fix
-sanitized only the six named fields without first reducing the object to
-that schema — any extra key an attacker added rode through byte-identical,
-undefanged, unstripped, uncapped. The allowlist step closes that gap by
-running BEFORE sanitization, so there is no seventh field left for the
-sanitizer to have skipped.
+sanitized only the six original named fields without first reducing the
+object to that schema — any extra key an attacker added rode through
+byte-identical, undefanged, unstripped, uncapped. The allowlist step closes
+that gap by running BEFORE sanitization, so there is no unlisted field left
+for the sanitizer to have skipped, and the same discipline extends to the
+three fields lr-2ebc41 added (`message`/`scope`/`file_sha256`) — they are
+allowlisted and sanitized exactly like the original six, whether or not
+they end up mechanically matched by gate code.
 
 The result is wrapped in a `===BEGIN/END DEFERRED FINDINGS DATA===` fence
 with the same treat-as-data framing the invariants and change-class-hint
@@ -198,12 +379,14 @@ coverage.
 
 | Mechanism | Location | Read by | Suppression path |
 |---|---|---|---|
-| `deferrals.json` | `.clagentic/deferrals.json` (gitignored) | Gate 3 reviewer prompt | LLM judgment |
+| `deferrals.json`, no `scope` or `scope` != `"stable-contract"` | `.clagentic/deferrals.json` (gitignored) | Gate 3 reviewer prompt | LLM judgment only |
+| `deferrals.json`, `scope: "stable-contract"` | `.clagentic/deferrals.json` (gitignored) | Gate 3 reviewer prompt AND `severity_blockers()` gate code | LLM judgment (advisory) AND mechanical file-hash match (authoritative — see "Gate-code deferral enforcement" above) |
 | `accepted-risks.md` | `.clagentic/accepted-risks.md` (committed) | Gate 6 merge-gate | Gate plumbing reads the doc; merge-gate LLM classifies covered findings as acknowledged |
 
-Use deferrals for local, ephemeral, or per-session suppression guidance. Use
-`accepted-risks.md` for committed, audited architectural decisions that persist
-in the repo history.
+Use deferrals for local, ephemeral, or per-session suppression guidance —
+`scope: "stable-contract"` entries additionally get mechanical enforcement
+independent of model compliance. Use `accepted-risks.md` for committed,
+audited architectural decisions that persist in the repo history.
 
 ### Cross-round finding dedup (opt-in)
 
