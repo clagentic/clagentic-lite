@@ -213,13 +213,17 @@ class TestEveryInvokeFunctionPropagatesExitStatus(unittest.TestCase):
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def test_sweep_discovers_at_least_the_known_carriers(self):
-        """Sanity check on the discovery mechanism itself: the known carriers
-        must be found by the grep-based sweep, so a change to the function
-        signature convention (e.g. renaming invoke_claude) is caught here
-        rather than silently shrinking the sweep to zero coverage."""
+    def test_sweep_discovers_every_carrier_it_knows_how_to_call(self):
+        """Sanity check on the discovery mechanism itself: every carrier this
+        sweep knows how to call (_INVOKE_CALL_SHAPES, the sweep's own call-
+        shape registry -- NOT a separately hardcoded name literal, so a
+        rename can't silently desync the two) must actually be found by the
+        grep-based discovery. This catches a change to the function
+        signature convention (e.g. `invoke_claude() {` no longer matching
+        the discovery pattern) rather than silently shrinking the sweep to
+        zero coverage, without hardcoding names that go stale on rename."""
         found = set(_discover_invoke_functions())
-        for expected in ("invoke_claude", "invoke_codex", "invoke_generic"):
+        for expected in _INVOKE_CALL_SHAPES:
             self.assertIn(expected, found, f"sweep failed to discover {expected}")
 
     def test_every_invoke_function_propagates_injected_exit_status(self):
@@ -244,6 +248,25 @@ class TestEveryInvokeFunctionPropagatesExitStatus(unittest.TestCase):
         self.assertEqual(r.returncode, 124,
                           f"invoke_claude must propagate a forced-timeout (124) status, "
                           f"not silently succeed. stderr={r.stderr!r}")
+
+    def test_a_renamed_carrier_fails_loudly_instead_of_silently_dropping_out(self):
+        """Proves the rename-blindness the pre-fold-in hardcoded sanity
+        check had: with a hardcoded literal tuple, renaming invoke_claude ->
+        invoke_claude_v2 in llm-client.sh would silently DROP the renamed
+        carrier from that check's coverage (the literal string
+        "invoke_claude" simply stops matching a name that no longer exists;
+        the assertion never fires because nothing asserts the NEW name is
+        present). Here: a discovered function name absent from
+        _INVOKE_CALL_SHAPES (simulating exactly that rename, since the
+        registry would not yet have been updated) must trip _run_invoke's
+        own assertIsNotNone trip-wire loudly, not pass silently."""
+        renamed = "invoke_claude_renamed_for_test"
+        self.assertNotIn(
+            renamed, _INVOKE_CALL_SHAPES,
+            "fixture name collides with a real registry entry -- pick another",
+        )
+        with self.assertRaises(AssertionError):
+            self._run_invoke(renamed, 124)
 
 
 if __name__ == "__main__":
