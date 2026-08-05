@@ -495,7 +495,8 @@ The Reviewer never has write tools. The Builder never sees its own review pre-gr
 
 ## Gate 4 — Local security scan
 
-Three independent sub-gates run as standard git hooks:
+Three independent sub-gates run as standard git hooks, plus a fourth
+change-scoped pattern scan (internal-bleed):
 
 ### 4a. Secrets (pre-commit)
 
@@ -547,6 +548,25 @@ The fix treats a resolved `origin/<default-branch>` ref as trustworthy only when
 **Fail-closed, not fail-narrow.** Any one of the above conditions failing — old semgrep, detached HEAD, on the default branch, a fetch that fails or times out, a resolved ref that disagrees with the independent `ls-remote` freshness check, or a failed merge-base (including shallow clones) — falls back to the exact prior full-tree `semgrep --config=auto --error --severity=ERROR` behavior, and blocks on whatever it finds. The gate never silently narrows to an empty or partial scan on a resolution failure; a scoping bug degrades to "noisier, but still safe," never to "quietly stops checking." The active mode and, when full-tree, the reason baseline scoping was unavailable are both logged to stderr and the `gate_runs.details` audit column.
 
 Rationale: deterministic tools, well-understood, no LLM in the security path. The LLM-driven `adversarial` layer (Gate 5) is separate and non-blocking by design.
+
+### 4d. Internal-bleed scan
+
+| | |
+|---|---|
+| **Fires** | `scripts/gates.sh bleed`; part of `gates ship`'s blocking sequence |
+| **Tool** | `grep -lIf` against a change-scoped file set, using a repo- or user-supplied pattern file |
+| **Blocks?** | Yes, on any pattern match. Opt-in: skips non-blocking when no pattern file is configured. |
+| **Pattern file** | `.clagentic/bleed-patterns` (repo-level, checked first) or `~/.config/clagentic/bleed-patterns` (global). BRE, one pattern per line; `#` comments and blank lines ignored. |
+| **Exclusions** | `.clagentic-bleed-ignore` (repo root, one path-substring per line); `.git/` and `.clagentic/` are always excluded. |
+| **Full-scan escape hatch** | `scripts/gates.sh bleed --full-scan`, or automatic whenever a change-scoped resolution can't be established (see below). |
+
+**Scoping (lr-caebc5).** This gate used to run `git ls-files` against the whole repo on every invocation — every tracked file, every run, with no relation to what changed. The three sibling gates already scope to the change under review (secrets: staged diff or branch history, above; SAST: merge-base baseline, above; merge-gate: staged diff or branch diff, below) — bleed was the outlier. It now follows the identical fallback ladder `cmd_secrets` uses:
+
+1. Staged files (`git diff --cached --name-only`), when the index is non-empty.
+2. Otherwise, the current branch's diff against `origin/${CLAGENTIC_DEFAULT_BRANCH}` (default `main`), when a usable branch baseline exists (not detached HEAD, not on the default branch itself, `origin/<default-branch>` resolvable).
+3. Otherwise (fresh repo, no staged changes and no usable branch baseline, or first run), full tree — this is the fallback path, not the default.
+
+A pattern-file change is also detected and forces a full scan regardless of the above: a newly added or edited pattern can match content in files the current diff never touches, so treating a pattern-file edit like any other narrow diff would risk silently missing an old, already-committed hit the new pattern is meant to catch. `--full-scan` is available as an explicit override for the same reason. Deletions in a diff-scoped file list are skipped (nothing left to grep); the active scope and the reason full-tree was used, when applicable, are both logged to stderr and the `gate_runs.details` audit column.
 
 ## Gate 5 — Adversarial pass
 
@@ -717,6 +737,18 @@ As a second, independent layer, `ds_adversarial_prompt` (`scripts/llm-client.sh`
 | **Unparseable decision** | Also blocks — schema-invalid merge-gate output is treated as a gate failure, not a pass. |
 
 The Merge Gate is the last LLM check before the PR is opened. It never overrides the deterministic security gates (those already gated upstream) and never adds its own findings — it reads the structured outputs of every prior gate and returns a single approve/refuse decision.
+
+**State-identity cache — no re-prompt on an unchanged state (lr-caebc5).** Gate results previously carried no notion of which commit/tree state they validated, only the mtimes of `last-review.json`/`last-adversarial.md`. Any incidental mtime change — a checkout, a stash, an editor save with no content change, or simply re-running `gates ship`/`gates merge-gate` again in the same session — was indistinguishable from a real change, so the Merge Gate re-ran, and re-prompted the operator, every time (`--recheck`'s SHA-staleness guard, above, closed one symptom of this but not the underlying gap: the non-`--recheck` path never checked whether it had already reached a verdict for the current state at all).
+
+`cmd_merge_gate` now computes a **state identity** — `<HEAD SHA>:<content hash>` — before doing anything else:
+
+- The content hash is `sha256(git diff HEAD + git status --porcelain)`, using the same `_rm_sha256` shim `dedup_findings`/`_review_deferral_match` already use for content-not-timestamp fingerprinting (`scripts/review-merge.sh`). `git diff HEAD` captures staged and unstaged changes to tracked files; `git status --porcelain` captures untracked files. Neither reads a file's mtime.
+- A commit SHA alone would be insufficient: a dirty working tree is the normal state while iterating, not an edge case, and two dirty trees on the same commit can differ. The content hash makes a dirty tree representable as its own distinct, cacheable state.
+- Every `pass` merge-gate audit row is stamped with `[state=<identity>]` in `gate_runs.details` (visible via `gates.sh status`/`gates.sh tail`, per Gate 6's own audit convention). Before doing any work, `cmd_merge_gate` looks up the most recent `merge-gate`/`merge-gate recheck` row; if its outcome is `pass` and its stamped state identity matches the current one, the invocation is a no-op — it reports the cached pass (from `last-merge-gate.json` if present) and returns without calling the LLM, without touching `gate-summary.json`, and without any new prompt to the operator.
+- Only a stored **pass** short-circuits. A stored `refuse` never does — a real refusal always requires the operator to act (fix the code, or re-run after a real change), so it is never silently bypassed by invoking `gates merge-gate` again.
+- mtime is never an input to this check anywhere in the codepath — only `git diff`/`git status --porcelain` content and `git rev-parse HEAD`.
+
+This closes the operator-facing complaint directly: run the gate to a pass, re-run with no content changes, and the second (and any subsequent) invocation reports the cached pass with zero LLM calls and zero new prompts.
 
 **Adversarial findings gate here on `tier`, not on severity alone (lr-e2b975).** Only `tier: "blocking"` adversarial findings (reachable, high/critical severity, and not excused by an ephemeral change class — see Gate 5 "Blocking vs advisory" and "Change class") are eligible to refuse the merge. `tier: "advisory"` findings — including real, correctly-severity-rated ones that are simply unreachable, lower severity, or class-downgraded — never gate `/ship` on their own; they are noted in the Merge Gate's `reason` text and remain fully visible in `last-adversarial.md`, `last-adversarial-findings.json`, and the audit trail. This is a threshold change, never suppression.
 
