@@ -84,6 +84,85 @@ cmd_log_run() {
     "INSERT INTO gate_runs (ts, gate, outcome, details, branch) VALUES ('$TS', '$GATE_ESC', '$OUT_ESC', '$DETAILS_ESC', '$BRANCH_ESC');"
 }
 
+# _gate_resolve_fresh_default_branch_ref DEFAULT_BRANCH TIMEOUT_SEC
+#
+# Resolves `origin/<DEFAULT_BRANCH>` and prints it to stdout ONLY when it can
+# be shown to be PROVABLY CURRENT, not merely present. Any caller that scopes
+# a security gate to a diff against the default branch (cmd_sast's
+# --baseline-commit, cmd_bleed's branch-diff file-set) needs this same
+# precondition — see below for why "we have some ref" is not enough on its
+# own.
+#
+# GOVERNING PRINCIPLE (security-audit follow-up to lr-06b87e, generalized
+# under lr-caebc5's bleed follow-up so cmd_bleed does not grow a second,
+# parallel freshness check): freshness of a resolved origin/<default-branch>
+# ref is a PRECONDITION, not an assumption. A non-fatal `git fetch` on the
+# theory that a failure "would simply make the later resolution fail too" is
+# false — if origin/<default-branch> already exists locally from a PRIOR
+# successful fetch, a fetch failure THIS run leaves that stale tracking ref
+# in place, and the later resolution succeeds against it anyway. If the
+# default branch was force-pushed/rewritten upstream since that last
+# successful fetch, the stale ref can resolve CLOSER TO HEAD than the true
+# tip — silently narrowing a diff-scoped window while the caller reports a
+# normal-looking verdict with a plausible-looking ref. This is a
+# SUCCESSFUL-LOOKING WRONG RESOLUTION, not a failure, so it slips past any
+# fallback keyed on "did the command error."
+#
+# The fix: fetch under a timeout (a blocking security gate must not hang
+# indefinitely on a stalled network op), and only trust the fetch as
+# PROVABLY CURRENT when it (a) exits 0 — not timed out, not any other
+# failure — AND (b) the resulting origin/<default-branch> tip matches a
+# fresh, independent `git ls-remote origin <default-branch>` read of the same
+# remote taken in this same run. (b) is what makes "we have some ref"
+# insufficient on its own: a fetch can exit 0 against a mirror/cache that
+# itself served stale data, or race a concurrent rewrite between the fetch
+# and the later resolution. Comparing two independent reads of the remote tip
+# is the only way to establish the resolution is current, not merely
+# present. A fetch timeout is treated identically to a fetch failure — a
+# timed-out fetch IS a failed fetch, not a third case.
+#
+# Args: DEFAULT_BRANCH (branch name, e.g. "main"), TIMEOUT_SEC (seconds,
+# already validated numeric by the caller).
+# stdout: the verified-current origin/<DEFAULT_BRANCH> SHA on success.
+# stderr: empty on success; a one-line reason on any failure path.
+# Exit: 0 with a SHA on stdout when provably current; 1 with nothing on
+# stdout otherwise. Callers must check the exit status, not just emptiness
+# of stdout, to distinguish "no ref at all" from other failures if they ever
+# need to (current callers only need pass/fail + the reason on stderr).
+_gate_resolve_fresh_default_branch_ref() {
+  _gfdbr_branch="$1"
+  _gfdbr_timeout="$2"
+
+  if ! $DS_TIMEOUT_CMD "$_gfdbr_timeout" git -C "$REPO_ROOT" fetch origin "$_gfdbr_branch" >/dev/null 2>&1; then
+    echo "git fetch origin ${_gfdbr_branch} failed or timed out after ${_gfdbr_timeout}s — cannot establish a provably current baseline" 1>&2
+    return 1
+  fi
+
+  if ! _git rev-parse --verify -q "origin/${_gfdbr_branch}" >/dev/null 2>&1; then
+    echo "origin/${_gfdbr_branch} not resolvable (missing remote-tracking ref)" 1>&2
+    return 1
+  fi
+
+  _gfdbr_local_tip=$(_git rev-parse "origin/${_gfdbr_branch}" 2>/dev/null || echo "")
+  _gfdbr_remote_tip=""
+  if [ -n "$_gfdbr_local_tip" ]; then
+    _gfdbr_remote_tip=$($DS_TIMEOUT_CMD "$_gfdbr_timeout" git -C "$REPO_ROOT" ls-remote origin "refs/heads/${_gfdbr_branch}" 2>/dev/null | awk '{print $1}')
+  fi
+
+  if [ -z "$_gfdbr_local_tip" ] || [ -z "$_gfdbr_remote_tip" ]; then
+    echo "could not verify origin/${_gfdbr_branch} freshness (ls-remote failed or timed out) — resolution not provably current" 1>&2
+    return 1
+  fi
+
+  if [ "$_gfdbr_local_tip" != "$_gfdbr_remote_tip" ]; then
+    echo "origin/${_gfdbr_branch} (${_gfdbr_local_tip}) does not match remote tip (${_gfdbr_remote_tip}) — stale ref, not provably current" 1>&2
+    return 1
+  fi
+
+  printf '%s\n' "$_gfdbr_local_tip"
+  return 0
+}
+
 cmd_secrets() {
   if ! command -v gitleaks >/dev/null 2>&1; then
     # FAIL CLOSED. AGENTS.md §4 contract: local tools own the security gate.
@@ -335,8 +414,8 @@ PY
 }
 
 cmd_bleed() {
-  # Internal-bleed scan: grep committed tracked files for patterns loaded from
-  # a user-supplied pattern file. Patterns are BRE (grep -f), one per line;
+  # Internal-bleed scan: grep the changed-file set for patterns loaded from a
+  # user-supplied pattern file. Patterns are BRE (grep -f), one per line;
   # lines starting with # and blank lines are ignored.
   #
   # Pattern file resolution (first found wins):
@@ -346,6 +425,35 @@ cmd_bleed() {
   # If neither exists, the gate skips non-blocking with a warning — the gate
   # is opt-in via pattern config, not fail-closed on missing config.
   # Project-level exclusions: .clagentic-bleed-ignore (one path-substring per line).
+  #
+  # SCOPE (lr-caebc5): this gate used to run `git ls-files` against the whole
+  # repo on every invocation — every tracked file, every run, regardless of
+  # what changed. Sibling gates already scope to the change under review
+  # (secrets: staged diff / branch history at :110; sast: merge-base baseline
+  # at :588; merge-gate: staged diff / branch diff further below). Bleed now
+  # follows the same precedent: staged files when the index is non-empty,
+  # else the current branch's diff against a PROVABLY CURRENT
+  # origin/<default-branch>, else full tree — full-tree is the fallback
+  # path, not the default, and stays reachable via --full-scan or
+  # automatically whenever a change-scoped resolution can't be established
+  # (fresh repo, no baseline, detached HEAD, a branch baseline that cannot
+  # be verified current, or the pattern file itself changed — a
+  # pattern-file edit can turn an old, already-committed hit newly
+  # relevant, so it forces a full scan).
+  #
+  # NOT the same fallback cmd_secrets uses (BOBBIE, lr-caebc5 follow-up):
+  # cmd_secrets' feature-branch fallback (:110-134) scans local branch
+  # HISTORY and never diffs against a remote ref. The branch-diff step here
+  # instead resolves and diffs against origin/<default-branch> — the same
+  # shape as cmd_sast's --baseline-commit mechanism (:588), including its
+  # freshness precondition (_gate_resolve_fresh_default_branch_ref, :88).
+  # See docs/GATES.md Gate 4d for the full writeup.
+  _BLEED_FULL_SCAN=0
+  for _bleed_arg in "$@"; do
+    case "$_bleed_arg" in
+      --full-scan) _BLEED_FULL_SCAN=1 ;;
+    esac
+  done
 
   _BLEED_PAT_FILE=""
   if [ -f "${CLAGENTIC_PROJECT_ROOT:-$PWD}/.clagentic/bleed-patterns" ]; then
@@ -370,13 +478,100 @@ cmd_bleed() {
     return 0
   fi
 
-  # Collect tracked file list; warn but don't block if git fails.
-  _BLEED_FILES=$(git -C "$REPO_ROOT" ls-files 2>/dev/null) || {
-    rm -f "$_BLEED_TMP"
-    echo "[gates/bleed] git ls-files failed — skipping" 1>&2
-    cmd_log_run bleed pass "git ls-files failed (non-blocking)"
-    return 0
-  }
+  # Determine the file-set scope. Same fallback ladder as cmd_secrets
+  # (:110-116): staged diff first, else branch diff against the default
+  # branch when there is nothing staged, else full tree when neither can be
+  # established or --full-scan was requested.
+  _BLEED_DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+  _BLEED_SCOPE_REASON=""
+  _BLEED_FILES=""
+
+  # A pattern-file change makes any prior full-scan history relevant again
+  # (a newly added pattern could match content in files the current diff
+  # never touches) — force full scan rather than silently narrowing.
+  _BLEED_PAT_FILE_REL=${_BLEED_PAT_FILE#"$REPO_ROOT"/}
+  if [ "$_BLEED_FULL_SCAN" != "1" ]; then
+    _BLEED_STAGED_CHECK=$(_git diff --cached --name-only 2>/dev/null || true)
+    if printf '%s\n' "$_BLEED_STAGED_CHECK" | grep -qF "$_BLEED_PAT_FILE_REL" 2>/dev/null; then
+      _BLEED_FULL_SCAN=1
+      _BLEED_SCOPE_REASON="pattern file changed in this diff"
+    fi
+  fi
+
+  if [ "$_BLEED_FULL_SCAN" = "1" ]; then
+    [ -z "$_BLEED_SCOPE_REASON" ] && _BLEED_SCOPE_REASON="--full-scan requested"
+    _BLEED_FILES=$(git -C "$REPO_ROOT" ls-files 2>/dev/null) || {
+      rm -f "$_BLEED_TMP"
+      echo "[gates/bleed] git ls-files failed — skipping" 1>&2
+      cmd_log_run bleed pass "git ls-files failed (non-blocking)"
+      return 0
+    }
+    echo "[gates/bleed] full-tree scan ($_BLEED_SCOPE_REASON)" 1>&2
+  else
+    _BLEED_STAGED=$(_git diff --cached --name-only 2>/dev/null || true)
+    if [ -n "$_BLEED_STAGED" ]; then
+      _BLEED_FILES="$_BLEED_STAGED"
+      _BLEED_SCOPE_REASON="staged diff"
+    else
+      _BLEED_CURRENT_BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+      if [ -n "$_BLEED_CURRENT_BRANCH" ] && [ "$_BLEED_CURRENT_BRANCH" != "HEAD" ] && [ "$_BLEED_CURRENT_BRANCH" != "$_BLEED_DEFAULT_BRANCH" ]; then
+        # FRESHNESS IS A PRECONDITION, NOT AN ASSUMPTION (BOBBIE, lr-caebc5
+        # follow-up to lr-06b87e). This scope used to trust a bare
+        # `git rev-parse --verify origin/<default-branch>` — present-but-
+        # stale is a SUCCESSFUL-LOOKING WRONG RESOLUTION: it exits 0,
+        # produces a plausible file set, and silently narrows the scan on a
+        # long-lived clone that was fetched once and never refreshed. A
+        # secret-bleed pattern committed to the default branch afterward is
+        # then invisible to this scope, and the gate reports an
+        # authoritative-looking clean pass. Delegate to the same
+        # provably-current fetch+ls-remote check cmd_sast uses
+        # (_gate_resolve_fresh_default_branch_ref, :88-164) rather than
+        # inventing a second mechanism — reuse first (AGENTS.md code-craft
+        # rule 2).
+        #
+        # NOTE ON PARITY: this is NOT "the same fallback cmd_secrets uses"
+        # (cmd_secrets' feature-branch fallback, :110-116, scans local
+        # branch HISTORY and never diffs against a remote ref at all). The
+        # actual precedent for a remote-ref-diff scope is cmd_sast's
+        # baseline-commit mechanism (:588-663) — see docs/GATES.md.
+        _BLEED_FETCH_TIMEOUT="${CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC:-30}"
+        case "$_BLEED_FETCH_TIMEOUT" in ''|*[!0-9]*) _BLEED_FETCH_TIMEOUT=30 ;; esac
+
+        _BLEED_FRESH_ERR_TMP=$(mktemp -t clagentic-bleed-fresh-err.XXXXXX)
+        _BLEED_FRESH_TIP=$(_gate_resolve_fresh_default_branch_ref "$_BLEED_DEFAULT_BRANCH" "$_BLEED_FETCH_TIMEOUT" 2>"$_BLEED_FRESH_ERR_TMP") || true
+        _BLEED_FRESH_ERR=$(cat "$_BLEED_FRESH_ERR_TMP" 2>/dev/null || echo "")
+        rm -f "$_BLEED_FRESH_ERR_TMP"
+
+        if [ -n "$_BLEED_FRESH_TIP" ]; then
+          _BLEED_FILES=$(_git diff "${_BLEED_FRESH_TIP}...HEAD" --name-only 2>/dev/null || true)
+          _BLEED_SCOPE_REASON="branch diff vs origin/${_BLEED_DEFAULT_BRANCH}"
+        else
+          # Unverifiable/stale baseline: fail toward MORE coverage, never
+          # less. Narrowing requires a positively-verified fresh baseline —
+          # a resolution we cannot prove is current degrades straight to
+          # full-tree, exactly like cmd_sast, rather than silently scanning
+          # nothing or trusting a possibly-stale ref.
+          echo "[gates/bleed] branch baseline not provably current ($_BLEED_FRESH_ERR) — falling back to full-tree scan" 1>&2
+        fi
+      fi
+      # Nothing staged, no usable branch baseline (detached HEAD, on the
+      # default branch itself, no origin/<default-branch> ref, or the
+      # branch baseline could not be shown to be provably current — fresh
+      # repo, first run, or a stale/unfetched remote-tracking ref): fall
+      # back to a full scan rather than silently scanning nothing or
+      # trusting an unverified baseline.
+      if [ -z "$_BLEED_FILES" ] && [ -z "$_BLEED_SCOPE_REASON" ]; then
+        _BLEED_FILES=$(git -C "$REPO_ROOT" ls-files 2>/dev/null) || {
+          rm -f "$_BLEED_TMP"
+          echo "[gates/bleed] git ls-files failed — skipping" 1>&2
+          cmd_log_run bleed pass "git ls-files failed (non-blocking)"
+          return 0
+        }
+        _BLEED_SCOPE_REASON="full-tree fallback (no staged changes, no usable branch baseline)"
+      fi
+    fi
+    echo "[gates/bleed] scanning $_BLEED_SCOPE_REASON" 1>&2
+  fi
 
   # Always exclude .git/ and .clagentic/ (binary DBs, pattern files).
   _BLEED_FILES=$(printf '%s\n' "$_BLEED_FILES" \
@@ -384,7 +579,7 @@ cmd_bleed() {
 
   if [ -z "$_BLEED_FILES" ]; then
     rm -f "$_BLEED_TMP"
-    cmd_log_run bleed pass "no files to scan"
+    cmd_log_run bleed pass "no files to scan ($_BLEED_SCOPE_REASON)"
     return 0
   fi
 
@@ -399,7 +594,18 @@ cmd_bleed() {
 
   if [ -z "$_BLEED_FILES" ]; then
     rm -f "$_BLEED_TMP"
-    cmd_log_run bleed pass "all files excluded"
+    cmd_log_run bleed pass "all files excluded ($_BLEED_SCOPE_REASON)"
+    return 0
+  fi
+
+  # Only scan files that still exist in the working tree (a diff-scoped list
+  # can include deletions, which have nothing left to grep).
+  _BLEED_FILES=$(printf '%s\n' "$_BLEED_FILES" \
+    | while IFS= read -r _bf; do [ -f "$REPO_ROOT/$_bf" ] && printf '%s\n' "$_bf"; done)
+
+  if [ -z "$_BLEED_FILES" ]; then
+    rm -f "$_BLEED_TMP"
+    cmd_log_run bleed pass "no existing files to scan ($_BLEED_SCOPE_REASON)"
     return 0
   fi
 
@@ -417,7 +623,7 @@ cmd_bleed() {
   fi
 
   echo "[gates/bleed] clean"
-  cmd_log_run bleed pass "no bleed patterns found"
+  cmd_log_run bleed pass "no bleed patterns found ($_BLEED_SCOPE_REASON)"
   return 0
 }
 
@@ -472,75 +678,29 @@ cmd_sast() {
     elif [ "$_SAST_CURRENT_BRANCH" = "$_SAST_DEFAULT_BRANCH" ]; then
       _SAST_BASELINE_SKIP_REASON="on default branch $_SAST_DEFAULT_BRANCH — nothing to baseline against"
     else
-      # Freshness is a PRECONDITION, not an assumption (security-audit
-      # follow-up to lr-06b87e). The original version of this code treated a
-      # non-fatal fetch failure as harmless on the theory that the later
-      # rev-parse/merge-base would "simply fail too" — but that is false:
-      # if origin/<default-branch> already exists locally from a PRIOR
-      # successful fetch, a fetch failure THIS run leaves that stale
-      # tracking ref in place, and rev-parse/merge-base both succeed
-      # against it. If the default branch was force-pushed/rewritten
-      # upstream since that last successful fetch, the stale ref can
-      # resolve to a merge-base CLOSER TO HEAD than the true one —
-      # silently narrowing the diff-introduced window while reporting a
-      # normal-looking verdict with a plausible baseline-commit=<sha>.
-      # This is a SUCCESSFUL-LOOKING WRONG RESOLUTION, not a failure, so
-      # it slips past every fallback keyed on "did the command error."
-      #
-      # The fix: fetch under a timeout (a blocking security gate must
-      # not hang indefinitely on a stalled network op — DNS timeout, TCP
-      # stall, auth-prompt hang against a private remote; scripts/platform.sh's
-      # DS_TIMEOUT_CMD is the existing mechanism for exactly this, already
-      # used for every LLM CLI invocation in llm-client.sh), and only
-      # trust the fetch as PROVABLY CURRENT when it (a) exits 0 — not
-      # timed out, not any other failure — AND (b) the resulting
-      # origin/<default-branch> tip matches a fresh, independent
-      # `git ls-remote origin <default-branch>` read of the same remote
-      # taken in this same run. (b) is what makes "we have some ref"
-      # insufficient on its own: a fetch can exit 0 against a mirror/cache
-      # that itself served stale data, or race a concurrent rewrite
-      # between the fetch and the later merge-base call. Comparing two
-      # independent reads of the remote tip is the only way to establish
-      # the resolution is current, not merely present.
-      #
-      # A fetch timeout is treated identically to a fetch failure — a
-      # timed-out fetch IS a failed fetch, not a third case.
+      # Freshness resolution delegates to _gate_resolve_fresh_default_branch_ref
+      # (:88-164) — the shared PROVABLY-CURRENT fetch+ls-remote check every
+      # gate that diffs against origin/<default-branch> must use. See that
+      # function's own docstring for the full rationale (security-audit
+      # follow-up to lr-06b87e); this call site only adds the merge-base
+      # step, which is specific to semgrep's --baseline-commit and not part
+      # of the shared freshness precondition itself.
       _SAST_FETCH_TIMEOUT="${CLAGENTIC_SAST_FETCH_TIMEOUT_SEC:-30}"
       case "$_SAST_FETCH_TIMEOUT" in ''|*[!0-9]*) _SAST_FETCH_TIMEOUT=30 ;; esac
 
-      _SAST_FETCH_OK=0
-      if $DS_TIMEOUT_CMD "$_SAST_FETCH_TIMEOUT" git -C "$REPO_ROOT" fetch origin "$_SAST_DEFAULT_BRANCH" >/dev/null 2>&1; then
-        _SAST_FETCH_OK=1
-      fi
+      _SAST_FRESH_ERR_TMP=$(mktemp -t clagentic-sast-fresh-err.XXXXXX)
+      _SAST_FRESH_TIP=$(_gate_resolve_fresh_default_branch_ref "$_SAST_DEFAULT_BRANCH" "$_SAST_FETCH_TIMEOUT" 2>"$_SAST_FRESH_ERR_TMP") || true
+      _SAST_FRESH_ERR=$(cat "$_SAST_FRESH_ERR_TMP" 2>/dev/null || echo "")
+      rm -f "$_SAST_FRESH_ERR_TMP"
 
-      if [ "$_SAST_FETCH_OK" -ne 1 ]; then
-        _SAST_BASELINE_SKIP_REASON="git fetch origin ${_SAST_DEFAULT_BRANCH} failed or timed out after ${_SAST_FETCH_TIMEOUT}s — cannot establish a provably current baseline"
-      elif ! _git rev-parse --verify -q "origin/${_SAST_DEFAULT_BRANCH}" >/dev/null 2>&1; then
-        _SAST_BASELINE_SKIP_REASON="origin/${_SAST_DEFAULT_BRANCH} not resolvable (missing remote-tracking ref)"
+      if [ -z "$_SAST_FRESH_TIP" ]; then
+        _SAST_BASELINE_SKIP_REASON="$_SAST_FRESH_ERR"
       else
-        # Independent freshness check: compare the just-fetched local
-        # tracking ref against a fresh `git ls-remote` read of the same
-        # branch on the same remote, taken in this run. A mismatch means
-        # the local ref cannot be shown to be current (stale mirror,
-        # cache, or a rewrite racing this run) — degrade to full-tree
-        # rather than trust a resolution we cannot prove is fresh.
-        _SAST_LOCAL_TIP=$(_git rev-parse "origin/${_SAST_DEFAULT_BRANCH}" 2>/dev/null || echo "")
-        _SAST_REMOTE_TIP=""
-        if [ -n "$_SAST_LOCAL_TIP" ]; then
-          _SAST_REMOTE_TIP=$($DS_TIMEOUT_CMD "$_SAST_FETCH_TIMEOUT" git -C "$REPO_ROOT" ls-remote origin "refs/heads/${_SAST_DEFAULT_BRANCH}" 2>/dev/null | awk '{print $1}')
-        fi
-
-        if [ -z "$_SAST_LOCAL_TIP" ] || [ -z "$_SAST_REMOTE_TIP" ]; then
-          _SAST_BASELINE_SKIP_REASON="could not verify origin/${_SAST_DEFAULT_BRANCH} freshness (ls-remote failed or timed out) — resolution not provably current"
-        elif [ "$_SAST_LOCAL_TIP" != "$_SAST_REMOTE_TIP" ]; then
-          _SAST_BASELINE_SKIP_REASON="origin/${_SAST_DEFAULT_BRANCH} (${_SAST_LOCAL_TIP}) does not match remote tip (${_SAST_REMOTE_TIP}) — stale ref, not provably current"
+        _SAST_MERGE_BASE=$(_git merge-base "origin/${_SAST_DEFAULT_BRANCH}" HEAD 2>/dev/null || echo "")
+        if [ -z "$_SAST_MERGE_BASE" ]; then
+          _SAST_BASELINE_SKIP_REASON="merge-base resolution failed (shallow clone with base not fetched, or unrelated histories)"
         else
-          _SAST_MERGE_BASE=$(_git merge-base "origin/${_SAST_DEFAULT_BRANCH}" HEAD 2>/dev/null || echo "")
-          if [ -z "$_SAST_MERGE_BASE" ]; then
-            _SAST_BASELINE_SKIP_REASON="merge-base resolution failed (shallow clone with base not fetched, or unrelated histories)"
-          else
-            _SAST_BASELINE="$_SAST_MERGE_BASE"
-          fi
+          _SAST_BASELINE="$_SAST_MERGE_BASE"
         fi
       fi
     fi
@@ -2377,6 +2537,42 @@ cmd_adversarial() {
   cat "$OUT"
 }
 
+# _mg_state_identity — print "<HEAD-SHA>:<content-hash>" for the current
+# working tree, or empty if REPO_ROOT is not (provably) a git repo.
+#
+# ROOT CAUSE (lr-caebc5): gate results previously carried no notion of which
+# commit/tree state they validated, only the file mtimes of gate output
+# files (last-review.json, last-adversarial.md). Any incidental mtime change
+# — a checkout, a stash, an editor save with no content change, a re-run in
+# the same session — looked indistinguishable from a real change, so the
+# merge-gate re-ran (and re-prompted the operator) every time. mtime is not
+# a reliable proxy for "did anything change."
+#
+# The commit SHA alone is also insufficient: a dirty working tree (staged or
+# unstaged edits not yet committed) is the NORMAL state while iterating, not
+# an edge case, and two dirty trees on the same HEAD can differ. So the
+# identity is HEAD SHA plus a content hash of the in-scope diff:
+#   - `git diff HEAD` captures staged AND unstaged changes to tracked files
+#     relative to HEAD (empty string on a clean tree).
+#   - `git status --porcelain` captures untracked files (added test/data
+#     files git diff would not otherwise reflect) without depending on any
+#     file's mtime — porcelain output is derived from content/index state.
+# Both are hashed together via the existing _rm_sha256 shim (review-merge.sh)
+# used by dedup_findings/_review_deferral_match for the exact same
+# fingerprint-content-not-timestamps reason. Symlink/toplevel canonicalization
+# mirrors the --recheck guard above (same REPO_ROOT ambiguity applies here).
+_mg_state_identity() {
+  _mgsi_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
+  _mgsi_git_toplevel=$(_git rev-parse --show-toplevel 2>/dev/null || echo "")
+  if [ "$_mgsi_git_toplevel" != "$_mgsi_repo_root_canon" ]; then
+    return 0
+  fi
+  _mgsi_head=$(_git rev-parse HEAD 2>/dev/null || echo "")
+  [ -n "$_mgsi_head" ] || return 0
+  _mgsi_content_hash=$( { _git diff HEAD 2>/dev/null; _git status --porcelain 2>/dev/null; } | _rm_sha256)
+  printf '%s:%s' "$_mgsi_head" "$_mgsi_content_hash"
+}
+
 cmd_merge_gate() {
   # Final LLM sanity check: feed gate outputs back through the merge-gate
   # role, which decides approve/refuse. BLOCKING BY DEFAULT — set
@@ -2395,6 +2591,39 @@ cmd_merge_gate() {
 
   IN="$REPO_ROOT/.clagentic/lite/gate-summary.json"
   OUT="$REPO_ROOT/.clagentic/lite/last-merge-gate.json"
+
+  # STATE-IDENTITY CACHE (lr-caebc5): if the current commit+content state
+  # already has a recorded PASS in the audit trail, this invocation is a
+  # no-op — report the cached pass and return without calling the LLM or
+  # touching last-merge-gate.json. This is what stops repeated re-prompts on
+  # unchanged content: a re-run for the same state is now provably a repeat
+  # of work already done, not a fresh judgment call. Only a stored PASS
+  # short-circuits; a stored refuse never does, so a real refusal is never
+  # silently bypassed by re-running gates merge-gate again.
+  _mg_state_id=$(_mg_state_identity)
+  if [ -n "$_mg_state_id" ]; then
+    _mg_cached=$(sqlite3 -separator '|' "$AUDIT_DB" \
+      "SELECT outcome, details FROM gate_runs
+       WHERE gate IN ('merge-gate','merge-gate recheck')
+       ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
+    if [ -n "$_mg_cached" ]; then
+      _mg_cached_outcome=${_mg_cached%%|*}
+      _mg_cached_details=${_mg_cached#*|}
+      case "$_mg_cached_details" in
+        *"[state=${_mg_state_id}]"*)
+          if [ "$_mg_cached_outcome" = "pass" ]; then
+            printf '[gates/merge-gate] already passed for this exact commit+content state — no-op (state=%s)\n' "$_mg_state_id" 1>&2
+            if [ -f "$OUT" ]; then
+              cat "$OUT"
+            else
+              printf '{"decision": "approve", "reason": "cached pass for unchanged state %s"}\n' "$_mg_state_id"
+            fi
+            return 0
+          fi
+          ;;
+      esac
+    fi
+  fi
 
   if [ "$_mg_recheck" = "1" ]; then
     # Recheck path: gate-summary.json must already exist.
@@ -2533,6 +2762,17 @@ except Exception:
     _mg_class_suffix=" [class=$_mg_class downgraded=$_mg_class_downgraded]"
   fi
 
+  # Recompute the state identity right before logging (not reused from the
+  # cache-check above): the LLM call/build_gate_summary happened in between,
+  # and stamping the identity actually current at decision time is what
+  # makes the next invocation's cache lookup correct, even in the unlikely
+  # case the tree changed mid-run.
+  _mg_state_id_now=$(_mg_state_identity)
+  _mg_state_suffix=""
+  if [ -n "$_mg_state_id_now" ]; then
+    _mg_state_suffix=" [state=${_mg_state_id_now}]"
+  fi
+
   DECISION=""
   if command -v jq >/dev/null 2>&1; then
     DECISION=$(jq -r '.decision // "unknown"' "$OUT" 2>/dev/null)
@@ -2563,9 +2803,9 @@ print("; ".join(parts))
         fi
       fi
       if [ "${ACK_COUNT:-0}" -gt 0 ]; then
-        cmd_log_run "$_mg_gate_name" pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL$_mg_class_suffix"
+        cmd_log_run "$_mg_gate_name" pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL$_mg_class_suffix$_mg_state_suffix"
       else
-        cmd_log_run "$_mg_gate_name" pass "approve$_mg_class_suffix"
+        cmd_log_run "$_mg_gate_name" pass "approve$_mg_class_suffix$_mg_state_suffix"
       fi
       ;;
     refuse)
@@ -3445,7 +3685,7 @@ cmd_tail() {
 
 case "${1:-}" in
   init)           cmd_init ;;
-  bleed)          cmd_bleed ;;
+  bleed)          shift; cmd_bleed "$@" ;;
   secrets)        cmd_secrets ;;
   deps)           cmd_deps ;;
   sast)           cmd_sast ;;
@@ -3460,5 +3700,5 @@ case "${1:-}" in
   digest)         cmd_digest ;;
   status)         shift; cmd_status "$@" ;;
   tail)           shift; cmd_tail "$@" ;;
-  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+  *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
 esac
