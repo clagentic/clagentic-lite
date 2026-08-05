@@ -222,7 +222,50 @@ cmd_recall() {
 
 cmd_summarize_turn() {
   # Pipe stdin through the Summarizer role-call wrapper, then log-turn.
-  SUMMARY=$("$TOOL_HOME/scripts/llm-client.sh" summarize | head -c 200)
+  #
+  # STATUS-CHECKED + DEGRADED-CHECKED (lr-7047bf, INV-1b, fold-in): this was
+  # the fifth, unwired consumer of walk_chain's outcome channel — the exact
+  # defect class this task exists to close, hiding in the one file the
+  # gates.sh-scoped sweep (test_llm_client_consumer_sweep.py) could not see.
+  # walk_chain now returns 3 whenever it emits a degraded envelope
+  # (llm-client.sh:1461-1468, 1557-1571), and llm-client.sh's cmd_summarize
+  # now propagates that status as its own exit status (fixed alongside this
+  # site — it used to be lost on a `walk_chain | head -c 200; echo` pipeline,
+  # whose reported status was always echo's, i.e. always 0). Capturing the
+  # status directly on the call here (`|| _szt_status=$?`, no pipe after the
+  # command substitution) is what makes that status observable at all.
+  #
+  # walk_chain's summarizer role has TWO distinct emit_degraded-adjacent
+  # outcomes, and they must not be conflated:
+  #   - no chain configured at all: a deliberate, silent, exempted no-op
+  #     (walk_chain returns 0, empty stdout) — established by
+  #     test_walk_chain_degraded_status.py
+  #     ::test_summarizer_role_with_no_chain_still_returns_0. This remains a
+  #     silent skip; an unconfigured summarizer must not start "failing".
+  #   - a chain IS configured and every step failed: walk_chain returns 3
+  #     and writes a non-empty "[clagentic-lite degraded] ..." line
+  #     (emit_degraded, line mode). Previously this line was indistinguishable
+  #     from a real summary — non-empty, so the old empty-string guard below
+  #     did not fire, and the degraded banner was truncated to 200 chars and
+  #     written into the turns table via cmd_log_turn as a FABRICATED SUMMARY,
+  #     polluting session memory and lore recall with an infra-failure banner
+  #     disguised as real content.
+  #
+  # Decision: on a genuine degraded chain, do NOT write to the turns table —
+  # a missing summary is correct, a fabricated one is not — and log the
+  # failure to stderr so it is visible without being written to persistent
+  # memory. This mirrors the "surfaced, not silent; not written as data"
+  # posture gates.sh uses for its own degraded consumers. The status check
+  # (-eq 3) is the primary signal; the text-marker check is defense in depth
+  # only, for the (currently theoretical, since cmd_summarize now propagates
+  # status faithfully) case of a caller path that loses the status but still
+  # sees the payload.
+  _szt_status=0
+  SUMMARY=$("$TOOL_HOME/scripts/llm-client.sh" summarize) || _szt_status=$?
+  if [ "$_szt_status" -eq 3 ] || printf '%s' "$SUMMARY" | grep -qF '[clagentic-lite degraded]'; then
+    echo "memory.sh summarize-turn: summarizer chain degraded (status=$_szt_status), skipping — not writing a fabricated summary" 1>&2
+    exit 0
+  fi
   [ -z "$SUMMARY" ] && { echo "memory.sh summarize-turn: empty summary, skipping" 1>&2; exit 0; }
   TAGS=$(printf '%s' "$SUMMARY" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]' ' ' | tr ' ' '\n' | \
     awk 'length($0) >= 4 && !/^(this|that|with|from|have|will|what|when|where|which|should|would|could|about|into|been|being|some|then|than|over|under|done|made|note|like|just|also|here|there|their|them)$/' | \

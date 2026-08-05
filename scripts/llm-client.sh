@@ -1575,8 +1575,26 @@ walk_chain() {
 }
 
 # Degraded envelopes — valid output shapes the caller can still parse.
-# The "degraded": true field is the load-bearing marker: gates.sh treats
-# it as a fail-closed condition rather than "0 findings = clean review."
+# The "degraded": true field is the load-bearing marker for json mode:
+# gates.sh treats it as a fail-closed condition rather than "0 findings =
+# clean review."
+#
+# UNFORGEABLE PREFIX (BOBBIE finding 1, lr-7047bf fold-in): line and markdown
+# mode previously relied on plain text ("[clagentic-lite degraded] " / "#
+# Degraded output") as the sole detection marker (_llm_output_is_degraded,
+# gates.sh). That text is indistinguishable from text a model could be
+# prompt-injected into emitting — a crafted diff could coax the Auditor into
+# opening its response with the exact banner text, misclassifying a real,
+# clean audit as degraded (over-cautious direction only: emit_degraded's
+# OWN output is never model-generated, so a genuine degraded envelope can
+# never be hidden this way — hence a nit, not blocking). DEGRADED_MARKER is
+# a literal ASCII SOH control byte (0x01, unprintable): it can never appear in a JSON
+# string per RFC 8259, and no realistic Builder/Reviewer/Auditor/Gate CLI
+# response stream writes raw control bytes, since mainstream model providers strip/reject them before token generation. The detector matches on the exact byte, not on
+# any text a model's tokenizer could produce. This is the marker being made
+# distinguishable from anything the model can emit, not merely "harder to
+# guess" — the fix Finding 1 asked for.
+DEGRADED_MARKER=$(printf '\001')
 emit_degraded() {
   MODE="$1"; REASON="$2"
   case "$MODE" in
@@ -1591,11 +1609,11 @@ emit_degraded() {
 EOF
       ;;
     line)
-      echo "[clagentic-lite degraded] $REASON"
+      printf '%s[clagentic-lite degraded] %s\n' "$DEGRADED_MARKER" "$REASON"
       ;;
     markdown|*)
+      printf '%s# Degraded output\n\n' "$DEGRADED_MARKER"
       cat <<EOF
-# Degraded output
 
 clagentic-lite role-call wrapper could not produce a real response: $REASON.
 
@@ -1615,7 +1633,23 @@ EOF
 # Stdin: user instruction (free text). Stdout: builder output (diff or prose).
 cmd_build()       { walk_chain builder    markdown ds_build_prompt; }
 cmd_review()      { walk_chain reviewer   json     ds_review_prompt; }
-cmd_summarize()   { walk_chain summarizer line     ds_summarize_prompt | head -c 200; echo; }
+# STATUS-PRESERVED (lr-7047bf, INV-1b, fold-in): a bare `walk_chain … | head
+# -c 200; echo` pipeline reports the exit status of the LAST command in the
+# pipeline (echo, always 0) — never walk_chain's. That made walk_chain's
+# status-3 degraded signal (the polarity flip this task landed) invisible to
+# every caller of `llm-client.sh summarize` from the moment it left this
+# process, regardless of what the caller itself checked. Capture the real
+# status explicitly and propagate it as this subcommand's own exit status so
+# `llm-client.sh summarize`'s exit code is a faithful proxy for walk_chain's,
+# exactly like every other cmd_* subcommand here (none of which pipe
+# walk_chain's output through another command).
+cmd_summarize() {
+  _cs_status=0
+  _cs_out=$(walk_chain summarizer line ds_summarize_prompt) || _cs_status=$?
+  printf '%s' "$_cs_out" | head -c 200
+  echo
+  return "$_cs_status"
+}
 cmd_adversarial() { walk_chain auditor    markdown ds_adversarial_prompt; }
 cmd_merge_gate()  { walk_chain gate       json     ds_merge_gate_prompt; }
 

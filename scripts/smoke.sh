@@ -123,6 +123,16 @@ if [ "$MODE" != "--quick" ]; then
   if [ "${CLAGENTIC_SMOKE_NO_LLM:-0}" = "1" ]; then
     OUT='{"findings":[],"summary":"smoke-test stub","degraded":false}'
   else
+    # Manual smoke probe, not a gate-enforcement consumer (lr-7047bf widened
+    # sweep, test_llm_client_consumer_sweep.py): the JSON-shape assertions
+    # immediately below already treat a degraded envelope as legitimate
+    # output to validate (still valid, parseable JSON with a .findings
+    # key), and step 5e below separately, explicitly exercises
+    # review_is_degraded against both a degraded and a clean envelope.
+    # Discarding the exit status here is deliberate: this step's job is
+    # "does llm-client.sh review still produce parseable output", not "did
+    # this particular invocation degrade" -- the latter is covered by 5e.
+    # llm-client-sweep-exempt: manual smoke probe validated for JSON shape only; degraded-vs-clean is covered separately by step 5e above
     OUT=$(printf '' | "$TOOL_HOME/scripts/llm-client.sh" review 2>/dev/null || true)
   fi
   if command -v jq >/dev/null 2>&1; then
