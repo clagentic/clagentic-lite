@@ -1114,18 +1114,45 @@ invoke_claude() {
   # backgrounds the subprocess — which prevents output capture and forces a
   # second manual run. Clearing the var in the subshell suppresses that
   # detection without requiring --bare (which breaks OAuth auth).
+  #
+  # EXIT STATUS (lr-53dc6e, propagating invoke_codex's already-correct shape,
+  # :1208-1244 below): capture the real invocation status into _claude_exit
+  # exactly like invoke_codex captures _codex_exit. Without this, the
+  # function's return status is whatever the LAST STATEMENT in this function
+  # produces — the post-processing python3 block below, which sys.exit(0)s on
+  # every path — so invoke_claude always returned 0 regardless of whether
+  # `claude --print` failed, timed out (124), or was hard-killed. walk_chain
+  # (:1458) gates review-gate success on this status, so a hard claude
+  # failure leaving parseable residue could be accepted as a passing review.
+  # The status is lost to this NEXT STATEMENT, not to the pipeline itself —
+  # `timeout` is already the last command inside the parenthesized subshell,
+  # so its exit code (including 124 on timeout) propagates out of the
+  # subshell correctly; only the assignment below was missing.
+  _claude_exit=0
   if [ -n "$MODEL" ]; then
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
       cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG --model "$MODEL" \
         $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" ) \
-      > "$OUTPUT_FILE" 2> "$ERR_FILE"
+      > "$OUTPUT_FILE" 2> "$ERR_FILE" || _claude_exit=$?
   else
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
       cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG \
         $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" ) \
-      > "$OUTPUT_FILE" 2> "$ERR_FILE"
+      > "$OUTPUT_FILE" 2> "$ERR_FILE" || _claude_exit=$?
+  fi
+  EXIT_CODE=$_claude_exit
+  # OUTPUT NORMALIZATION (lr-53dc6e, propagating invoke_codex's F-009 fix,
+  # :1240-1241 below): strip ANSI CSI escape sequences from OUTPUT_FILE
+  # before validation, same as invoke_codex already does for TMP_RAW. The
+  # claude CLI has no documented --color flag to suppress this at the
+  # source, so the strip happens here instead. A stray ESC sequence would
+  # otherwise fail jq's parse in validate_output and silently turn a working
+  # response into a schema-mismatch step-failure. Idempotent on clean output.
+  if [ -s "$OUTPUT_FILE" ]; then
+    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUTPUT_FILE" > "${OUTPUT_FILE}.stripped" 2>/dev/null \
+      && mv "${OUTPUT_FILE}.stripped" "$OUTPUT_FILE"
   fi
   # Post-process OUTPUT_FILE for json mode:
   # 1. Unwrap --output-format json envelope: extract .result if top-level "type"=="result".
@@ -1133,6 +1160,10 @@ invoke_claude() {
   # Both steps are needed: --output-format json wraps the response; the model may still
   # fence its JSON output even with --system-prompt. Fall through without error if
   # python3 is unavailable or the file is not an envelope (already bare JSON).
+  #
+  # Invocation failure stays distinguishable from post-processing failure: this
+  # block only reshapes OUTPUT_FILE content and never touches EXIT_CODE, which
+  # was already captured above from the real `claude --print` invocation.
   if [ "$CALL_MODE" = "json" ] && [ -s "$OUTPUT_FILE" ] && command -v python3 >/dev/null 2>&1; then
     python3 - "$OUTPUT_FILE" <<'PY'
 import json, re, sys
@@ -1170,6 +1201,7 @@ except Exception:
     pass  # not valid JSON after stripping — leave original envelope so validate_output rejects it
 PY
   fi
+  return $EXIT_CODE
 }
 
 # Codex non-interactive.
