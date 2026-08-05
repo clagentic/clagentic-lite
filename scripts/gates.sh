@@ -2286,8 +2286,10 @@ _review_chunks_total() {
 # (llm-client.sh) writes when every chain step failed. Covers all three
 # output shapes emit_degraded can produce:
 #   json     - {"degraded": true, ...}
-#   line     - a single line prefixed "[clagentic-lite degraded] "
-#   markdown - a document whose first line is "# Degraded output"
+#   line     - DEGRADED_MARKER (a literal ASCII SOH byte, 0x01) followed by
+#              "[clagentic-lite degraded] "
+#   markdown - a document whose first line starts with DEGRADED_MARKER
+#              followed by "# Degraded output"
 #
 # Prior to this, only the json shape had ANY detector anywhere in the repo
 # (review_is_degraded below, json-only). The markdown shape
@@ -2296,6 +2298,19 @@ _review_chunks_total() {
 # check: there was nothing to call. review_is_degraded is now a thin
 # json-mode wrapper around this function so its many existing call sites
 # are unaffected.
+#
+# UNFORGEABLE PREFIX (BOBBIE finding 1, lr-7047bf fold-in): line/markdown
+# mode previously matched on plain banner text alone ("[clagentic-lite
+# degraded] " / "# Degraded output"), which a prompt-injected model
+# response could reproduce verbatim, misclassifying a real audit as
+# degraded (over-cautious direction only -- emit_degraded's own output is
+# never model-generated, so a genuine degraded envelope could never be
+# hidden this way). The detector now requires the leading DEGRADED_MARKER
+# control byte (emit_degraded, llm-client.sh) to be present before it will
+# even consider the banner text -- a byte no realistic model response
+# stream emits (see DEGRADED_MARKER's own comment in llm-client.sh for the
+# full rationale). Banner text with no leading marker byte is NOT treated
+# as degraded.
 #
 # FAIL CLOSED on no validator: unlike the old review_is_degraded (which
 # fail-OPEN'd to "not degraded" when jq/python3 were both absent, relying
@@ -2320,10 +2335,14 @@ _llm_output_is_degraded() {
       ;;
     line)
       [ -f "$_lod_file" ] || return 0
+      _lod_first_byte=$(head -c 1 "$_lod_file" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+      [ "$_lod_first_byte" = "01" ] || return 1
       head -1 "$_lod_file" 2>/dev/null | grep -qF '[clagentic-lite degraded]'
       ;;
     markdown|*)
       [ -f "$_lod_file" ] || return 0
+      _lod_first_byte=$(head -c 1 "$_lod_file" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+      [ "$_lod_first_byte" = "01" ] || return 1
       head -1 "$_lod_file" 2>/dev/null | grep -qF '# Degraded output'
       ;;
   esac
