@@ -335,8 +335,8 @@ PY
 }
 
 cmd_bleed() {
-  # Internal-bleed scan: grep committed tracked files for patterns loaded from
-  # a user-supplied pattern file. Patterns are BRE (grep -f), one per line;
+  # Internal-bleed scan: grep the changed-file set for patterns loaded from a
+  # user-supplied pattern file. Patterns are BRE (grep -f), one per line;
   # lines starting with # and blank lines are ignored.
   #
   # Pattern file resolution (first found wins):
@@ -346,6 +346,25 @@ cmd_bleed() {
   # If neither exists, the gate skips non-blocking with a warning — the gate
   # is opt-in via pattern config, not fail-closed on missing config.
   # Project-level exclusions: .clagentic-bleed-ignore (one path-substring per line).
+  #
+  # SCOPE (lr-caebc5): this gate used to run `git ls-files` against the whole
+  # repo on every invocation — every tracked file, every run, regardless of
+  # what changed. Sibling gates already scope to the change under review
+  # (secrets: staged diff / branch history at :110; sast: merge-base baseline
+  # at :538; merge-gate: staged diff / branch diff at :2809). Bleed now
+  # follows the same precedent: staged files when the index is non-empty,
+  # else the current branch's diff against the default branch, else full
+  # tree — full-tree is the fallback path, not the default, and stays
+  # reachable via --full-scan or automatically whenever a change-scoped
+  # resolution can't be established (fresh repo, no baseline, detached HEAD,
+  # or the pattern file itself changed — a pattern-file edit can turn an
+  # old, already-committed hit newly relevant, so it forces a full scan).
+  _BLEED_FULL_SCAN=0
+  for _bleed_arg in "$@"; do
+    case "$_bleed_arg" in
+      --full-scan) _BLEED_FULL_SCAN=1 ;;
+    esac
+  done
 
   _BLEED_PAT_FILE=""
   if [ -f "${CLAGENTIC_PROJECT_ROOT:-$PWD}/.clagentic/bleed-patterns" ]; then
@@ -370,13 +389,63 @@ cmd_bleed() {
     return 0
   fi
 
-  # Collect tracked file list; warn but don't block if git fails.
-  _BLEED_FILES=$(git -C "$REPO_ROOT" ls-files 2>/dev/null) || {
-    rm -f "$_BLEED_TMP"
-    echo "[gates/bleed] git ls-files failed — skipping" 1>&2
-    cmd_log_run bleed pass "git ls-files failed (non-blocking)"
-    return 0
-  }
+  # Determine the file-set scope. Same fallback ladder as cmd_secrets
+  # (:110-116): staged diff first, else branch diff against the default
+  # branch when there is nothing staged, else full tree when neither can be
+  # established or --full-scan was requested.
+  _BLEED_DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+  _BLEED_SCOPE_REASON=""
+  _BLEED_FILES=""
+
+  # A pattern-file change makes any prior full-scan history relevant again
+  # (a newly added pattern could match content in files the current diff
+  # never touches) — force full scan rather than silently narrowing.
+  _BLEED_PAT_FILE_REL=${_BLEED_PAT_FILE#"$REPO_ROOT"/}
+  if [ "$_BLEED_FULL_SCAN" != "1" ]; then
+    _BLEED_STAGED_CHECK=$(_git diff --cached --name-only 2>/dev/null || true)
+    if printf '%s\n' "$_BLEED_STAGED_CHECK" | grep -qF "$_BLEED_PAT_FILE_REL" 2>/dev/null; then
+      _BLEED_FULL_SCAN=1
+      _BLEED_SCOPE_REASON="pattern file changed in this diff"
+    fi
+  fi
+
+  if [ "$_BLEED_FULL_SCAN" = "1" ]; then
+    [ -z "$_BLEED_SCOPE_REASON" ] && _BLEED_SCOPE_REASON="--full-scan requested"
+    _BLEED_FILES=$(git -C "$REPO_ROOT" ls-files 2>/dev/null) || {
+      rm -f "$_BLEED_TMP"
+      echo "[gates/bleed] git ls-files failed — skipping" 1>&2
+      cmd_log_run bleed pass "git ls-files failed (non-blocking)"
+      return 0
+    }
+    echo "[gates/bleed] full-tree scan ($_BLEED_SCOPE_REASON)" 1>&2
+  else
+    _BLEED_STAGED=$(_git diff --cached --name-only 2>/dev/null || true)
+    if [ -n "$_BLEED_STAGED" ]; then
+      _BLEED_FILES="$_BLEED_STAGED"
+      _BLEED_SCOPE_REASON="staged diff"
+    else
+      _BLEED_CURRENT_BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+      if [ -n "$_BLEED_CURRENT_BRANCH" ] && [ "$_BLEED_CURRENT_BRANCH" != "HEAD" ] && [ "$_BLEED_CURRENT_BRANCH" != "$_BLEED_DEFAULT_BRANCH" ] \
+        && _git rev-parse --verify -q "origin/${_BLEED_DEFAULT_BRANCH}" >/dev/null 2>&1; then
+        _BLEED_FILES=$(_git diff "origin/${_BLEED_DEFAULT_BRANCH}...HEAD" --name-only 2>/dev/null || true)
+        _BLEED_SCOPE_REASON="branch diff vs origin/${_BLEED_DEFAULT_BRANCH}"
+      fi
+      # Nothing staged, no usable branch baseline (detached HEAD, on the
+      # default branch itself, no origin/<default-branch> ref — fresh repo
+      # or first run): fall back to a full scan rather than silently
+      # scanning nothing.
+      if [ -z "$_BLEED_FILES" ] && [ -z "$_BLEED_SCOPE_REASON" ]; then
+        _BLEED_FILES=$(git -C "$REPO_ROOT" ls-files 2>/dev/null) || {
+          rm -f "$_BLEED_TMP"
+          echo "[gates/bleed] git ls-files failed — skipping" 1>&2
+          cmd_log_run bleed pass "git ls-files failed (non-blocking)"
+          return 0
+        }
+        _BLEED_SCOPE_REASON="full-tree fallback (no staged changes, no usable branch baseline)"
+      fi
+    fi
+    echo "[gates/bleed] scanning $_BLEED_SCOPE_REASON" 1>&2
+  fi
 
   # Always exclude .git/ and .clagentic/ (binary DBs, pattern files).
   _BLEED_FILES=$(printf '%s\n' "$_BLEED_FILES" \
@@ -384,7 +453,7 @@ cmd_bleed() {
 
   if [ -z "$_BLEED_FILES" ]; then
     rm -f "$_BLEED_TMP"
-    cmd_log_run bleed pass "no files to scan"
+    cmd_log_run bleed pass "no files to scan ($_BLEED_SCOPE_REASON)"
     return 0
   fi
 
@@ -399,7 +468,18 @@ cmd_bleed() {
 
   if [ -z "$_BLEED_FILES" ]; then
     rm -f "$_BLEED_TMP"
-    cmd_log_run bleed pass "all files excluded"
+    cmd_log_run bleed pass "all files excluded ($_BLEED_SCOPE_REASON)"
+    return 0
+  fi
+
+  # Only scan files that still exist in the working tree (a diff-scoped list
+  # can include deletions, which have nothing left to grep).
+  _BLEED_FILES=$(printf '%s\n' "$_BLEED_FILES" \
+    | while IFS= read -r _bf; do [ -f "$REPO_ROOT/$_bf" ] && printf '%s\n' "$_bf"; done)
+
+  if [ -z "$_BLEED_FILES" ]; then
+    rm -f "$_BLEED_TMP"
+    cmd_log_run bleed pass "no existing files to scan ($_BLEED_SCOPE_REASON)"
     return 0
   fi
 
@@ -417,7 +497,7 @@ cmd_bleed() {
   fi
 
   echo "[gates/bleed] clean"
-  cmd_log_run bleed pass "no bleed patterns found"
+  cmd_log_run bleed pass "no bleed patterns found ($_BLEED_SCOPE_REASON)"
   return 0
 }
 
@@ -2377,6 +2457,42 @@ cmd_adversarial() {
   cat "$OUT"
 }
 
+# _mg_state_identity — print "<HEAD-SHA>:<content-hash>" for the current
+# working tree, or empty if REPO_ROOT is not (provably) a git repo.
+#
+# ROOT CAUSE (lr-caebc5): gate results previously carried no notion of which
+# commit/tree state they validated, only the file mtimes of gate output
+# files (last-review.json, last-adversarial.md). Any incidental mtime change
+# — a checkout, a stash, an editor save with no content change, a re-run in
+# the same session — looked indistinguishable from a real change, so the
+# merge-gate re-ran (and re-prompted the operator) every time. mtime is not
+# a reliable proxy for "did anything change."
+#
+# The commit SHA alone is also insufficient: a dirty working tree (staged or
+# unstaged edits not yet committed) is the NORMAL state while iterating, not
+# an edge case, and two dirty trees on the same HEAD can differ. So the
+# identity is HEAD SHA plus a content hash of the in-scope diff:
+#   - `git diff HEAD` captures staged AND unstaged changes to tracked files
+#     relative to HEAD (empty string on a clean tree).
+#   - `git status --porcelain` captures untracked files (added test/data
+#     files git diff would not otherwise reflect) without depending on any
+#     file's mtime — porcelain output is derived from content/index state.
+# Both are hashed together via the existing _rm_sha256 shim (review-merge.sh)
+# used by dedup_findings/_review_deferral_match for the exact same
+# fingerprint-content-not-timestamps reason. Symlink/toplevel canonicalization
+# mirrors the --recheck guard above (same REPO_ROOT ambiguity applies here).
+_mg_state_identity() {
+  _mgsi_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
+  _mgsi_git_toplevel=$(_git rev-parse --show-toplevel 2>/dev/null || echo "")
+  if [ "$_mgsi_git_toplevel" != "$_mgsi_repo_root_canon" ]; then
+    return 0
+  fi
+  _mgsi_head=$(_git rev-parse HEAD 2>/dev/null || echo "")
+  [ -n "$_mgsi_head" ] || return 0
+  _mgsi_content_hash=$( { _git diff HEAD 2>/dev/null; _git status --porcelain 2>/dev/null; } | _rm_sha256)
+  printf '%s:%s' "$_mgsi_head" "$_mgsi_content_hash"
+}
+
 cmd_merge_gate() {
   # Final LLM sanity check: feed gate outputs back through the merge-gate
   # role, which decides approve/refuse. BLOCKING BY DEFAULT — set
@@ -2395,6 +2511,39 @@ cmd_merge_gate() {
 
   IN="$REPO_ROOT/.clagentic/lite/gate-summary.json"
   OUT="$REPO_ROOT/.clagentic/lite/last-merge-gate.json"
+
+  # STATE-IDENTITY CACHE (lr-caebc5): if the current commit+content state
+  # already has a recorded PASS in the audit trail, this invocation is a
+  # no-op — report the cached pass and return without calling the LLM or
+  # touching last-merge-gate.json. This is what stops repeated re-prompts on
+  # unchanged content: a re-run for the same state is now provably a repeat
+  # of work already done, not a fresh judgment call. Only a stored PASS
+  # short-circuits; a stored refuse never does, so a real refusal is never
+  # silently bypassed by re-running gates merge-gate again.
+  _mg_state_id=$(_mg_state_identity)
+  if [ -n "$_mg_state_id" ]; then
+    _mg_cached=$(sqlite3 -separator '|' "$AUDIT_DB" \
+      "SELECT outcome, details FROM gate_runs
+       WHERE gate IN ('merge-gate','merge-gate recheck')
+       ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
+    if [ -n "$_mg_cached" ]; then
+      _mg_cached_outcome=${_mg_cached%%|*}
+      _mg_cached_details=${_mg_cached#*|}
+      case "$_mg_cached_details" in
+        *"[state=${_mg_state_id}]"*)
+          if [ "$_mg_cached_outcome" = "pass" ]; then
+            printf '[gates/merge-gate] already passed for this exact commit+content state — no-op (state=%s)\n' "$_mg_state_id" 1>&2
+            if [ -f "$OUT" ]; then
+              cat "$OUT"
+            else
+              printf '{"decision": "approve", "reason": "cached pass for unchanged state %s"}\n' "$_mg_state_id"
+            fi
+            return 0
+          fi
+          ;;
+      esac
+    fi
+  fi
 
   if [ "$_mg_recheck" = "1" ]; then
     # Recheck path: gate-summary.json must already exist.
@@ -2533,6 +2682,17 @@ except Exception:
     _mg_class_suffix=" [class=$_mg_class downgraded=$_mg_class_downgraded]"
   fi
 
+  # Recompute the state identity right before logging (not reused from the
+  # cache-check above): the LLM call/build_gate_summary happened in between,
+  # and stamping the identity actually current at decision time is what
+  # makes the next invocation's cache lookup correct, even in the unlikely
+  # case the tree changed mid-run.
+  _mg_state_id_now=$(_mg_state_identity)
+  _mg_state_suffix=""
+  if [ -n "$_mg_state_id_now" ]; then
+    _mg_state_suffix=" [state=${_mg_state_id_now}]"
+  fi
+
   DECISION=""
   if command -v jq >/dev/null 2>&1; then
     DECISION=$(jq -r '.decision // "unknown"' "$OUT" 2>/dev/null)
@@ -2563,9 +2723,9 @@ print("; ".join(parts))
         fi
       fi
       if [ "${ACK_COUNT:-0}" -gt 0 ]; then
-        cmd_log_run "$_mg_gate_name" pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL$_mg_class_suffix"
+        cmd_log_run "$_mg_gate_name" pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL$_mg_class_suffix$_mg_state_suffix"
       else
-        cmd_log_run "$_mg_gate_name" pass "approve$_mg_class_suffix"
+        cmd_log_run "$_mg_gate_name" pass "approve$_mg_class_suffix$_mg_state_suffix"
       fi
       ;;
     refuse)
@@ -3445,7 +3605,7 @@ cmd_tail() {
 
 case "${1:-}" in
   init)           cmd_init ;;
-  bleed)          cmd_bleed ;;
+  bleed)          shift; cmd_bleed "$@" ;;
   secrets)        cmd_secrets ;;
   deps)           cmd_deps ;;
   sast)           cmd_sast ;;
@@ -3460,5 +3620,5 @@ case "${1:-}" in
   digest)         cmd_digest ;;
   status)         shift; cmd_status "$@" ;;
   tail)           shift; cmd_tail "$@" ;;
-  *) echo "usage: gates.sh {init|bleed|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+  *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
 esac
