@@ -696,7 +696,14 @@ cmd_sast() {
       if [ -z "$_SAST_FRESH_TIP" ]; then
         _SAST_BASELINE_SKIP_REASON="$_SAST_FRESH_ERR"
       else
-        _SAST_MERGE_BASE=$(_git merge-base "origin/${_SAST_DEFAULT_BRANCH}" HEAD 2>/dev/null || echo "")
+        # Use the verified-fresh SHA _gate_resolve_fresh_default_branch_ref
+        # just proved current (lr-53dc6e; matches cmd_bleed's own use of
+        # its verified tip at :546, `_git diff "${_BLEED_FRESH_TIP}...HEAD"`).
+        # Re-resolving "origin/${_SAST_DEFAULT_BRANCH}" BY NAME here would
+        # discard that proof and reopen the same TOCTOU gap the helper
+        # exists to close: a concurrent fetch/rewrite between the freshness
+        # check and this merge-base call could move the named ref again.
+        _SAST_MERGE_BASE=$(_git merge-base "$_SAST_FRESH_TIP" HEAD 2>/dev/null || echo "")
         if [ -z "$_SAST_MERGE_BASE" ]; then
           _SAST_BASELINE_SKIP_REASON="merge-base resolution failed (shallow clone with base not fetched, or unrelated histories)"
         else
@@ -776,11 +783,40 @@ get_review_diff() {
   fi
 
   if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ] && [ "$CURRENT_BRANCH" != "HEAD" ]; then
-    # Fetch the base ref so the comparison is accurate even in a fresh clone.
-    # Failure here is non-fatal — git diff will simply fall back to local state.
-    _git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
-    printf '[gates/review] no staged changes — using branch diff vs origin/%s\n' "$DEFAULT_BRANCH" 1>&2
-    _git diff "origin/${DEFAULT_BRANCH}...HEAD" --unified=3 2>/dev/null
+    # FRESHNESS IS A PRECONDITION, NOT AN ASSUMPTION (lr-53dc6e, propagating
+    # _gate_resolve_fresh_default_branch_ref's already-hardened form, :132-164,
+    # to this site). This used to do a bare `git fetch origin ... || true`
+    # (non-fatal on the theory that "git diff will simply fall back to local
+    # state") followed by a raw `origin/${DEFAULT_BRANCH}` name resolution —
+    # exactly the refuted fallacy _gate_resolve_fresh_default_branch_ref's own
+    # docstring (:96-131) exists to close: a stale local tracking ref from a
+    # PRIOR successful fetch resolves successfully even when THIS fetch fails
+    # or times out, silently narrowing the diff this function feeds to BOTH
+    # LLM security gates (cmd_review, cmd_adversarial) while producing a
+    # normal-looking, plausible diff and verdict.
+    #
+    # Delegate to the shared provably-current check instead of trusting
+    # presence alone. On any failure to prove freshness, fail toward MORE
+    # coverage or a hard error — never a silently narrower diff: this
+    # function returns non-zero, and under gates.sh's `set -e`, a caller that
+    # does not explicitly guard the call (cmd_review, cmd_adversarial both
+    # call it unguarded via `get_review_diff > "$tmp"`) aborts the gate
+    # rather than proceeding to review a partial diff as if it were complete.
+    _grd_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
+    case "$_grd_fetch_timeout" in ''|*[!0-9]*) _grd_fetch_timeout=30 ;; esac
+
+    _grd_fresh_err_tmp=$(mktemp -t clagentic-review-fresh-err.XXXXXX)
+    _grd_fresh_tip=$(_gate_resolve_fresh_default_branch_ref "$DEFAULT_BRANCH" "$_grd_fetch_timeout" 2>"$_grd_fresh_err_tmp") || true
+    _grd_fresh_err=$(cat "$_grd_fresh_err_tmp" 2>/dev/null || echo "")
+    rm -f "$_grd_fresh_err_tmp"
+
+    if [ -z "$_grd_fresh_tip" ]; then
+      printf '[gates/review] branch baseline not provably current (%s) — refusing to produce a possibly-narrowed diff\n' "$_grd_fresh_err" 1>&2
+      return 1
+    fi
+
+    printf '[gates/review] no staged changes — using branch diff vs verified origin/%s\n' "$DEFAULT_BRANCH" 1>&2
+    _git diff "${_grd_fresh_tip}...HEAD" --unified=3 2>/dev/null
     return 0
   fi
 
@@ -3049,9 +3085,38 @@ build_gate_summary() {
   if _git diff --cached --name-status 2>/dev/null | grep -q .; then
     _diff_status=$(_git diff --cached --name-status 2>/dev/null || true)
   else
-    _DEFAULT_BRANCH=$(_git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p' | tr -d ' \n')
-    [ -z "$_DEFAULT_BRANCH" ] && _DEFAULT_BRANCH="main"
-    _diff_status=$(_git diff "origin/${_DEFAULT_BRANCH}...HEAD" --name-status 2>/dev/null || true)
+    # FRESHNESS IS A PRECONDITION, NOT AN ASSUMPTION (lr-53dc6e, propagating
+    # _gate_resolve_fresh_default_branch_ref's already-hardened form, :132-164,
+    # to this site). This used to resolve "origin/${_DEFAULT_BRANCH}" by name
+    # with no fetch at all — not even the non-fatal `|| true` fetch
+    # get_review_diff had — relying purely on whatever the local
+    # tracking ref already happened to be. Delegate to the shared
+    # provably-current check rather than trusting presence alone.
+    #
+    # Fail toward MORE coverage, never a silently narrower diff: on a
+    # freshness failure, fall back to the raw name resolution's prior
+    # behavior only insofar as it still runs — but with an explicit stderr
+    # note so the fail-open ack-bootstrap flag below is not mistaken for a
+    # verified read. INTRODUCES_ACK_FILE is documented fail-open/
+    # informational-only (it only ENABLES an exemption, denying it is the
+    # safe direction), so unlike get_review_diff this site degrades rather
+    # than hard-errors — but it must still attempt the verified resolution
+    # first, not skip straight to an unverified guess.
+    _DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+    _bgs_fetch_timeout="${CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC:-30}"
+    case "$_bgs_fetch_timeout" in ''|*[!0-9]*) _bgs_fetch_timeout=30 ;; esac
+
+    _bgs_fresh_err_tmp=$(mktemp -t clagentic-bgs-fresh-err.XXXXXX)
+    _bgs_fresh_tip=$(_gate_resolve_fresh_default_branch_ref "$_DEFAULT_BRANCH" "$_bgs_fetch_timeout" 2>"$_bgs_fresh_err_tmp") || true
+    _bgs_fresh_err=$(cat "$_bgs_fresh_err_tmp" 2>/dev/null || echo "")
+    rm -f "$_bgs_fresh_err_tmp"
+
+    if [ -n "$_bgs_fresh_tip" ]; then
+      _diff_status=$(_git diff "${_bgs_fresh_tip}...HEAD" --name-status 2>/dev/null || true)
+    else
+      printf '[gates/build-gate-summary] branch baseline not provably current (%s) — ack-bootstrap detection may be incomplete\n' "$_bgs_fresh_err" 1>&2
+      _diff_status=""
+    fi
   fi
   if printf '%s\n' "$_diff_status" | grep -qE "^A[[:space:]]+(\\.clagentic/adversarial-acks\\.json|\\.clagentic/accepted-risks\\.md)$"; then
     INTRODUCES_ACK_FILE="true"
@@ -3659,6 +3724,14 @@ cmd_tail() {
   fi
 
   INTERVAL="${CLAGENTIC_TAIL_INTERVAL_SEC:-1}"
+  # Numeric guard (lr-53dc6e): every other timeout/interval var in this file
+  # gets this same case-based validation before use (e.g. _BLEED_FETCH_TIMEOUT
+  # gates.sh:538, _SAST_FETCH_TIMEOUT :689, BASE/RATE/MAX llm-client.sh:1041-
+  # 1043) — INTERVAL was the one sibling that reached `sleep "$INTERVAL"`
+  # below unguarded. An operator-set non-numeric CLAGENTIC_TAIL_INTERVAL_SEC
+  # would otherwise reach `sleep` raw and fail there instead of falling back
+  # to a safe default.
+  case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=1 ;; esac
   printf '== clagentic-lite gate tail (Ctrl-C to quit, polling every %ss) ==\n' "$INTERVAL"
   printf '   starting from gate_runs.id > %s\n\n' "$LAST_ID"
 
