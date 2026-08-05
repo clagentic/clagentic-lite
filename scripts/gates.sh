@@ -17,6 +17,10 @@
 #   tail             follow audit.db, render new gate_runs rows as they land; --no-follow exits after one poll
 #   pre-push         hook entry point (deps + sast + optional review)
 #   log-run          internal: insert one row into gate_runs
+#   deferrals-lint   validate .clagentic/deferrals.json against the gate-code schema
+#   audit-vocab-lint warn-only: flag "cmd_log_run <gate> pass" audit rows whose
+#                    details string contains a failure word (a tool that never
+#                    ran should not log as a clean pass)
 
 set -e
 . "$(dirname "$0")/platform.sh"
@@ -1965,7 +1969,41 @@ cmd_review() {
         _crv_cbytes=$(ds_file_size "$_crv_chunk")
         _crv_env_file=$(printf '%s/envelope-%03d.json' "$_crv_env_dir" "$_crv_cidx")
         printf '[gates/review] reviewing chunk %d/%d (%d bytes)\n' "$_crv_cidx" "$_crv_nchunks" "$_crv_cbytes" 1>&2
-        "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_chunk" > "$_crv_env_file" 2>/dev/null || true
+        # STATUS-CHECKED (lr-7047bf, INV-1b): walk_chain now returns 3 on a
+        # degraded emission (see llm-client.sh walk_chain). Capture the real
+        # status instead of discarding it -- the `|| true` here used to hide
+        # BOTH a degraded envelope AND any other invoke_* failure (127, a
+        # crash) behind the same silent success. The degraded FILE check
+        # below still runs unconditionally as the second, mode-appropriate
+        # channel (INV-1b requires both); a nonzero status that is NOT a
+        # degraded emission (chunk_status != 3, e.g. an actual crash) is
+        # still surfaced via the audit details string rather than swallowed.
+        _crv_chunk_status=0
+        _crv_chunk_err=$(mktemp -t clagentic-review-chunk-err.XXXXXX)
+        "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_chunk" > "$_crv_env_file" 2>"$_crv_chunk_err" || _crv_chunk_status=$?
+        _crv_chunk_outcome="pass"
+        if [ "$_crv_chunk_status" -ne 0 ] && [ "$_crv_chunk_status" -ne 3 ]; then
+          # A nonzero status that is NOT walk_chain's own degraded marker (3)
+          # means the call crashed before writing a usable envelope (or wrote
+          # partial/garbage content) -- $_crv_env_file cannot be trusted as
+          # review JSON. Overwrite it with an explicit degraded envelope
+          # BEFORE sanitize/merge ever see it, so merge_envelopes' own
+          # per-file `.degraded` check (review-merge.sh) counts this chunk
+          # correctly instead of silently treating unparseable content as
+          # "not degraded" (merge_envelopes' jq lookup on unparseable JSON
+          # returns empty, which compares false to "true").
+          # Strip characters that would break the hand-rolled JSON string
+          # below (this synthetic envelope is written before any jq/python3
+          # tool involvement, so there is no JSON encoder available to lean
+          # on here -- same constraint build_gate_summary's no-tool fallback
+          # documents).
+          _crv_chunk_err_hint=$(head -1 "$_crv_chunk_err" 2>/dev/null | cut -c1-200 | tr -d '"\\')
+          printf '{"degraded": true, "summary": "[clagentic-lite degraded] llm-client.sh exited %d: %s", "checked": [], "findings": []}\n' \
+            "$_crv_chunk_status" "$_crv_chunk_err_hint" > "$_crv_env_file"
+          printf '[gates/review] chunk %d/%d: llm-client.sh exited %d: %s\n' \
+            "$_crv_cidx" "$_crv_nchunks" "$_crv_chunk_status" "$_crv_chunk_err_hint" 1>&2
+        fi
+        rm -f "$_crv_chunk_err"
         # SECURITY (lr-66e598 follow-up): strip every finding in THIS chunk's
         # raw envelope to the closed review-finding schema BEFORE
         # merge_envelopes ever unions it with the other chunks --
@@ -1976,13 +2014,17 @@ cmd_review() {
         # _sanitize_review_findings_envelope's own doc comment for the full
         # rationale.
         _sanitize_review_findings_envelope "$_crv_env_file"
-        # Audit one row per chunk.
-        _crv_chunk_outcome="pass"
-        if review_is_degraded "$_crv_env_file" 2>/dev/null; then
+        # Audit one row per chunk. STATUS-CHECKED (lr-7047bf, INV-1b): a
+        # nonzero status is checked directly (3 = walk_chain's own degraded
+        # signal; any other nonzero was normalized to a degraded envelope
+        # above), alongside review_is_degraded as the mode-appropriate
+        # file-content check -- either alone would miss a case the other
+        # catches.
+        if [ "$_crv_chunk_status" -ne 0 ] || review_is_degraded "$_crv_env_file" 2>/dev/null; then
           _crv_chunk_outcome="degraded"
         fi
         cmd_log_run review-chunk "$_crv_chunk_outcome" \
-          "chunk=${_crv_cidx}/${_crv_nchunks} bytes=${_crv_cbytes}"
+          "chunk=${_crv_cidx}/${_crv_nchunks} bytes=${_crv_cbytes} status=${_crv_chunk_status}"
       done
 
       # Merge all chunk envelopes into the final output.
@@ -2074,7 +2116,15 @@ cmd_review() {
   fi
 
   # Single-pass path (original behavior).
-  "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_diff_tmp" > "$OUT"
+  # STATUS-CHECKED (lr-7047bf, INV-1b): guard explicitly -- gates.sh runs
+  # under `set -e`, and walk_chain now returns 3 on a degraded emission (see
+  # llm-client.sh walk_chain). An unguarded call here would abort the whole
+  # gate on a degraded envelope instead of reaching the mode-appropriate
+  # degraded check (review_is_degraded, below) that turns it into the
+  # INFRA_DEGRADED (exit 2) path. _crv_review_status is recorded in the audit
+  # details string below for the same reason the chunked path records it.
+  _crv_review_status=0
+  "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_diff_tmp" > "$OUT" || _crv_review_status=$?
   # Note: _crv_diff_tmp is NOT deleted yet — cross-round dedup needs it below.
 
   # SECURITY (lr-66e598 follow-up): strip every finding to the closed
@@ -2130,8 +2180,16 @@ cmd_review() {
   # network-out Reviewer chain reports "clean review" and the ship passes.
   # Exit 2 = INFRA_DEGRADED: distinct from exit 1 (REVIEW_BLOCKED) so callers
   # and CI can distinguish "retry — infra flaked" from "fix your code."
-  if review_is_degraded "$OUT"; then
-    cmd_log_run review block "infra-degraded: all reviewer chain steps failed"
+  #
+  # Both channels (lr-7047bf, INV-1b): a nonzero $_crv_review_status is
+  # walk_chain's own outcome signal (3 = degraded envelope written; 1 = hard
+  # failure under CLAGENTIC_REVIEWER_REQUIRED=1, in which case $OUT was never
+  # written and is empty -- review_is_degraded's JSON parse would not
+  # recognize an empty file as "degraded": true on its own); review_is_degraded
+  # is the mode-appropriate file-content check for the ordinary case. Either
+  # alone would miss a case the other catches, so both gate this check.
+  if [ "$_crv_review_status" -ne 0 ] || review_is_degraded "$OUT"; then
+    cmd_log_run review block "infra-degraded: all reviewer chain steps failed (status=$_crv_review_status)"
     echo "[gates/review] INFRA_DEGRADED: reviewer chain returned degraded envelope — no real review occurred." 1>&2
     echo "[gates/review] Check LLM CLI config/auth. Set CLAGENTIC_REVIEWER_REQUIRED=1 to make this a hard gate error." 1>&2
     # Pull the per-step failure reasons from the audit DB so the user sees them
@@ -2222,20 +2280,67 @@ _review_chunks_total() {
   fi
 }
 
+# _llm_output_is_degraded MODE FILE
+#
+# Mode-complete detector for the degraded envelope emit_degraded
+# (llm-client.sh) writes when every chain step failed. Covers all three
+# output shapes emit_degraded can produce:
+#   json     - {"degraded": true, ...}
+#   line     - a single line prefixed "[clagentic-lite degraded] "
+#   markdown - a document whose first line is "# Degraded output"
+#
+# Prior to this, only the json shape had ANY detector anywhere in the repo
+# (review_is_degraded below, json-only). The markdown shape
+# (cmd_adversarial's output) and the line shape (cmd_summarize's output)
+# had none — that absence is exactly why cmd_adversarial had no degraded
+# check: there was nothing to call. review_is_degraded is now a thin
+# json-mode wrapper around this function so its many existing call sites
+# are unaffected.
+#
+# FAIL CLOSED on no validator: unlike the old review_is_degraded (which
+# fail-OPEN'd to "not degraded" when jq/python3 were both absent, relying
+# on severity_blockers' own fail-closed as a backstop that does not exist
+# for adversarial/markdown output), this treats "cannot verify" as
+# "assume degraded" for every mode. A caller that cannot prove the output
+# is real must not treat it as real.
+#
+# Returns 0 if degraded, 1 if not.
+_llm_output_is_degraded() {
+  _lod_mode="$1"
+  _lod_file="$2"
+  case "$_lod_mode" in
+    json)
+      if command -v jq >/dev/null 2>&1; then
+        jq -e '.degraded == true' "$_lod_file" >/dev/null 2>&1
+      elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("degraded") is True else 1)' "$_lod_file" 2>/dev/null
+      else
+        return 0
+      fi
+      ;;
+    line)
+      [ -f "$_lod_file" ] || return 0
+      head -1 "$_lod_file" 2>/dev/null | grep -qF '[clagentic-lite degraded]'
+      ;;
+    markdown|*)
+      [ -f "$_lod_file" ] || return 0
+      head -1 "$_lod_file" 2>/dev/null | grep -qF '# Degraded output'
+      ;;
+  esac
+}
+
 # Detect the "degraded": true marker written by emit_degraded in llm-client.sh.
 # Args: FILE
-# Returns 0 if degraded, 1 if not (or if validators are unavailable — see M2).
+# Returns 0 if degraded, 1 if not.
+#
+# Thin json-mode wrapper around _llm_output_is_degraded, kept for the many
+# existing review call sites. NOTE: the no-validator branch now fails
+# CLOSED (assumes degraded) — see _llm_output_is_degraded's doc comment.
+# Previously this fail-opened ("assume not degraded"), relying on
+# severity_blockers' own fail-closed as a backstop; that backstop does not
+# exist for every consumer, so the detector itself must not fail open.
 review_is_degraded() {
-  FILE="$1"
-  if command -v jq >/dev/null 2>&1; then
-    jq -e '.degraded == true' "$FILE" >/dev/null 2>&1
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("degraded") is True else 1)' "$FILE" 2>/dev/null
-  else
-    # No validator — assume not degraded; the no-validator branch is itself
-    # caught by severity_blockers fail-closed.
-    return 1
-  fi
+  _llm_output_is_degraded json "$1"
 }
 
 # _parse_adversarial_findings MARKDOWN_FILE
@@ -2512,7 +2617,23 @@ cmd_adversarial() {
   FINDINGS_OUT="$REPO_ROOT/.clagentic/lite/last-adversarial-findings.json"
   _adv_diff_tmp=$(mktemp -t clagentic-adv-diff.XXXXXX)
   get_review_diff > "$_adv_diff_tmp"
-  "$TOOL_HOME/scripts/llm-client.sh" adversarial < "$_adv_diff_tmp" > "$OUT"
+  # STATUS-CHECKED + DEGRADED-CHECKED (lr-7047bf, INV-1b): this used to be
+  # THE WORST site in the class -- no check of any kind. A fully-dead
+  # auditor wrote a degraded markdown envelope, _parse_adversarial_findings
+  # found zero [FINDING] headers (a dead auditor and a genuinely clean diff
+  # were indistinguishable), build_gate_summary reported
+  # adversarial_blocking_count 0 and resolved_change_class null, and the
+  # merge-gate was told the audit was CLEAN. Capture the real exit status
+  # AND check the markdown-mode degraded marker (the mode-complete detector
+  # this task adds, _llm_output_is_degraded -- the markdown shape had no
+  # detector anywhere in the repo before this) BEFORE the SHA-stamp prepend
+  # below mutates $OUT's first line.
+  _adv_status=0
+  "$TOOL_HOME/scripts/llm-client.sh" adversarial < "$_adv_diff_tmp" > "$OUT" || _adv_status=$?
+  _adv_degraded=0
+  if [ "$_adv_status" -eq 3 ] || _llm_output_is_degraded markdown "$OUT"; then
+    _adv_degraded=1
+  fi
   # Prepend a SHA stamp comment as the first line so build_gate_summary can
   # detect stale payloads. Best-effort: skip if git unavailable or SHA empty.
   _adv_sha=$(_git rev-parse HEAD 2>/dev/null || echo "")
@@ -2569,6 +2690,24 @@ cmd_adversarial() {
   fi
   rm -f "$_adv_diff_tmp"
 
+  # cmd_adversarial can no longer report a clean audit when the auditor was
+  # dead. A degraded emission is a distinct, mechanically-detectable outcome
+  # ("degraded") from an ordinary non-blocking pass ("warn") -- both land in
+  # the audit trail, but only the degraded case returns non-zero. Existing
+  # non-blocking-by-design behavior (cmd_ship runs this as
+  # `cmd_adversarial || true`, docs/GATES.md) is preserved for the outcome
+  # this gate was actually designed to be non-blocking for (real findings,
+  # or a clean pass); it is NOT preserved silently for "the auditor never
+  # ran" -- that distinction is now visible on both the exit status and the
+  # audit row, and it is the caller's explicit `|| true` that decides
+  # whether a dead auditor still lets ship proceed.
+  if [ "$_adv_degraded" -eq 1 ]; then
+    cmd_log_run adversarial degraded "auditor produced a degraded envelope (status=$_adv_status) — no real audit occurred"
+    echo "[gates/adversarial] INFRA_DEGRADED: auditor chain returned a degraded envelope — no real audit occurred." 1>&2
+    echo "[gates/adversarial] Check LLM CLI config/auth. full details: $OUT  |  scripts/gates.sh digest" 1>&2
+    cat "$OUT"
+    return 2
+  fi
   cmd_log_run adversarial warn "wrote $OUT (non-blocking)"
   cat "$OUT"
 }
@@ -2751,6 +2890,23 @@ except Exception:
     _mg_gate_name="merge-gate"
   fi
 
+  # Detect a gate-summary-degraded envelope FIRST, tool-agnostically. This is
+  # site 1.12 (lr-7047bf): build_gate_summary's no-jq/no-python3 fallback
+  # writes "gate_summary_degraded": true as a literal, grep-able string
+  # specifically because the environment that produced it has no JSON
+  # parser -- checking for it here with jq/python3 would be circular (the
+  # exact case it flags is the case those tools are absent). A plain
+  # substring grep needs no JSON tool at all.
+  if grep -qF '"gate_summary_degraded": true' "$IN" 2>/dev/null; then
+    printf '{"decision": "refuse", "reason": "gate summary could not be built (no jq or python3 available) — install one or the other to run the merge gate"}\n' > "$OUT"
+    cmd_log_run "$_mg_gate_name" block "gate-summary degraded — no JSON tool available to build it"
+    cat "$OUT"
+    if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
+      return 1
+    fi
+    return 0
+  fi
+
   # Detect a stale-payload envelope emitted by build_gate_summary.
   # A stale payload means gate artifacts describe a different commit — skip
   # the LLM call entirely (deterministic refusal, no token burn) and write a
@@ -2774,7 +2930,22 @@ except Exception:
     return 0
   fi
 
-  "$TOOL_HOME/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT"
+  # STATUS-CHECKED (lr-7047bf, INV-1b): guard explicitly -- gates.sh runs
+  # under `set -e`, and walk_chain now returns 3 on a degraded emission (see
+  # llm-client.sh walk_chain). $_mg_status is checked immediately below
+  # alongside the merge-gate's own JSON-mode degraded marker so a degraded
+  # emission cannot be read as an ordinary parseable decision.
+  _mg_status=0
+  "$TOOL_HOME/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT" || _mg_status=$?
+  if [ "$_mg_status" -eq 3 ] || _llm_output_is_degraded json "$OUT"; then
+    cmd_log_run "$_mg_gate_name" block "infra-degraded: all merge-gate chain steps failed (status=$_mg_status)"
+    echo "[gates/merge-gate] INFRA_DEGRADED: merge-gate chain returned a degraded envelope — no real decision was made." 1>&2
+    echo "[gates/merge-gate] Check LLM CLI config/auth. full details: $OUT  |  scripts/gates.sh digest" 1>&2
+    if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
+      return 1
+    fi
+    return 0
+  fi
 
   # Resolved change class + downgrade count (lr-4f8316): read back from the
   # gate-summary payload ($IN, the exact input build_gate_summary produced)
@@ -2987,6 +3158,16 @@ build_gate_summary() {
   ACKS_FILE="$REPO_ROOT/.clagentic/adversarial-acks.json"
   AR_FILE="$REPO_ROOT/.clagentic/accepted-risks.md"
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
+  # ADVERSARIAL_DEGRADED (lr-7047bf, cmd_adversarial fold-in): cmd_adversarial
+  # now writes a degraded markdown envelope AND a fresh (matching) SHA stamp
+  # when the auditor chain failed -- a dead auditor is NOT "file absent"
+  # (ADVERSARIAL_MISSING) or "stale" (SHA mismatch); it is a third, distinct
+  # state this field surfaces to the merge-gate payload so a dead auditor
+  # cannot look identical to a clean pass. Default false: only the
+  # staleness-check block below (skipped entirely under
+  # CLAGENTIC_ALLOW_STALE_PAYLOAD=1) inspects last-adversarial.md's content
+  # to set this.
+  ADVERSARIAL_DEGRADED=false
 
   # Staleness check: compare HEAD SHA against the SHA stamped in each gate
   # output file. A mismatch means the file was written against a different
@@ -3045,6 +3226,12 @@ build_gate_summary() {
           else
             STALE_GATES="adversarial"
           fi
+        fi
+        # The degraded marker (emit_degraded, llm-client.sh) is on line 2
+        # when a SHA stamp (line 1) is present, or line 1 for a file
+        # written before the stamp feature existed -- check both.
+        if sed -n '1,2p' "$AD" 2>/dev/null | grep -qF '# Degraded output'; then
+          ADVERSARIAL_DEGRADED=true
         fi
       else
         # File absent: warn, do not treat as stale. The LLM decides.
@@ -3198,6 +3385,7 @@ build_gate_summary() {
   "review": $RV_PAYLOAD,
   "adversarial": $AD_PAYLOAD,
   "adversarial_missing": $ADVERSARIAL_MISSING,
+  "adversarial_degraded": $ADVERSARIAL_DEGRADED,
   "adversarial_findings": $ADF_PAYLOAD,
   "adversarial_findings_fenced": $ADF_FENCED_PAYLOAD,
   "adversarial_blocking_count": $ADV_BLOCKING_COUNT,
@@ -3224,7 +3412,7 @@ EOF
     [ -f "$ADF" ] && ADF_ARG="$ADF"
     [ -f "$ACKS_FILE" ] && ACKS_ARG="$ACKS_FILE"
     [ -f "$AR_FILE" ] && AR_ARG="$AR_FILE"
-    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" <<'PY'
+    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" <<'PY'
 import json, sys
 threshold           = sys.argv[1]
 introduces_ack      = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
@@ -3234,6 +3422,7 @@ ad_path             = sys.argv[5] if len(sys.argv) > 5 else ""
 acks_path           = sys.argv[6] if len(sys.argv) > 6 else ""
 ar_path             = sys.argv[7] if len(sys.argv) > 7 else ""
 adf_path            = sys.argv[8] if len(sys.argv) > 8 else ""
+adversarial_degraded = sys.argv[9].lower() == "true" if len(sys.argv) > 9 else False
 review = None
 if rv_path:
     try:
@@ -3314,6 +3503,7 @@ print(json.dumps({
     "review": review,
     "adversarial": adv,
     "adversarial_missing": adversarial_missing,
+    "adversarial_degraded": adversarial_degraded,
     "adversarial_findings": adv_findings,
     "adversarial_findings_fenced": adv_findings_fenced,
     "adversarial_blocking_count": adv_blocking_count,
@@ -3329,19 +3519,26 @@ PY
     return 0
   fi
 
-  # No JSON encoder available — emit a minimal envelope with adversarial
-  # and accepted_risks dropped. The Merge Gate will see this and may choose
-  # to refuse on incomplete context. introduces_ack_file is included as false
-  # (conservative — no bootstrap exemption in degraded mode). Structured
-  # adversarial_findings/counts are also dropped in this degraded path —
-  # same "cannot safely encode arbitrary content without a JSON encoder"
-  # limitation the adversarial markdown field already has above.
+  # No JSON encoder available (lr-7047bf, site 1.12: this branch used to
+  # emit a normal-shaped envelope -- adversarial: null, all counts 0,
+  # resolved_change_class: null -- and return 0, which cmd_merge_gate and the
+  # merge-gate LLM would read as an ordinary "nothing to report" clean pass
+  # rather than "this environment could not evaluate the gate summary at
+  # all." gate_summary_degraded: true names that distinction explicitly so
+  # cmd_merge_gate can refuse deterministically (same short-circuit shape as
+  # stale_payload below) instead of silently proceeding on a payload it
+  # could not actually build. adversarial and accepted_risks are still
+  # dropped here -- arbitrary content cannot be safely JSON-encoded without
+  # jq or python3 -- but the caller is now told this happened rather than
+  # inferring it from an envelope that looks identical to a genuinely empty
+  # one. introduces_ack_file is included as false (conservative — no
+  # bootstrap exemption in degraded mode).
   if [ -f "$RV" ]; then
     cat <<EOF
-{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "resolved_change_class": null, "adversarial_downgraded_by_class_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD"}
+{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_degraded": $ADVERSARIAL_DEGRADED, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "resolved_change_class": null, "adversarial_downgraded_by_class_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD", "gate_summary_degraded": true}
 EOF
   else
-    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\"}"
+    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_degraded\": $ADVERSARIAL_DEGRADED, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\", \"gate_summary_degraded\": true}"
   fi
 }
 
@@ -3507,6 +3704,128 @@ PYEOF
   return $?
 }
 
+# cmd_audit_vocab_lint [FILE] (lr-7047bf, foundry sub-class 1.6-1.11)
+#
+# WARN-ONLY lint over gates.sh's own source: flags every `cmd_log_run <gate>
+# pass "<details>"` call whose details string contains a failure word
+# (failed / not found / empty / no package sources / skipped / unavailable).
+# "cmd_log_run <gate> pass" is a promise: this gate ran and found nothing
+# wrong. A details string that itself says the underlying tool never ran
+# (git ls-files failed, no package sources found, empty pattern file) is
+# DEFINITIONALLY a lie against that promise -- the audit trail records
+# "pass" for a security check that produced zero real coverage, and nothing
+# downstream (a human reading `gates.sh digest`, or a future gate-code
+# consumer of the audit trail) can tell the difference from a genuine clean
+# scan without re-reading the gate's own source.
+#
+# Deliberately scoped to outcome=="pass" only, not "warn": a warn outcome
+# already signals "not fully clean" honestly (e.g. cross-round dedup's
+# "splice failed; original findings retained" -- a real, conservative
+# fallback correctly labeled as a warning, not a false pass). The lie this
+# lint closes is specifically a "pass" outcome paired with a details string
+# that contradicts it.
+#
+# WARN-ONLY BY DESIGN (foundry's smallest invariant-establishing step for
+# this sub-class): this does NOT rewrite the six gates' behavior. It blocks
+# NEW violations (any cmd_log_run pass/failure-word pair not already in
+# _AUDIT_VOCAB_KNOWN_VIOLATIONS below) while making the existing backlog
+# explicit rather than invisible. Never returns non-zero on its own --
+# wire a nonzero-on-new-violation caller separately if this needs to become
+# a real gate; today it is diagnostic output only (see docs/GATES.md).
+cmd_audit_vocab_lint() {
+  _cavl_file="${1:-$TOOL_HOME/scripts/gates.sh}"
+  [ -f "$_cavl_file" ] || { echo "[gates/audit-vocab-lint] no file at $_cavl_file"; return 0; }
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[gates/audit-vocab-lint] python3 not available — cannot lint (warn-only check, non-blocking either way)" 1>&2
+    return 0
+  fi
+
+  python3 - "$_cavl_file" <<'PYEOF'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.readlines()
+
+# Matches `cmd_log_run <gate> pass "<details>"` or `cmd_log_run <gate> pass ""`
+# (also the "$_mg_gate_name" quoted-variable gate-name form) -- captures the
+# gate name and the details string for the failure-word check below.
+_CALL_RE = re.compile(
+    r'cmd_log_run\s+(?:"([^"]+)"|(\S+))\s+pass\s+"([^"]*)"'
+)
+
+# The exact vocabulary the foundry sweep named: a tool/gate that never
+# actually ran or scanned anything, described in the details string of a
+# "pass" outcome.
+_FAILURE_WORDS = (
+    "failed", "not found", "empty", "no package sources", "skipped",
+    "unavailable",
+)
+
+# KNOWN VIOLATIONS (as of lr-7047bf): the existing backlog, enumerated
+# explicitly per the foundry's "make the backlog explicit, not invisible"
+# directive. This lint is warn-only and does not rewrite these six gates'
+# behavior -- most of these are real, pre-existing "pass" outcomes whose
+# details string names a reason the underlying tool did not actually scan
+# anything (deps/no-package-sources, bleed/empty-pattern-file,
+# bleed/git-ls-files-failed). Keyed as (gate, details) so a NEW violation
+# (different gate, or the same gate with new/changed wording) is not
+# silently absorbed by this allowlist -- only an EXACT match to one of
+# these known lines is suppressed from the warning output below.
+#
+# sast/"unavailable" is a reviewed, INTENTIONAL exception, not the same
+# lie-class as the other three: semgrep genuinely ran (full-tree, not
+# baseline-scoped) and the pass outcome is honest -- "unavailable" here
+# describes why the SCOPE is full-tree, not that the scan itself is fake.
+# It matches the mechanical word-list (this lint enumerates by vocabulary,
+# not by judgment of each site's actual honesty) and is allowlisted here
+# rather than narrowing the word-list, which would risk missing a future
+# genuine "scan unavailable" lie elsewhere that happens to use the same word.
+_KNOWN_VIOLATIONS = {
+    ("deps", "no package sources found"),
+    ("bleed", "empty pattern file"),
+    ("bleed", "git ls-files failed (non-blocking)"),
+    ("sast", "full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"),
+}
+
+findings = []
+for i, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped.startswith('#'):
+        continue
+    m = _CALL_RE.search(line)
+    if not m:
+        continue
+    gate = m.group(1) or m.group(2)
+    details = m.group(3)
+    details_lower = details.lower()
+    hit_words = [w for w in _FAILURE_WORDS if w in details_lower]
+    if not hit_words:
+        continue
+    key = (gate, details)
+    findings.append((i + 1, gate, details, hit_words, key in _KNOWN_VIOLATIONS))
+
+new_violations = [f for f in findings if not f[4]]
+known_violations = [f for f in findings if f[4]]
+
+if known_violations:
+    print("[gates/audit-vocab-lint] {} known (pre-existing, allowlisted) violation(s):".format(len(known_violations)))
+    for ln, gate, details, words, _ in known_violations:
+        print("  gates.sh:{} gate={} words={} details={!r}".format(ln, gate, words, details))
+
+if new_violations:
+    print("[gates/audit-vocab-lint] {} NEW violation(s) -- a \"pass\" outcome whose details string contains a failure word:".format(len(new_violations)))
+    for ln, gate, details, words, _ in new_violations:
+        print("  gates.sh:{} gate={} words={} details={!r}".format(ln, gate, words, details))
+    print("[gates/audit-vocab-lint] add the (gate, details) pair shown above to _KNOWN_VIOLATIONS in cmd_audit_vocab_lint if this is an intentional, reviewed exception; otherwise fix the gate to log block/warn instead of pass.")
+else:
+    print("[gates/audit-vocab-lint] no new violations ({} known, allowlisted)".format(len(known_violations)))
+PYEOF
+  return 0
+}
+
 # gate_enabled <name> — returns 0 if the named gate is in CLAGENTIC_GATES,
 # or if CLAGENTIC_GATES is unset (all gates run by default).
 gate_enabled() {
@@ -3556,6 +3875,15 @@ cmd_ship() {
   else
     ship_step_skip review
   fi
+  # EXPLICIT, VISIBLE `|| true` (lr-7047bf, INV-1 enforcement): adversarial
+  # is a non-blocking gate by design (AGENTS.md #4, docs/GATES.md) -- a
+  # degraded auditor must not abort `ship`. cmd_adversarial can now return
+  # non-zero (2) on a degraded envelope; this `|| true` is the deliberate,
+  # reviewable opt-out that decision requires, not an accidental default.
+  # The degraded state is NOT silently lost: cmd_adversarial's own audit row
+  # (outcome=degraded) records it, and build_gate_summary/cmd_merge_gate
+  # (adversarial_degraded field) independently surface it to the blocking
+  # merge-gate step that runs immediately after this line.
   if gate_enabled adversarial; then cmd_adversarial || true; else ship_step_skip adversarial; fi
   if gate_enabled merge-gate;  then cmd_merge_gate  || { echo "[gates/ship] BLOCKED at merge-gate"; ship_step_hint; exit 1; }; else ship_step_skip merge-gate;  fi
 
@@ -3767,11 +4095,12 @@ case "${1:-}" in
   merge-gate)     shift; cmd_merge_gate "$@" ;;
   render-review)  shift; cmd_render_review "$@" ;;
   deferrals-lint) shift; cmd_deferrals_lint "$@" ;;
+  audit-vocab-lint) shift; cmd_audit_vocab_lint "$@" ;;
   ship)           cmd_ship ;;
   pre-push)       cmd_pre_push ;;
   log-run)        shift; cmd_log_run "$@" ;;
   digest)         cmd_digest ;;
   status)         shift; cmd_status "$@" ;;
   tail)           shift; cmd_tail "$@" ;;
-  *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+  *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
 esac
