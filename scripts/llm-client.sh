@@ -1455,12 +1455,17 @@ walk_chain() {
       # empty summary ("empty summary, skipping"), so empty stdout is the
       # correct silent no-op. No scary degraded banner for a benign role.
       log_attempt "$ROLE_L" "" "" "skip" "no chain configured"
-    else
-      emit_degraded "$MODE" "no chain configured for role $ROLE_L"
-      log_attempt "$ROLE_L" "" "" "degraded" ""
+      rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
+      return 0
     fi
+    emit_degraded "$MODE" "no chain configured for role $ROLE_L"
+    log_attempt "$ROLE_L" "" "" "degraded" ""
     rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
-    return 0
+    # POLARITY FLIP (lr-7047bf, INV-1): return a distinct non-zero (3) so a
+    # degraded emission is never indistinguishable from success. See the
+    # matching comment at the full-chain-failure return below for the full
+    # rationale -- same defect class, same function, same fix.
+    return 3
   fi
 
   ATTEMPT=0
@@ -1551,6 +1556,19 @@ walk_chain() {
     fi
     emit_degraded "$MODE" "all chain steps failed for role $ROLE_L"
     log_attempt "$ROLE_L" "" "" "degraded" ""
+    rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
+    # POLARITY FLIP (lr-7047bf, INV-1): walk_chain used to return 0 on this
+    # path -- every chain step failed, emit_degraded wrote a degraded
+    # envelope, and the caller's `if EXIT_CODE -eq 0` read that as success.
+    # This is the highest-leverage fix in the class: a distinct non-zero
+    # status (3, chosen to be disjoint from the invoke_* contract's 0/124/127
+    # at :1063-1065) makes the degraded outcome visible on the SAME channel
+    # every caller already checks, instead of requiring every caller to
+    # separately parse the payload to learn what the exit status could have
+    # told it directly. A consumer that wants the old permissive behavior
+    # (proceed on a degraded envelope) must now write `|| true` explicitly --
+    # an invisible default becomes a reviewable line of diff.
+    return 3
   fi
   rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
   return 0
