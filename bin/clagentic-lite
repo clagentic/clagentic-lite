@@ -146,7 +146,7 @@ SHIM_VERSION="v3"
 
 # Claude Code artifact version markers. Bump when the corresponding template
 # changes so `clagentic-lite update` re-stamps enrolled repos automatically.
-CLAUDE_SETTINGS_VERSION="v5"
+CLAUDE_SETTINGS_VERSION="v6"
 # CLAUDE_MD_VERSION is retired — replaced by three narrower constants below.
 # The variable is kept as a tombstone so doctor/update version-compare calls
 # against old installed files continue to work during the transition period.
@@ -271,6 +271,51 @@ stamp_shim() {
   return 0
 }
 
+# _render_claude_settings TEMPLATE_FILE > stdout
+# Shared renderer for .claude/settings.json, used by all three stamp sites
+# (git-repo enroll, git-repo restamp, wrapper). Substitutes
+# __CLAGENTIC_LITE_HOME__ and __CLAGENTIC_ROUTER_ENV_BLOCK__ (the sentinel
+# line claude-settings.template carries right after its $comment header).
+#
+# Router env block is emitted ONLY when CLAGENTIC_ROUTER_URL is set —
+# unset is the default and must be byte-for-byte identical to the pre-router
+# template output, so the sentinel line is DELETED (not replaced with an
+# empty line) when unset. sed one-liner substitution cannot conditionally
+# delete-or-multiline-replace a single line, so this reads the template
+# line-by-line, mirroring the established pattern in _stamp_wrapper_claude_md.
+#
+# ANTHROPIC_AUTH_TOKEN (not ANTHROPIC_API_KEY) is stamped because Claude Code
+# sends that variable as `Authorization: Bearer <token>`, which is one of the
+# two header forms clagentic-router's routed-mode auth accepts (the other is
+# x-api-key) — see share/config.example's router section for the full
+# citation trail. CLAGENTIC_ROUTER_TOKEN may be empty (e.g. a passthrough-only
+# setup); the env block still stamps ANTHROPIC_AUTH_TOKEN with an empty value
+# in that case rather than omitting the key, so `clagentic-lite doctor` and a
+# human reading settings.json see explicitly that no token is configured
+# instead of silently missing the key.
+_render_claude_settings() {
+  _rcs_template="$1"
+  _rcs_router_url="${CLAGENTIC_ROUTER_URL:-}"
+
+  while IFS= read -r _rcs_line || [ -n "$_rcs_line" ]; do
+    case "$_rcs_line" in
+      *__CLAGENTIC_ROUTER_ENV_BLOCK__*)
+        if [ -n "$_rcs_router_url" ]; then
+          printf '  "env": {\n'
+          printf '    "ANTHROPIC_BASE_URL": "%s",\n' "$_rcs_router_url"
+          printf '    "ANTHROPIC_AUTH_TOKEN": "%s"\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
+          printf '  },\n'
+        fi
+        # Router URL unset: emit nothing — the sentinel line is dropped
+        # entirely, restoring byte-identical output to the pre-router template.
+        ;;
+      *)
+        printf '%s\n' "$_rcs_line" | sed "s|__CLAGENTIC_LITE_HOME__|$CLAGENTIC_LITE_HOME|g"
+        ;;
+    esac
+  done < "$_rcs_template"
+}
+
 # Stamp a wrapper-flavored CLAUDE.md into a non-git wrapper directory.
 # Args: WRAPPER_DIR  ENROLLED_REPOS (space-separated absolute paths)
 # Note: Claude Code lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse,
@@ -377,11 +422,12 @@ _stamp_wrapper_settings() {
     fi
   fi
 
-  # Generate settings.json from the shared template, but replace the $comment
+  # Generate settings.json from the shared template (router env block
+  # included when CLAGENTIC_ROUTER_URL is set), then replace the $comment
   # value so it identifies this as a wrapper-settings file (version: v1).
-  sed -e "s|__CLAGENTIC_LITE_HOME__|$CLAGENTIC_LITE_HOME|g" \
-      -e "s|clagentic-settings-version: v[^ ]*|clagentic-wrapper-settings-version: $CLAUDE_WRAPPER_SETTINGS_VERSION|g" \
-      "$_sws_template" > "$_sws_target"
+  _render_claude_settings "$_sws_template" \
+    | sed "s|clagentic-settings-version: v[^ ]*|clagentic-wrapper-settings-version: $CLAUDE_WRAPPER_SETTINGS_VERSION|g" \
+    > "$_sws_target"
 
   # Symlink commands/ so slash commands are available in wrapper sessions.
   ln -sfn "$CLAGENTIC_LITE_HOME/.claude/commands" "$_sws_claude_dir/commands"
@@ -1025,7 +1071,7 @@ _enroll_one() {
     fi
 
     if [ -n "$_claude_dir" ]; then
-      sed "s|__CLAGENTIC_LITE_HOME__|$CLAGENTIC_LITE_HOME|g" "$_claude_settings_template" > "$_cs_target"
+      _render_claude_settings "$_claude_settings_template" > "$_cs_target"
 
       # Symlink commands/ — markdown only, no path traversal.
       ln -sfn "$CLAGENTIC_LITE_HOME/.claude/commands" "$_claude_dir/commands"
@@ -1693,6 +1739,46 @@ cmd_doctor() {
     printf '       See AGENTS.md Invariants INV-2 and docs/DESIGN.md "The five roles" for the known limitation.\n'
   fi
 
+  # 9c. clagentic-router reachability probe. Silent (no output at all) when
+  # CLAGENTIC_ROUTER_URL is unset — this is the operator's primary validation
+  # tool for the router integration on a real machine, so failure output names
+  # the exact URL probed and what to check, not a bare ok/fail.
+  if [ -n "${CLAGENTIC_ROUTER_URL:-}" ]; then
+    printf '\nclagentic-router probe:\n'
+    _router_url="${CLAGENTIC_ROUTER_URL%/}"
+    _router_version_url="$_router_url/version"
+    if ! command -v curl >/dev/null 2>&1; then
+      printf '  WARN curl not on PATH — cannot probe %s\n' "$_router_version_url"
+      printf '       Install curl, or verify manually: curl %s\n' "$_router_version_url"
+    else
+      _router_probe_body=$(mktemp -t clagentic-doctor-router.XXXXXX)
+      _router_probe_http=$($DS_TIMEOUT_CMD 10 curl -s -o "$_router_probe_body" -w '%{http_code}' "$_router_version_url" 2>/dev/null)
+      _router_probe_rc=$?
+      if [ "$_router_probe_rc" -eq 0 ] && [ "$_router_probe_http" = "200" ]; then
+        _ok "clagentic-router reachable at $_router_url (GET /version -> 200)"
+        if [ -s "$_router_probe_body" ]; then
+          printf '       response: %s\n' "$(head -c 200 "$_router_probe_body" 2>/dev/null | tr -d '\n')"
+        fi
+      elif [ "$_router_probe_rc" -eq 0 ] && [ -n "$_router_probe_http" ]; then
+        _fail "clagentic-router at $_router_url responded but not with 200 (GET /version -> $_router_probe_http)"
+        printf '       Check that %s is actually a clagentic-router instance (not a different service on that port).\n' "$_router_url"
+      else
+        _fail "clagentic-router unreachable at $_router_url (GET /version — connection failed or timed out)"
+        printf '       Check that clagentic-router is running and listening at %s.\n' "$_router_url"
+        printf '       Start it from the clagentic-router checkout (see that repo'"'"'s README), then re-run '"'"'clagentic-lite doctor'"'"'.\n'
+        printf '       If CLAGENTIC_ROUTER_URL points at the wrong host/port, fix it in ~/.config/clagentic/config and re-run '"'"'clagentic-lite update'"'"'.\n'
+      fi
+      rm -f "$_router_probe_body"
+    fi
+    if [ -z "${CLAGENTIC_ROUTER_TOKEN:-}" ]; then
+      printf '  INFO CLAGENTIC_ROUTER_TOKEN is unset — routed-mode roles (role:<chain>) will fail auth; passthrough mode does not need it.\n'
+    fi
+    if [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" = "1" ]; then
+      printf '  INFO CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1 — reviewer/auditor/merge-gate agents install with model: role:<role>-chain in frontmatter.\n'
+      printf '       This injection point is UNVERIFIED against a live interactive session (claude-code GH#44385 territory). See README "Verifying on your machine".\n'
+    fi
+  fi
+
   # 10. Memory tunables.
   printf '\nmemory tunables:\n'
   _ok "CLAGENTIC_RECALL_LIMIT=${CLAGENTIC_RECALL_LIMIT:-5 (default)}"
@@ -1865,7 +1951,7 @@ _restamp_repo_artifacts() {
   if [ -f "$_ra_cs" ] && grep -q 'managed-by: clagentic' "$_ra_cs" 2>/dev/null; then
     _ra_cs_template="$SHARE_DIR/hook-shims/claude-settings.template"
     if [ -f "$_ra_cs_template" ]; then
-      sed "s|__CLAGENTIC_LITE_HOME__|$CLAGENTIC_LITE_HOME|g" "$_ra_cs_template" > "$_ra_cs"
+      _render_claude_settings "$_ra_cs_template" > "$_ra_cs"
       say "re-stamped${_ra_label}: $_ra_path/.claude/settings.json" >&2
       _ra_count=$((_ra_count+1))
     fi

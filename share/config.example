@@ -431,3 +431,57 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # When set, smoke.sh skips live LLM calls and substitutes a stub JSON envelope.
 # Use for in-session smoke runs or CI environments without LLM access.
 # Default: unset (live LLM calls enabled).
+
+# ---------- clagentic-router integration (optional) ----------
+# Opt-in only. Both keys unset (the default) is byte-for-byte identical to a
+# checkout without this section: no settings.json env block is stamped, no
+# doctor probe runs, no agent frontmatter is touched. See README.md
+# "Optional: clagentic-router integration" for the full setup walkthrough and
+# docs/DESIGN.md for why the interactive Agent-tool dispatch path needs a
+# router at all (the gap `CLAGENTIC_<ROLE>_CMD` alone cannot close).
+#
+# clagentic-router (github.com/clagentic/clagentic-router) is a separate,
+# optionally-run local proxy. It is not started, installed, or required by
+# clagentic-lite — you run it yourself if you want this integration.
+#
+# CLAGENTIC_ROUTER_URL: base URL of a running clagentic-router instance,
+# e.g. http://127.0.0.1:8765. When set, `clagentic-lite enroll`/`update`
+# stamps an `env` block into the enrolled repo's .claude/settings.json
+# (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN) so an INTERACTIVE Claude Code
+# session — not just gate-path LLM calls — routes through it. This is the
+# only channel that reaches the interactive session: clagentic-lite is not
+# Claude Code's parent process, so exporting the var at shell-startup time
+# reaches nothing.
+# CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765
+
+# CLAGENTIC_ROUTER_TOKEN: router inference token. Sent as
+# `Authorization: Bearer <token>` (ANTHROPIC_AUTH_TOKEN in the stamped
+# settings.json env block) — clagentic-router's routed-mode auth accepts
+# either that header or `x-api-key`; Claude Code sends the Bearer form for
+# ANTHROPIC_AUTH_TOKEN, so that is the variable clagentic-lite stamps. Must
+# match the `proxy.token` / CLAGENTIC_ROUTER_TOKEN the router itself was
+# started with (router.example.yaml, clagentic-router repo). Required
+# whenever CLAGENTIC_ROUTER_URL is set to a routed-mode chain (role:*); the
+# router's own passthrough mode does not check this token, but clagentic-lite
+# always stamps it when present so routed roles (reviewer/auditor by default)
+# work without a second manual step.
+# CLAGENTIC_ROUTER_TOKEN=
+
+# CLAGENTIC_ROUTER_INJECT_AGENT_MODEL: separate opt-in, OFF by default even
+# when CLAGENTIC_ROUTER_URL is set. Setting CLAGENTIC_ROUTER_URL alone gets
+# you the settings.json env-block passthrough and the doctor probe with zero
+# additional risk. This second key additionally renders a per-role-injected
+# copy of the reviewer/auditor/merge-gate subagent definitions (model:
+# role:<role>-chain in frontmatter, chain names matching clagentic-router's
+# router.example.yaml) and installs THAT rendered plugin instead of the
+# checked-in one — checked-in agent .md files under plugins/clagentic-lite/
+# are never modified on disk.
+#
+# UNVERIFIED: whether Claude Code actually honors a subagent frontmatter
+# `model:` field set to a non-standard string like "role:reviewer-chain" —
+# vs. silently ignoring it and falling back to the parent session's model —
+# has NOT been confirmed against a live interactive session from this
+# codebase (claude-code GH#44385 territory; see README "Verifying on your
+# machine" for the exact steps to confirm or refute this on a real machine).
+# Leave this key unset until you have run that verification once.
+# CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=0
