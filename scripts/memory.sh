@@ -85,6 +85,34 @@ cmd_log_turn() {
   SUMMARY="$1"
   TAGS="${2:-}"
   SOURCE="${3:-manual}"
+
+  # CHOKEPOINT DEGRADED GUARD (lr-7047bf, INV-1b, fold-in, BOBBIE finding 3):
+  # log-turn is the single sink every summarizer-role caller in this repo
+  # funnels through -- memory.sh's own cmd_summarize_turn, plus every
+  # external caller that pipes llm-client.sh's `summarize` output here
+  # (.claude/hooks/stop-summarize.sh, .claude/hooks/post-tool-nudge.sh).
+  # Requiring every CALLER to remember a degraded check is exactly the
+  # defect class this task closes -- a forgetful caller (twice, now,
+  # discovered in two separate hook files after this task's own gates.sh
+  # fix shipped) writes a fabricated summarizer-degraded banner into
+  # session memory as if it were real content. Rejecting the payload here,
+  # at the one place all of them write, makes the wrong form UNWRITABLE
+  # rather than merely discouraged -- callers should still skip the write
+  # themselves (cheaper, avoids a wasted round-trip through this function),
+  # but a caller that doesn't is now caught anyway, not just documented.
+  #
+  # Detection: emit_degraded's line-mode banner (llm-client.sh) is
+  # prefixed with DEGRADED_MARKER, a literal ASCII SOH byte (0x01,
+  # unforgeable by a real model response stream -- see llm-client.sh's own
+  # DEGRADED_MARKER comment for the full rationale). A real summary, manual
+  # pin, or seed-demo string can never legitimately start with this byte,
+  # so checking for it can never reject genuine content.
+  _lt_first_byte=$(printf '%s' "$SUMMARY" | head -c 1 | od -An -tx1 2>/dev/null | tr -d ' \n')
+  if [ "$_lt_first_byte" = "01" ]; then
+    echo "memory.sh log-turn: refusing to write a degraded-marked payload (source=$SOURCE) — not writing a fabricated summary" 1>&2
+    return 1
+  fi
+
   BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")  # pin to enrolled repo root, not $PWD
   TS=$(ds_date_iso)
   # CLAGENTIC_MEMORY_MAX_ROWS: opportunistic row cap (default 5000).

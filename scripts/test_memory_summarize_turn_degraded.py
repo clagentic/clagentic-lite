@@ -224,5 +224,109 @@ class TestBenignNoChainSkipIsUnaffected(unittest.TestCase):
         )
 
 
+def _run_log_turn(summary, tags="", source="manual"):
+    """Run the REAL `memory.sh log-turn` against a scratch repo/DB. Returns
+    (returncode, stdout, stderr, turns_row_count, turns_summaries)."""
+    tmpdir = tempfile.mkdtemp(prefix="clagentic-test-logturn-chokepoint-")
+    try:
+        repo_dir = os.path.join(tmpdir, "repo")
+        os.makedirs(repo_dir)
+        _init_scratch_repo(repo_dir)
+
+        env = dict(os.environ)
+        env["CLAGENTIC_PROJECT_ROOT"] = repo_dir
+        env["CLAGENTIC_LITE_HOME"] = os.path.join(tmpdir, "clagentic-home")
+
+        r = subprocess.run(
+            ["sh", MEMORY_SH, "log-turn", summary, tags, source],
+            capture_output=True,
+            text=True,
+            cwd=repo_dir,
+            env=env,
+        )
+
+        db_path = os.path.join(repo_dir, ".clagentic", "lite", "memory.db")
+        row_count = 0
+        summaries = []
+        if os.path.exists(db_path):
+            conn = sqlite3.connect(db_path)
+            try:
+                cur = conn.execute("SELECT summary FROM turns")
+                summaries = [row[0] for row in cur.fetchall()]
+                row_count = len(summaries)
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                conn.close()
+
+        return r.returncode, r.stdout, r.stderr, row_count, summaries
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestLogTurnChokepointRejectsADegradedMarkedPayload(unittest.TestCase):
+    """BOBBIE finding 3 (lr-7047bf fold-in, PR #141 review #2): log-turn is
+    the single sink every summarizer-role caller in this repo funnels
+    through -- memory.sh's own cmd_summarize_turn (already exercised above,
+    which never reaches log-turn on a degraded chain), plus every EXTERNAL
+    caller (.claude/hooks/stop-summarize.sh, .claude/hooks/post-tool-
+    nudge.sh) that pipes llm-client.sh's `summarize` output here directly.
+    Requiring every caller to remember its own degraded check is the exact
+    defect class this task closes -- discovered twice, in two separate
+    hook files, after cmd_adversarial's own in-process fix shipped. This
+    class proves the chokepoint itself: log-turn refuses to write a
+    payload carrying the unforgeable DEGRADED_MARKER byte (0x01), no
+    matter which caller handed it one -- making the wrong form unwritable
+    at the one place they all converge, not just documented per-caller."""
+
+    def test_marker_prefixed_summary_is_rejected_not_written(self):
+        degraded_payload = "\x01[clagentic-lite degraded] all chain steps failed for role summarizer"
+        rc, out, err, row_count, summaries = _run_log_turn(degraded_payload)
+        self.assertEqual(
+            row_count, 0,
+            f"log-turn must refuse to write a payload carrying the "
+            f"DEGRADED_MARKER byte -- a caller that forgets its own "
+            f"degraded check must still be caught here. rows written: "
+            f"{summaries!r}. stdout={out!r} stderr={err!r}",
+        )
+
+    def test_marker_prefixed_summary_returns_nonzero(self):
+        degraded_payload = "\x01[clagentic-lite degraded] all chain steps failed for role summarizer"
+        rc, out, err, row_count, summaries = _run_log_turn(degraded_payload)
+        self.assertNotEqual(
+            rc, 0,
+            f"log-turn must signal refusal via a nonzero exit, not silently "
+            f"no-op. stdout={out!r} stderr={err!r}",
+        )
+        self.assertIn(
+            "degraded", err.lower(),
+            f"the refusal must be visible on stderr. stderr={err!r}",
+        )
+
+    def test_a_real_summary_that_merely_mentions_the_word_degraded_is_still_written(self):
+        """Negative control, mirroring the marker-byte hardening's own
+        injection-resistance property (BOBBIE finding 1): the chokepoint
+        keys on the leading CONTROL BYTE, not the word "degraded" anywhere
+        in the text -- a real, legitimate summary that happens to discuss
+        a degraded chain (e.g. session notes about debugging this very
+        feature) must not be silently dropped just because it contains
+        that word."""
+        real_payload = "session summary: investigated why the summarizer chain degraded under load"
+        rc, out, err, row_count, summaries = _run_log_turn(real_payload)
+        self.assertEqual(
+            row_count, 1,
+            f"a real summary containing the word 'degraded' (but no marker "
+            f"byte) must still be written -- the chokepoint must not "
+            f"pattern-match on banner text. rows written: {summaries!r}. "
+            f"stdout={out!r} stderr={err!r}",
+        )
+        self.assertEqual(summaries[0], real_payload)
+
+    def test_a_normal_summary_is_unaffected(self):
+        rc, out, err, row_count, summaries = _run_log_turn("refactored the widget loader")
+        self.assertEqual(rc, 0, f"stdout={out!r} stderr={err!r}")
+        self.assertEqual(row_count, 1, f"summaries={summaries!r}")
+
+
 if __name__ == "__main__":
     unittest.main()
