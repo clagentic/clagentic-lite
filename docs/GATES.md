@@ -114,15 +114,26 @@ than one candidate are both failures, reported distinctly (never a silent
 first-or-last pick) — see that function's own doc comment for the full
 contract.
 
-**Reviewer tool restriction.** When the resolved chain step is `claude`, the
-Reviewer role's `claude --print` invocation carries `--allowedTools
-Read,Grep,Glob --disallowedTools Bash` — it keeps Read/Grep/Glob (its prompt
-mandates caller-tracing and import-checking) but loses Bash (nothing in its
-prompt asks it to execute anything, and a `--print` reviewer holding
-unrestricted Bash while reading an attacker-influenceable diff is a
-prompt-injection-to-execution path). Scoped to the Reviewer only — the
-Auditor, Merge Gate, Builder, and Summarizer are unaffected. Not
-independently enforceable against `codex` (no equivalent flag).
+**Reviewer tool restriction.** The Reviewer's LLM invocation loses shell
+execution on both shipped CLIs. When the resolved chain step is `claude`,
+`claude --print` carries `--allowedTools Read,Grep,Glob --disallowedTools
+Bash` — it keeps Read/Grep/Glob (its prompt mandates caller-tracing and
+import-checking) but loses Bash. When the resolved chain step is `codex`,
+`codex exec` carries `--disable shell_tool -s read-only` — verified against
+the installed CLI (codex-cli 0.142.5) to remove the model's shell-execution
+tool while preserving file reads (`-s read-only` additionally closes
+codex's separate `apply_patch` file-write tool, which `--disable shell_tool`
+alone does not gate). Both closures exist for the same reason: nothing in
+the Reviewer's prompt asks it to execute anything, and a `--print`/`exec`
+reviewer holding unrestricted Bash while reading an attacker-influenceable
+diff is a prompt-injection-to-execution path. Scoped to the Reviewer (and,
+as of lr-8a28e0, the Auditor's chain-step invocation — see Gate 5 below) —
+the Merge Gate, Builder, and Summarizer are unaffected. Still not
+enforceable when the resolved chain step is a third CLI outside claude/
+codex (`invoke_generic`, no restriction mechanism at all), or when the
+installed codex predates `CODEX_MIN_VERSION` (the tool-restriction flags are
+only applied on codex's version-gated, confirmed flag-surface path) —
+`walk_chain` prints a loud stderr warning in either remaining case.
 
 ### Reviewer-consulted deferrals
 
@@ -646,6 +657,10 @@ A pattern-file change is also detected and forces a full scan regardless of the 
 The Auditor argues, in concrete terms, how a hostile user could exploit each new or modified input surface. Cites file:line. Names threats with CWE if obvious. If nothing is exploitable, says so in one sentence and lists the surfaces considered.
 
 The Auditor prompt (`plugins/clagentic-lite/agents/auditor.md`, and the `ds_adversarial_prompt` heredoc in `scripts/llm-client.sh` — both surfaces carry the same material, since a non-Claude CLI chain step never has the agent `.md` file in context) carries a Pre-Report Gate, severity calibration, and a false-positive list, mirroring the Reviewer's (Gate 3). This exists because an uncalibrated adversarial pass is the dominant cause of repeated review bounces: real-but-unexploitable findings — a vulnerable-looking function nothing calls, a CWE pattern-match with no named attacker input — carried the same blocking weight as a live exposure. See "Reachability requirement" below for the mechanism that fixes this.
+
+**Auditor tool restriction (lr-8a28e0).** This gate's LLM invocation (the `TOOL_ROLE=auditor` chain step reached via `cmd_adversarial`, `scripts/gates.sh`) receives ONLY a diff on stdin (`ds_adversarial_prompt`) and never invokes `gitleaks`/`semgrep`/`osv-scanner` itself — those are Gate 4's deterministic sub-gates, run directly by `gates.sh`'s own shell code, independent of any LLM call (AGENTS.md §4: "Do not add LLM calls to the blocking path of any security check"). Because this specific invocation has no genuine execution need, it now carries the SAME Read/Grep/Glob-no-Bash restriction Gate 3 applies to the Reviewer — on `claude`, `--allowedTools Read,Grep,Glob --disallowedTools Bash`; on `codex`, `--disable shell_tool -s read-only` — via the same `ds_llm_role_is_bash_unrestricted` predicate (`scripts/platform.sh`) both roles now share.
+
+**This does NOT restrict `plugins/clagentic-lite/agents/auditor.md`**, the separate interactive Claude Code subagent a human/session invokes directly to actually run `gitleaks protect`/`osv-scanner`/`semgrep` and narrate their output. That subagent's Bash access is governed by Claude Code's own subagent `tools:` frontmatter (a security-tool-scoped allowlist, not a blanket grant) — a structurally different mechanism from `--allowedTools`/`--disallowedTools` on `claude --print`/`codex exec`, untouched by `ds_llm_role_is_bash_unrestricted` or by this restriction. The two "Auditor" names in this repo cover genuinely different invocation surfaces with genuinely different execution needs; conflating them was the accident lr-8a28e0 corrects, not a reason to restrict the subagent too.
 
 ### Exit codes for `gates.sh adversarial`
 

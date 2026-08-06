@@ -15,6 +15,23 @@ semgrep x2, git push, gh pr view, gh pr create) now runs through the
 run_bounded wrapper, and $DS_TIMEOUT_CMD (scripts/platform.sh) can never
 resolve to a silent-unbounded no-op.
 
+ALSO COVERS INV-5 (lr-37282a/lr-8a28e0, extended same-PR by a PEACHES
+fold-in, PR #144 review comment 5207862165): every reviewer-capable
+`invoke_*` carrier in scripts/llm-client.sh either consults ds_llm_role_is_
+bash_unrestricted (platform.sh) to decide its own tool-restriction flags,
+or is a KNOWN-exempt carrier (invoke_generic: no CLI-specific flag surface
+at all; invoke_step: the dispatcher, not a carrier) -- AND walk_chain's own
+per-call unrestricted-CLI warning is driven by that SAME predicate, never a
+hardcoded per-role literal comparison (the shape that let "auditor" fall
+silently out of warning coverage the moment it moved onto the restricted
+side, since the restriction propagated via the shared predicate but the
+warning's own hardcoded `ROLE_L == "reviewer"` guard did not). Discovery is
+by `git ls-files`-driven regex over the tracked llm-client.sh content, not
+a hardcoded function-name/role-name list -- a third `invoke_*` carrier, or
+a future role moved onto the restricted side, trips this sweep the day it
+happens, the same "per-CLI fix without the sweep is the instance-fixing
+pattern" property INV-1b/INV-4 already establish for their own classes.
+
 Run with: python3 -m unittest scripts.test_invariants -v
 """
 import os
@@ -25,6 +42,7 @@ import unittest
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
 PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
+LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
 
 # ---------------------------------------------------------------------- #
 # INV-4: every external-process invocation carries an explicit wall-clock
@@ -529,6 +547,350 @@ class TestDsPositiveIntOrDefaultRejectsZero(unittest.TestCase):
         out, rc = self._run("-5", "120")
         self.assertEqual(rc, 0)
         self.assertEqual(out, "120", f"stdout={out!r}")
+
+
+# ---------------------------------------------------------------------- #
+# INV-5: every reviewer-capable invoke_* carrier consults the SAME
+# Bash-restriction predicate; no carrier silently omits the check.
+# ---------------------------------------------------------------------- #
+
+# Discovers `invoke_<name>() {` function definitions at statement start in
+# the tracked llm-client.sh source -- not a hardcoded list of "invoke_claude,
+# invoke_codex", so a fourth carrier (e.g. invoke_gemini) is picked up the
+# day someone adds it, per the class-level bar this task sets.
+_INVOKE_FUNC_DEF_RE = re.compile(r'^invoke_(\w+)\(\)\s*\{')
+
+# A carrier is considered to "apply the restriction mechanism" if its own
+# function body (from its def line to the matching top-level closing brace)
+# calls ds_llm_role_is_bash_unrestricted -- the single source of truth both
+# invoke_claude and invoke_codex consult (platform.sh). Two KNOWN
+# exemptions, each asserted explicitly below rather than silently excluded
+# from the sweep:
+#   generic -- invoke_generic (the invoke_<CLI> naming pattern) has no
+#     CLI-specific flag surface to restrict at all: a bare `<cli> -p -`
+#     pipe for an arbitrary third-party binary. Covered instead by
+#     walk_chain's own per-call warning when a reviewer chain step
+#     resolves to a CLI outside claude/codex.
+#   step -- invoke_step (scripts/llm-client.sh) matches the same
+#     `invoke_(\w+)()` discovery regex but is NOT a per-CLI carrier at
+#     all -- it is the DISPATCHER that routes to invoke_claude/
+#     invoke_codex/invoke_generic by CLI name (see its own case statement).
+#     It has no role/tool-restriction decision of its own to make; its
+#     callees are what this sweep actually verifies, one function down.
+_KNOWN_UNRESTRICTABLE_CARRIERS = {"generic", "step"}
+
+
+def _iter_llm_client_sh_lines_raw():
+    with open(LLM_CLIENT_SH, encoding="utf-8") as f:
+        return f.readlines()
+
+
+def _discover_invoke_carriers(lines):
+    """Returns {carrier_name: function_body_text} for every invoke_* def
+    found via git-ls-files-tracked source, brace-counted to its own closing
+    line (mirrors test_invariants.py's own ds_timeout_missing brace-count
+    technique above, reused rather than reimplemented)."""
+    carriers = {}
+    i = 0
+    while i < len(lines):
+        m = _INVOKE_FUNC_DEF_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        start = i
+        depth = 0
+        end = None
+        for j in range(start, len(lines)):
+            depth += lines[j].count('{') - lines[j].count('}')
+            if depth == 0 and j > start:
+                end = j
+                break
+        if end is None:
+            i += 1
+            continue
+        carriers[name] = "".join(lines[start:end + 1])
+        i = end + 1
+    return carriers
+
+
+class TestEveryInvokeCarrierConsultsTheSharedBashRestrictionPredicate(unittest.TestCase):
+    """INV-5: every invoke_* carrier in scripts/llm-client.sh must either
+    call ds_llm_role_is_bash_unrestricted (the single source of truth,
+    platform.sh) to decide its own tool-restriction flags, or be in the
+    explicitly-enumerated KNOWN-unrestrictable set (currently just
+    invoke_generic) -- a fourth carrier added later that omits BOTH is a
+    silent regression to the exact "per-CLI fix without the sweep" pattern
+    this task's class-level bar forbids."""
+
+    def setUp(self):
+        self.lines = _iter_llm_client_sh_lines_raw()
+        self.carriers = _discover_invoke_carriers(self.lines)
+
+    def test_sweep_discovers_at_least_the_known_carriers(self):
+        """Sanity check on discovery itself: if this ever finds fewer than
+        the three known carriers, the regex is broken (e.g. invoke_claude
+        was renamed) and the assertion below would vacuously pass with
+        incomplete coverage."""
+        self.assertGreaterEqual(
+            len(self.carriers), 3,
+            f"expected at least invoke_claude, invoke_codex, invoke_generic; "
+            f"found carriers={sorted(self.carriers)!r}",
+        )
+        for expected in ("claude", "codex", "generic"):
+            self.assertIn(
+                expected, self.carriers,
+                f"expected an invoke_{expected} carrier; found "
+                f"carriers={sorted(self.carriers)!r}",
+            )
+
+    def test_every_carrier_either_restricts_or_is_a_known_exemption(self):
+        violations = []
+        for name, body in self.carriers.items():
+            if name in _KNOWN_UNRESTRICTABLE_CARRIERS:
+                continue
+            if "ds_llm_role_is_bash_unrestricted" not in body:
+                violations.append(name)
+        self.assertEqual(
+            violations, [],
+            f"invoke_{{{','.join(violations)}}} defines a reviewer-capable "
+            f"carrier that never consults ds_llm_role_is_bash_unrestricted "
+            f"(platform.sh) -- this carrier can silently ship a Bash-"
+            f"unrestricted reviewer/auditor call with no restriction "
+            f"mechanism and no known-exemption entry. Either wire the "
+            f"predicate in (mirroring invoke_claude/invoke_codex) or add "
+            f"the carrier name to _KNOWN_UNRESTRICTABLE_CARRIERS above "
+            f"with a comment explaining why it is genuinely exempt.",
+        )
+
+    def test_known_unrestrictable_carriers_are_actually_unrestrictable(self):
+        """The flip side of the assertion above: a carrier listed as a
+        KNOWN exemption must not have quietly grown a restriction call
+        without this test's own allowlist being updated to match -- proves
+        the exemption list is current, not stale."""
+        for name in _KNOWN_UNRESTRICTABLE_CARRIERS:
+            if name not in self.carriers:
+                continue
+            self.assertNotIn(
+                "ds_llm_role_is_bash_unrestricted", self.carriers[name],
+                f"invoke_{name} is listed as a KNOWN-unrestrictable "
+                f"exemption but its body now calls "
+                f"ds_llm_role_is_bash_unrestricted -- update "
+                f"_KNOWN_UNRESTRICTABLE_CARRIERS (remove {name!r}) so this "
+                f"sweep's positive-control assertion above actually covers "
+                f"it going forward.",
+            )
+
+
+class TestSweepCatchesASiblingCarrierMissingTheRestrictionCall(unittest.TestCase):
+    """Proves the sweep actually catches what it claims to, using a
+    synthetic sibling invoke_* function written in the exact
+    forgot-the-predicate shape a future third-CLI carrier could ship."""
+
+    _MISSING_PREDICATE_FIXTURE = (
+        'invoke_gemini() {\n'
+        '  MODEL="$1"; PROMPT_FILE="$2"\n'
+        '  gemini exec "$MODEL" < "$PROMPT_FILE"\n'
+        '}\n'
+    )
+
+    _WIRED_PREDICATE_FIXTURE = (
+        'invoke_gemini() {\n'
+        '  MODEL="$1"; PROMPT_FILE="$2"; TOOL_ROLE="${3:-}"\n'
+        '  FLAGS=""\n'
+        '  if ! ds_llm_role_is_bash_unrestricted "$TOOL_ROLE"; then\n'
+        '    FLAGS="--no-shell"\n'
+        '  fi\n'
+        '  gemini exec $FLAGS "$MODEL" < "$PROMPT_FILE"\n'
+        '}\n'
+    )
+
+    def test_flags_a_carrier_missing_the_predicate_call(self):
+        lines = self._MISSING_PREDICATE_FIXTURE.splitlines(keepends=True)
+        carriers = _discover_invoke_carriers(lines)
+        self.assertIn("gemini", carriers, f"carriers={carriers!r}")
+        self.assertNotIn("ds_llm_role_is_bash_unrestricted", carriers["gemini"])
+
+    def test_does_not_flag_a_carrier_with_the_predicate_wired_in(self):
+        lines = self._WIRED_PREDICATE_FIXTURE.splitlines(keepends=True)
+        carriers = _discover_invoke_carriers(lines)
+        self.assertIn("gemini", carriers, f"carriers={carriers!r}")
+        self.assertIn("ds_llm_role_is_bash_unrestricted", carriers["gemini"])
+
+
+# ---------------------------------------------------------------------- #
+# INV-5 (extended), PEACHES fold-in (PR #144 review, comment 5207862165):
+# the unrestricted-Bash WARNING must be driven by the SAME predicate that
+# decides the RESTRICTION, so a role moved onto the restricted side is
+# covered by construction, not by remembering to also touch the warning's
+# own gate condition.
+# ---------------------------------------------------------------------- #
+#
+# THE DEFECT THIS CLOSES: walk_chain's tool-restriction predicate
+# (ds_llm_role_is_bash_unrestricted) decided WHICH roles get restricted
+# flags, but the loud stderr warning covering the case where a chain step
+# resolves to a CLI/version the restriction cannot actually reach (a
+# non-claude/non-current-codex CLI) was hardcoded to `ROLE_L == "reviewer"`
+# only. When lr-8a28e0 moved "auditor" onto the restricted side, the
+# restriction propagated (invoke_claude/invoke_codex both consult the
+# predicate) but the WARNING did not -- an auditor chain step resolving to
+# an old/unversioned codex ran with genuinely unrestricted Bash and NO
+# diagnostic, the exact silent-unrestricted shape lr-8a28e0 exists to
+# prevent. This is a control/disclosure PAIR (PEACHES's framing): a fix
+# that updates one half without the other reopens the hole for any role
+# not present when the pair was first wired.
+#
+# THE MECHANICAL CHECK: extract walk_chain's warning-condition block from
+# the tracked llm-client.sh source (anchored on the distinguishing
+# "UNRESTRICTABLE-CLI" marker comment this block carries) and assert its
+# GUARDING condition invokes ds_llm_role_is_bash_unrestricted -- not a
+# bare `[ "$ROLE_L" = "<literal-role-name>" ]` comparison, which is
+# exactly the shape that silently stopped covering auditor. A per-role
+# literal comparison anywhere in the guarding condition is the instance-
+# fixing pattern this sweep exists to forbid recurring.
+_WALK_CHAIN_WARNING_BLOCK_START_RE = re.compile(r'UNRESTRICTABLE-CLI, FAIL-SAFE-NOT-SILENT')
+# A bare positional-parameter string-equality test against a role literal,
+# e.g. `[ "$ROLE_L" = "reviewer" ]` or `[ "$ROLE_L" = "auditor" ]` -- the
+# exact shape of the pre-fix hardcoded gate. Deliberately does NOT flag
+# `[ "$CLI" != "claude" ]` (a CLI-name comparison, not a role-name one --
+# unrelated to which roles the warning covers) or a `case "$ROLE_L" in
+# reviewer|auditor)` construct (walk_chain's SEPARATE role-sanity-check
+# block, a few lines below the warning block this sweep targets, which
+# has its own distinct purpose -- flagging an unrecognized role literal --
+# and is not part of this invariant).
+_ROLE_LITERAL_EQUALITY_RE = re.compile(r'\$ROLE_L"?\s*=\s*"(?:reviewer|auditor|gate|builder|summarizer)"')
+
+
+def _extract_walk_chain_warning_block(lines):
+    """Returns the warning-condition block's text (from its distinguishing
+    anchor comment through the closing `fi` of the outer `if` it opens),
+    or None if the anchor is not found -- callers must treat None as a
+    sweep-discovery failure, not a vacuous pass."""
+    start = None
+    for i, line in enumerate(lines):
+        if _WALK_CHAIN_WARNING_BLOCK_START_RE.search(line):
+            start = i
+            break
+    if start is None:
+        return None
+    # Find the first `if` after the anchor comment (the guarding
+    # condition itself), then brace/fi-count to its matching close. This
+    # block uses `if`/`fi`, not `{`/`}` -- POSIX sh conditional, not a
+    # function body -- so the counting primitive differs from
+    # _discover_invoke_carriers' brace count above.
+    if_start = None
+    for i in range(start, len(lines)):
+        if re.match(r'^\s*if\s', lines[i]):
+            if_start = i
+            break
+    if if_start is None:
+        return None
+    depth = 0
+    end = None
+    for i in range(if_start, len(lines)):
+        # Count opens/closes of if/fi pairs (nested ifs inside this block
+        # are expected -- the codex-vs-other-CLI branches are themselves
+        # nested `if`s).
+        depth += len(re.findall(r'(?:^|\s)if\s', lines[i]))
+        depth -= len(re.findall(r'(?:^|\s)fi(?:\s|$)', lines[i]))
+        if depth == 0 and i > if_start:
+            end = i
+            break
+    if end is None:
+        return None
+    return "".join(lines[if_start:end + 1])
+
+
+class TestUnrestrictedCliWarningIsDrivenByTheSharedPredicate(unittest.TestCase):
+    """PEACHES fold-in (PR #144 review): walk_chain's unrestricted-Bash
+    warning must consult ds_llm_role_is_bash_unrestricted, the SAME
+    predicate that gates the restriction itself -- never a hardcoded
+    per-role string literal, which is exactly the shape that silently
+    stopped covering auditor when lr-8a28e0 moved it onto the restricted
+    side without this file's warning gate being updated to match."""
+
+    def setUp(self):
+        self.lines = _iter_llm_client_sh_lines_raw()
+        self.block = _extract_walk_chain_warning_block(self.lines)
+
+    def test_sweep_finds_the_warning_block(self):
+        """Sanity check on discovery itself: if the anchor comment is
+        ever removed or reworded, this test fails loudly instead of the
+        assertion below vacuously passing on an empty/None block."""
+        self.assertIsNotNone(
+            self.block,
+            "could not locate walk_chain's unrestricted-CLI warning block "
+            "via its UNRESTRICTABLE-CLI anchor comment in llm-client.sh -- "
+            "either the anchor was renamed (update "
+            "_WALK_CHAIN_WARNING_BLOCK_START_RE to match) or the warning "
+            "block itself was removed (which would silently reopen this "
+            "invariant)",
+        )
+
+    def test_warning_block_consults_the_shared_predicate(self):
+        self.assertIn(
+            "ds_llm_role_is_bash_unrestricted", self.block or "",
+            "walk_chain's unrestricted-CLI warning block does not consult "
+            "ds_llm_role_is_bash_unrestricted -- if it instead hardcodes "
+            "which role(s) get this warning, a future role moved onto the "
+            "restricted side (the way auditor was under lr-8a28e0) will "
+            "silently lose warning coverage the same way auditor did "
+            "before this fix (PEACHES, PR #144 review, comment 5207862165)",
+        )
+
+    def test_warning_block_has_no_hardcoded_role_literal_guard(self):
+        hits = _ROLE_LITERAL_EQUALITY_RE.findall(self.block or "")
+        self.assertEqual(
+            hits, [],
+            f"walk_chain's unrestricted-CLI warning block contains a "
+            f"hardcoded role-literal equality guard ({hits!r}) -- this is "
+            f"the exact shape (`[ \"$ROLE_L\" = \"reviewer\" ]`) that let "
+            f"auditor silently fall out of warning coverage when it moved "
+            f"onto the restricted side; the guard must be the shared "
+            f"predicate, not a per-role literal comparison",
+        )
+
+
+class TestSweepCatchesAHardcodedRoleLiteralWarningGuard(unittest.TestCase):
+    """Proves the sweep actually catches what it claims to, using a
+    synthetic sibling warning block written in the exact hardcoded-
+    single-role shape the real code had before this fold-in."""
+
+    _HARDCODED_FIXTURE = (
+        '  while IFS= read -r STEP; do\n'
+        '    # UNRESTRICTABLE-CLI, FAIL-SAFE-NOT-SILENT (test fixture)\n'
+        '    if [ "$ROLE_L" = "reviewer" ] && [ "$CLI" != "claude" ]; then\n'
+        '      printf \'WARN\\n\' 1>&2\n'
+        '    fi\n'
+        '  done\n'
+    )
+
+    _PREDICATE_DRIVEN_FIXTURE = (
+        '  while IFS= read -r STEP; do\n'
+        '    # UNRESTRICTABLE-CLI, FAIL-SAFE-NOT-SILENT (test fixture)\n'
+        '    if ! ds_llm_role_is_bash_unrestricted "$ROLE_L"; then\n'
+        '      if [ "$CLI" != "claude" ]; then\n'
+        '        printf \'WARN\\n\' 1>&2\n'
+        '      fi\n'
+        '    fi\n'
+        '  done\n'
+    )
+
+    def test_flags_the_hardcoded_role_literal_guard(self):
+        lines = self._HARDCODED_FIXTURE.splitlines(keepends=True)
+        block = _extract_walk_chain_warning_block(lines)
+        self.assertIsNotNone(block, "sweep failed to locate the fixture's warning block at all")
+        hits = _ROLE_LITERAL_EQUALITY_RE.findall(block)
+        self.assertNotEqual(hits, [], f"sweep failed to flag the hardcoded guard; block={block!r}")
+        self.assertNotIn("ds_llm_role_is_bash_unrestricted", block)
+
+    def test_does_not_flag_the_predicate_driven_guard(self):
+        lines = self._PREDICATE_DRIVEN_FIXTURE.splitlines(keepends=True)
+        block = _extract_walk_chain_warning_block(lines)
+        self.assertIsNotNone(block, "sweep failed to locate the fixture's warning block at all")
+        hits = _ROLE_LITERAL_EQUALITY_RE.findall(block)
+        self.assertEqual(hits, [], f"violations={hits!r}")
+        self.assertIn("ds_llm_role_is_bash_unrestricted", block)
 
 
 if __name__ == "__main__":
