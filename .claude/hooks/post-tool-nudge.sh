@@ -189,13 +189,18 @@ if [ "${CLAGENTIC_DISABLE_AUTOSUMMARIZE:-0}" != "1" ] && [ -n "$REPO_ROOT" ]; th
           # reports head's status (and blanks DIGEST on ANY failure, status
           # or not, which also silently hid a real error as if it were the
           # ordinary "too short to bother" case).
+          # ALL THREE degraded exit statuses checked explicitly (lr-49df97
+          # fold-in, HOLDEN "also verify" item): see stop-summarize.sh's
+          # identical comment -- a bare `-eq 3` here was only ever
+          # accidentally correct for statuses 4/5 via the cause-agnostic
+          # text-marker grep, not because this status check recognized them.
           _ptn_status=0
           if [ -n "${DS_TIMEOUT_CMD:-}" ]; then
             _ptn_raw=$(printf '%s' "$OUTPUT" | $DS_TIMEOUT_CMD 10 "$_summarize_cmd" summarize 2>/dev/null) || _ptn_status=$?
           else
             _ptn_raw=$(printf '%s' "$OUTPUT" | "$_summarize_cmd" summarize 2>/dev/null) || _ptn_status=$?
           fi
-          if [ "$_ptn_status" -eq 3 ] || printf '%s' "$_ptn_raw" | grep -qF '[clagentic-lite degraded]'; then
+          if [ "$_ptn_status" -eq 3 ] || [ "$_ptn_status" -eq 4 ] || [ "$_ptn_status" -eq 5 ] || printf '%s' "$_ptn_raw" | grep -qF '[clagentic-lite degraded]'; then
             # A genuinely degraded summarizer chain: do not write a
             # fabricated digest to memory, and do not surface it to the
             # user via additionalContext either -- mirrors memory.sh

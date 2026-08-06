@@ -283,14 +283,26 @@ cmd_summarize_turn() {
   # a missing summary is correct, a fabricated one is not — and log the
   # failure to stderr so it is visible without being written to persistent
   # memory. This mirrors the "surfaced, not silent; not written as data"
-  # posture gates.sh uses for its own degraded consumers. The status check
-  # (-eq 3) is the primary signal; the text-marker check is defense in depth
-  # only, for the (currently theoretical, since cmd_summarize now propagates
-  # status faithfully) case of a caller path that loses the status but still
+  # posture gates.sh uses for its own degraded consumers.
+  #
+  # ALL THREE degraded exit statuses checked explicitly (lr-49df97 fold-in,
+  # HOLDEN "also verify" item): this used to test only `-eq 3`, and relied
+  # on the text-marker grep (below) to ALSO catch status 4 ("unwrap") and 5
+  # ("turns-exhausted") by accident -- emit_degraded's line-mode banner
+  # ("[clagentic-lite degraded] (CAUSE) ...") contains the same literal
+  # substring regardless of cause, so the grep happened to be cause-agnostic
+  # even though the status comparison next to it was not. That accident held
+  # for causes 3/4/5 only because emit_degraded's banner text was designed
+  # that way; a future new exit code is NOT guaranteed to share it, and
+  # nothing here would tell a reader that the status check itself was
+  # incomplete. Testing -eq 3/4/5 explicitly makes the intent (every
+  # walk_chain degraded outcome, not just "infra") visible in the code
+  # itself rather than only in this comment; the text-marker check remains
+  # as defense in depth for a caller path that loses the status but still
   # sees the payload.
   _szt_status=0
   SUMMARY=$("$TOOL_HOME/scripts/llm-client.sh" summarize) || _szt_status=$?
-  if [ "$_szt_status" -eq 3 ] || printf '%s' "$SUMMARY" | grep -qF '[clagentic-lite degraded]'; then
+  if [ "$_szt_status" -eq 3 ] || [ "$_szt_status" -eq 4 ] || [ "$_szt_status" -eq 5 ] || printf '%s' "$SUMMARY" | grep -qF '[clagentic-lite degraded]'; then
     echo "memory.sh summarize-turn: summarizer chain degraded (status=$_szt_status), skipping — not writing a fabricated summary" 1>&2
     exit 0
   fi

@@ -93,9 +93,16 @@ PY
   # memory.sh's cmd_summarize_turn had). Splitting the call from the
   # truncation, and capturing `|| _sts_status=$?` on the call itself
   # (no pipe after it), is what makes the real status observable.
+  # ALL THREE degraded exit statuses checked explicitly (lr-49df97 fold-in,
+  # HOLDEN "also verify" item): a bare `-eq 3` here was only ever
+  # accidentally correct for status 4 ("unwrap") and 5 ("turns-exhausted")
+  # because emit_degraded's line-mode banner text is cause-agnostic (the
+  # text-marker grep below catches all three by coincidence of shared
+  # wording, not because this status check recognized them) -- see
+  # memory.sh cmd_summarize_turn's identical comment for the full rationale.
   _sts_status=0
   _sts_raw=$(printf '%s' "$LAST_TURN" | "$REPO_ROOT/scripts/llm-client.sh" summarize 2>/dev/null) || _sts_status=$?
-  if [ "$_sts_status" -eq 3 ] || printf '%s' "$_sts_raw" | grep -qF '[clagentic-lite degraded]'; then
+  if [ "$_sts_status" -eq 3 ] || [ "$_sts_status" -eq 4 ] || [ "$_sts_status" -eq 5 ] || printf '%s' "$_sts_raw" | grep -qF '[clagentic-lite degraded]'; then
     # A genuinely degraded summarizer chain: do not write a fabricated
     # digest to memory, and do not claim an audit "pass" for it. Mirrors
     # memory.sh cmd_summarize_turn's identical decision.
