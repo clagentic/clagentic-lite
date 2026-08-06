@@ -300,6 +300,56 @@ CLAGENTIC_MODEL_OLLAMA_DEFAULT=llama3.1:8b
 
 …then reference it in a chain (`CLAGENTIC_REVIEWER_CHAIN=claude:default,ollama:default`). The wrapper's generic invocation path is `<cli> -p -` with prompt+input on stdin; CLIs that need a different invocation surface need their own `invoke_<cli>` function in `scripts/llm-client.sh` (see `invoke_claude` and `invoke_codex` for the pattern).
 
+### Optional: clagentic-router integration
+
+Everything above (`CLAGENTIC_<ROLE>_CMD`/`_TIER`/`_CHAIN`, `invoke_<cli>`) controls the **gate path** — `scripts/llm-client.sh`, invoked by `clagentic-lite gates review`/`ship`/etc. It does not touch the **interactive path**: when you dispatch a subagent (Reviewer, Auditor, …) via Claude Code's own Agent/Task tool mid-session, that dispatch goes straight to Anthropic (or wherever `ANTHROPIC_BASE_URL` points), never through `llm-client.sh`. clagentic-lite is not Claude Code's parent process, so there is no interception point on that path short of Claude Code's own settings.json.
+
+[clagentic-router](https://github.com/clagentic/clagentic-router) is a separate, optionally-run local proxy that closes this gap. It is not installed or started by clagentic-lite — you run it yourself.
+
+**What it does.** When `CLAGENTIC_ROUTER_URL` is set, `clagentic-lite enroll`/`update` stamps an `env` block into the enrolled repo's `.claude/settings.json` (`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`) so Claude Code — including interactive subagent dispatch — routes every request through the router. In passthrough mode (the default, no per-role chain reference) this is a transparent reverse proxy; your session behaves exactly as it does today. `clagentic-router` also supports *routed* mode: reference a named chain (`role:reviewer-chain`, matching `router.example.yaml` in the clagentic-router repo) and the router picks a backend per its own scoring/fallback policy instead of forwarding straight to Anthropic.
+
+**Setup:**
+
+```sh
+# 1. Run clagentic-router (see that repo's README for build/run instructions).
+#    It listens on 127.0.0.1:8765 by default.
+
+# 2. Set the two config keys (~/.config/clagentic/config or .clagentic/config):
+CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765
+CLAGENTIC_ROUTER_TOKEN=<your router's proxy.token / CLAGENTIC_ROUTER_TOKEN>
+
+# 3. Re-run enroll (or update) so settings.json picks up the env block:
+clagentic-lite enroll --force    # per enrolled repo
+# or: clagentic-lite update --restamp
+
+# 4. Verify:
+clagentic-lite doctor            # probes GET /version, reports reachable/unreachable
+```
+
+**Honest limitation.** Routed roles lose tool-calling and true streaming through clagentic-router's CLI adapters — fine for a one-shot Reviewer/Auditor/Merge-Gate pass that only reads a diff and returns text, wrong for a tool-using Builder that needs to read/write files mid-conversation. Do not point the Builder role through the router. This is why `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` (below) only ever touches Reviewer, Auditor, and Merge Gate.
+
+**Agent-model injection (separate opt-in, UNVERIFIED).** `CLAGENTIC_ROUTER_URL` alone gets you the settings.json passthrough above with no further risk. A second, independent key — `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1` — additionally renders a copy of the Reviewer/Auditor/Merge-Gate subagent definitions with `model: role:<role>-chain` injected into frontmatter (matching `router.example.yaml`'s `reviewer-chain`/`auditor-chain` examples) and installs that rendered plugin instead of the checked-in one. The checked-in `plugins/clagentic-lite/agents/*.md` files are never modified on disk — only a generated copy under `$CLAGENTIC_LITE_HOME/.clagentic/router-agents/` is.
+
+This is explicitly **unverified**: whether Claude Code actually honors a subagent frontmatter `model:` field set to a non-standard string like `role:reviewer-chain` — versus silently ignoring it and dispatching the subagent on the parent session's own model — has not been confirmed against a live interactive session from this codebase. This is [claude-code GH#44385](https://github.com/anthropics/claude-code/issues/44385) territory: that issue reports subagent frontmatter `model:` being ignored in some contexts. Leave `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` unset until you've run the verification below at least once.
+
+#### Verifying on your machine
+
+This is the one part of the router integration that could not be tested from this development environment (no route to a fresh interactive Claude Code session or a local HTTP capture listener from a crew-dispatched build). Run this on a real machine with `claude` installed:
+
+1. Stand up a minimal capture listener, e.g. `python3 -m http.server 8765` in a scratch directory, or any tool that logs the raw HTTP request it receives (headers + body).
+2. In a scratch repo (or the wrapper CLAUDE.md dir), enroll with the router pointed at your capture listener and injection turned on:
+   ```sh
+   CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765 CLAGENTIC_ROUTER_TOKEN=test-token \
+     CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1 CLAGENTIC_REVIEWER_CMD=codex \
+     clagentic-lite enroll --force
+   ```
+3. Open a fresh interactive Claude Code session in that repo (a plain session — not something that itself intercepts the request).
+4. Dispatch the Reviewer subagent (e.g. ask it to review a diff, or invoke it directly via the Task/Agent tool).
+5. Inspect what your capture listener received:
+   - **The `model` field in the request body, verbatim.** If it reads `role:reviewer-chain`, the injection point works as designed. If it reads a normal model alias/ID (e.g. `claude-sonnet-4-6`), Claude Code silently ignored the frontmatter field and fell back to the parent session's model — this is the GH#44385 failure mode. Either way, record what you saw as a comment on lr-49f25e (or the equivalent follow-up task) so the next person doesn't have to re-run this.
+   - **Which auth header arrived**: `x-api-key` or `Authorization: Bearer <token>`. clagentic-router's routed-mode auth (`internal/server/messages.go` in that repo) accepts either, keyed off the same token value — but confirming which one Claude Code actually sends closes a documentation gap on the router side too, independent of the model-field outcome.
+6. If the model field does NOT arrive verbatim: do not "fix" this by editing the router or the injection code to compensate — file a task naming the concrete alternative injection point (the Task/Agent tool's own `model` parameter, if callable with a custom string; or accept that this specific mechanism has no equivalent for interactive dispatch and scope it back to gate-path-only). Leave `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` off in your own config either way until it's confirmed working.
+
 ---
 
 ## Layout
