@@ -1637,25 +1637,36 @@ cmd_doctor() {
   fi
 
   # 9b. Reviewer tool-restriction check (lr-49df97 fold-in, BOBBIE finding
-  # 1). invoke_claude's --allowedTools/--disallowedTools restriction
-  # (AGENTS.md INV-2) only exists on the claude CLI path — codex exec has
-  # no confirmed equivalent flag (no codex binary was available to verify
-  # one against, and this project does not ship an unverified flag; see
-  # invoke_claude's own --temperature warning for why). Warn loudly here,
-  # not just at call time (llm-client.sh's own per-attempt stderr warning),
-  # so the exposure is visible on a `doctor` run before any review ever
-  # executes — same "fail-safe, not silent" posture as the cross-vendor
-  # check above.
+  # 1; UPDATED lr-37282a). invoke_claude's --allowedTools/--disallowedTools
+  # restriction (AGENTS.md INV-2) enforces on the claude CLI path.
+  # invoke_codex now ALSO enforces (--disable shell_tool -s read-only,
+  # verified against the installed codex CLI, codex-cli 0.142.5 — see that
+  # function's own doc comment in scripts/llm-client.sh for the full
+  # verification record), but only on codex's version-gated flag-surface
+  # path (CODEX_MIN_VERSION, scripts/llm-client.sh) — an installed codex
+  # older than that, or a third CLI outside claude/codex entirely, is still
+  # genuinely unrestricted. Doctor cannot cheaply re-run llm-client.sh's own
+  # cached version_ge comparison here without sourcing that file (which
+  # this bootstrap-early code path deliberately does not do), so this check
+  # names codex as restricted-when-current and points at the authoritative
+  # per-call warning (llm-client.sh's own stderr warning, which DOES run the
+  # real version check) for the precise version-gated case. Warn loudly
+  # here, not just at call time, so the exposure is visible on a `doctor`
+  # run before any review ever executes — same "fail-safe, not silent"
+  # posture as the cross-vendor check above.
   printf '\nreviewer tool-restriction check:\n'
   if [ -z "$_reviewer_cmd" ]; then
     printf '  (Reviewer CMD not configured — skipping)\n'
-  elif [ "$_reviewer_cmd" != "claude" ]; then
+  elif [ "$_reviewer_cmd" = "claude" ]; then
+    _ok "Reviewer=$_reviewer_cmd (tool-restriction enforced: --allowedTools Read,Grep,Glob --disallowedTools Bash)"
+  elif [ "$_reviewer_cmd" = "codex" ]; then
+    _ok "Reviewer=$_reviewer_cmd (tool-restriction enforced when codex >= CODEX_MIN_VERSION: --disable shell_tool -s read-only)"
+    printf '       On an older/unrecognized codex version, this call falls back to an unrestricted minimal flag set -- llm-client.sh prints a per-call stderr warning naming the installed version in that case.\n'
+  else
     printf '  WARN Reviewer CLI is "%s" — no known tool-restriction flag; Bash is UNRESTRICTED on reviewer calls through this CLI.\n' "$_reviewer_cmd"
-    printf '       The claude CLI path restricts the reviewer to Read/Grep/Glob (--disallowedTools Bash); %s has no confirmed equivalent.\n' "$_reviewer_cmd"
+    printf '       The claude and codex CLI paths restrict the reviewer (--disallowedTools Bash / --disable shell_tool -s read-only); %s has no confirmed equivalent.\n' "$_reviewer_cmd"
     printf '       A --print/exec reviewer holding unrestricted Bash while reading an attacker-influenceable diff is a live prompt-injection-to-execution path.\n'
     printf '       See AGENTS.md Invariants INV-2 and docs/DESIGN.md "The five roles" for the known limitation.\n'
-  else
-    _ok "Reviewer=$_reviewer_cmd (tool-restriction enforced: --allowedTools Read,Grep,Glob --disallowedTools Bash)"
   fi
 
   # 10. Memory tunables.
