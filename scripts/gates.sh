@@ -1976,15 +1976,20 @@ cmd_review() {
         # crash) behind the same silent success. The degraded FILE check
         # below still runs unconditionally as the second, mode-appropriate
         # channel (INV-1b requires both); a nonzero status that is NOT a
-        # degraded emission (chunk_status != 3, e.g. an actual crash) is
-        # still surfaced via the audit details string rather than swallowed.
+        # degraded emission (chunk_status not in {3,4}, e.g. an actual
+        # crash) is still surfaced via the audit details string rather than
+        # swallowed. STATUS 4 (lr-33958f, PR-C): walk_chain's second
+        # degraded exit status, the "unwrap" cause (model ran, output was
+        # unparseable) -- also a real degraded envelope with a trustworthy
+        # payload, not a crash, so it belongs on this same branch as 3.
         _crv_chunk_status=0
         _crv_chunk_err=$(mktemp -t clagentic-review-chunk-err.XXXXXX)
         "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_chunk" > "$_crv_env_file" 2>"$_crv_chunk_err" || _crv_chunk_status=$?
         _crv_chunk_outcome="pass"
-        if [ "$_crv_chunk_status" -ne 0 ] && [ "$_crv_chunk_status" -ne 3 ]; then
-          # A nonzero status that is NOT walk_chain's own degraded marker (3)
-          # means the call crashed before writing a usable envelope (or wrote
+        if [ "$_crv_chunk_status" -ne 0 ] && [ "$_crv_chunk_status" -ne 3 ] && [ "$_crv_chunk_status" -ne 4 ]; then
+          # A nonzero status that is NOT one of walk_chain's own degraded
+          # markers (3 = infra cause, 4 = unwrap cause) means the call
+          # crashed before writing a usable envelope (or wrote
           # partial/garbage content) -- $_crv_env_file cannot be trusted as
           # review JSON. Overwrite it with an explicit degraded envelope
           # BEFORE sanitize/merge ever see it, so merge_envelopes' own
@@ -2189,9 +2194,16 @@ cmd_review() {
   # is the mode-appropriate file-content check for the ordinary case. Either
   # alone would miss a case the other catches, so both gate this check.
   if [ "$_crv_review_status" -ne 0 ] || review_is_degraded "$OUT"; then
-    cmd_log_run review block "infra-degraded: all reviewer chain steps failed (status=$_crv_review_status)"
-    echo "[gates/review] INFRA_DEGRADED: reviewer chain returned degraded envelope — no real review occurred." 1>&2
-    echo "[gates/review] Check LLM CLI config/auth. Set CLAGENTIC_REVIEWER_REQUIRED=1 to make this a hard gate error." 1>&2
+    _crv_cause=$(_llm_degraded_cause "$_crv_review_status" "$OUT")
+    if [ "$_crv_cause" = "unwrap" ]; then
+      cmd_log_run review block "model-output-unparseable: reviewer ran but returned no parseable role-shaped JSON (status=$_crv_review_status)"
+      echo "[gates/review] MODEL_OUTPUT_UNPARSEABLE: reviewer ran successfully but its output could not be reduced to exactly one parseable review — no real review occurred." 1>&2
+    else
+      cmd_log_run review block "infra-degraded: all reviewer chain steps failed (status=$_crv_review_status)"
+      echo "[gates/review] INFRA_DEGRADED: reviewer chain returned degraded envelope — no real review occurred." 1>&2
+    fi
+    _llm_degraded_remediation_lines "$_crv_cause" 1>&2
+    echo "[gates/review] Set CLAGENTIC_REVIEWER_REQUIRED=1 to make this a hard gate error." 1>&2
     # Pull the per-step failure reasons from the audit DB so the user sees them
     # in the terminal without having to run `digest` or open last-review.json.
     ADB="$REPO_ROOT/.clagentic/lite/audit.db"
@@ -2387,6 +2399,70 @@ review_is_degraded() {
   _llm_output_is_degraded json "$1"
 }
 
+# _llm_degraded_cause STATUS FILE
+#
+# MODEL-RETURNED-PROSE CLASSIFICATION (lr-33958f, PR-C, the fix the foundry
+# insisted on hardest). Distinguishes walk_chain's two degraded causes so a
+# caller can point its remediation hint at the right place instead of
+# always saying "check LLM CLI config/auth":
+#   "infra"   — misconfigured/auth-broken/network-out chain. The name
+#               INFRA_DEGRADED actually describes. "check CLI config/auth"
+#               is correct remediation.
+#   "unwrap"  — the model ran successfully (auth worked, tokens were
+#               spent) but its output could not be reduced to exactly one
+#               role-shaped JSON candidate (prose-only, or ambiguous).
+#               NOT an infrastructure problem; sending the operator to
+#               check CLI config/auth here is the exact misdirection the
+#               foundry named as a plausible contributor to two real
+#               misdiagnoses. Remediation hint: reviewer OUTPUT SHAPE.
+#
+# STATUS is walk_chain's own captured exit code where available (4 = the
+# unwrap cause, unambiguous on its own) — checked FIRST because it needs no
+# JSON tool at all and is authoritative for the single-pass call site that
+# still has it in scope. FILE's own "cause" field (emit_degraded, llm-
+# client.sh) is the fallback for callers where the exit status was already
+# collapsed to a boolean before this point (e.g. after `merge_envelopes`),
+# or where STATUS is not available/passed as empty. Defaults to "infra"
+# when neither source resolves a value — the pre-existing behavior for
+# every degraded envelope this task predates, so an unlabeled legacy
+# envelope (no "cause" field, e.g. one written before this PR) is never
+# misclassified as the new, narrower "unwrap" cause it cannot actually be.
+_llm_degraded_cause() {
+  _ldc_status="${1:-}"
+  _ldc_file="$2"
+  if [ "$_ldc_status" = "4" ]; then
+    printf 'unwrap'
+    return 0
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    _ldc_cause=$(jq -r '.cause // "infra"' "$_ldc_file" 2>/dev/null || echo "infra")
+  elif command -v python3 >/dev/null 2>&1; then
+    _ldc_cause=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("cause") or "infra")' "$_ldc_file" 2>/dev/null || echo "infra")
+  else
+    _ldc_cause="infra"
+  fi
+  case "$_ldc_cause" in
+    unwrap) printf 'unwrap' ;;
+    *)      printf 'infra' ;;
+  esac
+}
+
+# _llm_degraded_remediation_lines CAUSE — prints the cause-specific
+# remediation hint line(s) for INFRA_DEGRADED/MODEL_OUTPUT_UNPARSEABLE
+# stderr output. Single source of the two message bodies so every call
+# site (review, adversarial, merge-gate) stays in sync rather than each
+# hand-rolling its own copy that could drift.
+_llm_degraded_remediation_lines() {
+  case "$1" in
+    unwrap)
+      printf '%s\n' "Check the reviewer/auditor OUTPUT SHAPE — the model ran (auth and network both worked) but did not return parseable role-shaped JSON. Not a CLI config/auth problem."
+      ;;
+    *)
+      printf '%s\n' "Check LLM CLI config/auth."
+      ;;
+  esac
+}
+
 # _parse_adversarial_findings MARKDOWN_FILE
 #
 # Loose-parses [FINDING] header lines from adversarial markdown output into
@@ -2440,6 +2516,7 @@ import json, re, sys
 
 path = sys.argv[1]
 findings = []
+_paf_read_failed = False
 # CWE and file:line are mandatory leading fields. severity is mandatory.
 # reachable/tier/class are optional (may be absent entirely, in any order
 # relative to each other, as long as all precede title when present) so a
@@ -2459,11 +2536,30 @@ header_re = re.compile(
     r'(?:\|\s*class:\s*([^|]+?)\s*)?'
     r'\|\s*title:\s*(.+)$'
 )
+# FAIL LOUD ON A GENUINE READ FAILURE (BOBBIE, lr-33958f PR-C fold-in
+# review, Class 2.7): an unreadable/unparseable adversarial markdown file
+# used to fall back to lines = [] here, which then yields the SAME
+# zero-findings JSON array a genuinely clean audit produces --
+# INDISTINGUISHABLE from a clean pass. This is the identical fail-open
+# class BOBBIE blocked on twice in PR-B (lr-7047bf): a failure signalled by
+# writing empty data rather than returning status. The distinction that
+# matters: $path is $OUT, written moments earlier in cmd_adversarial by the
+# same shell invocation (gates.sh) that is about to call this parser, so a
+# read failure here means something is wrong with the filesystem/permissions
+# between that write and this read, NOT "the auditor legitimately found
+# nothing" (which instead produces a readable file with zero [FINDING]
+# headers -- an ordinary, valid outcome that must NOT hit this branch).
+# SIGNAL ON THE RETURN CHANNEL, not via stdout content: print nothing to
+# stdout and exit 1, so the caller (cmd_adversarial, gates.sh) can tell
+# "read failed" (nonzero exit, empty stdout) apart from "clean audit"
+# (exit 0, stdout "[]") mechanically, rather than the two being the exact
+# same bytes on stdout.
 try:
     with open(path) as f:
         lines = f.readlines()
-except Exception:
-    lines = []
+except Exception as e:
+    print(f"_parse_adversarial_findings: could not read {path}: {e}", file=sys.stderr)
+    sys.exit(1)
 
 for line in lines:
     line = line.rstrip("\n")
@@ -2477,12 +2573,35 @@ for line in lines:
     tier_raw = (m.group(5) or "").strip().lower()
     class_raw = (m.group(6) or "").strip().lower()
     title = m.group(7).strip()
-    if ":" in fileline:
-        fname, _, lineno = fileline.rpartition(":")
-        try:
-            lineno = int(lineno)
-        except ValueError:
-            fname, lineno = fileline, 0
+    # FILE:LINE EXTRACTION -- LOCATE AND VALIDATE, NOT SPLIT-AND-HOPE
+    # (BOBBIE, lr-33958f PR-C fold-in review, Class 2.5): the prior form
+    # (`if ":" in fileline: fname, _, lineno = fileline.rpartition(":")`)
+    # was unanchored and permissive -- ANY colon anywhere in fileline routed
+    # it down the "has a line number" branch, including a path that
+    # legitimately contains a colon with no trailing digits (rpartition then
+    # falls back to (fileline, 0) via the ValueError catch, which happens to
+    # be safe here, but only by accident of the fallback, not by validating
+    # the shape up front). Mirrors _llm_unwrap_json_envelope's own INV-2
+    # discipline: LOCATE the expected shape with an anchored pattern, then
+    # only accept it once it has actually been confirmed to match, rather
+    # than probing for a substring and coercing whatever falls out.
+    #
+    # file_line_re anchors the ENTIRE fileline string end-to-end: everything
+    # up to the LAST colon is the file (greedy `.+`, so a path containing an
+    # earlier colon, e.g. a drive letter, is still captured whole), and
+    # everything after that last colon must be ONE OR MORE DIGITS with
+    # nothing else trailing -- not "starts with digits", not "contains
+    # digits somewhere". Any other shape (no colon at all, e.g. "general";
+    # a colon with non-numeric trailing text; a colon with an empty
+    # trailing segment) is REJECTED by the regex not matching at all, and
+    # falls back to (fileline, 0) explicitly -- the same conservative
+    # default the prior code used for "no colon", now also covering every
+    # colon-bearing shape that isn't genuinely file:line.
+    file_line_re = re.compile(r'^(.+):(\d+)$')
+    m_fl = file_line_re.match(fileline)
+    if m_fl:
+        fname = m_fl.group(1)
+        lineno = int(m_fl.group(2))
     else:
         fname, lineno = fileline, 0
     # severity is a closed set, same as reachable/tier/class below -- enum-check
@@ -2590,10 +2709,22 @@ PYEOF
 # everywhere else in gates.sh); python3 is the documented fallback the rest
 # of the file already uses for JSON when jq is absent.
 #
-# Per-field disposition (audited lr-e2b975 follow-up — every field in the
+# Per-field disposition (audited lr-e2b975 follow-up, RE-AUDITED lr-33958f
+# PR-C fold-in per BOBBIE's explicit instruction not to fix 2.5/2.7 narrowly
+# and leave a third field of the same shape unaudited — every field in the
 # parsed finding record, enumerated deliberately rather than asserted):
 #   file, category, message — free-form model text, no enum, unbounded
-#     length. SANITIZED here via _llm_field_sanitize.
+#     length. SANITIZED here via _llm_field_sanitize. `file` specifically is
+#     ALSO structurally constrained one layer up, in
+#     _parse_adversarial_findings itself (lr-33958f PR-C fold-in, Class
+#     2.5): the file:line header field is extracted via an ANCHORED regex
+#     (`^(.+):(\d+)$`) that only recognizes a genuine trailing line number,
+#     never an unanchored `rpartition(":")` that would treat any colon
+#     anywhere in the field as a line-number separator. That constraint is
+#     about SHAPE (does this look like a real file:line pair), not content
+#     — `file`'s content is still free text and still goes through
+#     _llm_field_sanitize here exactly like category/message; the two
+#     protections are independent and both apply.
 #   severity  — closed set (low/medium/high/critical). ENUM-VALIDATED AND
 #     FORCE-CORRECTED at parse time in _parse_adversarial_findings (an
 #     unrecognized value becomes "unknown", never passed through raw). NOT
@@ -2630,10 +2761,17 @@ PYEOF
 #     the clamp runs unconditionally after class is resolved, so an
 #     ephemeral declaration cannot buy a downgrade on a finding the clamp's
 #     predicate already caught.
-#   line      — always an int (parse failure on the numeric suffix falls
-#     back to 0 in _parse_adversarial_findings). Not text; nothing to
-#     sanitize; not enum-shaped either, so "validated" isn't quite the right
-#     word — it is type-constrained by construction (Python int(), never a
+#   line      — always an int (lr-33958f PR-C fold-in, Class 2.5: extracted
+#     via the SAME anchored `^(.+):(\d+)$` match as `file` above — the
+#     digit-only trailing group means int() on the captured text can never
+#     raise, unlike the pre-fix `rpartition(":")` + try/except ValueError
+#     shape, which relied on the exception path to reject a non-numeric
+#     trailing segment rather than never matching one to begin with). Falls
+#     back to 0 when fileline does not match the anchored pattern at all
+#     (no colon, e.g. "general"; a colon with non-numeric or empty trailing
+#     text). Not text; nothing to sanitize; not enum-shaped either, so
+#     "validated" isn't quite the right word — it is type-and-shape-
+#     constrained by construction (regex match + Python int(), never a
 #     pass-through of the captured string).
 #
 # Net: every field is either free-text-and-sanitized (file/category/message)
@@ -2675,7 +2813,11 @@ cmd_adversarial() {
   _adv_status=0
   "$TOOL_HOME/scripts/llm-client.sh" adversarial < "$_adv_diff_tmp" > "$OUT" || _adv_status=$?
   _adv_degraded=0
-  if [ "$_adv_status" -eq 3 ] || _llm_output_is_degraded markdown "$OUT"; then
+  # STATUS 4 (lr-33958f, PR-C): walk_chain's second degraded exit status,
+  # the "unwrap" cause -- also checked here alongside 3 so an auditor that
+  # ran successfully but returned unparseable output is not missed by this
+  # detector (see llm-client.sh walk_chain's DEGRADED_EXIT comment).
+  if [ "$_adv_status" -eq 3 ] || [ "$_adv_status" -eq 4 ] || _llm_output_is_degraded markdown "$OUT"; then
     _adv_degraded=1
   fi
   # Prepend a SHA stamp comment as the first line so build_gate_summary can
@@ -2705,9 +2847,92 @@ cmd_adversarial() {
   # read-time design rationale. The unsanitized $OUT markdown file is
   # untouched (still the full raw record); only the structured sidecar that
   # round-trips into a later system prompt is sanitized.
-  _adv_findings_json_raw=$(_parse_adversarial_findings "$OUT")
-  _adv_findings_json=$(_sanitize_adversarial_findings_json "$_adv_findings_json_raw")
+  # COUNT BOUND AT EMISSION (lr-33958f, PR-C, required foundry fix):
+  # _parse_adversarial_findings builds its array with no count bound of its
+  # own, and that array is embedded TWICE into the merge-gate system
+  # prompt (adversarial_findings and adversarial_findings_fenced,
+  # build_gate_summary below) -- the foundry ranked this the single most
+  # likely source of the next unreported filing, the sibling repo's
+  # seven-occurrence verdict-fence class restated as an emission-side cap
+  # rather than a parse-time presence check. Capped AFTER sanitize (order
+  # matches _invariant_feed_append's own sanitize-then-cap sequencing) so
+  # every retained finding is still clean.
+  #
+  # SEVERITY/TIER-SORTED BEFORE THE CAP (BOBBIE, lr-33958f PR-C fold-in
+  # review, bobbie.sast.unbounded-truncation-drops-severity): capping in
+  # raw PARSE order (the pre-fix behavior) truncates in the order the
+  # Auditor's markdown lists findings -- attacker-influenceable via prompt
+  # injection in the diff under review, so a late-emitted tier:"blocking"
+  # finding could be silently dropped while earlier tier:"advisory"
+  # findings survive. _adversarial_findings_sort_blocking_first
+  # (platform.sh) reorders tier:"blocking" findings first, severity
+  # descending within each tier, BEFORE _llm_json_array_cap ever runs --
+  # the cap can then only ever drop the least-severe, non-blocking tail.
+  # PARSE-READ-FAILURE CLASSIFICATION (BOBBIE, lr-33958f PR-C fold-in
+  # review, Class 2.7): _parse_adversarial_findings now exits nonzero (with
+  # nothing on stdout) on a genuine read failure -- a readable file with
+  # zero [FINDING] headers (an ordinary clean audit) still exits 0 with
+  # "[]". Guarded explicitly (`set -e` is active in this script) so a read
+  # failure is CLASSIFIED, not silently treated as "the parser produced an
+  # empty findings array" -- the same fail-open-by-writing-empty-data class
+  # BOBBIE blocked on twice in PR-B (lr-7047bf). A read failure here is
+  # distinct from _adv_degraded above (that covers the LLM chain itself
+  # failing to produce output at all); this covers the parse step failing
+  # on output that DID get written moments earlier in this same function.
+  _adv_parse_status=0
+  _adv_findings_json_raw=$(_parse_adversarial_findings "$OUT") || _adv_parse_status=$?
+  if [ "$_adv_parse_status" -ne 0 ]; then
+    cmd_log_run adversarial degraded "adversarial-findings-parse-failed: could not read $OUT to extract structured findings (status=$_adv_parse_status) — sidecar not trustworthy"
+    echo "[gates/adversarial] ADVERSARIAL_FINDINGS_PARSE_FAILED: could not read $OUT to extract structured [FINDING] headers — the markdown audit above may still be valid, but the structured sidecar the merge-gate reads could not be built. Check filesystem/permissions." 1>&2
+    _adv_findings_json_raw='[]'
+  fi
+  _adv_findings_json_sanitized=$(_sanitize_adversarial_findings_json "$_adv_findings_json_raw")
+  _adv_findings_json_sorted=$(_adversarial_findings_sort_blocking_first "$_adv_findings_json_sanitized")
+  _adv_findings_json=$(_llm_json_array_cap "$_adv_findings_json_sorted" "${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}")
   printf '%s\n' "$_adv_findings_json" > "$FINDINGS_OUT"
+
+  # DROPPED-COUNT VISIBILITY (BOBBIE, lr-33958f PR-C fold-in review): a
+  # truncated audit must never be silently presented as complete. Compute
+  # how many findings the cap actually dropped (pre-cap count minus
+  # post-cap count -- both read from the already-materialized JSON, no
+  # re-parse) and persist it to a small sidecar build_gate_summary reads,
+  # so the merge-gate payload can surface "N findings dropped by the count
+  # cap" instead of a bare capped array that looks indistinguishable from
+  # "the auditor only found this many." Logged to the audit trail and
+  # stderr whenever nonzero; the sidecar itself always exists so
+  # build_gate_summary has a single, unconditional read path (0 on a
+  # normal run, same "absent == 0" fail-open posture as every other
+  # optional gate-plumbing file in this codebase).
+  _adv_findings_dropped_count=0
+  if command -v jq >/dev/null 2>&1; then
+    _adv_findings_total_before_cap=$(printf '%s' "$_adv_findings_json_sorted" | jq 'length' 2>/dev/null || echo 0)
+    _adv_findings_total_after_cap=$(printf '%s' "$_adv_findings_json" | jq 'length' 2>/dev/null || echo 0)
+  elif command -v python3 >/dev/null 2>&1; then
+    _adv_findings_total_before_cap=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d) if isinstance(d, list) else 0)' <<EOF2 2>/dev/null || echo 0
+$_adv_findings_json_sorted
+EOF2
+)
+    _adv_findings_total_after_cap=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d) if isinstance(d, list) else 0)' <<EOF3 2>/dev/null || echo 0
+$_adv_findings_json
+EOF3
+)
+  else
+    _adv_findings_total_before_cap=0
+    _adv_findings_total_after_cap=0
+  fi
+  case "$_adv_findings_total_before_cap" in ''|*[!0-9]*) _adv_findings_total_before_cap=0 ;; esac
+  case "$_adv_findings_total_after_cap" in ''|*[!0-9]*) _adv_findings_total_after_cap=0 ;; esac
+  if [ "$_adv_findings_total_before_cap" -gt "$_adv_findings_total_after_cap" ]; then
+    _adv_findings_dropped_count=$((_adv_findings_total_before_cap - _adv_findings_total_after_cap))
+  fi
+  printf '{"dropped_count": %d, "total_before_cap": %d}\n' \
+    "$_adv_findings_dropped_count" "$_adv_findings_total_before_cap" \
+    > "$REPO_ROOT/.clagentic/lite/last-adversarial-findings-meta.json"
+  if [ "$_adv_findings_dropped_count" -gt 0 ]; then
+    cmd_log_run adversarial warn "adversarial findings count cap dropped $_adv_findings_dropped_count finding(s) (severity/tier-sorted before cap, so only the least-severe tail was dropped)"
+    printf '[gates/adversarial] %d finding(s) dropped by the count cap (CLAGENTIC_ADVERSARIAL_FINDINGS_MAX=%s) -- lowest severity/advisory-tier findings only, sorted before truncation.\n' \
+      "$_adv_findings_dropped_count" "${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}" 1>&2
+  fi
 
   # Invariant-feed writer (lr-63359e), adversarial half. Reuses the same
   # parsed findings above (previously re-parsed only inside this if-block;
@@ -2746,9 +2971,20 @@ cmd_adversarial() {
   # audit row, and it is the caller's explicit `|| true` that decides
   # whether a dead auditor still lets ship proceed.
   if [ "$_adv_degraded" -eq 1 ]; then
-    cmd_log_run adversarial degraded "auditor produced a degraded envelope (status=$_adv_status) — no real audit occurred"
-    echo "[gates/adversarial] INFRA_DEGRADED: auditor chain returned a degraded envelope — no real audit occurred." 1>&2
-    echo "[gates/adversarial] Check LLM CLI config/auth. full details: $OUT  |  scripts/gates.sh digest" 1>&2
+    # markdown mode carries no JSON "cause" field -- _adv_status itself is
+    # authoritative here (4 = unwrap cause is unambiguous on its own; see
+    # _llm_degraded_cause's own doc comment for why STATUS is checked
+    # first, before any file-content fallback).
+    _adv_cause=$(_llm_degraded_cause "$_adv_status" "$OUT")
+    if [ "$_adv_cause" = "unwrap" ]; then
+      cmd_log_run adversarial degraded "model-output-unparseable: auditor ran but returned no parseable output (status=$_adv_status)"
+      echo "[gates/adversarial] MODEL_OUTPUT_UNPARSEABLE: auditor ran successfully but its output could not be reduced to a parseable audit — no real audit occurred." 1>&2
+    else
+      cmd_log_run adversarial degraded "auditor produced a degraded envelope (status=$_adv_status) — no real audit occurred"
+      echo "[gates/adversarial] INFRA_DEGRADED: auditor chain returned a degraded envelope — no real audit occurred." 1>&2
+    fi
+    _llm_degraded_remediation_lines "$_adv_cause" 1>&2
+    echo "[gates/adversarial] full details: $OUT  |  scripts/gates.sh digest" 1>&2
     cat "$OUT"
     return 2
   fi
@@ -2981,10 +3217,19 @@ except Exception:
   # emission cannot be read as an ordinary parseable decision.
   _mg_status=0
   "$TOOL_HOME/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT" || _mg_status=$?
-  if [ "$_mg_status" -eq 3 ] || _llm_output_is_degraded json "$OUT"; then
-    cmd_log_run "$_mg_gate_name" block "infra-degraded: all merge-gate chain steps failed (status=$_mg_status)"
-    echo "[gates/merge-gate] INFRA_DEGRADED: merge-gate chain returned a degraded envelope — no real decision was made." 1>&2
-    echo "[gates/merge-gate] Check LLM CLI config/auth. full details: $OUT  |  scripts/gates.sh digest" 1>&2
+  # STATUS 4 (lr-33958f, PR-C): also checked, alongside 3, for the "unwrap"
+  # cause -- see llm-client.sh walk_chain's DEGRADED_EXIT comment.
+  if [ "$_mg_status" -eq 3 ] || [ "$_mg_status" -eq 4 ] || _llm_output_is_degraded json "$OUT"; then
+    _mg_cause=$(_llm_degraded_cause "$_mg_status" "$OUT")
+    if [ "$_mg_cause" = "unwrap" ]; then
+      cmd_log_run "$_mg_gate_name" block "model-output-unparseable: merge-gate ran but returned no parseable decision (status=$_mg_status)"
+      echo "[gates/merge-gate] MODEL_OUTPUT_UNPARSEABLE: merge-gate ran successfully but its output could not be reduced to a parseable decision — no real decision was made." 1>&2
+    else
+      cmd_log_run "$_mg_gate_name" block "infra-degraded: all merge-gate chain steps failed (status=$_mg_status)"
+      echo "[gates/merge-gate] INFRA_DEGRADED: merge-gate chain returned a degraded envelope — no real decision was made." 1>&2
+    fi
+    _llm_degraded_remediation_lines "$_mg_cause" 1>&2
+    echo "[gates/merge-gate] full details: $OUT  |  scripts/gates.sh digest" 1>&2
     if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
       return 1
     fi
@@ -3199,6 +3444,14 @@ build_gate_summary() {
   RV="$REPO_ROOT/.clagentic/lite/last-review.json"
   AD="$REPO_ROOT/.clagentic/lite/last-adversarial.md"
   ADF="$REPO_ROOT/.clagentic/lite/last-adversarial-findings.json"
+  # ADF_META (BOBBIE, lr-33958f PR-C fold-in review): cmd_adversarial's
+  # dropped-count sidecar (see the "DROPPED-COUNT VISIBILITY" comment at its
+  # write site) -- a truncated audit must never be silently presented as
+  # complete. Absent/unparseable degrades to dropped_count=0, matching the
+  # rest of this function's fail-open posture on optional gate-plumbing
+  # files: a missing meta file predates this feature, not evidence of a
+  # truncation that actually happened.
+  ADF_META="$REPO_ROOT/.clagentic/lite/last-adversarial-findings-meta.json"
   ACKS_FILE="$REPO_ROOT/.clagentic/adversarial-acks.json"
   AR_FILE="$REPO_ROOT/.clagentic/accepted-risks.md"
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
@@ -3422,6 +3675,16 @@ build_gate_summary() {
       '[.[] | select(.class == "ephemeral" and .tier == "advisory" and .reachable == "yes" and (.severity == "high" or .severity == "critical"))] | length' \
       2>/dev/null || echo 0)
     case "$ADV_DOWNGRADED_BY_CLASS_COUNT" in ''|*[!0-9]*) ADV_DOWNGRADED_BY_CLASS_COUNT=0 ;; esac
+    # DROPPED-COUNT VISIBILITY (BOBBIE, lr-33958f PR-C fold-in review): how
+    # many findings cmd_adversarial's count cap actually dropped, read back
+    # from its sidecar (see the write site's own comment). Absent/
+    # unparseable defaults to 0 -- fail-open, matching every other optional
+    # gate-plumbing file this function reads.
+    ADV_DROPPED_COUNT=0
+    if [ -f "$ADF_META" ]; then
+      ADV_DROPPED_COUNT=$(jq -r '.dropped_count // 0' "$ADF_META" 2>/dev/null || echo 0)
+    fi
+    case "$ADV_DROPPED_COUNT" in ''|*[!0-9]*) ADV_DROPPED_COUNT=0 ;; esac
     # Fenced, explicit-data-block rendering of the (already sanitized)
     # adversarial findings, mirroring the invariant-feed's
     # ===BEGIN/END INVARIANTS DATA=== treatment (lr-e2b975, matches
@@ -3444,6 +3707,7 @@ build_gate_summary() {
   "adversarial_advisory_count": $ADV_ADVISORY_COUNT,
   "resolved_change_class": $RESOLVED_CHANGE_CLASS,
   "adversarial_downgraded_by_class_count": $ADV_DOWNGRADED_BY_CLASS_COUNT,
+  "adversarial_findings_dropped_count": $ADV_DROPPED_COUNT,
   "adversarial_acks": $ACKS_PAYLOAD,
   "accepted_risks": $AR_PAYLOAD,
   "introduces_ack_file": $INTRODUCES_ACK_FILE,
@@ -3457,14 +3721,16 @@ EOF
     RV_ARG=""
     AD_ARG=""
     ADF_ARG=""
+    ADF_META_ARG=""
     ACKS_ARG=""
     AR_ARG=""
     [ -f "$RV" ] && RV_ARG="$RV"
     [ -f "$AD" ] && AD_ARG="$AD"
     [ -f "$ADF" ] && ADF_ARG="$ADF"
+    [ -f "$ADF_META" ] && ADF_META_ARG="$ADF_META"
     [ -f "$ACKS_FILE" ] && ACKS_ARG="$ACKS_FILE"
     [ -f "$AR_FILE" ] && AR_ARG="$AR_FILE"
-    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" <<'PY'
+    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" <<'PY'
 import json, sys
 threshold           = sys.argv[1]
 introduces_ack      = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
@@ -3475,6 +3741,7 @@ acks_path           = sys.argv[6] if len(sys.argv) > 6 else ""
 ar_path             = sys.argv[7] if len(sys.argv) > 7 else ""
 adf_path            = sys.argv[8] if len(sys.argv) > 8 else ""
 adversarial_degraded = sys.argv[9].lower() == "true" if len(sys.argv) > 9 else False
+adf_meta_path       = sys.argv[10] if len(sys.argv) > 10 else ""
 review = None
 if rv_path:
     try:
@@ -3525,6 +3792,19 @@ adv_downgraded_by_class_count = sum(
     and f.get("reachable") == "yes"
     and f.get("severity") in ("high", "critical")
 )
+# DROPPED-COUNT VISIBILITY (BOBBIE, lr-33958f PR-C fold-in review): mirrors
+# the jq branch's read of the same sidecar -- see build_gate_summary's
+# ADF_META comment and the write site's own comment (cmd_adversarial) for
+# the full rationale. Absent/unparseable defaults to 0 (fail-open).
+adv_dropped_count = 0
+if adf_meta_path:
+    try:
+        with open(adf_meta_path) as f:
+            adf_meta = json.load(f)
+        v = adf_meta.get("dropped_count", 0)
+        adv_dropped_count = v if isinstance(v, int) else 0
+    except Exception:
+        adv_dropped_count = 0
 # Fenced, explicit-data-block rendering (lr-e2b975) -- same
 # ===BEGIN/END ADVERSARIAL FINDINGS DATA=== fence the jq branch above emits
 # via _fence_adversarial_findings, mirroring ds_adversarial_prompt's
@@ -3562,6 +3842,7 @@ print(json.dumps({
     "adversarial_advisory_count": adv_advisory_count,
     "resolved_change_class": resolved_change_class,
     "adversarial_downgraded_by_class_count": adv_downgraded_by_class_count,
+    "adversarial_findings_dropped_count": adv_dropped_count,
     "adversarial_acks": acks,
     "accepted_risks": ar,
     "introduces_ack_file": introduces_ack,
@@ -3587,10 +3868,10 @@ PY
   # bootstrap exemption in degraded mode).
   if [ -f "$RV" ]; then
     cat <<EOF
-{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_degraded": $ADVERSARIAL_DEGRADED, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "resolved_change_class": null, "adversarial_downgraded_by_class_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD", "gate_summary_degraded": true}
+{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_degraded": $ADVERSARIAL_DEGRADED, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "resolved_change_class": null, "adversarial_downgraded_by_class_count": 0, "adversarial_findings_dropped_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD", "gate_summary_degraded": true}
 EOF
   else
-    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_degraded\": $ADVERSARIAL_DEGRADED, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\", \"gate_summary_degraded\": true}"
+    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_degraded\": $ADVERSARIAL_DEGRADED, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_findings_dropped_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\", \"gate_summary_degraded\": true}"
   fi
 }
 
