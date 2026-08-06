@@ -127,6 +127,23 @@ else
 fi
 AUDIT_DB="$REPO_ROOT/.clagentic/lite/audit.db"
 
+# _llm_repo_root_is_scoped — true (exit 0) only when REPO_ROOT itself is the
+# git repo `git -C "$REPO_ROOT"` will actually operate on. Local mirror of
+# gates.sh's `_git_repo_root_is_scoped` (lr-da1f28 sweep): this file has no
+# shared `_git` wrapper of its own, but the same ancestor-walk-up hazard
+# applies — `-C <dir>` only changes cwd before git's own repo discovery
+# runs, so it still walks UP the filesystem when REPO_ROOT is not itself a
+# git repo (the wrapper/.clagentic-project layout ds_repo_root, platform.sh,
+# can legitimately produce). See that helper's doc comment for the full
+# rationale; not extracted to a shared location since gates.sh sources
+# review-merge.sh but not vice versa, and this is the only call site in this
+# file that reads repo state rather than merely resolving REPO_ROOT itself.
+_llm_repo_root_is_scoped() {
+  _lrs_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
+  _lrs_git_toplevel=$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || echo "")
+  [ -n "$_lrs_git_toplevel" ] && [ "$_lrs_git_toplevel" = "$_lrs_repo_root_canon" ]
+}
+
 # _change_class_hint — extract the Builder-declared change-class trailer
 # (lr-4f8316), if present, from the tip commit message on the current
 # branch. Prints the raw (unvalidated) trailer VALUE on stdout, or nothing
@@ -173,6 +190,13 @@ _change_class_hint() {
   if ! command -v git >/dev/null 2>&1; then
     return 0
   fi
+  # REPO SCOPING (lr-da1f28 sweep): `-C "$REPO_ROOT"` alone does not stop
+  # git's own ancestor-directory discovery — see _llm_repo_root_is_scoped's
+  # doc comment. Without this guard, a non-git REPO_ROOT with a git ancestor
+  # would silently extract that UNRELATED repo's commit-message trailer and
+  # interpolate it into the Reviewer/Auditor prompt as if it were this
+  # branch's own change-class hint.
+  _llm_repo_root_is_scoped || return 0
   git -C "$REPO_ROOT" log -1 --format=%B 2>/dev/null \
     | grep -i '^Change-class:' \
     | tail -1 \

@@ -31,6 +31,18 @@ fi
 DB="$REPO_ROOT/.clagentic/lite/memory.db"
 mkdir -p "$REPO_ROOT/.clagentic/lite"
 
+# _mem_repo_root_is_scoped — true only when REPO_ROOT itself is the git repo
+# `git -C "$REPO_ROOT"` will actually operate on. Local mirror of gates.sh's
+# `_git_repo_root_is_scoped` (lr-da1f28 sweep) — see that helper's doc
+# comment for the ancestor-walk-up rationale. Not extracted to a shared
+# location: this file does not source gates.sh, and this is the only call
+# site here that reads repo state rather than merely resolving REPO_ROOT.
+_mem_repo_root_is_scoped() {
+  _mrs_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
+  _mrs_git_toplevel=$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || echo "")
+  [ -n "$_mrs_git_toplevel" ] && [ "$_mrs_git_toplevel" = "$_mrs_repo_root_canon" ]
+}
+
 cmd_init() {
   sqlite3 "$DB" <<'SQL'
 CREATE TABLE IF NOT EXISTS turns (
@@ -113,7 +125,14 @@ cmd_log_turn() {
     return 1
   fi
 
-  BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")  # pin to enrolled repo root, not $PWD
+  # Repo-scoped (lr-da1f28 sweep): `-C "$REPO_ROOT"` alone does not stop
+  # git's ancestor-directory discovery — see _mem_repo_root_is_scoped's doc
+  # comment. Without this guard, a non-git REPO_ROOT with a git ancestor
+  # would silently stamp this row with the ancestor repo's branch name.
+  BRANCH=""
+  if _mem_repo_root_is_scoped; then
+    BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  fi
   TS=$(ds_date_iso)
   # CLAGENTIC_MEMORY_MAX_ROWS: opportunistic row cap (default 5000).
   # After each INSERT, oldest rows beyond the cap are silently pruned.
