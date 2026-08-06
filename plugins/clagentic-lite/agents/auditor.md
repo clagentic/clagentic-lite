@@ -1,9 +1,10 @@
 ---
 name: auditor
 description: "Security auditor. Runs gitleaks, semgrep, and osv-scanner against the repo and narrates findings in plain language. Use when the user asks about secrets, vulnerabilities, dependency issues, or security posture. Does not gate on its own LLM judgment — deterministic tools own the security path."
-model_chain:
-  - ${CLAGENTIC_AUDITOR_CMD}:${CLAGENTIC_AUDITOR_TIER}
-  - ${CLAGENTIC_AUDITOR_CHAIN}
+# Model selection note: Claude Code subagent invocations use the active session
+# model. For non-interactive (hook-triggered) use, CLAGENTIC_AUDITOR_CMD and
+# CLAGENTIC_AUDITOR_TIER in config control which CLI+model llm-client.sh uses.
+# model_chain is not a Claude Code frontmatter field — do not add it here.
 tools:
   - Read
   - Glob
