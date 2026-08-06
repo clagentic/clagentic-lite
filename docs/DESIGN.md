@@ -32,7 +32,7 @@ clagentic-lite is the smallest credible expression of that thesis. It is built t
 | Role | CLI (default) | Job | Tools allowed |
 |---|---|---|---|
 | **Builder** | `claude` | Write code on a feature branch. Never merges. | Read, Write, Edit, Bash (allowlisted) |
-| **Reviewer** | `codex` | Read staged diff, return structured findings. Never writes code. | Read, Bash (read-only) |
+| **Reviewer** | `codex` | Read staged diff, return structured findings. Never writes code. | Read, Grep, Glob — no Bash. Enforced via `--allowedTools`/`--disallowedTools` when the resolved chain step is `claude` (see `scripts/llm-client.sh` `invoke_claude`, AGENTS.md Invariants INV-2); not independently enforceable against `codex`, which has no equivalent flag. |
 | **Auditor** | `codex` | LLM narration on top of deterministic security scans. Adversarial mode plays attacker. | Read, Bash (security tools) |
 | **Merge Gate** | `claude` | Final approve/refuse decision over every prior gate's output. Never opens PRs, never pushes. | Read |
 | **Troubleshooter** | `claude` | Read-only failure diagnosis. Receives one artifact, emits root cause + bounce target. Never writes, never dispatches. | Read, Glob, Grep, Bash (read-only) |
@@ -164,7 +164,7 @@ llm-client.sh <subcmd>
 
 Implementation is **one-shot per call**. Each subcommand resolves the configured chain for its role (`CLAGENTIC_<ROLE>_CMD/_TIER/_CHAIN`), tries each `(cmd, tier)` entry in order, validates the output's schema, and falls through on failure to a degraded envelope marked `"degraded": true`. The gate orchestrator (`scripts/gates.sh`) detects degraded envelopes and blocks rather than treats them as clean reviews.
 
-Per-call timeout is `$CLAGENTIC_LLM_TIMEOUT_SEC` (default 180s) via `timeout` or `gtimeout` — exposed as `$DS_TIMEOUT_CMD` from `scripts/platform.sh`. If neither is available, the wrapper runs without a timeout and `clagentic-lite doctor` warns.
+Per-call timeout is `$CLAGENTIC_LLM_TIMEOUT_SEC` (default 180s) via `timeout` or `gtimeout` — exposed as `$DS_TIMEOUT_CMD` from `scripts/platform.sh`. If neither is available, `$DS_TIMEOUT_CMD` resolves to `ds_timeout_missing`, which fails closed at the point of use: it refuses to run the wrapped command at all and returns a distinct exit status (99) rather than running it unbounded. `clagentic-lite doctor` should be run to install a real timeout binary before any gate or LLM call is attempted on such a host.
 
 Persistent codex sessions and persistent claude sessions were both considered and deferred. The wall-clock difference between repeated one-shots and one persistent session is small on the cadence clagentic-lite is built for (a few `/review` calls per coding session, not hundreds), and the persistent path would require either codex's experimental `app-server` or a long-running daemon — both of which violate the no-server constraint.
 

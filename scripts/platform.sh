@@ -121,17 +121,52 @@ ds_load_env() {
 # users install it via `brew install coreutils` which provides `gtimeout`.
 # Detect at source time and export DS_TIMEOUT_CMD. Callers run:
 #   $DS_TIMEOUT_CMD "$LLM_TIMEOUT" some-cli ...
-# When neither tool is present, DS_TIMEOUT_CMD is set to an empty wrapper
-# that runs the command without a timeout — degraded but doesn't fail-open
-# in a confusing way (`clagentic-lite doctor` warns when timeout is missing).
+#
+# FAIL CLOSED, NOT SILENTLY UNBOUNDED (INV-1a, class-4 foundry fix). This
+# used to fall back to `ds_no_timeout() { shift; "$@"; }` — a stub that
+# DISCARDED the duration argument and ran the wrapped command with NO bound
+# at all when neither `timeout` nor `gtimeout` was on PATH. Every timeout in
+# gates.sh and llm-client.sh routes through $DS_TIMEOUT_CMD, including the
+# freshness-check fetches _gate_resolve_fresh_default_branch_ref uses to
+# prove a diff baseline hasn't gone stale (its own documented guarantee, "a
+# fetch that timed out is treated as a failed fetch", held only because a
+# real timeout binary happened to be present — nothing enforced that
+# precondition). On a host missing both binaries, EVERY timeout in this
+# codebase silently evaporated: a hung `git fetch`, a runaway `semgrep
+# --config=auto` network pull, or an LLM CLI call that never returns would
+# block a blocking gate indefinitely with no diagnostic, and the freshness
+# helper's own safety story became conditional on a binary nobody checked
+# for. This fixes zero reported bugs on its own; it makes every other
+# timeout in the codebase MEAN what it says.
+#
+# `ds_timeout_missing` is set as DS_TIMEOUT_CMD instead of ds_no_timeout: it
+# still ACCEPTS the same "$DURATION cmd..." call shape every caller already
+# uses (so no call site needs to change), but instead of silently dropping
+# the duration and running unbounded, it prints a clear diagnostic and
+# returns a distinct, greppable exit status (99) the FIRST TIME it is
+# actually invoked. This is deliberately NOT a hard `exit` at platform.sh
+# SOURCE time: bin/clagentic-lite sources platform.sh unconditionally before
+# dispatching to any subcommand, including `doctor` itself — the one tool
+# meant to diagnose exactly this gap. A source-time exit would make `doctor`
+# unusable on the host it exists to help. Failing at the point of USE (the
+# first attempted timeout-bounded call) is "startup failure" for the gate or
+# LLM call that needed the bound, without making an unrelated `clagentic-lite
+# doctor`/`init` invocation collateral damage.
+ds_timeout_missing() {
+  # First arg is the (now-refused) duration; the rest is the command that
+  # would have run unbounded. Neither is executed.
+  shift
+  printf 'clagentic-lite: no timeout binary found (checked: timeout, gtimeout) -- refusing to run "%s" unbounded.\n' "$*" 1>&2
+  printf '  install: apt install coreutils | brew install coreutils (provides gtimeout on macOS)\n' 1>&2
+  printf '  every external process invocation and LLM call in this codebase requires a real timeout binary -- see AGENTS.md Invariants, INV-1a.\n' 1>&2
+  return 99
+}
 if command -v timeout >/dev/null 2>&1; then
   DS_TIMEOUT_CMD="timeout"
 elif command -v gtimeout >/dev/null 2>&1; then
   DS_TIMEOUT_CMD="gtimeout"
 else
-  # Stub: ignore the timeout arg, run the rest.
-  ds_no_timeout() { shift; "$@"; }
-  DS_TIMEOUT_CMD="ds_no_timeout"
+  DS_TIMEOUT_CMD="ds_timeout_missing"
 fi
 export DS_TIMEOUT_CMD
 

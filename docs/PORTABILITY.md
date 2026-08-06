@@ -22,7 +22,7 @@ Every script that uses `sed`, `date`, `stat`, or `find` sources `scripts/platfor
 | `xargs -I {}` | works | works but flag order is finicky | explicit `sh -c` wrappers |
 | `readlink -f` | works | not on macOS by default | shimmed via `cd && pwd` |
 | `mktemp -d -t` | template optional | template required | always provide template |
-| `timeout` | GNU coreutils default | not installed by default; `brew install coreutils` provides `gtimeout` | `$DS_TIMEOUT_CMD` (detects `timeout`, falls back to `gtimeout`, then to a no-op wrapper that warns) |
+| `timeout` | GNU coreutils default | not installed by default; `brew install coreutils` provides `gtimeout` | `$DS_TIMEOUT_CMD` (detects `timeout`, falls back to `gtimeout`; if neither exists, resolves to `ds_timeout_missing`, which FAILS CLOSED — refuses to run the wrapped command unbounded and returns exit 99 with an install hint, rather than silently running without a bound. See AGENTS.md Invariants, INV-1a.) |
 | JSON parsing in hooks | `jq` or `python3` | `jq` or `python3` (python3 ships on modern macOS) | `ds_json_field` helper in `scripts/platform.sh`. **Required** — hooks fail closed without either. |
 | `realpath` | available everywhere | not on macOS by default | shimmed via `python3 os.path.realpath` in `pre-write-guard.sh` for the W-002 normalization check |
 
