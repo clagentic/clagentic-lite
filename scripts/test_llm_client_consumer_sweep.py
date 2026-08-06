@@ -151,6 +151,20 @@ _SELF_EXCLUDE_BASENAMES = {"llm-client.sh", "test_llm_client_consumer_sweep.py"}
 # extension is more honest than trying to out-clever docstring detection:
 # the repo's own convention already guarantees no .py file is a real
 # consumer, so there is nothing this exclusion could hide.
+#
+# CLOSED, NOT MERELY ASSERTED (lr-33958f, PR-C, carried from PR-B review):
+# BOBBIE's follow-up correctly named this exclusion as accurate-today but
+# STRUCTURALLY INCIDENTAL -- nothing previously enforced it, so a future
+# .py script shelling out to llm-client.sh with the literal path would be
+# invisible. TestPyFilesShellingOutToLlmClientAreDetected (below, same
+# file) is the structural enforcement: an AST-based detector that finds a
+# real subprocess argv list/tuple literal (not prose/docstring text, which
+# a line-level regex cannot distinguish) shelling out to llm-client.sh.
+# The line-level .sh sweep above still excludes .py (that half of the
+# problem -- docstring false positives on a text-level regex -- is real
+# and unrelated to argv detection); the AST detector is a SEPARATE,
+# narrower check that closes the actual gap without reintroducing the
+# false-positive class the .sh sweep's exclusion exists to avoid.
 _EXCLUDE_EXTENSIONS = {".py"}
 
 
@@ -708,6 +722,193 @@ class TestSweepCatchesUncheckedAndAlternateStyleSiblings(unittest.TestCase):
                     f"repo-wide sweep failed to flag the pre-fix hook shape "
                     f"written to a dotfile directory. violations={violations!r}",
                 )
+
+
+
+# ---------------------------------------------------------------------- #
+# .py SHELL-OUT DETECTOR (lr-33958f, PR-C, carried from PR-B review):
+# BOBBIE assessed the blanket .py exclusion above as ACCURATE for the
+# current tree but STRUCTURALLY INCIDENTAL, not enforced -- a future
+# Python script shelling out to llm-client.sh with the literal path would
+# be invisible to the line-level sweep (which excludes .py entirely to
+# avoid docstring false positives, see _EXCLUDE_EXTENSIONS's own comment).
+#
+# This closes that gap WITHOUT reopening the docstring-false-positive
+# problem: instead of a line-level regex over .py source text (which
+# cannot distinguish "a docstring quoting the call shape for
+# documentation" from "a real subprocess argv"), this scans for the
+# call as a PYTHON LIST/TUPLE LITERAL ELEMENT -- the actual argv shape a
+# real subprocess.run/Popen call would use
+# (["...llm-client.sh", "review", ...]) -- which a docstring's prose
+# quoting the same shape does not produce (docstrings quote it as
+# free-form text or as a shell command STRING, e.g. the fixture shell
+# scripts embedded as triple-quoted strings elsewhere in this test suite,
+# never as a bare list-literal element).
+import ast
+
+
+def _iter_tracked_py_files():
+    """Same `git ls-files`-driven discovery as _iter_candidate_files, but
+    for .py files specifically (the class that function excludes)."""
+    out = subprocess.run(
+        ["git", "ls-files", "--", "*.py"],
+        cwd=TOOL_HOME,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [
+        os.path.join(TOOL_HOME, rel)
+        for rel in out.stdout.splitlines()
+        if rel.strip()
+    ]
+
+
+def _find_py_argv_shellouts_to_llm_client(path):
+    """Parse PATH as a Python AST and find every list/tuple literal
+    containing a string element ending in 'llm-client.sh' followed
+    (anywhere later in the same literal) by one of the five role
+    subcommands as its own string element -- the actual argv shape
+    subprocess.run(["path/to/llm-client.sh", "review", ...]) produces.
+    Returns a list of (lineno, role) tuples. A syntax error or unreadable
+    file yields an empty list (fail toward "nothing found" rather than
+    crashing the sweep on an unrelated file the repo happens to track)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=path)
+    except (SyntaxError, UnicodeDecodeError, OSError):
+        return []
+
+    roles = ("review", "adversarial", "merge-gate", "summarize")
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            continue
+        str_elems = [
+            (elt.value, elt.lineno)
+            for elt in node.elts
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+        ]
+        has_llm_client = any(v.endswith("llm-client.sh") for v, _ in str_elems)
+        if not has_llm_client:
+            continue
+        for value, lineno in str_elems:
+            if value in roles:
+                hits.append((lineno, value))
+    return hits
+
+
+class TestPyFilesShellingOutToLlmClientAreDetected(unittest.TestCase):
+    """Closes the carried-forward PR-B review gap: a real .py subprocess
+    argv shell-out to llm-client.sh IS discoverable, structurally, not
+    merely assumed absent by the line-level sweep's blanket exclusion."""
+
+    def test_no_tracked_py_file_shells_out_to_llm_client_today(self):
+        """Sanity check on the CURRENT state BOBBIE's assessment described:
+        confirms no tracked .py file actually does this today, so the
+        blanket line-level exclusion is not silently hiding a REAL
+        consumer right now. If this ever fails, the newly-discovered file
+        needs the SAME status+degraded-check discipline every .sh consumer
+        already has, via a Python-side check (subprocess returncode +
+        stdout inspection for a 'degraded'/'cause' marker) -- not just a
+        note that .py needs to be added to the .sh line-level sweep, which
+        cannot express Python's own call/return idiom anyway."""
+        offenders = []
+        for path in _iter_tracked_py_files():
+            hits = _find_py_argv_shellouts_to_llm_client(path)
+            if hits:
+                rel = os.path.relpath(path, TOOL_HOME)
+                offenders.extend(f"{rel}:{ln} (role={role})" for ln, role in hits)
+        self.assertEqual(
+            offenders, [],
+            f"found {len(offenders)} .py subprocess argv shell-out(s) to "
+            f"llm-client.sh -- the blanket .py exclusion in the line-level "
+            f"sweep above is only safe while this list is empty. Each "
+            f"offender needs explicit status+degraded-check discipline "
+            f"(python subprocess returncode check + stdout inspection for "
+            f"the degraded marker/cause field) added at its call site:\n" +
+            "\n".join(f"  {o}" for o in offenders),
+        )
+
+    def test_detector_actually_finds_a_synthetic_argv_shellout(self):
+        """Proves the detector is not vacuously passing -- a REAL .py file
+        on disk, containing an actual subprocess argv literal shaped
+        exactly like a live consumer, must be found. Written to a real
+        temp .py file (not just a string handed to the AST parser
+        in-process) so this exercises the full file-read-then-parse path."""
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-py-shellout-")
+        try:
+            fixture_path = os.path.join(tmpdir, "hypothetical_consumer.py")
+            with open(fixture_path, "w") as f:
+                f.write(
+                    "import subprocess\n"
+                    "def run_it():\n"
+                    "    r = subprocess.run(\n"
+                    "        ['/some/path/scripts/llm-client.sh', 'review'],\n"
+                    "        capture_output=True,\n"
+                    "    )\n"
+                    "    return r.stdout\n"
+                )
+            hits = _find_py_argv_shellouts_to_llm_client(fixture_path)
+            self.assertTrue(
+                any(role == "review" for _, role in hits),
+                f"detector failed to find a synthetic argv shell-out to "
+                f"llm-client.sh written to a real .py file. hits={hits!r}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_detector_does_not_flag_a_docstring_quoting_the_same_shape(self):
+        """Negative control: a docstring quoting the exact call shape as
+        PROSE (not a list literal) must not be flagged -- this is the
+        false-positive class the blanket .sh-side exclusion exists to
+        avoid, and the .py-specific AST detector must not reintroduce it."""
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-py-shellout-docstring-")
+        try:
+            fixture_path = os.path.join(tmpdir, "docs_only.py")
+            with open(fixture_path, "w") as f:
+                f.write(
+                    '"""\n'
+                    'This module documents the call shape:\n'
+                    '  "$TOOL_HOME/scripts/llm-client.sh" review\n'
+                    '"""\n'
+                    "import unittest\n"
+                )
+            hits = _find_py_argv_shellouts_to_llm_client(fixture_path)
+            self.assertEqual(
+                hits, [],
+                f"a docstring quoting the call shape as prose must not be "
+                f"flagged -- only an actual argv list/tuple literal "
+                f"element counts. hits={hits!r}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_detector_does_not_flag_a_shell_fixture_string_constant(self):
+        """Negative control: the existing _UNCHECKED_FIXTURE-style shell
+        script embedded as a triple-quoted STRING constant (this test
+        file's own established pattern) must not be flagged -- it is a
+        single string, not a list/tuple literal with 'llm-client.sh' and a
+        role as separate elements."""
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-py-shellout-fixture-")
+        try:
+            fixture_path = os.path.join(tmpdir, "fixture_only.py")
+            with open(fixture_path, "w") as f:
+                f.write(
+                    "FIXTURE = (\n"
+                    "    'cmd_fixture() {\\n'\n"
+                    "    '  \"$TOOL_HOME/scripts/llm-client.sh\" adversarial < \"$_fx_diff\" > \"$OUT\"\\n'\n"
+                    "    '}\\n'\n"
+                    ")\n"
+                )
+            hits = _find_py_argv_shellouts_to_llm_client(fixture_path)
+            self.assertEqual(hits, [], f"hits={hits!r}")
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
