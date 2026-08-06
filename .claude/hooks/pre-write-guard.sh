@@ -119,7 +119,27 @@ block() {
 # git repo) resolve the branch against the actual enrolled repo, not the
 # wrapper directory. Without -C, git rev-parse returns "" in a wrapper CWD,
 # "$ != main" is false, and W-001 silently allows writes to main.
-CURRENT_BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+#
+# REPO SCOPING (lr-da1f28 sweep): `-C "$REPO_ROOT"` alone is not sufficient
+# either — it only changes cwd before git's own ancestor-directory repo
+# discovery runs, so on a host where an ancestor of REPO_ROOT happens to be
+# a git repo (REPO_ROOT here can legitimately be a non-git wrapper-pointer
+# path, see the fallback above), this would silently resolve and check the
+# ANCESTOR repo's actual branch instead of REPO_ROOT's — a false negative
+# (ancestor happens to be on a feature branch) silently ALLOWS a write that
+# should have been blocked, exactly the write-gate bypass W-001 exists to
+# prevent. Fail toward blocking when REPO_ROOT cannot be proven to be the
+# repo `git -C` resolves against, matching W-002's own "can't determine ->
+# block" posture just below.
+_pwg_git_toplevel=""
+if [ -n "$REPO_ROOT" ]; then
+  _pwg_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
+  _pwg_git_toplevel=$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || echo "")
+fi
+CURRENT_BRANCH=""
+if [ -n "$_pwg_git_toplevel" ] && [ "$_pwg_git_toplevel" = "$_pwg_repo_root_canon" ]; then
+  CURRENT_BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+fi
 if [ "${CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE:-0}" != "1" ] && [ "$CURRENT_BRANCH" = "$DEFAULT_BRANCH" ]; then
   block W-001 "writes forbidden on default branch '$DEFAULT_BRANCH'"
 fi

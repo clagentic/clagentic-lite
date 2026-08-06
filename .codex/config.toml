@@ -1,5 +1,35 @@
 # clagentic-lite — Codex CLI config
-# Loaded when Codex is invoked from this repo.
+#
+# NOT AUTO-LOADED (lr-ae403d audit, follow-up to lr-2ec7b5). Confirmed via
+# codex-cli 0.142.5: `codex --help`/`codex exec --help`/`codex mcp --help`
+# describe `-c`/`--config`, `--ignore-user-config`, and `--profile` entirely
+# in terms of `~/.codex/config.toml` ($CODEX_HOME) -- never a project-local
+# `.codex/` directory. Definitive: `codex doctor --json`, run with
+# cwd=<this repo, which HAS this file>, reports
+# checks.config\.load.details["config.toml"] = "~/.codex/config.toml" (the
+# GLOBAL path) and no reference to this file at all. `invoke_codex`
+# (scripts/llm-client.sh) also never passes `-c`/`--config`/`-p`/`--profile`
+# pointing at this file, and passes `--skip-git-repo-check` -- confirming
+# from both sides (binary behavior AND caller code) that nothing reads this
+# file today.
+#
+# lr-2ec7b5 already established this for the (now-removed) `prompt_file`
+# field alone; this audit generalizes the finding to the WHOLE file: every
+# field below (approval, sandbox, network, roles.*, mcp_servers, telemetry)
+# is equally dead from this repo's own invocation path. The actual
+# equivalent of `[[roles.list]] permissions/tier` restriction lives in code
+# instead -- `invoke_codex`'s `--disable shell_tool -s read-only` flags,
+# gated by `ds_llm_role_is_bash_unrestricted` (scripts/platform.sh) -- see
+# that function's doc comment and AGENTS.md INV-5.
+#
+# KEPT (not deleted) as operator-facing documentation of the INTENDED
+# sandbox/role posture for anyone running `codex` interactively from this
+# repo outside clagentic-lite's own invocation path (a human session can
+# reference or `-c`-override these values manually; codex itself will not
+# read them automatically). If this file is ever wired to actually be read
+# (e.g. `invoke_codex` starts passing `-c`/`--config`), remove this notice
+# and re-verify the field-by-field behavior described in it, since none of
+# it has been exercised against a real load path.
 
 [runtime]
 # Approval mode: 'required' means Codex asks before executing any write/network action.

@@ -53,6 +53,51 @@ fi
 # state, or branch identity must be keyed to the enrolled project root.
 _git() { git -C "$REPO_ROOT" "$@"; }
 
+# _git_repo_root_is_scoped — true (exit 0) only when REPO_ROOT itself is the
+# git repo `_git` (or any `git -C "$REPO_ROOT" ...` call) will actually
+# operate on. `-C <dir>` only changes cwd before git's own repo discovery
+# runs — it still walks UP the filesystem looking for a `.git` directory. On
+# a host where an ancestor of REPO_ROOT happens to be a git repo (or
+# REPO_ROOT is not a git repo at all, as with the wrapper/.clagentic-project
+# layout ds_repo_root, platform.sh, can legitimately produce), any call that
+# reads repo state (rev-parse, diff, log, status, merge-base, fetch,
+# ls-remote, ...) would silently operate on that unrelated ancestor repo
+# instead — a wrong-repo result, not a git error, so nothing about the call
+# itself signals the mistake. Every call site that reads repo state for a
+# security- or correctness-relevant decision (a merge-base security-scan
+# baseline, a staged/branch diff fed to the review gates, a SHA staleness
+# comparison, a push-target branch name) must gate on this helper first, not
+# assume `_git`/`-C` alone is safe (lr-da1f28 sweep).
+#
+# `git rev-parse --show-toplevel` always prints an absolute, canonical
+# (symlink-resolved) path. REPO_ROOT is not guaranteed to be either: it can
+# come verbatim from CLAGENTIC_PROJECT_ROOT, or from ds_repo_root's
+# wrapper/.clagentic-project pointer-file fallback (platform.sh), neither of
+# which canonicalizes the path. A literal string compare between an
+# always-canonical toplevel and a possibly-relative/symlinked REPO_ROOT
+# falsely mismatches on a real git repo, silently no-op-ing every caller of
+# this helper on a repo it should have resolved. Canonicalize REPO_ROOT with
+# `cd DIR && pwd -P` (POSIX `pwd -P`, not plain `pwd`, which prints the
+# logical path and would leave a symlink component unresolved) to match what
+# `git rev-parse --show-toplevel` always returns. `cd` failing (REPO_ROOT
+# does not exist / not a directory) falls back to the raw value, which will
+# simply continue to correctly mismatch below.
+_git_repo_root_is_scoped() {
+  _grs_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
+  _grs_git_toplevel=$(_git rev-parse --show-toplevel 2>/dev/null || echo "")
+  [ -n "$_grs_git_toplevel" ] && [ "$_grs_git_toplevel" = "$_grs_repo_root_canon" ]
+}
+
+# _git_repo_scoped_head_sha — resolve HEAD's SHA, but ONLY when
+# _git_repo_root_is_scoped. Prints the resolved SHA on stdout, or nothing
+# when REPO_ROOT is not the git repo being consulted (or is not a git repo
+# at all).
+_git_repo_scoped_head_sha() {
+  if _git_repo_root_is_scoped; then
+    _git rev-parse HEAD 2>/dev/null || echo ""
+  fi
+}
+
 # run_bounded [TIMEOUT_SEC] -- CMD [ARGS...]
 #
 # INV-1a/INV-2 enforcement (class-4 foundry fix): the SOLE entry point for
@@ -134,7 +179,14 @@ cmd_log_run() {
   GATE="$1"
   OUTCOME="$2"
   DETAILS="${3:-}"
-  BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  # Repo-scoped (lr-da1f28 sweep): lower stakes than the security-relevant
+  # sites above (this is only an audit-log cosmetic column), but the same
+  # ancestor-walk-up defect applies — REPO_ROOT can come verbatim from
+  # CLAGENTIC_PROJECT_ROOT and need not itself be a git repo.
+  BRANCH=""
+  if _git_repo_root_is_scoped; then
+    BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  fi
   TS=$(ds_date_iso)
   # Every interpolated value must go through the same escape helper. A branch
   # named `feat/o'hare` would otherwise corrupt the INSERT under set -e.
@@ -191,9 +243,29 @@ cmd_log_run() {
 # stdout otherwise. Callers must check the exit status, not just emptiness
 # of stdout, to distinguish "no ref at all" from other failures if they ever
 # need to (current callers only need pass/fail + the reason on stderr).
+#
+# REPO SCOPING (lr-da1f28 sweep, highest-stakes site in that sweep): the
+# `git fetch`/`git ls-remote` calls below use `git -C "$REPO_ROOT"` directly
+# rather than `_git`, because $DS_TIMEOUT_CMD needs a literal external
+# command to exec, not a shell function — `_git` cannot be passed to it.
+# That means neither call was ever covered by `_git`'s own scoping
+# discipline, and — worse than a merely mis-stamped SHA — this is the
+# function whose output becomes cmd_sast's semgrep --baseline-commit and
+# cmd_bleed's branch-diff scope: if REPO_ROOT is not itself a git repo but
+# an ancestor is, every call below would silently fetch/resolve/diff against
+# that UNRELATED ancestor repo, producing a plausible-looking merge-base
+# that silently narrows a blocking security gate's scan window rather than
+# erroring. Gate the whole function on _git_repo_root_is_scoped up front and
+# refuse (same as any other resolution failure) when REPO_ROOT is not
+# provably the repo being consulted.
 _gate_resolve_fresh_default_branch_ref() {
   _gfdbr_branch="$1"
   _gfdbr_timeout="$2"
+
+  if ! _git_repo_root_is_scoped; then
+    echo "REPO_ROOT is not a git repo — cannot establish a provably current baseline" 1>&2
+    return 1
+  fi
 
   if ! $DS_TIMEOUT_CMD "$_gfdbr_timeout" git -C "$REPO_ROOT" fetch origin "$_gfdbr_branch" >/dev/null 2>&1; then
     echo "git fetch origin ${_gfdbr_branch} failed or timed out after ${_gfdbr_timeout}s — cannot establish a provably current baseline" 1>&2
@@ -248,9 +320,20 @@ cmd_secrets() {
   # we are on a feature branch, scan the full branch history instead — staged-
   # only mode is a no-op on a clean index and would silently miss committed
   # secrets in a PR workflow.
-  _SECRETS_STAGED=$(_git diff --cached --name-only 2>/dev/null)
+  #
+  # REPO SCOPING (lr-da1f28 sweep): guard on _git_repo_root_is_scoped before
+  # trusting either read below. If REPO_ROOT is not itself a git repo but an
+  # ancestor is, `_git diff --cached`/`_git rev-parse --abbrev-ref HEAD`
+  # would silently resolve against that unrelated ancestor repo — same class
+  # as get_review_diff's ancestor-diff leak, but feeding gitleaks instead of
+  # the LLM review gates.
+  _SECRETS_STAGED=""
+  _SECRETS_CURRENT_BRANCH=""
+  if _git_repo_root_is_scoped; then
+    _SECRETS_STAGED=$(_git diff --cached --name-only 2>/dev/null)
+    _SECRETS_CURRENT_BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  fi
   _SECRETS_DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
-  _SECRETS_CURRENT_BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
   _SECRETS_ON_FEATURE=0
   if [ -z "$_SECRETS_STAGED" ] && [ -n "$_SECRETS_CURRENT_BRANCH" ] && [ "$_SECRETS_CURRENT_BRANCH" != "$_SECRETS_DEFAULT_BRANCH" ] && [ "$_SECRETS_CURRENT_BRANCH" != "HEAD" ]; then
     _SECRETS_ON_FEATURE=1
@@ -561,6 +644,18 @@ cmd_bleed() {
   _BLEED_SCOPE_REASON=""
   _BLEED_FILES=""
 
+  # REPO SCOPING (lr-da1f28 sweep): every `_git` call below (staged diff,
+  # branch name, ls-files) needs REPO_ROOT to provably be the git repo `_git`
+  # resolves against — see _git_repo_root_is_scoped's doc comment. Resolve
+  # this once up front rather than per call site; when not scoped, force a
+  # full-tree scan (the documented fallback path this gate already has for
+  # "no usable git state") instead of silently trusting an ancestor repo's
+  # staged/branch state for a security-relevant file-set decision.
+  if ! _git_repo_root_is_scoped; then
+    _BLEED_FULL_SCAN=1
+    echo "[gates/bleed] REPO_ROOT is not a git repo — forcing full-tree scan" 1>&2
+  fi
+
   # A pattern-file change makes any prior full-scan history relevant again
   # (a newly added pattern could match content in files the current diff
   # never touches) — force full scan rather than silently narrowing.
@@ -575,7 +670,10 @@ cmd_bleed() {
 
   if [ "$_BLEED_FULL_SCAN" = "1" ]; then
     [ -z "$_BLEED_SCOPE_REASON" ] && _BLEED_SCOPE_REASON="--full-scan requested"
-    _BLEED_FILES=$(git -C "$REPO_ROOT" ls-files 2>/dev/null) || {
+    # lr-da1f28 sweep: was a bare `git -C "$REPO_ROOT" ls-files`, bypassing
+    # `_git` (and its scoping) for no documented reason — this is the same
+    # file-set the rest of cmd_bleed already resolves via `_git`.
+    _BLEED_FILES=$(_git ls-files 2>/dev/null) || {
       rm -f "$_BLEED_TMP"
       echo "[gates/bleed] git ls-files failed — skipping" 1>&2
       cmd_log_run bleed pass "git ls-files failed (non-blocking)"
@@ -636,7 +734,9 @@ cmd_bleed() {
       # back to a full scan rather than silently scanning nothing or
       # trusting an unverified baseline.
       if [ -z "$_BLEED_FILES" ] && [ -z "$_BLEED_SCOPE_REASON" ]; then
-        _BLEED_FILES=$(git -C "$REPO_ROOT" ls-files 2>/dev/null) || {
+        # lr-da1f28 sweep: same bare `git -C "$REPO_ROOT"` bypass as the
+        # full-scan branch above — no documented reason to skip `_git` here.
+        _BLEED_FILES=$(_git ls-files 2>/dev/null) || {
           rm -f "$_BLEED_TMP"
           echo "[gates/bleed] git ls-files failed — skipping" 1>&2
           cmd_log_run bleed pass "git ls-files failed (non-blocking)"
@@ -746,7 +846,17 @@ cmd_sast() {
     _SAST_BASELINE_SKIP_REASON="installed semgrep does not support --baseline-commit"
   else
     _SAST_DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
-    _SAST_CURRENT_BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    # REPO SCOPING (lr-da1f28 sweep): guard before trusting the branch name
+    # — an unscoped REPO_ROOT would otherwise silently resolve an ancestor
+    # repo's (real, non-empty, non-"HEAD") branch name, which the emptiness
+    # checks below would not catch. _gate_resolve_fresh_default_branch_ref
+    # (called further down) independently refuses on the same condition, but
+    # guarding here too keeps the diagnostic message honest rather than
+    # implying a real branch was found.
+    _SAST_CURRENT_BRANCH=""
+    if _git_repo_root_is_scoped; then
+      _SAST_CURRENT_BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    fi
 
     if [ -z "$_SAST_CURRENT_BRANCH" ] || [ "$_SAST_CURRENT_BRANCH" = "HEAD" ]; then
       _SAST_BASELINE_SKIP_REASON="detached HEAD — no branch to diff against a base"
@@ -830,8 +940,26 @@ cmd_sast() {
 #      an empty diff (the merge-gate has an explicit null-review rule for this).
 #
 # Prints one diagnostic line to stderr indicating which mode is active.
+#
+# REPO SCOPING (lr-da1f28 sweep): every git call below reads repo state
+# (staged diff, branch, HEAD) via `_git`, which only changes cwd before
+# git's own ancestor-directory repo discovery runs — see
+# _git_repo_root_is_scoped's doc comment. If REPO_ROOT is not itself a git
+# repo but an ancestor of it is (the wrapper/.clagentic-project layout
+# permits exactly this), every one of these calls would silently operate on
+# the ancestor repo's staged/branch/diff state instead of REPO_ROOT's —
+# feeding the review/adversarial gates a wrong-repo diff rather than merely
+# mis-stamping a SHA. Guard the whole function the same way: skip straight
+# to the documented "no staged changes" empty-diff fallback when REPO_ROOT
+# is not the git repo `_git` would actually resolve to.
 get_review_diff() {
   DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+
+  if ! _git_repo_root_is_scoped; then
+    printf '[gates/review] REPO_ROOT is not a git repo — empty diff\n' 1>&2
+    return 0
+  fi
+
   CURRENT_BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 
   if _git diff --cached --name-only 2>/dev/null | grep -q .; then
@@ -2114,8 +2242,10 @@ cmd_review() {
       printf '%s\n' "$_crv_merged" > "$OUT"
 
       # Stamp the merged envelope with the current HEAD SHA — same logic as
-      # the single-chunk path below.
-      _review_sha=$(_git rev-parse HEAD 2>/dev/null || echo "")
+      # the single-chunk path below. Repo-scoped (lr-da1f28 sweep): see
+      # _git_repo_scoped_head_sha's doc comment for why a bare `_git
+      # rev-parse HEAD` is not sufficient here.
+      _review_sha=$(_git_repo_scoped_head_sha)
       if [ -n "$_review_sha" ]; then
         _stamp_envelope "$OUT" "$_review_sha"
       fi
@@ -2221,7 +2351,9 @@ cmd_review() {
   # Stamp the output with the current HEAD SHA so build_gate_summary can
   # detect stale payloads (file written against a different branch/commit).
   # Best-effort: if git or jq/python3 are unavailable, skip silently.
-  _review_sha=$(_git rev-parse HEAD 2>/dev/null || echo "")
+  # Repo-scoped (lr-da1f28 sweep): see _git_repo_scoped_head_sha's doc
+  # comment for why a bare `_git rev-parse HEAD` is not sufficient here.
+  _review_sha=$(_git_repo_scoped_head_sha)
   if [ -n "$_review_sha" ]; then
     _stamp_envelope "$OUT" "$_review_sha"
   fi
@@ -2925,7 +3057,9 @@ cmd_adversarial() {
   fi
   # Prepend a SHA stamp comment as the first line so build_gate_summary can
   # detect stale payloads. Best-effort: skip if git unavailable or SHA empty.
-  _adv_sha=$(_git rev-parse HEAD 2>/dev/null || echo "")
+  # Repo-scoped (lr-da1f28 sweep): see _git_repo_scoped_head_sha's doc
+  # comment for why a bare `_git rev-parse HEAD` is not sufficient here.
+  _adv_sha=$(_git_repo_scoped_head_sha)
   if [ -n "$_adv_sha" ]; then
     _adv_tmp=$(mktemp -t clagentic-adv-stamp.XXXXXX)
     printf '<!-- clagentic-diff-sha: %s -->\n' "$_adv_sha" > "$_adv_tmp"
@@ -3121,14 +3255,12 @@ EOF3
 # Both are hashed together via the existing _rm_sha256 shim (review-merge.sh)
 # used by dedup_findings/_review_deferral_match for the exact same
 # fingerprint-content-not-timestamps reason. Symlink/toplevel canonicalization
-# mirrors the --recheck guard above (same REPO_ROOT ambiguity applies here).
+# delegates to _git_repo_scoped_head_sha (gates.sh, near the _git
+# definition), not a locally-duplicated inline check (lr-da1f28 sweep — this
+# used to hand-roll the same canonicalize-and-compare logic the --recheck
+# guard below also hand-rolled; both now share one implementation).
 _mg_state_identity() {
-  _mgsi_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
-  _mgsi_git_toplevel=$(_git rev-parse --show-toplevel 2>/dev/null || echo "")
-  if [ "$_mgsi_git_toplevel" != "$_mgsi_repo_root_canon" ]; then
-    return 0
-  fi
-  _mgsi_head=$(_git rev-parse HEAD 2>/dev/null || echo "")
+  _mgsi_head=$(_git_repo_scoped_head_sha)
   [ -n "$_mgsi_head" ] || return 0
   _mgsi_content_hash=$( { _git diff HEAD 2>/dev/null; _git status --porcelain 2>/dev/null; } | _rm_sha256)
   printf '%s:%s' "$_mgsi_head" "$_mgsi_content_hash"
@@ -3200,48 +3332,14 @@ cmd_merge_gate() {
     # _stamp_envelope via build_gate_summary) and compare it to HEAD. Refuse
     # if the SHA is missing or mismatches — the caller must rebuild first.
     #
-    # `_git rev-parse HEAD` alone is not enough: `git -C <dir> ...` only
-    # changes cwd before git's own repo discovery runs, so it still walks up
-    # the filesystem looking for a `.git` directory. On a host where an
-    # ancestor of REPO_ROOT happens to be a git repo (or is itself REPO_ROOT's
-    # own ancestor, as with the wrapper/.clagentic-project layout REPO_ROOT
-    # can legitimately resolve to without being a git repo — see
-    # ds_repo_root, platform.sh), that walk-up would incorrectly resolve a
-    # real SHA belonging to a different repo. Guard against this by requiring
-    # the resolved toplevel to equal REPO_ROOT itself before trusting the SHA.
-    #
-    # `git rev-parse --show-toplevel` always prints an absolute, canonical
-    # (symlink-resolved) path. REPO_ROOT is not guaranteed to be either: it
-    # can come verbatim from CLAGENTIC_PROJECT_ROOT, or from ds_repo_root's
-    # wrapper/.clagentic-project pointer-file fallback (platform.sh:63-66),
-    # neither of which canonicalizes the path. A literal string compare
-    # between an always-canonical toplevel and a possibly-relative/symlinked
-    # REPO_ROOT falsely mismatches on a real git repo, leaving
-    # _mg_head_sha empty and silently no-op-ing the staleness guard on a repo
-    # it should have checked — the same bug class as the ancestor-walk-up
-    # issue above, but with the polarity flipped: that one made --recheck
-    # falsely refuse, this one makes it falsely pass a stale summary (lr-4a3f88
-    # follow-up). Canonicalize REPO_ROOT using the same `cd DIR && pwd`
-    # idiom this codebase already uses elsewhere (gates.sh:29,
-    # bin/clagentic-lite) for the relative-path half of the problem, plus
-    # POSIX `pwd -P` (not plain `pwd`, which prints the logical path and
-    # would leave a symlink component unresolved) for the symlink half —
-    # both are needed to match what `git rev-parse --show-toplevel` always
-    # returns. `cd` failing (REPO_ROOT does not exist / not a directory)
-    # falls back to the raw value, which will simply continue to correctly
-    # mismatch below.
+    # HEAD resolution goes through _git_repo_scoped_head_sha (gates.sh, near
+    # the _git definition), not a bare `_git rev-parse HEAD`: see that
+    # helper's doc comment for the full ancestor-walk-up / symlinked-REPO_ROOT
+    # rationale (lr-4a3f88 and follow-up, lr-da1f28 sweep — this was the
+    # original call site the fix was built for; the logic now lives in the
+    # shared helper so the other call sites needing it don't duplicate it).
     _mg_summary_sha=""
-    _mg_head_sha=""
-    # `pwd -P` (not plain `pwd`) is required: plain `pwd` prints the LOGICAL
-    # path, preserving any symlink component named in the `cd` argument —
-    # it would NOT resolve a symlinked REPO_ROOT down to the same physical
-    # path `git rev-parse --show-toplevel` (which always fully resolves
-    # symlinks) reports. `-P` is POSIX `pwd`, no portability concern.
-    _mg_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
-    _mg_git_toplevel=$(_git rev-parse --show-toplevel 2>/dev/null || echo "")
-    if [ "$_mg_git_toplevel" = "$_mg_repo_root_canon" ]; then
-      _mg_head_sha=$(_git rev-parse HEAD 2>/dev/null || echo "")
-    fi
+    _mg_head_sha=$(_git_repo_scoped_head_sha)
     if [ -n "$_mg_head_sha" ]; then
       if command -v jq >/dev/null 2>&1; then
         _mg_summary_sha=$(jq -r '.review._clagentic_diff_sha // ""' "$IN" 2>/dev/null || echo "")
@@ -3586,14 +3684,25 @@ build_gate_summary() {
   #
   # Skip the check when CLAGENTIC_ALLOW_STALE_PAYLOAD=1 (e.g. CI pipelines
   # that write gate artifacts in a prior step, or air-gapped environments).
-  CURRENT_SHA=$(_git rev-parse HEAD 2>/dev/null || echo "")
+  # Repo-scoped (lr-da1f28 sweep): see _git_repo_scoped_head_sha's doc
+  # comment for why a bare `_git rev-parse HEAD` is not sufficient here — the
+  # same ancestor-repo walk-up risk applies to this comparison SHA as to the
+  # stamps it's compared against (cmd_review/cmd_adversarial above).
+  CURRENT_SHA=$(_git_repo_scoped_head_sha)
   ADVERSARIAL_MISSING=false
   # Fail-closed when REPO_ROOT is a valid git repo but CURRENT_SHA is empty:
   # treat as stale so the merge-gate refuses on incomplete data. Only the
-  # genuine non-git case (rev-parse --git-dir fails) may skip the check.
-  # Consistent with the "missing stamp = stale" philosophy at line ~1105.
+  # genuine non-git case (REPO_ROOT is not itself a git repo) may skip the
+  # check. Consistent with the "missing stamp = stale" philosophy at line
+  # ~1105. This must use the same toplevel-equality test as
+  # _git_repo_scoped_head_sha (via _git_repo_root_is_scoped), not a bare
+  # `_git rev-parse --git-dir`: the latter has the identical ancestor-walk-up
+  # problem (an ancestor of a non-git REPO_ROOT being a git repo would
+  # wrongly report git_dir_ok=1), which would then fail-closed on a repo
+  # REPO_ROOT was never part of rather than correctly skipping the check as
+  # the genuine non-git case.
   _git_dir_ok=0
-  if _git rev-parse --git-dir >/dev/null 2>&1; then _git_dir_ok=1; fi
+  if _git_repo_root_is_scoped; then _git_dir_ok=1; fi
   if [ -z "$CURRENT_SHA" ] && [ "$_git_dir_ok" = "1" ] && [ "${CLAGENTIC_ALLOW_STALE_PAYLOAD:-0}" != "1" ]; then
     printf '{"stale_payload": true, "stale_gates": ["review","adversarial"], "current_sha": "", "review_sha": "", "adversarial_sha": ""}\n'
     return 0
@@ -3686,7 +3795,12 @@ build_gate_summary() {
   _ar_rel=".clagentic/accepted-risks.md"
   INTRODUCES_ACK_FILE="false"
   _diff_status=""
-  if _git diff --cached --name-status 2>/dev/null | grep -q .; then
+  # REPO SCOPING (lr-da1f28 sweep): guard before trusting the staged diff —
+  # same ancestor-repo leak class as get_review_diff, here feeding the
+  # ack-bootstrap-exemption detection instead. Fail-open/informational only
+  # (denying the exemption is the safe direction), so an unscoped REPO_ROOT
+  # falls through to the branch-diff path below rather than hard-erroring.
+  if _git_repo_root_is_scoped && _git diff --cached --name-status 2>/dev/null | grep -q .; then
     _diff_status=$(_git diff --cached --name-status 2>/dev/null || true)
   else
     # FRESHNESS IS A PRECONDITION, NOT AN ASSUMPTION (lr-53dc6e, propagating
@@ -4333,7 +4447,16 @@ cmd_ship() {
   if gate_enabled merge-gate;  then cmd_merge_gate  || { echo "[gates/ship] BLOCKED at merge-gate"; ship_step_hint; exit 1; }; else ship_step_skip merge-gate;  fi
 
   echo "[gates/ship] all blocking gates passed"
-  BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  # Repo-scoped (lr-da1f28 sweep): a bare `_git rev-parse --abbrev-ref HEAD`
+  # would resolve an ancestor repo's branch name when REPO_ROOT is not
+  # itself a git repo (see _git_repo_root_is_scoped's doc comment), and
+  # `_git push -u origin "$BRANCH"` below IS correctly scoped to REPO_ROOT —
+  # pushing REPO_ROOT's history to a branch name borrowed from an unrelated
+  # repo. Treat "not scoped" the same as "no branch resolvable".
+  BRANCH=""
+  if _git_repo_root_is_scoped; then
+    BRANCH=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  fi
   DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
   if [ "$BRANCH" = "$DEFAULT_BRANCH" ] || [ -z "$BRANCH" ]; then
     echo "[gates/ship] on '$BRANCH' — not pushing or opening a PR; create a feature branch first"

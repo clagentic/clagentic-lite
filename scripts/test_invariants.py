@@ -893,5 +893,226 @@ class TestSweepCatchesAHardcodedRoleLiteralWarningGuard(unittest.TestCase):
         self.assertIn("ds_llm_role_is_bash_unrestricted", block)
 
 
+# ---------------------------------------------------------------------- #
+# INV-6 (lr-da1f28 sweep): no `git` invocation that reads REPO-STATE (a
+# staged diff, a branch name, a commit SHA, a merge-base, a ls-files/
+# ls-remote/fetch result) may resolve as a BARE `git ...` call, or as a
+# `git -C "$REPO_ROOT"`/`git -C "$SOME_HOME_VAR"` call NOT gated by a
+# toplevel-equality scoping check first -- in scripts/gates.sh specifically.
+# ---------------------------------------------------------------------- #
+#
+# THE DEFECT CLASS: `git -C <dir> <cmd>` only changes cwd BEFORE git's own
+# repo discovery runs -- it still walks UP the filesystem from <dir> looking
+# for a `.git` directory. When <dir> is not itself a git repo (the
+# wrapper/.clagentic-project layout this codebase supports permits exactly
+# this) but an ancestor of it is, EVERY repo-state read silently resolves
+# against that unrelated ancestor repo instead -- a wrong-repo RESULT, not a
+# git error, so nothing about the call itself signals the mistake. lr-4a3f88
+# fixed one instance (a --recheck SHA-staleness guard); this sweep is the
+# class-level closure: every site in gates.sh that reads repo state for a
+# security- or correctness-relevant decision must first prove REPO_ROOT is
+# the repo being consulted, via _git_repo_root_is_scoped (or the shared
+# _git_repo_scoped_head_sha wrapper for the common HEAD-SHA case).
+#
+# WHAT THIS SWEEP DOES NOT COVER (deliberately, not an oversight): `git
+# init <dir>` (creates a repo AT <dir> directly -- no discovery/walk-up
+# involved, so the defect class does not apply); `_git_repo_root_is_scoped`
+# and `_git_repo_scoped_head_sha`'s OWN internal `_git rev-parse
+# --show-toplevel`/`_git rev-parse HEAD` calls (they ARE the scoping check
+# --requiring them to be preceded by themselves is circular); the two
+# `$DS_TIMEOUT_CMD`-bound `git -C "$REPO_ROOT" fetch`/`ls-remote` calls
+# inside `_gate_resolve_fresh_default_branch_ref`, which cannot route through
+# the `_git` shell function at all ($DS_TIMEOUT_CMD execs a literal command,
+# not a function) -- that function instead gates its ENTIRE body on
+# `_git_repo_root_is_scoped` up front, which this sweep verifies separately.
+_GIT_REPO_STATE_SUBCOMMANDS = (
+    "rev-parse", "diff", "log", "status", "merge-base",
+    "ls-files", "ls-remote", "fetch", "remote", "push",
+)
+# Bare `git <subcommand>` (no `-C`, not `_git`) at statement start -- the
+# original lr-4a3f88 defect shape. Excludes `git init` (see docstring above)
+# and excludes any line already using `_git` (a shell function name that
+# happens to start with `git` would NOT match this pattern since it requires
+# a word-boundary `git` token followed by whitespace, not `_git`).
+_BARE_GIT_REPO_STATE_RE = re.compile(
+    r'(?:^|[;&|(]|\bif\s|\bthen\s)\s*git\s+(' + "|".join(_GIT_REPO_STATE_SUBCOMMANDS) + r')\b'
+)
+# `git -C "$SOMEVAR" <subcommand>` -- the -C-scoped-but-still-vulnerable
+# shape (lr-4a3f88's OWN original site, and this sweep's highest-stakes
+# find, _gate_resolve_fresh_default_branch_ref). Any occurrence outside the
+# two documented, already-function-level-guarded fetch/ls-remote sites is a
+# violation.
+_DASH_C_GIT_REPO_STATE_RE = re.compile(
+    r'git\s+-C\s+"\$\w+"\s+(' + "|".join(_GIT_REPO_STATE_SUBCOMMANDS) + r')\b'
+)
+
+
+def _find_gates_sh_scoping_violations(lines):
+    """Sweep primitive: every live (non-comment) line in gates.sh containing
+    a bare `git <repo-state-subcommand>` invocation (never using `_git` or
+    an explicit `-C`), OR a `git -C "$VAR" <repo-state-subcommand>` call
+    that is not one of the two documented $DS_TIMEOUT_CMD-bound sites inside
+    _gate_resolve_fresh_default_branch_ref (that function gates its entire
+    body on _git_repo_root_is_scoped up front -- verified by a separate
+    test below, not by this line-level sweep). Returns a list of
+    (line_no, line_text) violations."""
+    violations = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            continue
+        # `git init <dir>` is exempt -- see module-level docstring.
+        if re.search(r'\bgit\s+init\b', stripped):
+            continue
+        if _BARE_GIT_REPO_STATE_RE.search(stripped):
+            violations.append((i + 1, line.rstrip('\n')))
+            continue
+        m = _DASH_C_GIT_REPO_STATE_RE.search(stripped)
+        if m:
+            # The two documented exemptions: $DS_TIMEOUT_CMD-bound fetch/
+            # ls-remote inside _gate_resolve_fresh_default_branch_ref. Both
+            # carry a `$DS_TIMEOUT_CMD "$_gfdbr_timeout"` prefix on the same
+            # line -- a real, mechanically-checkable marker, not a
+            # line-number allowlist.
+            if '$DS_TIMEOUT_CMD' in stripped and '_gfdbr_timeout' in stripped:
+                continue
+            violations.append((i + 1, line.rstrip('\n')))
+    return violations
+
+
+class TestNoBareOrUnscopedGitRepoStateCallInGatesSh(unittest.TestCase):
+    """INV-6: every git invocation in scripts/gates.sh that reads repo state
+    must go through `_git` (or the two documented, function-guarded
+    $DS_TIMEOUT_CMD exemptions) -- never a bare `git <cmd>` or an
+    unguarded `git -C "$VAR" <cmd>`. Sweeps the real, current gates.sh via
+    git-ls-files-tracked content, not a hardcoded site list."""
+
+    def setUp(self):
+        self.lines = _iter_gates_sh_lines()
+
+    def test_git_repo_root_is_scoped_helper_exists(self):
+        self.assertTrue(
+            any(re.match(r'^_git_repo_root_is_scoped\s*\(\)\s*\{', ln) for ln in self.lines),
+            "_git_repo_root_is_scoped() not found in gates.sh -- INV-6's "
+            "scoping predicate is missing",
+        )
+
+    def test_sweep_discovers_at_least_the_known_git_call_sites(self):
+        """Sanity check on discovery itself: if this ever finds fewer real
+        `_git`/`git -C` repo-state calls than expected, the regex is broken
+        (e.g. a subcommand list drifted) and the violation sweep below
+        would vacuously pass with incomplete coverage."""
+        found = 0
+        for line in self.lines:
+            stripped = line.strip()
+            if stripped.startswith('#'):
+                continue
+            if re.search(r'_git\s+(' + "|".join(_GIT_REPO_STATE_SUBCOMMANDS) + r')\b', stripped):
+                found += 1
+        self.assertGreaterEqual(
+            found, 20,
+            f"expected at least 20 `_git <repo-state-subcommand>` call "
+            f"sites in gates.sh; found {found} -- did the subcommand list "
+            f"or discovery regex regress?",
+        )
+
+    def test_no_bare_or_unscoped_git_call_in_gates_sh(self):
+        violations = _find_gates_sh_scoping_violations(self.lines)
+        self.assertEqual(
+            violations, [],
+            f"found {len(violations)} bare or unscoped git repo-state "
+            f"call(s) in gates.sh -- this reintroduces the ancestor-repo "
+            f"walk-up class (INV-6, lr-da1f28 sweep): a bare `git <cmd>` or "
+            f"an ungated `git -C \"$VAR\" <cmd>` can silently resolve "
+            f"against an unrelated ancestor repo instead of REPO_ROOT. "
+            f"Route through `_git` (function-guarded call sites) or gate "
+            f"explicitly on _git_repo_root_is_scoped first:\n" +
+            "\n".join(f"  gates.sh:{ln}: {txt}" for ln, txt in violations),
+        )
+
+    def test_gate_resolve_fresh_default_branch_ref_gates_on_scoping_predicate(self):
+        """The two documented $DS_TIMEOUT_CMD-bound exemptions are only
+        safe because _gate_resolve_fresh_default_branch_ref gates its ENTIRE
+        body on _git_repo_root_is_scoped before either runs -- assert that
+        guard is actually present in the function, not just documented in
+        a comment a future edit could silently drop."""
+        content = "".join(self.lines)
+        m = re.search(
+            r'_gate_resolve_fresh_default_branch_ref\(\)\s*\{(.*?)\n\}',
+            content, re.DOTALL,
+        )
+        self.assertIsNotNone(
+            m, "could not locate _gate_resolve_fresh_default_branch_ref() body in gates.sh",
+        )
+        self.assertIn(
+            "_git_repo_root_is_scoped", m.group(1),
+            "_gate_resolve_fresh_default_branch_ref no longer gates on "
+            "_git_repo_root_is_scoped -- this is the highest-stakes site "
+            "in the lr-da1f28 sweep (feeds cmd_sast's semgrep "
+            "--baseline-commit and cmd_bleed's branch-diff scope); losing "
+            "this guard silently narrows a blocking security gate's scan "
+            "window against a wrong-repo baseline instead of erroring",
+        )
+
+
+class TestSweepCatchesABareGitSiblingCallInGatesSh(unittest.TestCase):
+    """Proves the sweep actually catches what it claims to, using
+    synthetic sibling fixtures in the exact bare-git and unscoped-`-C`
+    shapes the real pre-fix sites had (lr-da1f28 sweep, and the earlier
+    lr-4a3f88 site this generalizes)."""
+
+    _BARE_GIT_FIXTURE = (
+        'cmd_fixture() {\n'
+        '  FIXTURE_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")\n'
+        '}\n'
+    )
+
+    _UNGATED_DASH_C_FIXTURE = (
+        'cmd_fixture() {\n'
+        '  FIXTURE_TIP=$(git -C "$REPO_ROOT" ls-remote origin refs/heads/main 2>/dev/null)\n'
+        '}\n'
+    )
+
+    _PROPERLY_SCOPED_VIA_GIT_FUNC_FIXTURE = (
+        'cmd_fixture() {\n'
+        '  FIXTURE_SHA=$(_git rev-parse HEAD 2>/dev/null || echo "")\n'
+        '}\n'
+    )
+
+    _GIT_INIT_FIXTURE = (
+        'cmd_fixture() {\n'
+        '  git init "$_ep" || return 1\n'
+        '}\n'
+    )
+
+    def test_flags_a_bare_git_repo_state_call(self):
+        lines = self._BARE_GIT_FIXTURE.splitlines(keepends=True)
+        violations = _find_gates_sh_scoping_violations(lines)
+        self.assertTrue(
+            any('git rev-parse HEAD' in txt for _, txt in violations),
+            f"sweep failed to flag a bare `git rev-parse` call. "
+            f"violations={violations!r}",
+        )
+
+    def test_flags_an_ungated_dash_c_call(self):
+        lines = self._UNGATED_DASH_C_FIXTURE.splitlines(keepends=True)
+        violations = _find_gates_sh_scoping_violations(lines)
+        self.assertTrue(
+            any('ls-remote' in txt for _, txt in violations),
+            f"sweep failed to flag an ungated `git -C` ls-remote call. "
+            f"violations={violations!r}",
+        )
+
+    def test_does_not_flag_a_call_through_the_git_function(self):
+        lines = self._PROPERLY_SCOPED_VIA_GIT_FUNC_FIXTURE.splitlines(keepends=True)
+        violations = _find_gates_sh_scoping_violations(lines)
+        self.assertEqual(violations, [], f"violations={violations!r}")
+
+    def test_does_not_flag_git_init(self):
+        lines = self._GIT_INIT_FIXTURE.splitlines(keepends=True)
+        violations = _find_gates_sh_scoping_violations(lines)
+        self.assertEqual(violations, [], f"violations={violations!r}")
+
+
 if __name__ == "__main__":
     unittest.main()
