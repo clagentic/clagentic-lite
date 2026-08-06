@@ -1,11 +1,16 @@
 """
 Regression coverage for lr-7047bf (fold-in, BOBBIE + HOLDEN, PR #141 review
-#2): .claude/hooks/stop-summarize.sh's summarizer call was an unwired
-consumer of walk_chain's outcome channel -- invisible to a scripts/-and-
-bin/-scoped sweep because .claude/ is a dotfile directory that sweep never
-walked. A genuinely degraded summarizer chain must not write a fabricated
-summary to memory.db, and the audit trail must not report "pass" for a run
-that produced no real summary.
+#2): stop-summarize.sh's summarizer call was an unwired consumer of
+walk_chain's outcome channel -- invisible to a scripts/-and-bin/-scoped
+sweep because .claude/ is a dotfile directory that sweep never walked. A
+genuinely degraded summarizer chain must not write a fabricated summary to
+memory.db, and the audit trail must not report "pass" for a run that
+produced no real summary.
+
+Source of truth relocated from the formerly-tracked, live
+.claude/hooks/stop-summarize.sh to share/hook-shims/stop-summarize.sh.template
+(lr-57db23 -- see AGENTS.md INV-7); this file runs the tracked template
+directly.
 
 The hook detaches into a backgrounded subshell after a debounce sleep
 (CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC, default 20s) so Claude Code's Stop event
@@ -26,7 +31,7 @@ import time
 import unittest
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-HOOK = os.path.join(TOOL_HOME, ".claude", "hooks", "stop-summarize.sh")
+HOOK = os.path.join(TOOL_HOME, "share", "hook-shims", "stop-summarize.sh.template")
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
@@ -136,6 +141,12 @@ class _StopSummarizeFixture(unittest.TestCase):
         env["CLAGENTIC_ENV_LOADED"] = "1"
         env["CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC"] = "0"
         env["CLAGENTIC_DISABLE_HANDOFF"] = "1"
+        # This fixture's own scripts/platform.sh (copied in setUp) is the
+        # one the hook should source -- points CLAGENTIC_LITE_HOME at the
+        # fake repo, not the real checkout, so the hook resolves platform.sh
+        # against the SAME tree as the fake llm-client.sh/real memory.sh
+        # this fixture deliberately substitutes.
+        env["CLAGENTIC_LITE_HOME"] = self._repo
         env.pop("GIT_DIR", None)
         env.pop("GIT_WORK_TREE", None)
         result = subprocess.run(

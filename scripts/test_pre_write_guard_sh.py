@@ -1,5 +1,7 @@
 """
-Regression tests for .claude/hooks/pre-write-guard.sh (lr-a218d8, rule W-006).
+Regression tests for share/hook-shims/pre-write-guard.sh.template
+(lr-a218d8, rule W-006; relocated from the formerly-tracked, live
+.claude/hooks/pre-write-guard.sh by lr-57db23 -- see AGENTS.md INV-7).
 
 W-006 is a warn-only, non-blocking rule: when the PreToolUse(Write|Edit)
 payload omits `agent_type`, the orchestrator (main Claude Code loop) — not a
@@ -13,6 +15,11 @@ mirror of its logic), piping realistic PreToolUse JSON payloads on stdin,
 exactly as Claude Code does. A regression in the shell logic — the wrong
 field name, an accidental `exit 2`, a warn that fires when agent_type is
 present — would be caught here; a Python reimplementation would not catch it.
+Runs the tracked TEMPLATE directly (the file a diff review actually sees),
+with CLAGENTIC_LITE_HOME set to this checkout so its
+`${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}` fallback resolves
+platform.sh against the real, current scripts/ -- exactly as it would once
+materialized into $CLAGENTIC_LITE_HOME/.claude/hooks/ by _stamp_claude_hooks.
 
 Run with: python3 -m unittest scripts/test_pre_write_guard_sh.py -v
 """
@@ -22,16 +29,17 @@ import subprocess
 import tempfile
 import unittest
 
-TOOL_HOME = os.path.join(os.path.dirname(__file__), "..")
-HOOK_SH = os.path.join(TOOL_HOME, ".claude", "hooks", "pre-write-guard.sh")
+TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+HOOK_SH = os.path.join(TOOL_HOME, "share", "hook-shims", "pre-write-guard.sh.template")
 
 
 def _run_hook(payload, cwd, env_extra=None):
-    """Run the real pre-write-guard.sh with `payload` (dict) piped as JSON
-    on stdin, from `cwd` (a git repo on a non-default branch). Returns
-    (returncode, stdout, stderr)."""
+    """Run the real pre-write-guard.sh template with `payload` (dict) piped
+    as JSON on stdin, from `cwd` (a git repo on a non-default branch).
+    Returns (returncode, stdout, stderr)."""
     env = dict(os.environ)
     env.pop("CLAGENTIC_ENV_LOADED", None)
+    env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
     if env_extra:
         env.update(env_extra)
     proc = subprocess.run(

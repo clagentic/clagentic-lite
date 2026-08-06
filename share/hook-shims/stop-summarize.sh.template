@@ -6,9 +6,17 @@
 # Claude Code passes a JSON payload on stdin with fields including
 # session_id, transcript_path, and stop_hook_active. We read it before
 # detaching so the payload is captured before the parent closes stdin.
+#
+# managed-by: clagentic · clagentic-hooks-version: v1
+# Source of truth: share/hook-shims/stop-summarize.sh.template. Materialized
+# into $CLAGENTIC_LITE_HOME/.claude/hooks/stop-summarize.sh at `init`/`update`
+# time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
+# _stamp_claude_hooks). Enrolled repos never receive their own copy — their
+# .claude/settings.json calls back into this ONE materialized copy by
+# absolute path. Do not edit the installed copy by hand.
 
-HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR=.
-. "$HOOK_DIR/../../scripts/platform.sh" 2>/dev/null || exit 0
+: "${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}"
+. "$CLAGENTIC_LITE_HOME/scripts/platform.sh" 2>/dev/null || exit 0
 ds_load_env 2>/dev/null || true
 
 DEBOUNCE="${CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC:-20}"
@@ -81,6 +89,11 @@ PY
   [ -z "$LAST_TURN" ] && exit 0
 
   # Run the summarizer via the role-call wrapper.
+  #
+  # NOTE: REPO_ROOT-scoped, not CLAGENTIC_LITE_HOME-scoped — this is
+  # deliberate and preserved as-is by this relocation (share/hook-shims/,
+  # lr-57db23), not something the relocation changes. See
+  # post-tool-nudge.sh.template's identical comment.
   #
   # STATUS-CHECKED + DEGRADED-CHECKED (lr-7047bf, INV-1b, fold-in, BOBBIE +
   # HOLDEN, PR #141 review #2): this hook was one of two unwired consumers

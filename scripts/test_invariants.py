@@ -1114,5 +1114,106 @@ class TestSweepCatchesABareGitSiblingCallInGatesSh(unittest.TestCase):
         self.assertEqual(violations, [], f"violations={violations!r}")
 
 
+# ---------------------------------------------------------------------- #
+# INV-7: no tracked, live Claude Code hook script under .claude/ (lr-57db23)
+# ---------------------------------------------------------------------- #
+
+# The exact six hook script basenames this repo ships. Kept in one place so
+# a future addition to CLAGENTIC_HOOK_SCRIPTS (bin/clagentic-lite) needs a
+# matching update here -- the mechanical failure mode this sweep exists to
+# avoid is a NEW hook script landing back under a tracked .claude/hooks/
+# without this check ever running against it.
+_TRACKED_HOOK_SCRIPT_BASENAMES = (
+    "session-start.sh",
+    "prompt-inject.sh",
+    "pre-bash-guard.sh",
+    "pre-write-guard.sh",
+    "post-tool-nudge.sh",
+    "stop-summarize.sh",
+)
+
+
+def _git_ls_files_claude_dir():
+    """git ls-files under .claude/ -- the tracked-file source of truth this
+    sweep discovers violations from, never a hand-maintained path list."""
+    proc = subprocess.run(
+        ["git", "-C", TOOL_HOME, "ls-files", ".claude/"],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    return [ln for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+class TestNoTrackedLiveHookScriptUnderClaudeDir(unittest.TestCase):
+    """INV-7: this repo's own .claude/ must never carry a tracked, live
+    (i.e. installer-independent, directly Claude-Code-executed) copy of a
+    lifecycle hook script or settings.json again -- their source of truth
+    is share/hook-shims/*.sh.template + claude-settings.template,
+    installer-materialized into $CLAGENTIC_LITE_HOME/.claude/ at
+    init/update time (lr-57db23). Discovery is git-ls-files-driven over
+    the ACTUAL tracked tree, not a hardcoded snapshot of today's file
+    list -- a hook script re-added under .claude/hooks/ by a future PR
+    (even under a new name this list doesn't yet know) trips this sweep
+    the same way a bare-git call trips INV-6's sweep.
+    """
+
+    def setUp(self):
+        self.tracked = _git_ls_files_claude_dir()
+
+    def test_sweep_anchor_still_finds_the_known_tracked_claude_file(self):
+        """Fail LOUDLY, not silently-vacuous, if git ls-files' scope
+        under .claude/ is ever renamed/moved out from under this sweep
+        (e.g. .claude/commands/recall.md relocates or the tracked file
+        set under .claude/ becomes empty for an unrelated reason) --
+        this is the sweep's own anchor, proving the discovery mechanism
+        itself is still live before trusting an empty violation list
+        below as meaningful rather than as "found nothing to look at."
+        """
+        self.assertIn(
+            ".claude/commands/recall.md", self.tracked,
+            f"expected .claude/commands/recall.md in `git ls-files "
+            f".claude/` output -- if this file genuinely moved, update "
+            f"this anchor; do not delete the assertion, since an empty "
+            f"self.tracked list would otherwise let the violation check "
+            f"below pass vacuously with zero files actually swept. "
+            f"tracked={self.tracked!r}",
+        )
+
+    def test_no_tracked_hook_script_under_claude_hooks(self):
+        violations = [
+            path for path in self.tracked
+            if path.startswith(".claude/hooks/")
+            or os.path.basename(path) in _TRACKED_HOOK_SCRIPT_BASENAMES
+        ]
+        self.assertEqual(
+            violations, [],
+            f"found tracked Claude Code lifecycle hook script(s) under "
+            f".claude/ in this repo: {violations!r} -- this repo's own "
+            f".claude/ must not carry a live, tracked hook script again "
+            f"(lr-57db23: source of truth moved to "
+            f"share/hook-shims/*.sh.template, installer-materialized into "
+            f"$CLAGENTIC_LITE_HOME/.claude/hooks/ at init/update time). "
+            f"Move any new hook script's source to share/hook-shims/ and "
+            f"wire it through _stamp_claude_hooks instead.",
+        )
+
+    def test_no_tracked_settings_json_under_claude(self):
+        violations = [
+            path for path in self.tracked
+            if os.path.basename(path) == "settings.json"
+        ]
+        self.assertEqual(
+            violations, [],
+            f"found a tracked .claude/settings.json in this repo: "
+            f"{violations!r} -- this repo's own .claude/ must not carry a "
+            f"live, tracked settings.json again (lr-57db23). Enrolled "
+            f"repos still receive one via _stamp_claude_settings "
+            f"(share/hook-shims/claude-settings.template); this checkout's "
+            f"own copy, if a maintainer opts into self-dogfooding via "
+            f"`clagentic-lite init` (AGENTS.md \"Developing clagentic-lite "
+            f"itself\"), is materialized under $CLAGENTIC_LITE_HOME/.claude/ "
+            f"-- gitignored, never committed.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

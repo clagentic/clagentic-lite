@@ -19,14 +19,22 @@
 #    chars of the digest via additionalContext so the session sees a hint.
 #    Opt-out: CLAGENTIC_DISABLE_AUTOSUMMARIZE=1
 #    Threshold: CLAGENTIC_AUTOSUMMARIZE_BYTES (default 32768)
+#
+# managed-by: clagentic · clagentic-hooks-version: v1
+# Source of truth: share/hook-shims/post-tool-nudge.sh.template. Materialized
+# into $CLAGENTIC_LITE_HOME/.claude/hooks/post-tool-nudge.sh at `init`/`update`
+# time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
+# _stamp_claude_hooks). Enrolled repos never receive their own copy — their
+# .claude/settings.json calls back into this ONE materialized copy by
+# absolute path. Do not edit the installed copy by hand.
 
 set +e
 
-HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR=.
+: "${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}"
 
 # Load platform shims for ds_json_field, ds_repo_root, ds_load_env.
 # If platform.sh is missing or broken, skip everything — non-blocking.
-. "$HOOK_DIR/../../scripts/platform.sh" 2>/dev/null || exit 0
+. "$CLAGENTIC_LITE_HOME/scripts/platform.sh" 2>/dev/null || exit 0
 ds_load_env 2>/dev/null || true
 
 # Read tool payload from stdin once; both sections share it.
@@ -178,6 +186,10 @@ if [ "${CLAGENTIC_DISABLE_AUTOSUMMARIZE:-0}" != "1" ] && [ -n "$REPO_ROOT" ]; th
       if [ "$RESULT_BYTES" -gt "$AUTOSUMMARIZE_BYTES" ] 2>/dev/null; then
         # Summarize: pipe result through Summarizer; best-effort, 10s timeout.
         # Use $DS_TIMEOUT_CMD if available (from platform.sh), fall back to plain exec.
+        # NOTE: deliberately REPO_ROOT-scoped, not CLAGENTIC_LITE_HOME-scoped —
+        # matches memory.sh's own resolution and stop-summarize.sh's identical
+        # choice (see that hook's comment). Preserved as-is by this relocation;
+        # not something this migration changes.
         _summarize_cmd="$REPO_ROOT/scripts/llm-client.sh"
         if [ -x "$_summarize_cmd" ]; then
           # STATUS-CHECKED + DEGRADED-CHECKED (lr-7047bf, INV-1b, fold-in,
