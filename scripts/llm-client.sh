@@ -1980,39 +1980,42 @@ walk_chain() {
       *)   TIER="default" ;;
     esac
     [ -z "$TIER" ] && TIER="default"
-    # REVIEWER-ON-AN-UNRESTRICTABLE-CLI, FAIL-SAFE-NOT-SILENT (lr-49df97
-    # fold-in, BOBBIE finding 1; CLOSED FOR CODEX under lr-37282a).
-    # invoke_claude's --allowedTools/--disallowedTools tool restriction
-    # (INV-2) originally only existed for the claude CLI -- codex exec had
-    # no equivalent flag confirmed at the time (no codex binary was
-    # installed on any host that fix was authored/tested against). That gap
-    # is now closed: invoke_codex (above) applies `--disable shell_tool -s
-    # read-only` on the same restricted-by-default polarity
-    # (ds_llm_role_is_bash_unrestricted), verified against the installed
-    # codex CLI (codex-cli 0.142.5) via direct prompt-and-observe testing
-    # -- see invoke_codex's own doc comment for the full verification
-    # record. share/config.example ships CLAGENTIC_REVIEWER_CMD=codex as
-    # the DEFAULT, so this closes the gap on a stock install's PRIMARY
-    # reviewer path, not just a documented-but-inert control.
+    # UNRESTRICTABLE-CLI, FAIL-SAFE-NOT-SILENT (lr-49df97 fold-in, BOBBIE
+    # finding 1; CLOSED FOR CODEX under lr-37282a; DRIVEN BY THE SHARED
+    # PREDICATE under lr-8a28e0 PEACHES fold-in, PR #144 review). This used
+    # to be hardcoded to `[ "$ROLE_L" = "reviewer" ]` -- correct the day it
+    # was written (auditor was still Bash-unrestricted, so it genuinely
+    # didn't need this warning), but WRONG the moment lr-8a28e0 moved
+    # auditor onto the restricted side without updating this gate to match.
+    # The bug that produced: an auditor chain step resolving to a codex
+    # OLDER than CODEX_MIN_VERSION silently ran with unrestricted Bash --
+    # invoke_codex correctly skips the restriction flags on that unverified
+    # fallback path (same conservative posture as every other flag there),
+    # but nothing said so, because the warning only ever checked for
+    # "reviewer". PEACHES named this precisely: "a control and its
+    # disclosure mechanism are a pair" -- the restriction propagated to
+    # auditor, the warning didn't, and INERT-BUT-LOUD (PR-D's whole defense
+    # of the residual gap) silently became INERT-AND-SILENT for exactly the
+    # role/CLI/version combination lr-8a28e0 existed to close.
     #
-    # STILL UNRESTRICTABLE: invoke_generic (any CLI outside claude/codex)
-    # has no tool-restriction mechanism of any kind -- a reviewer chain step
-    # resolving to a third CLI is still a live, unclosed gap. A codex step
-    # on a version older than CODEX_MIN_VERSION is ALSO still unrestricted
-    # -- invoke_codex deliberately does not apply --disable shell_tool/-s
-    # read-only on its minimal (unverified-flag-surface) fallback path, the
-    # same conservative posture the version gate already applies to every
-    # other flag on that path. Probe the cached version check (invoke_codex
-    # itself caches this; calling it again here is a no-op after the first
-    # call) so the warning can distinguish "codex, restricted" from "codex,
-    # too old to trust the restriction flags on."
-    if [ "$ROLE_L" = "reviewer" ] && [ "$CLI" = "codex" ]; then
-      codex_version_check
-      [ "$_CODEX_VERSION_CODE" -ne 0 ] && \
-        printf '[clagentic-lite] WARN: reviewer role is using codex v%s (< required v%s) -- the tool-restriction flags (--disable shell_tool -s read-only) are NOT applied on this unverified-flag-surface fallback path, so Bash/file-write are UNRESTRICTED on this call. Upgrade codex to restore the restriction. See AGENTS.md Invariants INV-2.\n' \
-          "$_CODEX_VERSION_STR" "$CODEX_MIN_VERSION" 1>&2
-    elif [ "$ROLE_L" = "reviewer" ] && [ "$CLI" != "claude" ]; then
-      printf '[clagentic-lite] WARN: reviewer role is using CLI "%s", which has no known tool-restriction flag -- Bash is UNRESTRICTED on this call, unlike the claude/codex paths (--allowedTools/--disallowedTools on claude, --disable shell_tool -s read-only on codex; INV-2). A --print/exec reviewer holding unrestricted Bash while reading an attacker-influenceable diff is a live prompt-injection-to-execution path. See AGENTS.md Invariants INV-2 and docs/DESIGN.md "The five roles" for the known limitation.\n' "$CLI" 1>&2
+    # THE CLASS FIX, not an instance fix (a second hardcoded "auditor"
+    # string would repeat the exact defect this comment is describing, one
+    # role later): this condition is now driven by the SAME predicate that
+    # decides the restriction, ds_llm_role_is_bash_unrestricted
+    # (platform.sh) -- ANY role that predicate marks restricted
+    # automatically gets this warning's coverage too, with no second list
+    # to keep in sync. A future role moved onto the restricted side (the
+    # same way auditor was) is covered by construction, not by remembering
+    # to also touch this file's warning gate.
+    if ! ds_llm_role_is_bash_unrestricted "$ROLE_L"; then
+      if [ "$CLI" = "codex" ]; then
+        codex_version_check
+        [ "$_CODEX_VERSION_CODE" -ne 0 ] && \
+          printf '[clagentic-lite] WARN: %s role is using codex v%s (< required v%s) -- the tool-restriction flags (--disable shell_tool -s read-only) are NOT applied on this unverified-flag-surface fallback path, so Bash/file-write are UNRESTRICTED on this call. Upgrade codex to restore the restriction. See AGENTS.md Invariants INV-2/INV-5.\n' \
+            "$ROLE_L" "$_CODEX_VERSION_STR" "$CODEX_MIN_VERSION" 1>&2
+      elif [ "$CLI" != "claude" ]; then
+        printf '[clagentic-lite] WARN: %s role is using CLI "%s", which has no known tool-restriction flag -- Bash is UNRESTRICTED on this call, unlike the claude/codex paths (--allowedTools/--disallowedTools on claude, --disable shell_tool -s read-only on codex; INV-2). A --print/exec/restricted-role call holding unrestricted Bash while reading an attacker-influenceable diff is a live prompt-injection-to-execution path. See AGENTS.md Invariants INV-2/INV-5 and docs/DESIGN.md "The five roles" for the known limitation.\n' "$ROLE_L" "$CLI" 1>&2
+      fi
     fi
     # Truncate BOTH err and output files between attempts. Without truncating
     # TMP_OUT, a successful-on-write-but-exit-nonzero primary could leave
