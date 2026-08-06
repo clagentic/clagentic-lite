@@ -69,8 +69,18 @@ fi
 
 UPDATE_MSG=""
 
+# REPO SCOPING (lr-da1f28 sweep): `git -C "$CLAGENTIC_LITE_HOME" rev-parse
+# --git-dir` succeeding only proves SOME ancestor of CLAGENTIC_LITE_HOME is a
+# git repo, not that CLAGENTIC_LITE_HOME itself is — `-C <dir>` changes cwd
+# before git's own repo discovery walks up the filesystem. Low-stakes here
+# (this block only produces an advisory "behind upstream" notice, no write
+# or security consequence), but require the resolved toplevel to actually
+# equal CLAGENTIC_LITE_HOME before trusting any read below, consistent with
+# the rest of this sweep.
+_sst_git_toplevel=$(git -C "$CLAGENTIC_LITE_HOME" rev-parse --show-toplevel 2>/dev/null || echo "")
+_sst_home_canon=$(cd "$CLAGENTIC_LITE_HOME" 2>/dev/null && pwd -P || printf '%s' "$CLAGENTIC_LITE_HOME")
 if [ "${CLAGENTIC_SKIP_UPDATE_ALERT:-0}" != "1" ] \
-    && git -C "$CLAGENTIC_LITE_HOME" rev-parse --git-dir >/dev/null 2>&1; then
+    && [ -n "$_sst_git_toplevel" ] && [ "$_sst_git_toplevel" = "$_sst_home_canon" ]; then
 
   # State file: track the last time we did a network fetch.
   _STATE_DIR="$HOME/.config/clagentic"
