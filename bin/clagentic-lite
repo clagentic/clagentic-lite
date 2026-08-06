@@ -316,6 +316,150 @@ _render_claude_settings() {
   done < "$_rcs_template"
 }
 
+# ---------------------------------------------------------------- router agent-model injection
+#
+# UNVERIFIED (see README.md "Verifying on your machine" and share/config.example
+# CLAGENTIC_ROUTER_INJECT_AGENT_MODEL): whether Claude Code actually honors a
+# subagent frontmatter `model:` field set to a non-standard string like
+# "role:reviewer-chain" — versus silently ignoring it and dispatching on the
+# parent session's model instead — has not been confirmed against a live
+# interactive session from this codebase. This is claude-code GH#44385
+# territory. Gated behind its own key, separate from CLAGENTIC_ROUTER_URL, so
+# that setting the router URL alone (the settings.json env-block passthrough)
+# carries zero risk from this unverified injection path.
+#
+# _ROUTER_AGENTS_DIR is generated install-tree state (gitignored via the
+# repo's own .clagentic/* pattern, mirrored here under CLAGENTIC_LITE_HOME
+# for the same reason: it is a build artifact re-derived from the checked-in
+# plugins/clagentic-lite/agents/*.md files plus live config, never a source
+# of truth in its own right).
+_ROUTER_AGENTS_DIR="$CLAGENTIC_LITE_HOME/.clagentic/router-agents"
+_ROUTER_PLUGIN_NAME="clagentic-lite-router"
+
+# _router_agent_needs_injection ROLE_ENV_PREFIX
+# Returns 0 (needs model: injected) when CLAGENTIC_<PREFIX>_CMD is set and
+# not "claude" — a role already on claude inherits the session model, same
+# as the checked-in agent files today (builder.md/reviewer.md's own comment:
+# "model_chain is not a Claude Code frontmatter field — do not add it here").
+_router_agent_needs_injection() {
+  _rani_prefix="$1"
+  _rani_cmd=$(eval "printf '%s' \"\${CLAGENTIC_${_rani_prefix}_CMD:-}\"")
+  [ -n "$_rani_cmd" ] && [ "$_rani_cmd" != "claude" ]
+}
+
+# _render_router_agents_dir
+# Materializes a parallel plugin directory tree under _ROUTER_AGENTS_DIR:
+# one rendered copy of each of reviewer.md/auditor.md/merge-gate.md (the
+# three roles clagentic-router's router.example.yaml ships example chains
+# for — reviewer-chain, auditor-chain), a plugin.json, and a marketplace.json
+# pointing at that rendered plugin directory. Checked-in files under
+# plugins/clagentic-lite/agents/ are read-only inputs here — NEVER modified
+# on disk (they are re-read from the real checkout every render, so a
+# maintainer edit to the checked-in agent contract always flows through).
+#
+# Injection point: `model: role:<role>-chain` is inserted as a new frontmatter
+# line immediately after `name: <role>` (line 2 of every agent file in this
+# repo — a stable anchor) ONLY when the role's CLAGENTIC_<ROLE>_CMD is set to
+# a non-claude CLI. builder.md is never touched by this function — the task
+# spec is explicit that a tool-using role must not be routed (routed mode
+# drops tool-calling through clagentic-router's CLI adapters).
+_render_router_agents_dir() {
+  _rrad_agents_src="$CLAGENTIC_LITE_HOME/plugins/clagentic-lite/agents"
+  _rrad_out_agents="$_ROUTER_AGENTS_DIR/plugins/$_ROUTER_PLUGIN_NAME/agents"
+  rm -rf "$_ROUTER_AGENTS_DIR" 2>/dev/null || true
+  mkdir -p "$_rrad_out_agents" || { warn "cannot create $_rrad_out_agents"; return 1; }
+
+  # ROLE_ENV_PREFIX:agent-filename:chain-name triples. Builder deliberately
+  # excluded (see doc comment above); troubleshooter has no CLAGENTIC_*_CMD
+  # role mapping of its own (it is read-only diagnosis, not a gate role) and
+  # is out of scope for this injection.
+  for _rrad_triple in "REVIEWER:reviewer:reviewer-chain" "AUDITOR:auditor:auditor-chain" "GATE:merge-gate:merge-gate-chain"; do
+    _rrad_prefix="${_rrad_triple%%:*}"
+    _rrad_rest="${_rrad_triple#*:}"
+    _rrad_file="${_rrad_rest%%:*}"
+    _rrad_chain="${_rrad_rest#*:}"
+
+    _rrad_src_file="$_rrad_agents_src/${_rrad_file}.md"
+    _rrad_dst_file="$_rrad_out_agents/${_rrad_file}.md"
+    [ -f "$_rrad_src_file" ] || { warn "router agent render: source missing: $_rrad_src_file"; continue; }
+
+    if _router_agent_needs_injection "$_rrad_prefix"; then
+      # Insert "model: role:<chain>" as the line immediately after "name: <role>"
+      # (line 2 in every checked-in agent file). awk, not sed -i, so this works
+      # identically on GNU and BSD without a DS_SED_INPLACE branch.
+      awk -v model_line="model: role:${_rrad_chain}" \
+        'NR==2 { print; print model_line; next } { print }' \
+        "$_rrad_src_file" > "$_rrad_dst_file"
+    else
+      cp "$_rrad_src_file" "$_rrad_dst_file"
+    fi
+  done
+
+  # Minimal plugin manifest — deliberately does not track the main plugin's
+  # version; this is a derived render, not an independently versioned
+  # artifact. Regenerated in full on every init/update run.
+  mkdir -p "$_ROUTER_AGENTS_DIR/plugins/$_ROUTER_PLUGIN_NAME/.claude-plugin"
+  cat > "$_ROUTER_AGENTS_DIR/plugins/$_ROUTER_PLUGIN_NAME/.claude-plugin/plugin.json" <<-EOF
+	{
+	  "\$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+	  "name": "$_ROUTER_PLUGIN_NAME",
+	  "version": "0.0.0-generated",
+	  "description": "Generated by clagentic-lite init/update when CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1. Rendered copies of reviewer/auditor/merge-gate with model: role:<role>-chain injected into frontmatter. Regenerated on every run -- do not edit by hand."
+	}
+	EOF
+
+  mkdir -p "$_ROUTER_AGENTS_DIR/.claude-plugin"
+  cat > "$_ROUTER_AGENTS_DIR/.claude-plugin/marketplace.json" <<-EOF
+	{
+	  "name": "$_ROUTER_PLUGIN_NAME",
+	  "owner": { "name": "clagentic-lite (generated)" },
+	  "metadata": {
+	    "description": "Generated marketplace for router-injected agent variants. Not committed to any repo -- regenerated by clagentic-lite init/update."
+	  },
+	  "plugins": [
+	    {
+	      "name": "$_ROUTER_PLUGIN_NAME",
+	      "source": "./plugins/$_ROUTER_PLUGIN_NAME",
+	      "description": "Rendered reviewer/auditor/merge-gate with model: role:<role>-chain injected for non-claude CLAGENTIC_<ROLE>_CMD roles.",
+	      "version": "0.0.0-generated"
+	    }
+	  ]
+	}
+	EOF
+
+  return 0
+}
+
+# _install_router_agents_plugin
+# Registers the generated marketplace and installs/updates the router-variant
+# plugin. Mirrors the exact claude plugin marketplace add / install sequence
+# already used for the main clagentic-lite plugin (cmd_init / cmd_update) so
+# there is exactly one pattern to reason about, not two. Called ONLY when
+# CLAGENTIC_ROUTER_URL and CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1 are both set.
+_install_router_agents_plugin() {
+  command -v claude >/dev/null 2>&1 || { warn "claude not on PATH — skipping router-agent plugin install"; return 0; }
+
+  _render_router_agents_dir || { warn "router-agent render failed — skipping plugin install"; return 1; }
+
+  claude plugin marketplace add "$_ROUTER_AGENTS_DIR" --scope user 2>/dev/null || true
+
+  if claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_ROUTER_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
+    claude plugin marketplace update "$_ROUTER_PLUGIN_NAME" 2>/dev/null || true
+    if claude plugin update "${_ROUTER_PLUGIN_NAME}@${_ROUTER_PLUGIN_NAME}"; then
+      say "updated plugin: $_ROUTER_PLUGIN_NAME (model: role:<role>-chain injected — reviewer/auditor/merge-gate)"
+    else
+      warn "claude plugin update failed for $_ROUTER_PLUGIN_NAME; run manually: claude plugin update ${_ROUTER_PLUGIN_NAME}@${_ROUTER_PLUGIN_NAME}"
+    fi
+  else
+    if claude plugin marketplace add "$_ROUTER_AGENTS_DIR" --scope user && claude plugin install "${_ROUTER_PLUGIN_NAME}@${_ROUTER_PLUGIN_NAME}"; then
+      say "installed plugin: $_ROUTER_PLUGIN_NAME (model: role:<role>-chain injected — reviewer/auditor/merge-gate)"
+      say "UNVERIFIED: whether Claude Code honors this frontmatter model: field has not been confirmed on this machine — see README 'Verifying on your machine'"
+    else
+      warn "claude plugin install failed for $_ROUTER_PLUGIN_NAME; run manually: claude plugin marketplace add $_ROUTER_AGENTS_DIR && claude plugin install ${_ROUTER_PLUGIN_NAME}@${_ROUTER_PLUGIN_NAME}"
+    fi
+  fi
+}
+
 # Stamp a wrapper-flavored CLAUDE.md into a non-git wrapper directory.
 # Args: WRAPPER_DIR  ENROLLED_REPOS (space-separated absolute paths)
 # Note: Claude Code lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse,
@@ -682,6 +826,13 @@ cmd_init() {
     fi
   else
     warn "claude not on PATH — skipping plugin install; after adding to PATH run: claude plugin marketplace add $CLAGENTIC_LITE_HOME && claude plugin install clagentic-lite@clagentic-lite"
+  fi
+
+  # 6b. Router agent-model injection — opt-in, off by default even when
+  # CLAGENTIC_ROUTER_URL is set (see _install_router_agents_plugin doc
+  # comment: this half is UNVERIFIED, gated behind its own separate key).
+  if [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" = "1" ]; then
+    _install_router_agents_plugin
   fi
 
   say "init complete"
@@ -2174,6 +2325,13 @@ cmd_update() {
     fi
   else
     warn "plugin manifest not found: $_plugin_json — skipping plugin update"
+  fi
+
+  # Router agent-model injection — opt-in, off by default even when
+  # CLAGENTIC_ROUTER_URL is set. See _install_router_agents_plugin doc
+  # comment: this half is UNVERIFIED, gated behind its own separate key.
+  if [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" = "1" ]; then
+    _install_router_agents_plugin
   fi
 
   # Re-stamp shims in registered repos if the template version changed.
