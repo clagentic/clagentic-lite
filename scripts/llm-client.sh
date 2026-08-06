@@ -900,6 +900,19 @@ findings. The security floor is unaffected: a finding the Auditor tagged
 tier:"blocking" is never eligible for a class-based pass — class never
 suppresses a blocking finding, it only ever explains why a reachable
 high/critical finding is riding as advisory instead of blocking.
+
+Findings dropped by the count cap (lr-33958f PR-C fold-in): the payload's
+"adversarial_findings" array is capped to a maximum size (severity/tier
+sorted before the cap, so only the least-severe, non-blocking tail can ever
+be dropped — see the Auditor's own findings-count-cap discipline). If
+"adversarial_findings_dropped_count" is greater than 0, that many
+low-severity/advisory findings were truncated from the array and are not
+present in "adversarial_findings" or "adversarial_findings_fenced". This
+never removes a tier:"blocking" finding — the sort guarantees blocking
+findings sort first and survive the cap before any advisory finding does —
+so it never changes your decision, but note it in your "reason" text when
+nonzero (e.g. "approved; 3 low-severity advisory findings truncated by the
+count cap") so a truncated audit is never reported as a complete one.
 EOF
 }
 
@@ -1286,17 +1299,22 @@ invoke_generic() {
 }
 
 # Dispatch a single chain step.
-# Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE CALL_TIMEOUT [MODE] [ROLE]
+# Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE CALL_TIMEOUT [MODE]
 # Fails with exit 127 if the CLI binary is not on PATH.
 #
-# ROLE (9th positional) is accepted for BACKWARD-COMPATIBLE CALL SHAPE only
-# (lr-33958f, PR-C): existing callers/tests pass it, and POSIX sh silently
-# ignores a trailing positional arg no `$N`/`${N:-}` reads, so accepting-
-# and-not-binding it here is a no-op, not a latent bug. It is not bound to
-# a named variable and not forwarded to invoke_claude/invoke_codex/
-# invoke_generic, none of which need it any more -- role now flows
-# directly from walk_chain into _llm_unwrap_json_envelope, which runs
-# after invoke_step returns, not through this dispatcher.
+# NO 9th (ROLE) POSITIONAL (BOBBIE, lr-33958f PR-C fold-in review, nit 3):
+# a prior revision of this function accepted-but-never-bound a 9th
+# positional for "backward-compatible call shape" -- an accepted-but-unread
+# parameter is exactly the INV-3 defect this task's own fold-in review
+# named (see invoke_claude's CALL_ROLE removal above for the first instance
+# of this same class). Genuinely dead: nothing in this function's body ever
+# read it, and role already flows directly from walk_chain into
+# _llm_unwrap_json_envelope (below), which runs AFTER invoke_step returns,
+# not through this dispatcher. Removed from the documented signature
+# entirely rather than left "accepted for compatibility" -- callers that
+# still pass a trailing role argument (walk_chain does; POSIX sh silently
+# ignores an extra positional no `$N` reads) continue to work unchanged,
+# but the signature no longer claims to accept something it does not use.
 invoke_step() {
   CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"; CALL_MODE="${8:-}"
   command -v "$CLI" >/dev/null 2>&1 || return 127
@@ -1421,14 +1439,21 @@ if not isinstance(inner, str):
 
 
 def _role_shaped(obj):
-    """Same predicate validate_output (this file) applies -- kept as a
-    single definition referenced conceptually by both, not copy-pasted
-    and left to drift. reviewer/auditor: top-level .findings array, or a
-    single-key wrapper whose sole value has .findings as an array. gate:
-    top-level .decision in approve|refuse, or the same single-key-wrapper
-    tolerance. Any other role: any JSON value at all is acceptable shape
-    (this function only exists to pick among candidates; validate_output
-    remains the authority for roles with no closed schema)."""
+    """Same predicate validate_output (this file) applies in BOTH its jq
+    and python3 branches -- three independent implementations total (this
+    heredoc, validate_output's jq filter, validate_output's own python3
+    heredoc), NOT literally shared code (assessed and accepted as
+    duplication, BOBBIE lr-33958f PR-C fold-in review nit b -- see
+    validate_output's python3 branch for the full rationale). Kept
+    referenced conceptually as a single definition across all three, not
+    copy-pasted and left to drift silently: a change to the shape rules
+    here must be mirrored in the other two or they will disagree.
+    reviewer/auditor: top-level .findings array, or a single-key wrapper
+    whose sole value has .findings as an array. gate: top-level .decision
+    in approve|refuse, or the same single-key-wrapper tolerance. Any other
+    role: any JSON value at all is acceptable shape (this function only
+    exists to pick among candidates; validate_output remains the authority
+    for roles with no closed schema)."""
     if role in ("reviewer", "auditor"):
         if isinstance(obj, dict) and isinstance(obj.get("findings"), list):
             return True
@@ -1552,6 +1577,26 @@ validate_output() {
         esac
         return 0
       elif command -v python3 >/dev/null 2>&1; then
+        # DUPLICATION, ASSESSED AND ACCEPTED (BOBBIE, lr-33958f PR-C fold-in
+        # review, nit b): this branch's shape predicate (bare .findings /
+        # single-key-wrapper .findings; bare .decision / single-key-wrapper
+        # .decision) is the SAME predicate _llm_unwrap_json_envelope's
+        # _role_shaped (above) applies, and is NOT literally shared code --
+        # two independent heredoc bodies, each its own `python3 -` process.
+        # ASSESSED: unifying them would require extracting a real shared .py
+        # module both heredocs import, which is a bigger structural change
+        # than this nit warrants (a new file, an import-path story across
+        # gates.sh/llm-client.sh/platform.sh's shell-first, heredoc-based
+        # architecture) -- and this function ALREADY carries a second,
+        # independently-necessary duplicate of the same predicate one jq
+        # branch up (jq and python3 cannot share source at all), so full
+        # unification would still leave one duplicate no matter what. Left
+        # duplicated, not fixed, on this pass -- IF YOU CHANGE THE SHAPE
+        # PREDICATE HERE (or in the jq branch above, or in
+        # _llm_unwrap_json_envelope's _role_shaped), you must update all
+        # THREE call sites or they will drift, which is this repo's
+        # documented failure mode (the build_gate_summary duplicate,
+        # PR-B/lr-7047bf).
         python3 - "$F" "$ROLE" <<'PY' 2>/dev/null
 import json, sys
 
@@ -1704,8 +1749,14 @@ walk_chain() {
     # stale bytes that validate as the fallback step's "output."
     : > "$TMP_ERR"
     : > "$TMP_OUT"
+    # invoke_step's signature is CLI MODEL PROMPT_FILE INPUT_FILE
+    # OUTPUT_FILE ERR_FILE CALL_TIMEOUT [MODE] -- no role argument (BOBBIE,
+    # lr-33958f PR-C fold-in review, nit 3: the prior 9th positional was
+    # accepted-but-unread and has been removed from invoke_step entirely).
+    # $ROLE_L flows to _llm_unwrap_json_envelope below instead, the one
+    # place role is actually used in this loop.
     EXIT_CODE=0
-    invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" "$MODE" "$ROLE_L" \
+    invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" "$MODE" \
       || EXIT_CODE=$?
     # SHARED UNWRAP (lr-33958f, PR-C): runs immediately after invoke_step
     # succeeds and BEFORE validate_output ever inspects TMP_OUT -- this is
