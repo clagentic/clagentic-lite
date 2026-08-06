@@ -846,6 +846,107 @@ print(json.dumps(item))
   printf '%s' "$_ljasf_json"
 }
 
+# _adversarial_findings_sort_blocking_first JSON — reorder a JSON array of
+# adversarial-finding objects (the {file,line,category,message,severity,
+# reachable,tier,class} shape _parse_adversarial_findings produces, gates.sh)
+# so tier:"blocking" findings sort before tier:"advisory" findings, and
+# within each tier severity sorts critical > high > medium > low > unknown
+# (BOBBIE, lr-33958f PR-C fold-in review). Stable within each (tier,severity)
+# bucket — same-ranked findings keep their original relative (parse) order,
+# matching _llm_json_array_cap's own "first N, stable, deterministic" cap
+# contract one step downstream.
+#
+# WHY THIS EXISTS, SEPARATE FROM _llm_json_array_cap: _llm_json_array_cap
+# (below) is a GENERIC truncate-to-first-N helper with no notion of
+# severity/tier — every existing and future caller (e.g. a plain-object
+# array with no severity field at all) depends on it staying that way, and
+# its own test suite asserts first-N truncation is stable and deterministic
+# for arbitrary objects. Baking severity-awareness into that function would
+# either silently no-op for callers with no severity/tier fields (fine) or
+# require every caller to opt in/out of a behavior only one caller
+# (cmd_adversarial) actually needs. A caller with a severity/tier-shaped
+# array instead sorts FIRST with this function, then caps with
+# _llm_json_array_cap exactly as before — composition, not a new mode on
+# the shared cap.
+#
+# THE BUG THIS CLOSES: _parse_adversarial_findings (gates.sh) emits findings
+# in the order the Auditor's markdown lists them, which is
+# ATTACKER-INFLUENCEABLE — a diff under review can carry a prompt-injection
+# payload that steers a compromised/manipulated Auditor into emitting a late
+# tier:"blocking" finding after many earlier tier:"advisory" ones. Capping
+# to the first N IN PARSE ORDER (the pre-fix behavior) could then silently
+# drop the one finding that mattered while keeping N low-value advisory
+# findings — a hole the count cap itself introduced. Sorting
+# severity/tier-descending BEFORE the cap runs means truncation can only
+# ever drop the LEAST-severe, non-blocking tail of the array, never a
+# blocking finding while a less-severe one survives.
+#
+# Fail-open, matching every other JSON-tool-dependent helper in this
+# codebase: a non-array, malformed JSON, or the complete absence of jq AND
+# python3 returns the ORIGINAL input unchanged.
+#
+# Args: JSON (a JSON array of adversarial-finding objects, as a single
+# string). stdout: the same objects, reordered (or the original JSON
+# unchanged, on any failure).
+_adversarial_findings_sort_blocking_first() {
+  _afsbf_json="$1"
+
+  if command -v jq >/dev/null 2>&1; then
+    if ! printf '%s' "$_afsbf_json" | jq -e '. | type == "array"' >/dev/null 2>&1; then
+      printf '%s' "$_afsbf_json"
+      return 0
+    fi
+    _afsbf_out=$(printf '%s' "$_afsbf_json" | jq -c '
+      def tier_rank: if .tier == "blocking" then 1 else 0 end;
+      def sev_rank:
+        if .severity == "critical" then 4
+        elif .severity == "high" then 3
+        elif .severity == "medium" then 2
+        elif .severity == "low" then 1
+        else 0 end;
+      to_entries
+      | sort_by([-(.value | tier_rank), -(.value | sev_rank), .key])
+      | map(.value)
+    ' 2>/dev/null)
+    [ -n "$_afsbf_out" ] || { printf '%s' "$_afsbf_json"; return 0; }
+    printf '%s' "$_afsbf_out"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    _afsbf_out=$(python3 -c '
+import json, sys
+raw = sys.argv[1]
+sev_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+try:
+    arr = json.loads(raw)
+    if not isinstance(arr, list):
+        raise ValueError("not a list")
+except Exception:
+    print(raw)
+    sys.exit(0)
+
+def key(pair):
+    idx, item = pair
+    tier_rank = 1 if isinstance(item, dict) and item.get("tier") == "blocking" else 0
+    sr = sev_rank.get(item.get("severity") if isinstance(item, dict) else None, 0)
+    # Negate for descending order; idx (ascending) preserves original
+    # relative order within an identical (tier_rank, sr) bucket (stable).
+    return (-tier_rank, -sr, idx)
+
+ordered = [item for _, item in sorted(enumerate(arr), key=key)]
+print(json.dumps(ordered))
+' "$_afsbf_json" 2>/dev/null)
+    [ -n "$_afsbf_out" ] || { printf '%s' "$_afsbf_json"; return 0; }
+    printf '%s' "$_afsbf_out"
+    return 0
+  fi
+
+  # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open,
+  # matching every other JSON-tool-dependent helper in this codebase.
+  printf '%s' "$_afsbf_json"
+}
+
 # _llm_json_array_cap JSON MAX — truncate a JSON array of objects to the
 # first MAX entries (lr-33958f, PR-C, required foundry fix). Generic
 # extraction of the same shape _invariant_feed_append's own cap already
