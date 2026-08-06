@@ -342,5 +342,194 @@ class TestSweepCatchesTheOldNoOpStubShape(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------- #
+# lr-49df97 fold-in (BOBBIE finding 3): a timeout-like variable's numeric
+# guard must reject ZERO, not merely non-numeric/empty input.
+# ---------------------------------------------------------------------- #
+#
+# THE HOLE: `case "$VAR" in ''|*[!0-9]*) VAR=<default> ;; esac` -- the idiom
+# every timeout variable in gates.sh/llm-client.sh used before this fix --
+# rejects empty and non-digit input but ADMITS the literal string "0"
+# unchanged (it contains no non-digit character). A timeout variable that
+# survives this guard as 0 then reaches `$DS_TIMEOUT_CMD 0 cmd...`, and GNU
+# coreutils' documented behavior for `timeout 0 cmd` is to DISABLE the
+# timeout and run cmd unbounded -- silently reopening the exact class INV-1a
+# exists to close, through a config value that LOOKS validated. Fixed via
+# ds_positive_int_or_default (platform.sh), used at every timeout-like call
+# site in gates.sh and llm-client.sh's llm_timeout_for.
+#
+# SCOPE: only variables whose NAME contains "TIMEOUT" -- CLAGENTIC_LLM_
+# TIMEOUT_MAX_SEC's own MAX has a DELIBERATE, DOCUMENTED "0 = no cap"
+# sentinel (llm_timeout_for's own "Cap at max when max is set and positive"
+# comment) and is correctly excluded by name (its shell variable is `MAX`,
+# not `*TIMEOUT*`) rather than by an ad hoc allowlist.
+_BARE_NUMERIC_GUARD_ON_TIMEOUT_RE = re.compile(
+    r"case\s+\"?\$\{?(\w*TIMEOUT\w*)\}?\"?\s+in\s+''\|\*\[!0-9\]\*\)"
+)
+
+
+def _iter_llm_client_sh_lines():
+    llm_client_sh = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
+    with open(llm_client_sh, encoding="utf-8") as f:
+        return f.readlines()
+
+
+def _find_bare_zero_admitting_timeout_guards(lines):
+    """Sweep primitive: every live (non-comment) line using the bare
+    `case "$VAR" in ''|*[!0-9]*)` idiom where VAR's name contains TIMEOUT --
+    this idiom admits "0" unchanged, which is the exact hole this sweep
+    exists to catch. A hardened site uses ds_positive_int_or_default
+    instead and never matches this pattern at all."""
+    violations = []
+    for i, line in enumerate(lines):
+        if line.strip().startswith('#'):
+            continue
+        m = _BARE_NUMERIC_GUARD_ON_TIMEOUT_RE.search(line)
+        if m:
+            violations.append((i + 1, m.group(1), line.rstrip('\n')))
+    return violations
+
+
+class TestNoTimeoutVariableUsesTheZeroAdmittingBareGuard(unittest.TestCase):
+    """No TIMEOUT-named variable in gates.sh or llm-client.sh may use the
+    bare `''|*[!0-9]*` case guard -- every one must route through
+    ds_positive_int_or_default (platform.sh), which rejects zero as well as
+    non-numeric/empty input. Sweeps the real, current source files, not a
+    hardcoded site list."""
+
+    def test_gates_sh_has_no_bare_zero_admitting_timeout_guard(self):
+        lines = _iter_gates_sh_lines()
+        violations = _find_bare_zero_admitting_timeout_guards(lines)
+        self.assertEqual(
+            violations, [],
+            f"found {len(violations)} TIMEOUT variable(s) in gates.sh still "
+            f"using the bare ''|*[!0-9]* guard, which admits \"0\" unchanged "
+            f"and silently disables $DS_TIMEOUT_CMD's bound -- route through "
+            f"ds_positive_int_or_default (platform.sh) instead:\n" +
+            "\n".join(f"  gates.sh:{ln}: var={var!r}: {txt}" for ln, var, txt in violations),
+        )
+
+    def test_llm_client_sh_has_no_bare_zero_admitting_timeout_guard(self):
+        lines = _iter_llm_client_sh_lines()
+        violations = _find_bare_zero_admitting_timeout_guards(lines)
+        self.assertEqual(
+            violations, [],
+            f"found {len(violations)} TIMEOUT variable(s) in llm-client.sh "
+            f"still using the bare ''|*[!0-9]* guard:\n" +
+            "\n".join(f"  llm-client.sh:{ln}: var={var!r}: {txt}" for ln, var, txt in violations),
+        )
+
+    def test_ds_positive_int_or_default_exists_in_platform_sh(self):
+        with open(PLATFORM_SH, encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn(
+            "ds_positive_int_or_default", content,
+            "platform.sh must define ds_positive_int_or_default -- the "
+            "shared zero-rejecting normalizer this sweep requires every "
+            "TIMEOUT-named variable to use",
+        )
+
+    def test_sweep_discovers_at_least_the_known_timeout_sites(self):
+        """Sanity check on discovery: gates.sh has at least 7 distinct
+        TIMEOUT-named call sites (run_bounded x2, secrets, deps, bleed-fetch,
+        sast-fetch, sast, review-fetch, ship) that were converted by this
+        fix -- if the sweep finds none of the OLD guard shape (expected,
+        post-fix) it must still be able to discover the NEW call shape so a
+        future regression to the old idiom is not silently invisible."""
+        lines = _iter_gates_sh_lines()
+        ds_positive_calls = sum(
+            1 for ln in lines if "ds_positive_int_or_default" in ln and not ln.strip().startswith('#')
+        )
+        self.assertGreaterEqual(
+            ds_positive_calls, 7,
+            f"expected at least 7 ds_positive_int_or_default call sites in "
+            f"gates.sh (run_bounded x2, secrets, deps, bleed-fetch, "
+            f"sast-fetch, sast, review-fetch, ship); found {ds_positive_calls} "
+            f"-- did a call site regress to the bare case-guard idiom?",
+        )
+
+
+class TestSweepCatchesTheBareZeroAdmittingGuardShape(unittest.TestCase):
+    """Proves the sweep actually catches what it claims to, using a
+    synthetic sibling call site written in the exact bare, zero-admitting
+    guard shape every real TIMEOUT site had before this fix."""
+
+    _VULNERABLE_FIXTURE = (
+        'cmd_fixture() {\n'
+        '  _FIXTURE_TIMEOUT="${CLAGENTIC_FIXTURE_TIMEOUT_SEC:-30}"\n'
+        '  case "$_FIXTURE_TIMEOUT" in \'\'|*[!0-9]*) _FIXTURE_TIMEOUT=30 ;; esac\n'
+        '}\n'
+    )
+
+    _HARDENED_FIXTURE = (
+        'cmd_fixture() {\n'
+        '  _FIXTURE_TIMEOUT="${CLAGENTIC_FIXTURE_TIMEOUT_SEC:-30}"\n'
+        '  _FIXTURE_TIMEOUT=$(ds_positive_int_or_default "$_FIXTURE_TIMEOUT" 30)\n'
+        '}\n'
+    )
+
+    def test_flags_the_vulnerable_sibling(self):
+        lines = self._VULNERABLE_FIXTURE.splitlines(keepends=True)
+        violations = _find_bare_zero_admitting_timeout_guards(lines)
+        self.assertTrue(
+            any(var == "_FIXTURE_TIMEOUT" for _, var, _ in violations),
+            f"sweep failed to flag a bare zero-admitting TIMEOUT guard. "
+            f"violations={violations!r}",
+        )
+
+    def test_does_not_flag_the_hardened_call(self):
+        lines = self._HARDENED_FIXTURE.splitlines(keepends=True)
+        violations = _find_bare_zero_admitting_timeout_guards(lines)
+        self.assertEqual(violations, [], f"violations={violations!r}")
+
+
+class TestDsPositiveIntOrDefaultRejectsZero(unittest.TestCase):
+    """End-to-end: source platform.sh in a real subshell and call
+    ds_positive_int_or_default directly, proving it falls back to DEFAULT
+    on "0" (the exact input the old bare guard let through unchanged), not
+    just that the source sweep above finds no bare guards left."""
+
+    def _run(self, value, default):
+        script = (
+            f'. "{PLATFORM_SH}"\n'
+            f'ds_positive_int_or_default "{value}" "{default}"\n'
+        )
+        result = subprocess.run(
+            ["sh", "-c", script],
+            capture_output=True, text=True,
+        )
+        return result.stdout, result.returncode
+
+    def test_zero_falls_back_to_default(self):
+        out, rc = self._run("0", "120")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "120", f"stdout={out!r}")
+
+    def test_empty_falls_back_to_default(self):
+        out, rc = self._run("", "120")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "120", f"stdout={out!r}")
+
+    def test_non_numeric_falls_back_to_default(self):
+        out, rc = self._run("abc", "120")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "120", f"stdout={out!r}")
+
+    def test_valid_positive_integer_passes_through_unchanged(self):
+        out, rc = self._run("45", "120")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "45", f"stdout={out!r}")
+
+    def test_negative_number_falls_back_to_default(self):
+        """Not reachable via the bare-guard sweep (a leading '-' is itself a
+        non-digit character the old guard already rejected), but
+        ds_positive_int_or_default's own contract is "positive integer or
+        default" -- assert the boundary explicitly rather than leaving it
+        implied."""
+        out, rc = self._run("-5", "120")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "120", f"stdout={out!r}")
+
+
 if __name__ == "__main__":
     unittest.main()

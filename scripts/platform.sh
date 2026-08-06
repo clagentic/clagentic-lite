@@ -178,6 +178,48 @@ ds_sql_escape() {
   printf '%s' "$1" | sed "s/'/''/g"
 }
 
+# ds_positive_int_or_default VALUE DEFAULT — normalize VALUE to a positive
+# (>= 1) integer, falling back to DEFAULT on empty, non-numeric, OR ZERO
+# input. Prints the result on stdout.
+#
+# WHY THIS EXISTS (lr-49df97 fold-in, BOBBIE finding 3): every wall-clock
+# timeout guard in this codebase used the same two-line idiom —
+#   case "$VAR" in ''|*[!0-9]*) VAR=default ;; esac
+# — which rejects empty and non-digit input but ADMITS the single-digit
+# string "0" unchanged, because "0" contains no non-digit character. A
+# timeout variable that survives this guard as literal 0 then reaches
+# `$DS_TIMEOUT_CMD 0 cmd...` (GNU/BSD `timeout 0` / `gtimeout 0`), and GNU
+# coreutils' own documented behavior for `timeout 0 cmd` is to DISABLE the
+# timeout entirely and run cmd unbounded — the exact silent-no-op shape
+# INV-1a already forbids for a missing timeout binary, reachable here
+# through a config value that LOOKS validated (it passed the existing
+# numeric guard) rather than through a missing binary. This is the same
+# defect class as the DS_TIMEOUT_CMD no-op (INV-1a) and the old
+# CALL_ROLE-shaped accepted-but-unread parameter (INV-3): a control that
+# LOOKS enforced but silently admits the one value that defeats it.
+#
+# Fixed EVERYWHERE the pattern occurs on a timeout-like variable (gates.sh
+# run_bounded/cmd_secrets/cmd_deps/cmd_bleed/cmd_sast/get_review_diff/
+# cmd_ship, llm-client.sh llm_timeout_for's BASE/MAX) rather than at one
+# call site — a per-site patch here would be exactly the instance-fixing
+# AGENTS.md's Invariants section and the sweeping-test-discovery convention
+# both exist to close; see test_invariants.py's sweep for the mechanical
+# check that no call site regresses to the bare case-guard idiom.
+#
+# Deliberately NOT used for CLAGENTIC_LLM_TIMEOUT_MAX_SEC's own MAX
+# semantics (llm_timeout_for, llm-client.sh): that variable's 0 is a
+# DELIBERATE, DOCUMENTED "no cap" sentinel ("Cap at max when max is set and
+# positive") — a pre-existing, intentional, different meaning of zero, not
+# an instance of this defect. Only BASE timeouts (the wall-clock bound
+# actually handed to $DS_TIMEOUT_CMD) are in scope for this helper.
+ds_positive_int_or_default() {
+  _dpiod_val="$1"
+  _dpiod_default="$2"
+  case "$_dpiod_val" in ''|*[!0-9]*) _dpiod_val="$_dpiod_default" ;; esac
+  [ "$_dpiod_val" -le 0 ] 2>/dev/null && _dpiod_val="$_dpiod_default"
+  printf '%s' "$_dpiod_val"
+}
+
 # Write one row to .clagentic/lite/audit.db. Resolves repo root itself so callers
 # from any cwd (subdirectory hook invocations, etc.) hit the right DB.
 # Args: GATE OUTCOME DETAILS [SESSION_ID]

@@ -78,9 +78,12 @@ _git() { git -C "$REPO_ROOT" "$@"; }
 # with `--`) falls back to CLAGENTIC_EXTERNAL_TIMEOUT_SEC (default 120) —
 # long enough for a full-tree semgrep/osv-scanner pass on a mid-size repo,
 # short enough that a hung process surfaces as a step failure inside a
-# single gate invocation rather than wedging it. A non-numeric TIMEOUT_SEC
-# falls back the same way (numeric guard, matching every other
-# timeout/interval var in this file — see gates.sh:538, :689, :3598).
+# single gate invocation rather than wedging it. A non-numeric OR ZERO
+# TIMEOUT_SEC falls back the same way, via ds_positive_int_or_default
+# (platform.sh) — matching every other timeout/interval var in this file,
+# and every one in llm-client.sh's llm_timeout_for (lr-49df97 fold-up: a
+# bare `case ''|*[!0-9]*` guard admits "0" unchanged, and `timeout 0`
+# disables bounding entirely — see that helper's own doc comment).
 #
 # Relies on DS_TIMEOUT_CMD (platform.sh) for the actual bound. On a host
 # missing both `timeout` and `gtimeout`, DS_TIMEOUT_CMD resolves to
@@ -103,8 +106,8 @@ run_bounded() {
       [ "${1:-}" = "--" ] && shift
       ;;
   esac
-  case "$_rb_timeout" in ''|*[!0-9]*) _rb_timeout="${CLAGENTIC_EXTERNAL_TIMEOUT_SEC:-120}" ;; esac
-  case "$_rb_timeout" in ''|*[!0-9]*) _rb_timeout=120 ;; esac
+  _rb_timeout=$(ds_positive_int_or_default "$_rb_timeout" "${CLAGENTIC_EXTERNAL_TIMEOUT_SEC:-120}")
+  _rb_timeout=$(ds_positive_int_or_default "$_rb_timeout" 120)
   $DS_TIMEOUT_CMD "$_rb_timeout" "$@"
 }
 
@@ -262,7 +265,7 @@ cmd_secrets() {
   # the generic run_bounded default, so gitleaks gets its own configurable
   # timeout rather than sharing CLAGENTIC_EXTERNAL_TIMEOUT_SEC's 120s.
   _SECRETS_TIMEOUT="${CLAGENTIC_SECRETS_TIMEOUT_SEC:-300}"
-  case "$_SECRETS_TIMEOUT" in ''|*[!0-9]*) _SECRETS_TIMEOUT=300 ;; esac
+  _SECRETS_TIMEOUT=$(ds_positive_int_or_default "$_SECRETS_TIMEOUT" 300)
 
   if gitleaks git --help >/dev/null 2>&1; then
     if [ "$_SECRETS_ON_FEATURE" = "1" ]; then
@@ -324,7 +327,7 @@ cmd_deps() {
   # one path does a network vulnerability-DB lookup, so this defaults higher
   # than the generic run_bounded default.
   _OSV_TIMEOUT="${CLAGENTIC_OSV_TIMEOUT_SEC:-300}"
-  case "$_OSV_TIMEOUT" in ''|*[!0-9]*) _OSV_TIMEOUT=300 ;; esac
+  _OSV_TIMEOUT=$(ds_positive_int_or_default "$_OSV_TIMEOUT" 300)
 
   # Capability-probe: osv-scanner v2.x uses `scan source` subcommand; v1.x
   # used a flat invocation with --severity / --ignore-vulns flags (removed in
@@ -607,7 +610,7 @@ cmd_bleed() {
         # actual precedent for a remote-ref-diff scope is cmd_sast's
         # baseline-commit mechanism (:588-663) — see docs/GATES.md.
         _BLEED_FETCH_TIMEOUT="${CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC:-30}"
-        case "$_BLEED_FETCH_TIMEOUT" in ''|*[!0-9]*) _BLEED_FETCH_TIMEOUT=30 ;; esac
+        _BLEED_FETCH_TIMEOUT=$(ds_positive_int_or_default "$_BLEED_FETCH_TIMEOUT" 30)
 
         _BLEED_FRESH_ERR_TMP=$(mktemp -t clagentic-bleed-fresh-err.XXXXXX)
         _BLEED_FRESH_TIP=$(_gate_resolve_fresh_default_branch_ref "$_BLEED_DEFAULT_BRANCH" "$_BLEED_FETCH_TIMEOUT" 2>"$_BLEED_FRESH_ERR_TMP") || true
@@ -758,7 +761,7 @@ cmd_sast() {
       # step, which is specific to semgrep's --baseline-commit and not part
       # of the shared freshness precondition itself.
       _SAST_FETCH_TIMEOUT="${CLAGENTIC_SAST_FETCH_TIMEOUT_SEC:-30}"
-      case "$_SAST_FETCH_TIMEOUT" in ''|*[!0-9]*) _SAST_FETCH_TIMEOUT=30 ;; esac
+      _SAST_FETCH_TIMEOUT=$(ds_positive_int_or_default "$_SAST_FETCH_TIMEOUT" 30)
 
       _SAST_FRESH_ERR_TMP=$(mktemp -t clagentic-sast-fresh-err.XXXXXX)
       _SAST_FRESH_TIP=$(_gate_resolve_fresh_default_branch_ref "$_SAST_DEFAULT_BRANCH" "$_SAST_FETCH_TIMEOUT" 2>"$_SAST_FRESH_ERR_TMP") || true
@@ -789,7 +792,7 @@ cmd_sast() {
   # --config=auto DOWNLOADS RULES FROM THE NETWORK on top of running a scan,
   # so this defaults higher than the generic run_bounded default.
   _SAST_TIMEOUT="${CLAGENTIC_SAST_TIMEOUT_SEC:-300}"
-  case "$_SAST_TIMEOUT" in ''|*[!0-9]*) _SAST_TIMEOUT=300 ;; esac
+  _SAST_TIMEOUT=$(ds_positive_int_or_default "$_SAST_TIMEOUT" 300)
 
   # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
   if [ -n "$_SAST_BASELINE" ]; then
@@ -881,7 +884,7 @@ get_review_diff() {
     # call it unguarded via `get_review_diff > "$tmp"`) aborts the gate
     # rather than proceeding to review a partial diff as if it were complete.
     _grd_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-    case "$_grd_fetch_timeout" in ''|*[!0-9]*) _grd_fetch_timeout=30 ;; esac
+    _grd_fetch_timeout=$(ds_positive_int_or_default "$_grd_fetch_timeout" 30)
 
     _grd_fresh_err_tmp=$(mktemp -t clagentic-review-fresh-err.XXXXXX)
     _grd_fresh_tip=$(_gate_resolve_fresh_default_branch_ref "$DEFAULT_BRANCH" "$_grd_fetch_timeout" 2>"$_grd_fresh_err_tmp") || true
@@ -4344,7 +4347,7 @@ cmd_ship() {
   # `ship` indefinitely with no diagnostic, the last step of an otherwise
   # fully-bounded gate sequence.
   _SHIP_TIMEOUT="${CLAGENTIC_SHIP_TIMEOUT_SEC:-120}"
-  case "$_SHIP_TIMEOUT" in ''|*[!0-9]*) _SHIP_TIMEOUT=120 ;; esac
+  _SHIP_TIMEOUT=$(ds_positive_int_or_default "$_SHIP_TIMEOUT" 120)
 
   # Push + open PR if gh is available, else print a template.
   if _git remote get-url origin >/dev/null 2>&1; then
