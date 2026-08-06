@@ -2289,7 +2289,9 @@ _review_chunks_total() {
 #   line     - DEGRADED_MARKER (a literal ASCII SOH byte, 0x01) followed by
 #              "[clagentic-lite degraded] "
 #   markdown - a document whose first line starts with DEGRADED_MARKER
-#              followed by "# Degraded output"
+#              followed by "# Degraded output" -- OR, once cmd_adversarial
+#              prepends its SHA-stamp comment (gates.sh cmd_adversarial,
+#              "<!-- clagentic-diff-sha: ... -->\n" + cat), the SECOND line.
 #
 # Prior to this, only the json shape had ANY detector anywhere in the repo
 # (review_is_degraded below, json-only). The markdown shape
@@ -2311,6 +2313,22 @@ _review_chunks_total() {
 # stream emits (see DEGRADED_MARKER's own comment in llm-client.sh for the
 # full rationale). Banner text with no leading marker byte is NOT treated
 # as degraded.
+#
+# STAMP-AWARE MARKDOWN CHECK (BOBBIE finding 1 remainder, lr-7047bf
+# fold-in, PR #141 review #2): markdown mode originally checked ONLY byte 1
+# of the file, which is correct for cmd_adversarial's own in-process check
+# (_adv_status/_llm_output_is_degraded at the call site, BEFORE the SHA
+# stamp is prepended) but silently wrong for any LATER reader of the
+# persisted last-adversarial.md, whose first line is by then the SHA-stamp
+# HTML comment, pushing the DEGRADED_MARKER byte + banner to line 2.
+# build_gate_summary hand-rolled its own `sed -n '1,2p' | grep -qF` check
+# for exactly this reason, WITHOUT the marker-byte hardening this function
+# has -- two detectors for the same envelope, one hardened and one not, is
+# the documented failure mode this repo tracks (drift between duplicated
+# checks). Markdown mode now checks line 1 first, then falls back to line
+# 2 -- covering both the pre-stamp (cmd_adversarial's own call) and
+# post-stamp (build_gate_summary's persisted-file read) shapes with the
+# same hardened, marker-byte-gated logic.
 #
 # FAIL CLOSED on no validator: unlike the old review_is_degraded (which
 # fail-OPEN'd to "not degraded" when jq/python3 were both absent, relying
@@ -2342,8 +2360,15 @@ _llm_output_is_degraded() {
     markdown|*)
       [ -f "$_lod_file" ] || return 0
       _lod_first_byte=$(head -c 1 "$_lod_file" 2>/dev/null | od -An -tx1 | tr -d ' \n')
-      [ "$_lod_first_byte" = "01" ] || return 1
-      head -1 "$_lod_file" 2>/dev/null | grep -qF '# Degraded output'
+      if [ "$_lod_first_byte" = "01" ]; then
+        head -1 "$_lod_file" 2>/dev/null | grep -qF '# Degraded output' && return 0
+        return 1
+      fi
+      # Stamp-shifted case: line 1 is the SHA-stamp comment, so the marker
+      # (if present at all) is on line 2.
+      _lod_second_byte=$(sed -n '2p' "$_lod_file" 2>/dev/null | head -c 1 | od -An -tx1 | tr -d ' \n')
+      [ "$_lod_second_byte" = "01" ] || return 1
+      sed -n '2p' "$_lod_file" 2>/dev/null | grep -qF '# Degraded output'
       ;;
   esac
 }
@@ -3246,10 +3271,18 @@ build_gate_summary() {
             STALE_GATES="adversarial"
           fi
         fi
-        # The degraded marker (emit_degraded, llm-client.sh) is on line 2
-        # when a SHA stamp (line 1) is present, or line 1 for a file
-        # written before the stamp feature existed -- check both.
-        if sed -n '1,2p' "$AD" 2>/dev/null | grep -qF '# Degraded output'; then
+        # ROUTED THROUGH THE HARDENED DETECTOR (BOBBIE finding 1 remainder,
+        # lr-7047bf fold-in, PR #141 review #2): this used to be a raw
+        # `sed -n '1,2p' | grep -qF '# Degraded output'` -- a second,
+        # unhardened copy of _llm_output_is_degraded's own job, with no
+        # DEGRADED_MARKER control-byte gate, so a prompt-injected model
+        # response that reproduced the banner text verbatim (in either of
+        # the two lines checked) would misclassify a real audit as
+        # degraded. _llm_output_is_degraded markdown now handles the
+        # stamp-shifted (line 2) case itself -- see its own doc comment --
+        # so this call site no longer needs to hand-roll the line-1-or-2
+        # search.
+        if _llm_output_is_degraded markdown "$AD"; then
           ADVERSARIAL_DEGRADED=true
         fi
       else

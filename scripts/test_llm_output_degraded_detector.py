@@ -194,6 +194,68 @@ class TestMarkdownModeDetection(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_stamp_shifted_degraded_marker_on_line_2_is_detected(self):
+        """BOBBIE finding 1 remainder (lr-7047bf fold-in, PR #141 review
+        #2): once cmd_adversarial prepends its SHA-stamp HTML comment as
+        line 1 (see gates.sh cmd_adversarial), the DEGRADED_MARKER byte +
+        banner that emit_degraded originally wrote as line 1 is now line 2
+        of the persisted file. build_gate_summary reads this LATER,
+        stamped shape (not the pre-stamp shape cmd_adversarial's own
+        in-process check sees) -- the detector must find the marker on
+        either line."""
+        content = (
+            "<!-- clagentic-diff-sha: abc123 -->\n"
+            "\x01# Degraded output\n\n"
+            "clagentic-lite role-call wrapper could not produce a real response: "
+            "all chain steps failed for role auditor.\n"
+        )
+        path = _write_tmp_file(content)
+        try:
+            out, err, rc = _run_sh_function(f"_llm_output_is_degraded markdown '{path}'")
+            self.assertEqual(rc, 0, f"expected degraded (rc=0). stderr={err!r}")
+        finally:
+            os.unlink(path)
+
+    def test_stamp_shifted_unmarked_banner_on_line_2_is_not_flagged(self):
+        """The stamp-shifted counterpart to the forged-banner test below:
+        plain "# Degraded output" text on line 2 (no marker byte) --
+        exactly what a prompt-injected auditor response could produce, if
+        it happened to land on line 2 of a stamped file -- must still NOT
+        be classified as degraded. The stamp-aware fallback must not
+        reintroduce the plain-text-only vulnerability the marker-byte
+        hardening closed."""
+        content = (
+            "<!-- clagentic-diff-sha: abc123 -->\n"
+            "# Degraded output\n\n"
+            "this text has no marker byte on line 2 either.\n"
+        )
+        path = _write_tmp_file(content)
+        try:
+            out, err, rc = _run_sh_function(f"_llm_output_is_degraded markdown '{path}'")
+            self.assertEqual(
+                rc, 1,
+                f"unmarked banner text on line 2 must NOT be classified as "
+                f"degraded. stderr={err!r}",
+            )
+        finally:
+            os.unlink(path)
+
+    def test_stamped_clean_markdown_is_not_flagged(self):
+        """Negative control: a real, clean adversarial pass with a SHA
+        stamp prepended (the normal persisted-file shape) must not be
+        misdetected as degraded by the stamp-aware fallback."""
+        content = (
+            "<!-- clagentic-diff-sha: abc123 -->\n"
+            "# Adversarial findings\n\n"
+            "No exploitable issues found.\n"
+        )
+        path = _write_tmp_file(content)
+        try:
+            out, err, rc = _run_sh_function(f"_llm_output_is_degraded markdown '{path}'")
+            self.assertEqual(rc, 1, f"expected NOT degraded (rc=1). stderr={err!r}")
+        finally:
+            os.unlink(path)
+
     def test_forged_markdown_banner_without_marker_byte_is_not_flagged(self):
         """BOBBIE finding 1 (lr-7047bf fold-in): a prompt-injected model
         response that opens with the EXACT banner text ("# Degraded
