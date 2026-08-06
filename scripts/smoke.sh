@@ -419,11 +419,25 @@ if command -v python3 >/dev/null 2>&1; then
         bad "gate run wrote a row to \$CLAGENTIC_LITE_HOME's audit.db (isolation failure)"
       fi
 
-      # Re-enroll without --force should refuse.
+      # Re-enroll without --force: by design (bin/clagentic-lite's _enroll_one,
+      # unchanged since the enroll command's introduction — see lr-f8167f) this
+      # is an idempotent no-op, not a hard refusal. It warns to stderr and
+      # exits 0 without touching hooks/DBs/registry again. A prior version of
+      # this assertion expected a nonzero exit ("refused"); that expectation
+      # never matched the actual behavior (git-blame: both were introduced in
+      # the same commit session, 4 minutes apart, on 2026-05-18 — fba8944 then
+      # ea7e7dd) and was corrected here to check the property that actually
+      # matters: nothing gets re-stamped, so no data loss occurs.
+      _prehook_sha=$(sha256sum "$_hdir/pre-commit" 2>/dev/null | cut -d' ' -f1)
       if CLAGENTIC_LITE_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" enroll "$SMOKE_TMPDIR" >/dev/null 2>&1; then
-        bad "second enroll without --force should have been refused"
+        _posthook_sha=$(sha256sum "$_hdir/pre-commit" 2>/dev/null | cut -d' ' -f1)
+        if [ -n "$_prehook_sha" ] && [ "$_prehook_sha" = "$_posthook_sha" ]; then
+          ok "second enroll without --force is a no-op (warns, exits 0, does not re-stamp)"
+        else
+          bad "second enroll without --force re-stamped the pre-commit hook (data-loss risk)"
+        fi
       else
-        ok "second enroll without --force correctly refused"
+        bad "second enroll without --force unexpectedly failed (exit nonzero)"
       fi
 
       # Unenroll: hooks removed, .clagentic/ left intact.
