@@ -1189,15 +1189,24 @@ invoke_claude() {
   # must fail toward RESTRICTED, not toward permissive, on anything it does
   # not explicitly recognize.
   #
-  # OPT-OUT ROLES, enumerated (not opt-in) on purpose: auditor (keeps Bash
-  # for its security tools, docs/DESIGN.md "The five roles"), gate/
-  # merge-gate (read-only by contract but never asked to avoid Bash
-  # specifically -- unchanged from pre-fix behavior, no flags either way),
-  # builder (needs Bash to do its job at all), and summarizer (locked by
+  # OPT-OUT ROLES, enumerated (not opt-in) on purpose: gate/merge-gate
+  # (read-only by contract but never asked to avoid Bash specifically --
+  # unchanged from pre-fix behavior, no flags either way), builder (needs
+  # Bash to do its job at all), and summarizer (locked by
   # test_other_roles_get_no_tool_restriction_flags, which this fold-in
   # keeps passing UNMODIFIED per explicit instruction -- that test is the
-  # binding contract for these four role names specifically, not a
+  # binding contract for these three role names specifically, not a
   # judgment call re-derived here).
+  #
+  # AUDITOR NO LONGER ON THIS LIST (lr-8a28e0 adjudication): see
+  # ds_llm_role_is_bash_unrestricted's own doc comment (platform.sh) for
+  # the full reasoning -- the TOOL_ROLE=auditor invocation this function
+  # gates only ever reads a diff on stdin (ds_adversarial_prompt) and never
+  # shells out to gitleaks/semgrep/osv-scanner itself; those run as
+  # separate deterministic gates. The "auditor needs Bash for its security
+  # tools" need is real but belongs to a structurally different surface
+  # (plugins/clagentic-lite/agents/auditor.md, the interactive Claude Code
+  # subagent), not to this chain-step call.
   #
   # WHY ENUMERATE OPT-OUTS RATHER THAN OPT-INS: this is the mechanical form
   # of "fail toward restricted." An opt-IN list (the old shape) means every
@@ -1326,13 +1335,57 @@ invoke_claude() {
 #
 # Version-gated flag set (CODEX_MIN_VERSION):
 #   >= min: full flags --skip-git-repo-check -m M --color never -o FILE -
+#           (plus the tool-restriction flags below, when TOOL_ROLE calls for
+#           them)
 #   <  min: minimal `codex exec -` only; the banner/stderr is captured as
 #           ERR_HINT so the audit row is actionable. The -o flag is NOT used
 #           when version is unknown/old because the flag itself may be the one
 #           that was removed — writing output to ERR_FILE instead lets
-#           validate_output see empty TMP_RAW and fail cleanly.
+#           validate_output see empty TMP_RAW and fail cleanly. Tool
+#           restriction is likewise NOT applied on this path: an unconfirmed
+#           flag surface must not be assumed to also carry --disable/-s
+#           correctly, and the minimal form already ships with reduced
+#           capability by design.
+#
+# TOOL RESTRICTION (lr-37282a adjudication): the class-4 foundry fix
+# (invoke_claude, above) restricted the reviewer's Bash access via
+# `claude --print --allowedTools/--disallowedTools`, but share/config.example
+# ships CLAGENTIC_REVIEWER_CMD=codex as the DEFAULT, and invoke_codex had NO
+# equivalent mechanism at all -- a documented-but-inert control on a stock
+# install. Prior code here stated "no codex binary is installed on any host
+# this fix was authored/tested against, so the flag surface cannot be
+# confirmed" (the standing rule from :1099-1107 above, applied conservatively
+# at the time). That gap is now closed: `npx @openai/codex exec --help` and
+# `npx @openai/codex features list`, run against the INSTALLED codex CLI
+# (codex-cli 0.142.5, > CODEX_MIN_VERSION), confirm two flags that together
+# deny shell execution while preserving file reads/writes-when-permitted:
+#   --disable shell_tool   (equivalently -c features.shell_tool=false) --
+#     `codex features list` shows shell_tool as a real, "stable" feature
+#     flag (distinct from the -s/--sandbox flags below, whose own --help
+#     text reads "Select the sandbox policy to use when executing
+#     MODEL-GENERATED SHELL COMMANDS" -- i.e. sandbox scopes what an
+#     available shell tool can touch, it does not remove the tool itself).
+#     Empirically verified: with this flag, a prompt instructed to run
+#     `whoami` gets "I cannot run shell commands in this session because no
+#     shell execution tool is available" instead of a shell result.
+#   -s read-only            -- codex's own `apply_patch` file-write tool is
+#     NOT gated by --disable shell_tool (verified: a write succeeded with
+#     shell_tool disabled alone) -- `-s read-only` additionally blocks
+#     apply_patch, verified via the same prompt-and-observe method ("I
+#     cannot write files in this environment. The filesystem is currently
+#     read-only.").
+# Together these are the codex-side parity match for
+# `--allowedTools Read,Grep,Glob --disallowedTools Bash` on the claude path:
+# file reads still work (verified: a prompt to read AGENTS.md and quote its
+# first line succeeded with both flags set), shell execution and file writes
+# do not. Applied identically to every TOOL_ROLE this file restricts on the
+# claude path -- ds_llm_role_is_bash_unrestricted (platform.sh) is the SAME
+# single source of truth both invoke_claude and invoke_codex consult, so the
+# two carriers cannot drift onto two different opt-out enumerations (the
+# exact "what else differs between invoke_claude and invoke_codex" question
+# this task's class-level bar requires asking).
 invoke_codex() {
-  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"
+  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"; TOOL_ROLE="${7:-${CLAGENTIC_LLM_CLIENT_TOOL_ROLE:-}}"
   # Note: codex CLI does not expose a --temperature flag in its exec subcommand.
   # Determinism for adversarial calls is achieved via the CWE prompt discipline
   # and cross-round dedup; it cannot be reinforced at the CLI level for codex.
@@ -1343,15 +1396,26 @@ invoke_codex() {
   # Probe version once (result is cached in _CODEX_VERSION_CODE / _CODEX_VERSION_STR).
   codex_version_check
 
+  # Same restricted-by-default polarity as invoke_claude's TOOLS_FLAGS,
+  # same single source of truth (INV-2): anything NOT in the enumerated
+  # opt-out list (gate/builder/summarizer) is restricted, including
+  # "reviewer" itself and any unrecognized/empty role.
+  CODEX_TOOL_FLAGS=""
+  if ! ds_llm_role_is_bash_unrestricted "$TOOL_ROLE"; then
+    CODEX_TOOL_FLAGS="--disable shell_tool -s read-only"
+  fi
+
   _codex_exit=0
   if [ "$_CODEX_VERSION_CODE" -eq 0 ]; then
     # Full flag set: version is known-compatible.
     if [ -n "$MODEL" ]; then
+      # shellcheck disable=SC2086
       $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec --skip-git-repo-check -m "$MODEL" \
-        --color never -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1 || _codex_exit=$?
+        --color never $CODEX_TOOL_FLAGS -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1 || _codex_exit=$?
     else
+      # shellcheck disable=SC2086
       $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec --skip-git-repo-check \
-        --color never -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1 || _codex_exit=$?
+        --color never $CODEX_TOOL_FLAGS -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1 || _codex_exit=$?
     fi
   else
     # Minimal form: version is too old or unparseable. Avoid flags that may
@@ -1406,6 +1470,11 @@ invoke_generic() {
 # variable itself, and invoke_step's own dispatch line is completely
 # unchanged. This sidesteps the positional-argument channel this test
 # governs entirely, rather than colliding with it under a different name.
+# invoke_codex (lr-37282a) reads role via the exact same env-var channel --
+# its own 7th positional falls back to CLAGENTIC_LLM_CLIENT_TOOL_ROLE
+# identically to invoke_claude's 8th, and invoke_step's dispatch line below
+# passes no 7th arg to invoke_codex either, so both carriers reach the same
+# producer-side export with no invoke_step signature change for either.
 # Fails with exit 127 if the CLI binary is not on PATH.
 invoke_step() {
   CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"; CALL_MODE="${8:-}"
@@ -1912,29 +1981,38 @@ walk_chain() {
     esac
     [ -z "$TIER" ] && TIER="default"
     # REVIEWER-ON-AN-UNRESTRICTABLE-CLI, FAIL-SAFE-NOT-SILENT (lr-49df97
-    # fold-in, BOBBIE finding 1): invoke_claude's --allowedTools/
-    # --disallowedTools tool restriction (INV-2) only exists for the claude
-    # CLI -- codex exec has no equivalent flag (verified: no codex binary
-    # is installed on any host this fix was authored/tested against, so the
-    # flag surface cannot be confirmed the same way invoke_claude's flags
-    # were confirmed against a real `claude --help`; asserting one would
-    # repeat exactly the mistake the --temperature comment above warns
-    # against). share/config.example ships CLAGENTIC_REVIEWER_CMD=codex as
-    # the DEFAULT, so a stock install's PRIMARY reviewer path runs
-    # unrestricted by default with docs/DESIGN.md's tool-restriction row
-    # merely disclosing the gap in prose -- a documented-but-inert control,
-    # which is the exact failure shape this warning exists to stop being
-    # silent. Cross-vendor review (AGENTS.md §5, "Builder and Reviewer must
-    # default to different vendors") is the actual product thesis, so
-    # changing the shipped default away from codex was rejected as the fix
-    # here -- it would defeat cross-vendor review to close a gap in one
-    # specific CLI's flag surface. Instead: every reviewer chain step that
-    # resolves to a non-claude CLI prints a loud, one-line-per-attempt
-    # warning to stderr (never silent, never buried only in docs) so an
-    # operator running with the stock config sees the exposure on every
-    # review call, not just on a `doctor` run they may never think to run.
-    if [ "$ROLE_L" = "reviewer" ] && [ "$CLI" != "claude" ]; then
-      printf '[clagentic-lite] WARN: reviewer role is using CLI "%s", which has no known tool-restriction flag -- Bash is UNRESTRICTED on this call, unlike the claude path (--allowedTools/--disallowedTools, INV-2). A --print/exec reviewer holding unrestricted Bash while reading an attacker-influenceable diff is a live prompt-injection-to-execution path. See AGENTS.md Invariants INV-2 and docs/DESIGN.md "The five roles" for the known limitation.\n' "$CLI" 1>&2
+    # fold-in, BOBBIE finding 1; CLOSED FOR CODEX under lr-37282a).
+    # invoke_claude's --allowedTools/--disallowedTools tool restriction
+    # (INV-2) originally only existed for the claude CLI -- codex exec had
+    # no equivalent flag confirmed at the time (no codex binary was
+    # installed on any host that fix was authored/tested against). That gap
+    # is now closed: invoke_codex (above) applies `--disable shell_tool -s
+    # read-only` on the same restricted-by-default polarity
+    # (ds_llm_role_is_bash_unrestricted), verified against the installed
+    # codex CLI (codex-cli 0.142.5) via direct prompt-and-observe testing
+    # -- see invoke_codex's own doc comment for the full verification
+    # record. share/config.example ships CLAGENTIC_REVIEWER_CMD=codex as
+    # the DEFAULT, so this closes the gap on a stock install's PRIMARY
+    # reviewer path, not just a documented-but-inert control.
+    #
+    # STILL UNRESTRICTABLE: invoke_generic (any CLI outside claude/codex)
+    # has no tool-restriction mechanism of any kind -- a reviewer chain step
+    # resolving to a third CLI is still a live, unclosed gap. A codex step
+    # on a version older than CODEX_MIN_VERSION is ALSO still unrestricted
+    # -- invoke_codex deliberately does not apply --disable shell_tool/-s
+    # read-only on its minimal (unverified-flag-surface) fallback path, the
+    # same conservative posture the version gate already applies to every
+    # other flag on that path. Probe the cached version check (invoke_codex
+    # itself caches this; calling it again here is a no-op after the first
+    # call) so the warning can distinguish "codex, restricted" from "codex,
+    # too old to trust the restriction flags on."
+    if [ "$ROLE_L" = "reviewer" ] && [ "$CLI" = "codex" ]; then
+      codex_version_check
+      [ "$_CODEX_VERSION_CODE" -ne 0 ] && \
+        printf '[clagentic-lite] WARN: reviewer role is using codex v%s (< required v%s) -- the tool-restriction flags (--disable shell_tool -s read-only) are NOT applied on this unverified-flag-surface fallback path, so Bash/file-write are UNRESTRICTED on this call. Upgrade codex to restore the restriction. See AGENTS.md Invariants INV-2.\n' \
+          "$_CODEX_VERSION_STR" "$CODEX_MIN_VERSION" 1>&2
+    elif [ "$ROLE_L" = "reviewer" ] && [ "$CLI" != "claude" ]; then
+      printf '[clagentic-lite] WARN: reviewer role is using CLI "%s", which has no known tool-restriction flag -- Bash is UNRESTRICTED on this call, unlike the claude/codex paths (--allowedTools/--disallowedTools on claude, --disable shell_tool -s read-only on codex; INV-2). A --print/exec reviewer holding unrestricted Bash while reading an attacker-influenceable diff is a live prompt-injection-to-execution path. See AGENTS.md Invariants INV-2 and docs/DESIGN.md "The five roles" for the known limitation.\n' "$CLI" 1>&2
     fi
     # Truncate BOTH err and output files between attempts. Without truncating
     # TMP_OUT, a successful-on-write-but-exit-nonzero primary could leave
@@ -1959,18 +2037,27 @@ walk_chain() {
     # not recognize -- this is a SEPARATE, producer-side check, at the
     # point $ROLE_L is about to be exported, that does not depend on
     # invoke_claude's case statement being correct at all. A role literal
-    # that is neither a known opt-out role NOR "reviewer" itself (the one
-    # role this codebase deliberately routes through the restricted
-    # default) is surfaced loudly on stderr -- this can only happen if a
-    # future edit to this file's own subcommand dispatch introduces a sixth
-    # role name without updating either enumeration, which is exactly the
-    # "someone notices" property the coordinator's adjudication asked for.
-    # Never blocks the call (this wrapper's failure mode is always
-    # degrade-and-continue, per this file's own header contract) -- it only
-    # makes an otherwise-silent enumeration drift visible.
-    if ! ds_llm_role_is_bash_unrestricted "$ROLE_L" && [ "$ROLE_L" != "reviewer" ]; then
-      printf '[clagentic-lite] WARN: walk_chain role "%s" is neither a known Bash-unrestricted role (auditor/gate/builder/summarizer) nor "reviewer" -- defaulting to the RESTRICTED tool set (fail-safe). If this is a genuine new role, add it to ds_llm_role_is_bash_unrestricted (platform.sh) explicitly.\n' "$ROLE_L" 1>&2
-    fi
+    # that is neither a known opt-out role NOR one of the two roles this
+    # codebase deliberately routes through the restricted default on
+    # purpose ("reviewer", and as of lr-8a28e0 "auditor" -- see
+    # ds_llm_role_is_bash_unrestricted's own doc comment, platform.sh, for
+    # why the chain-step auditor invocation is deliberately restricted, not
+    # merely defaulted into it by omission) is surfaced loudly on stderr --
+    # this can only happen if a future edit to this file's own subcommand
+    # dispatch introduces a sixth role name without updating either
+    # enumeration, which is exactly the "someone notices" property the
+    # coordinator's adjudication asked for. Never blocks the call (this
+    # wrapper's failure mode is always degrade-and-continue, per this
+    # file's own header contract) -- it only makes an otherwise-silent
+    # enumeration drift visible.
+    case "$ROLE_L" in
+      reviewer|auditor) : ;;
+      *)
+        if ! ds_llm_role_is_bash_unrestricted "$ROLE_L"; then
+          printf '[clagentic-lite] WARN: walk_chain role "%s" is neither a known Bash-unrestricted role (gate/builder/summarizer) nor a deliberately-restricted role (reviewer/auditor) -- defaulting to the RESTRICTED tool set (fail-safe). If this is a genuine new role, add it to ds_llm_role_is_bash_unrestricted (platform.sh) explicitly.\n' "$ROLE_L" 1>&2
+        fi
+        ;;
+    esac
     export CLAGENTIC_LLM_CLIENT_TOOL_ROLE="$ROLE_L"
     EXIT_CODE=0
     invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" "$MODE" \

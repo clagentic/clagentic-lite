@@ -228,11 +228,37 @@ ds_positive_int_or_default() {
 # SINGLE SOURCE OF TRUTH for the opt-out enumeration (lr-49df97 fold-in,
 # HOLDEN-authorized correction): invoke_claude's own tool-restriction
 # decision (scripts/llm-client.sh) calls this rather than re-deriving the
-# same four-name list inline, so the enumeration cannot drift between two
-# copies. auditor/gate/builder/summarizer are the four names locked by
+# same list inline, so the enumeration cannot drift between two copies.
+# gate/builder/summarizer are the three names locked by
 # test_other_roles_get_no_tool_restriction_flags
 # (test_reviewer_tool_restriction.py) — that test is the binding contract
 # for this exact set, not a judgment call re-derived here.
+#
+# AUDITOR REMOVED FROM THIS LIST (lr-8a28e0 adjudication): this predicate
+# governs ONE specific invocation -- the non-interactive `claude --print`/
+# `codex exec` chain-step TOOL_ROLE=auditor invocation reached via
+# `gates.sh cmd_adversarial` -> `walk_chain adversarial` -> `invoke_claude`/
+# `invoke_codex` (ds_adversarial_prompt, scripts/llm-client.sh). That
+# invocation's ONLY input is a diff on stdin and its job is prose
+# exploitability commentary -- nothing in ds_adversarial_prompt asks it to
+# execute anything, and cmd_adversarial (scripts/gates.sh) never invokes
+# gitleaks/semgrep/osv-scanner itself; those run as separate, deterministic
+# gates (cmd_secrets/cmd_deps/cmd_sast) driven directly by gates.sh's own
+# shell code, per AGENTS.md §4 ("Do not add LLM calls to the blocking path
+# of any security check"). The original "auditor reads security-tool
+# output" rationale describes a DIFFERENT surface entirely:
+# plugins/clagentic-lite/agents/auditor.md, the interactive Claude Code
+# subagent a human/session invokes directly, which genuinely does run
+# `gitleaks`/`semgrep`/`osv-scanner` via its own scoped Bash allowlist
+# (frontmatter `tools: ... Bash # security-tool allowlist only`). That
+# subagent is a structurally separate mechanism (Claude Code's native
+# subagent tool-list, not `--allowedTools`/`--disallowedTools` on
+# `claude --print`/`codex exec`) and is entirely untouched by this
+# predicate or by invoke_claude/invoke_codex -- this fix does not and
+# cannot restrict it. Conflating the two surfaces was the accident this
+# adjudication corrects: the chain-step auditor was opted out of Bash
+# restriction on the strength of a need that belongs to a different
+# invocation path.
 #
 # WHY A SEPARATE FUNCTION, NOT JUST invoke_claude's OWN case STATEMENT
 # (the second, independent layer BOBBIE's fold-in and the coordinator's
@@ -240,12 +266,12 @@ ds_positive_int_or_default() {
 # CONSUMER of the restriction decision -- it decides what flags to pass.
 # This function is a distinct, independently-callable PREDICATE any future
 # producer/validator (walk_chain's own role-sanity check, a doctor
-# diagnostic, a test) can call without re-deriving or duplicating the
-# enumeration, so a future contributor extending the opt-out list has
-# exactly one place to edit and every consumer of the predicate picks up
-# the change automatically -- the same "one place to add a scanner"
-# discipline CLAGENTIC_SECURITY_TOOLS (bin/clagentic-lite) already uses
-# for an unrelated enumeration.
+# diagnostic, a test, invoke_codex) can call without re-deriving or
+# duplicating the enumeration, so a future contributor extending the
+# opt-out list has exactly one place to edit and every consumer of the
+# predicate picks up the change automatically -- the same "one place to
+# add a scanner" discipline CLAGENTIC_SECURITY_TOOLS (bin/clagentic-lite)
+# already uses for an unrelated enumeration.
 #
 # FAILS TOWARD RESTRICTED (the property this whole fold-in exists to
 # establish): the case statement's default arm is 1 (restricted) -- an
@@ -255,7 +281,7 @@ ds_positive_int_or_default() {
 # the fail-open shape BOBBIE's audit flagged.
 ds_llm_role_is_bash_unrestricted() {
   case "$1" in
-    auditor|gate|builder|summarizer) return 0 ;;
+    gate|builder|summarizer) return 0 ;;
     *) return 1 ;;
   esac
 }
