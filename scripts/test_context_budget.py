@@ -14,9 +14,19 @@ import tempfile
 import unittest
 
 
-# Absolute path to the hook — resolved from this file's location.
-_HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     "..", ".claude", "hooks", "post-tool-nudge.sh")
+# Absolute path to the tool's own checkout root -- the hook script's source
+# of truth moved from a tracked, live .claude/hooks/post-tool-nudge.sh to
+# share/hook-shims/post-tool-nudge.sh.template (lr-57db23; see AGENTS.md
+# INV-7). The template resolves its own CLAGENTIC_LITE_HOME via
+# `${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}` -- run it directly with
+# CLAGENTIC_LITE_HOME set to this checkout so platform.sh (and everything it
+# provides: ds_json_field, ds_repo_root, ds_load_env, $DS_TIMEOUT_CMD)
+# resolves against the REAL, current tracked scripts/, exactly as it would
+# once materialized into $CLAGENTIC_LITE_HOME/.claude/hooks/ by
+# _stamp_claude_hooks. Testing the template directly (not a materialized
+# copy) is deliberate: it is the tracked file a diff review actually sees.
+_TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_HOOK = os.path.join(_TOOL_HOME, "share", "hook-shims", "post-tool-nudge.sh.template")
 
 
 def _run_hook(payload: dict, env_overrides: dict | None = None) -> subprocess.CompletedProcess:
@@ -24,6 +34,7 @@ def _run_hook(payload: dict, env_overrides: dict | None = None) -> subprocess.Co
     env = dict(os.environ)
     # Suppress real ds_load_env config loading to keep tests hermetic.
     env["CLAGENTIC_ENV_LOADED"] = "1"
+    env["CLAGENTIC_LITE_HOME"] = _TOOL_HOME
     if env_overrides:
         env.update(env_overrides)
     return subprocess.run(
@@ -86,6 +97,7 @@ class TestContextBudgetMonitor(unittest.TestCase):
         full_env = dict(os.environ)
         full_env["CLAGENTIC_ENV_LOADED"] = "1"
         full_env["HOME"] = os.environ.get("HOME", "/root")
+        full_env["CLAGENTIC_LITE_HOME"] = _TOOL_HOME
         # Unset GIT_DIR/GIT_WORK_TREE so git uses the real repo at self._tmp (cwd).
         full_env.pop("GIT_DIR", None)
         full_env.pop("GIT_WORK_TREE", None)
@@ -269,7 +281,7 @@ class TestContextBudgetMonitor(unittest.TestCase):
             ["/bin/sh", _HOOK],
             input=b"",
             capture_output=True,
-            env={**os.environ, "CLAGENTIC_ENV_LOADED": "1"},
+            env={**os.environ, "CLAGENTIC_ENV_LOADED": "1", "CLAGENTIC_LITE_HOME": _TOOL_HOME},
             cwd=self._tmp,
         )
         self.assertEqual(result.returncode, 0)
@@ -352,6 +364,12 @@ class TestAutosummarizeDegradedHandling(unittest.TestCase):
         full_env = dict(os.environ)
         full_env["CLAGENTIC_ENV_LOADED"] = "1"
         full_env["HOME"] = os.environ.get("HOME", "/root")
+        # This fixture's own scripts/platform.sh (written by
+        # _write_real_memory_sh) is the one the hook should source -- not
+        # the real checkout's -- so the hook's top-level platform.sh load
+        # resolves against the SAME fake REPO_ROOT tree as the fake
+        # llm-client.sh/real memory.sh this class deliberately substitutes.
+        full_env["CLAGENTIC_LITE_HOME"] = self._tmp
         full_env.pop("GIT_DIR", None)
         full_env.pop("GIT_WORK_TREE", None)
         # Autosummarize threshold low enough that the 40000-byte fixture

@@ -347,10 +347,11 @@ class TestEveryLlmClientConsumerRepoWideIsStatusAndDegradedChecked(unittest.Test
     def test_sweep_discovers_at_least_the_known_consumer_roles(self):
         """Sanity check on the discovery mechanism itself: today's known
         call sites span gates.sh (review x2, adversarial, merge-gate),
-        memory.sh (summarize), and .claude/hooks/stop-summarize.sh +
-        .claude/hooks/post-tool-nudge.sh (both summarize). If this ever
-        finds zero sites, the grep pattern itself is broken (e.g. a caller
-        stopped quoting the binary path) and the sweep below would
+        memory.sh (summarize), and share/hook-shims/stop-summarize.sh.template
+        + share/hook-shims/post-tool-nudge.sh.template (both summarize --
+        relocated from .claude/hooks/ by lr-57db23, see AGENTS.md INV-7). If
+        this ever finds zero sites, the grep pattern itself is broken (e.g.
+        a caller stopped quoting the binary path) and the sweep below would
         vacuously pass with zero coverage -- this catches that
         silently-empty-sweep failure mode."""
         total_sites = 0
@@ -364,8 +365,9 @@ class TestEveryLlmClientConsumerRepoWideIsStatusAndDegradedChecked(unittest.Test
             total_sites, 7,
             f"expected at least 7 llm-client.sh call sites repo-wide "
             f"(gates.sh: review x2, adversarial, merge-gate; memory.sh: "
-            f"summarize; .claude/hooks/stop-summarize.sh: summarize; "
-            f".claude/hooks/post-tool-nudge.sh: summarize); found {total_sites}",
+            f"summarize; share/hook-shims/stop-summarize.sh.template: "
+            f"summarize; share/hook-shims/post-tool-nudge.sh.template: "
+            f"summarize); found {total_sites}",
         )
         for expected_role in ("review", "adversarial", "merge-gate", "summarize"):
             self.assertIn(
@@ -412,21 +414,27 @@ class TestEveryLlmClientConsumerRepoWideIsStatusAndDegradedChecked(unittest.Test
 
     def test_dotfile_hook_summarize_consumers_are_covered_by_the_repo_wide_sweep(self):
         """Names the specific finding (BOBBIE + HOLDEN, PR #141 review #2):
-        .claude/hooks/stop-summarize.sh and .claude/hooks/post-tool-nudge.sh
-        were the sixth and seventh unwired consumers, invisible to the
-        scripts/-and-bin/-only sweep specifically BECAUSE .claude/ is a
-        dotfile directory neither glob pattern walked. This test proves the
-        `git ls-files`-driven sweep actually discovers and clears both real
-        files at their real repo paths -- not a synthetic fixture standing
-        in for them -- so the round-2 widening is proven the same way the
-        round-1 widening was proven for memory.sh."""
-        hooks_dir = os.path.join(TOOL_HOME, ".claude", "hooks")
-        for hook_name in ("stop-summarize.sh", "post-tool-nudge.sh"):
-            hook_path = os.path.join(hooks_dir, hook_name)
+        stop-summarize.sh and post-tool-nudge.sh were the sixth and seventh
+        unwired consumers, invisible to the scripts/-and-bin/-only sweep
+        specifically BECAUSE .claude/ is a dotfile directory neither glob
+        pattern walked (their source of truth has since relocated from
+        .claude/hooks/ to share/hook-shims/*.sh.template, lr-57db23 -- see
+        AGENTS.md INV-7; the underlying gap this test proves closed is
+        unchanged by the relocation, since share/hook-shims/ was never a
+        blind spot to begin with -- this test now proves discovery at the
+        CURRENT tracked location instead of asserting a path that no longer
+        exists). This test proves the `git ls-files`-driven sweep actually
+        discovers and clears both real files at their real repo paths --
+        not a synthetic fixture standing in for them -- so the round-2
+        widening is proven the same way the round-1 widening was proven for
+        memory.sh."""
+        hook_shims_dir = os.path.join(TOOL_HOME, "share", "hook-shims")
+        for hook_name in ("stop-summarize.sh.template", "post-tool-nudge.sh.template"):
+            hook_path = os.path.join(hook_shims_dir, hook_name)
             self.assertIn(
                 hook_path, _iter_candidate_files(),
                 f"repo-wide file-discovery did not pick up {hook_name!r} "
-                f"under .claude/hooks/ -- the dotfile-directory gap this "
+                f"under share/hook-shims/ -- the dotfile-directory gap this "
                 f"round exists to close",
             )
             lines, violations = _sweep_file(hook_path)

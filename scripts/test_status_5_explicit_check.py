@@ -1,10 +1,11 @@
 """
 Regression coverage for lr-49df97 (fold-in, HOLDEN "also verify" item):
-memory.sh's cmd_summarize_turn and both .claude/hooks/ summarize consumers
-(stop-summarize.sh, post-tool-nudge.sh) only ever tested `-eq 3` for
-walk_chain's degraded exit status, relying on the cause-agnostic
-"[clagentic-lite degraded]" text-marker grep to also catch status 4
-("unwrap") and 5 ("turns-exhausted") by ACCIDENT -- emit_degraded's
+memory.sh's cmd_summarize_turn and both former .claude/hooks/ summarize
+consumers (stop-summarize.sh, post-tool-nudge.sh; source of truth now
+share/hook-shims/*.sh.template, lr-57db23 -- see AGENTS.md INV-7) only
+ever tested `-eq 3` for walk_chain's degraded exit status, relying on the
+cause-agnostic "[clagentic-lite degraded]" text-marker grep to also catch
+status 4 ("unwrap") and 5 ("turns-exhausted") by ACCIDENT -- emit_degraded's
 line-mode banner text happens to be the same regardless of cause, but
 nothing in the status check itself recognized 4 or 5 as degraded outcomes.
 
@@ -29,7 +30,9 @@ import unittest
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MEMORY_SH = os.path.join(TOOL_HOME, "scripts", "memory.sh")
-STOP_SUMMARIZE_HOOK = os.path.join(TOOL_HOME, ".claude", "hooks", "stop-summarize.sh")
+STOP_SUMMARIZE_HOOK = os.path.join(
+    TOOL_HOME, "share", "hook-shims", "stop-summarize.sh.template"
+)
 
 
 def _init_scratch_repo(repo_dir):
@@ -141,8 +144,9 @@ class TestMemoryShExplicitlyChecksStatus5(unittest.TestCase):
 
 
 class TestStopSummarizeHookExplicitlyChecksStatus5(unittest.TestCase):
-    """Same proof against the real .claude/hooks/stop-summarize.sh, which
-    invokes llm-client.sh via a relative REPO_ROOT-scoped path rather than
+    """Same proof against the real stop-summarize.sh (source of truth
+    share/hook-shims/stop-summarize.sh.template, lr-57db23), which invokes
+    llm-client.sh via a relative REPO_ROOT-scoped path rather than
     memory.sh's TOOL_HOME resolution."""
 
     def _run(self, exit_status):
@@ -184,15 +188,27 @@ class TestStopSummarizeHookExplicitlyChecksStatus5(unittest.TestCase):
             env["CLAGENTIC_ENV_LOADED"] = "1"
             env["CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC"] = "0"
             env["CLAGENTIC_DISABLE_HANDOFF"] = "1"
+            # This fixture's own scripts/platform.sh (copied above) is what
+            # the hook should source -- points CLAGENTIC_LITE_HOME at the
+            # fake repo, not the real checkout.
+            env["CLAGENTIC_LITE_HOME"] = repo_dir
             env.pop("GIT_DIR", None)
             env.pop("GIT_WORK_TREE", None)
 
-            subprocess.run(
+            hook_proc = subprocess.run(
                 ["sh", STOP_SUMMARIZE_HOOK],
                 input=json.dumps(payload).encode(),
                 capture_output=True,
                 env=env,
                 cwd=repo_dir,
+            )
+            # A "cannot open <hook path>: No such file" here would otherwise
+            # be silently indistinguishable from a real, clean skip -- both
+            # produce zero audit rows and zero summaries. Fail loudly on a
+            # missing/broken hook script rather than letting the assertions
+            # below pass vacuously for the wrong reason.
+            assert not hook_proc.stderr or b"No such file" not in hook_proc.stderr, (
+                f"stop-summarize.sh.template failed to run: {hook_proc.stderr!r}"
             )
 
             def _audit_rows():
