@@ -8,7 +8,9 @@
 #   unenroll [--purge] [PATH]             remove clagentic hooks, deregister
 #   list                                  show enrolled repos + status
 #   doctor                                diagnostics punch list
-#   update [--restamp]                    git pull + re-prereq + re-stamp shims + plugin update
+#   update [--restamp] [--force-discard]  git pull + re-prereq + re-stamp shims + plugin update
+#                                 (non-tty with a dirty CLAGENTIC_LITE_HOME refuses unless
+#                                 --force-discard or CLAGENTIC_UPDATE_FORCE_DISCARD=1 is set)
 #   recall [keywords...]                  search session memory for matching summaries
 #   remember "<note>" [tags]              store a manual memory entry
 #   show memory|gates [N]         pretty-print last N rows from .clagentic/ DBs
@@ -2529,8 +2531,12 @@ _restamp_repo_artifacts() {
 
 cmd_update() {
   RESTAMP=0
+  FORCE_DISCARD=0
   for _arg in "$@"; do
-    case "$_arg" in --restamp) RESTAMP=1 ;; esac
+    case "$_arg" in
+      --restamp) RESTAMP=1 ;;
+      --force-discard) FORCE_DISCARD=1 ;;
+    esac
   done
 
   # Migration: ~/.clagentic-lite -> ~/.clagentic/lite
@@ -2612,9 +2618,16 @@ cmd_update() {
   say "updating clagentic-lite at $CLAGENTIC_LITE_HOME..."
 
   # If CLAGENTIC_LITE_HOME has uncommitted changes, prompt before discarding them.
-  # Local edits to CLAGENTIC_LITE_HOME are tool internals, not user work — but the
-  # user should confirm before we silently discard them. On non-tty (CI, scripts),
-  # warn and proceed automatically so update remains unattended-safe.
+  # Local edits to CLAGENTIC_LITE_HOME are tool internals, not user work in the
+  # common case (a real install) — but `git stash drop` is irrecoverable via any
+  # normal git command, and CLAGENTIC_LITE_HOME can be misdirected at a real dev
+  # checkout (agent dispatch, misconfigured env) where the dirty tree IS user
+  # work. lr-dbf7f2: the prior non-tty behavior (warn, then discard) auto-ran
+  # this irrecoverable discard with no human present to see the warning, and
+  # silently destroyed uncommitted work in exactly that misdirected-env scenario,
+  # twice, in the same session. Fail-closed: non-tty now refuses by default and
+  # requires an explicit opt-in (--force-discard or
+  # CLAGENTIC_UPDATE_FORCE_DISCARD=1) to proceed, given the blast radius.
   if ! git -C "$CLAGENTIC_LITE_HOME" diff --quiet 2>/dev/null; then
     _dirty=$(git -C "$CLAGENTIC_LITE_HOME" diff --name-only 2>/dev/null)
     if [ -t 0 ]; then
@@ -2631,12 +2644,20 @@ cmd_update() {
           die "update cancelled — stash or commit changes in $CLAGENTIC_LITE_HOME first"
           ;;
       esac
-    else
-      # Non-tty (CI, script): warn and proceed, discard changes.
-      warn "non-tty: discarding uncommitted changes in $CLAGENTIC_LITE_HOME to proceed with update"
-      warn "dirty files: $(git -C "$CLAGENTIC_LITE_HOME" diff --name-only 2>/dev/null | tr '\n' ' ')"
+    elif [ "$FORCE_DISCARD" -eq 1 ] || [ "${CLAGENTIC_UPDATE_FORCE_DISCARD:-0}" = "1" ]; then
+      # Explicit opt-in: loudly warn exactly what will be destroyed, then discard.
+      warn "non-tty, --force-discard/CLAGENTIC_UPDATE_FORCE_DISCARD=1 set: discarding uncommitted changes in $CLAGENTIC_LITE_HOME to proceed with update"
+      warn "dirty files: $(printf '%s\n' "$_dirty" | tr '\n' ' ')"
       git -C "$CLAGENTIC_LITE_HOME" stash push -q -m "clagentic-lite update discard" 2>/dev/null
       git -C "$CLAGENTIC_LITE_HOME" stash drop -q 2>/dev/null || true
+    else
+      # Non-tty, no opt-in: refuse. `git stash drop` is not recoverable through
+      # normal means — a non-interactive invocation (CI, agent dispatch, cron)
+      # must never silently destroy uncommitted work with no human present to
+      # see a warning. See lr-dbf7f2.
+      printf '[clagentic-lite] ERROR: uncommitted changes in %s:\n' "$CLAGENTIC_LITE_HOME" >&2
+      printf '%s\n' "$_dirty" | sed 's/^/  /' >&2
+      die "non-tty update refused: $CLAGENTIC_LITE_HOME has uncommitted changes. Stash or commit them first, or re-run with --force-discard (or CLAGENTIC_UPDATE_FORCE_DISCARD=1) to discard them irrecoverably."
     fi
   fi
 
