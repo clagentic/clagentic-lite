@@ -180,10 +180,30 @@ if [ "${CLAGENTIC_DISABLE_AUTOSUMMARIZE:-0}" != "1" ] && [ -n "$REPO_ROOT" ]; th
         # Use $DS_TIMEOUT_CMD if available (from platform.sh), fall back to plain exec.
         _summarize_cmd="$REPO_ROOT/scripts/llm-client.sh"
         if [ -x "$_summarize_cmd" ]; then
+          # STATUS-CHECKED + DEGRADED-CHECKED (lr-7047bf, INV-1b, fold-in,
+          # BOBBIE + HOLDEN, PR #141 review #2): this was the other unwired
+          # dotfile-directory consumer (see stop-summarize.sh's identical
+          # comment for the full root-cause narrative). The status must be
+          # captured off the summarizer call itself, before the `| head -c
+          # 300` truncation -- a bare `$(cmd | head -c N) || VAR=""`
+          # reports head's status (and blanks DIGEST on ANY failure, status
+          # or not, which also silently hid a real error as if it were the
+          # ordinary "too short to bother" case).
+          _ptn_status=0
           if [ -n "${DS_TIMEOUT_CMD:-}" ]; then
-            DIGEST=$(printf '%s' "$OUTPUT" | $DS_TIMEOUT_CMD 10 "$_summarize_cmd" summarize 2>/dev/null | head -c 300) || DIGEST=""
+            _ptn_raw=$(printf '%s' "$OUTPUT" | $DS_TIMEOUT_CMD 10 "$_summarize_cmd" summarize 2>/dev/null) || _ptn_status=$?
           else
-            DIGEST=$(printf '%s' "$OUTPUT" | "$_summarize_cmd" summarize 2>/dev/null | head -c 300) || DIGEST=""
+            _ptn_raw=$(printf '%s' "$OUTPUT" | "$_summarize_cmd" summarize 2>/dev/null) || _ptn_status=$?
+          fi
+          if [ "$_ptn_status" -eq 3 ] || printf '%s' "$_ptn_raw" | grep -qF '[clagentic-lite degraded]'; then
+            # A genuinely degraded summarizer chain: do not write a
+            # fabricated digest to memory, and do not surface it to the
+            # user via additionalContext either -- mirrors memory.sh
+            # cmd_summarize_turn's and stop-summarize.sh's identical
+            # decision for the same outcome channel.
+            DIGEST=""
+          else
+            DIGEST=$(printf '%s' "$_ptn_raw" | head -c 300)
           fi
           if [ -n "$DIGEST" ]; then
             # Store digest in memory.db — best-effort, failures are silent.

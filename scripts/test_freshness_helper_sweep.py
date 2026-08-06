@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -129,7 +130,26 @@ def _find_stored_origin_ref_indirection(lines, helper_start, helper_end):
         if not am:
             continue
         assigned_var = am.group(1)
-        if _ORIGIN_REF_RE.search(line) and assigned_var not in _ALLOWED_LOG_STRING_VARS:
+        om = _ORIGIN_REF_RE.search(line)
+        if not om:
+            continue
+        # BUG FIX (lr-7047bf, carried from PR #140/lr-53dc6e review): the
+        # exemption must key on the CAPTURED origin-ref variable (the name
+        # inside `origin/${...}`, e.g. _BLEED_DEFAULT_BRANCH) -- the thing
+        # _ALLOWED_LOG_STRING_VARS actually documents as safe -- not on the
+        # ASSIGNED variable (the log-string variable being built, e.g.
+        # _BLEED_SCOPE_REASON). The prior form checked assigned_var, which is
+        # never itself an "origin/${VAR}"-referencing name and so was almost
+        # never in the allowlist -- gates.sh:547
+        # (_BLEED_SCOPE_REASON="branch diff vs origin/${_BLEED_DEFAULT_BRANCH}")
+        # avoided tripping this check only by accident, because none of its
+        # five consumers (:573,:582,:597,:608,:626) happen to also match
+        # _GIT_OP_RE, not because the exemption logic correctly recognized it
+        # as a safe log string. A future consumer of $_BLEED_SCOPE_REASON
+        # containing a git-subcommand word (e.g. a log line reading "git diff
+        # summary: ...") would have false-positived the entire suite.
+        captured_var = om.group(1)
+        if captured_var not in _ALLOWED_LOG_STRING_VARS:
             assigned_from_origin_ref[assigned_var] = (i + 1, line.rstrip('\n'))
 
     if not assigned_from_origin_ref:
@@ -304,6 +324,133 @@ class TestFreshnessSweepCatchesAlternateShellStylesAndIndirection(unittest.TestC
             f"variable indirection fixture -- an undetectable-by-regex "
             f"shape must trip a named failure, not pass silently. "
             f"hits={hits!r}",
+        )
+
+
+class TestIndirectionExemptionKeysOnCapturedVarNotAssignedVar(unittest.TestCase):
+    """Regression for the PR #140 review fold-in (BOBBIE, carried into
+    lr-7047bf): _find_stored_origin_ref_indirection used to check
+    `assigned_var not in _ALLOWED_LOG_STRING_VARS` -- the LHS variable being
+    built (e.g. _BLEED_SCOPE_REASON) -- when the allowlist actually documents
+    which CAPTURED origin-ref variable (the name inside `origin/${...}`,
+    e.g. _BLEED_DEFAULT_BRANCH) is safe to reference in a log string. Those
+    are never the same name, so the exemption almost never matched by
+    design, and gates.sh:547's real
+    `_BLEED_SCOPE_REASON="branch diff vs origin/${_BLEED_DEFAULT_BRANCH}"`
+    avoided tripping this check only because none of its five consumers
+    happen to also contain a git-subcommand word -- not because the
+    exemption logic recognized it as safe. A future consumer that DOES
+    contain one (e.g. a log line reading "git diff summary: <reason>")
+    would have false-positived the entire suite, and a future contributor
+    would have "fixed" that by disabling this trip-wire -- silently
+    reopening the freshness hole PR #140 closed."""
+
+    # Mirrors the real gates.sh:485-547 shape exactly: a log-string variable
+    # built from a captured, allowlisted origin-ref variable, then used by a
+    # LATER consumer that (unlike gates.sh's real five consumers) DOES
+    # contain a git-subcommand word. This is the genuinely dangerous case:
+    # the log string itself is fine (built from an allowlisted capture), but
+    # if a future edit's consumer line happens to look like a git operation,
+    # the exemption must still recognize the origin string as safe and not
+    # flag it -- correctly recognizing the ALLOWLISTED case is exactly what
+    # the keying bug broke.
+    _ALLOWLISTED_CAPTURE_FIXTURE = (
+        'cmd_fixture() {\n'
+        '  _FIX_DEFAULT_BRANCH="main"\n'
+        '  _FIX_SCOPE_REASON="branch diff vs origin/${_FIX_DEFAULT_BRANCH}"\n'
+        '  echo "git diff summary: $_FIX_SCOPE_REASON" 1>&2\n'
+        '}\n'
+    )
+
+    def setUp(self):
+        # Patch the module-level allowlist for the duration of this test so
+        # the fixture can use its own, self-contained variable names rather
+        # than colliding with the real _BLEED_DEFAULT_BRANCH -- keeps this
+        # test from silently depending on gates.sh's current variable names.
+        #
+        # ORDER-DEPENDENCY FIX (lr-7047bf fold-in): `import scripts.test_
+        # freshness_helper_sweep as mod` used to hardcode the dotted path.
+        # Under `python3 -m unittest scripts.test_freshness_helper_sweep`
+        # that happens to be the same module object this TestCase runs in,
+        # so the patch reached _find_stored_origin_ref_indirection's globals
+        # and every test passed. Under `python3 -m unittest discover -s
+        # scripts -t scripts` (this repo has no scripts/__init__.py),
+        # unittest's discovery loader imports this file as a BARE top-level
+        # module (test_freshness_helper_sweep) while the hardcoded import
+        # statement -- resolved against a repo-root sys.path entry that a
+        # `-m` invocation also seeds -- created a SECOND, independent module
+        # object under the `scripts.`-qualified name. setUp patched that
+        # second object's allowlist; the sweep functions the test actually
+        # exercises are bound to the FIRST (bare) object's unpatched globals,
+        # so the patch silently never took effect and the test failed only
+        # under discover -- a real order/dispatch-mode dependency, not a
+        # flake. Resolving the module via the TestCase's own __module__
+        # (looked up in sys.modules) always identifies the module object
+        # this test is actually running in, regardless of which import path
+        # produced it, so there is only ever one identity to patch.
+        self._mod = sys.modules[self.__class__.__module__]
+        self._orig_allowlist = self._mod._ALLOWED_LOG_STRING_VARS
+        self._mod._ALLOWED_LOG_STRING_VARS = {"_FIX_DEFAULT_BRANCH"}
+
+    def tearDown(self):
+        self._mod._ALLOWED_LOG_STRING_VARS = self._orig_allowlist
+
+    def test_old_assigned_var_keying_would_have_flagged_a_safe_allowlisted_capture(self):
+        """Guards the premise: with the OLD (buggy) keying -- checking the
+        ASSIGNED var (_FIX_SCOPE_REASON) against the allowlist instead of
+        the CAPTURED var (_FIX_DEFAULT_BRANCH) -- this fixture would be
+        flagged as a violation even though the captured variable IS
+        allowlisted. That would make the sweep noisy on legitimate code,
+        which is exactly the pressure that gets a trip-wire disabled by a
+        later contributor."""
+        lines = self._ALLOWLISTED_CAPTURE_FIXTURE.splitlines(keepends=True)
+        old_assigned_from_origin_ref = {}
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            am = _ASSIGNMENT_RE.match(stripped)
+            if not am:
+                continue
+            assigned_var = am.group(1)
+            if _ORIGIN_REF_RE.search(line) and assigned_var not in self._mod._ALLOWED_LOG_STRING_VARS:
+                old_assigned_from_origin_ref[assigned_var] = (i + 1, line.rstrip('\n'))
+        self.assertIn(
+            "_FIX_SCOPE_REASON", old_assigned_from_origin_ref,
+            "premise check failed: the old assigned-var-keyed logic was "
+            "expected to (wrongly) flag this fixture -- if it doesn't, this "
+            "is not a valid fixture for proving the fix matters",
+        )
+
+    def test_fixed_captured_var_keying_recognizes_the_allowlisted_capture(self):
+        """The actual fix: keying on the captured var means this fixture --
+        a log string built from an allowlisted capture, consumed by a line
+        that happens to contain a git-subcommand word -- produces NO
+        indirection hit, because _FIX_DEFAULT_BRANCH (the captured var) is
+        allowlisted, exactly as _BLEED_DEFAULT_BRANCH is for the real
+        gates.sh shape this fixture mirrors."""
+        lines = self._ALLOWLISTED_CAPTURE_FIXTURE.splitlines(keepends=True)
+        hits = _find_stored_origin_ref_indirection(lines, -1, -1)
+        self.assertEqual(
+            hits, [],
+            f"fixed exemption keying still flagged an allowlisted capture "
+            f"as a violation -- the fix should recognize _FIX_DEFAULT_BRANCH "
+            f"(the captured origin-ref var) as safe, matching real "
+            f"gates.sh:547's _BLEED_DEFAULT_BRANCH shape. hits={hits!r}",
+        )
+
+    def test_a_non_allowlisted_capture_with_the_same_shape_still_trips(self):
+        """Sanity check on the other direction: change the captured var to
+        one NOT in the allowlist (same fixture shape otherwise) and confirm
+        the indirection check still fires -- proves the fix narrows the
+        exemption to the captured var specifically, rather than accidentally
+        exempting everything."""
+        fixture = self._ALLOWLISTED_CAPTURE_FIXTURE.replace(
+            "_FIX_DEFAULT_BRANCH", "_FIX_UNLISTED_BRANCH")
+        lines = fixture.splitlines(keepends=True)
+        hits = _find_stored_origin_ref_indirection(lines, -1, -1)
+        self.assertTrue(
+            any("_FIX_SCOPE_REASON" in txt for _, txt in hits),
+            f"expected a hit once the captured var is no longer "
+            f"allowlisted. hits={hits!r}",
         )
 
 

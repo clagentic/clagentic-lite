@@ -579,12 +579,23 @@ A pattern-file change is also detected and forces a full scan regardless of the 
 |---|---|
 | **Fires** | `/review --adversarial`; `scripts/gates.sh adversarial` |
 | **Tool** | Auditor role via `scripts/llm-client.sh adversarial` |
-| **Blocks?** | No — Gate 5 itself is commentary only. A finding's `tier` field can make Gate 6 (Merge Gate) refuse — see "Reachability requirement" and "Blocking vs advisory" below. |
+| **Blocks?** | No — Gate 5 itself is commentary only. A finding's `tier` field can make Gate 6 (Merge Gate) refuse — see "Reachability requirement" and "Blocking vs advisory" below. `gates.sh ship` runs it as `cmd_adversarial \|\| true` (an explicit, deliberate opt-out, not an accidental default — see "Exit codes" below). |
 | **Output** | Markdown attack scenarios saved to `.clagentic/lite/last-adversarial.md`; structured findings (same data, machine-readable) saved to `.clagentic/lite/last-adversarial-findings.json`; attach to PR if interesting |
 
 The Auditor argues, in concrete terms, how a hostile user could exploit each new or modified input surface. Cites file:line. Names threats with CWE if obvious. If nothing is exploitable, says so in one sentence and lists the surfaces considered.
 
 The Auditor prompt (`plugins/clagentic-lite/agents/auditor.md`, and the `ds_adversarial_prompt` heredoc in `scripts/llm-client.sh` — both surfaces carry the same material, since a non-Claude CLI chain step never has the agent `.md` file in context) carries a Pre-Report Gate, severity calibration, and a false-positive list, mirroring the Reviewer's (Gate 3). This exists because an uncalibrated adversarial pass is the dominant cause of repeated review bounces: real-but-unexploitable findings — a vulnerable-looking function nothing calls, a CWE pattern-match with no named attacker input — carried the same blocking weight as a live exposure. See "Reachability requirement" below for the mechanism that fixes this.
+
+### Exit codes for `gates.sh adversarial`
+
+`cmd_adversarial` (lr-7047bf) checks the Auditor chain's own outcome, not just whether it produced findings — a fully-dead auditor (auth broken, CLI not on PATH, every chain step timed out) used to write a degraded markdown envelope indistinguishable from "nothing to report," and the merge gate downstream read that as a clean audit.
+
+| Exit code | Meaning | Action |
+|---|---|---|
+| `0` | Auditor ran; markdown + findings sidecar written (`gate_runs` outcome `warn`, non-blocking by design) | Review findings if any; attach interesting ones to the PR |
+| `2` | `INFRA_DEGRADED` — every Auditor chain step failed; degraded envelope written; no real audit occurred (`gate_runs` outcome `degraded`) | Check LLM CLI config/auth and retry |
+
+`build_gate_summary` independently surfaces this to the Merge Gate as `adversarial_degraded: true` in the gate-summary payload — a dead auditor is now distinguishable from a clean pass at every downstream consumer, not just at `cmd_adversarial`'s own exit status.
 
 ### Finding format (prose-primary with structured header)
 
@@ -809,6 +820,14 @@ CLAGENTIC_TAIL_INTERVAL_SEC=2 scripts/gates.sh tail   # adjust poll interval
 ```
 
 `status` and `tail` honor `NO_COLOR=1` and emit plain text when stdout is not a TTY (safe to pipe to a file). Both are read-only — neither writes to `audit.db`, neither runs a gate, neither spawns a daemon.
+
+### Audit-vocabulary lint — `scripts/gates.sh audit-vocab-lint [FILE]`
+
+`cmd_log_run <gate> pass "<details>"` is a promise: this gate ran and found nothing wrong. Several gates historically logged `pass` with a details string that itself names a reason the underlying tool never actually scanned anything — `git ls-files failed`, `no package sources found`, an empty pattern file. That is a contradiction between the outcome label and its own explanation, and it is invisible to anyone reading the audit trail without also reading the gate's source.
+
+`audit-vocab-lint` (default target: `scripts/gates.sh` itself) scans for `cmd_log_run <gate> pass "<details>"` calls whose details string contains a failure word (`failed` / `not found` / `empty` / `no package sources` / `skipped` / `unavailable`) and reports them. **Warn-only, non-blocking, never exits non-zero** — it does not rewrite any gate's behavior. Existing violations are enumerated in an explicit `_KNOWN_VIOLATIONS` allowlist inside `cmd_audit_vocab_lint`, keyed on the exact `(gate, details)` pair; a genuinely new violation (a different gate, or the same gate with reworded details) is reported separately from the known backlog rather than silently absorbed. `warn`-outcome rows are deliberately out of scope — a `warn` already signals "not fully clean" honestly (e.g. cross-round dedup's "splice failed; original findings retained"); the lie this lint targets is specifically a `pass` outcome contradicting itself.
+
+Not wired into `gates ship`'s blocking sequence — it is diagnostic output, run manually or from a maintenance script.
 
 ## Working around gates — use config, not code edits
 
