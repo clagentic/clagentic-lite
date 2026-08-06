@@ -845,3 +845,76 @@ print(json.dumps(item))
   # posture as _sanitize_adversarial_findings_json's own no-JSON-tool path.
   printf '%s' "$_ljasf_json"
 }
+
+# _llm_json_array_cap JSON MAX — truncate a JSON array of objects to the
+# first MAX entries (lr-33958f, PR-C, required foundry fix). Generic
+# extraction of the same shape _invariant_feed_append's own cap already
+# used inline (drop-oldest-first on that append path) — this is the
+# EMISSION-side cap the foundry specifically named as the most likely
+# source of the next unreported bug: _parse_adversarial_findings
+# (gates.sh) built its findings array with NO count bound at all, and that
+# array is embedded TWICE into the merge-gate system prompt
+# (adversarial_findings and adversarial_findings_fenced, build_gate_summary)
+# -- a diff that provokes an unusually chatty Auditor (or a prompt-injected
+# one) could grow that prompt without limit. This is a COUNT bound, not a
+# presence check, following the same "constrain the count, not the
+# presence" lesson INV-2 states explicitly — an earlier fix that merely
+# ensured "at least one finding is captured" would not have closed this.
+#
+# Truncates, does not reject: a merely-large finding set is not attacker
+# behavior on its own (a genuinely complex diff can legitimately produce
+# many findings), so dropping the excess rather than failing the whole
+# audit matches this codebase's established truncate-not-reject posture
+# (_llm_field_sanitize's own length cap, same rationale). Truncation
+# ALWAYS keeps the first MAX entries (stable, deterministic — the same
+# input always caps to the same output) rather than a random or
+# last-N selection.
+#
+# Args: JSON (a JSON array, as a single string), MAX (positive integer;
+# non-numeric/absent falls back to CLAGENTIC_ADVERSARIAL_FINDINGS_MAX,
+# default 200 -- generous for a single adversarial pass, small enough that
+# an unbounded array cannot balloon the merge-gate prompt).
+# stdout: the capped JSON array (or the original JSON UNCHANGED, on any
+# failure -- fail-open matches every other JSON-tool-dependent helper in
+# this codebase; a truncation failure must never turn into an emptied
+# array, which would be an over-suppression in the opposite, wrong
+# direction).
+_llm_json_array_cap() {
+  _ljac_json="$1"
+  _ljac_max="${2:-${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}}"
+  case "$_ljac_max" in ''|*[!0-9]*) _ljac_max="${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}" ;; esac
+  case "$_ljac_max" in ''|*[!0-9]*) _ljac_max=200 ;; esac
+
+  if command -v jq >/dev/null 2>&1; then
+    if ! printf '%s' "$_ljac_json" | jq -e '. | type == "array"' >/dev/null 2>&1; then
+      printf '%s' "$_ljac_json"
+      return 0
+    fi
+    _ljac_out=$(printf '%s' "$_ljac_json" | jq -c --argjson max "$_ljac_max" '.[0:$max]' 2>/dev/null)
+    [ -n "$_ljac_out" ] || { printf '%s' "$_ljac_json"; return 0; }
+    printf '%s' "$_ljac_out"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    _ljac_out=$(python3 -c '
+import json, sys
+raw, max_n = sys.argv[1], int(sys.argv[2])
+try:
+    arr = json.loads(raw)
+    if not isinstance(arr, list):
+        raise ValueError("not a list")
+except Exception:
+    print(raw)
+    sys.exit(0)
+print(json.dumps(arr[:max_n]))
+' "$_ljac_json" "$_ljac_max" 2>/dev/null)
+    [ -n "$_ljac_out" ] || { printf '%s' "$_ljac_json"; return 0; }
+    printf '%s' "$_ljac_out"
+    return 0
+  fi
+
+  # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open,
+  # matching every other JSON-tool-dependent helper in this codebase.
+  printf '%s' "$_ljac_json"
+}
