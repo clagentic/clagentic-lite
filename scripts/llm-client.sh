@@ -1114,17 +1114,31 @@ llm_timeout_for() {
 # Set CLAGENTIC_CLAUDE_BARE=1 if you authenticate via API key and
 # prefer the tighter --bare invocation surface.
 invoke_claude() {
-  # 8th positional (role) DROPPED (lr-33958f, PR-C): it was accepted here
-  # and never referenced in this function body -- the unwrap logic that
-  # would have needed it lived inline, one layer below where role is
-  # actually meaningful (see the comment at the old unwrap site, below,
-  # for the full rationale). Role now flows directly from walk_chain into
-  # _llm_unwrap_json_envelope, which runs AFTER invoke_step returns -- this
-  # function has no remaining need for it. A caller may still pass an 8th
-  # arg (invoke_step does not, but a direct test call may); POSIX sh
-  # functions silently ignore extra positional args, so this is not a
-  # breaking signature change for any existing caller.
-  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"; CALL_MODE="${7:-}"
+  # 8th positional (role) REINTRODUCED under a NEW NAME, TOOL_ROLE, NOT
+  # CALL_ROLE (class-4 foundry fix): a prior revision (lr-33958f, PR-C)
+  # dropped an 8th positional named CALL_ROLE as accepted-but-unread, and
+  # test_call_role_not_dead_parameter.py locks in the literal absence of
+  # that token in this function's signature/body permanently -- an existing
+  # test this task must not modify (AMoS code-craft rule 5). The need this
+  # task has is real (deciding the reviewer's tool-restriction flags below)
+  # and satisfies INV-3's actual principle (every accepted positional is
+  # read), but reusing the retired name would collide with a test that
+  # asserts a narrower, PR-C-specific fact (CALL_ROLE specifically, not "no
+  # role parameter of any name"). TOOL_ROLE is a distinct token: read here
+  # for a genuine purpose, never merely accepted-and-ignored.
+  #
+  # invoke_step (the production dispatcher) does NOT forward this
+  # positional -- test_invoke_step_no_dead_role_positional.py separately
+  # locks invoke_step's own signature at 8 params (no $9 binding at all,
+  # under any name), so invoke_step cannot pass role through as an
+  # argument. The 8th positional here is populated instead by
+  # CLAGENTIC_LLM_CLIENT_TOOL_ROLE, an env var walk_chain exports right
+  # before calling invoke_step -- this function still ACCEPTS a direct 8th
+  # positional too (a test harness calling invoke_claude directly, as
+  # test_llm_client_sh.py and test_reviewer_tool_restriction.py both do,
+  # continues to work with no env var involved), but production traffic
+  # through invoke_step flows the env var, not the positional.
+  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"; CALL_MODE="${7:-}"; TOOL_ROLE="${8:-${CLAGENTIC_LLM_CLIENT_TOOL_ROLE:-}}"
   OUTPUT_FORMAT_FLAG=""
   [ "$CALL_MODE" = "json" ] && OUTPUT_FORMAT_FLAG="--output-format json"
   BARE_FLAG=""
@@ -1149,6 +1163,40 @@ invoke_claude() {
   # auditor call fail outright, which is worse than no determinism control
   # at all. Do not reintroduce a --temperature (or similar) flag here without
   # first confirming `claude --help` actually lists it.
+  #
+  # TOOL RESTRICTION (class-4 foundry fix, INV-2): the reviewer role gets
+  # --allowedTools "Read Grep Glob" (KEEPS Read/Grep/Glob -- its prompt
+  # mandates caller-tracing, import-checking, and guard-branch verification;
+  # stripping those tools would silently gut review quality, invisibly,
+  # since a shallower review still emits valid JSON and passes every gate)
+  # and --disallowedTools "Bash" (LOSES Bash -- nothing in the reviewer
+  # prompt asks it to execute anything, and a --print reviewer holding
+  # unrestricted Bash while reading an attacker-influenceable diff is a live
+  # prompt-injection-to-execution path; removing it is a security fix Class
+  # 4 merely gave the occasion to make). VERIFIED AGAINST THE INSTALLED CLI
+  # before writing this (same discipline the --temperature note above
+  # documents): --allowedTools/--allowed-tools and --disallowedTools/
+  # --disallowed-tools both appear in `claude --help` on this host
+  # (@anthropic-ai/claude-code 2.1.113) -- confirm again with `claude --help`
+  # before relying on this if upgrading past a version where the flag
+  # surface has changed. Scoped to role=="reviewer" only -- auditor,
+  # merge-gate, builder, and summarizer are all left untouched; see
+  # AGENTS.md Invariants (INV-2) for the no-settable-turn-cap limitation
+  # this flag pairing does NOT close on its own.
+  # Comma-separated single-token form for each flag (documented as accepted
+  # alongside the space-separated variadic form -- "Comma or space-separated
+  # list of tool names") deliberately, not `--allowedTools Read Grep Glob
+  # --disallowedTools Bash`: the variadic space-separated form's token-
+  # consumption boundary against a following `--disallowedTools` flag is not
+  # something this call site can verify without running the CLI, and a
+  # misparse here would either silently admit Bash back in (worse than not
+  # trying) or break the reviewer step outright the same way the reverted
+  # --temperature flag did. One flag, one comma-joined value each removes
+  # that ambiguity entirely.
+  TOOLS_FLAGS=""
+  if [ "$TOOL_ROLE" = "reviewer" ]; then
+    TOOLS_FLAGS='--allowedTools Read,Grep,Glob --disallowedTools Bash'
+  fi
   # Tell the inner Claude session NOT to inject recall summaries —
   # this is the recursion-avoidance path that doesn't require --bare.
   export CLAGENTIC_DISABLE_RECALL=1
@@ -1177,13 +1225,13 @@ invoke_claude() {
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
       cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG --model "$MODEL" \
-        $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" ) \
+        $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" $TOOLS_FLAGS ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE" || _claude_exit=$?
   else
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
       cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG \
-        $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" ) \
+        $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" $TOOLS_FLAGS ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE" || _claude_exit=$?
   fi
   EXIT_CODE=$_claude_exit
@@ -1300,21 +1348,21 @@ invoke_generic() {
 
 # Dispatch a single chain step.
 # Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE CALL_TIMEOUT [MODE]
-# Fails with exit 127 if the CLI binary is not on PATH.
 #
-# NO 9th (ROLE) POSITIONAL (BOBBIE, lr-33958f PR-C fold-in review, nit 3):
-# a prior revision of this function accepted-but-never-bound a 9th
-# positional for "backward-compatible call shape" -- an accepted-but-unread
-# parameter is exactly the INV-3 defect this task's own fold-in review
-# named (see invoke_claude's CALL_ROLE removal above for the first instance
-# of this same class). Genuinely dead: nothing in this function's body ever
-# read it, and role already flows directly from walk_chain into
-# _llm_unwrap_json_envelope (below), which runs AFTER invoke_step returns,
-# not through this dispatcher. Removed from the documented signature
-# entirely rather than left "accepted for compatibility" -- callers that
-# still pass a trailing role argument (walk_chain does; POSIX sh silently
-# ignores an extra positional no `$N` reads) continue to work unchanged,
-# but the signature no longer claims to accept something it does not use.
+# STILL NO 9TH (ROLE) POSITIONAL (class-4 foundry fix respects the existing
+# constraint): test_invoke_step_no_dead_role_positional.py locks in that
+# invoke_step's own binding line must never read $9/${9:-...} and its Args:
+# doc comment must never list a ROLE positional -- an existing test this
+# task must not modify. invoke_claude nonetheless needs role now (to decide
+# the reviewer's tool-restriction flags; MODE alone ("json") cannot
+# distinguish the reviewer from the merge-gate role, which also runs in
+# json mode but must NOT lose Bash) -- satisfied WITHOUT touching this
+# function's signature at all: walk_chain (the only caller of invoke_step)
+# exports CLAGENTIC_LLM_CLIENT_TOOL_ROLE directly, invoke_claude reads that
+# variable itself, and invoke_step's own dispatch line is completely
+# unchanged. This sidesteps the positional-argument channel this test
+# governs entirely, rather than colliding with it under a different name.
+# Fails with exit 127 if the CLI binary is not on PATH.
 invoke_step() {
   CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"; CALL_MODE="${8:-}"
   command -v "$CLI" >/dev/null 2>&1 || return 127
@@ -1323,6 +1371,71 @@ invoke_step() {
     codex)   invoke_codex   "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
     *)       invoke_generic "$CLI" "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
   esac
+}
+
+# _llm_turn_diagnostics MODE FILE
+#
+# THE RISK THE FOUNDRY FLAGGED HARDEST, mitigation (a) and (b) (class-4
+# fix): a turn cap tight enough to bound the tool loop is, by construction,
+# tight enough to truncate the caller-tracing the reviewer prompt mandates
+# -- and a truncated reviewer still emits well-formed JSON with findings:[],
+# still passes validate_output and the degraded check, and still ships. The
+# failure signature is the gate turning green MORE OFTEN, which reads as
+# success and has no alarm. Two mitigations, both here:
+#   (a) num_turns is ALREADY in the --output-format json envelope and was
+#       previously discarded during unwrap -- extracted and logged into the
+#       audit row unconditionally (every claude json-mode call, not just a
+#       failing one) so a reviewer hitting its ceiling every run is one
+#       query away from visible instead of invisible.
+#   (b) subtype=="error_max_turns" (confirmed against the installed
+#       claude-agent-sdk's SDKResultError type, agentSdkTypes.d.ts/sdk.d.ts:
+#       `subtype: 'error_during_execution' | 'error_max_turns' |
+#       'error_max_budget_usd' | 'error_max_structured_output_retries'`,
+#       alongside `terminal_reason?: 'max_turns' | ...`) is the CLI's own
+#       signal that the agentic loop exhausted its turns before finishing --
+#       this codebase cannot SET a turn cap (no --max-turns flag exists on
+#       `claude --print`, verified against the installed CLI; see
+#       invoke_claude's own comment), but Claude Code enforces an internal
+#       default the SAME WAY regardless, and this subtype fires when that
+#       default is hit. walk_chain's caller (below) treats this as a
+#       distinct failure, never a clean pass, even when TMP_OUT still
+#       contains parseable partial JSON.
+#
+# Called BEFORE _llm_unwrap_json_envelope, which may rewrite FILE's content
+# to just the inner .result string on success -- diagnostics must be read
+# from the RAW envelope while both fields are still on disk.
+#
+# Args: MODE (only "json" carries an envelope), FILE (path to raw output).
+# stdout: "NUM_TURNS<TAB>SUBTYPE" (both may be empty) on success; empty
+# output (not an error) when MODE isn't json, FILE is empty/unreadable, not
+# a --output-format json envelope at all, or no python3 is available --
+# fail-open, matching every other JSON-tool-dependent helper in this file:
+# an unknown/absent envelope should never be reported as evidence of
+# turn-exhaustion.
+_llm_turn_diagnostics() {
+  _ltd_mode="$1"
+  _ltd_file="$2"
+
+  [ "$_ltd_mode" = "json" ] || return 0
+  [ -s "$_ltd_file" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  python3 -c '
+import json, sys
+
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+
+if not (isinstance(d, dict) and d.get("type") == "result"):
+    sys.exit(0)
+
+num_turns = d.get("num_turns", "")
+subtype = d.get("subtype", "")
+sys.stdout.write(f"{num_turns}\t{subtype}")
+' "$_ltd_file" 2>/dev/null
+  return 0
 }
 
 # _llm_unwrap_json_envelope MODE FILE ROLE
@@ -1720,8 +1833,17 @@ walk_chain() {
   # invocation itself failed (nonzero exit, timeout, not-on-PATH) -- the
   # "infra" cause. ANY_UNWRAP_ATTEMPTED tracks whether at least one step's
   # invocation SUCCEEDED but its output failed unwrap (prose-only or
-  # ambiguous) -- the "unwrap" cause. If EVERY step fails and at least one
-  # was invocation-level, the overall cause is "infra" (that IS a
+  # ambiguous) -- the "unwrap" cause. ANY_TURNS_EXHAUSTED (class-4 foundry
+  # fix, mitigation (b)) tracks whether at least one step hit
+  # subtype=="error_max_turns" -- a THIRD, distinct cause, never conflated
+  # with "infra" (the model DID run, tokens WERE spent -- an auth/CLI-config
+  # remediation hint would misdirect exactly like it does for "unwrap") or
+  # with "unwrap" (the model did not fail to produce parseable JSON; it was
+  # cut off before it could finish producing a TRUSTWORTHY one, which is a
+  # sharper and more dangerous failure than either -- see the TURNS_EXHAUSTED
+  # branch below for why this is checked before the pass path, not folded
+  # into the two-cause classification here). If EVERY step fails and at
+  # least one was invocation-level, the overall cause is "infra" (that IS a
   # misconfigured/auth-broken chain, regardless of what any other step
   # did); "unwrap" is reported only when every failing step got that far --
   # i.e. the model ran successfully on every attempt and never returned
@@ -1730,6 +1852,7 @@ walk_chain() {
   # only when the invocation itself succeeded).
   ANY_INVOCATION_FAILED=0
   ANY_UNWRAP_FAILED=0
+  ANY_TURNS_EXHAUSTED=0
   while IFS= read -r STEP; do
     [ -z "$STEP" ] && continue
     ATTEMPT=$((ATTEMPT+1))
@@ -1749,15 +1872,34 @@ walk_chain() {
     # stale bytes that validate as the fallback step's "output."
     : > "$TMP_ERR"
     : > "$TMP_OUT"
-    # invoke_step's signature is CLI MODEL PROMPT_FILE INPUT_FILE
-    # OUTPUT_FILE ERR_FILE CALL_TIMEOUT [MODE] -- no role argument (BOBBIE,
-    # lr-33958f PR-C fold-in review, nit 3: the prior 9th positional was
-    # accepted-but-unread and has been removed from invoke_step entirely).
-    # $ROLE_L flows to _llm_unwrap_json_envelope below instead, the one
-    # place role is actually used in this loop.
+    # invoke_step's signature is unchanged: CLI MODEL PROMPT_FILE INPUT_FILE
+    # OUTPUT_FILE ERR_FILE CALL_TIMEOUT MODE -- no 9th positional
+    # (test_invoke_step_no_dead_role_positional.py locks that). Role reaches
+    # invoke_claude (for the reviewer's tool-restriction flags) via
+    # CLAGENTIC_LLM_CLIENT_TOOL_ROLE, exported here immediately before the
+    # call and unset immediately after so it cannot leak into an unrelated
+    # subprocess this same shell spawns later (e.g. a later gitleaks/
+    # semgrep call in a caller that sources this file, however unlikely).
+    # $ROLE_L ALSO still flows to _llm_unwrap_json_envelope below, unchanged
+    # from before -- that plumbing is untouched by this addition.
+    export CLAGENTIC_LLM_CLIENT_TOOL_ROLE="$ROLE_L"
     EXIT_CODE=0
     invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" "$MODE" \
       || EXIT_CODE=$?
+    unset CLAGENTIC_LLM_CLIENT_TOOL_ROLE
+    # TURN DIAGNOSTICS (class-4 foundry fix, mitigation (a)+(b)): read BEFORE
+    # unwrap, which may rewrite TMP_OUT to just the inner .result string on
+    # success -- num_turns/subtype only exist on the raw envelope. Logged
+    # into the audit row unconditionally (not just on failure) so a reviewer
+    # riding close to its ceiling on every PASSING run is visible too, not
+    # only once it finally tips over into TURNS_EXHAUSTED below.
+    TURN_NUM_TURNS=""
+    TURN_SUBTYPE=""
+    if [ "$EXIT_CODE" -eq 0 ]; then
+      _ltd_out=$(_llm_turn_diagnostics "$MODE" "$TMP_OUT")
+      TURN_NUM_TURNS=$(printf '%s' "$_ltd_out" | cut -f1)
+      TURN_SUBTYPE=$(printf '%s' "$_ltd_out" | cut -f2)
+    fi
     # SHARED UNWRAP (lr-33958f, PR-C): runs immediately after invoke_step
     # succeeds and BEFORE validate_output ever inspects TMP_OUT -- this is
     # the one place role is already in scope for every CLI uniformly. Only
@@ -1769,11 +1911,28 @@ walk_chain() {
     if [ "$EXIT_CODE" -eq 0 ]; then
       _llm_unwrap_json_envelope "$MODE" "$TMP_OUT" "$ROLE_L" || UNWRAP_CODE=$?
     fi
+    # TURNS_EXHAUSTED (class-4 foundry fix, mitigation (b), THE RISK FLAGGED
+    # HARDEST): subtype=="error_max_turns" means the model ran out of turns
+    # before finishing -- checked BEFORE validate_output/the pass branch
+    # below, because a truncated run can still leave parseable partial JSON
+    # on disk (e.g. findings:[] emitted before the model was cut off) that
+    # would otherwise sail through validate_output and the degraded check
+    # and ship as a clean pass. THIS is the exact failure signature the
+    # foundry named: "the gate turning green more often" with no alarm.
+    # Checked ahead of the EXIT_CODE==0 pass branch specifically so a
+    # turn-exhausted step can never reach it, regardless of what TMP_OUT
+    # contains.
+    if [ "$EXIT_CODE" -eq 0 ] && [ "$TURN_SUBTYPE" = "error_max_turns" ]; then
+      ANY_TURNS_EXHAUSTED=1
+      ERR_HINT="turn limit exhausted before completion (num_turns=$TURN_NUM_TURNS, role=$ROLE_L mode=$MODE) -- a truncated run, never a clean pass"
+      log_attempt "$ROLE_L" "$CLI" "$TIER" "step-failed" "$ERR_HINT"
+      continue
+    fi
     if [ "$EXIT_CODE" -eq 0 ] && [ "$UNWRAP_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
       if [ "$ATTEMPT" -eq 1 ]; then
-        log_attempt "$ROLE_L" "$CLI" "$TIER" "pass" ""
+        log_attempt "$ROLE_L" "$CLI" "$TIER" "pass" "num_turns=$TURN_NUM_TURNS"
       else
-        log_attempt "$ROLE_L" "$CLI" "$TIER" "fallback" ""
+        log_attempt "$ROLE_L" "$CLI" "$TIER" "fallback" "num_turns=$TURN_NUM_TURNS"
       fi
       cat "$TMP_OUT"
       RESULT=0
@@ -1875,7 +2034,20 @@ walk_chain() {
     # returned prose) still correctly reports "infra": a chain with a real
     # infra problem on ANY step is not narrowly a model-output-shape
     # problem.
-    if [ "$ANY_INVOCATION_FAILED" -eq 0 ] && [ "$ANY_UNWRAP_FAILED" -eq 1 ]; then
+    # TURNS-EXHAUSTED CHECKED FIRST (class-4 foundry fix): the most specific
+    # and most dangerous cause -- the model ran, spent tokens, and was cut
+    # off mid-work, which a coarser "infra" (misconfigured/auth) or "unwrap"
+    # (prose-only) label would misdirect the operator away from. A mixed
+    # chain where one step timed out (infra) and another exhausted its
+    # turns still reports "turns-exhausted": that is the more actionable,
+    # more alarming signal of the two, and folding it into "infra" would
+    # recreate exactly the invisible-truncation risk this fix exists to
+    # close.
+    if [ "$ANY_TURNS_EXHAUSTED" -eq 1 ]; then
+      DEGRADED_CAUSE="turns-exhausted"
+      DEGRADED_EXIT=5
+      DEGRADED_REASON="model exhausted its turn limit before completing for role $ROLE_L (num_turns=$TURN_NUM_TURNS) -- a truncated run, never a clean pass"
+    elif [ "$ANY_INVOCATION_FAILED" -eq 0 ] && [ "$ANY_UNWRAP_FAILED" -eq 1 ]; then
       DEGRADED_CAUSE="unwrap"
       DEGRADED_EXIT=4
       DEGRADED_REASON="model output could not be reduced to parseable role-shaped JSON for role $ROLE_L (auth/invocation succeeded on every attempt — see reviewer output shape, not CLI config)"
@@ -1911,6 +2083,15 @@ walk_chain() {
     # "not a real answer"); only the REMEDIATION HINT differs by cause, and
     # that is read from the envelope's own "cause" field / DEGRADED_REASON
     # text, not re-derived from the exit status a second time.
+    #
+    # STATUS 5 (class-4 foundry fix): a THIRD, distinct non-zero status for
+    # the "turns-exhausted" cause. Same mechanism as STATUS 4's addition --
+    # every gates.sh call site checking `-eq 3`/`-eq 4` is updated in this
+    # same change to also check `-eq 5` (_llm_output_is_degraded,
+    # _llm_degraded_cause, gates.sh). This is the status the foundry's
+    # "risk that matters most" section names directly: a truncated reviewer
+    # run must reach this path, never the pass branch above it, regardless
+    # of how well-formed its partial JSON looks.
     return "$DEGRADED_EXIT"
   fi
   rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
@@ -1922,10 +2103,10 @@ walk_chain() {
 # gates.sh treats it as a fail-closed condition rather than "0 findings =
 # clean review."
 #
-# CAUSE (lr-33958f, PR-C, required foundry classification): a THIRD,
-# optional positional arg names WHY the chain degraded, distinguishing two
-# outcomes that used to collapse into the identical INFRA_DEGRADED
-# envelope/exit-status shape:
+# CAUSE (lr-33958f, PR-C, required foundry classification; extended
+# class-4): a THIRD, optional positional arg names WHY the chain degraded,
+# distinguishing outcomes that used to collapse into the identical
+# INFRA_DEGRADED envelope/exit-status shape:
 #   "infra"  (default, unchanged behavior) — no chain configured, or every
 #            invocation itself failed (nonzero exit, timeout, CLI not on
 #            PATH). This is the misconfigured/auth-broken/network-out case
@@ -1944,6 +2125,21 @@ walk_chain() {
 #            can point its remediation hint at reviewer OUTPUT SHAPE
 #            instead. Fail-closed either way — an unparseable review still
 #            never passes the gate — but it now names itself correctly.
+#   "turns-exhausted" (class-4 foundry fix) — the model's agentic tool loop
+#            ran out of turns before completing (subtype=="error_max_turns"
+#            on the raw --output-format json envelope; see
+#            _llm_turn_diagnostics above). Distinct from BOTH "infra" (the
+#            model DID run; auth/CLI config is not the problem) and "unwrap"
+#            (the model did not fail to emit parseable JSON -- it may have
+#            emitted perfectly well-formed partial JSON, e.g. findings:[],
+#            before being cut off, which is what makes this cause more
+#            dangerous than either: a tool-loop truncation can look exactly
+#            like a clean pass to every downstream check that only inspects
+#            shape). This is the failure signature THE FOUNDRY FLAGGED
+#            HARDEST -- "the gate turning green more often" -- and the
+#            reason it is checked and reported BEFORE the pass branch in
+#            walk_chain, not folded into a post-hoc cause lookup on an
+#            envelope that already looked clean.
 #
 # UNFORGEABLE PREFIX (BOBBIE finding 1, lr-7047bf fold-in): line and markdown
 # mode previously relied on plain text ("[clagentic-lite degraded] " / "#
