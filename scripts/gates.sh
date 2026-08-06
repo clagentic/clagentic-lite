@@ -1976,15 +1976,20 @@ cmd_review() {
         # crash) behind the same silent success. The degraded FILE check
         # below still runs unconditionally as the second, mode-appropriate
         # channel (INV-1b requires both); a nonzero status that is NOT a
-        # degraded emission (chunk_status != 3, e.g. an actual crash) is
-        # still surfaced via the audit details string rather than swallowed.
+        # degraded emission (chunk_status not in {3,4}, e.g. an actual
+        # crash) is still surfaced via the audit details string rather than
+        # swallowed. STATUS 4 (lr-33958f, PR-C): walk_chain's second
+        # degraded exit status, the "unwrap" cause (model ran, output was
+        # unparseable) -- also a real degraded envelope with a trustworthy
+        # payload, not a crash, so it belongs on this same branch as 3.
         _crv_chunk_status=0
         _crv_chunk_err=$(mktemp -t clagentic-review-chunk-err.XXXXXX)
         "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_chunk" > "$_crv_env_file" 2>"$_crv_chunk_err" || _crv_chunk_status=$?
         _crv_chunk_outcome="pass"
-        if [ "$_crv_chunk_status" -ne 0 ] && [ "$_crv_chunk_status" -ne 3 ]; then
-          # A nonzero status that is NOT walk_chain's own degraded marker (3)
-          # means the call crashed before writing a usable envelope (or wrote
+        if [ "$_crv_chunk_status" -ne 0 ] && [ "$_crv_chunk_status" -ne 3 ] && [ "$_crv_chunk_status" -ne 4 ]; then
+          # A nonzero status that is NOT one of walk_chain's own degraded
+          # markers (3 = infra cause, 4 = unwrap cause) means the call
+          # crashed before writing a usable envelope (or wrote
           # partial/garbage content) -- $_crv_env_file cannot be trusted as
           # review JSON. Overwrite it with an explicit degraded envelope
           # BEFORE sanitize/merge ever see it, so merge_envelopes' own
@@ -2189,9 +2194,16 @@ cmd_review() {
   # is the mode-appropriate file-content check for the ordinary case. Either
   # alone would miss a case the other catches, so both gate this check.
   if [ "$_crv_review_status" -ne 0 ] || review_is_degraded "$OUT"; then
-    cmd_log_run review block "infra-degraded: all reviewer chain steps failed (status=$_crv_review_status)"
-    echo "[gates/review] INFRA_DEGRADED: reviewer chain returned degraded envelope — no real review occurred." 1>&2
-    echo "[gates/review] Check LLM CLI config/auth. Set CLAGENTIC_REVIEWER_REQUIRED=1 to make this a hard gate error." 1>&2
+    _crv_cause=$(_llm_degraded_cause "$_crv_review_status" "$OUT")
+    if [ "$_crv_cause" = "unwrap" ]; then
+      cmd_log_run review block "model-output-unparseable: reviewer ran but returned no parseable role-shaped JSON (status=$_crv_review_status)"
+      echo "[gates/review] MODEL_OUTPUT_UNPARSEABLE: reviewer ran successfully but its output could not be reduced to exactly one parseable review — no real review occurred." 1>&2
+    else
+      cmd_log_run review block "infra-degraded: all reviewer chain steps failed (status=$_crv_review_status)"
+      echo "[gates/review] INFRA_DEGRADED: reviewer chain returned degraded envelope — no real review occurred." 1>&2
+    fi
+    _llm_degraded_remediation_lines "$_crv_cause" 1>&2
+    echo "[gates/review] Set CLAGENTIC_REVIEWER_REQUIRED=1 to make this a hard gate error." 1>&2
     # Pull the per-step failure reasons from the audit DB so the user sees them
     # in the terminal without having to run `digest` or open last-review.json.
     ADB="$REPO_ROOT/.clagentic/lite/audit.db"
@@ -2385,6 +2397,70 @@ _llm_output_is_degraded() {
 # exist for every consumer, so the detector itself must not fail open.
 review_is_degraded() {
   _llm_output_is_degraded json "$1"
+}
+
+# _llm_degraded_cause STATUS FILE
+#
+# MODEL-RETURNED-PROSE CLASSIFICATION (lr-33958f, PR-C, the fix the foundry
+# insisted on hardest). Distinguishes walk_chain's two degraded causes so a
+# caller can point its remediation hint at the right place instead of
+# always saying "check LLM CLI config/auth":
+#   "infra"   — misconfigured/auth-broken/network-out chain. The name
+#               INFRA_DEGRADED actually describes. "check CLI config/auth"
+#               is correct remediation.
+#   "unwrap"  — the model ran successfully (auth worked, tokens were
+#               spent) but its output could not be reduced to exactly one
+#               role-shaped JSON candidate (prose-only, or ambiguous).
+#               NOT an infrastructure problem; sending the operator to
+#               check CLI config/auth here is the exact misdirection the
+#               foundry named as a plausible contributor to two real
+#               misdiagnoses. Remediation hint: reviewer OUTPUT SHAPE.
+#
+# STATUS is walk_chain's own captured exit code where available (4 = the
+# unwrap cause, unambiguous on its own) — checked FIRST because it needs no
+# JSON tool at all and is authoritative for the single-pass call site that
+# still has it in scope. FILE's own "cause" field (emit_degraded, llm-
+# client.sh) is the fallback for callers where the exit status was already
+# collapsed to a boolean before this point (e.g. after `merge_envelopes`),
+# or where STATUS is not available/passed as empty. Defaults to "infra"
+# when neither source resolves a value — the pre-existing behavior for
+# every degraded envelope this task predates, so an unlabeled legacy
+# envelope (no "cause" field, e.g. one written before this PR) is never
+# misclassified as the new, narrower "unwrap" cause it cannot actually be.
+_llm_degraded_cause() {
+  _ldc_status="${1:-}"
+  _ldc_file="$2"
+  if [ "$_ldc_status" = "4" ]; then
+    printf 'unwrap'
+    return 0
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    _ldc_cause=$(jq -r '.cause // "infra"' "$_ldc_file" 2>/dev/null || echo "infra")
+  elif command -v python3 >/dev/null 2>&1; then
+    _ldc_cause=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("cause") or "infra")' "$_ldc_file" 2>/dev/null || echo "infra")
+  else
+    _ldc_cause="infra"
+  fi
+  case "$_ldc_cause" in
+    unwrap) printf 'unwrap' ;;
+    *)      printf 'infra' ;;
+  esac
+}
+
+# _llm_degraded_remediation_lines CAUSE — prints the cause-specific
+# remediation hint line(s) for INFRA_DEGRADED/MODEL_OUTPUT_UNPARSEABLE
+# stderr output. Single source of the two message bodies so every call
+# site (review, adversarial, merge-gate) stays in sync rather than each
+# hand-rolling its own copy that could drift.
+_llm_degraded_remediation_lines() {
+  case "$1" in
+    unwrap)
+      printf '%s\n' "Check the reviewer/auditor OUTPUT SHAPE — the model ran (auth and network both worked) but did not return parseable role-shaped JSON. Not a CLI config/auth problem."
+      ;;
+    *)
+      printf '%s\n' "Check LLM CLI config/auth."
+      ;;
+  esac
 }
 
 # _parse_adversarial_findings MARKDOWN_FILE
@@ -2675,7 +2751,11 @@ cmd_adversarial() {
   _adv_status=0
   "$TOOL_HOME/scripts/llm-client.sh" adversarial < "$_adv_diff_tmp" > "$OUT" || _adv_status=$?
   _adv_degraded=0
-  if [ "$_adv_status" -eq 3 ] || _llm_output_is_degraded markdown "$OUT"; then
+  # STATUS 4 (lr-33958f, PR-C): walk_chain's second degraded exit status,
+  # the "unwrap" cause -- also checked here alongside 3 so an auditor that
+  # ran successfully but returned unparseable output is not missed by this
+  # detector (see llm-client.sh walk_chain's DEGRADED_EXIT comment).
+  if [ "$_adv_status" -eq 3 ] || [ "$_adv_status" -eq 4 ] || _llm_output_is_degraded markdown "$OUT"; then
     _adv_degraded=1
   fi
   # Prepend a SHA stamp comment as the first line so build_gate_summary can
@@ -2705,8 +2785,20 @@ cmd_adversarial() {
   # read-time design rationale. The unsanitized $OUT markdown file is
   # untouched (still the full raw record); only the structured sidecar that
   # round-trips into a later system prompt is sanitized.
+  # COUNT BOUND AT EMISSION (lr-33958f, PR-C, required foundry fix):
+  # _parse_adversarial_findings builds its array with no count bound of its
+  # own, and that array is embedded TWICE into the merge-gate system
+  # prompt (adversarial_findings and adversarial_findings_fenced,
+  # build_gate_summary below) -- the foundry ranked this the single most
+  # likely source of the next unreported filing, the sibling repo's
+  # seven-occurrence verdict-fence class restated as an emission-side cap
+  # rather than a parse-time presence check. Capped AFTER sanitize (order
+  # matches _invariant_feed_append's own sanitize-then-cap sequencing) so
+  # every retained finding is still clean, and truncation always keeps the
+  # first N (stable across identical runs) rather than an arbitrary subset.
   _adv_findings_json_raw=$(_parse_adversarial_findings "$OUT")
-  _adv_findings_json=$(_sanitize_adversarial_findings_json "$_adv_findings_json_raw")
+  _adv_findings_json_sanitized=$(_sanitize_adversarial_findings_json "$_adv_findings_json_raw")
+  _adv_findings_json=$(_llm_json_array_cap "$_adv_findings_json_sanitized" "${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}")
   printf '%s\n' "$_adv_findings_json" > "$FINDINGS_OUT"
 
   # Invariant-feed writer (lr-63359e), adversarial half. Reuses the same
@@ -2746,9 +2838,20 @@ cmd_adversarial() {
   # audit row, and it is the caller's explicit `|| true` that decides
   # whether a dead auditor still lets ship proceed.
   if [ "$_adv_degraded" -eq 1 ]; then
-    cmd_log_run adversarial degraded "auditor produced a degraded envelope (status=$_adv_status) — no real audit occurred"
-    echo "[gates/adversarial] INFRA_DEGRADED: auditor chain returned a degraded envelope — no real audit occurred." 1>&2
-    echo "[gates/adversarial] Check LLM CLI config/auth. full details: $OUT  |  scripts/gates.sh digest" 1>&2
+    # markdown mode carries no JSON "cause" field -- _adv_status itself is
+    # authoritative here (4 = unwrap cause is unambiguous on its own; see
+    # _llm_degraded_cause's own doc comment for why STATUS is checked
+    # first, before any file-content fallback).
+    _adv_cause=$(_llm_degraded_cause "$_adv_status" "$OUT")
+    if [ "$_adv_cause" = "unwrap" ]; then
+      cmd_log_run adversarial degraded "model-output-unparseable: auditor ran but returned no parseable output (status=$_adv_status)"
+      echo "[gates/adversarial] MODEL_OUTPUT_UNPARSEABLE: auditor ran successfully but its output could not be reduced to a parseable audit — no real audit occurred." 1>&2
+    else
+      cmd_log_run adversarial degraded "auditor produced a degraded envelope (status=$_adv_status) — no real audit occurred"
+      echo "[gates/adversarial] INFRA_DEGRADED: auditor chain returned a degraded envelope — no real audit occurred." 1>&2
+    fi
+    _llm_degraded_remediation_lines "$_adv_cause" 1>&2
+    echo "[gates/adversarial] full details: $OUT  |  scripts/gates.sh digest" 1>&2
     cat "$OUT"
     return 2
   fi
@@ -2981,10 +3084,19 @@ except Exception:
   # emission cannot be read as an ordinary parseable decision.
   _mg_status=0
   "$TOOL_HOME/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT" || _mg_status=$?
-  if [ "$_mg_status" -eq 3 ] || _llm_output_is_degraded json "$OUT"; then
-    cmd_log_run "$_mg_gate_name" block "infra-degraded: all merge-gate chain steps failed (status=$_mg_status)"
-    echo "[gates/merge-gate] INFRA_DEGRADED: merge-gate chain returned a degraded envelope — no real decision was made." 1>&2
-    echo "[gates/merge-gate] Check LLM CLI config/auth. full details: $OUT  |  scripts/gates.sh digest" 1>&2
+  # STATUS 4 (lr-33958f, PR-C): also checked, alongside 3, for the "unwrap"
+  # cause -- see llm-client.sh walk_chain's DEGRADED_EXIT comment.
+  if [ "$_mg_status" -eq 3 ] || [ "$_mg_status" -eq 4 ] || _llm_output_is_degraded json "$OUT"; then
+    _mg_cause=$(_llm_degraded_cause "$_mg_status" "$OUT")
+    if [ "$_mg_cause" = "unwrap" ]; then
+      cmd_log_run "$_mg_gate_name" block "model-output-unparseable: merge-gate ran but returned no parseable decision (status=$_mg_status)"
+      echo "[gates/merge-gate] MODEL_OUTPUT_UNPARSEABLE: merge-gate ran successfully but its output could not be reduced to a parseable decision — no real decision was made." 1>&2
+    else
+      cmd_log_run "$_mg_gate_name" block "infra-degraded: all merge-gate chain steps failed (status=$_mg_status)"
+      echo "[gates/merge-gate] INFRA_DEGRADED: merge-gate chain returned a degraded envelope — no real decision was made." 1>&2
+    fi
+    _llm_degraded_remediation_lines "$_mg_cause" 1>&2
+    echo "[gates/merge-gate] full details: $OUT  |  scripts/gates.sh digest" 1>&2
     if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
       return 1
     fi
