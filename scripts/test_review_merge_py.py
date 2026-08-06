@@ -136,7 +136,22 @@ class TestDedupFindingsPy(unittest.TestCase):
         # triggers when compute_key returns None.
         findings = [{"severity": "high", "file": "x.py", "line": 1, "category": "c", "message": "m"}]
         # Monkey-patch compute_key to return None for this test only.
-        import scripts.test_review_merge_py as me
+        #
+        # ORDER-DEPENDENCY FIX (lr-7047bf fold-in, same class as
+        # test_freshness_helper_sweep.py): a hardcoded `import scripts.
+        # test_review_merge_py as me` can resolve to a DIFFERENT module
+        # object than the one this TestCase and dedup_findings_py actually
+        # run in, under `unittest discover` (no scripts/__init__.py in this
+        # repo, so discovery imports this file as a bare top-level module
+        # while the dotted import creates a second, independent object). A
+        # patch applied to the wrong object's `compute_key` attribute is a
+        # silent no-op -- dedup_findings_py's internal call still resolves
+        # the REAL compute_key via its own module's globals, so this test
+        # would pass for the wrong reason (the real compute_key never
+        # raising) rather than proving the conservative-retain path.
+        # Resolving via sys.modules[self.__class__.__module__] always
+        # targets the module this test is actually executing in.
+        me = sys.modules[self.__class__.__module__]
         orig = me.compute_key
         me.compute_key = lambda f, s, d="": None
         try:
@@ -208,7 +223,10 @@ class TestDedupFindingsPy(unittest.TestCase):
         `f.get("line", "")` which yielded "" instead, causing key mismatch between
         jq and python paths and breaking cross-round dedup.
         """
-        import scripts.test_review_merge_py as me
+        # See test_conservative_retain_on_none_key's comment above for why
+        # this resolves the module dynamically rather than via a hardcoded
+        # dotted import (lr-7047bf fold-in, order-dependency fix).
+        me = sys.modules[self.__class__.__module__]
         key_null   = me.compute_key({"file": "f.py", "line": None,   "category": "c", "message": "m"}, "location")
         key_absent = me.compute_key({"file": "f.py",                  "category": "c", "message": "m"}, "location")
         key_zero   = me.compute_key({"file": "f.py", "line": 0,      "category": "c", "message": "m"}, "location")

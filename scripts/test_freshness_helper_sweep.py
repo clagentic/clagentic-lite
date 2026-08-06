@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -366,10 +367,30 @@ class TestIndirectionExemptionKeysOnCapturedVarNotAssignedVar(unittest.TestCase)
         # the fixture can use its own, self-contained variable names rather
         # than colliding with the real _BLEED_DEFAULT_BRANCH -- keeps this
         # test from silently depending on gates.sh's current variable names.
-        import scripts.test_freshness_helper_sweep as mod
-        self._mod = mod
-        self._orig_allowlist = mod._ALLOWED_LOG_STRING_VARS
-        mod._ALLOWED_LOG_STRING_VARS = {"_FIX_DEFAULT_BRANCH"}
+        #
+        # ORDER-DEPENDENCY FIX (lr-7047bf fold-in): `import scripts.test_
+        # freshness_helper_sweep as mod` used to hardcode the dotted path.
+        # Under `python3 -m unittest scripts.test_freshness_helper_sweep`
+        # that happens to be the same module object this TestCase runs in,
+        # so the patch reached _find_stored_origin_ref_indirection's globals
+        # and every test passed. Under `python3 -m unittest discover -s
+        # scripts -t scripts` (this repo has no scripts/__init__.py),
+        # unittest's discovery loader imports this file as a BARE top-level
+        # module (test_freshness_helper_sweep) while the hardcoded import
+        # statement -- resolved against a repo-root sys.path entry that a
+        # `-m` invocation also seeds -- created a SECOND, independent module
+        # object under the `scripts.`-qualified name. setUp patched that
+        # second object's allowlist; the sweep functions the test actually
+        # exercises are bound to the FIRST (bare) object's unpatched globals,
+        # so the patch silently never took effect and the test failed only
+        # under discover -- a real order/dispatch-mode dependency, not a
+        # flake. Resolving the module via the TestCase's own __module__
+        # (looked up in sys.modules) always identifies the module object
+        # this test is actually running in, regardless of which import path
+        # produced it, so there is only ever one identity to patch.
+        self._mod = sys.modules[self.__class__.__module__]
+        self._orig_allowlist = self._mod._ALLOWED_LOG_STRING_VARS
+        self._mod._ALLOWED_LOG_STRING_VARS = {"_FIX_DEFAULT_BRANCH"}
 
     def tearDown(self):
         self._mod._ALLOWED_LOG_STRING_VARS = self._orig_allowlist
