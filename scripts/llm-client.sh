@@ -440,6 +440,19 @@ Return STRICT JSON matching this schema, no prose before or after:
   ]
 }
 
+Output format is EXACTLY one of the following two shapes, never a mix and
+never more than one:
+  (a) the bare JSON object above with NOTHING else on stdout — no leading
+      sentence, no trailing remark, no markdown fence; or
+  (b) that same JSON object inside exactly ONE fenced code block
+      (```json ... ```), with no other fenced block anywhere in the
+      response and no prose outside the fence.
+Emitting prose before or after the JSON, or emitting more than one fenced
+block, makes your response unparseable and the review is discarded. If you
+are uncertain how to format the response, prefer shape (a): a single line
+of accidental preamble is the single most common cause of a discarded
+review.
+
 Pre-Report Gate — answer all five before writing a finding. Any "no" or
 "unsure" answer means: downgrade severity or drop it.
 1. Can you cite the exact line? Name the file and line. Vague findings
@@ -813,6 +826,14 @@ whether the change is safe to merge.
 
 Return STRICT JSON: {"decision":"approve|refuse","reason":"<one sentence>"}
 
+Output format is EXACTLY one of two shapes, never a mix and never more
+than one: (a) the bare JSON object above with nothing else on stdout, or
+(b) that same JSON object inside exactly ONE fenced code block
+(```json ... ```) with no other fenced block anywhere in the response and
+no prose outside the fence. Prose before/after the JSON, or more than one
+fenced block, makes your response unparseable and the decision is
+discarded. Prefer shape (a) if uncertain.
+
 Refuse on any blocking gate failure, on any review finding at or above
 the configured severity threshold, or on contradictions between gates
 (e.g. review says clean but sast errored).
@@ -1080,7 +1101,17 @@ llm_timeout_for() {
 # Set CLAGENTIC_CLAUDE_BARE=1 if you authenticate via API key and
 # prefer the tighter --bare invocation surface.
 invoke_claude() {
-  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"; CALL_MODE="${7:-}"; CALL_ROLE="${8:-}"
+  # 8th positional (role) DROPPED (lr-33958f, PR-C): it was accepted here
+  # and never referenced in this function body -- the unwrap logic that
+  # would have needed it lived inline, one layer below where role is
+  # actually meaningful (see the comment at the old unwrap site, below,
+  # for the full rationale). Role now flows directly from walk_chain into
+  # _llm_unwrap_json_envelope, which runs AFTER invoke_step returns -- this
+  # function has no remaining need for it. A caller may still pass an 8th
+  # arg (invoke_step does not, but a direct test call may); POSIX sh
+  # functions silently ignore extra positional args, so this is not a
+  # breaking signature change for any existing caller.
+  MODEL="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"; CALL_MODE="${7:-}"
   OUTPUT_FORMAT_FLAG=""
   [ "$CALL_MODE" = "json" ] && OUTPUT_FORMAT_FLAG="--output-format json"
   BARE_FLAG=""
@@ -1154,53 +1185,23 @@ invoke_claude() {
     sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUTPUT_FILE" > "${OUTPUT_FILE}.stripped" 2>/dev/null \
       && mv "${OUTPUT_FILE}.stripped" "$OUTPUT_FILE"
   fi
-  # Post-process OUTPUT_FILE for json mode:
-  # 1. Unwrap --output-format json envelope: extract .result if top-level "type"=="result".
-  # 2. Strip markdown code fences (```json...``` or ```...```) from the extracted content.
-  # Both steps are needed: --output-format json wraps the response; the model may still
-  # fence its JSON output even with --system-prompt. Fall through without error if
-  # python3 is unavailable or the file is not an envelope (already bare JSON).
-  #
-  # Invocation failure stays distinguishable from post-processing failure: this
-  # block only reshapes OUTPUT_FILE content and never touches EXIT_CODE, which
-  # was already captured above from the real `claude --print` invocation.
-  if [ "$CALL_MODE" = "json" ] && [ -s "$OUTPUT_FILE" ] && command -v python3 >/dev/null 2>&1; then
-    python3 - "$OUTPUT_FILE" <<'PY'
-import json, re, sys
-
-path = sys.argv[1]
-try:
-    raw = open(path).read()
-    d = json.loads(raw)
-except Exception:
-    sys.exit(0)  # not JSON or unreadable — leave as-is
-
-# Unwrap --output-format json envelope.
-inner = raw
-if isinstance(d, dict) and d.get("type") == "result" and "result" in d:
-    inner = d["result"]
-    if not isinstance(inner, str):
-        # result is already a dict/list — write it back as JSON and exit.
-        open(path, "w").write(json.dumps(inner))
-        sys.exit(0)
-else:
-    sys.exit(0)  # not an envelope — leave as-is
-
-# Strip markdown code fence if present.
-inner = inner.strip()
-fence_re = re.compile(r'^```[a-z]*\n?(.*?)\n?```$', re.DOTALL)
-m = fence_re.match(inner)
-if m:
-    inner = m.group(1).strip()
-
-# Write back only if the stripped content is valid JSON.
-try:
-    json.loads(inner)
-    open(path, "w").write(inner)
-except Exception:
-    pass  # not valid JSON after stripping — leave original envelope so validate_output rejects it
-PY
-  fi
+  # UNWRAP MOVED OUT (lr-33958f, PR-C): --output-format json envelope
+  # unwrap + fenced-JSON extraction used to live here, inline, as a
+  # claude-only post-processing block. Two structural defects followed
+  # directly from that placement:
+  #   - invoke_codex never got it (codex has no --output-format json
+  #     envelope, but its output can still be fenced prose the same way
+  #     claude's can — there was no shared place to fix that for both).
+  #   - CALL_ROLE (the 8th positional arg, above) was accepted but never
+  #     referenced anywhere in this function body, because the unwrap
+  #     logic that would have needed it to pick a role-shaped fence
+  #     candidate lived here, one layer below where role is actually
+  #     meaningful.
+  # The unwrap now lives in _llm_unwrap_json_envelope (below), called once
+  # from walk_chain — the one place role is already in scope for every CLI
+  # uniformly, not just claude's. See that function's doc comment for the
+  # exactly-one-fenced-block contract and the three-way failure
+  # classification (invocation-failed / unwrap-failed / schema-invalid).
   return $EXIT_CODE
 }
 
@@ -1287,18 +1288,218 @@ invoke_generic() {
 # Dispatch a single chain step.
 # Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE CALL_TIMEOUT [MODE] [ROLE]
 # Fails with exit 127 if the CLI binary is not on PATH.
+#
+# ROLE (9th positional) is accepted for BACKWARD-COMPATIBLE CALL SHAPE only
+# (lr-33958f, PR-C): existing callers/tests pass it, and POSIX sh silently
+# ignores a trailing positional arg no `$N`/`${N:-}` reads, so accepting-
+# and-not-binding it here is a no-op, not a latent bug. It is not bound to
+# a named variable and not forwarded to invoke_claude/invoke_codex/
+# invoke_generic, none of which need it any more -- role now flows
+# directly from walk_chain into _llm_unwrap_json_envelope, which runs
+# after invoke_step returns, not through this dispatcher.
 invoke_step() {
-  CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"; CALL_MODE="${8:-}"; CALL_ROLE="${9:-}"
+  CLI="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"; CALL_MODE="${8:-}"
   command -v "$CLI" >/dev/null 2>&1 || return 127
   case "$CLI" in
-    claude)  invoke_claude  "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" "$CALL_MODE" "$CALL_ROLE" ;;
+    claude)  invoke_claude  "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" "$CALL_MODE" ;;
     codex)   invoke_codex   "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
     *)       invoke_generic "$CLI" "$MODEL" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" "$CALL_TIMEOUT" ;;
   esac
 }
 
+# _llm_unwrap_json_envelope MODE FILE ROLE
+#
+# SHARED UNWRAP (lr-33958f, PR-C, INV-2 + INV-3). Called once from
+# walk_chain, immediately after invoke_step returns 0 and before
+# validate_output ever inspects FILE — the ONE place in the pipeline where
+# role is already in scope for every CLI uniformly, not just claude's. This
+# is the structural fix the class-level task requires: fence handling
+# becomes a property of the PIPELINE (walk_chain), not of one CLI's invoke
+# function, which is why invoke_codex never had it and why CALL_ROLE was a
+# dead parameter one layer down (see invoke_claude's own comment at its old
+# unwrap site).
+#
+# WHAT THIS REPLACES (the reported bug): the old inline unwrap in
+# invoke_claude used `fence_re.match(inner)` with a start-and-end-anchored
+# pattern requiring the fenced JSON to be the model's ENTIRE .result — one
+# sentence of preamble defeated it, and the bare `except: pass` on failure
+# left the full 8-key --output-format-json envelope on disk, which
+# validate_output's single-key-wrapper tolerance rejects (8 != 1). The
+# operator's reproduction (15:55 pass, 16:02 fail, same commit/diff/auth,
+# seven minutes apart) is exactly this: whether the model led with the
+# fence or with a sentence of prose.
+#
+# INV-2, applied:
+#   (i) LOCATE with re.search/finditer over the WHOLE .result string, never
+#       an anchored whole-string match — a fence anywhere in the response
+#       is found, not just a fence that IS the entire response.
+#   (ii) COUNT, don't merely check presence: every fenced block is
+#        extracted as a CANDIDATE, filtered to candidates that (a) parse as
+#        JSON AND (b) satisfy ROLE's expected shape (the same shape
+#        validate_output already enforces — reviewer/auditor need a
+#        top-level or single-key-wrapped .findings array; gate needs a
+#        top-level or single-key-wrapped .decision in
+#        approve|refuse). Zero survivors is a failure — never "pick the
+#        last one" or "pick the first one," both of which are presence-
+#        shaped fixes that guarantee AT LEAST one, not EXACTLY one. More
+#        than one survivor is its OWN reported outcome (ambiguous), never
+#        a silent pick — this is the sibling-repo lesson: five prior fixes
+#        there each guaranteed presence; the class only closed when
+#        restated as exactly-one and enforced at emission (see also
+#        ds_review_prompt/ds_adversarial_prompt's "return exactly one
+#        fenced block or none" instruction, the emission-side half of this
+#        same fix).
+#   (iii) SIGNAL FAILURE on the return channel, never silently leave FILE
+#         unchanged and exit 0. This function's exit status is exactly
+#         `walk_chain`'s new distinguishable set: 0 = unwrapped (or
+#         nothing to unwrap — see below), 10 = unwrap-failed (zero
+#         candidates), 11 = unwrap-failed (ambiguous, >1 candidate). FILE
+#         is NEVER MODIFIED on a non-zero return — the raw envelope (with
+#         its num_turns/duration_ms) is preserved on disk exactly as the
+#         foundry ruling required: writing back the inner prose on failure
+#         would destroy the fields that reveal the model burned N turns
+#         and emitted nothing. Failure travels on the return channel, the
+#         data channel is left alone.
+#
+# WHAT COUNTS AS "NOTHING TO UNWRAP" (still returns 0, FILE untouched):
+#   - MODE is not "json" — no envelope shape exists for line/markdown
+#     output, so there is nothing this function's contract applies to.
+#   - FILE is empty, unreadable, or not a --output-format json envelope
+#     (no top-level "type":"result") at all — this is bare CLI output
+#     (e.g. codex's -o file, or a claude invocation that never requested
+#     --output-format json) already in whatever shape validate_output
+#     expects; this function's job is specifically the envelope-plus-
+#     possible-fence shape, not general JSON validation.
+#   - The envelope's .result is already a dict/list (not a string) — some
+#     CLI shapes may hand back structured JSON directly rather than a
+#     fenced/prose string; write it back bare and succeed, matching the
+#     original inline behavior for this one sub-case.
+#
+# EXTRACTION DETAIL — fence info-string character class (lr-33958f
+# required fix): the prior regex's info-string class was `[a-z]*`,
+# lowercase-only, missing an uppercase "```JSON" info string and any
+# json5/jsonc variant. The candidate-fence regex here matches
+# `[A-Za-z0-9_-]*` after the opening backticks (covers `json`, `JSON`,
+# `Json`, `json5`, `jsonc`, or no info string at all) and does not require
+# the fence to span the entire string — re.finditer over the full text.
+#
+# ROLE SHAPE FILTER reuses the identical predicate validate_output already
+# applies (this function and validate_output must never diverge on what
+# "role-shaped JSON" means — that would just relocate the fence bug one
+# function over) rather than re-deriving a second, possibly-drifting
+# definition.
+_llm_unwrap_json_envelope() {
+  _luje_mode="$1"
+  _luje_file="$2"
+  _luje_role="${3:-}"
+
+  [ "$_luje_mode" = "json" ] || return 0
+  [ -s "$_luje_file" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  python3 - "$_luje_file" "$_luje_role" <<'PY'
+import json
+import re
+import sys
+
+path, role = sys.argv[1], sys.argv[2]
+
+try:
+    raw = open(path).read()
+    d = json.loads(raw)
+except Exception:
+    sys.exit(0)  # not JSON or unreadable -- not this function's shape, leave as-is
+
+if not (isinstance(d, dict) and d.get("type") == "result" and "result" in d):
+    sys.exit(0)  # not an --output-format json envelope -- nothing to unwrap
+
+inner = d["result"]
+if not isinstance(inner, str):
+    # .result is already structured JSON (dict/list) -- write it back bare.
+    open(path, "w").write(json.dumps(inner))
+    sys.exit(0)
 
 
+def _role_shaped(obj):
+    """Same predicate validate_output (this file) applies -- kept as a
+    single definition referenced conceptually by both, not copy-pasted
+    and left to drift. reviewer/auditor: top-level .findings array, or a
+    single-key wrapper whose sole value has .findings as an array. gate:
+    top-level .decision in approve|refuse, or the same single-key-wrapper
+    tolerance. Any other role: any JSON value at all is acceptable shape
+    (this function only exists to pick among candidates; validate_output
+    remains the authority for roles with no closed schema)."""
+    if role in ("reviewer", "auditor"):
+        if isinstance(obj, dict) and isinstance(obj.get("findings"), list):
+            return True
+        if isinstance(obj, dict) and len(obj) == 1:
+            inner_obj = next(iter(obj.values()))
+            if isinstance(inner_obj, dict) and isinstance(inner_obj.get("findings"), list):
+                return True
+        return False
+    if role == "gate":
+        if isinstance(obj, dict) and str(obj.get("decision", "")).lower() in ("approve", "refuse"):
+            return True
+        if isinstance(obj, dict) and len(obj) == 1:
+            inner_obj = next(iter(obj.values()))
+            if isinstance(inner_obj, dict) and str(inner_obj.get("decision", "")).lower() in ("approve", "refuse"):
+                return True
+        return False
+    return True
+
+
+# LOCATE via finditer over the whole string -- never an anchored whole-
+# string match. Info-string class covers upper/lowercase and json5/jsonc
+# variants; the fence need not span the entire .result text.
+fence_re = re.compile(r'```[A-Za-z0-9_-]*\s*\n?(.*?)\n?```', re.DOTALL)
+candidates = []
+for m in fence_re.finditer(inner):
+    body = m.group(1).strip()
+    if not body:
+        continue
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        continue
+    if _role_shaped(parsed):
+        candidates.append(parsed)
+
+if not candidates:
+    # No fenced block matched -- try the WHOLE trimmed .result as a bare,
+    # unfenced JSON candidate (the "fence-only" shape the model may emit
+    # with no code-fence markers at all, just raw JSON text). This is
+    # still COUNTING, not presence-guessing: it is exactly one more
+    # candidate source, filtered by the same parse-and-shape predicate,
+    # folded into the same zero/one/many decision below rather than a
+    # separate silent acceptance path.
+    stripped = inner.strip()
+    if stripped:
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            parsed = None
+        if parsed is not None and _role_shaped(parsed):
+            candidates.append(parsed)
+
+if len(candidates) == 1:
+    open(path, "w").write(json.dumps(candidates[0]))
+    sys.exit(0)
+
+if len(candidates) == 0:
+    # UNWRAP-FAILED, zero candidates. FILE IS LEFT UNTOUCHED -- the raw
+    # envelope (with num_turns/duration_ms) stays on disk for diagnostics.
+    # This is the foundry-rejected-alternative boundary: writing back
+    # `inner` (the raw prose) here was explicitly rejected -- it would
+    # destroy exactly the fields that reveal the model burned N turns and
+    # emitted nothing. Failure travels on the return channel only.
+    sys.exit(10)
+
+# len(candidates) > 1: AMBIGUOUS, its own reported outcome -- never a
+# silent pick of first-or-last. FILE IS LEFT UNTOUCHED for the same reason.
+sys.exit(11)
+PY
+  return $?
+}
 
 # Validate output by mode + role. Args: MODE FILE [ROLE]
 # Returns 0 if the file matches the EXPECTED SCHEMA for that mode+role —
@@ -1470,6 +1671,20 @@ walk_chain() {
 
   ATTEMPT=0
   RESULT=1
+  # ANY_INVOCATION_FAILED tracks whether at least one step's underlying CLI
+  # invocation itself failed (nonzero exit, timeout, not-on-PATH) -- the
+  # "infra" cause. ANY_UNWRAP_ATTEMPTED tracks whether at least one step's
+  # invocation SUCCEEDED but its output failed unwrap (prose-only or
+  # ambiguous) -- the "unwrap" cause. If EVERY step fails and at least one
+  # was invocation-level, the overall cause is "infra" (that IS a
+  # misconfigured/auth-broken chain, regardless of what any other step
+  # did); "unwrap" is reported only when every failing step got that far --
+  # i.e. the model ran successfully on every attempt and never returned
+  # parseable role-shaped JSON. This mirrors the existing per-step
+  # ERR_HINT's own priority (timeout/not-on-PATH first, schema mismatch
+  # only when the invocation itself succeeded).
+  ANY_INVOCATION_FAILED=0
+  ANY_UNWRAP_FAILED=0
   while IFS= read -r STEP; do
     [ -z "$STEP" ] && continue
     ATTEMPT=$((ATTEMPT+1))
@@ -1492,7 +1707,18 @@ walk_chain() {
     EXIT_CODE=0
     invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" "$MODE" "$ROLE_L" \
       || EXIT_CODE=$?
-    if [ "$EXIT_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
+    # SHARED UNWRAP (lr-33958f, PR-C): runs immediately after invoke_step
+    # succeeds and BEFORE validate_output ever inspects TMP_OUT -- this is
+    # the one place role is already in scope for every CLI uniformly. Only
+    # attempted when the invocation itself succeeded; an invocation failure
+    # (EXIT_CODE != 0) has nothing to unwrap. UNWRAP_CODE stays 0
+    # (untouched) when invocation failed, so the classification below only
+    # ever attributes an unwrap failure to a step whose model actually ran.
+    UNWRAP_CODE=0
+    if [ "$EXIT_CODE" -eq 0 ]; then
+      _llm_unwrap_json_envelope "$MODE" "$TMP_OUT" "$ROLE_L" || UNWRAP_CODE=$?
+    fi
+    if [ "$EXIT_CODE" -eq 0 ] && [ "$UNWRAP_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
       if [ "$ATTEMPT" -eq 1 ]; then
         log_attempt "$ROLE_L" "$CLI" "$TIER" "pass" ""
       else
@@ -1508,21 +1734,51 @@ walk_chain() {
     # This is what surfaces "model not available on this account" / "auth
     # expired" / "timeout" rather than a blank or a spinner artifact.
     if [ "$EXIT_CODE" -eq 124 ]; then
+      ANY_INVOCATION_FAILED=1
       ERR_HINT="timeout after ${CALL_TIMEOUT}s (input=${CALL_BYTES} bytes)"
     elif [ "$EXIT_CODE" -eq 127 ]; then
+      ANY_INVOCATION_FAILED=1
       ERR_HINT="cli not on PATH"
+    elif [ "$EXIT_CODE" -eq 0 ] && [ "$UNWRAP_CODE" -eq 10 ]; then
+      # UNWRAP-FAILED, zero candidates: the model ran successfully (auth
+      # worked, tokens were spent) but returned no fenced or bare JSON
+      # matching this role's shape -- prose-only, the residual case that
+      # narrowing the fence regex alone does NOT fix (foundry ruling 3).
+      # NOT an invocation failure -- ANY_INVOCATION_FAILED is deliberately
+      # left unset on this branch so the overall cause classification below
+      # can distinguish "the model never even ran" from "the model ran and
+      # said nothing parseable."
+      ANY_UNWRAP_FAILED=1
+      ERR_HINT="model returned no parseable role-shaped JSON (unwrap-failed: zero candidates; role=$ROLE_L mode=$MODE)"
+    elif [ "$EXIT_CODE" -eq 0 ] && [ "$UNWRAP_CODE" -eq 11 ]; then
+      # UNWRAP-FAILED, ambiguous: MORE THAN ONE fenced/bare candidate parsed
+      # as role-shaped JSON. Per foundry ruling 2, this is never silently
+      # resolved by picking one -- it is its own reported outcome.
+      ANY_UNWRAP_FAILED=1
+      ERR_HINT="model returned more than one candidate JSON block matching role shape -- ambiguous, not silently picked (role=$ROLE_L mode=$MODE)"
     elif [ -s "$TMP_ERR" ]; then
       # Strip ANSI CSI sequences (ESC [ ... m) then take the first non-empty line.
       # sed -E is not POSIX but is available on every target (GNU + BSD sed both
       # support it). POSIX fallback: if sed -E fails, fall back to head -1.
+      ANY_INVOCATION_FAILED=1
       ERR_HINT=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$TMP_ERR" 2>/dev/null \
         | grep -v '^[[:space:]]*$' | head -1 | cut -c1-200) || \
         ERR_HINT=$(head -1 "$TMP_ERR" | cut -c1-200)
       [ -z "$ERR_HINT" ] && ERR_HINT="non-empty stderr (exit=$EXIT_CODE)"
     elif [ -s "$TMP_OUT" ]; then
-      # Output was non-empty but failed validate_output schema check.
-      # Emit a precise hint: include what shape was expected so the audit
-      # row is actionable without having to re-run the gate manually.
+      # SCHEMA-INVALID (the third of the minimum three failure classes,
+      # lr-33958f): unwrap SUCCEEDED (UNWRAP_CODE=0, or the mode has no
+      # unwrap contract) but the resulting JSON still failed
+      # validate_output's per-role shape check -- e.g. valid JSON like
+      # {"error":"auth expired"} that is not a findings/decision envelope
+      # at all. Distinct from unwrap-failed (no parseable JSON existed) and
+      # from invocation-failed (the CLI itself errored). Grouped with the
+      # "infra" cause for the OVERALL chain classification below (a
+      # schema-invalid step still means the caller cannot trust the model
+      # output any more than an invocation failure can), but logged with
+      # its own precise ERR_HINT so the audit row does not conflate it with
+      # a prose-only unwrap failure.
+      ANY_INVOCATION_FAILED=1
       case "$ROLE_L" in
         reviewer|auditor)
           ERR_HINT="output schema mismatch: expected JSON with top-level .findings array (role=$ROLE_L mode=$MODE)"
@@ -1535,6 +1791,7 @@ walk_chain() {
           ;;
       esac
     else
+      ANY_INVOCATION_FAILED=1
       ERR_HINT="empty output (exit=$EXIT_CODE)"
     fi
     log_attempt "$ROLE_L" "$CLI" "$TIER" "step-failed" "$ERR_HINT"
@@ -1554,8 +1811,30 @@ walk_chain() {
       rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
       return 1
     fi
-    emit_degraded "$MODE" "all chain steps failed for role $ROLE_L"
-    log_attempt "$ROLE_L" "" "" "degraded" ""
+    # CAUSE CLASSIFICATION (lr-33958f, PR-C, required foundry ruling 3):
+    # "infra" whenever at least one step's own INVOCATION failed (nonzero
+    # exit, timeout, not-on-PATH, or a schema-invalid output after a
+    # successful unwrap) -- that is the misconfigured/auth-broken/
+    # network-out case INFRA_DEGRADED's name actually describes. "unwrap"
+    # ONLY when every failing step got PAST invocation (the model ran,
+    # tokens were spent) and failed purely on unwrap (prose-only or
+    # ambiguous candidates) -- ANY_INVOCATION_FAILED=0 is only possible
+    # when no step in the whole loop ever hit an invocation-level or
+    # schema-level failure, so a mixed chain (one step timed out, another
+    # returned prose) still correctly reports "infra": a chain with a real
+    # infra problem on ANY step is not narrowly a model-output-shape
+    # problem.
+    if [ "$ANY_INVOCATION_FAILED" -eq 0 ] && [ "$ANY_UNWRAP_FAILED" -eq 1 ]; then
+      DEGRADED_CAUSE="unwrap"
+      DEGRADED_EXIT=4
+      DEGRADED_REASON="model output could not be reduced to parseable role-shaped JSON for role $ROLE_L (auth/invocation succeeded on every attempt — see reviewer output shape, not CLI config)"
+    else
+      DEGRADED_CAUSE="infra"
+      DEGRADED_EXIT=3
+      DEGRADED_REASON="all chain steps failed for role $ROLE_L"
+    fi
+    emit_degraded "$MODE" "$DEGRADED_REASON" "$DEGRADED_CAUSE"
+    log_attempt "$ROLE_L" "" "" "degraded" "cause=$DEGRADED_CAUSE"
     rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
     # POLARITY FLIP (lr-7047bf, INV-1): walk_chain used to return 0 on this
     # path -- every chain step failed, emit_degraded wrote a degraded
@@ -1568,7 +1847,20 @@ walk_chain() {
     # told it directly. A consumer that wants the old permissive behavior
     # (proceed on a degraded envelope) must now write `|| true` explicitly --
     # an invisible default becomes a reviewable line of diff.
-    return 3
+    #
+    # STATUS 4 (lr-33958f, PR-C): a SECOND, distinct non-zero status for the
+    # "unwrap" cause specifically -- the model-returned-prose classification
+    # the foundry insisted on hardest. A caller that only checks `-eq 3`
+    # (the pre-existing convention throughout gates.sh) would otherwise
+    # treat this new cause exactly like the "infra" cause it exists to be
+    # distinguished from. Every gates.sh call site checking `-eq 3` is
+    # updated in this same change to also check `-eq 4` (see
+    # _llm_output_is_degraded, gates.sh) -- the DEGRADED_MARKER/"degraded":
+    # true detection itself is cause-agnostic (both are still, correctly,
+    # "not a real answer"); only the REMEDIATION HINT differs by cause, and
+    # that is read from the envelope's own "cause" field / DEGRADED_REASON
+    # text, not re-derived from the exit status a second time.
+    return "$DEGRADED_EXIT"
   fi
   rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
   return 0
@@ -1578,6 +1870,29 @@ walk_chain() {
 # The "degraded": true field is the load-bearing marker for json mode:
 # gates.sh treats it as a fail-closed condition rather than "0 findings =
 # clean review."
+#
+# CAUSE (lr-33958f, PR-C, required foundry classification): a THIRD,
+# optional positional arg names WHY the chain degraded, distinguishing two
+# outcomes that used to collapse into the identical INFRA_DEGRADED
+# envelope/exit-status shape:
+#   "infra"  (default, unchanged behavior) — no chain configured, or every
+#            invocation itself failed (nonzero exit, timeout, CLI not on
+#            PATH). This is the misconfigured/auth-broken/network-out case
+#            INFRA_DEGRADED's own name describes; "check LLM CLI config and
+#            auth" is the correct remediation.
+#   "unwrap" — at least one step's model INVOCATION SUCCEEDED (auth worked,
+#            tokens were spent, exit 0) but its output could not be reduced
+#            to exactly one role-shaped JSON candidate (_llm_unwrap_json_
+#            envelope, above) -- zero candidates (prose-only) or more than
+#            one (ambiguous), and every configured chain step ended this
+#            way. This is NOT infrastructure failure: sending the operator
+#            to check CLI config/auth for a problem in neither is exactly
+#            the misdirection the foundry named as a plausible contributor
+#            to two real misdiagnoses. The json envelope's "cause" field
+#            and the line/markdown reason text both carry this so a caller
+#            can point its remediation hint at reviewer OUTPUT SHAPE
+#            instead. Fail-closed either way — an unparseable review still
+#            never passes the gate — but it now names itself correctly.
 #
 # UNFORGEABLE PREFIX (BOBBIE finding 1, lr-7047bf fold-in): line and markdown
 # mode previously relied on plain text ("[clagentic-lite degraded] " / "#
@@ -1596,12 +1911,13 @@ walk_chain() {
 # guess" — the fix Finding 1 asked for.
 DEGRADED_MARKER=$(printf '\001')
 emit_degraded() {
-  MODE="$1"; REASON="$2"
+  MODE="$1"; REASON="$2"; CAUSE="${3:-infra}"
   case "$MODE" in
     json)
       cat <<EOF
 {
   "degraded": true,
+  "cause": "$CAUSE",
   "summary": "[clagentic-lite degraded] $REASON",
   "checked": [],
   "findings": []
@@ -1609,13 +1925,14 @@ emit_degraded() {
 EOF
       ;;
     line)
-      printf '%s[clagentic-lite degraded] %s\n' "$DEGRADED_MARKER" "$REASON"
+      printf '%s[clagentic-lite degraded] (%s) %s\n' "$DEGRADED_MARKER" "$CAUSE" "$REASON"
       ;;
     markdown|*)
       printf '%s# Degraded output\n\n' "$DEGRADED_MARKER"
       cat <<EOF
 
 clagentic-lite role-call wrapper could not produce a real response: $REASON.
+(cause: $CAUSE)
 
 This is non-fatal; the calling gate continues. Configure
 CLAGENTIC_*_CMD / _CHAIN in .env and ensure the CLIs are on PATH.
