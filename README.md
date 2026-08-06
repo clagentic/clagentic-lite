@@ -332,7 +332,7 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
 │       ├── agents/{builder,reviewer,auditor,merge-gate,troubleshooter}.md  role contracts
 │       └── skills/{infosec-rt,eng-consult}/SKILL.md  commentary skills
 ├── .codex/
-│   ├── config.toml                             Codex sandbox + role config
+│   ├── config.toml                             Codex sandbox + role config (operator-facing docs; not auto-loaded — see AGENTS.md)
 │   └── AGENTS.md → ../AGENTS.md               symlink so Codex reads the same rules
 ├── scripts/
 │   ├── platform.sh                             GNU/BSD shims + ds_check_tool/ds_offer_install
