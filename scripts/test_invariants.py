@@ -15,6 +15,17 @@ semgrep x2, git push, gh pr view, gh pr create) now runs through the
 run_bounded wrapper, and $DS_TIMEOUT_CMD (scripts/platform.sh) can never
 resolve to a silent-unbounded no-op.
 
+ALSO COVERS INV-5 (lr-37282a/lr-8a28e0): every reviewer-capable `invoke_*`
+carrier in scripts/llm-client.sh either consults ds_llm_role_is_bash_
+unrestricted (platform.sh) to decide its own tool-restriction flags, or is
+a KNOWN-exempt carrier (invoke_generic, which restricts nothing for any
+CLI) that walk_chain's own per-call warning covers instead. Discovery is by
+`git ls-files`-driven regex over the tracked llm-client.sh content, not a
+hardcoded function-name list -- a third `invoke_*` carrier added later
+(e.g. for a fourth CLI) trips this sweep the day it is written, the same
+"per-CLI fix without the sweep is the instance-fixing pattern" property
+INV-1b/INV-4 already establish for their own classes.
+
 Run with: python3 -m unittest scripts.test_invariants -v
 """
 import os
@@ -25,6 +36,7 @@ import unittest
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
 PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
+LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
 
 # ---------------------------------------------------------------------- #
 # INV-4: every external-process invocation carries an explicit wall-clock
@@ -529,6 +541,175 @@ class TestDsPositiveIntOrDefaultRejectsZero(unittest.TestCase):
         out, rc = self._run("-5", "120")
         self.assertEqual(rc, 0)
         self.assertEqual(out, "120", f"stdout={out!r}")
+
+
+# ---------------------------------------------------------------------- #
+# INV-5: every reviewer-capable invoke_* carrier consults the SAME
+# Bash-restriction predicate; no carrier silently omits the check.
+# ---------------------------------------------------------------------- #
+
+# Discovers `invoke_<name>() {` function definitions at statement start in
+# the tracked llm-client.sh source -- not a hardcoded list of "invoke_claude,
+# invoke_codex", so a fourth carrier (e.g. invoke_gemini) is picked up the
+# day someone adds it, per the class-level bar this task sets.
+_INVOKE_FUNC_DEF_RE = re.compile(r'^invoke_(\w+)\(\)\s*\{')
+
+# A carrier is considered to "apply the restriction mechanism" if its own
+# function body (from its def line to the matching top-level closing brace)
+# calls ds_llm_role_is_bash_unrestricted -- the single source of truth both
+# invoke_claude and invoke_codex consult (platform.sh). Two KNOWN
+# exemptions, each asserted explicitly below rather than silently excluded
+# from the sweep:
+#   generic -- invoke_generic (the invoke_<CLI> naming pattern) has no
+#     CLI-specific flag surface to restrict at all: a bare `<cli> -p -`
+#     pipe for an arbitrary third-party binary. Covered instead by
+#     walk_chain's own per-call warning when a reviewer chain step
+#     resolves to a CLI outside claude/codex.
+#   step -- invoke_step (scripts/llm-client.sh) matches the same
+#     `invoke_(\w+)()` discovery regex but is NOT a per-CLI carrier at
+#     all -- it is the DISPATCHER that routes to invoke_claude/
+#     invoke_codex/invoke_generic by CLI name (see its own case statement).
+#     It has no role/tool-restriction decision of its own to make; its
+#     callees are what this sweep actually verifies, one function down.
+_KNOWN_UNRESTRICTABLE_CARRIERS = {"generic", "step"}
+
+
+def _iter_llm_client_sh_lines_raw():
+    with open(LLM_CLIENT_SH, encoding="utf-8") as f:
+        return f.readlines()
+
+
+def _discover_invoke_carriers(lines):
+    """Returns {carrier_name: function_body_text} for every invoke_* def
+    found via git-ls-files-tracked source, brace-counted to its own closing
+    line (mirrors test_invariants.py's own ds_timeout_missing brace-count
+    technique above, reused rather than reimplemented)."""
+    carriers = {}
+    i = 0
+    while i < len(lines):
+        m = _INVOKE_FUNC_DEF_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        start = i
+        depth = 0
+        end = None
+        for j in range(start, len(lines)):
+            depth += lines[j].count('{') - lines[j].count('}')
+            if depth == 0 and j > start:
+                end = j
+                break
+        if end is None:
+            i += 1
+            continue
+        carriers[name] = "".join(lines[start:end + 1])
+        i = end + 1
+    return carriers
+
+
+class TestEveryInvokeCarrierConsultsTheSharedBashRestrictionPredicate(unittest.TestCase):
+    """INV-5: every invoke_* carrier in scripts/llm-client.sh must either
+    call ds_llm_role_is_bash_unrestricted (the single source of truth,
+    platform.sh) to decide its own tool-restriction flags, or be in the
+    explicitly-enumerated KNOWN-unrestrictable set (currently just
+    invoke_generic) -- a fourth carrier added later that omits BOTH is a
+    silent regression to the exact "per-CLI fix without the sweep" pattern
+    this task's class-level bar forbids."""
+
+    def setUp(self):
+        self.lines = _iter_llm_client_sh_lines_raw()
+        self.carriers = _discover_invoke_carriers(self.lines)
+
+    def test_sweep_discovers_at_least_the_known_carriers(self):
+        """Sanity check on discovery itself: if this ever finds fewer than
+        the three known carriers, the regex is broken (e.g. invoke_claude
+        was renamed) and the assertion below would vacuously pass with
+        incomplete coverage."""
+        self.assertGreaterEqual(
+            len(self.carriers), 3,
+            f"expected at least invoke_claude, invoke_codex, invoke_generic; "
+            f"found carriers={sorted(self.carriers)!r}",
+        )
+        for expected in ("claude", "codex", "generic"):
+            self.assertIn(
+                expected, self.carriers,
+                f"expected an invoke_{expected} carrier; found "
+                f"carriers={sorted(self.carriers)!r}",
+            )
+
+    def test_every_carrier_either_restricts_or_is_a_known_exemption(self):
+        violations = []
+        for name, body in self.carriers.items():
+            if name in _KNOWN_UNRESTRICTABLE_CARRIERS:
+                continue
+            if "ds_llm_role_is_bash_unrestricted" not in body:
+                violations.append(name)
+        self.assertEqual(
+            violations, [],
+            f"invoke_{{{','.join(violations)}}} defines a reviewer-capable "
+            f"carrier that never consults ds_llm_role_is_bash_unrestricted "
+            f"(platform.sh) -- this carrier can silently ship a Bash-"
+            f"unrestricted reviewer/auditor call with no restriction "
+            f"mechanism and no known-exemption entry. Either wire the "
+            f"predicate in (mirroring invoke_claude/invoke_codex) or add "
+            f"the carrier name to _KNOWN_UNRESTRICTABLE_CARRIERS above "
+            f"with a comment explaining why it is genuinely exempt.",
+        )
+
+    def test_known_unrestrictable_carriers_are_actually_unrestrictable(self):
+        """The flip side of the assertion above: a carrier listed as a
+        KNOWN exemption must not have quietly grown a restriction call
+        without this test's own allowlist being updated to match -- proves
+        the exemption list is current, not stale."""
+        for name in _KNOWN_UNRESTRICTABLE_CARRIERS:
+            if name not in self.carriers:
+                continue
+            self.assertNotIn(
+                "ds_llm_role_is_bash_unrestricted", self.carriers[name],
+                f"invoke_{name} is listed as a KNOWN-unrestrictable "
+                f"exemption but its body now calls "
+                f"ds_llm_role_is_bash_unrestricted -- update "
+                f"_KNOWN_UNRESTRICTABLE_CARRIERS (remove {name!r}) so this "
+                f"sweep's positive-control assertion above actually covers "
+                f"it going forward.",
+            )
+
+
+class TestSweepCatchesASiblingCarrierMissingTheRestrictionCall(unittest.TestCase):
+    """Proves the sweep actually catches what it claims to, using a
+    synthetic sibling invoke_* function written in the exact
+    forgot-the-predicate shape a future third-CLI carrier could ship."""
+
+    _MISSING_PREDICATE_FIXTURE = (
+        'invoke_gemini() {\n'
+        '  MODEL="$1"; PROMPT_FILE="$2"\n'
+        '  gemini exec "$MODEL" < "$PROMPT_FILE"\n'
+        '}\n'
+    )
+
+    _WIRED_PREDICATE_FIXTURE = (
+        'invoke_gemini() {\n'
+        '  MODEL="$1"; PROMPT_FILE="$2"; TOOL_ROLE="${3:-}"\n'
+        '  FLAGS=""\n'
+        '  if ! ds_llm_role_is_bash_unrestricted "$TOOL_ROLE"; then\n'
+        '    FLAGS="--no-shell"\n'
+        '  fi\n'
+        '  gemini exec $FLAGS "$MODEL" < "$PROMPT_FILE"\n'
+        '}\n'
+    )
+
+    def test_flags_a_carrier_missing_the_predicate_call(self):
+        lines = self._MISSING_PREDICATE_FIXTURE.splitlines(keepends=True)
+        carriers = _discover_invoke_carriers(lines)
+        self.assertIn("gemini", carriers, f"carriers={carriers!r}")
+        self.assertNotIn("ds_llm_role_is_bash_unrestricted", carriers["gemini"])
+
+    def test_does_not_flag_a_carrier_with_the_predicate_wired_in(self):
+        lines = self._WIRED_PREDICATE_FIXTURE.splitlines(keepends=True)
+        carriers = _discover_invoke_carriers(lines)
+        self.assertIn("gemini", carriers, f"carriers={carriers!r}")
+        self.assertIn("ds_llm_role_is_bash_unrestricted", carriers["gemini"])
 
 
 if __name__ == "__main__":

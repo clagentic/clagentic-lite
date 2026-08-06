@@ -1,9 +1,11 @@
 """
-Regression coverage for the class-4 foundry fix, INV-2 tool restriction:
-invoke_claude (scripts/llm-client.sh) must pass --allowedTools Read,Grep,Glob
---disallowedTools Bash on the `claude --print` invocation for "reviewer" AND
-for any role it does not explicitly recognize as a legitimate Bash user, and
-must NOT pass either flag for the enumerated opt-out roles.
+Regression coverage for the class-4 foundry fix, INV-2/INV-5 tool
+restriction: invoke_claude (scripts/llm-client.sh) must pass --allowedTools
+Read,Grep,Glob --disallowedTools Bash on the `claude --print` invocation for
+"reviewer" AND for any role it does not explicitly recognize as a legitimate
+Bash user, and must NOT pass either flag for the enumerated opt-out roles.
+invoke_codex must carry the equivalent restriction (--disable shell_tool -s
+read-only) on its own version-gated flag-surface path (lr-37282a).
 
 FOUNDRY RULING THIS ENFORCES:
   - The reviewer (and anything defaulting to the reviewer's restricted set)
@@ -17,10 +19,29 @@ FOUNDRY RULING THIS ENFORCES:
     anything, and a --print reviewer holding unrestricted Bash while
     reading an attacker-influenceable diff is a live prompt-injection-to-
     execution path.
-  - auditor/gate/builder/summarizer are the ENUMERATED OPT-OUT roles --
-    stripping Bash from the auditor (which reads security-tool output) or
-    the merge-gate would be exactly the over-broad simplification the
-    foundry rejected.
+  - gate/builder/summarizer are the ENUMERATED OPT-OUT roles -- stripping
+    Bash from the merge-gate or the builder would be exactly the over-broad
+    simplification the foundry rejected.
+
+AUDITOR MOVED OFF THE OPT-OUT LIST (lr-8a28e0 adjudication, CORRECTING the
+original class-4 fix's assumption, not merely extending it): the ORIGINAL
+"auditor reads security-tool output" rationale for exempting auditor
+describes plugins/clagentic-lite/agents/auditor.md, the interactive Claude
+Code subagent a human/session invokes directly to run
+gitleaks/semgrep/osv-scanner itself via its own scoped Bash allowlist -- a
+STRUCTURALLY DIFFERENT mechanism (Claude Code's native subagent tools:
+frontmatter) from the one this predicate and these tests govern
+(--allowedTools/--disallowedTools on `claude --print` / --disable
+shell_tool on `codex exec`). The invocation this predicate ACTUALLY governs
+is the non-interactive TOOL_ROLE=auditor chain-step call
+(gates.sh cmd_adversarial -> llm-client.sh adversarial -> invoke_claude/
+invoke_codex): read scripts/llm-client.sh's ds_adversarial_prompt and
+scripts/gates.sh's cmd_adversarial directly -- the ONLY input this call
+receives is a diff on stdin, and cmd_adversarial never shells out to
+gitleaks/semgrep/osv-scanner itself (those run as separate, deterministic
+gates driven by gates.sh's own shell code, per AGENTS.md §4: "Do not add
+LLM calls to the blocking path of any security check"). This invocation has
+no genuine Bash need, so it is restricted identically to the reviewer.
 
 DEFAULT INVERTED (lr-49df97 fold-in, PR #143, HOLDEN-authorized correction):
 originally scoped narrowly to CALL_ROLE=="reviewer" as the one OPT-IN role
@@ -29,15 +50,17 @@ that an opt-in list is the wrong polarity for a control governing Bash
 access to a process reading untrusted diffs -- a typo, a dropped export, or
 a future caller that omits the role would silently hand Bash back to a
 reviewer. The restricted set is now the default for anything NOT in the
-enumerated opt-out list (auditor/gate/builder/summarizer), so an empty,
-misspelled, or genuinely unknown role also gets restricted -- see
+enumerated opt-out list (gate/builder/summarizer), so an empty, misspelled,
+or genuinely unknown role also gets restricted -- see
 ds_llm_role_is_bash_unrestricted (platform.sh), the single source of truth
-for the opt-out enumeration both invoke_claude and this test suite key off.
+for the opt-out enumeration invoke_claude, invoke_codex, and this test
+suite all key off.
 
-These tests source the ACTUAL sh function (invoke_claude) via `sh -c`,
-mirroring test_llm_client_sh.py's established fake-binary-on-PATH technique
-(same helpers, reused directly rather than reimplemented) -- proving the
-real invocation emits the flags, not a Python mirror of the logic.
+These tests source the ACTUAL sh functions (invoke_claude, invoke_codex)
+via `sh -c`, mirroring test_llm_client_sh.py's established fake-binary-on-
+PATH technique (same helpers, reused directly rather than reimplemented) --
+proving the real invocation emits the flags, not a Python mirror of the
+logic.
 
 Run with: python3 -m unittest scripts.test_reviewer_tool_restriction -v
 """
@@ -188,14 +211,26 @@ class TestReviewerRoleGetsToolRestrictionFlags(unittest.TestCase):
 
 
 class TestNonReviewerRolesAreUntouched(unittest.TestCase):
-    """Negative control, the other half of the foundry ruling: auditor,
-    gate, builder, and summarizer must NEVER receive either tool-
-    restriction flag -- stripping Bash from the auditor (which reads
-    security-tool output) or the merge-gate would be exactly the
-    over-broad simplification the foundry rejected."""
+    """Negative control, the other half of the foundry ruling: gate,
+    builder, and summarizer must NEVER receive either tool-restriction
+    flag -- stripping Bash from the builder (needs it to do its job) or
+    the merge-gate would be exactly the over-broad simplification the
+    foundry rejected.
+
+    AUDITOR IS DELIBERATELY ABSENT FROM THIS LIST (lr-8a28e0 adjudication,
+    replacing the prior accident, not merely narrowing an existing
+    contract). See TestAuditorRoleGetsToolRestrictionFlags below for the
+    corrected, adjudicated contract and its full reasoning -- the
+    TOOL_ROLE=auditor chain-step invocation this predicate governs has no
+    genuine Bash need (it only ever reads a diff on stdin;
+    gitleaks/semgrep/osv-scanner run as separate deterministic gates, never
+    through this LLM call), so it is now restricted identically to the
+    reviewer. The interactive Claude Code subagent that genuinely DOES need
+    Bash (plugins/clagentic-lite/agents/auditor.md) is a structurally
+    different mechanism this predicate does not and cannot reach."""
 
     def test_other_roles_get_no_tool_restriction_flags(self):
-        for role in ("auditor", "gate", "builder", "summarizer"):
+        for role in ("gate", "builder", "summarizer"):
             with self.subTest(role=role):
                 recorded, err, rc = _run_invoke_claude(role, call_mode="markdown")
                 self.assertEqual(rc, 0, f"role={role} err={err}")
@@ -230,8 +265,10 @@ class TestNonReviewerRolesAreUntouched(unittest.TestCase):
         introduced, not a weakening of an established invariant -- see the
         commit message for the full rule-5-exception rationale. The
         sibling test above (test_other_roles_get_no_tool_restriction_flags)
-        remains UNCHANGED: auditor/gate/builder/summarizer are a real,
-        deliberate, foundry-ruled enumeration and still get no restriction.
+        remains the current, adjudicated contract: gate/builder/summarizer
+        are a real, deliberate, foundry-ruled enumeration and still get no
+        restriction (auditor moved off this list under lr-8a28e0, see the
+        class docstring above).
 
         Covers empty string (the original case), a plausible misspelling
         of "reviewer" (proving this isn't merely an empty-string special
@@ -259,6 +296,71 @@ class TestNonReviewerRolesAreUntouched(unittest.TestCase):
                     "Bash", argv,
                     f"role={role!r} argv={argv!r}",
                 )
+
+
+class TestAuditorRoleGetsToolRestrictionFlags(unittest.TestCase):
+    """POSITIVE control, lr-8a28e0 adjudication: the TOOL_ROLE=auditor
+    chain-step invocation now gets the SAME --allowedTools Read,Grep,Glob
+    --disallowedTools Bash treatment as the reviewer, on the claude carrier.
+
+    WHY THIS IS CORRECT, NOT MERELY CONSISTENT: read
+    scripts/llm-client.sh's ds_adversarial_prompt (the actual prompt this
+    invocation sends) and scripts/gates.sh's cmd_adversarial (the actual
+    caller) directly -- the auditor's chain-step invocation receives ONLY a
+    diff on stdin and is asked for prose exploitability commentary; nothing
+    in that prompt asks it to execute anything, and cmd_adversarial never
+    shells out to gitleaks/semgrep/osv-scanner itself (those are separate,
+    deterministic gates -- cmd_secrets/cmd_deps/cmd_sast -- invoked directly
+    by gates.sh's own shell code, per AGENTS.md §4). This mirrors the
+    reviewer's own "nothing in its prompt asks it to execute anything"
+    justification exactly.
+
+    THIS IS NOT THE SAME "AUDITOR" the original class-4 fix's opt-out
+    rationale meant: plugins/clagentic-lite/agents/auditor.md, the
+    interactive Claude Code subagent a human/session invokes directly, DOES
+    read gitleaks/semgrep/osv-scanner output and genuinely needs Bash for
+    it -- but that subagent is governed by Claude Code's own subagent
+    tools: frontmatter, a structurally different mechanism this predicate
+    and these tests do not reach. Restricting the chain-step invocation
+    here does not touch that subagent's Bash access at all."""
+
+    def test_auditor_role_gets_allowed_and_disallowed_tools_flags(self):
+        recorded, err, rc = _run_invoke_claude("auditor", call_mode="markdown")
+        self.assertEqual(rc, 0, f"invoke_claude exited non-zero: {err}")
+        self.assertEqual(len(recorded), 1, f"expected exactly one claude invocation, got: {recorded}")
+        argv = recorded[0]
+        self.assertIn("--allowedTools", argv, f"auditor role must pass --allowedTools: {argv!r}")
+        self.assertIn("Read,Grep,Glob", argv, f"auditor role must allow exactly Read,Grep,Glob: {argv!r}")
+        self.assertIn("--disallowedTools", argv, f"auditor role must pass --disallowedTools: {argv!r}")
+        self.assertIn("Bash", argv, f"auditor role must disallow Bash: {argv!r}")
+
+    def test_auditor_role_gets_tool_flags_with_model_specified(self):
+        """Same guard on the model-specified branch of invoke_claude
+        (separate code path from the no-model branch above)."""
+        recorded, err, rc = _run_invoke_claude("auditor", call_mode="markdown", model="sonnet")
+        self.assertEqual(rc, 0, f"invoke_claude exited non-zero: {err}")
+        self.assertEqual(len(recorded), 1, f"expected exactly one claude invocation, got: {recorded}")
+        argv = recorded[0]
+        self.assertIn("--allowedTools", argv, f"argv={argv!r}")
+        self.assertIn("--disallowedTools", argv, f"argv={argv!r}")
+        self.assertIn("Bash", argv, f"argv={argv!r}")
+
+    def test_ds_llm_role_is_bash_unrestricted_returns_false_for_auditor(self):
+        """Direct probe of the single-source-of-truth predicate itself
+        (platform.sh), independent of invoke_claude's own consumption of
+        it -- proves the enumeration change landed at the source, not only
+        that invoke_claude happens to behave correctly today."""
+        script = (
+            f'. "{PLATFORM_SH}"\n'
+            'ds_llm_role_is_bash_unrestricted auditor\n'
+            'echo "RC=$?"\n'
+        )
+        r = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+        self.assertIn(
+            "RC=1", r.stdout,
+            f"ds_llm_role_is_bash_unrestricted must return 1 (restricted) "
+            f"for auditor; stdout={r.stdout!r}",
+        )
 
 
 def _write_fake_claude_json_reviewer(bin_dir, argv_file):
@@ -348,12 +450,19 @@ def _write_fake_codex_json_reviewer(bin_dir, argv_file):
     """Fake `codex` binary on PATH -- mirrors invoke_codex's real
     invocation shape (`codex exec ... -o OUTPUT_FILE -`, stdout/stderr both
     redirected to ERR_FILE by the real invoke_codex) closely enough for
-    walk_chain's validate_output to accept a clean reviewer envelope. Used
-    to prove the reviewer-on-unrestrictable-CLI warning (lr-49df97 fold-in,
-    BOBBIE finding 1) actually fires when the resolved chain step is codex,
-    not claude -- invoke_codex has no tool-restriction flags at all, so the
-    warning is walk_chain's OWN responsibility, not something the fake CLI
-    needs to simulate."""
+    walk_chain's validate_output to accept a clean reviewer envelope.
+    DOES NOT respond meaningfully to `--version` (falls through to the
+    generic argv-logging branch, no parseable version on stdout), so
+    codex_version_check resolves this fake to "unknown" -- i.e. this
+    fixture deliberately exercises invoke_codex's MINIMAL, version-gated
+    fallback path (lr-37282a: the path that does NOT apply the
+    tool-restriction flags, by the same conservative posture that also
+    skips -m/-o/--color on that path). Used to prove the
+    unrestricted-Bash warning (lr-49df97 fold-in, BOBBIE finding 1; text
+    UPDATED lr-37282a to name the version-gate reason) fires correctly
+    for that remaining case. See _write_fake_versioned_codex_json_reviewer
+    below for the fixture proving restriction WHEN the version check
+    passes."""
     fake = os.path.join(bin_dir, "codex")
     with open(fake, "w") as f:
         f.write(textwrap.dedent(f"""\
@@ -372,16 +481,52 @@ def _write_fake_codex_json_reviewer(bin_dir, argv_file):
     return fake
 
 
-class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
-    """lr-49df97 fold-in (BOBBIE finding 1): invoke_codex has no
-    --allowedTools/--disallowedTools equivalent, so a reviewer chain step
-    that resolves to codex (the SHIPPED DEFAULT, share/config.example:66)
-    runs with Bash fully unrestricted. This must never be silent --
-    walk_chain prints a loud stderr warning on every such attempt so an
-    operator running the stock config sees the exposure on every review
-    call, not only if they happen to run `clagentic-lite doctor`."""
+def _write_fake_versioned_codex_json_reviewer(bin_dir, argv_file, version="0.142.5"):
+    """Like _write_fake_codex_json_reviewer, but responds to `--version`
+    with a real, parseable version string above CODEX_MIN_VERSION -- so
+    codex_version_check resolves this fake to the FULL, tool-restriction-
+    carrying flag set (lr-37282a). Used to prove the restriction actually
+    lands in the real invocation's argv, not merely that the mechanism is
+    theoretically wired up."""
+    fake = os.path.join(bin_dir, "codex")
+    with open(fake, "w") as f:
+        f.write(textwrap.dedent(f"""\
+            #!/bin/sh
+            case "$1" in
+              --version)
+                printf 'codex-cli {version}\\n'
+                exit 0
+                ;;
+            esac
+            printf '%s\\n' "$*" >> '{argv_file}'
+            cat > /dev/null
+            for arg in "$@"; do
+                if [ "$prev" = "-o" ]; then
+                    printf '{{"summary":"clean","checked":[],"findings":[]}}\\n' > "$arg"
+                fi
+                prev="$arg"
+            done
+        """))
+    os.chmod(fake, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+    return fake
 
-    def test_reviewer_via_codex_prints_unrestricted_bash_warning(self):
+
+class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
+    """lr-49df97 fold-in (BOBBIE finding 1), UPDATED lr-37282a: codex now
+    HAS a tool-restriction mechanism (--disable shell_tool -s read-only,
+    invoke_codex) on its version-gated flag-surface path -- but that path
+    only activates when codex_version_check resolves the installed CLI to
+    >= CODEX_MIN_VERSION. A codex whose --version cannot be parsed (or is
+    genuinely too old) still runs with Bash fully unrestricted via
+    invoke_codex's minimal fallback form, by the same conservative posture
+    that also skips -m/-o/--color on that path -- an unconfirmed flag
+    surface must not be assumed to also carry the restriction flags
+    correctly. This must never be silent -- walk_chain prints a loud
+    stderr warning on every such attempt so an operator running an
+    old/unrecognized codex sees the exposure on every review call, not
+    only if they happen to run `clagentic-lite doctor`."""
+
+    def test_reviewer_via_unversioned_codex_prints_unrestricted_bash_warning(self):
         tmpdir = tempfile.mkdtemp(prefix="clagentic-test-reviewer-codex-warn-")
         try:
             argv_file = os.path.join(tmpdir, "argv.log")
@@ -456,10 +601,14 @@ class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_non_reviewer_role_via_codex_does_not_print_the_warning(self):
-        """The warning is scoped to ROLE_L=="reviewer" only -- the auditor
-        role legitimately runs on codex with Bash for its security tools
-        (docs/DESIGN.md "Auditor | Read, Bash (security tools)") and must
-        not be flagged as if it were an accidental exposure."""
+        """The warning is scoped to ROLE_L=="reviewer" only -- it is a
+        REVIEWER-specific diagnostic about the reviewer's own tool-
+        restriction mechanism, not a general "auditor is unrestricted"
+        alarm. As of lr-8a28e0 the auditor's chain-step invocation IS ALSO
+        restricted (see TestAuditorRoleGetsToolRestrictionFlags,
+        TestAuditorViaCodexGetsToolRestrictionFlags below) -- this test
+        only proves the reviewer-scoped warning does not misfire on a
+        different role, not that the auditor is unrestricted."""
         tmpdir = tempfile.mkdtemp(prefix="clagentic-test-auditor-codex-nowarn-")
         try:
             argv_file = os.path.join(tmpdir, "argv.log")
@@ -491,6 +640,137 @@ class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _run_walk_chain_with_codex_fixture(role_lower, cli_cmd_env_var, fixture_writer, mode="json", argv_file_name="argv.log"):
+    """Shared harness: writes FIXTURE_WRITER's fake codex on PATH, runs
+    walk_chain for ROLE_LOWER with CLI_CMD_ENV_VAR pointed at codex, and
+    returns (recorded_argv_lines, stderr, rc). Generalizes
+    _run_walk_chain_reviewer (claude-only) to the codex carrier so the
+    same shape of end-to-end proof (env-var relay actually works, not just
+    invoke_codex's own direct-call behavior) covers both CLIs. MODE must
+    match the role's real validate_output schema (json for reviewer/
+    auditor/gate roles whose fixture output satisfies .findings; markdown
+    for roles with no closed schema) -- a mismatch makes walk_chain report
+    a degraded envelope (exit 3/4) for reasons unrelated to the
+    tool-restriction flags this harness exists to observe."""
+    tmpdir = tempfile.mkdtemp(prefix="clagentic-test-walkchain-codex-toolrole-")
+    try:
+        argv_file = os.path.join(tmpdir, argv_file_name)
+        open(argv_file, "w").close()
+        bin_dir = os.path.join(tmpdir, "bin")
+        os.makedirs(bin_dir)
+        fixture_writer(bin_dir, argv_file)
+
+        src_dir = os.path.join(tmpdir, "src")
+        os.makedirs(src_dir)
+        sourced = _functions_only_source(src_dir)
+
+        script = textwrap.dedent(f"""\
+            export PATH='{bin_dir}':"$PATH"
+            export {cli_cmd_env_var}=codex
+            _fixture_prompt() {{ printf 'test prompt'; }}
+            . '{sourced}'
+            printf 'stdin diff content' | walk_chain {role_lower} {mode} _fixture_prompt
+        """)
+        r = subprocess.run(
+            ["sh", "-c", script, sourced],
+            capture_output=True, text=True, cwd=TOOL_HOME,
+        )
+        with open(argv_file) as f:
+            recorded = [line.rstrip("\n") for line in f if line.strip()]
+        return recorded, r.stderr, r.returncode
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestReviewerViaVersionedCodexGetsToolRestrictionFlags(unittest.TestCase):
+    """POSITIVE control, lr-37282a: when the resolved codex CLI reports a
+    version >= CODEX_MIN_VERSION, invoke_codex's real argv carries
+    --disable shell_tool -s read-only, and walk_chain's unrestricted-Bash
+    warning does NOT fire (it would be a false alarm on the CLI/version
+    combination where the control genuinely works now, mirroring
+    test_reviewer_via_claude_does_not_print_the_warning's own negative
+    control for the claude path)."""
+
+    def test_reviewer_via_codex_gets_disable_shell_tool_and_sandbox_flags(self):
+        recorded, err, rc = _run_walk_chain_with_codex_fixture(
+            "reviewer", "CLAGENTIC_REVIEWER_CMD",
+            _write_fake_versioned_codex_json_reviewer,
+        )
+        self.assertEqual(rc, 0, f"walk_chain failed: err={err!r}")
+        self.assertEqual(len(recorded), 1, f"recorded={recorded!r}")
+        argv = recorded[0]
+        self.assertIn("--disable", argv, f"argv={argv!r}")
+        self.assertIn("shell_tool", argv, f"argv={argv!r}")
+        self.assertIn("-s", argv, f"argv={argv!r}")
+        self.assertIn("read-only", argv, f"argv={argv!r}")
+
+    def test_reviewer_via_versioned_codex_does_not_print_the_warning(self):
+        recorded, err, rc = _run_walk_chain_with_codex_fixture(
+            "reviewer", "CLAGENTIC_REVIEWER_CMD",
+            _write_fake_versioned_codex_json_reviewer,
+        )
+        self.assertEqual(rc, 0, f"walk_chain failed: err={err!r}")
+        self.assertNotIn(
+            "UNRESTRICTED", err,
+            f"reviewer-via-current-codex must not emit the unrestricted-"
+            f"Bash warning -- it IS restricted on this version; err={err!r}",
+        )
+
+
+class TestAuditorViaCodexGetsToolRestrictionFlags(unittest.TestCase):
+    """POSITIVE control, lr-8a28e0 (codex side): the TOOL_ROLE=auditor
+    chain-step invocation is restricted on the codex carrier exactly like
+    it is on the claude carrier (TestAuditorRoleGetsToolRestrictionFlags,
+    above) -- ds_llm_role_is_bash_unrestricted (platform.sh) is the SAME
+    single source of truth both invoke_claude and invoke_codex consult, so
+    this is not a second, independently-derived decision that could drift
+    from the claude-side one."""
+
+    def test_auditor_via_codex_gets_disable_shell_tool_and_sandbox_flags(self):
+        recorded, err, rc = _run_walk_chain_with_codex_fixture(
+            "auditor", "CLAGENTIC_AUDITOR_CMD",
+            _write_fake_versioned_codex_json_reviewer,
+        )
+        self.assertEqual(rc, 0, f"walk_chain failed: err={err!r}")
+        self.assertEqual(len(recorded), 1, f"recorded={recorded!r}")
+        argv = recorded[0]
+        self.assertIn("--disable", argv, f"argv={argv!r}")
+        self.assertIn("shell_tool", argv, f"argv={argv!r}")
+        self.assertIn("-s", argv, f"argv={argv!r}")
+        self.assertIn("read-only", argv, f"argv={argv!r}")
+
+
+class TestGateBuilderSummarizerViaCodexAreUntouched(unittest.TestCase):
+    """Negative control, codex side: gate/builder/summarizer must NOT
+    receive the codex tool-restriction flags either -- mirrors
+    TestNonReviewerRolesAreUntouched's claude-side coverage, proving the
+    two carriers agree on the SAME opt-out set via the SAME predicate
+    rather than each hand-rolling its own enumeration."""
+
+    def test_other_roles_via_codex_get_no_tool_restriction_flags(self):
+        for role, env_var in (
+            ("gate", "CLAGENTIC_GATE_CMD"),
+            ("builder", "CLAGENTIC_BUILDER_CMD"),
+            ("summarizer", "CLAGENTIC_SUMMARIZER_CMD"),
+        ):
+            with self.subTest(role=role):
+                recorded, err, rc = _run_walk_chain_with_codex_fixture(
+                    role, env_var, _write_fake_versioned_codex_json_reviewer,
+                    mode="markdown",
+                )
+                self.assertEqual(rc, 0, f"role={role} walk_chain failed: err={err!r}")
+                argv = recorded[0] if recorded else ""
+                self.assertNotIn(
+                    "--disable", argv,
+                    f"role={role} must not receive --disable shell_tool: {argv!r}",
+                )
+                self.assertNotIn(
+                    "shell_tool", argv,
+                    f"role={role} argv={argv!r}",
+                )
 
 
 def _run_walk_chain_with_role(role_lower, bin_dir, argv_file):
@@ -579,10 +859,45 @@ class TestWalkChainOwnRoleSanityCheckIsIndependentOfInvokeClaude(unittest.TestCa
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_known_optout_role_does_not_trigger_the_warning(self):
-        """Negative control: a real, enumerated opt-out role (auditor) must
-        not trip walk_chain's own sanity-check warning -- it is a known,
-        deliberate role, not an unrecognized one."""
+        """Negative control: a real, enumerated Bash-unrestricted opt-out
+        role (gate) must not trip walk_chain's own sanity-check warning --
+        it is a known, deliberate role, not an unrecognized one.
+
+        Uses "gate", not "auditor" (the fixture this test used before
+        lr-8a28e0): auditor moved OFF ds_llm_role_is_bash_unrestricted's
+        opt-out enumeration under that adjudication -- it is now a
+        deliberately-RESTRICTED role instead, exempted from THIS warning
+        via the explicit reviewer|auditor case arm above (see
+        TestAuditorRoleGetsToolRestrictionFlags for its own, separate
+        positive-control coverage), not via the opt-out predicate this
+        test is meant to probe. "gate" is a genuine, still-current member
+        of the opt-out enumeration and keeps this test's original
+        property intact."""
         tmpdir = tempfile.mkdtemp(prefix="clagentic-test-walkchain-rolecheck-known-")
+        try:
+            argv_file = os.path.join(tmpdir, "argv.log")
+            open(argv_file, "w").close()
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(bin_dir)
+            _write_fake_claude_json_reviewer(bin_dir, argv_file)
+
+            recorded, err, rc = _run_walk_chain_with_role("gate", bin_dir, argv_file)
+            self.assertNotIn(
+                "RESTRICTED", err,
+                f"a known opt-out role must not trigger the role-sanity "
+                f"warning; stderr={err!r}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_auditor_role_does_not_trigger_the_warning(self):
+        """Sibling negative control, lr-8a28e0: "auditor" is the SECOND
+        role (alongside "reviewer") this codebase deliberately routes
+        through the restricted default on purpose -- it must not trigger
+        walk_chain's own role-sanity warning either, even though it is no
+        longer in ds_llm_role_is_bash_unrestricted's opt-out enumeration."""
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-walkchain-rolecheck-auditor-")
         try:
             argv_file = os.path.join(tmpdir, "argv.log")
             open(argv_file, "w").close()
@@ -593,8 +908,8 @@ class TestWalkChainOwnRoleSanityCheckIsIndependentOfInvokeClaude(unittest.TestCa
             recorded, err, rc = _run_walk_chain_with_role("auditor", bin_dir, argv_file)
             self.assertNotIn(
                 "RESTRICTED", err,
-                f"a known opt-out role must not trigger the role-sanity "
-                f"warning; stderr={err!r}",
+                f"auditor is a deliberately-restricted role and must not "
+                f"trigger the unrecognized-role warning; stderr={err!r}",
             )
         finally:
             import shutil
