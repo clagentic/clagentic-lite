@@ -512,19 +512,32 @@ def _write_fake_versioned_codex_json_reviewer(bin_dir, argv_file, version="0.142
 
 
 class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
-    """lr-49df97 fold-in (BOBBIE finding 1), UPDATED lr-37282a: codex now
-    HAS a tool-restriction mechanism (--disable shell_tool -s read-only,
-    invoke_codex) on its version-gated flag-surface path -- but that path
-    only activates when codex_version_check resolves the installed CLI to
-    >= CODEX_MIN_VERSION. A codex whose --version cannot be parsed (or is
-    genuinely too old) still runs with Bash fully unrestricted via
-    invoke_codex's minimal fallback form, by the same conservative posture
-    that also skips -m/-o/--color on that path -- an unconfirmed flag
-    surface must not be assumed to also carry the restriction flags
-    correctly. This must never be silent -- walk_chain prints a loud
-    stderr warning on every such attempt so an operator running an
-    old/unrecognized codex sees the exposure on every review call, not
-    only if they happen to run `clagentic-lite doctor`."""
+    """lr-49df97 fold-in (BOBBIE finding 1), UPDATED lr-37282a, THEN
+    UPDATED AGAIN under lr-8a28e0 (PEACHES fold-in, PR #144 review,
+    comment 5207862165): codex now HAS a tool-restriction mechanism
+    (--disable shell_tool -s read-only, invoke_codex) on its version-gated
+    flag-surface path -- but that path only activates when
+    codex_version_check resolves the installed CLI to >= CODEX_MIN_VERSION.
+    A codex whose --version cannot be parsed (or is genuinely too old)
+    still runs with Bash fully unrestricted via invoke_codex's minimal
+    fallback form, by the same conservative posture that also skips
+    -m/-o/--color on that path -- an unconfirmed flag surface must not be
+    assumed to also carry the restriction flags correctly. This must never
+    be silent -- walk_chain prints a loud stderr warning on every such
+    attempt.
+
+    THE WARNING GATE IS NOW DRIVEN BY ds_llm_role_is_bash_unrestricted
+    (the SAME predicate that decides the restriction itself), not a
+    hardcoded ROLE_L=="reviewer" check. PEACHES caught the class defect
+    this correction closes: the original condition was hardcoded to
+    "reviewer" only, so when lr-8a28e0 (this same PR) moved auditor onto
+    the restricted side, the WARNING did not move with it -- an auditor
+    chain step on an old/unversioned codex silently ran with unrestricted
+    Bash, exactly the defect lr-8a28e0's restriction existed to prevent.
+    See test_auditor_via_unversioned_codex_prints_unrestricted_bash_warning
+    below for the corrected coverage, and
+    test_invariants.py's TestEveryBashRestrictedRoleWarningIsCoveredByTheSharedPredicate
+    for the class-level sweep that would have caught this."""
 
     def test_reviewer_via_unversioned_codex_prints_unrestricted_bash_warning(self):
         tmpdir = tempfile.mkdtemp(prefix="clagentic-test-reviewer-codex-warn-")
@@ -600,16 +613,24 @@ class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def test_non_reviewer_role_via_codex_does_not_print_the_warning(self):
-        """The warning is scoped to ROLE_L=="reviewer" only -- it is a
-        REVIEWER-specific diagnostic about the reviewer's own tool-
-        restriction mechanism, not a general "auditor is unrestricted"
-        alarm. As of lr-8a28e0 the auditor's chain-step invocation IS ALSO
-        restricted (see TestAuditorRoleGetsToolRestrictionFlags,
-        TestAuditorViaCodexGetsToolRestrictionFlags below) -- this test
-        only proves the reviewer-scoped warning does not misfire on a
-        different role, not that the auditor is unrestricted."""
-        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-auditor-codex-nowarn-")
+    def test_auditor_via_unversioned_codex_prints_unrestricted_bash_warning(self):
+        """CORRECTED, PEACHES-caught fold-in (PR #144 review, comment
+        5207862165): this test used to assert the warning was scoped to
+        ROLE_L=="reviewer" ONLY and must NOT fire for auditor. That
+        assertion was WRONG the moment lr-8a28e0 moved auditor onto the
+        restricted side (this same PR) without updating this hardcoded
+        gate to match -- a genuinely silent gap on auditor-via-old-codex:
+        invoke_codex correctly skips the restriction flags on its
+        unverified-flag-surface fallback path, but nothing said so,
+        because the warning only ever checked for "reviewer". PR-D's
+        whole defense of the residual reviewer-on-codex gap was "INERT
+        means SILENT, and this is loud" -- that defense did not hold for
+        auditor until this fix. The warning is now driven by
+        ds_llm_role_is_bash_unrestricted (the SAME predicate that decides
+        the restriction itself, not a second hardcoded role name), so
+        auditor is covered automatically, as is any future role moved
+        onto the restricted side."""
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-auditor-codex-warn-")
         try:
             argv_file = os.path.join(tmpdir, "argv.log")
             open(argv_file, "w").close()
@@ -632,14 +653,39 @@ class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
                 ["sh", "-c", script, sourced],
                 capture_output=True, text=True, cwd=TOOL_HOME,
             )
-            self.assertNotIn(
+            self.assertIn(
                 "UNRESTRICTED", r.stderr,
-                f"auditor role must not emit the reviewer-scoped warning; "
-                f"stderr={r.stderr!r}",
+                f"expected a loud unrestricted-Bash warning on stderr when "
+                f"an auditor chain step resolves to an unversioned/old "
+                f"codex; stderr={r.stderr!r}",
+            )
+            self.assertIn(
+                "auditor", r.stderr,
+                f"warning should name the role in use; stderr={r.stderr!r}",
             )
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_auditor_via_versioned_codex_does_not_print_the_warning(self):
+        """Negative control, the corrected contract's other half: an
+        auditor chain step resolving to a CURRENT codex (>= CODEX_MIN_
+        VERSION) IS genuinely restricted (TestAuditorViaCodexGetsToolRestrictionFlags
+        proves the flags land) -- the warning must not misfire there,
+        the same "no false alarm on the CLI/version combination where
+        the control genuinely works" property
+        TestReviewerViaVersionedCodexGetsToolRestrictionFlags already
+        proves for the reviewer role."""
+        recorded, err, rc = _run_walk_chain_with_codex_fixture(
+            "auditor", "CLAGENTIC_AUDITOR_CMD",
+            _write_fake_versioned_codex_json_reviewer,
+        )
+        self.assertEqual(rc, 0, f"walk_chain failed: err={err!r}")
+        self.assertNotIn(
+            "UNRESTRICTED", err,
+            f"auditor-via-current-codex must not emit the unrestricted-"
+            f"Bash warning -- it IS restricted on this version; err={err!r}",
+        )
 
 
 def _run_walk_chain_with_codex_fixture(role_lower, cli_cmd_env_var, fixture_writer, mode="json", argv_file_name="argv.log"):
