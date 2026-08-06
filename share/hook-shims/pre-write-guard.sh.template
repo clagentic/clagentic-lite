@@ -2,13 +2,21 @@
 # clagentic-lite :: PreToolUse (Write|Edit) hook
 # Blocks writes to the default branch, outside the repo, or to sensitive paths.
 # Exit 2 = block.
+#
+# managed-by: clagentic · clagentic-hooks-version: v1
+# Source of truth: share/hook-shims/pre-write-guard.sh.template. Materialized
+# into $CLAGENTIC_LITE_HOME/.claude/hooks/pre-write-guard.sh at `init`/`update`
+# time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
+# _stamp_claude_hooks). Enrolled repos never receive their own copy — their
+# .claude/settings.json calls back into this ONE materialized copy by
+# absolute path. Do not edit the installed copy by hand.
 
 # set -e intentionally absent: unexpected failures must exit 0, not crash the
 # session. Only the explicit block() paths below exit 2 to block a tool call.
 # If platform.sh is missing or broken the hook fails open (allow + no audit).
 
-HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR=.
-if ! . "$HOOK_DIR/../../scripts/platform.sh" 2>/dev/null; then
+: "${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}"
+if ! . "$CLAGENTIC_LITE_HOME/scripts/platform.sh" 2>/dev/null; then
   exit 0
 fi
 ds_load_env 2>/dev/null || true

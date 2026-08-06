@@ -164,6 +164,23 @@ CLAUDE_WRAPPER_VERSION="v2"
 # Bump on any content change to trigger restamp via _restamp_repo_artifacts.
 CLAUDE_WRAPPER_SETTINGS_VERSION="v1"
 
+# Claude Code lifecycle hook scripts (session-start.sh, pre-write-guard.sh,
+# etc). Source of truth: share/hook-shims/<name>.template (lr-57db23 —
+# relocated out of the live, tracked $CLAGENTIC_LITE_HOME/.claude/hooks/ so
+# the tool's own repo no longer self-executes an always-tracked copy of its
+# own product; see AGENTS.md file-map + docs/DESIGN.md). Materialized into
+# $CLAGENTIC_LITE_HOME/.claude/hooks/ at `init`/`update` time — this is the
+# ONE copy every enrolled repo's settings.json calls back into by absolute
+# path (enrolled repos never receive their own copy of these scripts).
+# Bump on any content change to any hook template so `clagentic-lite update`
+# re-stamps existing installs.
+CLAUDE_HOOKS_VERSION="v1"
+
+# Single source of truth for which hook scripts are stamped into
+# $CLAGENTIC_LITE_HOME/.claude/hooks/. Space-separated POSIX-sh string (no
+# arrays) — _stamp_claude_hooks (init/update) is the sole consumer.
+CLAGENTIC_HOOK_SCRIPTS="session-start.sh prompt-inject.sh pre-bash-guard.sh pre-write-guard.sh post-tool-nudge.sh stop-summarize.sh"
+
 # Single source of truth for the security-gate tool list. Adding a new
 # scanner means editing this one line — _run_prereq_checks (init/update)
 # and cmd_doctor both iterate this list, so they stay in sync.
@@ -240,6 +257,54 @@ claude_wrapper_settings_version() {
   _cwsv_file="$1"
   [ -f "$_cwsv_file" ] || { printf ''; return; }
   grep -o 'clagentic-wrapper-settings-version: v[^ ·>]*' "$_cwsv_file" 2>/dev/null | sed 's/clagentic-wrapper-settings-version: //'
+}
+
+# Read the version marker from an installed Claude Code lifecycle hook script
+# under $CLAGENTIC_LITE_HOME/.claude/hooks/.
+claude_hooks_version() {
+  _chv_file="$1"
+  [ -f "$_chv_file" ] || { printf ''; return; }
+  grep -o 'clagentic-hooks-version: v[^ ·>]*' "$_chv_file" 2>/dev/null | sed 's/clagentic-hooks-version: //'
+}
+
+# Materialize $CLAGENTIC_LITE_HOME/.claude/hooks/*.sh from
+# share/hook-shims/*.sh.template (lr-57db23). This is the tool stamping its
+# OWN .claude/hooks/ — not a per-enrolled-repo copy. Every enrolled repo's
+# generated .claude/settings.json points its hook `command` entries at these
+# same materialized paths by absolute $CLAGENTIC_LITE_HOME reference, so this
+# is the single copy that actually executes for every enrolled machine.
+#
+# Explicit opt-in only: called from cmd_init and cmd_update, never implicitly
+# on every invocation — a maintainer working in this checkout who wants the
+# tool to dogfood itself runs `clagentic-lite init` (or `enroll --self`) once,
+# same as any other consuming machine. Cloning the repo alone does not wire
+# anything; see AGENTS.md and README.md "Developing clagentic-lite itself".
+#
+# Renders to a same-directory temp file, then atomic `mv` over the real
+# target — mirrors _stamp_claude_settings's validate-then-temp-then-move
+# shape (PR #146 review 5209002495, finding 3) so a failed/partial sed run
+# can never leave a truncated, empty hook script sitting at the target path.
+#
+# Args: (none — always targets $CLAGENTIC_LITE_HOME/.claude/hooks/)
+# Prints the number of hook scripts (re)stamped to stdout.
+_stamp_claude_hooks() {
+  _sch_dir="$CLAGENTIC_LITE_HOME/.claude/hooks"
+  mkdir -p "$_sch_dir" || { warn "cannot create $_sch_dir"; printf '0\n'; return 1; }
+  _sch_count=0
+  for _sch_name in $CLAGENTIC_HOOK_SCRIPTS; do
+    _sch_template="$SHARE_DIR/hook-shims/${_sch_name}.template"
+    if [ ! -f "$_sch_template" ]; then
+      warn "hook template missing: $_sch_template"
+      continue
+    fi
+    _sch_target="$_sch_dir/$_sch_name"
+    _sch_tmp="${_sch_target}.tmp.$$"
+    sed "s|__CLAGENTIC_LITE_HOME__|$CLAGENTIC_LITE_HOME|g" "$_sch_template" > "$_sch_tmp"
+    chmod +x "$_sch_tmp"
+    mv -f "$_sch_tmp" "$_sch_target"
+    _sch_count=$((_sch_count + 1))
+  done
+  printf '%d\n' "$_sch_count"
 }
 
 # Stamp a hook shim from share/hook-shims/<name>.template into a repo's
@@ -1042,6 +1107,15 @@ cmd_init() {
     fi
   fi
 
+  # 1.6. Materialize $CLAGENTIC_LITE_HOME/.claude/hooks/*.sh from
+  # share/hook-shims/*.sh.template (lr-57db23). Always runs, unconditionally
+  # (idempotent, cheap, no prompts) — this is the ONE copy of the Claude Code
+  # lifecycle hooks every enrolled repo's settings.json calls back into by
+  # absolute path; without this step a fresh checkout has no .claude/hooks/
+  # at all and every enrolled repo's hooks fail closed (missing script).
+  _init_hooks_stamped=$(_stamp_claude_hooks)
+  say "materialized $_init_hooks_stamped Claude Code hook script(s): $CLAGENTIC_LITE_HOME/.claude/hooks/"
+
   # 2. Prereq detection — shared helper used by init / update / doctor.
   #    On a re-run with config already present, the prereq sweep still runs
   #    (always useful), but the two-question front door is skipped — silence
@@ -1798,6 +1872,24 @@ cmd_doctor() {
   else
     _fail "$CLI_SYMLINK missing — run \`clagentic-lite init\`"
   fi
+
+  # 2b. Claude Code lifecycle hooks materialized (lr-57db23). This is the
+  # ONE copy every enrolled repo's settings.json calls back into by absolute
+  # path — missing or stale here means every enrolled repo's hooks fail
+  # closed or run stale logic, not just this checkout's own dogfood wiring.
+  for _dh_name in $CLAGENTIC_HOOK_SCRIPTS; do
+    _dh_file="$CLAGENTIC_LITE_HOME/.claude/hooks/$_dh_name"
+    if [ ! -f "$_dh_file" ]; then
+      _fail "$_dh_file missing — run \`clagentic-lite init\` or \`clagentic-lite update\` to materialize"
+    else
+      _dh_ver=$(claude_hooks_version "$_dh_file")
+      if [ "$_dh_ver" != "$CLAUDE_HOOKS_VERSION" ]; then
+        _fail "$_dh_file version $_dh_ver (current: $CLAUDE_HOOKS_VERSION) — run \`clagentic-lite update\`"
+      else
+        _ok "$_dh_file version $CLAUDE_HOOKS_VERSION OK"
+      fi
+    fi
+  done
 
   # 3. LOCAL_BIN on PATH.
   case ":$PATH:" in
@@ -2623,6 +2715,31 @@ cmd_update() {
   # comment: this half is UNVERIFIED, gated behind its own separate key.
   if [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" = "1" ]; then
     _install_router_agents_plugin
+  fi
+
+  # Re-stamp $CLAGENTIC_LITE_HOME/.claude/hooks/*.sh if any hook template
+  # changed (lr-57db23). Self-targeted — not per-enrolled-repo, since
+  # enrolled repos call back into this ONE materialized copy by absolute
+  # path rather than holding their own. Version-checked per script so an
+  # unrelated hook's unchanged content is not needlessly rewritten.
+  _hooks_need_restamp=0
+  for _uh_name in $CLAGENTIC_HOOK_SCRIPTS; do
+    _uh_installed="$CLAGENTIC_LITE_HOME/.claude/hooks/$_uh_name"
+    if [ ! -f "$_uh_installed" ]; then
+      _hooks_need_restamp=1
+      break
+    fi
+    _uh_ver=$(claude_hooks_version "$_uh_installed")
+    if [ "$_uh_ver" != "$CLAUDE_HOOKS_VERSION" ]; then
+      _hooks_need_restamp=1
+      break
+    fi
+  done
+  if [ "$_hooks_need_restamp" -eq 1 ]; then
+    _uh_count=$(_stamp_claude_hooks)
+    say "re-stamped $_uh_count Claude Code hook script(s): $CLAGENTIC_LITE_HOME/.claude/hooks/ (-> $CLAUDE_HOOKS_VERSION)"
+  else
+    say "Claude Code hook scripts up to date ($CLAUDE_HOOKS_VERSION)"
   fi
 
   # Re-stamp shims in registered repos if the template version changed.

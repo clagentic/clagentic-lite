@@ -33,3 +33,11 @@ build/
 
 # LORE local state (we use lore during dev but don't ship it)
 .lore
+
+# Claude Code lifecycle hooks + settings.json are installer-materialized
+# (lr-57db23) from share/hook-shims/*.template via `clagentic-lite init` /
+# `update` / `enroll --self` — never tracked source. .claude/commands/ stays
+# tracked: it is the real symlink source enrolled repos point back to, not a
+# generated artifact. See AGENTS.md file map + docs/DESIGN.md.
+/.claude/hooks/
+/.claude/settings.json

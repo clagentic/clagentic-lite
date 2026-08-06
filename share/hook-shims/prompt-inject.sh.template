@@ -5,6 +5,14 @@
 # additionalContext so the session can reference prior decisions without
 # asking the user to recall them manually.
 # Non-blocking — any failure exits 0 silently.
+#
+# managed-by: clagentic · clagentic-hooks-version: v1
+# Source of truth: share/hook-shims/prompt-inject.sh.template. Materialized
+# into $CLAGENTIC_LITE_HOME/.claude/hooks/prompt-inject.sh at `init`/`update`
+# time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
+# _stamp_claude_hooks). Enrolled repos never receive their own copy — their
+# .claude/settings.json calls back into this ONE materialized copy by
+# absolute path. Do not edit the installed copy by hand.
 
 # set -e intentionally absent — this hook is non-blocking and must always
 # exit 0 on unexpected failures.
@@ -18,8 +26,8 @@ MEMORY_DB="${PWD}/.clagentic/lite/memory.db"
 # pre-bash-guard.sh and pre-write-guard.sh. The sed-based extraction it
 # replaced was vulnerable to prompt injection: a payload containing
 # escaped quotes or embedded JSON would corrupt the extracted field.
-HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR=.
-. "$HOOK_DIR/../../scripts/platform.sh" 2>/dev/null || true
+: "${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}"
+. "$CLAGENTIC_LITE_HOME/scripts/platform.sh" 2>/dev/null || true
 
 # Read hook payload from stdin (Claude Code passes JSON).
 PAYLOAD=$(cat 2>/dev/null || true)

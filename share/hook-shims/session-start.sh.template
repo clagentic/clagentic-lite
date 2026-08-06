@@ -8,9 +8,18 @@
 #    any failure exits 0 silently.  Suppress with CLAGENTIC_SKIP_UPDATE_ALERT=1.
 #
 # Non-blocking — any failure exits 0 silently.
+#
+# managed-by: clagentic · clagentic-hooks-version: v1
+# Source of truth: share/hook-shims/session-start.sh.template. Materialized
+# into $CLAGENTIC_LITE_HOME/.claude/hooks/session-start.sh at `init`/`update`
+# time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
+# _stamp_claude_hooks). Enrolled repos never receive their own copy — their
+# .claude/settings.json calls back into this ONE materialized copy by
+# absolute path. Do not edit the installed copy by hand.
 
-# shellcheck source=../../scripts/platform.sh
-. "$(dirname "$0")/../../scripts/platform.sh" 2>/dev/null || true
+: "${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}"
+# shellcheck disable=SC1091
+. "$CLAGENTIC_LITE_HOME/scripts/platform.sh" 2>/dev/null || true
 
 MEMORY_DB="${PWD}/.clagentic/lite/memory.db"
 CONTRACT_MD="${PWD}/.clagentic/lite/builder-contract.md"
@@ -63,9 +72,8 @@ if [ -f "$CONTRACT_MD" ]; then
 fi
 
 # ---- 2. Update alert -------------------------------------------------------
-# Resolve CLAGENTIC_LITE_HOME; fall back to the hook file's grandparent directory
-# (mirrors the bin/clagentic-lite resolution logic).
-: "${CLAGENTIC_LITE_HOME:=${CLAGENTIC_HOME:-$HOME/.clagentic/lite}}"
+# CLAGENTIC_LITE_HOME already resolved above (also falls back to the default
+# path, mirroring bin/clagentic-lite's own resolution logic).
 
 UPDATE_MSG=""
 
