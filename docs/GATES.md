@@ -72,6 +72,34 @@ Write rules:
 | **Per-call timeout** | `${CLAGENTIC_LLM_TIMEOUT_SEC}` seconds (default 180). Hung CLI → step failure → chain advances. |
 | **Required-role enforcement** | `CLAGENTIC_REVIEWER_REQUIRED=1` makes a full-chain failure a hard gate error (non-zero exit) instead of a degraded envelope. Use when the cross-vendor property is non-negotiable and a same-vendor fallback must be a visible failure rather than a silent degradation. Applies to any role: `CLAGENTIC_<ROLE>_REQUIRED=1`. |
 
+**Two distinct degraded causes (lr-33958f).** A degraded chain reports one of
+two mutually exclusive causes, both fail-closed but with different
+remediation:
+
+- **`INFRA_DEGRADED`** (`walk_chain` exit 3, envelope `"cause": "infra"`) —
+  no chain configured, or every step's own CLI invocation failed (nonzero
+  exit, timeout, not on PATH). This is genuinely a misconfigured/
+  auth-broken/network-out chain; remediation is "check LLM CLI config/auth."
+- **`MODEL_OUTPUT_UNPARSEABLE`** (`walk_chain` exit 4, envelope
+  `"cause": "unwrap"`) — every step's model invocation *succeeded* (auth
+  worked, tokens were spent) but its output could never be reduced to
+  exactly one role-shaped JSON candidate — the model returned prose, no
+  JSON at all, or more than one competing JSON block. This is NOT an
+  infrastructure problem; remediation points at reviewer/auditor output
+  shape, never CLI config. Before lr-33958f this collapsed into the
+  identical `INFRA_DEGRADED` message, which sent operators to check CLI
+  config/auth for a problem in neither — see the shared unwrap helper,
+  `_llm_unwrap_json_envelope` in `scripts/llm-client.sh`, called once from
+  `walk_chain` for every role/CLI uniformly.
+
+Unwrap itself requires **exactly one** JSON candidate — located via
+`re.search`/`finditer` over the model's full response (never an
+anchored whole-string match), filtered to candidates that both parse as
+JSON and match the calling role's expected shape. Zero candidates and more
+than one candidate are both failures, reported distinctly (never a silent
+first-or-last pick) — see that function's own doc comment for the full
+contract.
+
 ### Reviewer-consulted deferrals
 
 When an operator has reviewed a finding and decided to defer it — because it is
