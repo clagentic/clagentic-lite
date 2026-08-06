@@ -308,6 +308,12 @@ Everything above (`CLAGENTIC_<ROLE>_CMD`/`_TIER`/`_CHAIN`, `invoke_<cli>`) contr
 
 **What it does.** When `CLAGENTIC_ROUTER_URL` is set, `clagentic-lite enroll`/`update` stamps an `env` block into the enrolled repo's `.claude/settings.json` (`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`) so Claude Code — including interactive subagent dispatch — routes every request through the router. In passthrough mode (the default, no per-role chain reference) this is a transparent reverse proxy; your session behaves exactly as it does today. `clagentic-router` also supports *routed* mode: reference a named chain (`role:reviewer-chain`, matching `router.example.yaml` in the clagentic-router repo) and the router picks a backend per its own scoring/fallback policy instead of forwarding straight to Anthropic.
 
+**`CLAGENTIC_ROUTER_URL` is validated before it is ever stamped.** This value redirects your entire Claude Code session and, in passthrough mode, forwards your real Anthropic credentials to whatever host it names — it is a traffic-interception primitive, not an ordinary config string. `clagentic-lite enroll`/`update`/`doctor` all validate it the same way:
+
+- **Malformed** (not a well-formed `http://` or `https://` URL) — **refused**. Enroll/update stop with an error rather than stamping a value that would silently break every session opened against the repo afterward.
+- **Well-formed, non-local host** (anything other than `localhost`/`127.0.0.0/8`/`::1`) — **allowed, but warned loudly**, at both stamp time and every `clagentic-lite doctor` run, naming exactly what gets forwarded. The router is designed to run locally (this is why every example below uses `127.0.0.1`), but running it on another box on your own LAN is a legitimate setup, not a mistake — so this is a warning, not a refusal. A silent accept would be the wrong failure mode here: an operator should never discover after the fact that their credentials have been going to a remote host they forgot they configured.
+- **Well-formed, local host** — silent, same as any other correctly-configured value.
+
 **Setup:**
 
 ```sh

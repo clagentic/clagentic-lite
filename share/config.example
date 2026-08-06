@@ -452,6 +452,21 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # only channel that reaches the interactive session: clagentic-lite is not
 # Claude Code's parent process, so exporting the var at shell-startup time
 # reaches nothing.
+#
+# VALIDATED before it is ever stamped or probed (bin/clagentic-lite,
+# _validate_router_url): this value is a traffic-interception primitive — it
+# redirects the entire Claude Code session, and in the router's passthrough
+# mode your real Anthropic credentials are forwarded to whatever host it
+# names. A malformed value (not a well-formed http:// or https:// URL) is
+# REFUSED at enroll/update time rather than silently stamped — a bad value
+# here breaks every session opened against the enrolled repo, so failing
+# loudly at stamp time is far cheaper than debugging that later. A
+# well-formed but NON-LOCAL host (anything other than localhost/127.0.0.0/8/
+# ::1) is allowed but WARNED loudly at both stamp time and every `doctor`
+# run, naming exactly what gets forwarded — the router is designed to run
+# locally, but someone legitimately running it on another LAN box is not
+# wrong, only unusual enough to deserve an unmissable flag rather than a
+# silent accept.
 # CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765
 
 # CLAGENTIC_ROUTER_TOKEN: router inference token. Sent as

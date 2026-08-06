@@ -267,5 +267,148 @@ class TestRouterSettingsStampRestamp(unittest.TestCase):
         self.assertEqual(parsed["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8765")
 
 
+class TestRouterUrlValidation(unittest.TestCase):
+    """CLAGENTIC_ROUTER_URL is a traffic-interception primitive (BOBBIE
+    finding, PR #146 review 5208927288) -- validated before it is ever
+    stamped into settings.json or probed by doctor. Three classes:
+        malformed  -- refused (enroll/update fail, nothing stamped)
+        nonlocal   -- allowed, but warned loudly (stamp time AND doctor)
+        local      -- silent, same as before this change
+
+    Unset stays untouched by any of this -- covered by
+    TestRouterSettingsStampInertWhenUnset above; this class only adds cases
+    for a URL that IS set, so it does not regress that proof.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="clagentic-test-router-url-validation-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.home = os.path.join(self.tmpdir, "home")
+        os.makedirs(self.home)
+        self.repo = os.path.join(self.tmpdir, "repo")
+        _init_git_repo(self.repo)
+
+    def test_malformed_url_refused_at_enroll(self):
+        rc, out, err = _run_cli(
+            ["enroll", self.repo],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={"CLAGENTIC_ROUTER_URL": "not-a-url"},
+        )
+        self.assertNotEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        self.assertIn("not a well-formed", err, msg=err)
+        self.assertIn("CLAGENTIC_ROUTER_URL", err, msg=err)
+
+    def test_malformed_url_leaves_no_settings_json_env_block(self):
+        """A refused enroll must not leave a half-written settings.json with
+        the malformed value baked in -- die() aborts before any output is
+        written to the target file (redirection creates the file, but the
+        function's own stdout is empty when it dies before printing)."""
+        rc, out, err = _run_cli(
+            ["enroll", self.repo],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={"CLAGENTIC_ROUTER_URL": "ftp://example.com"},
+        )
+        self.assertNotEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        settings_path = os.path.join(self.repo, ".claude", "settings.json")
+        if os.path.isfile(settings_path):
+            with open(settings_path) as f:
+                content = f.read()
+            self.assertNotIn("ftp://example.com", content, msg=content)
+
+    def test_url_with_no_host_refused(self):
+        rc, out, err = _run_cli(
+            ["enroll", self.repo],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={"CLAGENTIC_ROUTER_URL": "http://"},
+        )
+        self.assertNotEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        self.assertIn("CLAGENTIC_ROUTER_URL", err, msg=err)
+
+    def test_valid_localhost_accepted_silently(self):
+        rc, out, err = _run_cli(
+            ["enroll", self.repo],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={"CLAGENTIC_ROUTER_URL": "http://localhost:8765"},
+        )
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        self.assertNotIn("NON-LOCAL", err, msg=err)
+        self.assertNotIn("WARN", err, msg=err)
+
+    def test_valid_127_0_0_1_accepted_silently(self):
+        rc, out, err = _run_cli(
+            ["enroll", self.repo],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={"CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765"},
+        )
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        self.assertNotIn("NON-LOCAL", err, msg=err)
+
+    def test_nonlocal_host_allowed_but_warned_at_stamp_time(self):
+        rc, out, err = _run_cli(
+            ["enroll", self.repo],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={"CLAGENTIC_ROUTER_URL": "http://router.example.com:8765"},
+        )
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        self.assertIn("NON-LOCAL", err, msg=err)
+        self.assertIn("router.example.com", err, msg=err)
+        self.assertIn("credentials", err, msg=err)
+
+        # Allowed means it still stamps -- this is a warning, not a refusal.
+        settings_path = os.path.join(self.repo, ".claude", "settings.json")
+        with open(settings_path) as f:
+            parsed = json.load(f)
+        self.assertEqual(parsed["env"]["ANTHROPIC_BASE_URL"], "http://router.example.com:8765")
+
+    def test_doctor_reports_malformed_url_as_fail(self):
+        rc, out, err = _run_cli(
+            ["doctor"],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={"CLAGENTIC_SKIP_UPDATE_ALERT": "1", "CLAGENTIC_ROUTER_URL": "not-a-url"},
+        )
+        # doctor itself never dies on a bad probe target -- it reports FAIL
+        # (via _fail, which writes to stderr, same as every other doctor
+        # check) and continues the rest of the diagnostic sweep.
+        self.assertIn("FAIL", err, msg=err)
+        self.assertIn("not a well-formed", err, msg=err)
+        self.assertIn("== doctor summary:", out, msg=out)
+
+    def test_doctor_reports_nonlocal_host_warning(self):
+        rc, out, err = _run_cli(
+            ["doctor"],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={
+                "CLAGENTIC_SKIP_UPDATE_ALERT": "1",
+                "CLAGENTIC_ROUTER_URL": "http://router.example.com:8765",
+            },
+        )
+        self.assertIn("NON-LOCAL", out, msg=out)
+        self.assertIn("router.example.com", out, msg=out)
+
+    def test_doctor_silent_on_local_host_beyond_the_probe_itself(self):
+        """Doctor still runs its GET /version probe (which will report
+        unreachable in this sandbox -- no live router) but must not print
+        any NON-LOCAL/malformed warning for a well-formed local URL."""
+        rc, out, err = _run_cli(
+            ["doctor"],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={
+                "CLAGENTIC_SKIP_UPDATE_ALERT": "1",
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:19999",
+            },
+        )
+        self.assertNotIn("NON-LOCAL", out, msg=out)
+        self.assertNotIn("not a well-formed", out, msg=out)
+
+
 if __name__ == "__main__":
     unittest.main()

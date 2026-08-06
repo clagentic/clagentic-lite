@@ -271,6 +271,116 @@ stamp_shim() {
   return 0
 }
 
+# _router_url_classify URL
+# Pure classifier, no side effects (no die/warn/print) — the single source
+# of truth for "is this CLAGENTIC_ROUTER_URL well-formed, and is its host
+# local", shared by _validate_router_url (stamp-time enforcement, below) and
+# cmd_doctor's router probe (diagnostic-only, must never abort the doctor
+# run). Sets _ROUTER_URL_CLASS to one of:
+#   malformed  — not a well-formed http:// or https:// URL, or empty host
+#   local      — well-formed, host is localhost/127.0.0.0/8/::1
+#   nonlocal   — well-formed, host is anything else
+# Also sets _ROUTER_URL_HOST (empty on malformed) for callers that want to
+# name the offending host in their own message.
+_router_url_classify() {
+  _ruc_url="$1"
+  _ROUTER_URL_HOST=""
+
+  case "$_ruc_url" in
+    http://*/*|http://*|https://*/*|https://*)
+      : # well-formed scheme prefix — fall through to host extraction
+      ;;
+    *)
+      _ROUTER_URL_CLASS="malformed"
+      return 0
+      ;;
+  esac
+
+  # Strip scheme, then strip any path/query after the host[:port] segment.
+  _ruc_hostport="${_ruc_url#http://}"
+  _ruc_hostport="${_ruc_hostport#https://}"
+  _ruc_hostport="${_ruc_hostport%%/*}"
+  _ruc_host="${_ruc_hostport%%:*}"
+
+  if [ -z "$_ruc_host" ]; then
+    _ROUTER_URL_CLASS="malformed"
+    return 0
+  fi
+  _ROUTER_URL_HOST="$_ruc_host"
+
+  # "Local" is deliberately narrow: localhost, 127.0.0.0/8 literals, and ::1
+  # — not private RFC1918 ranges generally, because a 192.168.x.x/10.x.x.x
+  # address is exactly the "another box on the LAN" case the nonlocal warning
+  # exists for, not silently equivalent to loopback.
+  case "$_ruc_host" in
+    localhost|127.*|::1|\[::1\])
+      _ROUTER_URL_CLASS="local"
+      ;;
+    *)
+      _ROUTER_URL_CLASS="nonlocal"
+      ;;
+  esac
+}
+
+# _validate_router_url URL
+# Validates a non-empty CLAGENTIC_ROUTER_URL before it is ever written into
+# settings.json as ANTHROPIC_BASE_URL. Callers MUST only invoke this when the
+# value is non-empty — an unset/empty router URL must never reach this
+# function at all, so the inert-when-unset property holds by construction
+# (there is no "validate the empty case" branch to regress).
+#
+# THREAT MODEL (BOBBIE finding, PR #146 review 5208927288): this value is a
+# traffic-interception primitive. Once stamped, it redirects an ENTIRE
+# interactive Claude Code session — orchestrator included, not just gate-path
+# calls — and in passthrough mode the operator's real Anthropic credentials
+# (whatever auth header that session already carries) are forwarded verbatim
+# to whatever host this names. A malformed value here does not fail loudly
+# at the point of the mistake; it silently breaks every session opened
+# against the enrolled repo afterward, days later, in a way that looks like
+# an unrelated Claude Code problem. Failing loudly HERE, at stamp time, is
+# far cheaper than debugging that later.
+#
+# TWO SEPARATE DECISIONS, deliberately different severities:
+#   1. Malformed — REFUSE. There is no legitimate reason for this value to be
+#      anything other than a well-formed URL; a router is either a real URL
+#      or misconfigured, and stamping a non-URL string into ANTHROPIC_BASE_URL
+#      cannot possibly route correctly, only fail mysteriously downstream.
+#      die() exits non-zero, which set -e propagates out of every call site
+#      (enroll, restamp, wrapper stamp) without those sites needing their
+#      own failure-handling branch.
+#   2. Well-formed but pointing at a non-local host — WARN, do not refuse.
+#      The router is DESIGNED to run locally (README setup steps assume
+#      127.0.0.1), but a non-local host is not necessarily a mistake —
+#      someone may legitimately run clagentic-router on another box on their
+#      own LAN. A hard refusal would block that legitimate case. A SILENT
+#      accept would be the opposite failure: an arbitrary remote host that
+#      will receive forwarded Anthropic credentials with no signal at all.
+#      Loud-but-not-blocking is the middle ground: the operator sees exactly
+#      what is being forwarded and where, at both stamp time (here) and
+#      every `doctor` run (the router probe re-classifies independently, via
+#      the same _router_url_classify, so the warning does not only appear
+#      once at enroll time and then go stale in memory).
+_validate_router_url() {
+  _vru_url="$1"
+  _router_url_classify "$_vru_url"
+
+  case "$_ROUTER_URL_CLASS" in
+    malformed)
+      die "CLAGENTIC_ROUTER_URL is not a well-formed http:// or https:// URL: '$_vru_url' -- refusing to stamp this into settings.json (a bad value here breaks every Claude Code session opened against this repo). Fix CLAGENTIC_ROUTER_URL in your config and re-run."
+      ;;
+    nonlocal)
+      warn "CLAGENTIC_ROUTER_URL points at a NON-LOCAL host: $_vru_url"
+      warn "  This redirects the ENTIRE Claude Code session (interactive + gate-path) through that host."
+      warn "  In the router's passthrough mode, this session's real Anthropic credentials are forwarded to it verbatim."
+      warn "  This is allowed (clagentic-router can legitimately run on another box on your own network) but is NOT the common case -- the setup docs assume 127.0.0.1."
+      warn "  If this is not intentional, fix CLAGENTIC_ROUTER_URL in your config now."
+      ;;
+    local)
+      : # local — no warning
+      ;;
+  esac
+}
+
 # _render_claude_settings TEMPLATE_FILE > stdout
 # Shared renderer for .claude/settings.json, used by all three stamp sites
 # (git-repo enroll, git-repo restamp, wrapper). Substitutes
@@ -293,9 +403,15 @@ stamp_shim() {
 # in that case rather than omitting the key, so `clagentic-lite doctor` and a
 # human reading settings.json see explicitly that no token is configured
 # instead of silently missing the key.
+#
+# _validate_router_url is called ONLY inside the "URL is non-empty" branch
+# below — never on the unset path — so inert-when-unset holds by
+# construction: there is no code path here that can emit output, warn, or
+# refuse when CLAGENTIC_ROUTER_URL is unset.
 _render_claude_settings() {
   _rcs_template="$1"
   _rcs_router_url="${CLAGENTIC_ROUTER_URL:-}"
+  [ -n "$_rcs_router_url" ] && _validate_router_url "$_rcs_router_url"
 
   while IFS= read -r _rcs_line || [ -n "$_rcs_line" ]; do
     case "$_rcs_line" in
@@ -1896,30 +2012,45 @@ cmd_doctor() {
   # the exact URL probed and what to check, not a bare ok/fail.
   if [ -n "${CLAGENTIC_ROUTER_URL:-}" ]; then
     printf '\nclagentic-router probe:\n'
-    _router_url="${CLAGENTIC_ROUTER_URL%/}"
-    _router_version_url="$_router_url/version"
-    if ! command -v curl >/dev/null 2>&1; then
-      printf '  WARN curl not on PATH — cannot probe %s\n' "$_router_version_url"
-      printf '       Install curl, or verify manually: curl %s\n' "$_router_version_url"
+    _router_url_classify "${CLAGENTIC_ROUTER_URL}"
+
+    if [ "$_ROUTER_URL_CLASS" = "malformed" ]; then
+      _fail "CLAGENTIC_ROUTER_URL is not a well-formed http:// or https:// URL: ${CLAGENTIC_ROUTER_URL}"
+      printf '       enroll/update will refuse to stamp this into settings.json until it is fixed.\n'
+      printf '       Fix CLAGENTIC_ROUTER_URL in ~/.config/clagentic/config, then re-run '"'"'clagentic-lite update'"'"' and '"'"'clagentic-lite doctor'"'"'.\n'
     else
-      _router_probe_body=$(mktemp -t clagentic-doctor-router.XXXXXX)
-      _router_probe_http=$($DS_TIMEOUT_CMD 10 curl -s -o "$_router_probe_body" -w '%{http_code}' "$_router_version_url" 2>/dev/null)
-      _router_probe_rc=$?
-      if [ "$_router_probe_rc" -eq 0 ] && [ "$_router_probe_http" = "200" ]; then
-        _ok "clagentic-router reachable at $_router_url (GET /version -> 200)"
-        if [ -s "$_router_probe_body" ]; then
-          printf '       response: %s\n' "$(head -c 200 "$_router_probe_body" 2>/dev/null | tr -d '\n')"
-        fi
-      elif [ "$_router_probe_rc" -eq 0 ] && [ -n "$_router_probe_http" ]; then
-        _fail "clagentic-router at $_router_url responded but not with 200 (GET /version -> $_router_probe_http)"
-        printf '       Check that %s is actually a clagentic-router instance (not a different service on that port).\n' "$_router_url"
-      else
-        _fail "clagentic-router unreachable at $_router_url (GET /version — connection failed or timed out)"
-        printf '       Check that clagentic-router is running and listening at %s.\n' "$_router_url"
-        printf '       Start it from the clagentic-router checkout (see that repo'"'"'s README), then re-run '"'"'clagentic-lite doctor'"'"'.\n'
-        printf '       If CLAGENTIC_ROUTER_URL points at the wrong host/port, fix it in ~/.config/clagentic/config and re-run '"'"'clagentic-lite update'"'"'.\n'
+      if [ "$_ROUTER_URL_CLASS" = "nonlocal" ]; then
+        printf '  WARN CLAGENTIC_ROUTER_URL points at a NON-LOCAL host: %s (host: %s)\n' "$CLAGENTIC_ROUTER_URL" "$_ROUTER_URL_HOST"
+        printf '       This redirects the ENTIRE Claude Code session (interactive + gate-path) through that host.\n'
+        printf '       In the router'"'"'s passthrough mode, this session'"'"'s real Anthropic credentials are forwarded to it verbatim.\n'
+        printf '       Allowed (clagentic-router can run on another box on your own network) but not the common case -- setup docs assume 127.0.0.1.\n'
       fi
-      rm -f "$_router_probe_body"
+
+      _router_url="${CLAGENTIC_ROUTER_URL%/}"
+      _router_version_url="$_router_url/version"
+      if ! command -v curl >/dev/null 2>&1; then
+        printf '  WARN curl not on PATH — cannot probe %s\n' "$_router_version_url"
+        printf '       Install curl, or verify manually: curl %s\n' "$_router_version_url"
+      else
+        _router_probe_body=$(mktemp -t clagentic-doctor-router.XXXXXX)
+        _router_probe_http=$($DS_TIMEOUT_CMD 10 curl -s -o "$_router_probe_body" -w '%{http_code}' "$_router_version_url" 2>/dev/null)
+        _router_probe_rc=$?
+        if [ "$_router_probe_rc" -eq 0 ] && [ "$_router_probe_http" = "200" ]; then
+          _ok "clagentic-router reachable at $_router_url (GET /version -> 200)"
+          if [ -s "$_router_probe_body" ]; then
+            printf '       response: %s\n' "$(head -c 200 "$_router_probe_body" 2>/dev/null | tr -d '\n')"
+          fi
+        elif [ "$_router_probe_rc" -eq 0 ] && [ -n "$_router_probe_http" ]; then
+          _fail "clagentic-router at $_router_url responded but not with 200 (GET /version -> $_router_probe_http)"
+          printf '       Check that %s is actually a clagentic-router instance (not a different service on that port).\n' "$_router_url"
+        else
+          _fail "clagentic-router unreachable at $_router_url (GET /version — connection failed or timed out)"
+          printf '       Check that clagentic-router is running and listening at %s.\n' "$_router_url"
+          printf '       Start it from the clagentic-router checkout (see that repo'"'"'s README), then re-run '"'"'clagentic-lite doctor'"'"'.\n'
+          printf '       If CLAGENTIC_ROUTER_URL points at the wrong host/port, fix it in ~/.config/clagentic/config and re-run '"'"'clagentic-lite update'"'"'.\n'
+        fi
+        rm -f "$_router_probe_body"
+      fi
     fi
     if [ -z "${CLAGENTIC_ROUTER_TOKEN:-}" ]; then
       printf '  INFO CLAGENTIC_ROUTER_TOKEN is unset — routed-mode roles (role:<chain>) will fail auth; passthrough mode does not need it.\n'

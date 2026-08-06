@@ -180,6 +180,8 @@ This still cannot make Claude Code itself select a non-default model for a subag
 
 Both halves are opt-in and byte-for-byte inert when their respective config keys are unset — see `share/config.example`'s router section for the full config surface.
 
+Because `CLAGENTIC_ROUTER_URL` redirects the entire session's traffic (and, in passthrough mode, carries the operator's real Anthropic credentials to whatever host it names), `bin/clagentic-lite` validates it before stamping or probing: a malformed value is refused outright, a well-formed non-local host is allowed but warned loudly at both stamp time and every `doctor` run. See `_validate_router_url`/`_router_url_classify` in `bin/clagentic-lite` for the full reasoning and README's "Optional: clagentic-router integration" section for the operator-facing behavior.
+
 ## Portability strategy
 
 `scripts/platform.sh` is sourced by every script and exports:
