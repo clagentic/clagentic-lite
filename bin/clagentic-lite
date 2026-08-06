@@ -554,8 +554,16 @@ cmd_init() {
   # re-running init without pulling).
   # Skippable with CLAGENTIC_SKIP_FETCH=1 for offline use, and silently
   # tolerant of failure (no upstream, no network, not a worktree, etc.).
+  #
+  # REPO SCOPING (lr-da1f28 sweep): `rev-parse --git-dir` succeeding only
+  # proves SOME ancestor of CLAGENTIC_LITE_HOME is a git repo, not that
+  # CLAGENTIC_LITE_HOME itself is — `-C <dir>` changes cwd before git's own
+  # repo discovery walks up the filesystem. Require the resolved toplevel to
+  # actually equal CLAGENTIC_LITE_HOME before trusting any read below.
+  _init_git_toplevel=$(git -C "$CLAGENTIC_LITE_HOME" rev-parse --show-toplevel 2>/dev/null || echo "")
+  _init_home_canon=$(cd "$CLAGENTIC_LITE_HOME" 2>/dev/null && pwd -P || printf '%s' "$CLAGENTIC_LITE_HOME")
   if [ "${CLAGENTIC_SKIP_FETCH:-0}" != "1" ] \
-      && git -C "$CLAGENTIC_LITE_HOME" rev-parse --git-dir >/dev/null 2>&1; then
+      && [ -n "$_init_git_toplevel" ] && [ "$_init_git_toplevel" = "$_init_home_canon" ]; then
     # Best-effort fetch; suppress output. Network failures are non-fatal.
     git -C "$CLAGENTIC_LITE_HOME" fetch --quiet 2>/dev/null || true
     _BRANCH=$(git -C "$CLAGENTIC_LITE_HOME" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
@@ -834,7 +842,23 @@ _enroll_one() {
 
   # Verify it's a git repo. If not, offer wrapper detection (tty only) or
   # fall through to a git init offer.
-  if ! git -C "$_ep" rev-parse --git-dir >/dev/null 2>&1; then
+  #
+  # REPO SCOPING (lr-da1f28 sweep): `git -C "$_ep" rev-parse --git-dir`
+  # succeeding only proves SOME ancestor of $_ep is a git repo, not that
+  # $_ep itself is — `-C <dir>` changes cwd before git's own repo discovery
+  # walks up the filesystem. This is the ROOT CAUSE of the same defect
+  # reappearing at every consumer of the enrollment registry (list/doctor/
+  # update --restamp all re-check `git -C "$_rpath" rev-parse --git-dir` on
+  # values that ultimately trace back to this check): if $_ep is not a git
+  # repo but an ancestor is, this check wrongly succeeds, skips the
+  # nested-repo detection entirely, and enrollment proceeds treating $_ep as
+  # if it were the actual repo — `_canon` (below) is set to $_ep verbatim,
+  # and every later `git -C "$_canon" ...` call (hook stamping, etc.) then
+  # silently operates on the wrong ancestor repo's .git too. Require the
+  # resolved toplevel to actually equal $_ep before trusting it.
+  _eo_git_toplevel=$(git -C "$_ep" rev-parse --show-toplevel 2>/dev/null || echo "")
+  _eo_ep_canon=$(cd "$_ep" 2>/dev/null && pwd -P || printf '%s' "$_ep")
+  if [ -z "$_eo_git_toplevel" ] || [ "$_eo_git_toplevel" != "$_eo_ep_canon" ]; then
     if [ -t 0 ]; then
       # Scan for nested git repos up to 3 levels deep.
       _nested_raw=$(find "$_ep" -maxdepth 3 -name .git -type d 2>/dev/null)
