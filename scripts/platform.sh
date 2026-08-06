@@ -121,17 +121,52 @@ ds_load_env() {
 # users install it via `brew install coreutils` which provides `gtimeout`.
 # Detect at source time and export DS_TIMEOUT_CMD. Callers run:
 #   $DS_TIMEOUT_CMD "$LLM_TIMEOUT" some-cli ...
-# When neither tool is present, DS_TIMEOUT_CMD is set to an empty wrapper
-# that runs the command without a timeout — degraded but doesn't fail-open
-# in a confusing way (`clagentic-lite doctor` warns when timeout is missing).
+#
+# FAIL CLOSED, NOT SILENTLY UNBOUNDED (INV-1a, class-4 foundry fix). This
+# used to fall back to `ds_no_timeout() { shift; "$@"; }` — a stub that
+# DISCARDED the duration argument and ran the wrapped command with NO bound
+# at all when neither `timeout` nor `gtimeout` was on PATH. Every timeout in
+# gates.sh and llm-client.sh routes through $DS_TIMEOUT_CMD, including the
+# freshness-check fetches _gate_resolve_fresh_default_branch_ref uses to
+# prove a diff baseline hasn't gone stale (its own documented guarantee, "a
+# fetch that timed out is treated as a failed fetch", held only because a
+# real timeout binary happened to be present — nothing enforced that
+# precondition). On a host missing both binaries, EVERY timeout in this
+# codebase silently evaporated: a hung `git fetch`, a runaway `semgrep
+# --config=auto` network pull, or an LLM CLI call that never returns would
+# block a blocking gate indefinitely with no diagnostic, and the freshness
+# helper's own safety story became conditional on a binary nobody checked
+# for. This fixes zero reported bugs on its own; it makes every other
+# timeout in the codebase MEAN what it says.
+#
+# `ds_timeout_missing` is set as DS_TIMEOUT_CMD instead of ds_no_timeout: it
+# still ACCEPTS the same "$DURATION cmd..." call shape every caller already
+# uses (so no call site needs to change), but instead of silently dropping
+# the duration and running unbounded, it prints a clear diagnostic and
+# returns a distinct, greppable exit status (99) the FIRST TIME it is
+# actually invoked. This is deliberately NOT a hard `exit` at platform.sh
+# SOURCE time: bin/clagentic-lite sources platform.sh unconditionally before
+# dispatching to any subcommand, including `doctor` itself — the one tool
+# meant to diagnose exactly this gap. A source-time exit would make `doctor`
+# unusable on the host it exists to help. Failing at the point of USE (the
+# first attempted timeout-bounded call) is "startup failure" for the gate or
+# LLM call that needed the bound, without making an unrelated `clagentic-lite
+# doctor`/`init` invocation collateral damage.
+ds_timeout_missing() {
+  # First arg is the (now-refused) duration; the rest is the command that
+  # would have run unbounded. Neither is executed.
+  shift
+  printf 'clagentic-lite: no timeout binary found (checked: timeout, gtimeout) -- refusing to run "%s" unbounded.\n' "$*" 1>&2
+  printf '  install: apt install coreutils | brew install coreutils (provides gtimeout on macOS)\n' 1>&2
+  printf '  every external process invocation and LLM call in this codebase requires a real timeout binary -- see AGENTS.md Invariants, INV-1a.\n' 1>&2
+  return 99
+}
 if command -v timeout >/dev/null 2>&1; then
   DS_TIMEOUT_CMD="timeout"
 elif command -v gtimeout >/dev/null 2>&1; then
   DS_TIMEOUT_CMD="gtimeout"
 else
-  # Stub: ignore the timeout arg, run the rest.
-  ds_no_timeout() { shift; "$@"; }
-  DS_TIMEOUT_CMD="ds_no_timeout"
+  DS_TIMEOUT_CMD="ds_timeout_missing"
 fi
 export DS_TIMEOUT_CMD
 
@@ -141,6 +176,88 @@ export DS_TIMEOUT_CMD
 # POSIX sed: replace every single quote with two single quotes.
 ds_sql_escape() {
   printf '%s' "$1" | sed "s/'/''/g"
+}
+
+# ds_positive_int_or_default VALUE DEFAULT — normalize VALUE to a positive
+# (>= 1) integer, falling back to DEFAULT on empty, non-numeric, OR ZERO
+# input. Prints the result on stdout.
+#
+# WHY THIS EXISTS (lr-49df97 fold-in, BOBBIE finding 3): every wall-clock
+# timeout guard in this codebase used the same two-line idiom —
+#   case "$VAR" in ''|*[!0-9]*) VAR=default ;; esac
+# — which rejects empty and non-digit input but ADMITS the single-digit
+# string "0" unchanged, because "0" contains no non-digit character. A
+# timeout variable that survives this guard as literal 0 then reaches
+# `$DS_TIMEOUT_CMD 0 cmd...` (GNU/BSD `timeout 0` / `gtimeout 0`), and GNU
+# coreutils' own documented behavior for `timeout 0 cmd` is to DISABLE the
+# timeout entirely and run cmd unbounded — the exact silent-no-op shape
+# INV-1a already forbids for a missing timeout binary, reachable here
+# through a config value that LOOKS validated (it passed the existing
+# numeric guard) rather than through a missing binary. This is the same
+# defect class as the DS_TIMEOUT_CMD no-op (INV-1a) and the old
+# CALL_ROLE-shaped accepted-but-unread parameter (INV-3): a control that
+# LOOKS enforced but silently admits the one value that defeats it.
+#
+# Fixed EVERYWHERE the pattern occurs on a timeout-like variable (gates.sh
+# run_bounded/cmd_secrets/cmd_deps/cmd_bleed/cmd_sast/get_review_diff/
+# cmd_ship, llm-client.sh llm_timeout_for's BASE/MAX) rather than at one
+# call site — a per-site patch here would be exactly the instance-fixing
+# AGENTS.md's Invariants section and the sweeping-test-discovery convention
+# both exist to close; see test_invariants.py's sweep for the mechanical
+# check that no call site regresses to the bare case-guard idiom.
+#
+# Deliberately NOT used for CLAGENTIC_LLM_TIMEOUT_MAX_SEC's own MAX
+# semantics (llm_timeout_for, llm-client.sh): that variable's 0 is a
+# DELIBERATE, DOCUMENTED "no cap" sentinel ("Cap at max when max is set and
+# positive") — a pre-existing, intentional, different meaning of zero, not
+# an instance of this defect. Only BASE timeouts (the wall-clock bound
+# actually handed to $DS_TIMEOUT_CMD) are in scope for this helper.
+ds_positive_int_or_default() {
+  _dpiod_val="$1"
+  _dpiod_default="$2"
+  case "$_dpiod_val" in ''|*[!0-9]*) _dpiod_val="$_dpiod_default" ;; esac
+  [ "$_dpiod_val" -le 0 ] 2>/dev/null && _dpiod_val="$_dpiod_default"
+  printf '%s' "$_dpiod_val"
+}
+
+# ds_llm_role_is_bash_unrestricted ROLE — returns 0 (true) iff ROLE is one
+# of the explicitly enumerated LLM roles that legitimately keeps Bash;
+# returns 1 (restricted) for anything else, including empty, unset, or a
+# misspelled/unrecognized role string.
+#
+# SINGLE SOURCE OF TRUTH for the opt-out enumeration (lr-49df97 fold-in,
+# HOLDEN-authorized correction): invoke_claude's own tool-restriction
+# decision (scripts/llm-client.sh) calls this rather than re-deriving the
+# same four-name list inline, so the enumeration cannot drift between two
+# copies. auditor/gate/builder/summarizer are the four names locked by
+# test_other_roles_get_no_tool_restriction_flags
+# (test_reviewer_tool_restriction.py) — that test is the binding contract
+# for this exact set, not a judgment call re-derived here.
+#
+# WHY A SEPARATE FUNCTION, NOT JUST invoke_claude's OWN case STATEMENT
+# (the second, independent layer BOBBIE's fold-in and the coordinator's
+# adjudication both asked for): invoke_claude's case statement is the
+# CONSUMER of the restriction decision -- it decides what flags to pass.
+# This function is a distinct, independently-callable PREDICATE any future
+# producer/validator (walk_chain's own role-sanity check, a doctor
+# diagnostic, a test) can call without re-deriving or duplicating the
+# enumeration, so a future contributor extending the opt-out list has
+# exactly one place to edit and every consumer of the predicate picks up
+# the change automatically -- the same "one place to add a scanner"
+# discipline CLAGENTIC_SECURITY_TOOLS (bin/clagentic-lite) already uses
+# for an unrelated enumeration.
+#
+# FAILS TOWARD RESTRICTED (the property this whole fold-in exists to
+# establish): the case statement's default arm is 1 (restricted) -- an
+# empty, unset, or misspelled ROLE never reaches the 0 (unrestricted)
+# return. This is the opposite polarity of an opt-in list, where anything
+# NOT recognized would silently fall through to unrestricted -- exactly
+# the fail-open shape BOBBIE's audit flagged.
+ds_llm_role_is_bash_unrestricted() {
+  case "$1" in
+    auditor|gate|builder|summarizer) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Write one row to .clagentic/lite/audit.db. Resolves repo root itself so callers
