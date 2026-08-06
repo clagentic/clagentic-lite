@@ -53,6 +53,61 @@ fi
 # state, or branch identity must be keyed to the enrolled project root.
 _git() { git -C "$REPO_ROOT" "$@"; }
 
+# run_bounded [TIMEOUT_SEC] -- CMD [ARGS...]
+#
+# INV-1a/INV-2 enforcement (class-4 foundry fix): the SOLE entry point for
+# every external-process invocation in this file that was previously
+# untimed — gitleaks, osv-scanner, semgrep, `git push`, `gh pr view`, `gh pr
+# create`. (`git fetch`/`git ls-remote` inside
+# _gate_resolve_fresh_default_branch_ref were already timed via
+# $DS_TIMEOUT_CMD directly, predating this task — not converted here since
+# they were never part of the untimed set, but they benefit from the same
+# platform.sh fail-closed guarantee this function relies on.) Before this
+# fix, each of the untimed sites ran with NO wall-clock budget at all — a
+# hung scanner, a stalled push, or a `semgrep --config=auto` rule download
+# that never completes blocks a blocking security gate indefinitely with no
+# diagnostic. Routing every one of these through a single named wrapper
+# makes the unbounded form UNWRITABLE (a reviewer or future contributor
+# cannot add a tenth bare invocation without it being visibly different
+# from every sibling call) and gives one place to raise the default or add
+# a turn/output cap later, rather than a per-site timeout variable that a
+# future call site can simply omit.
+#
+# Args: TIMEOUT_SEC (optional, positive integer seconds) then `--` then the
+# command and its arguments. Omitting TIMEOUT_SEC (i.e. starting directly
+# with `--`) falls back to CLAGENTIC_EXTERNAL_TIMEOUT_SEC (default 120) —
+# long enough for a full-tree semgrep/osv-scanner pass on a mid-size repo,
+# short enough that a hung process surfaces as a step failure inside a
+# single gate invocation rather than wedging it. A non-numeric TIMEOUT_SEC
+# falls back the same way (numeric guard, matching every other
+# timeout/interval var in this file — see gates.sh:538, :689, :3598).
+#
+# Relies on DS_TIMEOUT_CMD (platform.sh) for the actual bound. On a host
+# missing both `timeout` and `gtimeout`, DS_TIMEOUT_CMD resolves to
+# ds_timeout_missing, which fails closed (returns 99, refuses to run the
+# command at all) rather than silently running unbounded — that guarantee
+# is what makes every timeout this function applies actually mean
+# something (see platform.sh's own INV-1a comment).
+run_bounded() {
+  case "$1" in
+    --)
+      _rb_timeout="${CLAGENTIC_EXTERNAL_TIMEOUT_SEC:-120}"
+      shift
+      ;;
+    *)
+      _rb_timeout="$1"
+      shift
+      # Expect the `--` separator next; tolerate its absence (a caller that
+      # passes TIMEOUT_SEC directly followed by the command, no separator)
+      # since this is an internal call convention, not a public CLI.
+      [ "${1:-}" = "--" ] && shift
+      ;;
+  esac
+  case "$_rb_timeout" in ''|*[!0-9]*) _rb_timeout="${CLAGENTIC_EXTERNAL_TIMEOUT_SEC:-120}" ;; esac
+  case "$_rb_timeout" in ''|*[!0-9]*) _rb_timeout=120 ;; esac
+  $DS_TIMEOUT_CMD "$_rb_timeout" "$@"
+}
+
 AUDIT_DB="$REPO_ROOT/.clagentic/lite/audit.db"
 mkdir -p "$REPO_ROOT/.clagentic/lite"
 
@@ -202,6 +257,13 @@ cmd_secrets() {
   # format varies (`v8.18.4`, `8.18.4`, multi-line banner). The `git`
   # subcommand was added in 8.18; if `gitleaks git --help` exits 0 we use
   # it, otherwise we fall back to `gitleaks protect`.
+  # Bound every gitleaks invocation (INV-1a/INV-2, class-4 foundry fix): a
+  # full branch-history scan in particular can legitimately take longer than
+  # the generic run_bounded default, so gitleaks gets its own configurable
+  # timeout rather than sharing CLAGENTIC_EXTERNAL_TIMEOUT_SEC's 120s.
+  _SECRETS_TIMEOUT="${CLAGENTIC_SECRETS_TIMEOUT_SEC:-300}"
+  case "$_SECRETS_TIMEOUT" in ''|*[!0-9]*) _SECRETS_TIMEOUT=300 ;; esac
+
   if gitleaks git --help >/dev/null 2>&1; then
     if [ "$_SECRETS_ON_FEATURE" = "1" ]; then
       # No staged changes on a feature branch — scan the branch's committed
@@ -209,18 +271,18 @@ cmd_secrets() {
       # already-committed hunks that would otherwise be invisible to --staged.
       printf '[gates/secrets] no staged changes — scanning branch history with gitleaks git\n' 1>&2
       # shellcheck disable=SC2086
-      if gitleaks git --redact --no-banner $CFG_ARG; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --redact --no-banner $CFG_ARG; then
         cmd_log_run secrets pass "branch history scan (no staged changes)"
       else
-        cmd_log_run secrets block "gitleaks reported findings (branch history scan)"
+        cmd_log_run secrets block "gitleaks reported findings or timed out after ${_SECRETS_TIMEOUT}s (branch history scan)"
         return 1
       fi
     else
       # shellcheck disable=SC2086
-      if gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG; then
         cmd_log_run secrets pass ""
       else
-        cmd_log_run secrets block "gitleaks reported findings"
+        cmd_log_run secrets block "gitleaks reported findings or timed out after ${_SECRETS_TIMEOUT}s"
         return 1
       fi
     fi
@@ -232,10 +294,10 @@ cmd_secrets() {
       cmd_log_run secrets warn "older gitleaks; no staged changes on feature branch (history scan unavailable)"
     else
       # shellcheck disable=SC2086
-      if gitleaks protect --staged --redact --no-banner $CFG_ARG; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks protect --staged --redact --no-banner $CFG_ARG; then
         cmd_log_run secrets pass ""
       else
-        cmd_log_run secrets block "gitleaks reported findings"
+        cmd_log_run secrets block "gitleaks reported findings or timed out after ${_SECRETS_TIMEOUT}s"
         return 1
       fi
     fi
@@ -257,6 +319,12 @@ cmd_deps() {
   SEVERITY="${CLAGENTIC_OSV_SEVERITY:-CRITICAL}"
   GLOBAL_IGNORE="$HOME/.config/clagentic/osv-ignore"
   REPO_IGNORE="$REPO_ROOT/.clagentic/osv-ignore"
+
+  # Bound every osv-scanner invocation (INV-1a/INV-2, class-4 foundry fix):
+  # one path does a network vulnerability-DB lookup, so this defaults higher
+  # than the generic run_bounded default.
+  _OSV_TIMEOUT="${CLAGENTIC_OSV_TIMEOUT_SEC:-300}"
+  case "$_OSV_TIMEOUT" in ''|*[!0-9]*) _OSV_TIMEOUT=300 ;; esac
 
   # Capability-probe: osv-scanner v2.x uses `scan source` subcommand; v1.x
   # used a flat invocation with --severity / --ignore-vulns flags (removed in
@@ -308,9 +376,9 @@ cmd_deps() {
     _OSV_STATUS=0
     if [ "$_OSV_SUBCMD" = "source" ]; then
       # shellcheck disable=SC2086
-      osv-scanner scan source -r --format=json "--config=$_OSV_TMP" $_OSV_EXCL_FLAGS . > "$_OSV_JSON" || _OSV_STATUS=$?
+      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan source -r --format=json "--config=$_OSV_TMP" $_OSV_EXCL_FLAGS . > "$_OSV_JSON" || _OSV_STATUS=$?
     else
-      osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" . > "$_OSV_JSON" || _OSV_STATUS=$?
+      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" . > "$_OSV_JSON" || _OSV_STATUS=$?
     fi
     case "$_OSV_STATUS" in
       0)
@@ -355,10 +423,10 @@ cmd_deps() {
 
     set -- "$@" .   # trailing path arg
 
-    if osv-scanner "$@"; then
+    if run_bounded "$_OSV_TIMEOUT" -- osv-scanner "$@"; then
       cmd_log_run deps pass ""
     else
-      cmd_log_run deps block "osv-scanner reported vulnerabilities"
+      cmd_log_run deps block "osv-scanner reported vulnerabilities or timed out after ${_OSV_TIMEOUT}s"
       return 1
     fi
   fi
@@ -717,21 +785,27 @@ cmd_sast() {
     fi
   fi
 
+  # Bound every semgrep invocation (INV-1a/INV-2, class-4 foundry fix):
+  # --config=auto DOWNLOADS RULES FROM THE NETWORK on top of running a scan,
+  # so this defaults higher than the generic run_bounded default.
+  _SAST_TIMEOUT="${CLAGENTIC_SAST_TIMEOUT_SEC:-300}"
+  case "$_SAST_TIMEOUT" in ''|*[!0-9]*) _SAST_TIMEOUT=300 ;; esac
+
   # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
   if [ -n "$_SAST_BASELINE" ]; then
     echo "[gates/sast] scoping to diff-introduced findings (baseline-commit=$_SAST_BASELINE)" 1>&2
-    if semgrep --config=auto --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE"; then
+    if run_bounded "$_SAST_TIMEOUT" -- semgrep --config=auto --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE"; then
       cmd_log_run sast pass "baseline-commit=$_SAST_BASELINE"
     else
-      cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE"
+      cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE (or timed out after ${_SAST_TIMEOUT}s)"
       return 1
     fi
   else
     echo "[gates/sast] full-tree scan (baseline scoping unavailable: $_SAST_BASELINE_SKIP_REASON)" 1>&2
-    if semgrep --config=auto --error --severity=ERROR; then
+    if run_bounded "$_SAST_TIMEOUT" -- semgrep --config=auto --error --severity=ERROR; then
       cmd_log_run sast pass "full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"
     else
-      cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON)"
+      cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON; or timed out after ${_SAST_TIMEOUT}s)"
       return 1
     fi
   fi
@@ -2198,6 +2272,9 @@ cmd_review() {
     if [ "$_crv_cause" = "unwrap" ]; then
       cmd_log_run review block "model-output-unparseable: reviewer ran but returned no parseable role-shaped JSON (status=$_crv_review_status)"
       echo "[gates/review] MODEL_OUTPUT_UNPARSEABLE: reviewer ran successfully but its output could not be reduced to exactly one parseable review — no real review occurred." 1>&2
+    elif [ "$_crv_cause" = "turns-exhausted" ]; then
+      cmd_log_run review block "turns-exhausted: reviewer ran out of turns before completing (status=$_crv_review_status)"
+      echo "[gates/review] TURNS_EXHAUSTED: reviewer exhausted its turn limit before completing — a truncated run, not a real review. This is the failure a well-formed-but-truncated findings:[] would otherwise hide as a clean pass." 1>&2
     else
       cmd_log_run review block "infra-degraded: all reviewer chain steps failed (status=$_crv_review_status)"
       echo "[gates/review] INFRA_DEGRADED: reviewer chain returned degraded envelope — no real review occurred." 1>&2
@@ -2402,36 +2479,52 @@ review_is_degraded() {
 # _llm_degraded_cause STATUS FILE
 #
 # MODEL-RETURNED-PROSE CLASSIFICATION (lr-33958f, PR-C, the fix the foundry
-# insisted on hardest). Distinguishes walk_chain's two degraded causes so a
-# caller can point its remediation hint at the right place instead of
-# always saying "check LLM CLI config/auth":
-#   "infra"   — misconfigured/auth-broken/network-out chain. The name
-#               INFRA_DEGRADED actually describes. "check CLI config/auth"
-#               is correct remediation.
-#   "unwrap"  — the model ran successfully (auth worked, tokens were
-#               spent) but its output could not be reduced to exactly one
-#               role-shaped JSON candidate (prose-only, or ambiguous).
-#               NOT an infrastructure problem; sending the operator to
-#               check CLI config/auth here is the exact misdirection the
-#               foundry named as a plausible contributor to two real
-#               misdiagnoses. Remediation hint: reviewer OUTPUT SHAPE.
+# insisted on hardest; extended class-4). Distinguishes walk_chain's
+# degraded causes so a caller can point its remediation hint at the right
+# place instead of always saying "check LLM CLI config/auth":
+#   "infra"            — misconfigured/auth-broken/network-out chain. The
+#                         name INFRA_DEGRADED actually describes. "check CLI
+#                         config/auth" is correct remediation.
+#   "unwrap"            — the model ran successfully (auth worked, tokens
+#                         were spent) but its output could not be reduced to
+#                         exactly one role-shaped JSON candidate (prose-only,
+#                         or ambiguous). NOT an infrastructure problem;
+#                         sending the operator to check CLI config/auth here
+#                         is the exact misdirection the foundry named as a
+#                         plausible contributor to two real misdiagnoses.
+#                         Remediation hint: reviewer OUTPUT SHAPE.
+#   "turns-exhausted"   — the model ran, spent tokens, and was cut off by
+#                         its own internal turn ceiling before completing
+#                         (subtype=="error_max_turns"). NOT infra, NOT
+#                         unwrap: the output may be perfectly well-formed
+#                         JSON, which is exactly what makes this cause the
+#                         one the foundry flagged hardest -- it can look
+#                         identical to a clean pass to any check that only
+#                         inspects shape. Remediation hint: the diff is too
+#                         large or the caller-tracing work too deep for the
+#                         model's turn budget on this call.
 #
 # STATUS is walk_chain's own captured exit code where available (4 = the
-# unwrap cause, unambiguous on its own) — checked FIRST because it needs no
-# JSON tool at all and is authoritative for the single-pass call site that
-# still has it in scope. FILE's own "cause" field (emit_degraded, llm-
-# client.sh) is the fallback for callers where the exit status was already
-# collapsed to a boolean before this point (e.g. after `merge_envelopes`),
-# or where STATUS is not available/passed as empty. Defaults to "infra"
-# when neither source resolves a value — the pre-existing behavior for
-# every degraded envelope this task predates, so an unlabeled legacy
-# envelope (no "cause" field, e.g. one written before this PR) is never
-# misclassified as the new, narrower "unwrap" cause it cannot actually be.
+# unwrap cause, 5 = the turns-exhausted cause, both unambiguous on their
+# own) — checked FIRST because it needs no JSON tool at all and is
+# authoritative for the single-pass call site that still has it in scope.
+# FILE's own "cause" field (emit_degraded, llm-client.sh) is the fallback
+# for callers where the exit status was already collapsed to a boolean
+# before this point (e.g. after `merge_envelopes`), or where STATUS is not
+# available/passed as empty. Defaults to "infra" when neither source
+# resolves a value — the pre-existing behavior for every degraded envelope
+# this task predates, so an unlabeled legacy envelope (no "cause" field,
+# e.g. one written before this PR) is never misclassified as a newer,
+# narrower cause it cannot actually be.
 _llm_degraded_cause() {
   _ldc_status="${1:-}"
   _ldc_file="$2"
   if [ "$_ldc_status" = "4" ]; then
     printf 'unwrap'
+    return 0
+  fi
+  if [ "$_ldc_status" = "5" ]; then
+    printf 'turns-exhausted'
     return 0
   fi
   if command -v jq >/dev/null 2>&1; then
@@ -2442,20 +2535,24 @@ _llm_degraded_cause() {
     _ldc_cause="infra"
   fi
   case "$_ldc_cause" in
-    unwrap) printf 'unwrap' ;;
-    *)      printf 'infra' ;;
+    unwrap)           printf 'unwrap' ;;
+    turns-exhausted)  printf 'turns-exhausted' ;;
+    *)                printf 'infra' ;;
   esac
 }
 
 # _llm_degraded_remediation_lines CAUSE — prints the cause-specific
-# remediation hint line(s) for INFRA_DEGRADED/MODEL_OUTPUT_UNPARSEABLE
-# stderr output. Single source of the two message bodies so every call
-# site (review, adversarial, merge-gate) stays in sync rather than each
-# hand-rolling its own copy that could drift.
+# remediation hint line(s) for INFRA_DEGRADED/MODEL_OUTPUT_UNPARSEABLE/
+# TURNS_EXHAUSTED stderr output. Single source of the message bodies so
+# every call site (review, adversarial, merge-gate) stays in sync rather
+# than each hand-rolling its own copy that could drift.
 _llm_degraded_remediation_lines() {
   case "$1" in
     unwrap)
       printf '%s\n' "Check the reviewer/auditor OUTPUT SHAPE — the model ran (auth and network both worked) but did not return parseable role-shaped JSON. Not a CLI config/auth problem."
+      ;;
+    turns-exhausted)
+      printf '%s\n' "The model exhausted its turn limit before finishing — not a CLI config/auth problem. The diff may be too large, or the required caller-tracing too deep, for the model's turn budget on this call. Check num_turns in the audit trail (scripts/gates.sh digest / llm-call rows) against recent successful runs."
       ;;
     *)
       printf '%s\n' "Check LLM CLI config/auth."
@@ -2817,7 +2914,10 @@ cmd_adversarial() {
   # the "unwrap" cause -- also checked here alongside 3 so an auditor that
   # ran successfully but returned unparseable output is not missed by this
   # detector (see llm-client.sh walk_chain's DEGRADED_EXIT comment).
-  if [ "$_adv_status" -eq 3 ] || [ "$_adv_status" -eq 4 ] || _llm_output_is_degraded markdown "$OUT"; then
+  # STATUS 5 (class-4 foundry fix): walk_chain's THIRD degraded exit status,
+  # the "turns-exhausted" cause -- a truncated auditor run must never be
+  # indistinguishable from a genuinely clean pass.
+  if [ "$_adv_status" -eq 3 ] || [ "$_adv_status" -eq 4 ] || [ "$_adv_status" -eq 5 ] || _llm_output_is_degraded markdown "$OUT"; then
     _adv_degraded=1
   fi
   # Prepend a SHA stamp comment as the first line so build_gate_summary can
@@ -2979,6 +3079,9 @@ EOF3
     if [ "$_adv_cause" = "unwrap" ]; then
       cmd_log_run adversarial degraded "model-output-unparseable: auditor ran but returned no parseable output (status=$_adv_status)"
       echo "[gates/adversarial] MODEL_OUTPUT_UNPARSEABLE: auditor ran successfully but its output could not be reduced to a parseable audit — no real audit occurred." 1>&2
+    elif [ "$_adv_cause" = "turns-exhausted" ]; then
+      cmd_log_run adversarial degraded "turns-exhausted: auditor ran out of turns before completing (status=$_adv_status)"
+      echo "[gates/adversarial] TURNS_EXHAUSTED: auditor exhausted its turn limit before completing — no real audit occurred." 1>&2
     else
       cmd_log_run adversarial degraded "auditor produced a degraded envelope (status=$_adv_status) — no real audit occurred"
       echo "[gates/adversarial] INFRA_DEGRADED: auditor chain returned a degraded envelope — no real audit occurred." 1>&2
@@ -3219,11 +3322,17 @@ except Exception:
   "$TOOL_HOME/scripts/llm-client.sh" merge-gate < "$IN" > "$OUT" || _mg_status=$?
   # STATUS 4 (lr-33958f, PR-C): also checked, alongside 3, for the "unwrap"
   # cause -- see llm-client.sh walk_chain's DEGRADED_EXIT comment.
-  if [ "$_mg_status" -eq 3 ] || [ "$_mg_status" -eq 4 ] || _llm_output_is_degraded json "$OUT"; then
+  # STATUS 5 (class-4 foundry fix): also checked for the "turns-exhausted"
+  # cause -- a merge-gate decision truncated mid-reasoning must never be
+  # read as a real approve/refuse.
+  if [ "$_mg_status" -eq 3 ] || [ "$_mg_status" -eq 4 ] || [ "$_mg_status" -eq 5 ] || _llm_output_is_degraded json "$OUT"; then
     _mg_cause=$(_llm_degraded_cause "$_mg_status" "$OUT")
     if [ "$_mg_cause" = "unwrap" ]; then
       cmd_log_run "$_mg_gate_name" block "model-output-unparseable: merge-gate ran but returned no parseable decision (status=$_mg_status)"
       echo "[gates/merge-gate] MODEL_OUTPUT_UNPARSEABLE: merge-gate ran successfully but its output could not be reduced to a parseable decision — no real decision was made." 1>&2
+    elif [ "$_mg_cause" = "turns-exhausted" ]; then
+      cmd_log_run "$_mg_gate_name" block "turns-exhausted: merge-gate ran out of turns before completing (status=$_mg_status)"
+      echo "[gates/merge-gate] TURNS_EXHAUSTED: merge-gate exhausted its turn limit before completing — no real decision was made." 1>&2
     else
       cmd_log_run "$_mg_gate_name" block "infra-degraded: all merge-gate chain steps failed (status=$_mg_status)"
       echo "[gates/merge-gate] INFRA_DEGRADED: merge-gate chain returned a degraded envelope — no real decision was made." 1>&2
@@ -4229,16 +4338,24 @@ cmd_ship() {
     return 0
   fi
 
+  # Bound every network-touching git/gh invocation below (INV-1a/INV-2,
+  # class-4 foundry fix): `git push`, `gh pr view`, `gh pr create` were all
+  # previously untimed -- a hung push or a stalled gh API call would block
+  # `ship` indefinitely with no diagnostic, the last step of an otherwise
+  # fully-bounded gate sequence.
+  _SHIP_TIMEOUT="${CLAGENTIC_SHIP_TIMEOUT_SEC:-120}"
+  case "$_SHIP_TIMEOUT" in ''|*[!0-9]*) _SHIP_TIMEOUT=120 ;; esac
+
   # Push + open PR if gh is available, else print a template.
   if _git remote get-url origin >/dev/null 2>&1; then
-    _git push -u origin "$BRANCH" || { echo "[gates/ship] push failed"; cmd_log_run ship block "push failed"; exit 1; }
+    run_bounded "$_SHIP_TIMEOUT" -- _git push -u origin "$BRANCH" || { echo "[gates/ship] push failed or timed out after ${_SHIP_TIMEOUT}s"; cmd_log_run ship block "push failed"; exit 1; }
   fi
   if command -v gh >/dev/null 2>&1; then
-    if gh pr view "$BRANCH" >/dev/null 2>&1; then
+    if run_bounded "$_SHIP_TIMEOUT" -- gh pr view "$BRANCH" >/dev/null 2>&1; then
       echo "[gates/ship] PR already open for $BRANCH"
     else
-      gh pr create --fill --base "$DEFAULT_BRANCH" --head "$BRANCH" || \
-        echo "[gates/ship] gh pr create failed — open the PR manually"
+      run_bounded "$_SHIP_TIMEOUT" -- gh pr create --fill --base "$DEFAULT_BRANCH" --head "$BRANCH" || \
+        echo "[gates/ship] gh pr create failed or timed out after ${_SHIP_TIMEOUT}s — open the PR manually"
     fi
   else
     REMOTE=$(_git remote get-url origin 2>/dev/null || echo "<remote>")

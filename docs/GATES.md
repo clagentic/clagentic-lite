@@ -72,9 +72,8 @@ Write rules:
 | **Per-call timeout** | `${CLAGENTIC_LLM_TIMEOUT_SEC}` seconds (default 180). Hung CLI → step failure → chain advances. |
 | **Required-role enforcement** | `CLAGENTIC_REVIEWER_REQUIRED=1` makes a full-chain failure a hard gate error (non-zero exit) instead of a degraded envelope. Use when the cross-vendor property is non-negotiable and a same-vendor fallback must be a visible failure rather than a silent degradation. Applies to any role: `CLAGENTIC_<ROLE>_REQUIRED=1`. |
 
-**Two distinct degraded causes (lr-33958f).** A degraded chain reports one of
-two mutually exclusive causes, both fail-closed but with different
-remediation:
+**Three distinct degraded causes.** A degraded chain reports one of three
+mutually exclusive causes, all fail-closed but with different remediation:
 
 - **`INFRA_DEGRADED`** (`walk_chain` exit 3, envelope `"cause": "infra"`) —
   no chain configured, or every step's own CLI invocation failed (nonzero
@@ -91,6 +90,21 @@ remediation:
   config/auth for a problem in neither — see the shared unwrap helper,
   `_llm_unwrap_json_envelope` in `scripts/llm-client.sh`, called once from
   `walk_chain` for every role/CLI uniformly.
+- **`TURNS_EXHAUSTED`** (`walk_chain` exit 5, envelope
+  `"cause": "turns-exhausted"`) — the model exhausted its agentic tool-use
+  turn ceiling (`subtype=="error_max_turns"` on the raw
+  `--output-format json` envelope) before completing. Distinct from BOTH of
+  the above: the model ran (not infra), and its output may be
+  well-formed, role-shaped JSON — e.g. `findings: []` emitted before being
+  cut off — which is exactly what makes this the most dangerous of the
+  three. A truncated run must never pass as a clean review; this cause is
+  checked, and rejected, BEFORE `walk_chain`'s own pass branch, regardless
+  of how parseable the partial output looks. `num_turns` is logged into the
+  `llm-call` audit row for every claude json-mode call (not only a failing
+  one), so a reviewer riding close to its ceiling is visible in
+  `gates.sh digest`/`gates.sh status` before it tips over into this state.
+  See AGENTS.md § Invariants, INV-4, for the full rationale and the
+  no-settable-turn-cap limitation this detection does NOT close on its own.
 
 Unwrap itself requires **exactly one** JSON candidate — located via
 `re.search`/`finditer` over the model's full response (never an
@@ -99,6 +113,16 @@ JSON and match the calling role's expected shape. Zero candidates and more
 than one candidate are both failures, reported distinctly (never a silent
 first-or-last pick) — see that function's own doc comment for the full
 contract.
+
+**Reviewer tool restriction.** When the resolved chain step is `claude`, the
+Reviewer role's `claude --print` invocation carries `--allowedTools
+Read,Grep,Glob --disallowedTools Bash` — it keeps Read/Grep/Glob (its prompt
+mandates caller-tracing and import-checking) but loses Bash (nothing in its
+prompt asks it to execute anything, and a `--print` reviewer holding
+unrestricted Bash while reading an attacker-influenceable diff is a
+prompt-injection-to-execution path). Scoped to the Reviewer only — the
+Auditor, Merge Gate, Builder, and Summarizer are unaffected. Not
+independently enforceable against `codex` (no equivalent flag).
 
 ### Reviewer-consulted deferrals
 
@@ -534,6 +558,7 @@ change-scoped pattern scan (internal-bleed):
 | **Blocks?** | Yes. Also blocks if gitleaks is missing entirely — set `CLAGENTIC_ALLOW_MISSING_GITLEAKS=1` to skip explicitly. |
 | **Override** | None for findings — secrets cannot be committed. Rotate, then re-stage. |
 | **Augment** | `.gitleaks.toml` in repo root extends the default ruleset. Path-scoped allowlists only (see `.gitleaks.toml` comment for why regex allowlists on token literals are dangerous). |
+| **Timeout** | Every gitleaks invocation runs under `run_bounded` (default 300s, configurable via `CLAGENTIC_SECRETS_TIMEOUT_SEC`) — a full branch-history scan can legitimately take longer than a staged-only scan. A timeout counts as a block, same as a real finding. |
 
 ### 4b. Dependencies (pre-push)
 
@@ -544,6 +569,7 @@ change-scoped pattern scan (internal-bleed):
 | **Severity** | Set `CLAGENTIC_OSV_SEVERITY` in `~/.config/clagentic/config` or `.clagentic/config`. Values: `CRITICAL` (default), `HIGH`, `MEDIUM`, `LOW`. Set `LOW` to restore block-on-any-finding behavior. Newer releases no longer expose a scan-time severity filter, so clagentic-lite captures JSON and applies the threshold to osv-scanner's computed `max_severity` values. Missing or malformed severity data blocks fail-closed. |
 | **Ignore list** | Add CVE/GHSA IDs one-per-line to `~/.config/clagentic/osv-ignore` (global) or `.clagentic/osv-ignore` (repo). Lines starting with `#` and blank lines are ignored. For newer releases, these become `[[IgnoredVulns]]` blocks in the generated temp config; for older releases, they are passed as `--ignore-vulns=<id>`. |
 | **Missing tool** | Set `CLAGENTIC_ALLOW_MISSING_OSV=1` to skip if osv-scanner is not installed. |
+| **Timeout** | Every osv-scanner invocation runs under `run_bounded` (default 300s, configurable via `CLAGENTIC_OSV_TIMEOUT_SEC`) — the vulnerability-DB lookup is a network call. A timeout counts as a block. |
 
 ### 4c. SAST (pre-push)
 
@@ -554,6 +580,7 @@ change-scoped pattern scan (internal-bleed):
 | **Override** | `.semgrepignore` at the repo root (natively honored by semgrep — add file paths or rule IDs to suppress); `# nosemgrep: <rule-id> — <reason>` inline in source. |
 | **Missing tool** | Set `CLAGENTIC_ALLOW_MISSING_SEMGREP=1` if semgrep is not installed locally. |
 | **Baseline fetch timeout** | `CLAGENTIC_SAST_FETCH_TIMEOUT_SEC` (default 30). Bounds both the `git fetch` and the `git ls-remote` freshness check used to resolve the baseline commit (see below) — expiry falls back to full-tree, same as any other resolution failure. |
+| **Scan timeout** | Every semgrep invocation runs under `run_bounded` (default 300s, configurable via `CLAGENTIC_SAST_TIMEOUT_SEC`) — `--config=auto` downloads rules over the network on top of running the scan itself. A timeout counts as a block, same as an ERROR-severity finding. |
 
 **Baseline scoping (lr-06b87e).** A plain `semgrep --config=auto` with no path argument scans the entire working tree on every run, so pre-existing findings in files the current branch never touched get attributed to that branch and block the gate — a full-tree scan is punished the same as a real regression. `cmd_sast` (`scripts/gates.sh`) narrows this with semgrep's own `--baseline-commit=<ref>`, which reports only findings introduced relative to that commit (semgrep, not clagentic-lite, computes the diff — this correctly follows moved/changed-context findings the way a path-restricted or full-tree-plus-filter approach cannot).
 
@@ -576,6 +603,12 @@ The fix treats a resolved `origin/<default-branch>` ref as trustworthy only when
 **Fail-closed, not fail-narrow.** Any one of the above conditions failing — old semgrep, detached HEAD, on the default branch, a fetch that fails or times out, a resolved ref that disagrees with the independent `ls-remote` freshness check, or a failed merge-base (including shallow clones) — falls back to the exact prior full-tree `semgrep --config=auto --error --severity=ERROR` behavior, and blocks on whatever it finds. The gate never silently narrows to an empty or partial scan on a resolution failure; a scoping bug degrades to "noisier, but still safe," never to "quietly stops checking." The active mode and, when full-tree, the reason baseline scoping was unavailable are both logged to stderr and the `gate_runs.details` audit column.
 
 Rationale: deterministic tools, well-understood, no LLM in the security path. The LLM-driven `adversarial` layer (Gate 5) is separate and non-blocking by design.
+
+### Every external-process invocation is bounded (INV-4)
+
+`scripts/gates.sh`'s `run_bounded` wrapper is the single entry point every gitleaks, osv-scanner, semgrep, `git push`, `gh pr view`, and `gh pr create` invocation runs through — a call site that bypasses it stands out as visibly different from every sibling. Each tool gets its own configurable default (`CLAGENTIC_SECRETS_TIMEOUT_SEC`, `CLAGENTIC_OSV_TIMEOUT_SEC`, `CLAGENTIC_SAST_TIMEOUT_SEC`, `CLAGENTIC_SHIP_TIMEOUT_SEC`; unnamed sites fall back to `CLAGENTIC_EXTERNAL_TIMEOUT_SEC`, default 120s) because a full branch-history gitleaks scan or a rule-downloading `semgrep --config=auto` legitimately needs more headroom than a quick `gh pr view` check.
+
+**This bound is only as real as the timeout binary underneath it.** `$DS_TIMEOUT_CMD` (`scripts/platform.sh`) resolves to `timeout` or `gtimeout` when either is on PATH; when neither is present, it resolves to `ds_timeout_missing`, which refuses to run the wrapped command at all (distinct exit status 99) rather than silently running it unbounded. Every timeout in this codebase — this section's, Gate 4c's fetch timeout, and the LLM per-call timeout `scripts/llm-client.sh` uses — depends on this guarantee; see AGENTS.md § Invariants, INV-1a.
 
 ### 4d. Internal-bleed scan
 
