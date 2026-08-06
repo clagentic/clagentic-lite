@@ -454,19 +454,31 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # reaches nothing.
 #
 # VALIDATED before it is ever stamped or probed (bin/clagentic-lite,
-# _validate_router_url): this value is a traffic-interception primitive — it
-# redirects the entire Claude Code session, and in the router's passthrough
-# mode your real Anthropic credentials are forwarded to whatever host it
-# names. A malformed value (not a well-formed http:// or https:// URL) is
-# REFUSED at enroll/update time rather than silently stamped — a bad value
-# here breaks every session opened against the enrolled repo, so failing
-# loudly at stamp time is far cheaper than debugging that later. A
-# well-formed but NON-LOCAL host (anything other than localhost/127.0.0.0/8/
-# ::1) is allowed but WARNED loudly at both stamp time and every `doctor`
-# run, naming exactly what gets forwarded — the router is designed to run
-# locally, but someone legitimately running it on another LAN box is not
-# wrong, only unusual enough to deserve an unmissable flag rather than a
+# _validate_router_url / _router_url_classify): this value is a
+# traffic-interception primitive — it redirects the entire Claude Code
+# session, and in the router's passthrough mode your real Anthropic
+# credentials are forwarded to whatever host it names. A malformed value
+# (not a well-formed http:// or https:// URL) is REFUSED at enroll/update
+# time rather than silently stamped — a bad value here breaks every session
+# opened against the enrolled repo, so failing loudly at stamp time is far
+# cheaper than debugging that later. A well-formed but NON-LOCAL host
+# (anything other than exactly localhost/0.0.0.0/a real 127.0.0.0/8 address/
+# ::1 or [::1]) is allowed but WARNED loudly at both stamp time and every
+# `doctor` run, naming exactly what gets forwarded — the router is designed
+# to run locally, but someone legitimately running it on another LAN box is
+# not wrong, only unusual enough to deserve an unmissable flag rather than a
 # silent accept.
+#
+# The host check is structural, not string-matched: RFC 3986 userinfo
+# (user:pass@ before the real host) is stripped before the host is ever
+# read, and 127.0.0.0/8 membership is a real numeric-octet-range check, not
+# a "starts with 127." prefix test -- both "http://127.0.0.1:x@evil.com/"
+# and "http://127.0.0.1.evil.com/" correctly classify as the non-local host
+# evil.com, not as local. Any host shape this check does not confidently
+# recognize (IPv4-mapped IPv6 such as [::ffff:127.0.0.1], octal/decimal/hex
+# IP encodings) is classified non-local rather than guessed at -- a false
+# "non-local" costs one warning line, a false "local" would silently
+# forward real credentials, so ambiguity always resolves toward the warning.
 # CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765
 
 # CLAGENTIC_ROUTER_TOKEN: router inference token. Sent as

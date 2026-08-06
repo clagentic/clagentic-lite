@@ -271,6 +271,62 @@ stamp_shim() {
   return 0
 }
 
+# _ipv4_octet_in_range OCTET
+# Exact-value helper for _host_is_local_ip4: true (0) only when OCTET is
+# ALL-DECIMAL-DIGIT (rejects octal/hex/leading-zero-ambiguous forms like
+# "0177" or "0x7f" outright — those are handled by falling through to
+# "not recognized -> nonlocal" in the caller, never by trying to interpret
+# them) and numerically in 0-255. Empty or non-digit input is false.
+_ipv4_octet_in_range() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -le 255 ] 2>/dev/null
+}
+
+# _host_is_local_ip4 HOST
+# True (0) only when HOST is EXACTLY four decimal octets (a.b.c.d, each
+# 0-255, no extra characters before/after) and the first octet is exactly
+# 127 — real 127.0.0.0/8 membership, not a "starts with 127." string
+# prefix (bobbie.sast.access-control-bypass finding 2, PR #146 review
+# 5209002495: "http://127.0.0.1.evil.com/" must NOT match). Any host that
+# is not cleanly four decimal octets (extra labels, non-numeric, wrong
+# segment count, IPv6, hex/octal encodings) returns false and falls through
+# to the caller's nonlocal branch — never treated as local by inference.
+_host_is_local_ip4() {
+  _hli4_host="$1"
+  _hli4_rest="$_hli4_host"
+  _hli4_i=0
+  _hli4_o1=""; _hli4_o2=""; _hli4_o3=""; _hli4_o4=""
+  while [ "$_hli4_i" -lt 3 ]; do
+    case "$_hli4_rest" in
+      *.*) ;;
+      *) return 1 ;;  # fewer than 4 dot-separated segments
+    esac
+    _hli4_seg="${_hli4_rest%%.*}"
+    _hli4_rest="${_hli4_rest#*.}"
+    _hli4_i=$((_hli4_i+1))
+    case "$_hli4_i" in
+      1) _hli4_o1="$_hli4_seg" ;;
+      2) _hli4_o2="$_hli4_seg" ;;
+      3) _hli4_o3="$_hli4_seg" ;;
+    esac
+  done
+  _hli4_o4="$_hli4_rest"
+  # Reject if the 4th segment itself contains a further dot (5+ segments,
+  # e.g. the "127.0.0.1.evil.com" bypass) or any other stray character.
+  case "$_hli4_o4" in
+    *.*) return 1 ;;
+  esac
+
+  _ipv4_octet_in_range "$_hli4_o1" || return 1
+  _ipv4_octet_in_range "$_hli4_o2" || return 1
+  _ipv4_octet_in_range "$_hli4_o3" || return 1
+  _ipv4_octet_in_range "$_hli4_o4" || return 1
+
+  [ "$_hli4_o1" = "127" ]
+}
+
 # _router_url_classify URL
 # Pure classifier, no side effects (no die/warn/print) — the single source
 # of truth for "is this CLAGENTIC_ROUTER_URL well-formed, and is its host
@@ -278,10 +334,36 @@ stamp_shim() {
 # cmd_doctor's router probe (diagnostic-only, must never abort the doctor
 # run). Sets _ROUTER_URL_CLASS to one of:
 #   malformed  — not a well-formed http:// or https:// URL, or empty host
-#   local      — well-formed, host is localhost/127.0.0.0/8/::1
-#   nonlocal   — well-formed, host is anything else
+#   local      — well-formed, host is EXACTLY localhost/0.0.0.0/127.0.0.0/8
+#                (real octet-bounded match, see _host_is_local_ip4)/::1
+#   nonlocal   — well-formed, host is anything else, INCLUDING any host
+#                shape this classifier does not confidently recognize
 # Also sets _ROUTER_URL_HOST (empty on malformed) for callers that want to
 # name the offending host in their own message.
+#
+# CLASS-LEVEL FIX (bobbie.sast.access-control-bypass, PR #146 review
+# 5209002495, second round on this function): both reported bypasses were
+# the SAME underlying defect — string-shaped matching (glob prefix, naive
+# first-":" split) standing in for structured parsing of a value an
+# attacker can fully control. This rewrite eliminates that shape rather
+# than patching the two reported inputs:
+#   1. USERINFO STRIPPING: RFC 3986 allows "scheme://user:pass@host/" —
+#      "http://127.0.0.1:x@evil.com/" has REAL host evil.com, but a naive
+#      split on the first ":" reads "127.0.0.1" as the host. Userinfo is
+#      now stripped up to the LAST unescaped "@" before the first "/"
+#      (${_ruc_hostport##*@}, greedy-prefix removal — handles
+#      "http://a@b@evil.com/" -> evil.com correctly, not "b@evil.com").
+#   2. EXACT/BOUNDED HOST MATCHING: "127.*" was a shell GLOB PREFIX, so
+#      "127.0.0.1.evil.com" matched. Local IPv4 now requires
+#      _host_is_local_ip4 — exactly four decimal octets, numerically
+#      bounded, first octet exactly 127 — not a string prefix.
+# FAIL TOWARD WARNING: any host form this function does not confidently
+# recognize as local (IPv4-mapped IPv6 like [::ffff:127.0.0.1], octal
+# "0177.0.0.1", decimal "2130706433", hex encodings, anything else) is
+# classified nonlocal, not local. A false "nonlocal" costs one warning
+# line; a false "local" silently forwards real credentials — the two
+# outcomes are not symmetric, so ambiguity always resolves toward the
+# cheaper mistake.
 _router_url_classify() {
   _ruc_url="$1"
   _ROUTER_URL_HOST=""
@@ -300,7 +382,36 @@ _router_url_classify() {
   _ruc_hostport="${_ruc_url#http://}"
   _ruc_hostport="${_ruc_hostport#https://}"
   _ruc_hostport="${_ruc_hostport%%/*}"
-  _ruc_host="${_ruc_hostport%%:*}"
+
+  # Strip userinfo up to the LAST unescaped "@" (RFC 3986: everything before
+  # the final "@" in the authority component is userinfo, not host). Greedy
+  # "##*@" removes the longest "*@" prefix, i.e. up to the LAST "@" —
+  # "a@b@evil.com" -> "evil.com", not "b@evil.com".
+  case "$_ruc_hostport" in
+    *@*) _ruc_hostport="${_ruc_hostport##*@}" ;;
+  esac
+
+  # IPv6 literal in brackets carries its own colons (port, if any, follows
+  # the closing bracket: "[::1]:8765") — strip the bracketed host first so
+  # the later ":" strip below only ever removes a PORT, never part of an
+  # IPv6 address. A BARE (unbracketed) IPv6 literal such as "::1" also
+  # contains multiple colons of its own; RFC 3986 requires bracket
+  # notation whenever a port follows an IPv6 host, so an unbracketed host
+  # containing more than one colon cannot have a trailing ":port" to strip
+  # at all -- treat the WHOLE string as the host in that case, rather than
+  # naively splitting on the first colon and truncating "::1" to "".
+  case "$_ruc_hostport" in
+    \[*\]*)
+      _ruc_host="${_ruc_hostport%%]*}]"
+      ;;
+    *:*:*)
+      # Two or more colons, no brackets: bare IPv6 literal, no port.
+      _ruc_host="$_ruc_hostport"
+      ;;
+    *)
+      _ruc_host="${_ruc_hostport%%:*}"
+      ;;
+  esac
 
   if [ -z "$_ruc_host" ]; then
     _ROUTER_URL_CLASS="malformed"
@@ -308,18 +419,21 @@ _router_url_classify() {
   fi
   _ROUTER_URL_HOST="$_ruc_host"
 
-  # "Local" is deliberately narrow: localhost, 127.0.0.0/8 literals, and ::1
-  # — not private RFC1918 ranges generally, because a 192.168.x.x/10.x.x.x
-  # address is exactly the "another box on the LAN" case the nonlocal warning
-  # exists for, not silently equivalent to loopback.
-  case "$_ruc_host" in
-    localhost|127.*|::1|\[::1\])
-      _ROUTER_URL_CLASS="local"
-      ;;
-    *)
-      _ROUTER_URL_CLASS="nonlocal"
-      ;;
-  esac
+  # "Local" is deliberately narrow: localhost, 0.0.0.0, real 127.0.0.0/8
+  # membership, and ::1/[::1] — not private RFC1918 ranges generally,
+  # because a 192.168.x.x/10.x.x.x address is exactly the "another box on
+  # the LAN" case the nonlocal warning exists for, not silently equivalent
+  # to loopback. Any host shape not exactly one of these (including
+  # IPv4-mapped IPv6, non-decimal IP encodings, or anything else) falls
+  # through to nonlocal — see the FAIL TOWARD WARNING note above.
+  if [ "$_ruc_host" = "localhost" ] || [ "$_ruc_host" = "0.0.0.0" ] \
+    || [ "$_ruc_host" = "::1" ] || [ "$_ruc_host" = "[::1]" ]; then
+    _ROUTER_URL_CLASS="local"
+  elif _host_is_local_ip4 "$_ruc_host"; then
+    _ROUTER_URL_CLASS="local"
+  else
+    _ROUTER_URL_CLASS="nonlocal"
+  fi
 }
 
 # _validate_router_url URL
@@ -381,11 +495,13 @@ _validate_router_url() {
   esac
 }
 
-# _render_claude_settings TEMPLATE_FILE > stdout
-# Shared renderer for .claude/settings.json, used by all three stamp sites
-# (git-repo enroll, git-repo restamp, wrapper). Substitutes
-# __CLAGENTIC_LITE_HOME__ and __CLAGENTIC_ROUTER_ENV_BLOCK__ (the sentinel
-# line claude-settings.template carries right after its $comment header).
+# _render_claude_settings_body TEMPLATE_FILE > stdout
+# Pure renderer for .claude/settings.json content — NO validation, NO file
+# I/O beyond reading TEMPLATE_FILE, safe to call only after the caller has
+# already validated CLAGENTIC_ROUTER_URL (see _stamp_claude_settings below,
+# the sole caller). Substitutes __CLAGENTIC_LITE_HOME__ and
+# __CLAGENTIC_ROUTER_ENV_BLOCK__ (the sentinel line claude-settings.template
+# carries right after its $comment header).
 #
 # Router env block is emitted ONLY when CLAGENTIC_ROUTER_URL is set —
 # unset is the default and must be byte-for-byte identical to the pre-router
@@ -403,15 +519,9 @@ _validate_router_url() {
 # in that case rather than omitting the key, so `clagentic-lite doctor` and a
 # human reading settings.json see explicitly that no token is configured
 # instead of silently missing the key.
-#
-# _validate_router_url is called ONLY inside the "URL is non-empty" branch
-# below — never on the unset path — so inert-when-unset holds by
-# construction: there is no code path here that can emit output, warn, or
-# refuse when CLAGENTIC_ROUTER_URL is unset.
-_render_claude_settings() {
+_render_claude_settings_body() {
   _rcs_template="$1"
   _rcs_router_url="${CLAGENTIC_ROUTER_URL:-}"
-  [ -n "$_rcs_router_url" ] && _validate_router_url "$_rcs_router_url"
 
   while IFS= read -r _rcs_line || [ -n "$_rcs_line" ]; do
     case "$_rcs_line" in
@@ -430,6 +540,55 @@ _render_claude_settings() {
         ;;
     esac
   done < "$_rcs_template"
+}
+
+# _stamp_claude_settings TEMPLATE_FILE TARGET_FILE [COMMENT_SED_EXPR]
+# The ONLY caller of _render_claude_settings_body, and the SOLE writer of a
+# .claude/settings.json file anywhere in this codebase — all three stamp
+# sites (git-repo enroll, git-repo restamp, wrapper) call this, never the
+# body-renderer or a raw `>` redirect directly.
+#
+# FIXES bobbie.bleed.partial-write (PR #146 review 5209002495, finding 3):
+# the previous shape called _render_claude_settings via shell `>`
+# redirection at each of the three call sites — e.g.
+# `_render_claude_settings "$_tmpl" > "$_target"` — and `>` TRUNCATES
+# TARGET_FILE before the function body (including URL validation) ever
+# runs. A die() on a malformed CLAGENTIC_ROUTER_URL during `update
+# --restamp` or a re-enroll against an EXISTING settings.json therefore
+# emptied a previously-working file instead of preserving it. This function
+# closes that gap structurally, not by remembering to validate-before-
+# redirect at each of the three call sites individually:
+#   1. Validate FIRST (only when the URL is non-empty — see
+#      _validate_router_url's own inert-when-unset contract). If this
+#      dies, TARGET_FILE has not been touched at all yet.
+#   2. Render to a TEMP file in the same directory as TARGET_FILE (same
+#      filesystem, so the final `mv` is atomic, not a cross-device copy).
+#   3. `mv` the temp file over TARGET_FILE only after a complete, valid
+#      render succeeded. TARGET_FILE is replaced in one atomic rename —
+#      never observed half-written, and never truncated by a failed render.
+# COMMENT_SED_EXPR, when supplied, is applied to the rendered body before
+# the atomic write (the wrapper flavor's own settings-version comment
+# rewrite) — kept as a rendering-time step, not a second file write, so
+# there is still only one point where TARGET_FILE itself is touched.
+_stamp_claude_settings() {
+  _scs_template="$1"
+  _scs_target="$2"
+  _scs_comment_sed="${3:-}"
+  _scs_router_url="${CLAGENTIC_ROUTER_URL:-}"
+
+  # Validate BEFORE anything opens a redirection against the real target —
+  # inert-when-unset holds by construction: this call is skipped entirely
+  # when CLAGENTIC_ROUTER_URL is unset, so there is no code path here that
+  # can emit output, warn, refuse, or touch the temp/target files in that case.
+  [ -n "$_scs_router_url" ] && _validate_router_url "$_scs_router_url"
+
+  _scs_tmp="${_scs_target}.tmp.$$"
+  if [ -n "$_scs_comment_sed" ]; then
+    _render_claude_settings_body "$_scs_template" | sed "$_scs_comment_sed" > "$_scs_tmp"
+  else
+    _render_claude_settings_body "$_scs_template" > "$_scs_tmp"
+  fi
+  mv -f "$_scs_tmp" "$_scs_target"
 }
 
 # ---------------------------------------------------------------- router agent-model injection
@@ -685,9 +844,10 @@ _stamp_wrapper_settings() {
   # Generate settings.json from the shared template (router env block
   # included when CLAGENTIC_ROUTER_URL is set), then replace the $comment
   # value so it identifies this as a wrapper-settings file (version: v1).
-  _render_claude_settings "$_sws_template" \
-    | sed "s|clagentic-settings-version: v[^ ]*|clagentic-wrapper-settings-version: $CLAUDE_WRAPPER_SETTINGS_VERSION|g" \
-    > "$_sws_target"
+  # _stamp_claude_settings validates CLAGENTIC_ROUTER_URL and writes
+  # atomically -- see that function's doc comment.
+  _stamp_claude_settings "$_sws_template" "$_sws_target" \
+    "s|clagentic-settings-version: v[^ ]*|clagentic-wrapper-settings-version: $CLAUDE_WRAPPER_SETTINGS_VERSION|g"
 
   # Symlink commands/ so slash commands are available in wrapper sessions.
   ln -sfn "$CLAGENTIC_LITE_HOME/.claude/commands" "$_sws_claude_dir/commands"
@@ -1338,7 +1498,7 @@ _enroll_one() {
     fi
 
     if [ -n "$_claude_dir" ]; then
-      _render_claude_settings "$_claude_settings_template" > "$_cs_target"
+      _stamp_claude_settings "$_claude_settings_template" "$_cs_target"
 
       # Symlink commands/ — markdown only, no path traversal.
       ln -sfn "$CLAGENTIC_LITE_HOME/.claude/commands" "$_claude_dir/commands"
@@ -2233,7 +2393,7 @@ _restamp_repo_artifacts() {
   if [ -f "$_ra_cs" ] && grep -q 'managed-by: clagentic' "$_ra_cs" 2>/dev/null; then
     _ra_cs_template="$SHARE_DIR/hook-shims/claude-settings.template"
     if [ -f "$_ra_cs_template" ]; then
-      _render_claude_settings "$_ra_cs_template" > "$_ra_cs"
+      _stamp_claude_settings "$_ra_cs_template" "$_ra_cs"
       say "re-stamped${_ra_label}: $_ra_path/.claude/settings.json" >&2
       _ra_count=$((_ra_count+1))
     fi

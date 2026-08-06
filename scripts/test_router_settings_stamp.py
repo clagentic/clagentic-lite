@@ -410,5 +410,294 @@ class TestRouterUrlValidation(unittest.TestCase):
         self.assertNotIn("not a well-formed", out, msg=out)
 
 
+class TestRouterUrlClassifierBypasses(unittest.TestCase):
+    """Negative fixtures for bobbie.sast.access-control-bypass, PR #146
+    review 5209002495 (second round on _router_url_classify):
+
+        Finding 1 -- USERINFO BYPASS: the classifier split host:port on the
+        first ":" without ever stripping RFC 3986 userinfo, so
+        "http://127.0.0.1:x@evil.com/" read as host "127.0.0.1" while the
+        real HTTP connection target is evil.com.
+
+        Finding 2 -- GLOB-PREFIX BYPASS: "127.*" was a shell glob PREFIX
+        match, not an IP literal/CIDR test, so any host merely starting
+        with "127." (e.g. "127.0.0.1.evil.com") classified local.
+
+    Both were the same underlying defect: string-shaped matching standing
+    in for structured parsing of a fully attacker-controlled value. Each
+    case here asserts BOTH the intended classification (via enroll's
+    exit code / stamped settings.json) AND the corresponding signal (a
+    NON-LOCAL warning in stderr, or none) actually fires -- not just one
+    or the other.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="clagentic-test-router-url-bypass-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.home = os.path.join(self.tmpdir, "home")
+        os.makedirs(self.home)
+        self.repo = os.path.join(self.tmpdir, "repo")
+        _init_git_repo(self.repo)
+
+    def _assert_nonlocal(self, url):
+        """Asserts a URL is classified nonlocal: enroll succeeds (allowed,
+        not refused), a NON-LOCAL warning fires naming the URL, AND the
+        value is still stamped verbatim (allowed-but-warned, not silently
+        rewritten to something safe)."""
+        rc, out, err = _run_cli(
+            ["enroll", self.repo],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={"CLAGENTIC_ROUTER_URL": url},
+        )
+        self.assertEqual(rc, 0, msg=f"url={url!r} stdout={out!r} stderr={err!r}")
+        self.assertIn("NON-LOCAL", err, msg=f"url={url!r} stderr={err!r}")
+        settings_path = os.path.join(self.repo, ".claude", "settings.json")
+        with open(settings_path) as f:
+            parsed = json.load(f)
+        self.assertEqual(parsed["env"]["ANTHROPIC_BASE_URL"], url,
+                          msg=f"url={url!r}: allowed means still stamped verbatim")
+
+    def _assert_local(self, url):
+        """Asserts a URL is classified local: enroll succeeds and NO
+        NON-LOCAL warning fires."""
+        rc, out, err = _run_cli(
+            ["enroll", self.repo],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={"CLAGENTIC_ROUTER_URL": url},
+        )
+        self.assertEqual(rc, 0, msg=f"url={url!r} stdout={out!r} stderr={err!r}")
+        self.assertNotIn("NON-LOCAL", err, msg=f"url={url!r} stderr={err!r}")
+
+    # ---- Finding 1: userinfo bypass ----
+
+    def test_userinfo_bypass_single_at_classified_nonlocal(self):
+        """The exact PoC from the finding: naive first-':' split reads
+        '127.0.0.1' as host; the real connection target is evil.com."""
+        self._assert_nonlocal("http://127.0.0.1:x@evil.com/")
+
+    def test_userinfo_bypass_double_at_resolves_to_last_at(self):
+        """'a@b@evil.com' must resolve host to evil.com (the LAST
+        unescaped '@'), not 'b@evil.com' (a naive first/only-@ split).
+
+        Uses `doctor`, not `enroll`: doctor's NON-LOCAL warning prints the
+        EXTRACTED host explicitly ("(host: <host>)"), which is what this
+        test needs to pin down -- enroll's warning only echoes the full
+        original URL verbatim, and "b@evil.com" is trivially a substring
+        of "http://a@b@evil.com/" regardless of how the host was parsed,
+        so asserting against enroll's message would not actually prove
+        anything about which host was extracted."""
+        rc, out, err = _run_cli(
+            ["doctor"],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={
+                "CLAGENTIC_SKIP_UPDATE_ALERT": "1",
+                "CLAGENTIC_ROUTER_URL": "http://a@b@evil.com/",
+            },
+        )
+        self.assertIn("NON-LOCAL", out, msg=out)
+        self.assertIn("host: evil.com", out, msg=out)
+        self.assertNotIn("host: b@evil.com", out, msg=out)
+
+    def test_userinfo_with_local_looking_prefix_still_nonlocal(self):
+        self._assert_nonlocal("http://localhost:pw@evil.com/")
+
+    def test_userinfo_stripped_correctly_for_genuinely_local_target(self):
+        """A userinfo-bearing URL whose REAL host is local must still
+        classify local -- userinfo stripping must not overcorrect into
+        treating every userinfo-bearing URL as nonlocal."""
+        self._assert_local("http://user:pass@127.0.0.1:8765/")
+
+    # ---- Finding 2: glob-prefix bypass ----
+
+    def test_glob_prefix_bypass_ip_suffix_classified_nonlocal(self):
+        """The exact PoC from the finding: '127.*' matched this as a
+        string prefix with no '@' trick required at all."""
+        self._assert_nonlocal("http://127.0.0.1.evil.com/")
+
+    def test_glob_prefix_bypass_localhost_suffix_classified_nonlocal(self):
+        self._assert_nonlocal("http://localhost.evil.com/")
+
+    def test_127_x_x_x_still_classifies_local_bounded(self):
+        """127.0.0.0/8 membership must still work for real addresses in
+        the range -- only the STRING-PREFIX shape was the bug, not
+        127.0.0.0/8 recognition itself."""
+        self._assert_local("http://127.1.2.3:8765/")
+        self._assert_local("http://127.255.255.254/")
+
+    def test_127_out_of_range_octet_classified_nonlocal(self):
+        """'127.0.0.256' is not a valid IPv4 address (octet > 255) --
+        FAIL TOWARD WARNING: an unrecognized/invalid form is nonlocal,
+        never silently treated as local."""
+        self._assert_nonlocal("http://127.0.0.256/")
+
+    def test_five_segment_ip_shape_classified_nonlocal(self):
+        self._assert_nonlocal("http://127.0.0.1.1/")
+
+    # ---- Encodings the finding explicitly calls out: fail toward warning ----
+
+    def test_ipv6_mapped_ipv4_classified_nonlocal(self):
+        """[::ffff:127.0.0.1] is IPv4-mapped IPv6 loopback -- this
+        classifier does not attempt to parse it; per the FAIL TOWARD
+        WARNING policy it must classify nonlocal, not local."""
+        self._assert_nonlocal("http://[::ffff:127.0.0.1]/")
+
+    def test_octal_ip_encoding_classified_nonlocal(self):
+        """0177.0.0.1 is an octal encoding of 127.0.0.1 some HTTP clients
+        accept -- not decimal-octet parseable by _ipv4_octet_in_range
+        (which rejects any non-pure-decimal-digit input), so it falls
+        through to nonlocal rather than being silently accepted as local."""
+        self._assert_nonlocal("http://0177.0.0.1/")
+
+    def test_decimal_ip_encoding_classified_nonlocal(self):
+        """2130706433 is the single-integer decimal encoding of
+        127.0.0.1 -- not four dot-separated octets, so it is not
+        recognized as local."""
+        self._assert_nonlocal("http://2130706433/")
+
+    def test_hex_ip_encoding_classified_nonlocal(self):
+        self._assert_nonlocal("http://0x7f.0.0.1/")
+
+    # ---- Bracketed/loopback IPv6 forms ----
+
+    def test_bracketed_ipv6_loopback_classified_local(self):
+        self._assert_local("http://[::1]/")
+
+    def test_bracketed_ipv6_loopback_with_port_classified_local(self):
+        """Port after the closing bracket must not be mistaken for part
+        of the host, and must not cause the bracket-stripping logic to
+        misfire."""
+        self._assert_local("http://[::1]:8765/")
+
+    def test_bare_ipv6_loopback_classified_local(self):
+        self._assert_local("http://::1/")
+
+    def test_0_0_0_0_classified_local(self):
+        self._assert_local("http://0.0.0.0:8765/")
+
+
+class TestRouterSettingsStampPreservesExistingFileOnRefusal(unittest.TestCase):
+    """bobbie.bleed.partial-write, PR #146 review 5209002495, finding 3:
+    _render_claude_settings was invoked via shell '>' redirection at all
+    three stamp sites, which TRUNCATES the target file before the
+    function body (including URL validation) ever runs. A die() on a
+    malformed CLAGENTIC_ROUTER_URL during a re-enroll or `update
+    --restamp` against an EXISTING settings.json therefore emptied a
+    previously-working file. The prior test suite only covered
+    fresh-enroll, where no file existed yet -- this class covers the
+    missed case: an EXISTING file must survive a refused re-stamp
+    byte-for-byte.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="clagentic-test-router-partial-write-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.home = os.path.join(self.tmpdir, "home")
+        os.makedirs(self.home)
+        self.repo = os.path.join(self.tmpdir, "repo")
+        _init_git_repo(self.repo)
+
+    def test_reenroll_with_malformed_url_preserves_existing_settings_json(self):
+        # First enroll succeeds with no router configured -- a real,
+        # working settings.json now exists.
+        rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+
+        settings_path = os.path.join(self.repo, ".claude", "settings.json")
+        with open(settings_path, "rb") as f:
+            before = f.read()
+        self.assertTrue(len(before) > 0)
+
+        # Re-enroll with --force and a malformed router URL -- must be
+        # refused, and must NOT truncate/modify the existing file.
+        rc, out, err = _run_cli(
+            ["enroll", "--force", self.repo],
+            cwd=self.repo,
+            home=self.home,
+            env_extra={"CLAGENTIC_ROUTER_URL": "not-a-url"},
+        )
+        self.assertNotEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+
+        with open(settings_path, "rb") as f:
+            after = f.read()
+        self.assertEqual(before, after,
+                          msg="existing settings.json was modified/truncated by a refused re-stamp")
+        self.assertGreater(len(after), 0, "existing settings.json was truncated to empty")
+
+    def test_restamp_with_malformed_url_preserves_existing_settings_json(self):
+        """Same property via the update --restamp path (the exact path
+        BOBBIE's fold-in brief named) -- runs against a throwaway git
+        clone of the checkout, never the real dev tree (see
+        TestRouterSettingsStampRestamp's own docstring for why).
+
+        NOTE: `git clone` reflects committed HEAD only, not uncommitted
+        working-tree edits -- this test (and TestRouterSettingsStampRestamp
+        above, which established the pattern) must be run against a
+        checkout where the change under test is already committed, or it
+        silently exercises stale pre-fix code. cmd_update's own `git pull
+        --ff-only` requires a real clone with an upstream, which is why a
+        plain `git init` + working-tree copy (no clone) is not a viable
+        substitute here the way it is for test_router_agent_model_injection.py's
+        `cmd_init` tests (init never pulls)."""
+        fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")
+        subprocess.run(["git", "clone", "-q", TOOL_HOME, fake_tool_home],
+                        check=True, capture_output=True)
+        subprocess.run(["git", "-C", fake_tool_home, "config", "user.email", "test@example.com"],
+                        check=True, capture_output=True)
+        subprocess.run(["git", "-C", fake_tool_home, "config", "user.name", "Test"],
+                        check=True, capture_output=True)
+
+        def run_fake_home(argv, env_extra=None):
+            env = dict(os.environ)
+            env["HOME"] = self.home
+            env["CLAGENTIC_LITE_HOME"] = fake_tool_home
+            env.pop("CLAGENTIC_HOME", None)
+            env.pop("CLAGENTIC_ROUTER_URL", None)
+            env.pop("CLAGENTIC_ROUTER_TOKEN", None)
+            if env_extra:
+                env.update(env_extra)
+            proc = subprocess.run(
+                [os.path.join(fake_tool_home, "bin", "clagentic-lite")] + argv,
+                cwd=self.repo,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return proc.returncode, proc.stdout, proc.stderr
+
+        rc, out, err = run_fake_home(["enroll", self.repo])
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+
+        settings_path = os.path.join(self.repo, ".claude", "settings.json")
+        with open(settings_path, "rb") as f:
+            before = f.read()
+        self.assertTrue(len(before) > 0)
+
+        registry_dir = os.path.join(self.home, ".local", "state", "clagentic")
+        os.makedirs(registry_dir, exist_ok=True)
+        with open(os.path.join(registry_dir, "registry"), "w") as f:
+            f.write(self.repo + "\n")
+
+        # Force a restamp attempt with a malformed router URL configured --
+        # must be refused for that repo without touching its existing file.
+        # (cmd_update's restamp loop may abort processing further repos on
+        # a die() from one repo's stamp -- out of scope for this fix per
+        # the fold-in brief, which asked only that the FILE ITSELF survive
+        # a refused stamp, not that the multi-repo loop continue past it.)
+        run_fake_home(
+            ["update", "--restamp"],
+            env_extra={"CLAGENTIC_ROUTER_URL": "not-a-url", "CLAGENTIC_SKIP_FETCH": "1"},
+        )
+
+        with open(settings_path, "rb") as f:
+            after = f.read()
+        self.assertEqual(before, after,
+                          msg="existing settings.json was modified/truncated by a refused restamp")
+        self.assertGreater(len(after), 0, "existing settings.json was truncated to empty")
+
+
 if __name__ == "__main__":
     unittest.main()
