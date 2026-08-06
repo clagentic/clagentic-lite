@@ -1072,7 +1072,17 @@ llm_timeout_for() {
   MAX=$(role_env "$ROLE_U" TIMEOUT_MAX_SEC "${CLAGENTIC_LLM_TIMEOUT_MAX_SEC:-1800}")
 
   # Normalize config to integers; use safe defaults on parse failure.
-  case "$BASE" in ''|*[!0-9]*) BASE=180 ;; esac
+  # BASE goes through ds_positive_int_or_default (platform.sh), not a bare
+  # case guard (lr-49df97 fold-in, BOBBIE finding 3): BASE is the wall-clock
+  # seconds handed to $DS_TIMEOUT_CMD below, and a bare `''|*[!0-9]*` guard
+  # admits the literal string "0" unchanged (it contains no non-digit
+  # character) — `timeout 0` disables the timeout entirely, silently
+  # reopening the exact unbounded-call hole INV-1a exists to close, through
+  # a config value that LOOKS validated. MAX keeps its own bare guard
+  # deliberately: MAX=0 is a pre-existing, DOCUMENTED "no cap" sentinel (see
+  # "Cap at max when max is set and positive" below) — a different, intended
+  # meaning of zero, not an instance of this defect.
+  BASE=$(ds_positive_int_or_default "$BASE" 180)
   case "$RATE" in ''|*[!0-9]*) RATE=300 ;; esac
   case "$MAX"  in ''|*[!0-9]*) MAX=1800 ;; esac
   [ "$RATE" -le 0 ] && RATE=300
@@ -1867,6 +1877,31 @@ walk_chain() {
       *)   TIER="default" ;;
     esac
     [ -z "$TIER" ] && TIER="default"
+    # REVIEWER-ON-AN-UNRESTRICTABLE-CLI, FAIL-SAFE-NOT-SILENT (lr-49df97
+    # fold-in, BOBBIE finding 1): invoke_claude's --allowedTools/
+    # --disallowedTools tool restriction (INV-2) only exists for the claude
+    # CLI -- codex exec has no equivalent flag (verified: no codex binary
+    # is installed on any host this fix was authored/tested against, so the
+    # flag surface cannot be confirmed the same way invoke_claude's flags
+    # were confirmed against a real `claude --help`; asserting one would
+    # repeat exactly the mistake the --temperature comment above warns
+    # against). share/config.example ships CLAGENTIC_REVIEWER_CMD=codex as
+    # the DEFAULT, so a stock install's PRIMARY reviewer path runs
+    # unrestricted by default with docs/DESIGN.md's tool-restriction row
+    # merely disclosing the gap in prose -- a documented-but-inert control,
+    # which is the exact failure shape this warning exists to stop being
+    # silent. Cross-vendor review (AGENTS.md §5, "Builder and Reviewer must
+    # default to different vendors") is the actual product thesis, so
+    # changing the shipped default away from codex was rejected as the fix
+    # here -- it would defeat cross-vendor review to close a gap in one
+    # specific CLI's flag surface. Instead: every reviewer chain step that
+    # resolves to a non-claude CLI prints a loud, one-line-per-attempt
+    # warning to stderr (never silent, never buried only in docs) so an
+    # operator running with the stock config sees the exposure on every
+    # review call, not just on a `doctor` run they may never think to run.
+    if [ "$ROLE_L" = "reviewer" ] && [ "$CLI" != "claude" ]; then
+      printf '[clagentic-lite] WARN: reviewer role is using CLI "%s", which has no known tool-restriction flag -- Bash is UNRESTRICTED on this call, unlike the claude path (--allowedTools/--disallowedTools, INV-2). A --print/exec reviewer holding unrestricted Bash while reading an attacker-influenceable diff is a live prompt-injection-to-execution path. See AGENTS.md Invariants INV-2 and docs/DESIGN.md "The five roles" for the known limitation.\n' "$CLI" 1>&2
+    fi
     # Truncate BOTH err and output files between attempts. Without truncating
     # TMP_OUT, a successful-on-write-but-exit-nonzero primary could leave
     # stale bytes that validate as the fallback step's "output."

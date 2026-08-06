@@ -288,5 +288,154 @@ class TestToolRestrictionAppliesThroughTheRealWalkChainPath(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _write_fake_codex_json_reviewer(bin_dir, argv_file):
+    """Fake `codex` binary on PATH -- mirrors invoke_codex's real
+    invocation shape (`codex exec ... -o OUTPUT_FILE -`, stdout/stderr both
+    redirected to ERR_FILE by the real invoke_codex) closely enough for
+    walk_chain's validate_output to accept a clean reviewer envelope. Used
+    to prove the reviewer-on-unrestrictable-CLI warning (lr-49df97 fold-in,
+    BOBBIE finding 1) actually fires when the resolved chain step is codex,
+    not claude -- invoke_codex has no tool-restriction flags at all, so the
+    warning is walk_chain's OWN responsibility, not something the fake CLI
+    needs to simulate."""
+    fake = os.path.join(bin_dir, "codex")
+    with open(fake, "w") as f:
+        f.write(textwrap.dedent(f"""\
+            #!/bin/sh
+            printf '%s\\n' "$*" >> '{argv_file}'
+            cat > /dev/null
+            # invoke_codex writes the real response via -o FILE; find it in argv.
+            for arg in "$@"; do
+                if [ "$prev" = "-o" ]; then
+                    printf '{{"summary":"clean","checked":[],"findings":[]}}\\n' > "$arg"
+                fi
+                prev="$arg"
+            done
+        """))
+    os.chmod(fake, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+    return fake
+
+
+class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
+    """lr-49df97 fold-in (BOBBIE finding 1): invoke_codex has no
+    --allowedTools/--disallowedTools equivalent, so a reviewer chain step
+    that resolves to codex (the SHIPPED DEFAULT, share/config.example:66)
+    runs with Bash fully unrestricted. This must never be silent --
+    walk_chain prints a loud stderr warning on every such attempt so an
+    operator running the stock config sees the exposure on every review
+    call, not only if they happen to run `clagentic-lite doctor`."""
+
+    def test_reviewer_via_codex_prints_unrestricted_bash_warning(self):
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-reviewer-codex-warn-")
+        try:
+            argv_file = os.path.join(tmpdir, "argv.log")
+            open(argv_file, "w").close()
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(bin_dir)
+            _write_fake_codex_json_reviewer(bin_dir, argv_file)
+
+            src_dir = os.path.join(tmpdir, "src")
+            os.makedirs(src_dir)
+            sourced = _functions_only_source(src_dir)
+
+            script = textwrap.dedent(f"""\
+                export PATH='{bin_dir}':"$PATH"
+                export CLAGENTIC_REVIEWER_CMD=codex
+                _fixture_prompt() {{ printf 'test prompt'; }}
+                . '{sourced}'
+                printf 'stdin diff content' | walk_chain reviewer json _fixture_prompt
+            """)
+            r = subprocess.run(
+                ["sh", "-c", script, sourced],
+                capture_output=True, text=True, cwd=TOOL_HOME,
+            )
+            self.assertIn(
+                "UNRESTRICTED", r.stderr,
+                f"expected a loud unrestricted-Bash warning on stderr when "
+                f"the reviewer chain resolves to codex; stderr={r.stderr!r}",
+            )
+            self.assertIn(
+                "codex", r.stderr,
+                f"warning should name the CLI in use; stderr={r.stderr!r}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_reviewer_via_claude_does_not_print_the_warning(self):
+        """Negative control: the claude path IS restricted (the sibling
+        tests above prove the flags land), so it must not also emit the
+        unrestricted-Bash warning -- that would be a false alarm on the one
+        CLI where the control genuinely works."""
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-reviewer-claude-nowarn-")
+        try:
+            argv_file = os.path.join(tmpdir, "argv.log")
+            open(argv_file, "w").close()
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(bin_dir)
+            _write_fake_claude_json_reviewer(bin_dir, argv_file)
+
+            src_dir = os.path.join(tmpdir, "src")
+            os.makedirs(src_dir)
+            sourced = _functions_only_source(src_dir)
+
+            script = textwrap.dedent(f"""\
+                export PATH='{bin_dir}':"$PATH"
+                export CLAGENTIC_REVIEWER_CMD=claude
+                _fixture_prompt() {{ printf 'test prompt'; }}
+                . '{sourced}'
+                printf 'stdin diff content' | walk_chain reviewer json _fixture_prompt
+            """)
+            r = subprocess.run(
+                ["sh", "-c", script, sourced],
+                capture_output=True, text=True, cwd=TOOL_HOME,
+            )
+            self.assertNotIn(
+                "UNRESTRICTED", r.stderr,
+                f"claude reviewer path must not emit the unrestricted-Bash "
+                f"warning -- it IS restricted; stderr={r.stderr!r}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_non_reviewer_role_via_codex_does_not_print_the_warning(self):
+        """The warning is scoped to ROLE_L=="reviewer" only -- the auditor
+        role legitimately runs on codex with Bash for its security tools
+        (docs/DESIGN.md "Auditor | Read, Bash (security tools)") and must
+        not be flagged as if it were an accidental exposure."""
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-auditor-codex-nowarn-")
+        try:
+            argv_file = os.path.join(tmpdir, "argv.log")
+            open(argv_file, "w").close()
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(bin_dir)
+            _write_fake_codex_json_reviewer(bin_dir, argv_file)
+
+            src_dir = os.path.join(tmpdir, "src")
+            os.makedirs(src_dir)
+            sourced = _functions_only_source(src_dir)
+
+            script = textwrap.dedent(f"""\
+                export PATH='{bin_dir}':"$PATH"
+                export CLAGENTIC_AUDITOR_CMD=codex
+                _fixture_prompt() {{ printf 'test prompt'; }}
+                . '{sourced}'
+                printf 'stdin diff content' | walk_chain auditor json _fixture_prompt
+            """)
+            r = subprocess.run(
+                ["sh", "-c", script, sourced],
+                capture_output=True, text=True, cwd=TOOL_HOME,
+            )
+            self.assertNotIn(
+                "UNRESTRICTED", r.stderr,
+                f"auditor role must not emit the reviewer-scoped warning; "
+                f"stderr={r.stderr!r}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
