@@ -276,5 +276,143 @@ class TestContextBudgetMonitor(unittest.TestCase):
         self.assertEqual(result.stdout, b"")
 
 
+class TestAutosummarizeDegradedHandling(unittest.TestCase):
+    """Regression coverage for lr-7047bf (fold-in, BOBBIE + HOLDEN, PR #141
+    review #2): the auto-summarize section (section 3) of post-tool-
+    nudge.sh was one of two unwired llm-client.sh consumers a scripts/-and-
+    bin/-scoped sweep could not see, because .claude/ is a dotfile
+    directory that sweep never walked. A genuinely degraded summarizer
+    chain must not write a fabricated digest to memory.db, and must not
+    surface it to the user via additionalContext either.
+
+    Runs the REAL hook script end-to-end (subprocess), against a real git
+    repo with a fake scripts/llm-client.sh and scripts/memory.sh under
+    REPO_ROOT (the same paths the hook resolves via ds_repo_root) --
+    mirrors this file's existing TestContextBudgetMonitor convention."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        lite_dir = os.path.join(self._tmp, ".clagentic", "lite")
+        os.makedirs(lite_dir, exist_ok=True)
+        self._audit_db = os.path.join(lite_dir, "audit.db")
+        _make_audit_db(self._audit_db)
+        self._memory_db = os.path.join(lite_dir, "memory.db")
+        subprocess.run(
+            ["git", "init", "-q", self._tmp],
+            check=True, capture_output=True,
+        )
+        self._scripts_dir = os.path.join(self._tmp, "scripts")
+        os.makedirs(self._scripts_dir, exist_ok=True)
+
+    def _write_fake_llm_client(self, degraded):
+        """A stub scripts/llm-client.sh: `degraded=True` emits the real
+        emit_degraded line-mode shape (marker byte + banner, exit 3);
+        `degraded=False` emits a plain digest, exit 0."""
+        path = os.path.join(self._scripts_dir, "llm-client.sh")
+        if degraded:
+            body = (
+                "#!/bin/sh\n"
+                "cat > /dev/null\n"
+                "printf '\\001[clagentic-lite degraded] all chain steps failed for role summarizer'\n"
+                "exit 3\n"
+            )
+        else:
+            body = (
+                "#!/bin/sh\n"
+                "cat > /dev/null\n"
+                "printf 'a real digest of the large tool result'\n"
+                "exit 0\n"
+            )
+        with open(path, "w") as f:
+            f.write(body)
+        os.chmod(path, 0o755)
+
+    def _write_real_memory_sh(self):
+        """Copy the REAL scripts/memory.sh into the fake REPO_ROOT so
+        log-turn's own chokepoint guard is exercised too, not bypassed by
+        a stub -- proving the hook's own degraded check AND the sink's
+        chokepoint agree (defense in depth, not either/or)."""
+        real_memory_sh = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "memory.sh",
+        )
+        real_platform_sh = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "platform.sh",
+        )
+        with open(real_memory_sh) as src:
+            content = src.read()
+        dest = os.path.join(self._scripts_dir, "memory.sh")
+        with open(dest, "w") as f:
+            f.write(content)
+        os.chmod(dest, 0o755)
+        platform_dest = os.path.join(self._scripts_dir, "platform.sh")
+        with open(real_platform_sh) as src, open(platform_dest, "w") as f:
+            f.write(src.read())
+
+    def _run(self, payload: dict, env: dict | None = None) -> subprocess.CompletedProcess:
+        full_env = dict(os.environ)
+        full_env["CLAGENTIC_ENV_LOADED"] = "1"
+        full_env["HOME"] = os.environ.get("HOME", "/root")
+        full_env.pop("GIT_DIR", None)
+        full_env.pop("GIT_WORK_TREE", None)
+        # Autosummarize threshold low enough that the 40000-byte fixture
+        # output crosses it deterministically.
+        full_env["CLAGENTIC_AUTOSUMMARIZE_BYTES"] = "100"
+        if env:
+            full_env.update(env)
+        return subprocess.run(
+            ["/bin/sh", _HOOK],
+            input=json.dumps(payload).encode(),
+            capture_output=True,
+            env=full_env,
+            cwd=self._tmp,
+        )
+
+    def test_degraded_chain_writes_no_digest_row(self):
+        self._write_fake_llm_client(degraded=True)
+        self._write_real_memory_sh()
+        output = "x" * 40000
+        self._run({"session_id": "sess-auto-degraded", "tool_name": "Bash", "output": output})
+        conn = sqlite3.connect(self._memory_db)
+        try:
+            rows = conn.execute("SELECT summary FROM turns;").fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        conn.close()
+        self.assertEqual(
+            rows, [],
+            f"a genuinely degraded summarizer chain must not write ANY row "
+            f"to memory.db's turns table. rows={rows!r}",
+        )
+
+    def test_degraded_chain_does_not_surface_fabricated_digest_to_user(self):
+        self._write_fake_llm_client(degraded=True)
+        self._write_real_memory_sh()
+        output = "x" * 40000
+        result = self._run({"session_id": "sess-auto-degraded-2", "tool_name": "Bash", "output": output})
+        self.assertEqual(result.returncode, 0)
+        stdout = result.stdout.decode()
+        self.assertNotIn(
+            "CLAGENTIC AUTOSUMMARIZE", stdout,
+            f"a degraded chain must not surface a fabricated digest hint "
+            f"via additionalContext. stdout={stdout!r}",
+        )
+
+    def test_clean_chain_writes_digest_row_and_surfaces_hint(self):
+        """Negative control: a real, successful summarizer response must
+        still be written and surfaced -- proves the degraded check does
+        not simply suppress the whole feature."""
+        self._write_fake_llm_client(degraded=False)
+        self._write_real_memory_sh()
+        output = "x" * 40000
+        result = self._run({"session_id": "sess-auto-clean", "tool_name": "Bash", "output": output})
+        stdout = result.stdout.decode()
+        self.assertIn("CLAGENTIC AUTOSUMMARIZE", stdout, f"stdout={stdout!r}")
+        conn = sqlite3.connect(self._memory_db)
+        rows = conn.execute("SELECT summary FROM turns;").fetchall()
+        conn.close()
+        self.assertEqual(len(rows), 1, f"rows={rows!r}")
+        self.assertIn("a real digest", rows[0][0])
+
+
 if __name__ == "__main__":
     unittest.main()

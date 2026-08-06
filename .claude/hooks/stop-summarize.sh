@@ -81,7 +81,29 @@ PY
   [ -z "$LAST_TURN" ] && exit 0
 
   # Run the summarizer via the role-call wrapper.
-  SUMMARY=$(printf '%s' "$LAST_TURN" | "$REPO_ROOT/scripts/llm-client.sh" summarize 2>/dev/null | head -c 200)
+  #
+  # STATUS-CHECKED + DEGRADED-CHECKED (lr-7047bf, INV-1b, fold-in, BOBBIE +
+  # HOLDEN, PR #141 review #2): this hook was one of two unwired consumers
+  # a scripts/-and-bin/-scoped sweep could not see, because .claude/ is a
+  # dotfile directory the sweep's own discovery never walked -- the exact
+  # defect class this task exists to close, repeated a third time. The
+  # captured status must come from llm-client.sh itself, not the trailing
+  # `| head -c 200` truncation (a bare `$(cmd | head -c N)` reports head's
+  # exit status, not cmd's -- the same "status lost on a pipeline" bug
+  # memory.sh's cmd_summarize_turn had). Splitting the call from the
+  # truncation, and capturing `|| _sts_status=$?` on the call itself
+  # (no pipe after it), is what makes the real status observable.
+  _sts_status=0
+  _sts_raw=$(printf '%s' "$LAST_TURN" | "$REPO_ROOT/scripts/llm-client.sh" summarize 2>/dev/null) || _sts_status=$?
+  if [ "$_sts_status" -eq 3 ] || printf '%s' "$_sts_raw" | grep -qF '[clagentic-lite degraded]'; then
+    # A genuinely degraded summarizer chain: do not write a fabricated
+    # digest to memory, and do not claim an audit "pass" for it. Mirrors
+    # memory.sh cmd_summarize_turn's identical decision.
+    echo "stop-summarize: summarizer chain degraded (status=$_sts_status), skipping — not writing a fabricated summary" 1>&2
+    ds_audit_log summarize skip "stop-summarize: chain degraded, session=$SESSION_ID" "$SESSION_ID"
+    exit 0
+  fi
+  SUMMARY=$(printf '%s' "$_sts_raw" | head -c 200)
   [ -z "$SUMMARY" ] && exit 0
 
   # Extract up to 3 tag tokens (>=4 chars, non-stopword) from the summary.
