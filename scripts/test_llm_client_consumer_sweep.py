@@ -1,10 +1,10 @@
 """
 Sweeping regression coverage for lr-7047bf (PR-B/fold-in, INV-1b): every
-direct llm-client.sh invocation ANYWHERE in this repo's scripts/ and bin/
-trees must be BOTH status-checked (the real exit status of the call is
-captured, not discarded) AND degraded-checked (the mode-appropriate
-degraded marker is inspected before the output is trusted) -- or carry an
-explicit, discoverable exemption with a stated reason.
+direct llm-client.sh invocation ANYWHERE in this repository must be BOTH
+status-checked (the real exit status of the call is captured, not
+discarded) AND degraded-checked (the mode-appropriate degraded marker is
+inspected before the output is trusted) -- or carry an explicit,
+discoverable exemption with a stated reason.
 
 Root cause (walk_chain, scripts/llm-client.sh): invoke_claude/invoke_codex
 communicate outcomes through the FILESYSTEM (a written payload) instead of
@@ -15,16 +15,29 @@ worst offender (cmd_adversarial) had no check of any kind: a fully-dead
 auditor produced a degraded markdown envelope, and the merge gate was told
 the audit was clean.
 
-WIDENING (BOBBIE, PR #141 review, fold-in): the original version of this
-sweep scanned gates.sh ONLY. That scope was exactly why memory.sh's
-cmd_summarize_turn (scripts/memory.sh:225) was invisible to it -- a fifth,
-unwired consumer of the same walk_chain outcome channel, discovered only
-by BOBBIE's manual review after this task's own enforcement mechanism
-shipped. The enforcement mechanism replicated the defect class it was
-built to prevent. This version discovers every live `llm-client.sh <role>`
-invocation across every *.sh file under scripts/ and every file under
-bin/ -- not a hardcoded file list -- so a future sixth consumer anywhere
-in the repo is covered automatically, not just a future gates.sh site.
+WIDENING, ROUND 1 (BOBBIE, PR #141 review #1, fold-in): the original
+version of this sweep scanned gates.sh ONLY. That scope was exactly why
+memory.sh's cmd_summarize_turn (scripts/memory.sh:225) was invisible to it
+-- a fifth, unwired consumer of the same walk_chain outcome channel,
+discovered only by BOBBIE's manual review after this task's own
+enforcement mechanism shipped. The fix widened discovery to every *.sh
+file under scripts/ plus every file under bin/, via glob -- an improvement,
+but still a DIRECTORY LIST, and a directory list is exactly the shape of
+mistake this round is closing.
+
+WIDENING, ROUND 2 (BOBBIE + HOLDEN, PR #141 review #2, fold-in): the
+scripts/-and-bin/ glob was STILL invisible to two more consumers --
+.claude/hooks/stop-summarize.sh and .claude/hooks/post-tool-nudge.sh --
+because .claude/ is a dotfile directory neither glob pattern walked, and
+PEACHES's "no consumers exist outside these trees" assertion on the same
+PR head was disproven by a single grep. Enumerating trees has now failed
+THREE times running (gates.sh only -> +memory.sh -> +.claude/hooks/) with
+the same shape of failure each time: the enforcement mechanism's own
+discovery scope was narrower than the repository. Discovery is now driven
+by `git ls-files` -- every file Git tracks in this repository, full stop --
+not a hardcoded directory or extension list, so a future consumer in ANY
+tracked location (a new dotfile directory, a new top-level tool, anything)
+is covered automatically the day it lands, with no edit to this test file.
 
 THIS TEST IS DELIBERATELY NOT NAMED AFTER ONE SITE, following the pattern
 PR #140 established (test_invoke_exit_status_sweep.py,
@@ -32,21 +45,40 @@ test_freshness_helper_sweep.py, test_numeric_guard_sweep.py).
 
 Run with: python3 -m unittest scripts.test_llm_client_consumer_sweep -v
 """
-import glob
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SCRIPTS_DIR = os.path.join(TOOL_HOME, "scripts")
 BIN_DIR = os.path.join(TOOL_HOME, "bin")
 
 # Matches a live (non-comment) invocation of llm-client.sh with one of the
-# five llm-client.sh subcommands, exactly as every consumer in this repo
-# calls it: "$TOOL_HOME/scripts/llm-client.sh" <role> ... -- captures the
+# five llm-client.sh subcommands, exactly as most consumers in this repo
+# call it: "$TOOL_HOME/scripts/llm-client.sh" <role> ... -- captures the
 # role name so a violation message can say which consumer is affected.
 _LLM_CLIENT_CALL_RE = re.compile(
     r'llm-client\.sh"\s+(review|adversarial|merge-gate|summarize)\b'
+)
+
+# INDIRECTION (BOBBIE + HOLDEN, PR #141 review #2, fold-in): a caller may
+# assign the llm-client.sh path to a variable first, then call it via that
+# variable -- .claude/hooks/post-tool-nudge.sh does exactly this
+# (`_summarize_cmd="$REPO_ROOT/scripts/llm-client.sh"`, then `"$_summarize_
+# cmd" summarize`), the same indirection shape
+# test_freshness_helper_sweep.py's TestNoRawOriginRefResolutionOutsideHelper
+# already had to handle for a different sweep. _LLM_CLIENT_CALL_RE alone
+# cannot see this: the literal text `llm-client.sh"` never appears on the
+# call line itself. Two-pass fix: first find every `VAR=".../llm-client.sh"`
+# assignment (capturing VAR), then treat `"$VAR" <role>` anywhere later in
+# the same file as an additional call site using that assignment's captured
+# variable name.
+_LLM_CLIENT_VAR_ASSIGN_RE = re.compile(
+    r'^\s*(\w+)=["\']?\S*llm-client\.sh["\']?\s*$'
 )
 
 # A captured exit status on the SAME line: `|| VAR=$?` (the idiom this
@@ -99,30 +131,115 @@ _EXEMPT_RE = re.compile(r'llm-client-sweep-exempt:\s*(\S.*)$')
 # the DEFINITION of the call, not a caller of it).
 _SELF_EXCLUDE_BASENAMES = {"llm-client.sh", "test_llm_client_consumer_sweep.py"}
 
+# .py FILES ARE NEVER SCANNED FOR LIVE CALL SITES (BOBBIE + HOLDEN, PR #141
+# review #2, fold-in -- discovered by the repo-wide widening itself). Every
+# *.py file this repo tracks is either a unittest module or an unrelated
+# example (examples/python/auth.py) -- confirmed by direct inspection of
+# every `git ls-files -- '*.py'` hit at the time of this widening. A Python
+# unittest module never invokes llm-client.sh as literal Python source; it
+# either (a) shells out to a REAL *.sh consumer via subprocess, which this
+# sweep already scans directly, or (b) embeds a shell FIXTURE as a string
+# constant for a synthetic test (the existing _UNCHECKED_FIXTURE-style
+# constants below), which this sweep's own dedicated fixture tests already
+# exercise by calling _find_unchecked_consumers directly on that string --
+# NOT by relying on file-discovery to stumble onto it. What .py files DO
+# contain, routinely, is PROSE quoting the exact call shape in a docstring
+# for documentation (test_merge_gate_recheck.py's `_make_fake_llm_client`
+# docstring, test_memory_summarize_turn_degraded.py's module docstring) --
+# indistinguishable from a live call site to a line-level regex, and a
+# false positive the repo-wide widening surfaced immediately. Excluding the
+# extension is more honest than trying to out-clever docstring detection:
+# the repo's own convention already guarantees no .py file is a real
+# consumer, so there is nothing this exclusion could hide.
+_EXCLUDE_EXTENSIONS = {".py"}
+
 
 def _iter_candidate_files():
-    """Every *.sh file under scripts/, plus every file under bin/ -- the
-    two trees AMoS's own tool allowlist and this repo's own layout treat
-    as 'things that can invoke llm-client.sh', per BOBBIE's fold-in
-    finding 2. Not a hardcoded list: a new script dropped into either
-    directory is picked up the next run with no test-file edit."""
-    paths = sorted(glob.glob(os.path.join(SCRIPTS_DIR, "*.sh")))
-    if os.path.isdir(BIN_DIR):
-        paths += sorted(
-            p for p in glob.glob(os.path.join(BIN_DIR, "*")) if os.path.isfile(p)
-        )
-    return [p for p in paths if os.path.basename(p) not in _SELF_EXCLUDE_BASENAMES]
+    """Every file `git ls-files` tracks in this repository (ROUND 2
+    widening, BOBBIE + HOLDEN fold-in) -- NOT a directory list. A directory
+    list (first gates.sh only, then +scripts/*.sh and bin/) is the exact
+    shape of mistake that hid memory.sh and then .claude/hooks/*.sh from
+    two prior versions of this sweep in a row. `git ls-files` walks the
+    whole tracked tree, dotfile directories (.claude/, .codex/, .crew/,
+    .github/) included, so a future consumer anywhere Git tracks it is
+    discovered automatically with no edit to this test file.
+
+    Binary/non-UTF-8 tracked files (media/, *.png, etc.) are skipped by
+    the caller on decode failure (see `_read_lines`), not filtered here --
+    keeping the discovery step itself a single, unconditional `git
+    ls-files` call is what makes "did we scan everything" a fact about one
+    subprocess call, not about a maintained include/exclude list.
+    """
+    out = subprocess.run(
+        ["git", "ls-files"],
+        cwd=TOOL_HOME,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    paths = [
+        os.path.join(TOOL_HOME, rel)
+        for rel in out.stdout.splitlines()
+        if rel.strip()
+    ]
+    return [
+        p for p in paths
+        if os.path.basename(p) not in _SELF_EXCLUDE_BASENAMES
+        and os.path.splitext(p)[1] not in _EXCLUDE_EXTENSIONS
+        and os.path.isfile(p)
+    ]
+
+
+def _read_lines(path):
+    """Read a tracked file as text, returning [] for anything that isn't
+    (binary assets like media/*.png can't contain a shell invocation, and
+    must not crash the sweep)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.readlines()
+    except (UnicodeDecodeError, OSError):
+        return []
+
+
+def _find_llm_client_indirection_vars(lines):
+    """Pre-pass: every variable assigned a path ending in llm-client.sh,
+    e.g. `_summarize_cmd="$REPO_ROOT/scripts/llm-client.sh"`. Returns a set
+    of variable names. See _LLM_CLIENT_VAR_ASSIGN_RE's comment for why this
+    exists -- a caller can invoke llm-client.sh through a variable, and
+    that call line carries no literal `llm-client.sh"` text for
+    _LLM_CLIENT_CALL_RE to match."""
+    names = set()
+    for line in lines:
+        if line.strip().startswith('#'):
+            continue
+        m = _LLM_CLIENT_VAR_ASSIGN_RE.match(line)
+        if m:
+            names.add(m.group(1))
+    return names
 
 
 def _discover_llm_client_call_sites(lines):
     """Grep primitive: every live (non-comment) line that directly invokes
-    llm-client.sh with one of its five subcommands. Returns a list of
-    (line_no, role, line_text, exempt_reason_or_None)."""
+    llm-client.sh with one of its five subcommands, either literally
+    (`"$TOOL_HOME/scripts/llm-client.sh" <role>`) or via a variable
+    assigned that path earlier in the file (`"$VAR" <role>` where VAR was
+    assigned a .../llm-client.sh path -- see _find_llm_client_indirection_
+    vars). Returns a list of (line_no, role, line_text, exempt_reason_or_None).
+    """
+    indirection_vars = _find_llm_client_indirection_vars(lines)
+    indirect_call_re = None
+    if indirection_vars:
+        var_alt = "|".join(re.escape(v) for v in sorted(indirection_vars))
+        indirect_call_re = re.compile(
+            r'\$(?:\{)?(?:' + var_alt + r')(?:\})?"?\s+(review|adversarial|merge-gate|summarize)\b'
+        )
     sites = []
     for i, line in enumerate(lines):
         if line.strip().startswith('#'):
             continue
         m = _LLM_CLIENT_CALL_RE.search(line)
+        if not m and indirect_call_re is not None:
+            m = indirect_call_re.search(line)
         if not m:
             continue
         exempt_reason = None
@@ -138,7 +255,18 @@ def _discover_llm_client_call_sites(lines):
 def _find_enclosing_function_range(lines, call_idx):
     """Return (start_idx, end_idx) 0-based inclusive for the function body
     containing call_idx, via brace counting from the nearest preceding
-    `name() {` line. Falls back to (0, len(lines)-1) if none is found."""
+    `name() {` line. Falls back to (0, len(lines)-1) if none is found OR if
+    the nearest preceding function def's body closes BEFORE reaching
+    call_idx (BOBBIE + HOLDEN, PR #141 review #2, fold-in widening: a
+    top-level dotfile hook script -- .claude/hooks/post-tool-nudge.sh --
+    has helper functions defined near the top (_json_escape) followed by
+    plain top-level statements with no enclosing function at all; the
+    'nearest preceding name() {' search found _json_escape, whose body
+    closes long before call_idx, silently handing back a range that does
+    not even CONTAIN the call site. A range that excludes its own call
+    site can never find a downstream degraded check, no matter how real
+    one is -- this guard is what makes call_idx-not-in-range detectable
+    instead of silently wrong)."""
     start = None
     for i in range(call_idx, -1, -1):
         if _FUNC_DEF_RE.match(lines[i]):
@@ -150,8 +278,10 @@ def _find_enclosing_function_range(lines, call_idx):
     for i in range(start, len(lines)):
         depth += lines[i].count('{') - lines[i].count('}')
         if depth == 0 and i > start:
-            return start, i
-    return start, len(lines) - 1
+            if call_idx <= i:
+                return start, i
+            break  # call_idx is past this function's own closing brace
+    return 0, len(lines) - 1
 
 
 def _find_unchecked_consumers(lines):
@@ -186,27 +316,29 @@ def _find_unchecked_consumers(lines):
 
 def _sweep_file(path):
     """Read one candidate file and return its (lines, violations)."""
-    with open(path) as f:
-        lines = f.readlines()
+    lines = _read_lines(path)
     return lines, _find_unchecked_consumers(lines)
 
 
 class TestEveryLlmClientConsumerRepoWideIsStatusAndDegradedChecked(unittest.TestCase):
-    """INV-1b, widened (BOBBIE fold-in): every *.sh file under scripts/ and
-    every file under bin/ that directly invokes llm-client.sh with a role
-    subcommand must capture its exit status AND be followed by a
-    mode-appropriate degraded check in the same function, OR carry an
-    explicit `llm-client-sweep-exempt: <reason>` marker. A future consumer
-    in ANY file under either tree is covered automatically -- no edit to
-    this test file is required."""
+    """INV-1b, widened (BOBBIE + HOLDEN fold-in, round 2): every file this
+    repository's `git ls-files` tracks -- not a directory list -- that
+    directly invokes llm-client.sh with a role subcommand must capture its
+    exit status AND be followed by a mode-appropriate degraded check in
+    the same function, OR carry an explicit `llm-client-sweep-exempt:
+    <reason>` marker. A future consumer anywhere in the tracked tree
+    (including a new dotfile directory) is covered automatically -- no
+    edit to this test file is required."""
 
     def test_sweep_discovers_at_least_the_known_consumer_roles(self):
         """Sanity check on the discovery mechanism itself: today's known
-        call sites span gates.sh (review x2, adversarial, merge-gate) and
-        memory.sh (summarize). If this ever finds zero sites, the grep
-        pattern itself is broken (e.g. a caller stopped quoting the binary
-        path) and the sweep below would vacuously pass with zero coverage
-        -- this catches that silently-empty-sweep failure mode."""
+        call sites span gates.sh (review x2, adversarial, merge-gate),
+        memory.sh (summarize), and .claude/hooks/stop-summarize.sh +
+        .claude/hooks/post-tool-nudge.sh (both summarize). If this ever
+        finds zero sites, the grep pattern itself is broken (e.g. a caller
+        stopped quoting the binary path) and the sweep below would
+        vacuously pass with zero coverage -- this catches that
+        silently-empty-sweep failure mode."""
         total_sites = 0
         roles_found = set()
         for path in _iter_candidate_files():
@@ -215,16 +347,17 @@ class TestEveryLlmClientConsumerRepoWideIsStatusAndDegradedChecked(unittest.Test
                 total_sites += 1
                 roles_found.add(role)
         self.assertGreaterEqual(
-            total_sites, 5,
-            f"expected at least 5 llm-client.sh call sites across scripts/ "
-            f"and bin/ (gates.sh: review x2, adversarial, merge-gate; "
-            f"memory.sh: summarize); found {total_sites}",
+            total_sites, 7,
+            f"expected at least 7 llm-client.sh call sites repo-wide "
+            f"(gates.sh: review x2, adversarial, merge-gate; memory.sh: "
+            f"summarize; .claude/hooks/stop-summarize.sh: summarize; "
+            f".claude/hooks/post-tool-nudge.sh: summarize); found {total_sites}",
         )
         for expected_role in ("review", "adversarial", "merge-gate", "summarize"):
             self.assertIn(
                 expected_role, roles_found,
-                f"sweep failed to discover a '{expected_role}' consumer anywhere "
-                f"under scripts/ or bin/",
+                f"sweep failed to discover a '{expected_role}' consumer "
+                f"anywhere in the tracked tree",
             )
 
     def test_every_consumer_repo_wide_is_status_and_degraded_checked(self):
@@ -235,8 +368,8 @@ class TestEveryLlmClientConsumerRepoWideIsStatusAndDegradedChecked(unittest.Test
             all_violations.extend((rel, ln, role, reason) for ln, role, reason in violations)
         self.assertEqual(
             all_violations, [],
-            f"found {len(all_violations)} llm-client.sh consumer site(s) across "
-            f"scripts/ and bin/ that are not both status-checked and "
+            f"found {len(all_violations)} llm-client.sh consumer site(s) "
+            f"repo-wide that are not both status-checked and "
             f"degraded-checked, and are not explicitly exempted (INV-1b):\n" +
             "\n".join(
                 f"  {rel}:{ln} (role={role}): {reason}"
@@ -245,11 +378,11 @@ class TestEveryLlmClientConsumerRepoWideIsStatusAndDegradedChecked(unittest.Test
         )
 
     def test_memory_sh_summarize_consumer_is_covered_by_the_widened_sweep(self):
-        """Names the specific finding (BOBBIE, PR #141): scripts/memory.sh's
-        cmd_summarize_turn was the unwired fifth consumer that the
-        gates.sh-only sweep could not see. This test proves the widened
-        sweep actually discovers and clears it, not just that the general
-        assertion above happens to pass."""
+        """Names the specific finding (BOBBIE, PR #141 review #1): scripts/
+        memory.sh's cmd_summarize_turn was the unwired fifth consumer that
+        the gates.sh-only sweep could not see. This test proves the
+        widened sweep actually discovers and clears it, not just that the
+        general assertion above happens to pass."""
         memory_sh = os.path.join(SCRIPTS_DIR, "memory.sh")
         lines, violations = _sweep_file(memory_sh)
         sites = _discover_llm_client_call_sites(lines)
@@ -262,6 +395,38 @@ class TestEveryLlmClientConsumerRepoWideIsStatusAndDegradedChecked(unittest.Test
             violations, [],
             f"memory.sh's summarize consumer is not fully wired: {violations!r}",
         )
+
+    def test_dotfile_hook_summarize_consumers_are_covered_by_the_repo_wide_sweep(self):
+        """Names the specific finding (BOBBIE + HOLDEN, PR #141 review #2):
+        .claude/hooks/stop-summarize.sh and .claude/hooks/post-tool-nudge.sh
+        were the sixth and seventh unwired consumers, invisible to the
+        scripts/-and-bin/-only sweep specifically BECAUSE .claude/ is a
+        dotfile directory neither glob pattern walked. This test proves the
+        `git ls-files`-driven sweep actually discovers and clears both real
+        files at their real repo paths -- not a synthetic fixture standing
+        in for them -- so the round-2 widening is proven the same way the
+        round-1 widening was proven for memory.sh."""
+        hooks_dir = os.path.join(TOOL_HOME, ".claude", "hooks")
+        for hook_name in ("stop-summarize.sh", "post-tool-nudge.sh"):
+            hook_path = os.path.join(hooks_dir, hook_name)
+            self.assertIn(
+                hook_path, _iter_candidate_files(),
+                f"repo-wide file-discovery did not pick up {hook_name!r} "
+                f"under .claude/hooks/ -- the dotfile-directory gap this "
+                f"round exists to close",
+            )
+            lines, violations = _sweep_file(hook_path)
+            sites = _discover_llm_client_call_sites(lines)
+            self.assertTrue(
+                any(role == "summarize" for _, role, _, _ in sites),
+                f"widened sweep failed to discover {hook_name}'s summarize "
+                f"call site at all -- sites found: {sites!r}",
+            )
+            self.assertEqual(
+                violations, [],
+                f"{hook_name}'s summarize consumer is not fully wired: "
+                f"{violations!r}",
+            )
 
 
 class TestSweepCatchesUncheckedAndAlternateStyleSiblings(unittest.TestCase):
@@ -377,29 +542,64 @@ class TestSweepCatchesUncheckedAndAlternateStyleSiblings(unittest.TestCase):
         )
 
     def test_widened_sweep_catches_a_consumer_in_a_file_other_than_gates_sh(self):
-        """Proves the widening itself, not just the per-line logic: writes
-        the pre-fix memory.sh shape to a real *.sh file under scripts/,
-        runs it through the SAME file-discovery primitive the real sweep
-        uses (_iter_candidate_files), and asserts it is flagged. Without
-        this fixture, "the sweep now scans scripts/ and bin/" is an
-        assertion about the code, not a proven behavior -- this is what
-        BOBBIE's review explicitly asked for."""
-        fixture_path = os.path.join(SCRIPTS_DIR, "_test_fixture_other_file_consumer.sh")
-        with open(fixture_path, "w") as f:
-            f.write(self._MEMORY_SH_PRE_FIX_SHAPE)
-        try:
-            self.assertIn(
-                fixture_path, _iter_candidate_files(),
-                "widened file-discovery did not pick up a *.sh file under scripts/",
+        """Proves the round-1 widening itself, not just the per-line logic:
+        writes the pre-fix memory.sh shape to a real *.sh file, runs it
+        through the SAME file-discovery primitive the real sweep uses
+        (_iter_candidate_files), and asserts it is flagged. Without this
+        fixture, "the sweep now scans every tracked file" is an assertion
+        about the code, not a proven behavior -- this is what BOBBIE's
+        review explicitly asked for.
+
+        Discovery is now `git ls-files`-driven (ROUND 2, BOBBIE + HOLDEN
+        fold-in), which reads the real repo's tracked-file list -- an
+        UNTRACKED scratch file dropped into scripts/ is invisible to it by
+        design (the whole point of moving off a directory glob is that
+        "on disk" is no longer sufficient; "tracked" is what's scanned).
+        Writing a real untracked file and asserting `git ls-files` finds it
+        would therefore be testing git's behavior, not this sweep's -- so,
+        like test_repo_wide_discovery_catches_a_consumer_in_a_dotfile_
+        directory below, this stubs `subprocess.run` to make
+        _iter_candidate_files believe `git ls-files` reported this fixture
+        path, exercising the exact same production code path
+        (_iter_candidate_files -> _sweep_file) with a real file on disk."""
+        with tempfile.TemporaryDirectory() as tmp_repo:
+            fixture_path = os.path.join(tmp_repo, "_test_fixture_other_file_consumer.sh")
+            with open(fixture_path, "w") as f:
+                f.write(self._MEMORY_SH_PRE_FIX_SHAPE)
+            fake_ls_files = subprocess.CompletedProcess(
+                args=["git", "ls-files"], returncode=0,
+                stdout=os.path.relpath(fixture_path, tmp_repo) + "\n", stderr="",
             )
-            lines, violations = _sweep_file(fixture_path)
-            self.assertTrue(
-                any(role == "summarize" and "not captured" in reason for _, role, reason in violations),
-                f"widened sweep failed to flag the pre-fix memory.sh shape "
-                f"written to a file OTHER than gates.sh. violations={violations!r}",
-            )
-        finally:
-            os.remove(fixture_path)
+            # MODULE RESOLUTION (matches test_freshness_helper_sweep.py's
+            # and test_review_merge_py.py's identical fix, same PR,
+            # order-dependency class): a hardcoded dotted patch target
+            # ("scripts.test_llm_client_consumer_sweep.TOOL_HOME") can
+            # resolve to a DIFFERENT module object than the one this
+            # TestCase and _iter_candidate_files actually run in, under
+            # `unittest discover` (no scripts/__init__.py in this repo, so
+            # discovery imports this file as a bare top-level module while
+            # the dotted patch target creates/addresses a second,
+            # independent module object). Patching the wrong object's
+            # TOOL_HOME is a silent no-op -- _iter_candidate_files still
+            # reads the REAL module's unpatched TOOL_HOME, so this fixture
+            # would fail only under discover, not under a direct `-m
+            # unittest scripts.test_llm_client_consumer_sweep` run.
+            # Resolving via sys.modules[self.__class__.__module__] always
+            # targets the module this test is actually executing in.
+            _self_mod_name = sys.modules[self.__class__.__module__].__name__
+            with patch(f"{_self_mod_name}.TOOL_HOME", tmp_repo), \
+                 patch("subprocess.run", return_value=fake_ls_files):
+                self.assertIn(
+                    fixture_path, _iter_candidate_files(),
+                    "widened file-discovery did not pick up a tracked *.sh "
+                    "file outside gates.sh",
+                )
+                lines, violations = _sweep_file(fixture_path)
+                self.assertTrue(
+                    any(role == "summarize" and "not captured" in reason for _, role, reason in violations),
+                    f"widened sweep failed to flag the pre-fix memory.sh shape "
+                    f"written to a file OTHER than gates.sh. violations={violations!r}",
+                )
 
     def test_explicit_exemption_marker_suppresses_a_violation_with_a_reason(self):
         """The benign no-chain-configured summarizer skip is a real,
@@ -437,6 +637,77 @@ class TestSweepCatchesUncheckedAndAlternateStyleSiblings(unittest.TestCase):
             f"silent-omission failure mode this marker exists to prevent. "
             f"violations={violations!r}",
         )
+
+    def test_repo_wide_discovery_catches_a_consumer_in_a_dotfile_directory(self):
+        """Proves the ROUND 2 widening itself (BOBBIE + HOLDEN fold-in),
+        the same way test_widened_sweep_catches_a_consumer_in_a_file_other_
+        than_gates_sh above proved round 1: without this fixture, "the
+        sweep now scans every git-tracked file, dotfile directories
+        included" is an assertion about the code, not a proven behavior --
+        exactly the same trap the scripts/-and-bin/ widening fell into for
+        real files at .claude/hooks/.
+
+        Rather than mutating this repo's real git index (which `git
+        ls-files` reads live and which a build step must not touch), this
+        writes the pre-fix hook shape to a real file inside a SYNTHETIC
+        dotfile directory (a temp tree's own `.dotdir/`) and stubs
+        `subprocess.run` so `_iter_candidate_files` believes `git
+        ls-files` reported that path -- exercising the exact same
+        production code path (`_iter_candidate_files` -> `_sweep_file` ->
+        `_discover_llm_client_call_sites` / `_find_unchecked_consumers`)
+        the real sweep runs, with a dotfile directory as the discriminating
+        variable, not scripts/ vs. some other ordinary directory."""
+        with tempfile.TemporaryDirectory() as tmp_repo:
+            dotdir = os.path.join(tmp_repo, ".dotdir", "hooks")
+            os.makedirs(dotdir)
+            fixture_path = os.path.join(dotdir, "consumer.sh")
+            with open(fixture_path, "w") as f:
+                f.write(
+                    '#!/bin/sh\n'
+                    'run_hook() {\n'
+                    '  SUMMARY=$("$TOOL_HOME/scripts/llm-client.sh" summarize | head -c 200)\n'
+                    '  [ -z "$SUMMARY" ] && exit 0\n'
+                    '  echo "$SUMMARY"\n'
+                    '}\n'
+                )
+            fake_ls_files = subprocess.CompletedProcess(
+                args=["git", "ls-files"], returncode=0,
+                stdout=os.path.relpath(fixture_path, tmp_repo) + "\n", stderr="",
+            )
+            # MODULE RESOLUTION (matches test_freshness_helper_sweep.py's
+            # and test_review_merge_py.py's identical fix, same PR,
+            # order-dependency class): a hardcoded dotted patch target
+            # ("scripts.test_llm_client_consumer_sweep.TOOL_HOME") can
+            # resolve to a DIFFERENT module object than the one this
+            # TestCase and _iter_candidate_files actually run in, under
+            # `unittest discover` (no scripts/__init__.py in this repo, so
+            # discovery imports this file as a bare top-level module while
+            # the dotted patch target creates/addresses a second,
+            # independent module object). Patching the wrong object's
+            # TOOL_HOME is a silent no-op -- _iter_candidate_files still
+            # reads the REAL module's unpatched TOOL_HOME, so this fixture
+            # would fail only under discover, not under a direct `-m
+            # unittest scripts.test_llm_client_consumer_sweep` run.
+            # Resolving via sys.modules[self.__class__.__module__] always
+            # targets the module this test is actually executing in.
+            _self_mod_name = sys.modules[self.__class__.__module__].__name__
+            with patch(f"{_self_mod_name}.TOOL_HOME", tmp_repo), \
+                 patch("subprocess.run", return_value=fake_ls_files):
+                discovered = _iter_candidate_files()
+                self.assertIn(
+                    fixture_path, discovered,
+                    "repo-wide file-discovery did not pick up a consumer in a "
+                    "synthetic dotfile directory -- the exact gap that hid "
+                    ".claude/hooks/stop-summarize.sh and "
+                    ".claude/hooks/post-tool-nudge.sh from the scripts/-and-bin/ "
+                    "glob this round replaces",
+                )
+                lines, violations = _sweep_file(fixture_path)
+                self.assertTrue(
+                    any(role == "summarize" and "not captured" in reason for _, role, reason in violations),
+                    f"repo-wide sweep failed to flag the pre-fix hook shape "
+                    f"written to a dotfile directory. violations={violations!r}",
+                )
 
 
 if __name__ == "__main__":
