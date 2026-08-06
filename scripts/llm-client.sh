@@ -1174,25 +1174,56 @@ invoke_claude() {
   # at all. Do not reintroduce a --temperature (or similar) flag here without
   # first confirming `claude --help` actually lists it.
   #
-  # TOOL RESTRICTION (class-4 foundry fix, INV-2): the reviewer role gets
-  # --allowedTools "Read Grep Glob" (KEEPS Read/Grep/Glob -- its prompt
-  # mandates caller-tracing, import-checking, and guard-branch verification;
-  # stripping those tools would silently gut review quality, invisibly,
-  # since a shallower review still emits valid JSON and passes every gate)
-  # and --disallowedTools "Bash" (LOSES Bash -- nothing in the reviewer
-  # prompt asks it to execute anything, and a --print reviewer holding
-  # unrestricted Bash while reading an attacker-influenceable diff is a live
-  # prompt-injection-to-execution path; removing it is a security fix Class
-  # 4 merely gave the occasion to make). VERIFIED AGAINST THE INSTALLED CLI
-  # before writing this (same discipline the --temperature note above
-  # documents): --allowedTools/--allowed-tools and --disallowedTools/
-  # --disallowed-tools both appear in `claude --help` on this host
-  # (@anthropic-ai/claude-code 2.1.113) -- confirm again with `claude --help`
-  # before relying on this if upgrading past a version where the flag
-  # surface has changed. Scoped to role=="reviewer" only -- auditor,
-  # merge-gate, builder, and summarizer are all left untouched; see
-  # AGENTS.md Invariants (INV-2) for the no-settable-turn-cap limitation
-  # this flag pairing does NOT close on its own.
+  # TOOL RESTRICTION (class-4 foundry fix, INV-2; DEFAULT INVERTED lr-49df97
+  # fold-in, HOLDEN-authorized correction): --allowedTools "Read,Grep,Glob"
+  # / --disallowedTools "Bash" is now the DEFAULT for every TOOL_ROLE value
+  # EXCEPT the explicitly enumerated opt-out roles below. This is an
+  # inversion of the original class-4 shape (which enumerated the ONE
+  # opt-IN role, "reviewer") -- BOBBIE's fold-in audit (PR #143) named the
+  # original shape as a fail-open control: a typo, a refactor, a dropped
+  # export, or a nested invocation that lost the role positional/env var
+  # would silently hand Bash back to a reviewer reading an
+  # attacker-influenceable diff, and nothing about that failure mode is
+  # visible -- the call just quietly runs unrestricted. A control that
+  # decides whether Bash is available to a process reading untrusted input
+  # must fail toward RESTRICTED, not toward permissive, on anything it does
+  # not explicitly recognize.
+  #
+  # OPT-OUT ROLES, enumerated (not opt-in) on purpose: auditor (keeps Bash
+  # for its security tools, docs/DESIGN.md "The five roles"), gate/
+  # merge-gate (read-only by contract but never asked to avoid Bash
+  # specifically -- unchanged from pre-fix behavior, no flags either way),
+  # builder (needs Bash to do its job at all), and summarizer (locked by
+  # test_other_roles_get_no_tool_restriction_flags, which this fold-in
+  # keeps passing UNMODIFIED per explicit instruction -- that test is the
+  # binding contract for these four role names specifically, not a
+  # judgment call re-derived here).
+  #
+  # WHY ENUMERATE OPT-OUTS RATHER THAN OPT-INS: this is the mechanical form
+  # of "fail toward restricted." An opt-IN list (the old shape) means every
+  # role NOT on the list gets the permissive default -- exactly backwards
+  # for a security control. An opt-OUT list means every role NOT on the
+  # list gets the restrictive default, and a genuinely new role added later
+  # without updating this enumeration is automatically restricted (and
+  # someone notices via a broken auditor/builder/gate call, not via a
+  # silent Bash-availability regression on a role reading untrusted diffs).
+  #
+  # KEEPS Read/Grep/Glob for the restricted set (not a bare Bash-only
+  # strip): the reviewer's prompt mandates caller-tracing, import-checking,
+  # and guard-branch verification -- stripping those tools too would
+  # silently gut review quality for any role that lands in the restricted
+  # default, invisibly, since a shallower response still emits valid output
+  # and passes every gate.
+  #
+  # VERIFIED AGAINST THE INSTALLED CLI before writing this (same discipline
+  # the --temperature note above documents): --allowedTools/--allowed-tools
+  # and --disallowedTools/--disallowed-tools both appear in `claude --help`
+  # on this host (@anthropic-ai/claude-code 2.1.113) -- confirm again with
+  # `claude --help` before relying on this if upgrading past a version
+  # where the flag surface has changed. See AGENTS.md Invariants (INV-2)
+  # for the no-settable-turn-cap limitation this flag pairing does NOT
+  # close on its own.
+  #
   # Comma-separated single-token form for each flag (documented as accepted
   # alongside the space-separated variadic form -- "Comma or space-separated
   # list of tool names") deliberately, not `--allowedTools Read Grep Glob
@@ -1203,10 +1234,13 @@ invoke_claude() {
   # trying) or break the reviewer step outright the same way the reverted
   # --temperature flag did. One flag, one comma-joined value each removes
   # that ambiguity entirely.
-  TOOLS_FLAGS=""
-  if [ "$TOOL_ROLE" = "reviewer" ]; then
-    TOOLS_FLAGS='--allowedTools Read,Grep,Glob --disallowedTools Bash'
-  fi
+  # ds_llm_role_is_bash_unrestricted (platform.sh) is the SINGLE source of
+  # truth for the opt-out enumeration -- called here rather than a second,
+  # inline case statement so this consumer-side decision and any other
+  # caller of the predicate (e.g. walk_chain's own independent role-sanity
+  # check, below) can never drift onto two different enumerations.
+  TOOLS_FLAGS='--allowedTools Read,Grep,Glob --disallowedTools Bash'
+  ds_llm_role_is_bash_unrestricted "$TOOL_ROLE" && TOOLS_FLAGS=""
   # Tell the inner Claude session NOT to inject recall summaries —
   # this is the recursion-avoidance path that doesn't require --bare.
   export CLAGENTIC_DISABLE_RECALL=1
@@ -1917,6 +1951,26 @@ walk_chain() {
     # semgrep call in a caller that sources this file, however unlikely).
     # $ROLE_L ALSO still flows to _llm_unwrap_json_envelope below, unchanged
     # from before -- that plumbing is untouched by this addition.
+    #
+    # SECOND, INDEPENDENT FAIL-TOWARD-RESTRICTED LAYER (lr-49df97 fold-in,
+    # HOLDEN-authorized correction, "both layers should fail toward
+    # restricted independently"): invoke_claude's own default (see
+    # ds_llm_role_is_bash_unrestricted) already restricts anything it does
+    # not recognize -- this is a SEPARATE, producer-side check, at the
+    # point $ROLE_L is about to be exported, that does not depend on
+    # invoke_claude's case statement being correct at all. A role literal
+    # that is neither a known opt-out role NOR "reviewer" itself (the one
+    # role this codebase deliberately routes through the restricted
+    # default) is surfaced loudly on stderr -- this can only happen if a
+    # future edit to this file's own subcommand dispatch introduces a sixth
+    # role name without updating either enumeration, which is exactly the
+    # "someone notices" property the coordinator's adjudication asked for.
+    # Never blocks the call (this wrapper's failure mode is always
+    # degrade-and-continue, per this file's own header contract) -- it only
+    # makes an otherwise-silent enumeration drift visible.
+    if ! ds_llm_role_is_bash_unrestricted "$ROLE_L" && [ "$ROLE_L" != "reviewer" ]; then
+      printf '[clagentic-lite] WARN: walk_chain role "%s" is neither a known Bash-unrestricted role (auditor/gate/builder/summarizer) nor "reviewer" -- defaulting to the RESTRICTED tool set (fail-safe). If this is a genuine new role, add it to ds_llm_role_is_bash_unrestricted (platform.sh) explicitly.\n' "$ROLE_L" 1>&2
+    fi
     export CLAGENTIC_LLM_CLIENT_TOOL_ROLE="$ROLE_L"
     EXIT_CODE=0
     invoke_step "$CLI" "$MODEL" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" "$MODE" \

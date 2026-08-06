@@ -220,6 +220,46 @@ ds_positive_int_or_default() {
   printf '%s' "$_dpiod_val"
 }
 
+# ds_llm_role_is_bash_unrestricted ROLE — returns 0 (true) iff ROLE is one
+# of the explicitly enumerated LLM roles that legitimately keeps Bash;
+# returns 1 (restricted) for anything else, including empty, unset, or a
+# misspelled/unrecognized role string.
+#
+# SINGLE SOURCE OF TRUTH for the opt-out enumeration (lr-49df97 fold-in,
+# HOLDEN-authorized correction): invoke_claude's own tool-restriction
+# decision (scripts/llm-client.sh) calls this rather than re-deriving the
+# same four-name list inline, so the enumeration cannot drift between two
+# copies. auditor/gate/builder/summarizer are the four names locked by
+# test_other_roles_get_no_tool_restriction_flags
+# (test_reviewer_tool_restriction.py) — that test is the binding contract
+# for this exact set, not a judgment call re-derived here.
+#
+# WHY A SEPARATE FUNCTION, NOT JUST invoke_claude's OWN case STATEMENT
+# (the second, independent layer BOBBIE's fold-in and the coordinator's
+# adjudication both asked for): invoke_claude's case statement is the
+# CONSUMER of the restriction decision -- it decides what flags to pass.
+# This function is a distinct, independently-callable PREDICATE any future
+# producer/validator (walk_chain's own role-sanity check, a doctor
+# diagnostic, a test) can call without re-deriving or duplicating the
+# enumeration, so a future contributor extending the opt-out list has
+# exactly one place to edit and every consumer of the predicate picks up
+# the change automatically -- the same "one place to add a scanner"
+# discipline CLAGENTIC_SECURITY_TOOLS (bin/clagentic-lite) already uses
+# for an unrelated enumeration.
+#
+# FAILS TOWARD RESTRICTED (the property this whole fold-in exists to
+# establish): the case statement's default arm is 1 (restricted) -- an
+# empty, unset, or misspelled ROLE never reaches the 0 (unrestricted)
+# return. This is the opposite polarity of an opt-in list, where anything
+# NOT recognized would silently fall through to unrestricted -- exactly
+# the fail-open shape BOBBIE's audit flagged.
+ds_llm_role_is_bash_unrestricted() {
+  case "$1" in
+    auditor|gate|builder|summarizer) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Write one row to .clagentic/lite/audit.db. Resolves repo root itself so callers
 # from any cwd (subdirectory hook invocations, etc.) hit the right DB.
 # Args: GATE OUTCOME DETAILS [SESSION_ID]

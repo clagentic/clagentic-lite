@@ -1,22 +1,38 @@
 """
 Regression coverage for the class-4 foundry fix, INV-2 tool restriction:
 invoke_claude (scripts/llm-client.sh) must pass --allowedTools Read,Grep,Glob
---disallowedTools Bash on the `claude --print` invocation when CALL_ROLE is
-"reviewer", and must NOT pass either flag for any other role.
+--disallowedTools Bash on the `claude --print` invocation for "reviewer" AND
+for any role it does not explicitly recognize as a legitimate Bash user, and
+must NOT pass either flag for the enumerated opt-out roles.
 
 FOUNDRY RULING THIS ENFORCES:
-  - The reviewer KEEPS Read/Grep/Glob -- its prompt mandates caller-tracing,
-    import-checking, and guard-branch verification ("Have you read the
-    surrounding context? Check callers, imports, and tests"; "trace at
-    least one caller first"). Stripping those tools would silently gut
-    review quality, invisibly (a shallower review still emits valid JSON
-    and passes every gate).
+  - The reviewer (and anything defaulting to the reviewer's restricted set)
+    KEEPS Read/Grep/Glob -- its prompt mandates caller-tracing, import-
+    checking, and guard-branch verification ("Have you read the surrounding
+    context? Check callers, imports, and tests"; "trace at least one caller
+    first"). Stripping those tools would silently gut review quality,
+    invisibly (a shallower review still emits valid JSON and passes every
+    gate).
   - The reviewer LOSES Bash -- nothing in its prompt asks it to execute
     anything, and a --print reviewer holding unrestricted Bash while
     reading an attacker-influenceable diff is a live prompt-injection-to-
     execution path.
-  - No other role (auditor, gate, builder, summarizer) is touched --
-    scoped narrowly to CALL_ROLE=="reviewer" only.
+  - auditor/gate/builder/summarizer are the ENUMERATED OPT-OUT roles --
+    stripping Bash from the auditor (which reads security-tool output) or
+    the merge-gate would be exactly the over-broad simplification the
+    foundry rejected.
+
+DEFAULT INVERTED (lr-49df97 fold-in, PR #143, HOLDEN-authorized correction):
+originally scoped narrowly to CALL_ROLE=="reviewer" as the one OPT-IN role
+(everything else unrestricted by default). BOBBIE's fold-in audit named
+that an opt-in list is the wrong polarity for a control governing Bash
+access to a process reading untrusted diffs -- a typo, a dropped export, or
+a future caller that omits the role would silently hand Bash back to a
+reviewer. The restricted set is now the default for anything NOT in the
+enumerated opt-out list (auditor/gate/builder/summarizer), so an empty,
+misspelled, or genuinely unknown role also gets restricted -- see
+ds_llm_role_is_bash_unrestricted (platform.sh), the single source of truth
+for the opt-out enumeration both invoke_claude and this test suite key off.
 
 These tests source the ACTUAL sh function (invoke_claude) via `sh -c`,
 mirroring test_llm_client_sh.py's established fake-binary-on-PATH technique
@@ -193,16 +209,56 @@ class TestNonReviewerRolesAreUntouched(unittest.TestCase):
                     f"role={role} must not receive --disallowedTools: {argv!r}",
                 )
 
-    def test_empty_role_gets_no_tool_restriction_flags(self):
-        """A caller that passes no role at all (e.g. a direct test call, or
-        any future caller that omits the 8th positional) must default to
-        the unrestricted behavior, not silently restrict tools for an
-        unknown role."""
-        recorded, err, rc = _run_invoke_claude("", call_mode="markdown")
-        self.assertEqual(rc, 0, f"err={err}")
-        argv = recorded[0] if recorded else ""
-        self.assertNotIn("--allowedTools", argv, f"argv={argv!r}")
-        self.assertNotIn("--disallowedTools", argv, f"argv={argv!r}")
+    def test_empty_or_unrecognized_role_gets_the_restricted_tool_flags(self):
+        """CORRECTED lr-49df97 fold-in, HOLDEN-authorized rule-5 exception
+        (PR #143 review): this test originally asserted the OPPOSITE --
+        that an empty/unknown role must default to UNRESTRICTED. That
+        assertion was WRONG, not a considered contract: it was written in
+        this same task, hours before the correction, and it happened to
+        lock in a fail-open default for a control that decides whether
+        Bash is available to a process reading an attacker-influenceable
+        diff. For a control of that kind, the hazard is inverted from what
+        the original docstring named -- "silently restrict tools for an
+        unknown role" is not the risk; silently UN-restricting Bash on a
+        typo'd role string, a dropped export, or a nested invocation that
+        lost the role entirely is. A security-relevant tool gate must fail
+        toward RESTRICTED on anything it does not explicitly recognize, the
+        same posture ds_llm_role_is_bash_unrestricted (platform.sh) and
+        invoke_claude's inverted default now both take.
+
+        This is a correction of a fresh, wrong assertion this same PR
+        introduced, not a weakening of an established invariant -- see the
+        commit message for the full rule-5-exception rationale. The
+        sibling test above (test_other_roles_get_no_tool_restriction_flags)
+        remains UNCHANGED: auditor/gate/builder/summarizer are a real,
+        deliberate, foundry-ruled enumeration and still get no restriction.
+
+        Covers empty string (the original case), a plausible misspelling
+        of "reviewer" (proving this isn't merely an empty-string special
+        case), and an entirely unrecognized role string."""
+        for role in ("", "reviewr", "not-a-real-role"):
+            with self.subTest(role=role):
+                recorded, err, rc = _run_invoke_claude(role, call_mode="markdown")
+                self.assertEqual(rc, 0, f"role={role!r} err={err}")
+                argv = recorded[0] if recorded else ""
+                self.assertIn(
+                    "--allowedTools", argv,
+                    f"role={role!r} must receive --allowedTools -- an "
+                    f"unrecognized role must fail toward RESTRICTED, not "
+                    f"unrestricted: {argv!r}",
+                )
+                self.assertIn(
+                    "Read,Grep,Glob", argv,
+                    f"role={role!r} argv={argv!r}",
+                )
+                self.assertIn(
+                    "--disallowedTools", argv,
+                    f"role={role!r} must receive --disallowedTools Bash: {argv!r}",
+                )
+                self.assertIn(
+                    "Bash", argv,
+                    f"role={role!r} argv={argv!r}",
+                )
 
 
 def _write_fake_claude_json_reviewer(bin_dir, argv_file):
@@ -431,6 +487,137 @@ class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
                 "UNRESTRICTED", r.stderr,
                 f"auditor role must not emit the reviewer-scoped warning; "
                 f"stderr={r.stderr!r}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _run_walk_chain_with_role(role_lower, bin_dir, argv_file):
+    """Calls walk_chain directly with an arbitrary ROLE_L string (not
+    necessarily one of the five real subcommand-dispatch roles) -- proves
+    the SECOND, INDEPENDENT layer (walk_chain's own role-sanity check,
+    scripts/llm-client.sh) fires on its own, not merely that invoke_claude's
+    default (the first layer, already covered by
+    TestNonReviewerRolesAreUntouched above) happens to restrict too."""
+    tmpdir = tempfile.mkdtemp(prefix="clagentic-test-walkchain-rolecheck-")
+    try:
+        src_dir = os.path.join(tmpdir, "src")
+        os.makedirs(src_dir)
+        sourced = _functions_only_source(src_dir)
+
+        role_upper = role_lower.upper().replace("-", "_")
+        script = textwrap.dedent(f"""\
+            export PATH='{bin_dir}':"$PATH"
+            export CLAGENTIC_{role_upper}_CMD=claude
+            _fixture_prompt() {{ printf 'test prompt'; }}
+            . '{sourced}'
+            printf 'stdin diff content' | walk_chain '{role_lower}' json _fixture_prompt
+        """)
+        r = subprocess.run(
+            ["sh", "-c", script, sourced],
+            capture_output=True, text=True, cwd=TOOL_HOME,
+        )
+        with open(argv_file) as f:
+            recorded = [line.rstrip("\n") for line in f if line.strip()]
+        return recorded, r.stderr, r.returncode
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestWalkChainOwnRoleSanityCheckIsIndependentOfInvokeClaude(unittest.TestCase):
+    """lr-49df97 fold-in, HOLDEN-authorized correction, layer 2: walk_chain
+    itself warns when ROLE_L is neither a known opt-out role nor
+    "reviewer" -- a producer-side check at the export site, structurally
+    separate from invoke_claude's consumer-side default (proven by the
+    OTHER test classes in this file). Neither layer's test depends on the
+    other layer's code path."""
+
+    def test_unrecognized_role_triggers_the_walk_chain_own_warning(self):
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-walkchain-rolecheck-outer-")
+        try:
+            argv_file = os.path.join(tmpdir, "argv.log")
+            open(argv_file, "w").close()
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(bin_dir)
+            _write_fake_claude_json_reviewer(bin_dir, argv_file)
+
+            recorded, err, rc = _run_walk_chain_with_role("bogus-role", bin_dir, argv_file)
+            self.assertIn(
+                "RESTRICTED", err,
+                f"an unrecognized ROLE_L must trigger walk_chain's own "
+                f"fail-safe warning naming the fallback to the restricted "
+                f"set; stderr={err!r}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_unrecognized_role_still_gets_the_restricted_flags_on_the_real_call(self):
+        """The warning is diagnostic, not a substitute for the actual
+        restriction -- the real claude invocation this role reaches must
+        still carry the restricted flags (invoke_claude's own default,
+        layer 1), proving the two layers agree in practice even though
+        this test only exercises walk_chain's call shape."""
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-walkchain-rolecheck-flags-")
+        try:
+            argv_file = os.path.join(tmpdir, "argv.log")
+            open(argv_file, "w").close()
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(bin_dir)
+            _write_fake_claude_json_reviewer(bin_dir, argv_file)
+
+            recorded, err, rc = _run_walk_chain_with_role("bogus-role", bin_dir, argv_file)
+            self.assertEqual(len(recorded), 1, f"recorded={recorded!r} err={err!r}")
+            argv = recorded[0]
+            self.assertIn("--allowedTools", argv, f"argv={argv!r}")
+            self.assertIn("--disallowedTools", argv, f"argv={argv!r}")
+            self.assertIn("Bash", argv, f"argv={argv!r}")
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_known_optout_role_does_not_trigger_the_warning(self):
+        """Negative control: a real, enumerated opt-out role (auditor) must
+        not trip walk_chain's own sanity-check warning -- it is a known,
+        deliberate role, not an unrecognized one."""
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-walkchain-rolecheck-known-")
+        try:
+            argv_file = os.path.join(tmpdir, "argv.log")
+            open(argv_file, "w").close()
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(bin_dir)
+            _write_fake_claude_json_reviewer(bin_dir, argv_file)
+
+            recorded, err, rc = _run_walk_chain_with_role("auditor", bin_dir, argv_file)
+            self.assertNotIn(
+                "RESTRICTED", err,
+                f"a known opt-out role must not trigger the role-sanity "
+                f"warning; stderr={err!r}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_reviewer_role_does_not_trigger_the_warning(self):
+        """Negative control: "reviewer" is the one role deliberately routed
+        through the restricted default without being an opt-out role --
+        walk_chain's own check must recognize it as expected, not flag it
+        as an unrecognized role."""
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-walkchain-rolecheck-reviewer-")
+        try:
+            argv_file = os.path.join(tmpdir, "argv.log")
+            open(argv_file, "w").close()
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(bin_dir)
+            _write_fake_claude_json_reviewer(bin_dir, argv_file)
+
+            recorded, err, rc = _run_walk_chain_with_role("reviewer", bin_dir, argv_file)
+            self.assertNotIn(
+                "RESTRICTED", err,
+                f"the reviewer role itself must not trigger the "
+                f"role-sanity warning; stderr={err!r}",
             )
         finally:
             import shutil
