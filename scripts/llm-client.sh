@@ -1070,6 +1070,25 @@ log_attempt() {
   ds_audit_log llm-call "$OUTCOME" "$DETAILS"
 }
 
+# Print a one-line stderr notice for a step-failed or fallback outcome.
+# Previously log_attempt (above) was the ONLY destination for these
+# outcomes -- audit.db, never the terminal -- so a same-vendor fallback
+# (e.g. auditor codex times out, falls through to claude) produced zero
+# visible signal on a normal `gates review`/`gates ship` run and was only
+# discoverable by manually querying audit.db (lr-829fcd). Deliberately NOT
+# called on a clean primary pass (ATTEMPT == 1): the happy path stays
+# silent, matching this file's existing degrade-and-continue posture --
+# CLAGENTIC_<ROLE>_REQUIRED=1 (see the hard-failure branch below) is the
+# opt-in for turning this into a blocking error; this notice only makes
+# the default, non-blocking degrade visible instead of silent.
+# Args: OUTCOME (step-failed|fallback) ROLE CLI TIER [ERR_HINT]
+notify_step_outcome() {
+  NOTICE_OUTCOME="$1"; NOTICE_ROLE="$2"; NOTICE_CLI="$3"; NOTICE_TIER="$4"; NOTICE_HINT="${5:-}"
+  NOTICE_MSG="[clagentic-lite/llm-client] $NOTICE_OUTCOME: role=$NOTICE_ROLE cli=$NOTICE_CLI tier=$NOTICE_TIER"
+  [ -n "$NOTICE_HINT" ] && NOTICE_MSG="$NOTICE_MSG — $NOTICE_HINT"
+  printf '%s\n' "$NOTICE_MSG" 1>&2
+}
+
 # Configurable per-call timeout (seconds). Defaults to 3 minutes — long
 # enough for a high-effort review on a deep prompt, short enough that a
 # hung CLI surfaces as a step failure rather than wedging the gate.
@@ -2129,6 +2148,7 @@ walk_chain() {
       ANY_TURNS_EXHAUSTED=1
       ERR_HINT="turn limit exhausted before completion (num_turns=$TURN_NUM_TURNS, role=$ROLE_L mode=$MODE) -- a truncated run, never a clean pass"
       log_attempt "$ROLE_L" "$CLI" "$TIER" "step-failed" "$ERR_HINT"
+      notify_step_outcome "step-failed" "$ROLE_L" "$CLI" "$TIER" "$ERR_HINT"
       continue
     fi
     if [ "$EXIT_CODE" -eq 0 ] && [ "$UNWRAP_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
@@ -2136,6 +2156,7 @@ walk_chain() {
         log_attempt "$ROLE_L" "$CLI" "$TIER" "pass" "num_turns=$TURN_NUM_TURNS"
       else
         log_attempt "$ROLE_L" "$CLI" "$TIER" "fallback" "num_turns=$TURN_NUM_TURNS"
+        notify_step_outcome "fallback" "$ROLE_L" "$CLI" "$TIER" "num_turns=$TURN_NUM_TURNS"
       fi
       cat "$TMP_OUT"
       RESULT=0
@@ -2208,6 +2229,7 @@ walk_chain() {
       ERR_HINT="empty output (exit=$EXIT_CODE)"
     fi
     log_attempt "$ROLE_L" "$CLI" "$TIER" "step-failed" "$ERR_HINT"
+    notify_step_outcome "step-failed" "$ROLE_L" "$CLI" "$TIER" "$ERR_HINT"
   done < "$TMP_CHAIN"
 
   if [ "$RESULT" -ne 0 ]; then
