@@ -12,7 +12,6 @@
 
 set -e
 . "$(dirname "$0")/platform.sh"
-ds_load_env
 
 # Tool home: resolved from this script's own location (same convention as gates.sh).
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -383,6 +382,24 @@ cmd_seed_demo() {
   cmd_log_turn "Discussed input normalization for auth; decided strip+lower is insufficient." "auth normalization" "seed"
   cmd_log_turn "Adversarial pass surfaced null-byte injection in _normalize_email; fix planned." "auth security" "seed"
 }
+
+# ENROLL-TIME TRUST GATE (lr-33fb89, PR #152 second fold-in, coordinator-
+# escalated bobbie.sast.3 follow-through) -- mirrors the identical gate in
+# gates.sh; see that file's own comment at its dispatch site for the full
+# rationale. `init` is the ONE subcommand reachable BEFORE a repo has been
+# enrolled (`clagentic-lite enroll` invokes `memory.sh init` directly,
+# bin/clagentic-lite _enroll_one, from cwd that is commonly INSIDE the
+# not-yet-enrolled target repo). cmd_init reads no CLAGENTIC_* config value
+# except CLAGENTIC_DISABLE_FTS (a host/environment sqlite3-capability knob,
+# not a per-repo semantic choice), so skipping ds_load_env for `init`
+# specifically closes the pre-trust execution window with no material
+# behavior change. Every other subcommand (log-turn, recall, summarize-turn,
+# digest, seed-demo) is reachable only post-enrollment (hook shims/operator
+# already working in an enrolled repo) and still gets the full, unchanged
+# ds_load_env exactly as before this fold-in.
+if [ "${1:-}" != "init" ]; then
+  ds_load_env
+fi
 
 case "${1:-}" in
   init)            cmd_init ;;

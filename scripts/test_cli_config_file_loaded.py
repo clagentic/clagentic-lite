@@ -74,6 +74,30 @@ added for this fold-in:
        failure), escalated in-scope by the coordinator during this same
        fold-in since it is the same file/function this PR already touches.
 
+PR #152 SECOND FOLD-IN (coordinator follow-through on bobbie.sast.3): the
+first round's fix closed the CLI-DISPATCH path but left a second, deeper
+one open -- `clagentic-lite enroll`'s own internal delegation
+(bin/clagentic-lite _enroll_one) invokes `scripts/memory.sh init` and
+`scripts/gates.sh init` as subprocesses, BEFORE the repo is registered.
+Those scripts each called the combined ds_load_env unconditionally at
+their own top level (memory.sh:15, gates.sh:27 pre-fix), independent of
+bin/clagentic-lite's own gate, so the exact `git clone && cd && enroll`
+shape -- the single most common enrollment workflow -- still executed a
+hostile repo-local .clagentic/config, one process frame down from where
+BOBBIE looked. Fixed by moving ds_load_env in both scripts to run for
+every subcommand EXCEPT `init` (verified: cmd_init in both scripts reads
+no config-file-sourced CLAGENTIC_* value at all, so this is a no-op for
+`init`'s own behavior and a real gate for the pre-trust window).
+test_first_enroll_does_not_execute_the_repo_being_enrolled now asserts
+sentinel absence (previously only asserted enroll succeeded, explicitly
+noting the subprocess path was unverified) -- this is the test that FAILED
+on the first fold-in's code even though every CLI-dispatch-level test
+passed, proving the two layers are genuinely independent execution paths.
+Paired with test_second_invocation_against_enrolled_repo_honors_repo_local_config
+(narrowness proof: the gate defers timing, it does not disable the
+feature) and test_first_enroll_from_outside_target_repo_does_not_execute_it
+(cwd-independence proof).
+
 HAZARD (PR #146 lesson, repeated here because two tests in this file touch
 `update --restamp`): `clagentic-lite update` runs `git -C
 "$CLAGENTIC_LITE_HOME" stash push` (and, on a non-tty, `stash drop`) against
@@ -569,33 +593,48 @@ class TestHostileRepoLocalConfigNotExecutedPreTrust(unittest.TestCase):
         self._assert_sentinel_absent("show")
 
     def test_first_enroll_does_not_execute_the_repo_being_enrolled(self):
-        """THE SHARPEST CASE: enroll is how a repo becomes trusted, and
-        cannot require prior trust as a precondition for reading it -- but
-        it must also not execute the repo's own config as the PRICE of
-        enrolling it. The very first `enroll` call for this repo must not
-        trigger the sentinel, even though enroll succeeds and the repo ends
-        up enrolled afterward.
+        """THE SHARPEST CASE, and the one the CLI-dispatch-only version of
+        this test suite missed (coordinator follow-up on bobbie.sast.3,
+        second round): the exact `git clone && cd && clagentic-lite enroll`
+        shape, cwd INSIDE the not-yet-enrolled repo, hostile
+        .clagentic/config already present. enroll is how a repo becomes
+        trusted and cannot require prior trust as a precondition for
+        reading it -- but it must also not execute the repo's own config as
+        the PRICE of enrolling it. The very first `enroll` call for this
+        repo must not trigger the sentinel, even though enroll succeeds and
+        the repo ends up enrolled afterward.
 
-        NOTE: this asserts the CLI-DISPATCH trust gate specifically (the
-        surface bobbie.sast.3 named). enroll's OWN internal delegation to
-        `scripts/memory.sh init`/`scripts/gates.sh init` (bin/clagentic-lite
-        _enroll_one) is a SEPARATE, PRE-EXISTING execution path -- those
-        scripts call the combined ds_load_env themselves, unconditionally,
-        independent of this PR's CLI-dispatch gate, and were already
-        reachable from a first `enroll` call before this PR existed. That
-        gap is real but out of scope for this fold-in (BOBBIE's finding was
-        about bin/clagentic-lite's own dispatch; the coordinator scoped the
-        fix to "the CLI's trust precondition", not gates.sh/memory.sh) --
-        see the PR body's followups section. This test therefore plants a
-        hostile config with NO CLAGENTIC_ROUTER_* side effect that would
-        make enroll itself behave differently either way, and asserts only
-        that the CLI-dispatch-level execution does not happen; it does not
-        (and structurally cannot, without touching gates.sh/memory.sh) prove
-        the enroll-internal subprocess path is also clean.
-        """
+        THIS NOW COVERS BOTH LAYERS: the CLI-dispatch trust gate
+        (_cli_maybe_load_repo_env, bin/clagentic-lite -- excludes `enroll`
+        entirely) AND the enroll-internal subprocess path (_enroll_one's
+        `scripts/memory.sh init` / `scripts/gates.sh init` calls, which
+        used to call the combined ds_load_env unconditionally regardless of
+        the CLI-dispatch gate -- fixed by moving each script's ds_load_env
+        call to run for every subcommand EXCEPT `init`, since cmd_init in
+        both scripts reads no config-sourced CLAGENTIC_* value at all).
+        Before that second fix, THIS test failed even though the
+        CLI-dispatch-only tests above all passed -- proof the two layers
+        are genuinely independent execution paths, not one gate protecting
+        both."""
         self._plant_hostile_config()
         rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
         self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        self._assert_sentinel_absent("enroll (first call, cwd inside target repo)")
+
+    def test_first_enroll_from_outside_target_repo_does_not_execute_it(self):
+        """Companion to the above: enroll invoked with an explicit PATH
+        argument from OUTSIDE the target repo (cwd is some other directory
+        entirely) -- ds_repo_root() inside the memory.sh/gates.sh init
+        subprocesses resolves from THEIR OWN cwd, which _enroll_one does not
+        change before invoking them, so this should behave identically to
+        the cwd-inside case. Confirms the fix does not depend on which
+        directory the operator happened to run enroll from."""
+        self._plant_hostile_config()
+        outside_cwd = os.path.join(self.tmpdir, "elsewhere")
+        os.makedirs(outside_cwd, exist_ok=True)
+        rc, out, err = _run_cli(["enroll", self.repo], cwd=outside_cwd, home=self.home)
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        self._assert_sentinel_absent("enroll (first call, cwd outside target repo)")
 
     def test_re_enrolled_or_post_enroll_repo_local_config_still_loads_safely(self):
         """Sanity check the gate is not overcorrecting: a repo-local config
@@ -623,6 +662,32 @@ class TestHostileRepoLocalConfigNotExecutedPreTrust(unittest.TestCase):
             env_extra={"CLAGENTIC_SKIP_UPDATE_ALERT": "1"},
         )
         self.assertIn("127.0.0.1:7777", out + err, msg=f"OUT={out}\nERR={err}")
+
+    def test_second_invocation_against_enrolled_repo_honors_repo_local_config(self):
+        """The narrowness proof the coordinator asked for, paired directly
+        with test_first_enroll_does_not_execute_the_repo_being_enrolled: the
+        SAME repo, enrolled with a BENIGN config first (so the pre-trust
+        gate is proven not to interfere with a normal enrollment), then a
+        SECOND invocation (doctor) against that now-enrolled repo, with the
+        repo-local config still legitimately present, DOES honor it -- this
+        gate narrows WHEN the repo-local layer loads (pre-trust vs
+        post-trust), it does not permanently disable the feature the
+        moment ANY .clagentic/config has ever existed in a repo's history."""
+        cfg_dir = os.path.join(self.repo, ".clagentic")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config"), "w") as f:
+            f.write("CLAGENTIC_ROUTER_URL=http://127.0.0.1:8888\n")
+
+        rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+
+        rc, out, err = _run_cli(
+            ["doctor"], cwd=self.repo, home=self.home,
+            env_extra={"CLAGENTIC_SKIP_UPDATE_ALERT": "1"},
+        )
+        self.assertIn("127.0.0.1:8888", out + err,
+                       msg=f"repo-local config was not honored on the SECOND (post-enrollment) "
+                           f"invocation -- gate over-blocked: OUT={out} ERR={err}")
 
 
 if __name__ == "__main__":
