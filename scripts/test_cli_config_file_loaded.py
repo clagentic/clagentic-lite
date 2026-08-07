@@ -690,5 +690,57 @@ class TestHostileRepoLocalConfigNotExecutedPreTrust(unittest.TestCase):
                            f"invocation -- gate over-blocked: OUT={out} ERR={err}")
 
 
+class TestEnrollTimeSkippedConfigNotice(unittest.TestCase):
+    """PR #152 third fold-in (PEACHES review, comment 5220090596): the
+    per-repo config timing narrowing is user-visible and was documented
+    only in code -- this class covers the visible-surprise mitigation:
+    enroll prints a one-time stderr notice when a repo-local
+    .clagentic/config exists but will not be read during THIS call. Must
+    NOT fire when no such file exists, and must NOT fire on any subsequent
+    (post-enrollment) subcommand."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="clagentic-test-enroll-notice-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.home = os.path.join(self.tmpdir, "home")
+        os.makedirs(self.home)
+        self.repo = os.path.join(self.tmpdir, "repo")
+        _init_git_repo(self.repo)
+
+    def test_notice_fires_when_repo_local_config_present_at_enroll(self):
+        cfg_dir = os.path.join(self.repo, ".clagentic")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config"), "w") as f:
+            f.write("CLAGENTIC_ROUTER_URL=http://127.0.0.1:9999\n")
+
+        rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        self.assertIn("is not read during enroll", out + err, msg=f"OUT={out}\nERR={err}")
+        self.assertIn(".clagentic/config", out + err, msg=f"OUT={out}\nERR={err}")
+
+    def test_notice_absent_when_no_repo_local_config(self):
+        rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        self.assertNotIn("is not read during enroll", out + err, msg=f"OUT={out}\nERR={err}")
+
+    def test_notice_does_not_fire_on_post_enrollment_doctor(self):
+        """The notice is enroll-specific -- doctor against the same,
+        now-enrolled repo (with the same repo-local config still present
+        and now legitimately loaded) must not repeat it."""
+        cfg_dir = os.path.join(self.repo, ".clagentic")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config"), "w") as f:
+            f.write("CLAGENTIC_ROUTER_URL=http://127.0.0.1:9999\n")
+
+        rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+
+        rc, out, err = _run_cli(
+            ["doctor"], cwd=self.repo, home=self.home,
+            env_extra={"CLAGENTIC_SKIP_UPDATE_ALERT": "1"},
+        )
+        self.assertNotIn("is not read during enroll", out + err, msg=f"OUT={out}\nERR={err}")
+
+
 if __name__ == "__main__":
     unittest.main()

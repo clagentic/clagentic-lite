@@ -1685,6 +1685,20 @@ _enroll_one() {
   mkdir -p "$_dot" && chmod 755 "$_dot" \
     || { warn "cannot create $_dot"; return 1; }
 
+  # A repo-local .clagentic/config present at enroll time is NOT read on
+  # this call (see docs/DESIGN.md "Trust boundary: global config vs.
+  # per-repo config" — the CLI's own dispatch skips the repo-local load for
+  # the `enroll` subcommand specifically, deliberately and unconditionally,
+  # never mind registry state). Converting that into a visible, one-time
+  # notice rather than a silent surprise: fires on every `enroll` call
+  # (including a --force re-enroll, since the CLI-dispatch skip applies to
+  # the subcommand itself, not to first-enroll-only), never on doctor,
+  # update, or any other subcommand, which all load it normally once the
+  # repo is a registry member.
+  if [ -f "$_canon/.clagentic/config" ]; then
+    say "note: $_canon/.clagentic/config exists but is not read during enroll (see docs/DESIGN.md)"
+  fi
+
   CLAGENTIC_PROJECT_ROOT="$_canon" "$CLAGENTIC_LITE_HOME/scripts/memory.sh" init
   CLAGENTIC_PROJECT_ROOT="$_canon" "$CLAGENTIC_LITE_HOME/scripts/gates.sh" init
 

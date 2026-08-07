@@ -3,6 +3,14 @@
 # Per-repo .clagentic/config is OPTIONAL and SPARSE — only override keys.
 # Load order at gate-run time: global config → per-repo .clagentic/config → env vars.
 #
+# TIMING: a repo-local .clagentic/config does not take effect until AFTER
+# the repo has been enrolled — it is not read during the very first
+# `clagentic-lite enroll` call on that repo, only from the next invocation
+# onward (doctor, update, a re-enroll, or a hook firing on your next
+# commit). This is deliberate: the CLI will not execute a repo's own
+# config before that repo is enrolled/trusted. The global config above is
+# unaffected and applies at enroll time as normal.
+#
 # Per-role contract: each role has its own primary CLI+model and an ordered
 # fallback chain. The chain is walked left-to-right when the primary fails
 # (non-zero exit, parse failure, timeout). Each entry is "cmd:tier" where
