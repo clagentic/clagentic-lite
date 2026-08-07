@@ -146,7 +146,7 @@ SHIM_VERSION="v3"
 
 # Claude Code artifact version markers. Bump when the corresponding template
 # changes so `clagentic-lite update` re-stamps enrolled repos automatically.
-CLAUDE_SETTINGS_VERSION="v6"
+CLAUDE_SETTINGS_VERSION="v7"
 # CLAUDE_MD_VERSION is retired — replaced by three narrower constants below.
 # The variable is kept as a tombstone so doctor/update version-compare calls
 # against old installed files continue to work during the transition period.
@@ -584,9 +584,41 @@ _validate_router_url() {
 # in that case rather than omitting the key, so `clagentic-lite doctor` and a
 # human reading settings.json see explicitly that no token is configured
 # instead of silently missing the key.
+#
+# BEDROCK PAIR (lr-4af4c4): ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN are
+# INERT for any session running CLAUDE_CODE_USE_BEDROCK=1 — that mode
+# ignores both and speaks the AWS Bedrock Runtime InvokeModel wire protocol
+# instead, using ANTHROPIC_BEDROCK_BASE_URL (the Bedrock-mode equivalent of
+# ANTHROPIC_BASE_URL) and, per Claude Code's Bedrock API-key option,
+# AWS_BEARER_TOKEN_BEDROCK as a bearer-token alternative to full SigV4
+# signing (https://code.claude.com/docs/en/amazon-bedrock, "Option E:
+# Amazon Bedrock API keys"). CLAGENTIC_ROUTER_TOKEN is reused verbatim as
+# AWS_BEARER_TOKEN_BEDROCK — same token, different variable name, matching
+# clagentic-router's auth check, which does not distinguish which header/
+# variable carried the token in; a second token config key would be a false
+# distinction. Gated behind its own explicit opt-in,
+# CLAGENTIC_ROUTER_BEDROCK_MODE=1 (requires CLAGENTIC_ROUTER_URL also set),
+# rather than auto-detected from CLAUDE_CODE_USE_BEDROCK in the enroll-time
+# environment — enroll-time environment does not reliably predict
+# session-time environment, so an explicit durable config key is the
+# correct place for this, not an environment-shape check.
+#
+# SUPPLEMENT, NOT REPLACE: the Bedrock pair is stamped ALONGSIDE the
+# direct-API pair, not instead of it. A single settings.json may be opened
+# by sessions running in either auth mode (e.g. an operator who runs Claude
+# Code both with and without CLAUDE_CODE_USE_BEDROCK=1 depending on
+# terminal/profile) — each mode only ever reads the two variables it
+# understands and ignores the other pair, so stamping both is safe for
+# either mode and correct for both, at the cost of a settings.json that
+# always carries the unused pair for whichever mode the operator is not
+# currently running. The alternative (replacing the direct-API pair
+# whenever Bedrock mode is configured) would silently break any
+# direct-API-auth session opened against the same repo — a worse failure
+# than an unused key sitting in the file.
 _render_claude_settings_body() {
   _rcs_template="$1"
   _rcs_router_url="${CLAGENTIC_ROUTER_URL:-}"
+  _rcs_bedrock_mode="${CLAGENTIC_ROUTER_BEDROCK_MODE:-0}"
 
   while IFS= read -r _rcs_line || [ -n "$_rcs_line" ]; do
     case "$_rcs_line" in
@@ -594,7 +626,13 @@ _render_claude_settings_body() {
         if [ -n "$_rcs_router_url" ]; then
           printf '  "env": {\n'
           printf '    "ANTHROPIC_BASE_URL": "%s",\n' "$_rcs_router_url"
-          printf '    "ANTHROPIC_AUTH_TOKEN": "%s"\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
+          if [ "$_rcs_bedrock_mode" = "1" ]; then
+            printf '    "ANTHROPIC_AUTH_TOKEN": "%s",\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
+            printf '    "ANTHROPIC_BEDROCK_BASE_URL": "%s",\n' "$_rcs_router_url"
+            printf '    "AWS_BEARER_TOKEN_BEDROCK": "%s"\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
+          else
+            printf '    "ANTHROPIC_AUTH_TOKEN": "%s"\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
+          fi
           printf '  },\n'
         fi
         # Router URL unset: emit nothing — the sentinel line is dropped
@@ -2306,6 +2344,12 @@ cmd_doctor() {
     fi
     if [ -z "${CLAGENTIC_ROUTER_TOKEN:-}" ]; then
       printf '  INFO CLAGENTIC_ROUTER_TOKEN is unset — routed-mode roles (role:<chain>) will fail auth; passthrough mode does not need it.\n'
+    fi
+    if [ "${CLAGENTIC_ROUTER_BEDROCK_MODE:-0}" = "1" ]; then
+      printf '  INFO CLAGENTIC_ROUTER_BEDROCK_MODE=1 — settings.json also carries ANTHROPIC_BEDROCK_BASE_URL/AWS_BEARER_TOKEN_BEDROCK, required for CLAUDE_CODE_USE_BEDROCK=1 sessions to route through the router.\n'
+    elif [ "${CLAUDE_CODE_USE_BEDROCK:-}" = "1" ]; then
+      printf '  WARN CLAUDE_CODE_USE_BEDROCK=1 is set in this environment but CLAGENTIC_ROUTER_BEDROCK_MODE is not — Bedrock-mode sessions ignore ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN entirely and will NOT route through clagentic-router.\n'
+      printf '       This is an advisory check of the environment doctor runs in, not a durable stamp-time decision -- set CLAGENTIC_ROUTER_BEDROCK_MODE=1 and re-run enroll/update if your Claude Code sessions use Bedrock auth.\n'
     fi
     if [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" = "1" ]; then
       printf '  INFO CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1 — reviewer/auditor/merge-gate agents install with model: role:<role>-chain in frontmatter.\n'
