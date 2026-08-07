@@ -134,6 +134,52 @@ if [ ! -f "$SCRIPTS_DIR/platform.sh" ]; then
 fi
 . "$SCRIPTS_DIR/platform.sh"
 
+# Load ~/.config/clagentic/config and any per-repo .clagentic/config
+# (ds_load_env, scripts/platform.sh) — the same call every other runtime
+# entry point (hooks, gates.sh, llm-client.sh, memory.sh, smoke.sh) makes
+# immediately after sourcing platform.sh. Before this fix (lr-33fb89),
+# bin/clagentic-lite was not on that list: every CLAGENTIC_* var it reads
+# directly (chiefly CLAGENTIC_ROUTER_URL/_TOKEN/_INJECT_AGENT_MODEL/
+# _BEDROCK_MODE) was silently inert unless the calling shell had already
+# exported it — writing it into the config file exactly as
+# share/config.example and the README instruct had no effect.
+#
+# PRECEDENCE (deliberate, matches the existing ds_load_env contract, not
+# assumed inert): ds_load_env sources each config layer with `set -a`
+# around a dot-source, so a config-file value UNCONDITIONALLY OVERWRITES an
+# already-exported shell value for the same key — that is the accepted,
+# tested contract at every other entry point (gates.sh, llm-client.sh,
+# memory.sh, smoke.sh, every hook shim). This call matches it for
+# consistency: a CLAGENTIC_ROUTER_* value set in the global config now
+# behaves identically whether the CLI reads it or a gate script does.
+#
+# THE ONE DELIBERATE EXCEPTION: CLAGENTIC_LITE_HOME. SCRIPTS_DIR (above)
+# and every path resolved from it (_bootstrap_resolve_self, platform.sh
+# itself) were already locked in from the bootstrap block at the top of
+# this file BEFORE platform.sh — and therefore ds_load_env — could even be
+# sourced (classic chicken-and-egg: the config file that might redefine
+# CLAGENTIC_LITE_HOME lives inside the tree CLAGENTIC_LITE_HOME points at,
+# so it cannot be consulted to find itself). Letting ds_load_env's normal
+# config-wins behavior silently repoint CLAGENTIC_LITE_HOME after that
+# would split the process: SCRIPTS_DIR/platform.sh already loaded from tree
+# A, but SHARE_DIR (next line) and every subsequent path built from
+# CLAGENTIC_LITE_HOME would point at tree B — a real, silent inconsistency,
+# not simulated inertness. So CLAGENTIC_LITE_HOME is explicitly re-pinned
+# to the bootstrap-resolved value immediately after ds_load_env runs,
+# overriding whatever the config file said for that one key. This mirrors
+# share/config.example's own framing of CLAGENTIC_LITE_HOME ("Set
+# automatically by `clagentic-lite init`. Edit only if you move the
+# install.") — the file's copy is meant to describe the current install,
+# not redirect it live. CLAGENTIC_HOME's deprecation-warning check (doctor
+# check 11, below) is unaffected either way: it only inspects whether
+# CLAGENTIC_HOME is set in the environment at report time, which
+# ds_load_env does not touch (share/config.example defines
+# CLAGENTIC_LITE_HOME only, never the deprecated CLAGENTIC_HOME).
+_PRE_ENV_LOAD_CLAGENTIC_LITE_HOME="$CLAGENTIC_LITE_HOME"
+ds_load_env
+CLAGENTIC_LITE_HOME="$_PRE_ENV_LOAD_CLAGENTIC_LITE_HOME"
+export CLAGENTIC_LITE_HOME
+
 SHARE_DIR="$CLAGENTIC_LITE_HOME/share"
 REGISTRY="$HOME/.local/state/clagentic/registry"
 GLOBAL_CONFIG="$HOME/.config/clagentic/config"

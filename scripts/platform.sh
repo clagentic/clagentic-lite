@@ -79,8 +79,13 @@ ds_repo_root() {
 #
 # Idempotent — honors a CLAGENTIC_ENV_LOADED guard so re-sourcing in the
 # same process doesn't double-export. Every runtime entry point (hooks,
-# gates.sh, llm-client.sh, memory.sh, smoke.sh) calls this immediately
-# after sourcing platform.sh.
+# gates.sh, llm-client.sh, memory.sh, smoke.sh, bin/clagentic-lite) calls
+# this immediately after sourcing platform.sh. bin/clagentic-lite is the one
+# exception to "immediately": CLAGENTIC_LITE_HOME must already be resolved
+# (bootstrap, before platform.sh can even be sourced) and is then re-pinned
+# to that bootstrap value right after this call returns — see the call site
+# in bin/clagentic-lite for why that one key cannot follow the same
+# config-wins precedence every other key here does (lr-33fb89).
 ds_load_env() {
   [ "${CLAGENTIC_ENV_LOADED:-0}" = "1" ] && return 0
 
