@@ -223,6 +223,29 @@ Per-repo footprint is `.clagentic/lite/{audit.db,memory.db}`, thin shims in `.gi
 
 Project root isolation: `gates.sh`, `memory.sh`, and `llm-client.sh` resolve the project root via `CLAGENTIC_PROJECT_ROOT` env var when set, falling back to `git rev-parse --show-toplevel` of cwd. Hook shims run from inside the enrolled repo's working tree, so git show-toplevel finds the enrolled project automatically without the shim needing to know the path at stamp time.
 
+### Trust boundary: global config vs. per-repo config
+
+Two config files feed into every clagentic-lite process: `~/.config/clagentic/config` (global, written by `init`, lives outside any repo) and `<repo>/.clagentic/config` (optional, sparse, lives inside the repo). Both are loaded the same way — sourced into the shell, each assignment auto-exported — which means loading either one *executes* it: it is a shell file, not a passive key-value format.
+
+That distinction matters because the two files have very different provenance. The global config is something the operator wrote, on their own machine, before any of this runs. The per-repo config is *repo content* — it travels with `git clone` like everything else in the tree. A repo you have merely cloned, never enrolled, never reviewed, can carry a `.clagentic/config` an attacker planted. If the CLI sourced that file the moment it noticed cwd was inside a git repo, running something as innocuous as `clagentic-lite doctor` right after cloning an unfamiliar repo — out of curiosity, before deciding whether to trust it at all — would execute arbitrary shell on your machine.
+
+The fix is to treat the two files differently rather than loading them through one unconditional call:
+
+- **`ds_load_global_env`** (`scripts/platform.sh`) loads only the global config. Safe to call unconditionally, for every subcommand, because it never touches repo content.
+- **`ds_load_repo_env`** (`scripts/platform.sh`) loads only the per-repo config (plus a legacy `.env` file, same idea). This one requires a trust decision first.
+- **`ds_load_env`** composes both, in order, and remains what `gates.sh`, `llm-client.sh`, `memory.sh`, `smoke.sh`, and the Claude Code hook shims call — unconditionally, exactly as before this split existed. That is correct for them: every one of those only ever runs against a repo you have already deliberately enrolled (a hook fires from inside your own working tree; you invoked the script yourself while working in that repo). The precondition — "this repo is already trusted" — genuinely holds before any of them run.
+
+`bin/clagentic-lite`'s own top-level dispatch is the one place that precondition does *not* automatically hold, because it is the thing deciding, moment to moment, which repo (if any) to trust. So it calls `ds_load_global_env` unconditionally, then a separate helper that loads the repo-local layer *only* when the repo's canonical path is already listed in `~/.local/state/clagentic/registry` — the file `enroll` appends to on success. Registry membership is the trust signal specifically because it lives outside the repo: nothing in a hostile clone can add itself to a file on the operator's machine that the operator never asked to write.
+
+`enroll` and `init` are the two exceptions, and each is a real design decision, not an oversight:
+
+- **`init`** has no per-repo context at all — it configures the tool installation, not a project.
+- **`enroll` is how a repo becomes trusted.** It cannot require prior registry membership as a precondition for reading the repo it is in the middle of enrolling — that would make it impossible to ever enroll a first repo. But it must also not execute that repo's own config as the price of enrolling it; doing so would just move the same pre-trust execution problem one subcommand over. So `enroll` skips the repo-local layer entirely. The practical consequence: a repo-local override is not honored on the very first `enroll` call for a given repo — only from the next invocation onward (`doctor`, `update`, a re-`enroll`), once registry membership exists. The global config is unaffected and still applies at enroll time.
+
+This same reasoning extends one layer down: `enroll` itself shells out to `gates.sh init` and `memory.sh init` to create each repo's local databases, before the registry entry is written. Those two scripts skip the repo-local config load specifically for their `init` subcommand (and only `init` — every other subcommand they support keeps the unconditional combined load, since those are only ever reached post-enrollment) for the identical reason: `init` in both scripts needs nothing from a config file, global or per-repo, so there is no cost to deferring the repo-local layer past that one call.
+
+If you find yourself wanting to simplify this back into a single unconditional config load anywhere in the CLI's own dispatch path (as opposed to the hook-invoked runtime scripts, where it is correct): don't. That collapses the trust boundary this section exists to describe, and turns a passing `doctor`/`list`/`update` invocation against an unenrolled repo back into an arbitrary-code-execution surface.
+
 ## Non-goals
 
 - Multi-agent orchestration (no director, no relay).

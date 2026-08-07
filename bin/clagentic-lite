@@ -137,6 +137,67 @@ fi
 SHARE_DIR="$CLAGENTIC_LITE_HOME/share"
 REGISTRY="$HOME/.local/state/clagentic/registry"
 GLOBAL_CONFIG="$HOME/.config/clagentic/config"
+
+# Load ~/.config/clagentic/config (ds_load_global_env, scripts/platform.sh)
+# — the same operator-owned global config every other runtime entry point
+# (hooks, gates.sh, llm-client.sh, memory.sh, smoke.sh) reads via ds_load_env.
+# Before lr-33fb89, bin/clagentic-lite was not on that list: every
+# CLAGENTIC_* var it reads directly (chiefly CLAGENTIC_ROUTER_URL/_TOKEN/
+# _INJECT_AGENT_MODEL/_BEDROCK_MODE) was silently inert unless the calling
+# shell had already exported it — writing it into the config file exactly
+# as share/config.example and the README instruct had no effect.
+#
+# THIS IS THE GLOBAL LOAD ONLY — deliberately NOT the combined ds_load_env.
+# ds_load_env also dot-sources <repo-root>/.clagentic/config, which is REPO
+# CONTENT, not operator content: dot-sourcing EXECUTES it. Calling the
+# combined loader unconditionally here, at the CLI's own top-level dispatch,
+# would mean `clagentic-lite doctor` (or `list`, or `update`) run with cwd
+# inside ANY git repo — including one merely cloned out of curiosity, never
+# enrolled, never trusted — executes that repo's .clagentic/config with zero
+# prior trust signal (bobbie.sast.3, PR #152 review). gates.sh/llm-client.sh/
+# memory.sh/smoke.sh/every hook shim keep using the combined ds_load_env
+# unchanged: they only ever run post-enrollment (invoked by a repo's own
+# git hooks, or by an operator already working inside a repo they enrolled),
+# so that precondition holds for them and does not hold for the CLI's own
+# bootstrap. See _cli_maybe_load_repo_env (below, called from dispatch)
+# for where and how the repo-local layer is loaded instead — gated on
+# registry membership, not unconditional.
+#
+# PRECEDENCE for the global layer (deliberate, matches the existing
+# ds_load_env contract, not assumed inert): ds_load_global_env sources the
+# global config with `set -a` around a dot-source, so a config-file value
+# UNCONDITIONALLY OVERWRITES an already-exported shell value for the same
+# key — that is the accepted, tested contract at every other entry point.
+# This call matches it for consistency: a CLAGENTIC_ROUTER_* value set in
+# the global config now behaves identically whether the CLI reads it or a
+# gate script does.
+#
+# THE ONE DELIBERATE EXCEPTION: CLAGENTIC_LITE_HOME. SCRIPTS_DIR (above)
+# and every path resolved from it (_bootstrap_resolve_self, platform.sh
+# itself) were already locked in from the bootstrap block at the top of
+# this file BEFORE platform.sh — and therefore ds_load_global_env — could
+# even be sourced (classic chicken-and-egg: the config file that might
+# redefine CLAGENTIC_LITE_HOME lives inside the tree CLAGENTIC_LITE_HOME
+# points at, so it cannot be consulted to find itself). Letting the normal
+# config-wins behavior silently repoint CLAGENTIC_LITE_HOME after that
+# would split the process: SCRIPTS_DIR/platform.sh already loaded from tree
+# A, but SHARE_DIR (above) and every subsequent path built from
+# CLAGENTIC_LITE_HOME would point at tree B — a real, silent inconsistency,
+# not simulated inertness. So CLAGENTIC_LITE_HOME is explicitly re-pinned
+# to the bootstrap-resolved value immediately after the load, overriding
+# whatever the config file said for that one key. This mirrors
+# share/config.example's own framing of CLAGENTIC_LITE_HOME ("Set
+# automatically by `clagentic-lite init`. Edit only if you move the
+# install.") — the file's copy is meant to describe the current install,
+# not redirect it live. CLAGENTIC_HOME's deprecation-warning check (doctor
+# check 11, below) is unaffected either way: it only inspects whether
+# CLAGENTIC_HOME is set in the environment at report time, which this load
+# does not touch (share/config.example defines CLAGENTIC_LITE_HOME only,
+# never the deprecated CLAGENTIC_HOME).
+_PRE_ENV_LOAD_CLAGENTIC_LITE_HOME="$CLAGENTIC_LITE_HOME"
+ds_load_global_env
+CLAGENTIC_LITE_HOME="$_PRE_ENV_LOAD_CLAGENTIC_LITE_HOME"
+export CLAGENTIC_LITE_HOME
 LOCAL_BIN="$HOME/.local/bin"
 CLI_SYMLINK="$LOCAL_BIN/clagentic-lite"
 
@@ -190,6 +251,58 @@ CLAGENTIC_SECURITY_TOOLS="gitleaks semgrep osv-scanner"
 say()  { printf '[clagentic-lite] %s\n' "$*"; }
 warn() { printf '[clagentic-lite] WARN: %s\n' "$*" 1>&2; }
 die()  { printf '[clagentic-lite] ERROR: %s\n' "$*" 1>&2; exit 1; }
+
+# _cli_maybe_load_repo_env — the CLI's one trust gate for
+# ds_load_repo_env (scripts/platform.sh), called once from dispatch
+# (lr-33fb89 fold-in, bobbie.sast.3). Loads <repo-root>/.clagentic/config
+# (and legacy .env) ONLY when ds_repo_root()'s result is already a member
+# of $REGISTRY — i.e. the operator ran `clagentic-lite enroll` for that
+# exact repo at some point in the past. This is the ONLY place in
+# bin/clagentic-lite that decides whether to trust repo content enough to
+# execute it; every dispatch case that needs the repo-local layer calls
+# this one function rather than re-deriving the trust check.
+#
+# WHY REGISTRY MEMBERSHIP IS THE RIGHT TRUST SIGNAL: it is the one
+# enrollment marker that lives OUTSIDE the repo (at
+# $HOME/.local/state/clagentic/registry, operator-machine-local), so a
+# hostile repo cannot forge its own trust by shipping a fake marker file
+# inside itself — the only way a path lands in REGISTRY is a prior,
+# deliberate `enroll` run by the operator on THIS machine (bin/clagentic-lite
+# _enroll_one, REGISTRY append). Compare to in-repo markers
+# (.clagentic/lite/, .claude/settings.json, the CLAUDE.md notice stamp):
+# those are exactly the kind of file a hostile clone could plant to look
+# pre-enrolled and defeat a marker-in-repo trust check.
+#
+# WHY `enroll` ITSELF DOES NOT CALL THIS: enroll is how a repo BECOMES
+# trusted — it cannot require prior enrollment (REGISTRY membership) as a
+# precondition for reading the repo it is in the middle of enrolling
+# without becoming unable to ever enroll a first repo. But it also must not
+# execute that repo's OWN .clagentic/config as the price of enrolling it —
+# doing so would be exactly the pre-trust execution this gate exists to
+# close, just moved one subcommand over. So `enroll` skips the repo-local
+# layer entirely at the CLI-bootstrap level: a per-repo CLAGENTIC_ROUTER_*
+# override is not honored on the FIRST `enroll` invocation for a given
+# repo, only from the next invocation onward (doctor/update/etc., once
+# REGISTRY membership exists) — a narrow, deliberate behavior change from
+# this PR's earlier revision (which combined ds_load_env unconditionally
+# and so DID pick up a repo-local override at enroll time). The global
+# config (ds_load_global_env, already loaded unconditionally above) still
+# applies at enroll time exactly as before — only the repo-local override
+# layer is deferred.
+#
+# FAIL TOWARD NOT EXECUTING: ds_repo_root() empty (not in a git repo, no
+# wrapper pointer) or REGISTRY missing/repo not listed both leave the
+# repo-local layer unloaded — the safe default. `enroll`/`unenroll`/`init`
+# never call this at all (see dispatch, below); `unenroll` doesn't need to
+# skip it explicitly since the repo being unenrolled is, by definition,
+# still a REGISTRY member at the moment unenroll runs.
+_cli_maybe_load_repo_env() {
+  [ -f "$REGISTRY" ] || return 0
+  _cmlre_root=$(ds_repo_root)
+  [ -n "$_cmlre_root" ] || return 0
+  grep -qxF "$_cmlre_root" "$REGISTRY" 2>/dev/null || return 0
+  ds_load_repo_env
+}
 
 # ---------------------------------------------------------------- helpers
 
@@ -1572,6 +1685,20 @@ _enroll_one() {
   mkdir -p "$_dot" && chmod 755 "$_dot" \
     || { warn "cannot create $_dot"; return 1; }
 
+  # A repo-local .clagentic/config present at enroll time is NOT read on
+  # this call (see docs/DESIGN.md "Trust boundary: global config vs.
+  # per-repo config" — the CLI's own dispatch skips the repo-local load for
+  # the `enroll` subcommand specifically, deliberately and unconditionally,
+  # never mind registry state). Converting that into a visible, one-time
+  # notice rather than a silent surprise: fires on every `enroll` call
+  # (including a --force re-enroll, since the CLI-dispatch skip applies to
+  # the subcommand itself, not to first-enroll-only), never on doctor,
+  # update, or any other subcommand, which all load it normally once the
+  # repo is a registry member.
+  if [ -f "$_canon/.clagentic/config" ]; then
+    say "note: $_canon/.clagentic/config exists but is not read during enroll (see docs/DESIGN.md)"
+  fi
+
   CLAGENTIC_PROJECT_ROOT="$_canon" "$CLAGENTIC_LITE_HOME/scripts/memory.sh" init
   CLAGENTIC_PROJECT_ROOT="$_canon" "$CLAGENTIC_LITE_HOME/scripts/gates.sh" init
 
@@ -2322,9 +2449,29 @@ cmd_doctor() {
         printf '  WARN curl not on PATH — cannot probe %s\n' "$_router_version_url"
         printf '       Install curl, or verify manually: curl %s\n' "$_router_version_url"
       else
+        # BUG (PR #152 fold-in): a bare assignment whose RHS is a command
+        # substitution over a FAILING command aborts the whole script under
+        # `set -e` on a strict POSIX `sh` (dash) -- unlike bash, dash treats
+        # the assignment statement itself as the "simple command" that
+        # failed, propagating the substituted command's exit status to the
+        # assignment. curl exits non-zero on the single most common real
+        # case here (connection refused -- the configured router simply
+        # isn't running yet), which used to kill `doctor` mid-report with
+        # no diagnostic at all, well before check #11 and the final
+        # "== doctor summary ==" line ever printed. Wrapping the assignment
+        # in `if ... ; then ... fi` makes the substitution's exit status the
+        # CONDITION of a guarded statement rather than the exit status of a
+        # bare simple command, so `set -e` never sees it as a top-level
+        # failure -- the existing `_router_probe_rc` capture pattern
+        # (used for the exact same reason immediately below) is the
+        # established idiom in this codebase; this fixes the ONE call site
+        # that predated it.
         _router_probe_body=$(mktemp -t clagentic-doctor-router.XXXXXX)
-        _router_probe_http=$($DS_TIMEOUT_CMD 10 curl -s -o "$_router_probe_body" -w '%{http_code}' "$_router_version_url" 2>/dev/null)
-        _router_probe_rc=$?
+        if _router_probe_http=$($DS_TIMEOUT_CMD 10 curl -s -o "$_router_probe_body" -w '%{http_code}' "$_router_version_url" 2>/dev/null); then
+          _router_probe_rc=0
+        else
+          _router_probe_rc=$?
+        fi
         if [ "$_router_probe_rc" -eq 0 ] && [ "$_router_probe_http" = "200" ]; then
           _ok "clagentic-router reachable at $_router_url (GET /version -> 200)"
           if [ -s "$_router_probe_body" ]; then
@@ -3219,6 +3366,21 @@ HTMLEOF
 }
 
 # ---------------------------------------------------------------- dispatch
+
+# Trust-gated repo-local config load (_cli_maybe_load_repo_env, above) —
+# called ONCE here, before the subcommand case below, for every subcommand
+# that stays in this process and might read a repo-scoped CLAGENTIC_* value
+# for the enrolled repo at cwd. `init` and `enroll` are the deliberate
+# exceptions (see _cli_maybe_load_repo_env's own docstring for why enroll
+# specifically must not load it); recall/remember/gates exec into
+# memory.sh/gates.sh, which load it themselves via the unchanged combined
+# ds_load_env — calling it here too would be a harmless but pointless
+# second (idempotent) load, so it is skipped for those to keep this call
+# scoped to the subcommands that actually need it in THIS process.
+case "${1:-}" in
+  init|enroll|recall|remember|gates) : ;;
+  *) _cli_maybe_load_repo_env ;;
+esac
 
 case "${1:-}" in
   init)     shift; cmd_init "$@" ;;

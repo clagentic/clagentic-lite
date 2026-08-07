@@ -173,6 +173,8 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 7. Stamps `CLAUDE.md` at the repo root — activates the Builder contract and exposes agents for Claude Code auto-dispatch. Refuses to overwrite a non-clagentic `CLAUDE.md` unless `--force`.
 8. Registers the repo path in `~/.local/state/clagentic/registry`.
 
+**A repo-local `.clagentic/config` does not apply on this very first `enroll` call** — the CLI will not execute a repo's own config before that repo is registered as enrolled. It takes effect starting with the next command you run against the repo (`doctor`, `update`, a re-`enroll`, or any hook that fires from your next commit). The global config (`~/.config/clagentic/config`) is unaffected and applies at enroll time as normal.
+
 ### Solo vs. shared repos
 
 **Solo / private repo**: `CLAUDE.md` is generated and ready to use. If you'd rather not commit it, add it to `.gitignore` yourself — clagentic-lite won't do that automatically because the file is safe to commit.
@@ -419,7 +421,7 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
 │   ├── adversarial-acks.json                   per-CWE ack list (governance, committed)
 │   ├── accepted-risks.md                       architectural risk docs (governance, committed)
 │   ├── osv-ignore                              osv CVE ignore list (governance, committed)
-│   ├── config                                  repo-level config overrides (governance, committed)
+│   ├── config                                  repo-level config overrides (governance, committed; not read on the first `enroll` — see "What init and enroll do" above)
 │   └── lite/
 │       ├── audit.db                            gate run log (written by gates.sh, gitignored)
 │       └── memory.db                           session memory (written by memory.sh, gitignored)

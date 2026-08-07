@@ -71,20 +71,27 @@ ds_repo_root() {
   # Both failed — return empty; callers handle the empty case.
 }
 
-# Load configuration into the current shell. Load order (each layer can
-# override the previous):
-#   1. ~/.config/clagentic/config   — global defaults (written by `clagentic-lite init`)
-#   2. <project-root>/.clagentic/config — per-repo sparse overrides (optional)
-#   3. Legacy: <project-root>/.env  — backward compat; honored if present
+# ds_load_global_env — load ONLY the operator-owned global config
+# (~/.config/clagentic/config, written by `clagentic-lite init`). Trust
+# boundary: this file lives outside any repo, so no amount of cloning or
+# `cd`-ing into an untrusted repo can plant or influence it — safe to
+# dot-source unconditionally, at any point, for any subcommand.
 #
-# Idempotent — honors a CLAGENTIC_ENV_LOADED guard so re-sourcing in the
-# same process doesn't double-export. Every runtime entry point (hooks,
-# gates.sh, llm-client.sh, memory.sh, smoke.sh) calls this immediately
-# after sourcing platform.sh.
-ds_load_env() {
+# Split out of the combined ds_load_env (lr-33fb89 fold-in, bobbie.sast.3)
+# specifically so bin/clagentic-lite's CLI dispatch can load the global
+# config for every subcommand WITHOUT also loading the repo-local config
+# below — see ds_load_repo_env's docstring for why that second load is not
+# safe to run unconditionally the way this one is.
+#
+# Idempotent — honors CLAGENTIC_ENV_LOADED same as the combined
+# ds_load_env (below), which calls this function internally: a prior
+# ds_load_global_env call is enough to skip the global-config re-read
+# ds_load_env would otherwise repeat, and a prior full ds_load_env call
+# means the global config is already loaded, so this returns immediately.
+ds_load_global_env() {
   [ "${CLAGENTIC_ENV_LOADED:-0}" = "1" ] && return 0
+  [ "${CLAGENTIC_GLOBAL_ENV_LOADED:-0}" = "1" ] && return 0
 
-  # 1. Global config.
   _GLOBAL_CFG="$HOME/.config/clagentic/config"
   if [ -f "$_GLOBAL_CFG" ]; then
     set -a
@@ -93,9 +100,46 @@ ds_load_env() {
     set +a
   fi
 
+  CLAGENTIC_GLOBAL_ENV_LOADED=1
+  export CLAGENTIC_GLOBAL_ENV_LOADED
+}
+
+# ds_load_repo_env — load the PER-REPO config layers only:
+#   1. <project-root>/.clagentic/config — per-repo sparse overrides (optional)
+#   2. Legacy: <project-root>/.env      — backward compat; honored if present
+#
+# TRUST BOUNDARY (lr-33fb89 fold-in, bobbie.sast.3 — read this before
+# calling this function from anywhere new): both files above are REPO
+# CONTENT. dot-sourcing a file EXECUTES it as shell, with `set -a` making
+# every assignment auto-export. Anyone who can put a file at
+# <repo>/.clagentic/config or <repo>/.env can run arbitrary shell in this
+# process the moment this function is called with that repo as
+# ds_repo_root()'s result. That is fine, by design, for the POST-enrollment
+# runtime scripts (gates.sh, llm-client.sh, memory.sh, smoke.sh, every hook
+# shim) — they only ever run against a repo the operator already
+# deliberately enrolled (hooks fire from inside that repo's own git
+# lifecycle; gates.sh/memory.sh/llm-client.sh are invoked by those hooks or
+# by an operator who has already chosen to work in that repo). It is NOT
+# fine to call this unconditionally from bin/clagentic-lite's own top-level
+# CLI dispatch, because that runs BEFORE any trust decision exists: an
+# operator who merely clones an unfamiliar repo and runs `clagentic-lite
+# doctor` (or `list`, or `update`) out of curiosity, with cwd inside that
+# clone, would otherwise have its .clagentic/config executed on their
+# machine with zero prior trust signal. bin/clagentic-lite therefore does
+# NOT call this function unconditionally the way gates.sh/memory.sh/etc.
+# do — see _cli_maybe_load_repo_env in bin/clagentic-lite, which gates this
+# call on registry membership (the repo's canonical path already present in
+# $HOME/.local/state/clagentic/registry, i.e. the operator ran `enroll` for
+# it at some point in the past) before ever calling this function.
+#
+# Idempotent per-process, same convention as ds_load_global_env.
+ds_load_repo_env() {
+  [ "${CLAGENTIC_ENV_LOADED:-0}" = "1" ] && return 0
+  [ "${CLAGENTIC_REPO_ENV_LOADED:-0}" = "1" ] && return 0
+
   RR=$(ds_repo_root)
   if [ -n "$RR" ]; then
-    # 2. Per-repo sparse config (v0.2: optional; not created by default).
+    # 1. Per-repo sparse config (v0.2: optional; not created by default).
     _REPO_CFG="$RR/.clagentic/config"
     if [ -f "$_REPO_CFG" ]; then
       set -a
@@ -103,7 +147,7 @@ ds_load_env() {
       . "$_REPO_CFG"
       set +a
     fi
-    # 3. Legacy .env (v0.1 compatibility; honored but not created in v0.2).
+    # 2. Legacy .env (v0.1 compatibility; honored but not created in v0.2).
     _ENV_FILE="$RR/.env"
     if [ -f "$_ENV_FILE" ]; then
       set -a
@@ -112,6 +156,34 @@ ds_load_env() {
       set +a
     fi
   fi
+
+  CLAGENTIC_REPO_ENV_LOADED=1
+  export CLAGENTIC_REPO_ENV_LOADED
+}
+
+# ds_load_env — load configuration into the current shell: the global
+# config, THEN the per-repo config (each layer can override the previous).
+# This is the COMBINED, POST-ENROLLMENT-TRUST convenience wrapper every
+# runtime entry point EXCEPT bin/clagentic-lite calls (hooks, gates.sh,
+# llm-client.sh, memory.sh, smoke.sh) — unchanged behavior, unchanged
+# contract, from before the ds_load_global_env/ds_load_repo_env split
+# (lr-33fb89 fold-in). Those entry points only ever run post-enrollment
+# (see ds_load_repo_env's docstring for why that precondition holds for
+# them) so combining both loads unconditionally remains correct and safe
+# there.
+#
+# bin/clagentic-lite does NOT call this combined function — see its own
+# call site (ds_load_global_env, then a registry-gated ds_load_repo_env)
+# and _cli_maybe_load_repo_env's docstring for why the CLI's own dispatch
+# needs the split instead.
+#
+# Idempotent — honors a CLAGENTIC_ENV_LOADED guard so re-sourcing in the
+# same process doesn't double-export.
+ds_load_env() {
+  [ "${CLAGENTIC_ENV_LOADED:-0}" = "1" ] && return 0
+
+  ds_load_global_env
+  ds_load_repo_env
 
   CLAGENTIC_ENV_LOADED=1
   export CLAGENTIC_ENV_LOADED

@@ -24,7 +24,6 @@
 
 set -e
 . "$(dirname "$0")/platform.sh"
-ds_load_env
 . "$(dirname "$0")/review-merge.sh"
 
 # Tool home: the directory containing scripts/ — resolved from this script's
@@ -4659,6 +4658,38 @@ cmd_tail() {
     sleep "$INTERVAL"
   done
 }
+
+# ENROLL-TIME TRUST GATE (lr-33fb89, PR #152 second fold-in, coordinator-
+# escalated bobbie.sast.3 follow-through): `init` is the ONE subcommand
+# reachable BEFORE a repo has been enrolled -- `clagentic-lite enroll`
+# invokes `gates.sh init` directly (bin/clagentic-lite _enroll_one) to
+# create audit.db's schema, and that invocation's cwd is whatever cwd
+# enroll itself was run from, which is very commonly INSIDE the
+# not-yet-enrolled target repo (`git clone X && cd X && clagentic-lite
+# enroll`). ds_load_env dot-sources (EXECUTES) that repo's own
+# .clagentic/config with no trust check -- the same class of pre-trust
+# execution bobbie.sast.3 flagged in bin/clagentic-lite's own dispatch, one
+# process frame down. Every OTHER subcommand here (bleed, secrets, deps,
+# sast, review, adversarial, ship, pre-push, log-run, digest, status,
+# tail, merge-gate, render-review, deferrals-lint, audit-vocab-lint) is
+# reachable ONLY post-enrollment (via a hook shim `enroll` itself installs,
+# or an operator deliberately running `clagentic-lite gates <subcmd>` /
+# this script directly against a repo they are already working in) -- see
+# ds_load_repo_env's docstring in platform.sh for why that precondition is
+# what makes the unconditional combined ds_load_env correct for them.
+#
+# cmd_init (above) reads NO CLAGENTIC_* config value at all -- verified: its
+# only external input is $AUDIT_DB, itself derived only from $REPO_ROOT
+# (CLAGENTIC_PROJECT_ROOT, an explicit override the caller passes, or
+# ds_repo_root()'s pure git/filesystem resolution -- neither reads a config
+# FILE). So skipping ds_load_env specifically for `init` changes nothing
+# about what `init` does; it only closes the pre-trust execution window.
+# Every other branch below still gets the full, unchanged, combined
+# ds_load_env exactly as before this fold-in -- POST-ENROLLMENT BEHAVIOR
+# HERE IS UNCHANGED, this is a migration for the init-time path only.
+if [ "${1:-}" != "init" ]; then
+  ds_load_env
+fi
 
 case "${1:-}" in
   init)           cmd_init ;;
