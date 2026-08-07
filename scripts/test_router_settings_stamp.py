@@ -172,13 +172,16 @@ class TestRouterSettingsStampWhenSet(unittest.TestCase):
         self.assertIn("ANTHROPIC_AUTH_TOKEN", parsed["env"])
         self.assertEqual(parsed["env"]["ANTHROPIC_AUTH_TOKEN"], "")
 
-    def test_settings_version_marker_is_v6(self):
+    def test_settings_version_marker_is_v7(self):
+        # v6 -> v7 bumped by lr-4af4c4 (ANTHROPIC_BEDROCK_BASE_URL /
+        # AWS_BEARER_TOKEN_BEDROCK support) -- a migration, not a
+        # content-only change.
         rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
         self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
         settings_path = os.path.join(self.repo, ".claude", "settings.json")
         with open(settings_path) as f:
             raw = f.read()
-        self.assertIn("clagentic-settings-version: v6", raw, msg=raw)
+        self.assertIn("clagentic-settings-version: v7", raw, msg=raw)
 
 
 class TestRouterSettingsStampRestamp(unittest.TestCase):
@@ -241,7 +244,7 @@ class TestRouterSettingsStampRestamp(unittest.TestCase):
         settings_path = os.path.join(self.repo, ".claude", "settings.json")
         with open(settings_path) as f:
             raw = f.read()
-        raw = raw.replace("clagentic-settings-version: v6", "clagentic-settings-version: v5")
+        raw = raw.replace("clagentic-settings-version: v7", "clagentic-settings-version: v6")
         with open(settings_path, "w") as f:
             f.write(raw)
 
