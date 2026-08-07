@@ -46,6 +46,34 @@ Covers:
        own scripts/platform.sh before any config file could be read), and
        the CLAGENTIC_HOME deprecation warning must still fire correctly.
 
+PR #152 FOLD-IN (bobbie.sast.3, github.com/clagentic/clagentic-lite/pull/152
+review comment): the original revision of this fix called the COMBINED
+ds_load_env unconditionally from bin/clagentic-lite's dispatch, which
+dot-sources (EXECUTES) a repo-local .clagentic/config with no trust check
+at all -- reachable from `doctor`/`list`/`update` against a repo merely
+cloned, never enrolled. The fix under test now splits the global load
+(ds_load_global_env, unconditional -- operator-owned, not repo content)
+from the repo-local load (ds_load_repo_env, gated on REGISTRY membership
+via _cli_maybe_load_repo_env in bin/clagentic-lite). Additional coverage
+added for this fold-in:
+    7. TestPerRepoConfigPrecedence was revised: a repo-local override is
+       NOT honored on the very first `enroll` call (the repo is not yet a
+       REGISTRY member at that point), but IS honored on every subsequent
+       invocation (doctor, update, a re-enroll) once it is.
+    8. TestHostileRepoLocalConfigNotExecutedPreTrust: a hostile
+       .clagentic/config that writes a sentinel file as a side effect must
+       NOT execute against an unenrolled repo under doctor/list/update/show
+       -- observable non-execution (sentinel absence), not merely a return
+       code. Also proves enroll itself does not execute the repo it is in
+       the middle of enrolling, and that the gate does not overcorrect
+       (post-enrollment repo-local config still loads normally).
+    9. test_doctor_unreachable_router_reports_failure_without_aborting:
+       regression for a separate, pre-existing `set -e`/curl fragility in
+       cmd_doctor's router-reachability probe (dash treats a bare
+       assignment's failing command-substitution RHS as a top-level
+       failure), escalated in-scope by the coordinator during this same
+       fold-in since it is the same file/function this PR already touches.
+
 HAZARD (PR #146 lesson, repeated here because two tests in this file touch
 `update --restamp`): `clagentic-lite update` runs `git -C
 "$CLAGENTIC_LITE_HOME" stash push` (and, on a non-tty, `stash drop`) against
@@ -204,21 +232,10 @@ class TestConfigFileRouterUrlHonored(unittest.TestCase):
     def test_doctor_probes_configured_router_instead_of_reporting_unconfigured(self):
         """Acceptance criterion: doctor probes the configured router rather
         than reporting it unconfigured, when the URL is config-file-only.
-
-        Uses an http:// scheme doctor classifies "malformed" (no host at
-        all) rather than a real reachability probe -- doctor's own
-        reachability branch shells out to `$DS_TIMEOUT_CMD curl ...` and
-        assigns its output via command substitution, which a strict POSIX
-        `sh` (dash) aborts the whole script on when curl's own exit status
-        is non-zero (e.g. connection refused) under `set -e`. That is a
-        PRE-EXISTING fragility in cmd_doctor's router-reachability branch,
-        independent of ds_load_env/config-file loading (this task's actual
-        fix never touches that code path) -- see the PR body's followups
-        section. Using the "malformed" branch instead exercises the exact
-        same "was CLAGENTIC_ROUTER_URL read from the config file at all"
-        question this test needs to answer, via a code path that does not
-        shell out and so is not sensitive to that pre-existing bug.
-        """
+        Uses a malformed URL (doctor's own validation-refusal branch, which
+        never shells out) to isolate "was CLAGENTIC_ROUTER_URL read from the
+        config file at all" from the reachability-probe fix covered
+        separately below."""
         _write_global_config(self.home, 'CLAGENTIC_ROUTER_URL=not-a-url\n')
         rc, out, err = _run_cli(
             ["doctor"], cwd=self.repo, home=self.home,
@@ -231,6 +248,39 @@ class TestConfigFileRouterUrlHonored(unittest.TestCase):
         # nothing at all under "clagentic-router probe:").
         self.assertIn("not a well-formed", err, msg=err)
         self.assertIn("not-a-url", err, msg=err)
+
+    def test_doctor_unreachable_router_reports_failure_without_aborting(self):
+        """Regression for the set -e/curl fragility (PR #152 fold-in,
+        coordinator-escalated to in-scope): cmd_doctor's router-reachability
+        probe used to assign curl's command-substitution output directly to
+        a bare variable, which a strict POSIX sh (dash) treats as a
+        top-level failing command under `set -e` when curl exits non-zero
+        (e.g. ECONNREFUSED -- the single most common real case, router
+        configured but not running yet). That aborted the ENTIRE doctor run
+        immediately after printing the "clagentic-router probe:" header,
+        with no diagnostic and no later sections (memory tunables, env var
+        migration, doctor summary) ever printing. This asserts the fix:
+        doctor completes the full report and prints an actionable
+        unreachable message, exactly the shape a user following the README
+        (set CLAGENTIC_ROUTER_URL in the global config, router not started
+        yet) would hit."""
+        _write_global_config(self.home, 'CLAGENTIC_ROUTER_URL=http://127.0.0.1:19999\n')
+        rc, out, err = _run_cli(
+            ["doctor"], cwd=self.repo, home=self.home,
+            env_extra={"CLAGENTIC_SKIP_UPDATE_ALERT": "1"},
+        )
+        # The report must reach its own final line -- proof the process did
+        # not die mid-report the way it did before this fix.
+        self.assertIn("== doctor summary:", out, msg=f"OUT={out}\nERR={err}")
+        self.assertIn("clagentic-router probe:", out, msg=out)
+        self.assertIn("clagentic-router unreachable at", err, msg=err)
+        self.assertIn("127.0.0.1:19999", err, msg=err)
+        # Sections that come AFTER the router probe in cmd_doctor's own
+        # ordering must still have run -- the strongest proof this is not
+        # merely "some text after the probe" but the actual rest of the
+        # function completing.
+        self.assertIn("memory tunables:", out, msg=out)
+        self.assertIn("env var migration:", out, msg=out)
 
 
 class TestConfigFileInertWhenAbsent(unittest.TestCase):
@@ -275,7 +325,20 @@ class TestPerRepoConfigPrecedence(unittest.TestCase):
     """Acceptance criterion: a repo-local .clagentic/config resolves with the
     same precedence as every other ds_load_env entry point -- per-repo
     overrides global, both override an already-exported shell value for the
-    same key (config-file-wins, ds_load_env's documented, tested contract)."""
+    same key (config-file-wins, ds_load_env's documented, tested contract).
+
+    TRUST GATE (bobbie.sast.3, PR #152 fold-in): the repo-local layer is
+    only loaded by bin/clagentic-lite once the repo is a REGISTRY member --
+    i.e. from the SECOND invocation onward (doctor, update --restamp, a
+    re-enroll), never on the FIRST `enroll` call that establishes trust in
+    the first place. See _cli_maybe_load_repo_env's docstring in
+    bin/clagentic-lite for why enroll itself must not execute the repo's
+    own .clagentic/config as the price of enrolling it. This is a
+    deliberate, narrow behavior change from this PR's earlier revision
+    (which combined ds_load_env unconditionally and so honored a per-repo
+    override on the very first enroll) -- the global config still applies
+    at enroll time exactly as before; only the repo-local override layer is
+    deferred to post-enrollment invocations."""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="clagentic-test-cfgfile-perrepo-")
@@ -285,7 +348,12 @@ class TestPerRepoConfigPrecedence(unittest.TestCase):
         self.repo = os.path.join(self.tmpdir, "repo")
         _init_git_repo(self.repo)
 
-    def test_per_repo_config_overrides_global_config(self):
+    def test_per_repo_config_not_honored_on_first_enroll(self):
+        """The trust-gate boundary itself: a per-repo override present at
+        the moment of the FIRST enroll call must NOT be honored -- the repo
+        is not yet a REGISTRY member when enroll's own CLI-bootstrap load
+        runs. The global config value wins by omission (repo-local layer
+        simply isn't loaded yet), not by any precedence contest."""
         _write_global_config(self.home, 'CLAGENTIC_ROUTER_URL=http://127.0.0.1:1111\n')
         repo_cfg_dir = os.path.join(self.repo, ".clagentic")
         os.makedirs(repo_cfg_dir, exist_ok=True)
@@ -298,8 +366,33 @@ class TestPerRepoConfigPrecedence(unittest.TestCase):
         settings_path = os.path.join(self.repo, ".claude", "settings.json")
         with open(settings_path) as f:
             parsed = json.load(f)
-        self.assertEqual(parsed["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:2222",
-                          msg="per-repo .clagentic/config did not override global config")
+        self.assertEqual(parsed["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:1111",
+                          msg="per-repo .clagentic/config was honored on the FIRST enroll call "
+                              "-- trust gate did not hold (repo is not yet a REGISTRY member "
+                              "at that point)")
+
+    def test_per_repo_config_overrides_global_config_after_enrollment(self):
+        """Once the repo IS a REGISTRY member (post-enroll), the repo-local
+        override applies and wins over the global value -- the trust
+        precondition, not the override mechanism itself, was gated."""
+        _write_global_config(self.home, 'CLAGENTIC_ROUTER_URL=http://127.0.0.1:1111\n')
+
+        rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+
+        repo_cfg_dir = os.path.join(self.repo, ".clagentic")
+        os.makedirs(repo_cfg_dir, exist_ok=True)
+        with open(os.path.join(repo_cfg_dir, "config"), "w") as f:
+            f.write('CLAGENTIC_ROUTER_URL=http://127.0.0.1:2222\n')
+
+        rc, out, err = _run_cli(
+            ["doctor"], cwd=self.repo, home=self.home,
+            env_extra={"CLAGENTIC_SKIP_UPDATE_ALERT": "1"},
+        )
+        self.assertIn("127.0.0.1:2222", out + err,
+                       msg=f"repo-local override was not honored post-enrollment: OUT={out} ERR={err}")
+        self.assertNotIn("127.0.0.1:1111", out,
+                          msg="global value leaked through instead of the repo-local override")
 
     def test_config_file_value_overwrites_already_exported_shell_value(self):
         """PRECEDENCE proof: config-file-wins over an already-exported shell
@@ -388,6 +481,148 @@ class TestClagenticLiteHomeExemptFromConfigFileOverride(unittest.TestCase):
         self.assertIn("CLAGENTIC_HOME is deprecated", proc.stderr, msg=proc.stderr)
         self.assertIn(f"CLAGENTIC_LITE_HOME={TOOL_HOME}", proc.stdout, msg=proc.stdout)
         self.assertIn("WARN CLAGENTIC_HOME is set (deprecated)", proc.stdout, msg=proc.stdout)
+
+
+class TestHostileRepoLocalConfigNotExecutedPreTrust(unittest.TestCase):
+    """Regression coverage for bobbie.sast.3 (PR #152 review comment on
+    github.com/clagentic/clagentic-lite/pull/152): a repo-local
+    .clagentic/config is REPO CONTENT, and dot-sourcing it EXECUTES it.
+    Before this fold-in, bin/clagentic-lite's own CLI dispatch called the
+    combined ds_load_env unconditionally for every subcommand, which
+    dot-sources <ds_repo_root-of-cwd>/.clagentic/config with NO trust check
+    at all -- an operator who clones an unfamiliar repo and runs
+    `clagentic-lite doctor` (or `list`, or `update`) out of curiosity, cwd
+    inside that clone, would have executed arbitrary shell from the clone
+    before ever making a deliberate trust decision about it.
+
+    THE FIX UNDER TEST: bin/clagentic-lite now loads the repo-local layer
+    only via _cli_maybe_load_repo_env, gated on the repo's canonical path
+    already being a member of $HOME/.local/state/clagentic/registry (i.e.
+    the operator previously ran `enroll` for this exact repo on this exact
+    machine). A REGISTRY entry cannot be forged by repo content -- it lives
+    outside the repo entirely.
+
+    ASSERTS OBSERVABLE NON-EXECUTION, not a function's return value: the
+    hostile .clagentic/config writes a SENTINEL FILE as a side effect (the
+    unambiguous proof dot-sourcing actually ran shell, not just that some
+    CLAGENTIC_* variable ended up set -- a variable assignment alone could
+    theoretically come from elsewhere, a side-effecting file write cannot).
+    Every subcommand a plain `git clone && cd && clagentic-lite <cmd>`
+    workflow would plausibly try FIRST on an unenrolled repo (doctor, list,
+    update) is covered -- the sentinel must NOT appear for any of them.
+
+    HAZARD (repeated per file convention): never point CLAGENTIC_LITE_HOME
+    at the live dev checkout; the restamp-adjacent update test uses a
+    throwaway git clone.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="clagentic-test-hostile-repo-cfg-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.home = os.path.join(self.tmpdir, "home")
+        os.makedirs(self.home)
+        self.repo = os.path.join(self.tmpdir, "repo")
+        _init_git_repo(self.repo)
+        self.sentinel = os.path.join(self.tmpdir, "pwned.txt")
+
+    def _plant_hostile_config(self):
+        """A .clagentic/config that, if ever dot-sourced, writes a sentinel
+        file OUTSIDE the repo -- proof of actual shell execution, not proof
+        of a variable assignment (which a config file is also expected to
+        do legitimately)."""
+        cfg_dir = os.path.join(self.repo, ".clagentic")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config"), "w") as f:
+            f.write(f'touch "{self.sentinel}"\nCLAGENTIC_ROUTER_URL=http://127.0.0.1:6666\n')
+
+    def _assert_sentinel_absent(self, msg_prefix):
+        self.assertFalse(
+            os.path.exists(self.sentinel),
+            msg=f"{msg_prefix}: hostile .clagentic/config was EXECUTED "
+                f"(sentinel file present) against an unenrolled/untrusted repo",
+        )
+
+    def test_doctor_on_unenrolled_clone_does_not_execute_hostile_config(self):
+        """The exact bobbie.sast.3 repro: clone (simulated by _init_git_repo
+        + planting the hostile file directly, equivalent to a clone that
+        already carries it), cd in, run doctor out of curiosity -- never
+        enrolled."""
+        self._plant_hostile_config()
+        _run_cli(["doctor"], cwd=self.repo, home=self.home,
+                  env_extra={"CLAGENTIC_SKIP_UPDATE_ALERT": "1"})
+        self._assert_sentinel_absent("doctor")
+
+    def test_list_on_unenrolled_clone_does_not_execute_hostile_config(self):
+        self._plant_hostile_config()
+        _run_cli(["list"], cwd=self.repo, home=self.home)
+        self._assert_sentinel_absent("list")
+
+    def test_update_on_unenrolled_clone_does_not_execute_hostile_config(self):
+        self._plant_hostile_config()
+        _run_cli(["update"], cwd=self.repo, home=self.home,
+                  env_extra={"CLAGENTIC_SKIP_FETCH": "1"})
+        self._assert_sentinel_absent("update")
+
+    def test_show_on_unenrolled_clone_does_not_execute_hostile_config(self):
+        self._plant_hostile_config()
+        _run_cli(["show", "memory"], cwd=self.repo, home=self.home)
+        self._assert_sentinel_absent("show")
+
+    def test_first_enroll_does_not_execute_the_repo_being_enrolled(self):
+        """THE SHARPEST CASE: enroll is how a repo becomes trusted, and
+        cannot require prior trust as a precondition for reading it -- but
+        it must also not execute the repo's own config as the PRICE of
+        enrolling it. The very first `enroll` call for this repo must not
+        trigger the sentinel, even though enroll succeeds and the repo ends
+        up enrolled afterward.
+
+        NOTE: this asserts the CLI-DISPATCH trust gate specifically (the
+        surface bobbie.sast.3 named). enroll's OWN internal delegation to
+        `scripts/memory.sh init`/`scripts/gates.sh init` (bin/clagentic-lite
+        _enroll_one) is a SEPARATE, PRE-EXISTING execution path -- those
+        scripts call the combined ds_load_env themselves, unconditionally,
+        independent of this PR's CLI-dispatch gate, and were already
+        reachable from a first `enroll` call before this PR existed. That
+        gap is real but out of scope for this fold-in (BOBBIE's finding was
+        about bin/clagentic-lite's own dispatch; the coordinator scoped the
+        fix to "the CLI's trust precondition", not gates.sh/memory.sh) --
+        see the PR body's followups section. This test therefore plants a
+        hostile config with NO CLAGENTIC_ROUTER_* side effect that would
+        make enroll itself behave differently either way, and asserts only
+        that the CLI-dispatch-level execution does not happen; it does not
+        (and structurally cannot, without touching gates.sh/memory.sh) prove
+        the enroll-internal subprocess path is also clean.
+        """
+        self._plant_hostile_config()
+        rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+
+    def test_re_enrolled_or_post_enroll_repo_local_config_still_loads_safely(self):
+        """Sanity check the gate is not overcorrecting: a repo-local config
+        that is NOT hostile (no side effect, just a var assignment) still
+        loads normally once the repo is a REGISTRY member -- the trust gate
+        blocks EXECUTION-worthy risk pre-trust, it does not permanently
+        disable the legitimate per-repo override feature post-trust."""
+        cfg_dir = os.path.join(self.repo, ".clagentic")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config"), "w") as f:
+            f.write("")  # enroll first with a benign (empty) config
+
+        rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+
+        # Now write a benign, non-hostile override and confirm doctor picks
+        # it up post-enrollment (same property as
+        # TestPerRepoConfigPrecedence.test_per_repo_config_overrides_global_config_after_enrollment,
+        # asserted again here in the same file/class as the hostile-config
+        # negative case so the two properties are visibly paired).
+        with open(os.path.join(cfg_dir, "config"), "w") as f:
+            f.write("CLAGENTIC_ROUTER_URL=http://127.0.0.1:7777\n")
+        rc, out, err = _run_cli(
+            ["doctor"], cwd=self.repo, home=self.home,
+            env_extra={"CLAGENTIC_SKIP_UPDATE_ALERT": "1"},
+        )
+        self.assertIn("127.0.0.1:7777", out + err, msg=f"OUT={out}\nERR={err}")
 
 
 if __name__ == "__main__":
