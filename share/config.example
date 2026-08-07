@@ -512,3 +512,36 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # machine" for the exact steps to confirm or refute this on a real machine).
 # Leave this key unset until you have run that verification once.
 # CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=0
+
+# CLAGENTIC_ROUTER_BEDROCK_MODE: separate opt-in, OFF by default even when
+# CLAGENTIC_ROUTER_URL is set. Required for any Claude Code session that runs
+# with CLAUDE_CODE_USE_BEDROCK=1 (Amazon Bedrock auth, e.g. an AWS SSO
+# profile) to actually route through clagentic-router at all.
+#
+# WHY THIS IS NOT OPTIONAL FOR BEDROCK-MODE SESSIONS: CLAUDE_CODE_USE_BEDROCK=1
+# makes Claude Code ignore ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN entirely —
+# it speaks the AWS Bedrock Runtime InvokeModel wire protocol instead. The
+# router integration above is SILENTLY inert for such a session: no error,
+# no warning, `doctor` reports the router reachable while the session never
+# talks to it. Setting CLAGENTIC_ROUTER_BEDROCK_MODE=1 additionally stamps
+# ANTHROPIC_BEDROCK_BASE_URL (the Bedrock-mode equivalent of
+# ANTHROPIC_BASE_URL) and AWS_BEARER_TOKEN_BEDROCK (a bearer-token
+# alternative to full AWS SigV4 signing, per Claude Code's documented
+# "Option E: Amazon Bedrock API keys",
+# https://code.claude.com/docs/en/amazon-bedrock) into the same env block.
+# CLAGENTIC_ROUTER_TOKEN is reused verbatim as AWS_BEARER_TOKEN_BEDROCK —
+# same token, different variable name; clagentic-router's auth check does
+# not distinguish which header/variable carried it.
+#
+# SUPPLEMENTS, DOES NOT REPLACE, the direct-API pair: both
+# ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN AND
+# ANTHROPIC_BEDROCK_BASE_URL/AWS_BEARER_TOKEN_BEDROCK are stamped together,
+# because a single settings.json may be opened by sessions running in
+# either auth mode (direct API/OAuth vs. Bedrock) -- each mode only reads
+# the pair it understands and ignores the other, so stamping both is safe
+# and correct regardless of which mode a given session uses. Replacing the
+# direct-API pair instead would silently break any non-Bedrock session
+# opened against the same repo.
+#
+# Requires CLAGENTIC_ROUTER_URL also set -- this key alone does nothing.
+# CLAGENTIC_ROUTER_BEDROCK_MODE=0

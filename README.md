@@ -334,6 +334,16 @@ clagentic-lite enroll --force    # per enrolled repo
 clagentic-lite doctor            # probes GET /version, reports reachable/unreachable
 ```
 
+**Bedrock-mode sessions need a second variable pair — the direct-API pair above does NOT work for them.** If you run Claude Code with `CLAUDE_CODE_USE_BEDROCK=1` (e.g. an AWS SSO profile), it ignores `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` entirely and speaks the AWS Bedrock Runtime `InvokeModel` wire protocol instead. Setting `CLAGENTIC_ROUTER_URL` alone will look like it worked (`clagentic-lite doctor` reports the router reachable) while every Bedrock-mode session silently never talks to it — no error, no warning, nothing routed. Set a third config key to fix this:
+
+```sh
+CLAGENTIC_ROUTER_BEDROCK_MODE=1
+```
+
+When set (alongside `CLAGENTIC_ROUTER_URL`), `enroll`/`update` additionally stamp `ANTHROPIC_BEDROCK_BASE_URL` (the Bedrock-mode equivalent of `ANTHROPIC_BASE_URL`) and `AWS_BEARER_TOKEN_BEDROCK` (a bearer-token alternative to full AWS SigV4 signing — Claude Code's documented ["Option E: Amazon Bedrock API keys"](https://code.claude.com/docs/en/amazon-bedrock)) into the same `env` block, reusing `CLAGENTIC_ROUTER_TOKEN` verbatim as the Bedrock bearer token. `AWS_BEARER_TOKEN_BEDROCK` is not optional: without it, Bedrock-mode Claude Code signs requests with full SigV4 instead of a bearer token, which fails the router's auth check and 401s even though `ANTHROPIC_BEDROCK_BASE_URL` correctly pointed traffic at the router.
+
+Both pairs are stamped together, not one instead of the other — a single `settings.json` may be opened by sessions running in either auth mode (direct API/OAuth vs. Bedrock), and each mode only reads the pair it understands. `CLAGENTIC_ROUTER_BEDROCK_MODE` is validated through the exact same `CLAGENTIC_ROUTER_URL` classifier and atomic settings-stamp writer as the direct-API pair — it stamps the same URL value into a second variable name, not a second independently-configured URL.
+
 **Honest limitation.** Routed roles lose tool-calling and true streaming through clagentic-router's CLI adapters — fine for a one-shot Reviewer/Auditor/Merge-Gate pass that only reads a diff and returns text, wrong for a tool-using Builder that needs to read/write files mid-conversation. Do not point the Builder role through the router. This is why `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` (below) only ever touches Reviewer, Auditor, and Merge Gate.
 
 **Agent-model injection (separate opt-in, UNVERIFIED).** `CLAGENTIC_ROUTER_URL` alone gets you the settings.json passthrough above with no further risk. A second, independent key — `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1` — additionally renders a copy of the Reviewer/Auditor/Merge-Gate subagent definitions with `model: role:<role>-chain` injected into frontmatter (matching `router.example.yaml`'s `reviewer-chain`/`auditor-chain` examples) and installs that rendered plugin instead of the checked-in one. The checked-in `plugins/clagentic-lite/agents/*.md` files are never modified on disk — only a generated copy under `$CLAGENTIC_LITE_HOME/.clagentic/router-agents/` is.
