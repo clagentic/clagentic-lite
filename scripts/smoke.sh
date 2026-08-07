@@ -174,7 +174,10 @@ fi
 step "5d. exit-code contract: audit-row detail format for infra-degraded and review-blocked"
 # Log synthetic rows with the exact detail strings cmd_review uses, then verify
 # they are retrievable with the expected prefix.
-"$TOOL_HOME/scripts/gates.sh" log-run review block "infra-degraded: all reviewer chain steps failed" >/dev/null 2>&1
+# GUARDED (lr-b56a03 sweep): bare under this file's `set -e` previously — a
+# gates.sh log-run failure here would have killed the whole smoke run with no
+# FAIL line, same defect class as the step 11 abort MILLER diagnosed.
+"$TOOL_HOME/scripts/gates.sh" log-run review block "infra-degraded: all reviewer chain steps failed" >/dev/null 2>&1 || true
 _EC_DETAIL=$(sqlite3 "$REPO_ROOT/.clagentic/lite/audit.db" \
   "SELECT details FROM gate_runs WHERE gate='review' AND details LIKE 'infra-degraded%' ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)
 if printf '%s' "$_EC_DETAIL" | grep -q 'infra-degraded'; then
@@ -183,7 +186,7 @@ else
   bad "exit-code contract: infra-degraded audit row missing or wrong (got: $_EC_DETAIL)"
 fi
 
-"$TOOL_HOME/scripts/gates.sh" log-run review block "review-blocked: 2 finding(s) at >= high" >/dev/null 2>&1
+"$TOOL_HOME/scripts/gates.sh" log-run review block "review-blocked: 2 finding(s) at >= high" >/dev/null 2>&1 || true
 _EC_DETAIL2=$(sqlite3 "$REPO_ROOT/.clagentic/lite/audit.db" \
   "SELECT details FROM gate_runs WHERE gate='review' AND details LIKE 'review-blocked%' ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)
 if printf '%s' "$_EC_DETAIL2" | grep -q 'review-blocked'; then
@@ -355,9 +358,12 @@ if command -v python3 >/dev/null 2>&1; then
     bad "could not create temp dir for enroll test"
   else
     # Init a fresh git repo in the tempdir.
-    git init "$SMOKE_TMPDIR" >/dev/null 2>&1
-    git -C "$SMOKE_TMPDIR" config user.email "smoke@clagentic.test"
-    git -C "$SMOKE_TMPDIR" config user.name "smoke"
+    # GUARDED (lr-b56a03 sweep): these three were bare under this file's
+    # `set -e` -- a failure here (e.g. no write access to a tempdir, git
+    # misconfigured) would have killed the whole smoke run with no FAIL line.
+    git init "$SMOKE_TMPDIR" >/dev/null 2>&1 || true
+    git -C "$SMOKE_TMPDIR" config user.email "smoke@clagentic.test" || true
+    git -C "$SMOKE_TMPDIR" config user.name "smoke" || true
 
     # Enroll with CLAGENTIC_LITE_HOME pointing at our tool checkout.
     if CLAGENTIC_LITE_HOME="$TOOL_HOME" "$TOOL_HOME/bin/clagentic-lite" enroll "$SMOKE_TMPDIR" >/tmp/clagentic-smoke-enroll.log 2>&1; then
@@ -507,11 +513,30 @@ fi
 step "11. CLAGENTIC_MEMORY_MAX_ROWS row-cap pruning"
 _cap=10
 i=0
+_logturn_fail=0
+_logturn_err=""
 while [ $i -lt 15 ]; do
-  CLAGENTIC_MEMORY_MAX_ROWS="$_cap" CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
-    "$TOOL_HOME/scripts/memory.sh" log-turn "row-cap smoke row $i" "smoke cap" "seed" >/dev/null 2>&1
+  # GUARDED, STDERR PRESERVED (lr-b56a03, MILLER diagnosis): this was the
+  # only unguarded external invocation in the loop, bare under this file's
+  # `set -e` (contrast the `|| true`-guarded calls elsewhere in this file).
+  # A non-zero exit here used to kill the whole smoke run immediately, and
+  # `>/dev/null 2>&1` discarded the one line ("database disk image is
+  # malformed") that would have named the real cause on the first run.
+  # log-turn now self-heals an FTS5 desync internally (memory.sh cmd_init /
+  # cmd_log_turn); this guard's job is to make any OTHER failure a normal
+  # FAIL line instead of a process-killing, unexplained numeric exit.
+  _lt_out=$(CLAGENTIC_MEMORY_MAX_ROWS="$_cap" CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" \
+    "$TOOL_HOME/scripts/memory.sh" log-turn "row-cap smoke row $i" "smoke cap" "seed" 2>&1) || {
+      _logturn_fail=$((_logturn_fail + 1))
+      _logturn_err="$_lt_out"
+    }
   i=$((i+1))
 done
+if [ "$_logturn_fail" -eq 0 ]; then
+  ok "row-cap seeding: all 15 log-turn calls succeeded"
+else
+  bad "row-cap seeding: $_logturn_fail/15 log-turn call(s) failed; last error: $_logturn_err"
+fi
 _row_count=$(sqlite3 "$REPO_ROOT/.clagentic/lite/memory.db" \
   "SELECT COUNT(*) FROM turns;" 2>/dev/null || echo 0)
 if [ "${_row_count:-0}" -le "$_cap" ]; then
@@ -541,10 +566,13 @@ fi
 step "13. pin-first recall: source=manual row surfaces before newer auto rows (lr-17a8)"
 _pin_db="$REPO_ROOT/.clagentic/lite/memory.db"
 sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-smoke%';" 2>/dev/null || true
+# GUARDED (lr-b56a03 sweep): these raw INSERTs were bare -- a failure here
+# (e.g. FTS5 index still desynced from a prior interrupted run) would have
+# killed the whole smoke run with no FAIL line, same defect shape as step 11.
 sqlite3 "$_pin_db" \
-  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-01-02T00:00:00Z', 'smoke', 'lr17a8-smoke auto row newer', 'smoke', 'stop-hook');"
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-01-02T00:00:00Z', 'smoke', 'lr17a8-smoke auto row newer', 'smoke', 'stop-hook');" || true
 sqlite3 "$_pin_db" \
-  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-01-01T00:00:00Z', 'smoke', 'lr17a8-smoke manual row pinned older', 'smoke', 'manual');"
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-01-01T00:00:00Z', 'smoke', 'lr17a8-smoke manual row pinned older', 'smoke', 'manual');" || true
 _pin_recall=$(CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" "$TOOL_HOME/scripts/memory.sh" recall lr17a8-smoke 2>&1)
 _pin_first=$(printf '%s\n' "$_pin_recall" | grep 'lr17a8-smoke' | head -1)
 if printf '%s' "$_pin_first" | grep -q '\[pin\]'; then
@@ -558,15 +586,29 @@ else
   bad "pin-first: [pin] marker not in expected position; line: $_pin_first"
 fi
 sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-smoke%';" 2>/dev/null || true
+# FTS5 REBUILD AFTER RAW WRITES (lr-b56a03, MILLER diagnosis fix #4): this
+# step writes/deletes `turns` rows with raw sqlite3 rather than memory.sh, to
+# control `ts` and `source` precisely for the ordering assertions above. The
+# AFTER INSERT/DELETE triggers on `turns` still fire for these raw
+# statements, so this is not itself the corrupting act in the way an
+# out-of-band write bypassing the triggers entirely would be -- but any of
+# the `2>/dev/null || true`-masked DELETEs in this section failing silently,
+# or an interrupted run leaving the two DBs' row/trigger state out of step,
+# is exactly the kind of drift the empty-only backfill in cmd_init could
+# never detect or repair. Rebuild the FTS5 index unconditionally after each
+# raw-write block so this section can never be the seed of a desync that
+# then surfaces as an opaque SQLITE_CORRUPT in a later, unrelated step.
+sqlite3 "$_pin_db" "INSERT INTO turns_fts(turns_fts) VALUES('rebuild');" 2>/dev/null || true
 
 # ---------------------------------- 14. seen-N: count shown when duplicates exist
 
 step "14. seen-N: '(seen 2)' shown when two rows share the same summary prefix (lr-17a8)"
 sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-seen%';" 2>/dev/null || true
+# GUARDED (lr-b56a03 sweep) -- see step 13's comment above.
 sqlite3 "$_pin_db" \
-  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-02-01T00:00:00Z', 'smoke', 'lr17a8-seen duplicate summary for smoke test', 'smoke', 'stop-hook');"
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-02-01T00:00:00Z', 'smoke', 'lr17a8-seen duplicate summary for smoke test', 'smoke', 'stop-hook');" || true
 sqlite3 "$_pin_db" \
-  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-02-02T00:00:00Z', 'smoke', 'lr17a8-seen duplicate summary for smoke test', 'smoke', 'stop-hook');"
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2020-02-02T00:00:00Z', 'smoke', 'lr17a8-seen duplicate summary for smoke test', 'smoke', 'stop-hook');" || true
 _seen_recall=$(CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" "$TOOL_HOME/scripts/memory.sh" recall lr17a8-seen 2>&1)
 if printf '%s' "$_seen_recall" | grep -q '(seen 2)'; then
   ok "seen-N: '(seen 2)' annotation present for duplicate summary rows"
@@ -580,6 +622,8 @@ else
   bad "seen-N: expected 2 lr17a8-seen rows, got $_seen_count"
 fi
 sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-seen%';" 2>/dev/null || true
+# FTS5 rebuild after raw writes (lr-b56a03) -- see step 13's comment above.
+sqlite3 "$_pin_db" "INSERT INTO turns_fts(turns_fts) VALUES('rebuild');" 2>/dev/null || true
 
 # ---- 11b. ordering proof: seen-N count does not drive ORDER; recency holds for
 #           non-pinned rows and pin-first holds for pinned rows.
@@ -595,17 +639,18 @@ sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-seen%';" 2>/dev
 
 step "11b. ordering proof: pin-first overrides recency; seen-N never drives ORDER"
 sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-ord%';" 2>/dev/null || true
+# GUARDED (lr-b56a03 sweep) -- see step 13's comment above.
 # Older manual pin
 sqlite3 "$_pin_db" \
-  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-01T00:00:00Z', 'smoke', 'lr17a8-ord pinned manual row', 'lr17a8ord', 'manual');"
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-01T00:00:00Z', 'smoke', 'lr17a8-ord pinned manual row', 'lr17a8ord', 'manual');" || true
 # Newer auto, no duplicate (unique prefix)
 sqlite3 "$_pin_db" \
-  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-03T00:00:00Z', 'smoke', 'lr17a8-ord auto unique newer', 'lr17a8ord', 'stop-hook');"
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-03T00:00:00Z', 'smoke', 'lr17a8-ord auto unique newer', 'lr17a8ord', 'stop-hook');" || true
 # Older auto with a duplicate to trigger seen-2 annotation
 sqlite3 "$_pin_db" \
-  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-01T00:00:01Z', 'smoke', 'lr17a8-ord auto duplicate older A', 'lr17a8ord', 'stop-hook');"
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-01T00:00:01Z', 'smoke', 'lr17a8-ord auto duplicate older A', 'lr17a8ord', 'stop-hook');" || true
 sqlite3 "$_pin_db" \
-  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-01T00:00:00Z', 'smoke', 'lr17a8-ord auto duplicate older A', 'lr17a8ord', 'stop-hook');"
+  "INSERT INTO turns (ts, session_id, summary, tags, source) VALUES ('2021-03-01T00:00:00Z', 'smoke', 'lr17a8-ord auto duplicate older A', 'lr17a8ord', 'stop-hook');" || true
 _ord_recall=$(CLAGENTIC_PROJECT_ROOT="$REPO_ROOT" "$TOOL_HOME/scripts/memory.sh" recall lr17a8-ord 2>&1)
 # Line 1 must be the pin.
 _ord_line1=$(printf '%s\n' "$_ord_recall" | grep 'lr17a8-ord' | sed -n '1p')
@@ -622,6 +667,8 @@ else
   bad "ord-proof: expected 'auto unique newer' at position 2; got: $_ord_line2"
 fi
 sqlite3 "$_pin_db" "DELETE FROM turns WHERE summary LIKE 'lr17a8-ord%';" 2>/dev/null || true
+# FTS5 rebuild after raw writes (lr-b56a03) -- see step 13's comment above.
+sqlite3 "$_pin_db" "INSERT INTO turns_fts(turns_fts) VALUES('rebuild');" 2>/dev/null || true
 
 # Steps 15-20: review-merge module tests. Run with CLAGENTIC_SMOKE_NO_LLM=1 to avoid
 # live LLM calls. Steps 15-20 source review-merge.sh and call functions directly --
@@ -1296,7 +1343,7 @@ s = sys.stdin.read()
 results = []
 # tab: \t or
 results.append("1" if ("\\t" in s or "\\u0009" in s) else "0")
-# CR: \r or/
+# CR: backslash-r or an escape sequence must be present
 results.append("1" if ("\\r" in s or "\\u000d" in s or "\\u000D" in s) else "0")
 # backslash doubled: output has \\ (2 chars); in Python "\\\\" = 2-char string
 results.append("1" if "\\\\" in s else "0")
