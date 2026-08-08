@@ -238,10 +238,26 @@ class TestSplitDiffSh(unittest.TestCase):
             )
 
     def test_small_budget_multiple_chunks(self):
-        """Small budget produces more chunks than large budget."""
+        """Small budget produces more chunks than large budget.
+
+        REGRESSION (lr-25ce17): split_diff previously clamped ANY caller
+        budget under 1024 bytes up to 1024 with no stderr notice, silently
+        overriding the caller's explicit CHUNK_BYTES argument. This
+        synthetic diff's two file blocks total well under 1024 bytes, so
+        the clamp made it impossible for a small-budget caller (here, or in
+        production via CLAGENTIC_REVIEW_CHUNK_BYTES / CLAGENTIC_REVIEWER_
+        MAX_DIFF_KB) to ever exercise the hunk-split / multi-chunk-flush
+        code paths. The count assertion below is the one that actually
+        caught this; the header-format assertion alone did not.
+        """
         count_large, _, _, _, _ = self._run_split(self.SYNTHETIC_DIFF, 65536)
         count_small, chunks_small, contents_small, err, rc = self._run_split(self.SYNTHETIC_DIFF, 50)
         self.assertEqual(rc, 0)
+        self.assertGreater(
+            count_small, count_large,
+            f"Expected small budget (50) to produce more chunks than large budget "
+            f"(65536): got {count_small} vs {count_large}. stderr: {err}"
+        )
         # Each small-budget chunk must also start with diff --git or @@ (hunk header).
         for cname, content in contents_small.items():
             first_line = content.split("\n")[0] if content else ""

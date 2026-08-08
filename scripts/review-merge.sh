@@ -75,11 +75,24 @@ split_diff() {
     return 0
   fi
 
-  # Integer guard for budget.
+  # Integer guard for budget: non-numeric or empty falls back to the
+  # documented default (256 KiB).
   case "$_sd_budget" in
     ''|*[!0-9]*) _sd_budget=262144 ;;
   esac
-  [ "$_sd_budget" -lt 1024 ] && _sd_budget=1024
+  # Degenerate-only floor (lr-25ce17): a budget of 0 would make every file
+  # block "exceed the budget" and enter the hunk-split branch even for an
+  # empty diff, and could loop pathologically on a file with no @@ hunks.
+  # Floor only true degenerate values (0) rather than clamping any caller
+  # value below an arbitrary 1024-byte threshold -- the previous 1024 floor
+  # silently overrode ANY caller-specified budget under 1KB with no stderr
+  # notice, defeating the documented CHUNK_BYTES contract (this function's
+  # own header comment: "stdout: number of chunks" driven directly by the
+  # caller's budget) and making small-budget chunking un-exercisable by any
+  # caller, test or production (CLAGENTIC_REVIEW_CHUNK_BYTES /
+  # CLAGENTIC_REVIEWER_MAX_DIFF_KB in gates.sh apply no lower bound of their
+  # own before reaching here).
+  [ "$_sd_budget" -lt 1 ] && _sd_budget=1
 
   mkdir -p "$_sd_dir"
 

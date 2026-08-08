@@ -87,6 +87,27 @@ SQL
       if [ "${_fts_count:-0}" = "0" ] && [ "${_turns_count:-0}" != "0" ]; then
         sqlite3 "$DB" "INSERT INTO turns_fts(rowid, summary, tags) SELECT id, summary, tags FROM turns;" 2>/dev/null || true
       fi
+
+      # SELF-HEALING INTEGRITY CHECK (lr-b56a03): an external-content FTS5
+      # index (content=turns, content_rowid=id) is only consistent when EVERY
+      # write to `turns` goes through the AFTER INSERT/DELETE/UPDATE triggers
+      # above. Anything that writes/deletes `turns` rows out-of-band (raw
+      # sqlite3, a restored backup, manual surgery) desyncs the index without
+      # touching its row count, so the empty-only backfill above can never
+      # catch or repair it -- a partially-desynced index is appended to
+      # forever, not fixed. Once desynced, a later external-content write
+      # raises SQLITE_CORRUPT and that raw SQLite result code was observed
+      # propagating verbatim out of cmd_log_turn under a caller's `set -e`
+      # (smoke.sh step 11, MILLER diagnosis lr-b56a03). Run FTS5's built-in
+      # 'integrity-check' command and, only on failure, 'rebuild' the index
+      # from `turns` (the source of truth) so cmd_init makes the index
+      # self-healing on every call rather than a one-time backfill.
+      # 2>/dev/null on the integrity-check itself is intentional: a non-zero
+      # exit there IS the expected "index is desynced" signal, not an error
+      # to hide -- the failure path is handled explicitly below, not masked.
+      if ! sqlite3 "$DB" "INSERT INTO turns_fts(turns_fts) VALUES('integrity-check');" 2>/dev/null; then
+        sqlite3 "$DB" "INSERT INTO turns_fts(turns_fts) VALUES('rebuild');" 2>/dev/null || true
+      fi
     fi
   fi
 }
@@ -147,9 +168,31 @@ cmd_log_turn() {
   TAGS_ESC=$(ds_sql_escape "$TAGS")
   SOURCE_ESC=$(ds_sql_escape "$SOURCE")
   BRANCH_ESC=$(ds_sql_escape "$BRANCH")
-  sqlite3 "$DB" \
-    "INSERT INTO turns (ts, branch, summary, tags, source) VALUES ('$TS', '$BRANCH_ESC', '$SUMMARY_ESC', '$TAGS_ESC', '$SOURCE_ESC');
+  _lt_sql="INSERT INTO turns (ts, branch, summary, tags, source) VALUES ('$TS', '$BRANCH_ESC', '$SUMMARY_ESC', '$TAGS_ESC', '$SOURCE_ESC');
 DELETE FROM turns WHERE id NOT IN (SELECT id FROM turns ORDER BY ts DESC LIMIT $MAX_ROWS);"
+  # NO BARE `set -e`-EXPOSED sqlite3 CALL HERE (lr-b56a03): log-turn is the
+  # chokepoint every stop-summarize hook funnels through, so a raw SQLite
+  # result code escaping this function under a caller's `set -e` means
+  # session memory silently stops recording and the only visible symptom is
+  # an opaque numeric exit (observed: exit 11 == SQLITE_CORRUPT, surfaced
+  # verbatim as smoke.sh's exit code with no message at all). Capture stderr
+  # into a variable (not a /tmp file) and the exit status explicitly instead
+  # of letting either propagate raw.
+  _lt_err=$(sqlite3 "$DB" "$_lt_sql" 2>&1 1>/dev/null) && _lt_rc=0 || _lt_rc=$?
+  if [ "$_lt_rc" -ne 0 ]; then
+    # Self-heal once: an external-content FTS5 index desync (SQLITE_CORRUPT,
+    # result code 11) is recoverable via 'rebuild' without losing any turns
+    # rows -- turns itself is untouched, only the FTS5 shadow index is stale.
+    # Retry the write after rebuilding; if it still fails, this is a real
+    # write failure (disk full, permissions, non-FTS5 corruption) and must
+    # be reported loudly rather than swallowed.
+    sqlite3 "$DB" "INSERT INTO turns_fts(turns_fts) VALUES('rebuild');" 2>/dev/null || true
+    _lt_err2=$(sqlite3 "$DB" "$_lt_sql" 2>&1 1>/dev/null) && _lt_rc2=0 || _lt_rc2=$?
+    if [ "${_lt_rc2:-1}" -ne 0 ]; then
+      echo "memory.sh log-turn: failed to write turn even after FTS5 rebuild -- session memory not recorded for this turn: ${_lt_err2:-$_lt_err}" 1>&2
+      return 1
+    fi
+  fi
 }
 
 cmd_recall() {
