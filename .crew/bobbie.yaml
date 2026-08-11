@@ -29,7 +29,40 @@
 schema_version: 1
 
 security:
-  rules: []
+  rules:
+    # ------------------------------------------------------------------
+    # NEW-SUPPRESSION REVIEW (lr-cfc360) — see docs/GATES.md § "Suppression
+    # policy" under Gate 4c and § "Rule-exclude ladder (lr-321e18)" for the
+    # sanctioned forms this rule enforces review of.
+    # ------------------------------------------------------------------
+    - id: clagentic-lite.new-suppression-review
+      severity: blocking
+      description: >-
+        Any NEW suppression introduced in a diff — an inline
+        `# nosemgrep: <rule-id>` comment, or a new entry in
+        `.clagentic/semgrep-exclude` / `~/.config/clagentic/semgrep-exclude`
+        — is in-scope for security review, not a docs/config change to
+        wave through. Verify the stated justification against the actual
+        code it claims to describe: does the cited pattern (ORM usage,
+        input source, call path) genuinely exist, or not exist, at the
+        claimed location; do any cited engram/task IDs actually resolve;
+        does the suppressed rule's vulnerability class genuinely not apply
+        here. A justification that does not hold up under that check is a
+        real finding being buried, not a legitimate suppression, and must
+        be reported as such regardless of how plausible the stated
+        rationale reads. lr-321e18's own history is the worked example:
+        a proposed `python.sqlalchemy.security.sqlalchemy-execute-raw-query`
+        exclusion cited sqlalchemy/psycopg2/`sql.Identifier` usage and two
+        engram IDs; none of it resolved against this repo, and the entry
+        was removed rather than shipped (PR #159) — that is this rule
+        operating correctly, not an exceptional case.
+      applies_to:
+        - "**/*.py"
+        - "**/*.sh"
+        - "**/*.go"
+        - "**/*.js"
+        - "**/*.ts"
+        - ".clagentic/semgrep-exclude"
 
   # No scanner overrides — use BOBBIE's defaults (gitleaks / semgrep /
   # osv-scanner). clagentic-lite is a shell+Python CLI tool with no
