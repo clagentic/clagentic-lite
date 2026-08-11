@@ -1236,37 +1236,72 @@ except Exception:
     print("")' 2>/dev/null)
     fi
     if [ -n "$_la_branch" ]; then
-      # Cheap branch match without a JSON parser: match the literal
-      # "branch":"<value>" substring. Good enough for a capping HEURISTIC
-      # (worst case, an under-cap or over-cap by a few entries on a branch
-      # name that is also a JSON-escaped substring of another field) --
-      # never used for anything correctness-relevant (ledger_latest_for_branch
-      # does a real JSON parse, not this scan). Two straightforward linear
-      # passes: count this branch's lines, then rewrite dropping the oldest
-      # excess ones, preserving every other branch's lines verbatim and in
-      # original order.
+      # REAL JSON PARSE, not a raw substring match on `"branch":"<value>"`
+      # text: that heuristic is brittle against separator differences
+      # between JSON encoders (jq -c emits no space after `:`; plain
+      # python json.dumps() emits `"branch": "<value>"` WITH a space),
+      # silently under-counting matches and disabling the cap on any line
+      # this module's own python3 fallback wrote. python3 does the count
+      # and the rewrite together, in one pass over the file, whenever
+      # available -- preferred here (ahead of jq) specifically because a
+      # single pass has no TOCTOU between separately reading a count and
+      # reading the file again to rewrite it.
       _la_tmp=$(mktemp -t clagentic-ledger-cap.XXXXXX)
-      _la_branch_count=$(awk -v key="\"branch\":\"${_la_branch}\"" '
-        index($0, key) > 0 { c++ } END { print c+0 }
-      ' "$_la_file" 2>/dev/null)
-      case "$_la_branch_count" in ''|*[!0-9]*) _la_branch_count=0 ;; esac
-      if [ "$_la_branch_count" -gt "$_la_max" ]; then
-        _la_drop=$((_la_branch_count - _la_max))
-        awk -v key="\"branch\":\"${_la_branch}\"" -v drop="$_la_drop" '
-          BEGIN { seen = 0 }
-          {
-            if (index($0, key) > 0) {
-              seen++
-              if (seen <= drop) next
-            }
-            print
-          }
-        ' "$_la_file" > "$_la_tmp" 2>/dev/null
-        if [ -s "$_la_tmp" ] || [ ! -s "$_la_file" ]; then
-          mv "$_la_tmp" "$_la_file"
-        else
-          rm -f "$_la_tmp"
+      if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import json, sys
+
+branch, max_n, out_path = sys.argv[2], int(sys.argv[3]), sys.argv[4]
+
+def is_branch_match(raw):
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return False
+    return isinstance(obj, dict) and obj.get("branch") == branch
+
+with open(sys.argv[1]) as f:
+    lines = [line.rstrip("\n") for line in f if line.strip()]
+
+match_count = sum(1 for raw in lines if is_branch_match(raw))
+drop = match_count - max_n if match_count > max_n else 0
+
+out, seen = [], 0
+for raw in lines:
+    if is_branch_match(raw):
+        seen += 1
+        if seen <= drop:
+            continue
+    out.append(raw)
+
+with open(out_path, "w") as f:
+    for raw in out:
+        f.write(raw + "\n")
+' "$_la_file" "$_la_branch" "$_la_max" "$_la_tmp" 2>/dev/null
+      else
+        # jq-only fallback (no python3 on PATH). jq CAN express "drop the
+        # first N matches, keep every other line verbatim and in order" in
+        # a single filter: foreach over the input stream, tracking a
+        # running per-branch match counter in the state accumulator, and
+        # emitting a line only when it is NOT a to-be-dropped match.
+        _la_branch_count=$(jq -c --arg b "$_la_branch" 'select(.branch == $b)' "$_la_file" 2>/dev/null | wc -l | tr -d '[:space:]')
+        case "$_la_branch_count" in ''|*[!0-9]*) _la_branch_count=0 ;; esac
+        if [ "$_la_branch_count" -gt "$_la_max" ]; then
+          _la_drop=$((_la_branch_count - _la_max))
+          jq -c --arg b "$_la_branch" --argjson drop "$_la_drop" -s '
+            reduce .[] as $entry
+              ([0, []];
+                if $entry.branch == $b then
+                  (.[0] + 1) as $seen
+                  | if $seen <= $drop then [$seen, .[1]] else [$seen, .[1] + [$entry]] end
+                else
+                  [.[0], .[1] + [$entry]]
+                end)
+            | .[1][]
+          ' "$_la_file" > "$_la_tmp" 2>/dev/null
         fi
+      fi
+      if [ -s "$_la_tmp" ]; then
+        mv "$_la_tmp" "$_la_file"
       else
         rm -f "$_la_tmp"
       fi
