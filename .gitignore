@@ -12,6 +12,12 @@
 # "adversarial-acks.json" section) -- it must be un-ignored the same way the
 # loadout config above is, or it can never be committed to the repo.
 !.clagentic/adversarial-acks.json
+
+# semgrep-exclude is a committed, per-repo SAST rule-exclusion ladder entry
+# (docs/GATES.md Gate 4c "SAST", lr-321e18) -- same un-ignore treatment as
+# adversarial-acks.json above, for the same reason: it's tracked policy, not
+# local runtime state.
+!.clagentic/semgrep-exclude
 .env
 .env.local
 

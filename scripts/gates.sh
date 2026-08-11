@@ -801,6 +801,74 @@ cmd_bleed() {
   return 0
 }
 
+# _sast_exclude_rule_flags — build the `--exclude-rule <id>` argument list
+# from the two-level exclude ladder, mirroring cmd_deps' osv-ignore mechanism
+# (:404-450, :500-507) exactly (reuse-first, AGENTS.md code-craft rule 2) —
+# same two file paths (global then repo), same one-id-per-line format, same
+# `''|'#'*` comment/blank skip, same trailing-comment-and-whitespace strip.
+#
+# Args: GLOBAL_FILE REPO_FILE (both paths, existence checked internally —
+# same "[ -f ... ] || continue" tolerance cmd_deps uses for a ladder level
+# that isn't present).
+# stdout: NUL-free, newline-separated argv tokens — "--exclude-rule\n<id>"
+# per active entry, one token per line, ready for reconstruction via a
+# `while read` loop (a single space-joined string would break on a rule id
+# containing whitespace, though semgrep rule ids never do in practice; the
+# newline-per-token form is simply the safer POSIX shape and costs nothing
+# extra here).
+_sast_exclude_rule_flags() {
+  _serf_global="$1"
+  _serf_repo="$2"
+  for _serf_file in "$_serf_global" "$_serf_repo"; do
+    [ -f "$_serf_file" ] || continue
+    while IFS= read -r _serf_line; do
+      case "$_serf_line" in ''|'#'*) continue ;; esac
+      _serf_id=$(printf '%s' "$_serf_line" | sed 's/[[:space:]]*#.*//' | sed 's/[[:space:]]*$//')
+      [ -n "$_serf_id" ] || continue
+      printf -- '--exclude-rule\n%s\n' "$_serf_id"
+    done < "$_serf_file"
+  done
+}
+
+# _sast_config_flag — print the semgrep `--config` argument(s) to use.
+# DEFAULT STAYS auto (CLAGENTIC_SEMGREP_CONFIG unset or empty): lite ships to
+# other people, so pinning a policy file is a per-repo opt-in, never a
+# hardcoded preference baked into gates.sh itself. When set, the env var
+# value replaces --config=auto outright — auto is not contacted at all.
+#
+# stdout: NUL-free, newline-separated argv tokens ("--config\n<value>" or
+# "--config=auto"), same shape _sast_exclude_rule_flags uses.
+_sast_config_flag() {
+  if [ -n "${CLAGENTIC_SEMGREP_CONFIG:-}" ]; then
+    printf -- '--config\n%s\n' "$CLAGENTIC_SEMGREP_CONFIG"
+  else
+    printf -- '--config=auto\n'
+  fi
+}
+
+# _sast_pinned_config_from_argv ARG1 ARG2 — extract the pinned config path
+# from cmd_sast's own reconstructed argv (its first two positional
+# parameters, before --exclude-rule tokens are appended), given the shape
+# _sast_config_flag emits: a literal "--config" token followed by the path,
+# when CLAGENTIC_SEMGREP_CONFIG was set, or the single fused
+# "--config=auto" token when it was not (which never matches "--config" as
+# a standalone ARG1, so this prints nothing in the default case).
+#
+# BOBBIE finding (PR #159, comment 5258964196): a pinned config can replace
+# --config=auto with a policy path that disables every rule, and that
+# override used to reach neither stderr nor the audit-log details string --
+# the same silent-suppression failure the task forbids for the exclude
+# ladder, just on the config pin instead. This helper is what cmd_sast now
+# calls to detect the pin so it can surface it, the same way
+# _sast_exclude_rule_flags' output already gets scanned for visibility.
+#
+# stdout: the pinned config path, or empty when --config=auto is active.
+_sast_pinned_config_from_argv() {
+  if [ "${1:-}" = "--config" ]; then
+    printf '%s' "${2:-}"
+  fi
+}
+
 cmd_sast() {
   if ! command -v semgrep >/dev/null 2>&1; then
     if [ "${CLAGENTIC_ALLOW_MISSING_SEMGREP:-0}" = "1" ]; then
@@ -903,19 +971,90 @@ cmd_sast() {
   _SAST_TIMEOUT="${CLAGENTIC_SAST_TIMEOUT_SEC:-300}"
   _SAST_TIMEOUT=$(ds_positive_int_or_default "$_SAST_TIMEOUT" 300)
 
+  # Config: --config=auto by default, or CLAGENTIC_SEMGREP_CONFIG when set —
+  # DEFAULT STAYS auto (lite ships to other people; pinning is per-repo
+  # opt-in, never hardcoded here). Reconstructed via positional parameters
+  # (POSIX-safe, no eval), same technique the legacy osv-scanner branch
+  # (:495-517) uses. Config comes FIRST in $@ so the no-exclusions,
+  # no-CLAGENTIC_SEMGREP_CONFIG case reconstructs the exact prior argv
+  # (`semgrep --config=auto --error --severity=ERROR`) byte-for-byte.
+  set --
+  while IFS= read -r _SAST_CFG_TOK; do
+    [ -n "$_SAST_CFG_TOK" ] || continue
+    set -- "$@" "$_SAST_CFG_TOK"
+  done <<EOF_CFG
+$(_sast_config_flag)
+EOF_CFG
+
+  # Exclude ladder (lr-321e18): $HOME/.config/clagentic/semgrep-exclude
+  # (global) union $REPO_ROOT/.clagentic/semgrep-exclude (repo) — mirrors
+  # cmd_deps' osv-ignore mechanism exactly (reuse-first). Each rule id
+  # becomes an --exclude-rule flag on BOTH the baseline and full-tree
+  # invocations below.
+  while IFS= read -r _SAST_EXCL_TOK; do
+    [ -n "$_SAST_EXCL_TOK" ] || continue
+    set -- "$@" "$_SAST_EXCL_TOK"
+  done <<EOF_EXCL
+$(_sast_exclude_rule_flags "$HOME/.config/clagentic/semgrep-exclude" "$REPO_ROOT/.clagentic/semgrep-exclude")
+EOF_EXCL
+
+  # A suppressed rule must never be silent (task requirement): when the
+  # ladder produced at least one --exclude-rule flag, name the excluded rule
+  # ids on stderr and fold the count/ids into the audit-log details string
+  # for both outcome branches below.
+  _SAST_EXCL_IDS=""
+  _SAST_EXCL_COUNT=0
+  _sast_prev=""
+  for _sast_tok in "$@"; do
+    if [ "$_sast_prev" = "--exclude-rule" ]; then
+      _SAST_EXCL_COUNT=$((_SAST_EXCL_COUNT + 1))
+      if [ -z "$_SAST_EXCL_IDS" ]; then
+        _SAST_EXCL_IDS="$_sast_tok"
+      else
+        _SAST_EXCL_IDS="$_SAST_EXCL_IDS,$_sast_tok"
+      fi
+    fi
+    _sast_prev="$_sast_tok"
+  done
+  if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
+    echo "[gates/sast] excluding $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS" 1>&2
+  fi
+
+  # A pinned config must never be silent either (BOBBIE, PR #159 comment
+  # 5258964196): CLAGENTIC_SEMGREP_CONFIG can replace --config=auto with a
+  # policy path that disables every rule, and that override used to reach
+  # neither stderr nor the audit-log details string -- the same
+  # silent-suppression failure the task forbids for the exclude ladder,
+  # applied to the config pin. See _sast_pinned_config_from_argv's own
+  # doc comment for how the pin is detected from the reconstructed argv.
+  _SAST_PINNED_CONFIG=$(_sast_pinned_config_from_argv "${1:-}" "${2:-}")
+  if [ -n "$_SAST_PINNED_CONFIG" ]; then
+    echo "[gates/sast] using pinned config: $_SAST_PINNED_CONFIG" 1>&2
+  fi
+
   # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
   if [ -n "$_SAST_BASELINE" ]; then
     echo "[gates/sast] scoping to diff-introduced findings (baseline-commit=$_SAST_BASELINE)" 1>&2
-    if run_bounded "$_SAST_TIMEOUT" -- semgrep --config=auto --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE"; then
-      cmd_log_run sast pass "baseline-commit=$_SAST_BASELINE"
+    if run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE"; then
+      _SAST_PASS_DETAILS="baseline-commit=$_SAST_BASELINE"
+      [ -n "$_SAST_PINNED_CONFIG" ] && _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; config=$_SAST_PINNED_CONFIG"
+      if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
+        _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; excluded $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS"
+      fi
+      cmd_log_run sast pass "$_SAST_PASS_DETAILS"
     else
       cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE (or timed out after ${_SAST_TIMEOUT}s)"
       return 1
     fi
   else
     echo "[gates/sast] full-tree scan (baseline scoping unavailable: $_SAST_BASELINE_SKIP_REASON)" 1>&2
-    if run_bounded "$_SAST_TIMEOUT" -- semgrep --config=auto --error --severity=ERROR; then
-      cmd_log_run sast pass "full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"
+    if run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR; then
+      _SAST_PASS_DETAILS="full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"
+      [ -n "$_SAST_PINNED_CONFIG" ] && _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; config=$_SAST_PINNED_CONFIG"
+      if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
+        _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; excluded $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS"
+      fi
+      cmd_log_run sast pass "$_SAST_PASS_DETAILS"
     else
       cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON; or timed out after ${_SAST_TIMEOUT}s)"
       return 1
@@ -4360,19 +4499,25 @@ _FAILURE_WORDS = (
 # silently absorbed by this allowlist -- only an EXACT match to one of
 # these known lines is suppressed from the warning output below.
 #
-# sast/"unavailable" is a reviewed, INTENTIONAL exception, not the same
-# lie-class as the other three: semgrep genuinely ran (full-tree, not
-# baseline-scoped) and the pass outcome is honest -- "unavailable" here
-# describes why the SCOPE is full-tree, not that the scan itself is fake.
-# It matches the mechanical word-list (this lint enumerates by vocabulary,
-# not by judgment of each site's actual honesty) and is allowlisted here
-# rather than narrowing the word-list, which would risk missing a future
-# genuine "scan unavailable" lie elsewhere that happens to use the same word.
+# sast/"unavailable" WAS a reviewed, intentional exception here (semgrep
+# genuinely ran full-tree; "unavailable" described why the SCOPE was
+# full-tree, not that the scan was fake) but is REMOVED as of lr-321e18's
+# BOBBIE fold-in: cmd_sast's two `cmd_log_run sast pass ...` call sites now
+# build their details string into a variable ($_SAST_PASS_DETAILS) so the
+# config-pin visibility fix (below) can conditionally append to it, and pass
+# that variable -- `cmd_log_run sast pass "$_SAST_PASS_DETAILS"` -- rather
+# than a literal string. This lint's regex only matches a literal
+# double-quoted details string; a variable reference contains no failure
+# word literally, so this call site is no longer statically flagged at all
+# and the two entries that used to allowlist it are dead (their exact
+# literal source text no longer appears anywhere in gates.sh). Per this
+# section's own contract ("if any disappeared, the allowlist should be
+# trimmed rather than silently going stale"), removed rather than left
+# behind as no-op entries.
 _KNOWN_VIOLATIONS = {
     ("deps", "no package sources found"),
     ("bleed", "empty pattern file"),
     ("bleed", "git ls-files failed (non-blocking)"),
-    ("sast", "full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"),
 }
 
 findings = []

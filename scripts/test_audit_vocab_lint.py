@@ -98,20 +98,31 @@ class TestRealGatesShKnownBacklog(unittest.TestCase):
         )
 
     def test_real_gates_sh_has_exactly_the_documented_known_violations(self):
-        """Sanity check on the allowlist itself: five known VIOLATION SITES
-        from four distinct _KNOWN_VIOLATIONS entries (deps/no-package-
+        """Sanity check on the allowlist itself: four known VIOLATION SITES
+        from three distinct _KNOWN_VIOLATIONS entries (deps/no-package-
         sources, bleed/empty-pattern-file, bleed/git-ls-files-failed --
-        matched at TWO call sites, identical text -- and the reviewed
-        sast/unavailable exception) must still be present and still
-        counted as known -- if any disappeared, the allowlist should be
-        trimmed rather than silently going stale (a stale allowlist entry
-        provides no coverage but looks like it does)."""
+        matched at TWO call sites, identical text) must still be present and
+        still counted as known -- if any disappeared, the allowlist should
+        be trimmed rather than silently going stale (a stale allowlist
+        entry provides no coverage but looks like it does).
+
+        The former sast/"unavailable" exception (and its lr-321e18
+        exclude-ladder-suffixed sibling) is GONE, not merely uncounted:
+        lr-321e18's BOBBIE fold-in changed cmd_sast's two
+        `cmd_log_run sast pass ...` call sites to build their details string
+        into a variable ($_SAST_PASS_DETAILS, so the new config-pin
+        visibility fix can conditionally append to it) and pass that
+        variable rather than a literal string -- this lint's regex only
+        matches a literal double-quoted details string, so those two call
+        sites are no longer statically flagged at all, and the entries that
+        used to allowlist them were removed from _KNOWN_VIOLATIONS as dead
+        (see that dict's own comment)."""
         out, err, rc = _run_lint(GATES_SH)
-        self.assertIn("5 known", out, f"output={out!r}")
+        self.assertIn("4 known", out, f"output={out!r}")
         self.assertIn("no package sources found", out)
         self.assertIn("empty pattern file", out)
         self.assertIn("git ls-files failed", out)
-        self.assertIn("baseline unavailable", out)
+        self.assertNotIn("baseline unavailable", out)
 
 
 class TestSyntheticFixtures(unittest.TestCase):
