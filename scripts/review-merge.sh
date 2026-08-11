@@ -1172,3 +1172,174 @@ PYEOF
   rm -f "$_frb_in"
   return 0
 }
+
+# ------------------------------------------------------------- ledger_append --
+#
+# ledger_append LEDGER_FILE JSON_LINE MAX_PER_BRANCH
+#
+# Appends ONE JSON object (already-serialized, single line, no trailing
+# newline required) to LEDGER_FILE in JSON-Lines format (one JSON value per
+# line) and creates the file (and its parent directory) if absent. This is
+# the sole writer for the review ledger (lr-01ae73) -- gates.sh's cmd_review
+# is the only caller.
+#
+# APPEND-ONLY BY DESIGN: unlike review-seen-keys/review-recurrence.json
+# (which persist only the LATEST rolled-up state), the ledger's whole point
+# is that prior entries are retained so finding recurrence across rounds is
+# visible after the fact -- this function only ever adds a line, never
+# rewrites or removes one, except for the per-branch cap below.
+#
+# PER-BRANCH CAP (MAX_PER_BRANCH, default unlimited when 0/absent): the
+# ledger exists to catch review churn, so its own storage must not become
+# the thing that grows without bound on a long-lived branch with many
+# rounds -- same "the feature that watches for unbounded growth must not
+# itself grow unboundedly" posture _invariant_feed_append (gates.sh) already
+# established. When capping, the OLDEST entries for THIS SAME BRANCH are
+# dropped first; entries for other branches are never touched by a
+# branch-scoped cap. A MAX_PER_BRANCH of 0 (or non-numeric) disables
+# capping entirely -- capping is opt-in via CLAGENTIC_LEDGER_MAX_PER_BRANCH,
+# gates.sh.
+#
+# stdin: none. stdout: none. stderr: diagnostics only.
+# exit 0: always -- a ledger write failure must never abort the review gate
+# itself (fail-open, matching every other on-disk gate-state writer in this
+# codebase: a lost ledger entry only degrades recurrence visibility and
+# forces a fresh full-range review next round, it never silently reports a
+# false pass).
+ledger_append() {
+  _la_file="$1"
+  _la_line="$2"
+  _la_max="${3:-0}"
+
+  case "$_la_max" in ''|*[!0-9]*) _la_max=0 ;; esac
+
+  _la_dir=$(dirname "$_la_file")
+  mkdir -p "$_la_dir" 2>/dev/null || true
+
+  # Single-line contract: LEDGER_FILE is JSON-Lines, so JSON_LINE must never
+  # itself contain an embedded newline (a well-formed single-line JSON
+  # serialization never does). Strip defensively rather than trust the
+  # caller -- a stray newline would silently split one logical entry into
+  # two lines, corrupting the JSONL contract for every future reader.
+  printf '%s' "$_la_line" | tr -d '\n' >> "$_la_file" 2>/dev/null
+  printf '\n' >> "$_la_file" 2>/dev/null
+
+  if [ "$_la_max" -gt 0 ] 2>/dev/null; then
+    _la_branch=""
+    if command -v jq >/dev/null 2>&1; then
+      _la_branch=$(printf '%s' "$_la_line" | jq -r '.branch // ""' 2>/dev/null)
+    elif command -v python3 >/dev/null 2>&1; then
+      _la_branch=$(printf '%s' "$_la_line" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("branch",""))
+except Exception:
+    print("")' 2>/dev/null)
+    fi
+    if [ -n "$_la_branch" ]; then
+      # Cheap branch match without a JSON parser: match the literal
+      # "branch":"<value>" substring. Good enough for a capping HEURISTIC
+      # (worst case, an under-cap or over-cap by a few entries on a branch
+      # name that is also a JSON-escaped substring of another field) --
+      # never used for anything correctness-relevant (ledger_latest_for_branch
+      # does a real JSON parse, not this scan). Two straightforward linear
+      # passes: count this branch's lines, then rewrite dropping the oldest
+      # excess ones, preserving every other branch's lines verbatim and in
+      # original order.
+      _la_tmp=$(mktemp -t clagentic-ledger-cap.XXXXXX)
+      _la_branch_count=$(awk -v key="\"branch\":\"${_la_branch}\"" '
+        index($0, key) > 0 { c++ } END { print c+0 }
+      ' "$_la_file" 2>/dev/null)
+      case "$_la_branch_count" in ''|*[!0-9]*) _la_branch_count=0 ;; esac
+      if [ "$_la_branch_count" -gt "$_la_max" ]; then
+        _la_drop=$((_la_branch_count - _la_max))
+        awk -v key="\"branch\":\"${_la_branch}\"" -v drop="$_la_drop" '
+          BEGIN { seen = 0 }
+          {
+            if (index($0, key) > 0) {
+              seen++
+              if (seen <= drop) next
+            }
+            print
+          }
+        ' "$_la_file" > "$_la_tmp" 2>/dev/null
+        if [ -s "$_la_tmp" ] || [ ! -s "$_la_file" ]; then
+          mv "$_la_tmp" "$_la_file"
+        else
+          rm -f "$_la_tmp"
+        fi
+      else
+        rm -f "$_la_tmp"
+      fi
+    fi
+  fi
+
+  return 0
+}
+
+# --------------------------------------------------------- ledger_entries_for_branch --
+#
+# ledger_entries_for_branch LEDGER_FILE BRANCH
+#
+# stdout: every JSONL line in LEDGER_FILE belonging to BRANCH, oldest first
+# (original file order -- ledger_append only ever appends, so file order IS
+# chronological order), one JSON object per line, unparsed (callers that
+# need structured access read a specific field via jq/python3 themselves).
+# Absent/empty LEDGER_FILE or no matching lines: no output, exit 0.
+#
+# Uses a real JSON parse (not the awk substring heuristic ledger_append's
+# capping uses internally) so a branch name that happens to be a substring
+# of another branch name (e.g. "foo" vs "foo-bar") is never confused --
+# correctness-relevant reads always go through this function or
+# ledger_latest_for_branch, never the awk heuristic.
+ledger_entries_for_branch() {
+  _lefb_file="$1"
+  _lefb_branch="$2"
+  [ -f "$_lefb_file" ] || return 0
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -c --arg b "$_lefb_branch" 'select(.branch == $b)' "$_lefb_file" 2>/dev/null
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, sys
+branch = sys.argv[2]
+try:
+    with open(sys.argv[1]) as f:
+        lines = f.readlines()
+except Exception:
+    sys.exit(0)
+for line in lines:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    if obj.get("branch") == branch:
+        print(json.dumps(obj))
+' "$_lefb_file" "$_lefb_branch" 2>/dev/null
+    return 0
+  fi
+  # No JSON tool: cannot safely parse JSONL -- no output (conservative: a
+  # caller treats "no entries" the same as "ledger unreadable," which is the
+  # correct fail-open direction for recurrence marking, and the safe
+  # fail-CLOSED direction for "is there an anchored verdict at HEAD" checks
+  # that require a positive match to proceed).
+  return 0
+}
+
+# ----------------------------------------------------------- ledger_latest_for_branch --
+#
+# ledger_latest_for_branch LEDGER_FILE BRANCH
+#
+# stdout: the single most recent (last-appended) JSONL entry for BRANCH, or
+# nothing if none exists / LEDGER_FILE is absent / no JSON tool available.
+# Thin convenience wrapper over ledger_entries_for_branch — same fail-open-
+# on-missing-tool, fail-safe-on-no-match posture.
+ledger_latest_for_branch() {
+  _llfb_file="$1"
+  _llfb_branch="$2"
+  ledger_entries_for_branch "$_llfb_file" "$_llfb_branch" | tail -n 1
+}
