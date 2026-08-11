@@ -129,6 +129,31 @@ class TestDedupFindingsPy(unittest.TestCase):
         result, _ = dedup_findings_py(findings, strategy="location")
         self.assertEqual(len(result), 2)
 
+    def test_issue_class_and_class_fix_survive_dedup_untouched(self):
+        """lr-3eb18c: dedup_findings_py (like the sh/jq merge path) is pure
+        object pass-through keyed on file/line/category/message -- it must
+        never inspect, require, or drop issue_class/class_fix. Two distinct
+        findings, each carrying the new fields, must both survive dedup with
+        those fields byte-identical -- proving the per-chunk merge path
+        carries the mandatory field through without any code change of its
+        own (the fields flow because this function never allowlists,
+        unlike _sanitize_review_findings_envelope upstream of it)."""
+        findings = [
+            {"severity": "high", "file": "a.py", "line": 1, "category": "sec",
+             "message": "xss", "issue_class": "unbounded external call",
+             "class_fix": "route through run_bounded"},
+            {"severity": "low", "file": "b.py", "line": 2, "category": "style",
+             "message": "long line", "issue_class": "none — isolated",
+             "class_fix": "n/a — isolated"},
+        ]
+        result, _ = dedup_findings_py(findings, strategy="location")
+        self.assertEqual(len(result), 2)
+        by_file = {f["file"]: f for f in result}
+        self.assertEqual(by_file["a.py"]["issue_class"], "unbounded external call")
+        self.assertEqual(by_file["a.py"]["class_fix"], "route through run_bounded")
+        self.assertEqual(by_file["b.py"]["issue_class"], "none — isolated")
+        self.assertEqual(by_file["b.py"]["class_fix"], "n/a — isolated")
+
     def test_conservative_retain_on_none_key(self):
         """Finding that raises key computation should be retained (never dropped)."""
         # Simulate a finding with None-producing key: we pass a bad dict that

@@ -459,7 +459,9 @@ Return STRICT JSON matching this schema, no prose before or after:
       "category": "security|correctness|performance|maintainability|style|docs",
       "message": "what is wrong, in one sentence",
       "evidence": "the specific code or pattern that triggered this",
-      "suggestion": "concrete fix"
+      "suggestion": "concrete fix",
+      "issue_class": "the class this finding is an instance of, in a few words (e.g. \"unbounded external call\", \"missing input validation on trust boundary\"), or the literal string \"none — isolated\" if this finding does not belong to any recognizable recurring class",
+      "class_fix": "a higher-level, structural change that would eliminate the whole class at once — not a fix for this one instance — or \"n/a — isolated\" when issue_class is \"none — isolated\""
     }
   ]
 }
@@ -478,7 +480,11 @@ of accidental preamble is the single most common cause of a discarded
 review.
 
 Pre-Report Gate — answer all five before writing a finding. Any "no" or
-"unsure" answer means: downgrade severity or drop it.
+"unsure" answer means: downgrade severity or drop it. This gate is about
+the finding itself — the cited line, the failure mode, the evidence. It
+does not apply to issue_class/class_fix below: those are attributes OF an
+already-cited, already-passing finding, never a substitute for one and
+never grounds for reporting an uncited finding of their own.
 1. Can you cite the exact line? Name the file and line. Vague findings
    ("somewhere in the auth layer") are not actionable and must be dropped.
 2. Can you describe the concrete failure mode? Name the input, state, and
@@ -502,6 +508,21 @@ HIGH/CRITICAL findings require: the exact snippet and line number, the
 specific failure scenario (input, state, outcome), and why existing guards
 (types, validation, framework defaults) do not catch it. Missing any of
 these — demote to medium or drop the finding.
+
+issue_class / class_fix — required on every finding that survives the gate
+above (mandatory, never blocking): once you have a properly-cited finding,
+step back and name the CLASS of issue it belongs to in a few words (e.g.
+"unbounded external call", "missing input validation on trust boundary",
+"secret read outside the config loader"), and, only if a class is named,
+the higher-level structural change that would eliminate every instance of
+that class at once — not a fix for this one line. If the finding is
+genuinely a one-off with no recognizable recurring shape, say so plainly:
+issue_class is the literal string "none — isolated" and class_fix is
+"n/a — isolated". Do not invent a class to fill the field — a manufactured
+class is exactly the manufactured-finding failure mode above, one level
+up, and "none — isolated" is the correct, complete answer for a genuinely
+isolated finding. issue_class/class_fix never change a finding's severity
+and are never themselves grounds to add, drop, or escalate a finding.
 
 Zero findings is a valid review. Do not manufacture findings to justify the
 invocation. If the diff is small, well-typed, tested, and follows the
@@ -1722,7 +1743,20 @@ def _role_shaped(obj):
     in approve|refuse, or the same single-key-wrapper tolerance. Any other
     role: any JSON value at all is acceptable shape (this function only
     exists to pick among candidates; validate_output remains the authority
-    for roles with no closed schema)."""
+    for roles with no closed schema).
+
+    DELIBERATELY NOT extended to require issue_class/class_fix (lr-3eb18c):
+    this predicate decides CANDIDACY among possibly-multiple fenced blocks,
+    not final acceptance -- narrowing it further would make a genuine
+    reviewer response that is merely missing the two new required fields
+    silently lose the zero/one/many candidate count this function's whole
+    job is to get right (INV-2), rather than being unwrapped successfully
+    and then explicitly rejected by validate_output's own, later, named
+    presence check -- a less diagnosable failure one layer earlier than
+    where the task places presence enforcement. Keep this predicate scoped
+    to "is this role-shaped JSON at all" and let validate_output own
+    "does this role-shaped JSON satisfy every required field."
+    """
     if role in ("reviewer", "auditor"):
         if isinstance(obj, dict) and isinstance(obj.get("findings"), list):
             return True
@@ -1833,6 +1867,31 @@ validate_output() {
               jq -e '(to_entries | length == 1) and (to_entries[0].value.findings | type == "array")' "$F" >/dev/null 2>&1 || return 1
               jq -e 'to_entries[0].value.findings // [] | all(.severity == null or (.severity | ascii_downcase | IN("low","medium","high","critical")))' "$F" >/dev/null 2>&1 || return 1
             fi
+            # ISSUE_CLASS / CLASS_FIX PRESENCE (lr-3eb18c): scoped to
+            # "reviewer" only -- ds_review_prompt (this file) is the only
+            # prompt that defines these fields; ds_adversarial_prompt (the
+            # Auditor's prompt) never has, and the Auditor's chain step is
+            # markdown mode, never json (see cmd_adversarial below), so this
+            # branch is unreachable for role=="auditor" today regardless --
+            # scoping explicitly rather than relying on that being true
+            # forever. MANDATORY BUT NON-BLOCKING (task constraint): this
+            # makes an OMITTING review malformed (validate_output fails ->
+            # walk_chain treats the step as a failure and advances the
+            # chain, same as any other schema violation) -- it does not
+            # touch severity_blockers, which never reads either field (see
+            # that function's own comment, scripts/gates.sh). Both fields
+            # must be present and non-empty strings on every finding; no
+            # enum check here beyond that -- "none — isolated"/"n/a —
+            # isolated" are valid strings like any other class name, and
+            # policing the exact enum text is the prompt's job, not a
+            # parser's.
+            if [ "$ROLE" = "reviewer" ]; then
+              if jq -e '.findings | type == "array"' "$F" >/dev/null 2>&1; then
+                jq -e '.findings // [] | all((.issue_class | type == "string") and (.issue_class | length > 0) and (.class_fix | type == "string") and (.class_fix | length > 0))' "$F" >/dev/null 2>&1 || return 1
+              else
+                jq -e 'to_entries[0].value.findings // [] | all((.issue_class | type == "string") and (.issue_class | length > 0) and (.class_fix | type == "string") and (.class_fix | length > 0))' "$F" >/dev/null 2>&1 || return 1
+              fi
+            fi
             ;;
           gate)
             # Decision must be approve|refuse, case-insensitive; tolerate one wrapper level.
@@ -1877,6 +1936,21 @@ def findings_valid(lst):
             return False
     return True
 
+def findings_have_issue_class(lst):
+    # ISSUE_CLASS / CLASS_FIX PRESENCE (lr-3eb18c): mirrors the jq branch's
+    # own comment above -- scoped to role=="reviewer" only (ds_review_prompt
+    # is the only prompt defining these fields; the Auditor's chain step is
+    # always markdown mode, never json, so this is unreachable for
+    # role=="auditor" today, but the scoping is explicit rather than
+    # incidental). Mandatory presence, no enum policing here -- that is the
+    # prompt's job.
+    for item in lst:
+        if not isinstance(item.get("issue_class"), str) or not item.get("issue_class"):
+            return False
+        if not isinstance(item.get("class_fix"), str) or not item.get("class_fix"):
+            return False
+    return True
+
 try:
     d = json.load(open(sys.argv[1]))
 except Exception:
@@ -1887,6 +1961,8 @@ if role in ("reviewer", "auditor"):
     if isinstance(d.get("findings"), list):
         if not findings_valid(d["findings"]):
             sys.exit(1)
+        if role == "reviewer" and not findings_have_issue_class(d["findings"]):
+            sys.exit(1)
     else:
         # Widened: single-key wrapper containing .findings.
         keys = list(d.keys()) if isinstance(d, dict) else []
@@ -1896,6 +1972,8 @@ if role in ("reviewer", "auditor"):
         if not isinstance(inner, dict) or not isinstance(inner.get("findings"), list):
             sys.exit(1)
         if not findings_valid(inner["findings"]):
+            sys.exit(1)
+        if role == "reviewer" and not findings_have_issue_class(inner["findings"]):
             sys.exit(1)
 elif role == "gate":
     # Primary: bare top-level .decision.

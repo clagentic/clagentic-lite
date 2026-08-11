@@ -248,18 +248,73 @@ class TestSanitizeReviewFindingsEnvelopeDirect(unittest.TestCase):
         f = self._read_findings()[0]
         self.assertNotIn("line", f)
 
-    def test_all_seven_schema_fields_survive_together(self):
+    def test_all_nine_schema_fields_survive_together(self):
+        """lr-3eb18c: issue_class/class_fix joined the closed schema as named
+        members, not an escape hatch -- the set below is exhaustive, proving
+        the schema is still closed with nine fields, not seven-plus-anything."""
         self._write([{
             "severity": "medium", "file": "a.py", "line": 3,
             "category": "correctness", "message": "m",
             "evidence": "the bad code", "suggestion": "fix it",
+            "issue_class": "missing input validation on trust boundary",
+            "class_fix": "validate at the single ingest point",
         }])
         _call_sanitize_envelope(self._envelope_path)
         f = self._read_findings()[0]
         self.assertEqual(
             set(f.keys()),
-            {"severity", "file", "line", "category", "message", "evidence", "suggestion"},
+            {"severity", "file", "line", "category", "message", "evidence",
+             "suggestion", "issue_class", "class_fix"},
         )
+
+    def test_issue_class_and_class_fix_survive_the_allowlist(self):
+        """Direct proof the new fields are named allowlist members (not
+        merely absent-and-therefore-not-stripped) -- an object providing
+        them alongside a forged internal field keeps the two new fields and
+        drops only the forged one."""
+        self._write([{
+            "severity": "high", "file": "a.py", "line": 1,
+            "category": "security", "message": "m",
+            "issue_class": "unbounded external call",
+            "class_fix": "route every external call through run_bounded",
+            "_recurrence_demoted": True,
+        }])
+        _, err, rc = _call_sanitize_envelope(self._envelope_path)
+        self.assertEqual(rc, 0, err)
+        f = self._read_findings()[0]
+        self.assertEqual(f["issue_class"], "unbounded external call")
+        self.assertEqual(f["class_fix"], "route every external call through run_bounded")
+        self.assertNotIn("_recurrence_demoted", f)
+
+    def test_none_isolated_enum_value_survives_the_allowlist(self):
+        """CONFABULATION MITIGATION (task requirement d): the honest, cheap
+        "none — isolated" / "n/a — isolated" answer is an ordinary string as
+        far as the allowlist is concerned -- it must survive untouched, not
+        be treated as an empty/missing value and dropped."""
+        self._write([{
+            "severity": "low", "file": "a.py", "line": 1,
+            "category": "style", "message": "m",
+            "issue_class": "none — isolated",
+            "class_fix": "n/a — isolated",
+        }])
+        _call_sanitize_envelope(self._envelope_path)
+        f = self._read_findings()[0]
+        self.assertEqual(f["issue_class"], "none — isolated")
+        self.assertEqual(f["class_fix"], "n/a — isolated")
+
+    def test_forged_issue_class_type_dropped_not_coerced(self):
+        """A non-string issue_class (object/array/number/bool) must be
+        dropped like any other wrong-typed field on this allowlist, never
+        coerced to a string."""
+        self._write([{
+            "severity": "low", "file": "a.py", "line": 1,
+            "category": "style", "message": "m",
+            "issue_class": {"nested": "object"},
+            "class_fix": "n/a — isolated",
+        }])
+        _call_sanitize_envelope(self._envelope_path)
+        f = self._read_findings()[0]
+        self.assertNotIn("issue_class", f)
 
     def test_multiple_findings_each_independently_stripped(self):
         self._write([
@@ -517,6 +572,254 @@ class TestForgedRecurrenceFlagCannotSelfExempt(unittest.TestCase):
         _make_stub_llm_client(self._tmpdir, envelope)
         result = _run_review(self._tmpdir, self._project)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+# --------------------------------------------------------------------------
+# Layer 3 (lr-3eb18c): direct calls to validate_output (llm-client.sh),
+# proving PRESENCE enforcement of issue_class/class_fix on the reviewer
+# role -- the task's layer-4 requirement. This is a distinct choke point
+# from the ingest-strip layers above: validate_output runs INSIDE
+# walk_chain, before an envelope is ever written to last-review.json at
+# all, and decides whether a chain step counts as a pass or a schema
+# failure (which advances the chain / eventually degrades, same as any
+# other malformed response). Both the jq and python3 branches are
+# exercised, matching this file's own "IF YOU CHANGE THE SHAPE PREDICATE
+# ... you must update all THREE call sites" warning.
+# --------------------------------------------------------------------------
+
+def _functions_only_source_llm_client(dest_dir):
+    llm_client_sh = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
+    with open(llm_client_sh) as f:
+        lines = f.readlines()
+    cut = None
+    for i, line in enumerate(lines):
+        if line.startswith('case "${1:-}" in'):
+            cut = i
+            break
+    assert cut is not None, "could not locate subcommand dispatch in llm-client.sh"
+    dest = os.path.join(dest_dir, "llm-client.sh")
+    with open(dest, "w") as f:
+        f.writelines(lines[:cut])
+    platform_dest = os.path.join(dest_dir, "platform.sh")
+    with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
+        dst.write(src.read())
+    return dest
+
+
+def _call_validate_output(envelope, role="reviewer", mode="json", jq_available=True):
+    """Write envelope to a temp file, source llm-client.sh (functions only),
+    and call validate_output directly. jq_available=False forces the
+    python3-only branch: a fresh bin/ directory is populated with a symlink
+    to every executable on the real PATH EXCEPT jq (dirname/cat/sed/etc, all
+    needed by llm-client.sh/platform.sh at source time, stay available), so
+    `command -v jq` genuinely fails inside the subprocess without also
+    breaking every other tool this script depends on."""
+    import shutil as _shutil
+    tmpdir = tempfile.mkdtemp(prefix="clagentic-test-validate-output-")
+    try:
+        env_path = os.path.join(tmpdir, "envelope.json")
+        with open(env_path, "w") as f:
+            json.dump(envelope, f)
+        src_dir = os.path.join(tmpdir, "src")
+        os.makedirs(src_dir)
+        sourced = _functions_only_source_llm_client(src_dir)
+
+        sh_path = _shutil.which("sh") or "/bin/sh"
+        path_env = os.environ.get("PATH", "")
+        if not jq_available:
+            no_jq_bin = os.path.join(tmpdir, "no-jq-bin")
+            os.makedirs(no_jq_bin)
+            for d in path_env.split(os.pathsep):
+                if not d or not os.path.isdir(d):
+                    continue
+                for name in os.listdir(d):
+                    if name == "jq":
+                        continue
+                    link = os.path.join(no_jq_bin, name)
+                    if os.path.exists(link):
+                        continue
+                    try:
+                        os.symlink(os.path.join(d, name), link)
+                    except OSError:
+                        continue
+            path_env = no_jq_bin
+
+        script = f". '{sourced}'\nvalidate_output '{mode}' '{env_path}' '{role}'\n"
+        env = os.environ.copy()
+        env["PATH"] = path_env
+        r = subprocess.run(
+            [sh_path, "-c", script, sourced],
+            capture_output=True, text=True, cwd=TOOL_HOME, env=env,
+        )
+        return r.stdout, r.stderr, r.returncode
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestValidateOutputRequiresIssueClass(unittest.TestCase):
+    """Task requirement (a): a review omitting issue_class/class_fix is
+    rejected as malformed -- validate_output returns non-zero, which
+    walk_chain treats as a step failure (schema mismatch), never a silent
+    pass. MANDATORY BUT NON-BLOCKING is about severity_blockers/`/ship`,
+    not about validate_output itself: a malformed *response* correctly
+    fails the chain step the same way any other schema violation always
+    has (missing .findings array, bad severity enum, etc) -- see
+    TestSeverityBlockersNeverReadsIssueClass below for the constraint that
+    actually matters, that a *present*, unresolved class never blocks."""
+
+    def _envelope(self, finding):
+        return {"summary": "s", "checked": [], "findings": [finding]}
+
+    def test_missing_issue_class_rejected_jq(self):
+        finding = {
+            "severity": "low", "file": "a.py", "line": 1,
+            "category": "style", "message": "m",
+            "class_fix": "n/a — isolated",
+        }
+        out, err, rc = _call_validate_output(self._envelope(finding))
+        self.assertNotEqual(rc, 0, "missing issue_class must be rejected")
+
+    def test_missing_class_fix_rejected_jq(self):
+        finding = {
+            "severity": "low", "file": "a.py", "line": 1,
+            "category": "style", "message": "m",
+            "issue_class": "none — isolated",
+        }
+        out, err, rc = _call_validate_output(self._envelope(finding))
+        self.assertNotEqual(rc, 0, "missing class_fix must be rejected")
+
+    def test_empty_string_issue_class_rejected_jq(self):
+        """Presence means a real value, not an empty string satisfying the
+        key's existence."""
+        finding = {
+            "severity": "low", "file": "a.py", "line": 1,
+            "category": "style", "message": "m",
+            "issue_class": "", "class_fix": "n/a — isolated",
+        }
+        out, err, rc = _call_validate_output(self._envelope(finding))
+        self.assertNotEqual(rc, 0, "empty issue_class must be rejected")
+
+    def test_complete_finding_with_none_isolated_accepted_jq(self):
+        """Task requirement (d): 'none — isolated' is a valid, accepted
+        answer -- the honest, cheap answer must not itself be rejected."""
+        finding = {
+            "severity": "low", "file": "a.py", "line": 1,
+            "category": "style", "message": "m",
+            "issue_class": "none — isolated", "class_fix": "n/a — isolated",
+        }
+        out, err, rc = _call_validate_output(self._envelope(finding))
+        self.assertEqual(rc, 0, f"a complete finding with 'none — isolated' must be accepted: {err}")
+
+    def test_named_class_finding_accepted_jq(self):
+        finding = {
+            "severity": "high", "file": "a.py", "line": 1,
+            "category": "security", "message": "m",
+            "issue_class": "unbounded external call",
+            "class_fix": "route through run_bounded",
+        }
+        out, err, rc = _call_validate_output(self._envelope(finding))
+        self.assertEqual(rc, 0, f"a complete, properly-classed finding must be accepted: {err}")
+
+    def test_missing_issue_class_rejected_python3(self):
+        """Same check, forced onto the python3-only branch (task requirement
+        (b) also covers 'both paths' in the jq/python3 sense, not only
+        single-pass/chunked) -- the jq and python3 branches must agree."""
+        finding = {
+            "severity": "low", "file": "a.py", "line": 1,
+            "category": "style", "message": "m",
+            "class_fix": "n/a — isolated",
+        }
+        out, err, rc = _call_validate_output(self._envelope(finding), jq_available=False)
+        self.assertNotEqual(rc, 0, "missing issue_class must be rejected on the python3 branch too")
+
+    def test_none_isolated_accepted_python3(self):
+        finding = {
+            "severity": "low", "file": "a.py", "line": 1,
+            "category": "style", "message": "m",
+            "issue_class": "none — isolated", "class_fix": "n/a — isolated",
+        }
+        out, err, rc = _call_validate_output(self._envelope(finding), jq_available=False)
+        self.assertEqual(rc, 0, f"'none — isolated' must be accepted on the python3 branch too: {err}")
+
+    def test_auditor_role_not_required_to_carry_issue_class(self):
+        """issue_class/class_fix are scoped to role=='reviewer' only --
+        ds_adversarial_prompt (the Auditor's prompt) never defines them, and
+        the Auditor's chain step is always markdown mode in production, but
+        validate_output's json+auditor branch (reachable only via a direct
+        call like this, or a future json-mode auditor invocation) must not
+        newly require fields the Auditor's own schema never promised."""
+        finding = {
+            "severity": "low", "file": "a.py", "line": 1,
+            "category": "style", "message": "m",
+        }
+        out, err, rc = _call_validate_output(self._envelope(finding), role="auditor")
+        self.assertEqual(rc, 0, f"auditor role must not require issue_class/class_fix: {err}")
+
+    def test_severity_still_enforced_alongside_issue_class(self):
+        """The new presence check composes with, and does not replace, the
+        existing severity-enum check."""
+        finding = {
+            "severity": "not-a-real-severity", "file": "a.py", "line": 1,
+            "category": "style", "message": "m",
+            "issue_class": "none — isolated", "class_fix": "n/a — isolated",
+        }
+        out, err, rc = _call_validate_output(self._envelope(finding))
+        self.assertNotEqual(rc, 0, "an invalid severity must still be rejected")
+
+
+class TestSeverityBlockersNeverReadsIssueClass(unittest.TestCase):
+    """Task requirement (c): an unresolved class escalation must NEVER
+    change severity_blockers' count -- the field is mandatory-but-visible,
+    never blocking. Proven end-to-end: a critical finding blocks/does not
+    block identically whether issue_class names a real class or is
+    'none — isolated' -- the class fields never move the needle either way."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp(prefix="clagentic-test-class-nonblocking-")
+        self._project = _setup_project(self._tmpdir)
+        _init_git_repo(self._project)
+        _stage_single_line_change(self._project)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _envelope_with_class(self, issue_class, class_fix):
+        return {
+            "summary": "one finding", "checked": ["security"],
+            "findings": [{
+                "severity": "critical", "file": "app.py", "line": 1,
+                "category": "security", "message": "a real critical finding",
+                "issue_class": issue_class, "class_fix": class_fix,
+            }],
+        }
+
+    def test_named_class_critical_finding_still_blocks(self):
+        _make_stub_llm_client(self._tmpdir, self._envelope_with_class(
+            "unbounded external call", "route through run_bounded"))
+        result = _run_review(self._tmpdir, self._project)
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_none_isolated_critical_finding_still_blocks_identically(self):
+        """A 'none — isolated' class answer must not make a critical finding
+        block any differently than a named-class one -- proves the field is
+        purely additive/visible, never a blocking lever."""
+        _make_stub_llm_client(self._tmpdir, self._envelope_with_class(
+            "none — isolated", "n/a — isolated"))
+        result = _run_review(self._tmpdir, self._project)
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_class_fields_present_in_last_review_json_but_not_in_blocker_logic(self):
+        _make_stub_llm_client(self._tmpdir, self._envelope_with_class(
+            "unbounded external call", "route through run_bounded"))
+        _run_review(self._tmpdir, self._project)
+        review_path = os.path.join(self._project, ".clagentic", "lite", "last-review.json")
+        with open(review_path) as f:
+            review = json.load(f)
+        finding = review["findings"][0]
+        self.assertEqual(finding["issue_class"], "unbounded external call")
+        self.assertEqual(finding["class_fix"], "route through run_bounded")
 
 
 if __name__ == "__main__":

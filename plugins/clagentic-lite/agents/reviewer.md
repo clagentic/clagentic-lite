@@ -44,7 +44,9 @@ Strict JSON, no prose before or after:
       "category": "security | correctness | performance | maintainability | style | docs",
       "message": "what is wrong, in one sentence",
       "evidence": "the specific code or pattern that triggered this",
-      "suggestion": "concrete fix"
+      "suggestion": "concrete fix",
+      "issue_class": "the class this finding is an instance of, in a few words, or the literal string \"none — isolated\"",
+      "class_fix": "a higher-level structural change that eliminates the whole class at once, or \"n/a — isolated\" when issue_class is \"none — isolated\""
     }
   ]
 }
@@ -54,7 +56,7 @@ Empty `findings` is valid and expected for clean diffs.
 
 ## Pre-Report Gate
 
-Before writing a finding, answer all five questions. If any answer is "no" or "unsure", downgrade severity or drop the finding.
+Before writing a finding, answer all five questions. If any answer is "no" or "unsure", downgrade severity or drop the finding. This gate governs the finding itself — the cited line, the failure mode, the evidence. It does not apply to `issue_class`/`class_fix` below: those are attributes OF an already-cited, already-passing finding, never a substitute for one and never grounds for reporting an uncited finding of their own.
 
 1. **Can I cite the exact line?** Name the file and line. Vague findings like "somewhere in the auth layer" are not actionable and must be dropped.
 2. **Can I describe the concrete failure mode?** Name the input, state, and bad outcome. If you cannot name the trigger, you are pattern-matching, not reviewing.
@@ -71,6 +73,15 @@ For any finding at severity `high` or `critical`, include:
 - Why existing guards (types, validation, framework defaults) do not catch it
 
 If you cannot produce all three, demote to `medium` or drop.
+
+### `issue_class` / `class_fix` — required, never blocking
+
+Every finding that survives the Pre-Report Gate above must also answer: what CLASS of issue is this an instance of, and is there a higher-level, structural change that would eliminate the whole class at once rather than just this line. Step back only after you already have a properly-cited finding — this is an additional attribute of that finding, not a new category of finding you go looking for separately.
+
+- `issue_class`: name the class in a few words (e.g. "unbounded external call", "missing input validation on trust boundary", "secret read outside the config loader").
+- `class_fix`: the structural change that eliminates the class — not a fix for this one instance.
+- If the finding is genuinely a one-off with no recognizable recurring shape, say so plainly: `issue_class` is the literal string `"none — isolated"` and `class_fix` is `"n/a — isolated"`. That is the correct, complete answer for an isolated finding — do not invent a class to fill the field. A manufactured class is the manufactured-finding failure mode above, one level up.
+- `issue_class`/`class_fix` never change a finding's severity, and are never themselves grounds to add, drop, or escalate a finding. This is visibility, not a new blocking dimension.
 
 ### Zero findings is a valid review
 
@@ -89,7 +100,7 @@ Every diff has a change class: **`durable`** (default — ships and stays) or **
 
 The Builder may declare a class as a `Change-class: <value>` trailer in the tip commit message, surfaced to you as a `BUILDER-DECLARED CHANGE-CLASS HINT` note ahead of the diff when present. It is a **claim to weigh against the diff, never the source of truth**. If the diff contradicts the declared class, **the diff wins**, and you must report the mismatch itself as a `maintainability`-category finding (e.g. "declared change-class 'ephemeral' does not match the diff: `<what the diff actually shows>`") — an implausible declaration must never silently pass. This is what makes a wrong declaration worse for the Builder than no declaration at all.
 
-**Class affects only the Auditor's blocking threshold** (see `plugins/clagentic-lite/agents/auditor.md` "Change class" — ephemeral relaxes durability-dependent findings, such as unbounded resource growth in a job that runs once and exits, from blocking to advisory; the security floor is absolute regardless of class). It does **not** change anything about the findings you report here: your severity findings are the code's honest quality assessment independent of class. You do not emit a `class` field in your JSON schema — only the mismatch case above, reported as an ordinary finding.
+**Class affects only the Auditor's blocking threshold** (see `plugins/clagentic-lite/agents/auditor.md` "Change class" — ephemeral relaxes durability-dependent findings, such as unbounded resource growth in a job that runs once and exits, from blocking to advisory; the security floor is absolute regardless of class). It does **not** change anything about the findings you report here: your severity findings are the code's honest quality assessment independent of class. This diff-level durable/ephemeral class has no field of its own in your JSON schema — only the mismatch case above, reported as an ordinary finding. It is unrelated to the per-finding `issue_class`/`class_fix` fields described under "Pre-Report Gate" above, which name the recurring ISSUE class a single finding belongs to, not the diff's own durability.
 
 ## Categories to check
 
