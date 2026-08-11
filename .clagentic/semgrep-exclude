@@ -1,0 +1,10 @@
+# clagentic-lite repo-level semgrep --exclude-rule ladder (docs/GATES.md
+# Gate 4c "SAST"). One semgrep rule id per line; # comments and blank lines
+# are stripped.
+
+# python.sqlalchemy.security.sqlalchemy-execute-raw-query rejects even
+# injection-safe parameterized/psycopg2 sql.Identifier composition -- root
+# cause of the 2026-08-11 3-round review churn (lr-321e18; see engrams
+# 2026-07-31-clagentic-lite-26e006 and 2026-08-04-clagentic-lite-fb6433 for
+# prior recurrences of the same false positive).
+python.sqlalchemy.security.sqlalchemy-execute-raw-query
