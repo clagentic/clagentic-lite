@@ -220,11 +220,64 @@ def _init_git_repo_no_remote(project_root):
     assert r.stdout.strip() == "", "test setup must produce a repo with no remote"
 
 
+def _init_git_repo_with_local_file_remote(tmpdir, project_root):
+    """A repo with a LOCAL FILE-PATH 'origin' (a bare repo on the same
+    filesystem, no network involved at all) -- used only by tests that
+    exercise get_review_diff's pre-existing (not introduced by this task)
+    full-branch-diff-against-origin/<default> fallback, which requires
+    proving origin/<default> freshness via a real `git fetch`/`git
+    ls-remote`. This is still fully local/offline verification (no host, no
+    network, no running session) -- 'origin' here is a directory on disk,
+    exercised the same way test_sast_baseline_scope.py and
+    test_bleed_scope.py already do for their own baseline-freshness tests.
+    Distinct from _init_git_repo_no_remote, which proves the AC6 "no remote
+    at all" scenario for the ledger's OWN capabilities (recording,
+    delta-scoping off a prior verdict, merge-gate consumption) -- those
+    never need to reach this fallback at all once a first verdict exists."""
+    bare_remote = os.path.join(tmpdir, "origin.git")
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", bare_remote], check=True)
+    _git(["init", "-q", "-b", "main", project_root], cwd=None)
+    _git(["remote", "add", "origin", bare_remote], cwd=project_root)
+    with open(os.path.join(project_root, "app.py"), "w") as f:
+        f.write("def handle(x):\n    return x\n")
+    _git(["add", "app.py"], cwd=project_root)
+    _git(["commit", "-q", "-m", "seed"], cwd=project_root)
+    _git(["push", "-q", "origin", "main"], cwd=project_root)
+    _git(["checkout", "-q", "-b", "feat/example"], cwd=project_root)
+    return bare_remote
+
+
 def _commit_file(project_root, name, content, msg):
     path = os.path.join(project_root, name)
     with open(path, "w") as f:
         f.write(content)
     _git(["add", name], cwd=project_root)
+    _git(["commit", "-q", "-m", msg], cwd=project_root)
+    return _git(["rev-parse", "HEAD"], cwd=project_root).stdout.strip()
+
+
+def _stage_file(project_root, name, content):
+    """Stage (but do not commit) a file change. get_review_diff's HIGHEST
+    priority path is the staged diff (git diff --cached) -- it never
+    consults the ledger or the branch-diff-against-default fallback, so it
+    never needs a remote. This is how round 1 (no prior ledger entry yet)
+    is driven in this suite's fixtures: a repo with NO remote configured at
+    all (AC6) cannot prove origin/<default> freshness, so the ONLY diff
+    source that works with zero prior ledger state is a staged one --
+    matches test_review_recurrence_demotion.py's own _stage_identical_recreation
+    pattern for the identical reason."""
+    path = os.path.join(project_root, name)
+    with open(path, "w") as f:
+        f.write(content)
+    _git(["add", name], cwd=project_root)
+
+
+def _commit_staged(project_root, msg):
+    """Commit whatever is currently staged (advances HEAD without changing
+    the working tree contents) -- used after a round that reviewed a staged
+    diff, so the NEXT round's ledger-anchored delta path has a real,
+    committed head_sha to diff against (delta re-review's fast path,
+    prior_head resolved + ancestor-of-HEAD, never touches origin either)."""
     _git(["commit", "-q", "-m", msg], cwd=project_root)
     return _git(["rev-parse", "HEAD"], cwd=project_root).stdout.strip()
 
@@ -396,8 +449,14 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
     def test_anchored_pass_verdict_recorded_with_base_and_head_sha(self):
         """Given a completed review on branch B at HEAD X, the ledger
         contains a verdict entry keyed to (base_sha, X) with structured
-        findings."""
-        head_x = _commit_file(self._project, "feature.py", "print('hi')\n", "add feature")
+        findings. Round 1 uses a STAGED diff -- get_review_diff's highest
+        priority path, needed here because this repo has no remote (AC6)
+        and a committed-but-unstaged round-1 diff would otherwise fall
+        through to the branch-diff-against-default path, which requires
+        proving origin/<default> freshness and cannot on a remoteless repo
+        (a PRE-EXISTING gates.sh property, unrelated to this task)."""
+        _stage_file(self._project, "feature.py", "print('hi')\n")
+        head_x = _commit_staged(self._project, "add feature")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
         result = _run_review([], self._tmpdir, self._project)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -415,7 +474,7 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
         self.assertIn("ts", entry)
 
     def test_block_verdict_recorded_with_findings(self):
-        _commit_file(self._project, "feature.py", "print('hi')\n", "add feature")
+        _stage_file(self._project, "feature.py", "print('hi')\n")
         _make_stub_llm_client(self._tmpdir, [_envelope([_finding()])])
         result = _run_review([], self._tmpdir, self._project)
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -454,14 +513,22 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
     # ------------------------------------------------------------------ AC5
     def test_finding_marked_recurring_on_second_round(self):
         """Given a finding that appeared in a prior round on the same
-        branch, when it appears again, the ledger marks it recurring."""
-        # Disable cross-round dedup so the SAME finding is reported (and
-        # reaches the ledger) on both rounds -- this test is about the
-        # ledger's OWN recurrence marker, independent of dedup suppression.
+        branch, when it appears again, the ledger marks it recurring.
+        Round 1 seeds via a staged diff (see test_anchored_pass_verdict...
+        for why); round 2 commits a NEW file and relies on the delta
+        re-review default (prior anchored verdict -> diff <head1>..HEAD,
+        which never touches origin either) rather than --full-review, so
+        this test also exercises the default delta path end to end."""
         env_off = {"CLAGENTIC_CROSS_ROUND_DEDUP": "0"}
 
-        _commit_file(self._project, "feature.py", "print('hi')\nprint('bye')\n", "add feature")
-        _make_stub_llm_client(self._tmpdir, [_envelope([_finding(file="feature.py", line=1)])])
+        _stage_file(self._project, "feature.py", "print('hi')\nprint('bye')\n")
+        _commit_staged(self._project, "add feature")
+        # Re-stage the SAME content as a no-op modification so round 1 has
+        # a staged diff to review (get_review_diff's staged-diff priority
+        # path) -- the committed baseline above exists so round 2's delta
+        # diff has something to compare against.
+        _stage_file(self._project, "feature.py", "print('hi')\nprint('bye')\nx = 1\n")
+        _make_stub_llm_client(self._tmpdir, [_envelope([_finding(file="feature.py", line=3)])])
         r1 = _run_review([], self._tmpdir, self._project, env_off)
         self.assertEqual(r1.returncode, 1, r1.stderr)
 
@@ -470,10 +537,10 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
         self.assertFalse(entries[0]["findings"][0]["_ledger_recurring"],
                           "the very first report of a finding must not be marked recurring")
 
-        _commit_file(self._project, "feature2.py", "print('another')\n", "second commit")
-        _make_stub_llm_client(self._tmpdir, [_envelope([_finding(file="feature.py", line=1)])],
-                               )
-        r2 = _run_review(["--full-review"], self._tmpdir, self._project, env_off)
+        _commit_staged(self._project, "round 1 commit")
+        _stage_file(self._project, "feature2.py", "print('another')\n")
+        _make_stub_llm_client(self._tmpdir, [_envelope([_finding(file="feature.py", line=3)])])
+        r2 = _run_review([], self._tmpdir, self._project, env_off)
         self.assertEqual(r2.returncode, 1, r2.stderr)
 
         entries = _read_ledger_entries(self._project, "feat/example")
@@ -489,13 +556,15 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
         finding from blocking -- that policy (lr-66e598) is explicitly not
         resurrected by this task. A recurring finding still blocks."""
         env_off = {"CLAGENTIC_CROSS_ROUND_DEDUP": "0"}
-        _commit_file(self._project, "feature.py", "print('hi')\n", "add feature")
+        _stage_file(self._project, "feature.py", "print('hi')\n")
         _make_stub_llm_client(self._tmpdir, [_envelope([_finding(file="feature.py", line=1)])])
-        _run_review([], self._tmpdir, self._project, env_off)
+        r1 = _run_review([], self._tmpdir, self._project, env_off)
+        self.assertEqual(r1.returncode, 1, r1.stderr)
+        _commit_staged(self._project, "round 1 commit")
 
-        _commit_file(self._project, "feature2.py", "print('another')\n", "second commit")
+        _stage_file(self._project, "feature2.py", "print('another')\n")
         _make_stub_llm_client(self._tmpdir, [_envelope([_finding(file="feature.py", line=1)])])
-        r2 = _run_review(["--full-review"], self._tmpdir, self._project, env_off)
+        r2 = _run_review([], self._tmpdir, self._project, env_off)
         self.assertEqual(r2.returncode, 1,
                           "a recurring finding recorded by the ledger must still block -- "
                           "the ledger's _ledger_recurring marker carries no severity-demotion "
@@ -506,11 +575,16 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
         """When a branch has a prior verdicted head_sha, review evaluates
         only that SHA..HEAD by default -- proven by asserting the SECOND
         round's diff sent to the reviewer contains only the second commit's
-        change, not the first commit's."""
-        _commit_file(self._project, "first.py", "first content\n", "first commit")
+        change, not the first commit's. Round 1 seeds via a staged diff (no
+        remote needed); round 2 commits a new file and relies purely on the
+        delta path (also no remote needed -- prior_head resolves as an
+        ancestor of HEAD, so get_review_diff never reaches the
+        branch-diff-against-default fallback at all)."""
+        _stage_file(self._project, "first.py", "first content\n")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE, _CLEAN_ENVELOPE], capture_diffs=True)
         r1 = _run_review([], self._tmpdir, self._project)
         self.assertEqual(r1.returncode, 0, r1.stderr)
+        _commit_staged(self._project, "first commit")
 
         _commit_file(self._project, "second.py", "second content\n", "second commit")
         r2 = _run_review([], self._tmpdir, self._project)
@@ -527,11 +601,20 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
                           "ONLY the new commit, not re-include round 1's already-verdicted change")
 
     def test_full_review_flag_forces_full_range_regardless_of_ledger(self):
-        _commit_file(self._project, "first.py", "first content\n", "first commit")
+        """--full-review forces the full-branch-diff-against-default path
+        (pre-existing gates.sh mechanism, requires a resolvable origin/<default>
+        to prove freshness) -- uses the local-file-remote fixture, still
+        fully offline/local, no network host involved."""
+        _init_git_repo_with_local_file_remote(self._tmpdir, self._project)
+        _stage_file(self._project, "first.py", "first content\n")
+        _commit_staged(self._project, "first commit")
+        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=self._project)
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE, _CLEAN_ENVELOPE], capture_diffs=True)
-        _run_review([], self._tmpdir, self._project)
+        r1 = _run_review([], self._tmpdir, self._project)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
 
-        _commit_file(self._project, "second.py", "second content\n", "second commit")
+        _stage_file(self._project, "second.py", "second content\n")
+        _commit_staged(self._project, "second commit")
         r2 = _run_review(["--full-review"], self._tmpdir, self._project)
         self.assertEqual(r2.returncode, 0, r2.stderr)
 
@@ -544,7 +627,10 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
                        "not just the delta since the prior verdict")
 
     def test_no_prior_verdict_first_round_is_full_range_and_says_so(self):
-        _commit_file(self._project, "first.py", "first content\n", "first commit")
+        _init_git_repo_with_local_file_remote(self._tmpdir, self._project)
+        _stage_file(self._project, "first.py", "first content\n")
+        _commit_staged(self._project, "first commit")
+        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=self._project)
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
         r1 = _run_review([], self._tmpdir, self._project)
         self.assertEqual(r1.returncode, 0, r1.stderr)
@@ -554,8 +640,15 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
     def test_rebase_invalidates_prior_sha_falls_back_to_full_range_and_says_so(self):
         """Given a rebase that invalidates the prior verdicted SHA, when
         review runs, it falls back to full-range review and says so in
-        output."""
-        _commit_file(self._project, "first.py", "first content\n", "first commit")
+        output. The fallback itself needs a resolvable origin/<default>
+        (pre-existing full-range path), so this uses the local-file-remote
+        fixture; the DETECTION of the invalidated SHA is proven purely from
+        local git state (rev-parse + merge-base --is-ancestor), independent
+        of the remote."""
+        _init_git_repo_with_local_file_remote(self._tmpdir, self._project)
+        _stage_file(self._project, "first.py", "first content\n")
+        _commit_staged(self._project, "first commit")
+        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=self._project)
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE, _CLEAN_ENVELOPE], capture_diffs=True)
         r1 = _run_review([], self._tmpdir, self._project)
         self.assertEqual(r1.returncode, 0, r1.stderr)
@@ -563,7 +656,8 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
         # Simulate a rebase/amend: rewrite the tip commit so the prior
         # verdicted SHA is no longer reachable as an ancestor of HEAD.
         _git(["commit", "--amend", "-q", "-m", "first commit (amended)"], cwd=self._project)
-        _commit_file(self._project, "second.py", "second content\n", "second commit")
+        _stage_file(self._project, "second.py", "second content\n")
+        _commit_staged(self._project, "second commit")
 
         r2 = _run_review([], self._tmpdir, self._project)
         self.assertEqual(r2.returncode, 0, r2.stderr)
@@ -583,7 +677,7 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
     def test_since_last_review_flag_still_accepted_as_noop(self):
         """Backward compatibility: --since-last-review is still accepted
         (it names the same behavior that is now the default)."""
-        _commit_file(self._project, "first.py", "first content\n", "first commit")
+        _stage_file(self._project, "first.py", "first content\n")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
         result = _run_review(["--since-last-review"], self._tmpdir, self._project)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -610,11 +704,17 @@ class TestMergeGateLedgerConsumption(unittest.TestCase):
     def test_passing_verdict_at_head_lets_merge_gate_proceed(self):
         """Given a passing verdict at X and HEAD still X, merge-gate must
         NOT refuse on staleness grounds (it may still call the LLM, which
-        the stub approves)."""
-        _commit_file(self._project, "feature.py", "print('hi')\n", "add feature")
+        the stub approves). Commits first, then stages a trivial additional
+        edit so get_review_diff's staged-diff path (no remote needed) has
+        something to review, with HEAD already reflecting the reviewed
+        state's true tip once that staged edit is folded in below."""
+        _stage_file(self._project, "feature.py", "print('hi')\n")
+        _commit_staged(self._project, "add feature")
+        _stage_file(self._project, "feature.py", "print('hi')\nprint('again')\n")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
         r1 = _run_review([], self._tmpdir, self._project)
         self.assertEqual(r1.returncode, 0, r1.stderr)
+        _commit_staged(self._project, "add feature (finalize)")
 
         # Also need a last-adversarial.md stamp fresh at the same HEAD, or
         # build_gate_summary's existing adversarial-staleness check fires
@@ -634,10 +734,11 @@ class TestMergeGateLedgerConsumption(unittest.TestCase):
         """Given a passing verdict at X and a new commit Y on B, when
         ship/merge-gate runs, it refuses to treat X's verdict as current and
         requires review at Y -- deterministically, without an LLM call."""
-        _commit_file(self._project, "feature.py", "print('hi')\n", "add feature")
+        _stage_file(self._project, "feature.py", "print('hi')\n")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
         r1 = _run_review([], self._tmpdir, self._project)
         self.assertEqual(r1.returncode, 0, r1.stderr)
+        _commit_staged(self._project, "add feature")
 
         head_x = _git(["rev-parse", "HEAD"], cwd=self._project).stdout.strip()
         ad_path = os.path.join(self._project, ".clagentic", "lite", "last-adversarial.md")
@@ -671,11 +772,17 @@ class TestMergeGateLedgerConsumption(unittest.TestCase):
 
     def test_blocked_verdict_at_head_still_refuses(self):
         """A ledger verdict of 'block' at current HEAD must never be
-        misread as an anchored pass."""
-        _commit_file(self._project, "feature.py", "print('hi')\n", "add feature")
+        misread as an anchored pass. Commits first, then stages a trivial
+        additional edit (same pattern as test_passing_verdict_at_head_...)
+        so the ledger's recorded head_sha lines up exactly with HEAD after
+        the final commit below."""
+        _stage_file(self._project, "feature.py", "print('hi')\n")
+        _commit_staged(self._project, "add feature")
+        _stage_file(self._project, "feature.py", "print('hi')\nprint('again')\n")
         _make_stub_llm_client(self._tmpdir, [_envelope([_finding()])])
         r1 = _run_review([], self._tmpdir, self._project)
         self.assertEqual(r1.returncode, 1, r1.stderr)
+        _commit_staged(self._project, "add feature (finalize)")
 
         head = _git(["rev-parse", "HEAD"], cwd=self._project).stdout.strip()
         ad_path = os.path.join(self._project, ".clagentic", "lite", "last-adversarial.md")
