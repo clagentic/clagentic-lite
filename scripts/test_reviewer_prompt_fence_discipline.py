@@ -84,5 +84,46 @@ class TestMergeGatePromptDemandsExactlyOneFencedBlockOrNone(unittest.TestCase):
         self.assertIn("no other fenced block", out)
 
 
+class TestReviewerPromptRequiresIssueClass(unittest.TestCase):
+    """lr-3eb18c: every finding in the schema block must carry issue_class/
+    class_fix, the honest 'none — isolated' answer must be named explicitly
+    (confabulation mitigation -- the cheap answer must also be the
+    documented one, not something the model has to infer is acceptable),
+    and the anti-vagueness Pre-Report Gate rule (item 1: 'vague findings ...
+    must be dropped') must be explicitly scoped so it does not eat the new
+    class-level fields, per the task's own hard constraint."""
+
+    def test_schema_block_carries_issue_class_field(self):
+        out, err, rc = _run_prompt_func("ds_review_prompt")
+        self.assertEqual(rc, 0, f"stderr={err!r}")
+        self.assertIn("issue_class", out)
+
+    def test_schema_block_carries_class_fix_field(self):
+        out, err, rc = _run_prompt_func("ds_review_prompt")
+        self.assertIn("class_fix", out)
+
+    def test_none_isolated_named_as_the_honest_answer(self):
+        out, err, rc = _run_prompt_func("ds_review_prompt")
+        self.assertIn("none — isolated", out)
+
+    def test_vagueness_rule_scoped_away_from_class_fields(self):
+        """The per-finding citation requirement (item 1 of the Pre-Report
+        Gate) must stay intact, AND the prompt must say explicitly that it
+        does not apply to issue_class/class_fix -- otherwise 'vague findings
+        ... must be dropped' reads as license to drop the class answer for
+        being non-specific, exactly the failure mode the task names."""
+        out, err, rc = _run_prompt_func("ds_review_prompt")
+        self.assertIn(
+            "must be dropped", out,
+            "the original per-finding vagueness rule must survive verbatim",
+        )
+        self.assertIn(
+            "does not apply to issue_class", out,
+            "the vagueness rule must be explicitly scoped away from "
+            "issue_class/class_fix, or a model will read it as license to "
+            "drop the class answer for not being a cited line",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
