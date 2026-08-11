@@ -783,10 +783,10 @@ class TestMergeGateLedgerConsumption(unittest.TestCase):
         feature, via a review on a DIFFERENT branch) but no verdict of its
         own at all must still refuse -- 'missing verdict-at-HEAD means
         re-review, never proceed' applies per-branch, not merely per-repo.
-        Ledger totally absent for the WHOLE repo is instead a bootstrap
-        no-op (see build_gate_summary's own bootstrap-exemption comment) --
-        covered by the pre-existing single-file SHA-stamp staleness check
-        in that narrower case, which this test does not exercise."""
+        (There is no ledger-totally-absent bootstrap exemption at all as of
+        the lr-01ae73 PEACHES/coordinator fold-in on PR #162 -- see
+        test_hand_written_last_review_with_no_ledger_never_passes below for
+        that narrower, now-closed case.)"""
         # Branch off feat/example (setUp's default) into a SEPARATE branch,
         # review there (seeding a ledger entry keyed to THAT branch), then
         # switch back to feat/example, which never had its own review.
@@ -831,6 +831,45 @@ class TestMergeGateLedgerConsumption(unittest.TestCase):
         self.assertEqual(self._merge_gate_calls(), 0,
                           "a ledger entry recorded as verdict=block at HEAD must never "
                           "be read as an anchored pass by the merge gate")
+
+    def test_hand_written_last_review_with_no_ledger_never_passes(self):
+        """PEACHES/coordinator finding on PR #162 (comment 5260223912): a
+        repo with NO ledger file at all and a hand-written, correctly-
+        SHA-stamped last-review.json must NOT pass the merge gate. Before
+        this fix, a "no ledger file exists" bootstrap exemption let this
+        exact scenario through -- indistinguishable from a ledger deleted
+        specifically to bypass the anchored-verdict requirement, and
+        contradicting item 4 ("stale or missing verdict-at-HEAD means
+        re-review, never proceed") permanently for any repo/tooling path
+        that never calls cmd_review. This never invokes cmd_review at all
+        -- last-review.json is hand-written directly, exactly the shape
+        item 4 must close."""
+        _commit_file(self._project, "feature.py", "print('hi')\n", "add feature")
+        head = _git(["rev-parse", "HEAD"], cwd=self._project).stdout.strip()
+
+        clagentic_dir = os.path.join(self._project, ".clagentic", "lite")
+        os.makedirs(clagentic_dir, exist_ok=True)
+        review_path = os.path.join(clagentic_dir, "last-review.json")
+        with open(review_path, "w") as f:
+            json.dump({"summary": "clean", "checked": [], "findings": [],
+                       "_clagentic_diff_sha": head}, f)
+
+        ad_path = os.path.join(clagentic_dir, "last-adversarial.md")
+        with open(ad_path, "w") as f:
+            f.write(f"<!-- clagentic-diff-sha: {head} -->\n# Adversarial audit\nclean\n")
+
+        ledger_path = _ledger_path(self._project)
+        self.assertFalse(os.path.exists(ledger_path),
+                          "test setup must produce a repo with NO ledger file at all")
+
+        r = _run_merge_gate(self._tmpdir, self._project, decision="approve")
+        self.assertEqual(r.returncode, 1,
+                          f"a hand-written, freshly-stamped last-review.json with NO "
+                          f"ledger entry must still refuse -- there is no bootstrap "
+                          f"exemption\nstdout={r.stdout!r} stderr={r.stderr!r}")
+        self.assertEqual(self._merge_gate_calls(), 0,
+                          "the refusal must be deterministic -- no LLM call")
+        self.assertIn("stale", r.stdout.lower())
 
 
 if __name__ == "__main__":
