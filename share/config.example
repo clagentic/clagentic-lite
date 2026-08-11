@@ -152,8 +152,12 @@ CLAGENTIC_DISABLE_HANDOFF=0
 # CLAGENTIC_RECALL_MIN_KEYWORDS=2
 
 # Suppress the session-start update alert (set =1 if you manage updates manually
-# or the network fetch is unwanted — e.g. air-gapped environments).
-CLAGENTIC_SKIP_UPDATE_ALERT=0
+# or the network fetch is unwanted — e.g. air-gapped environments). Left unset
+# (commented out) by default, not =0 — an explicit "0" here was harmless
+# (the guard only checks for "1") but meant every fresh install carried this
+# var in its config from day one, which is why it went unscrutinized for so
+# long (lr-716012).
+# CLAGENTIC_SKIP_UPDATE_ALERT=0
 
 # Context-budget monitor (PostToolUse hook).
 # Estimates token cost of each tool result (4 bytes ≈ 1 token) and warns via
