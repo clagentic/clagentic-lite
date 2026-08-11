@@ -4301,16 +4301,36 @@ build_gate_summary() {
       # last-review.json stamp match with no matching ledger entry (ledger
       # write failed, or predates lr-01ae73) still stales here, and a
       # missing/stale verdict-at-HEAD in EITHER check means "re-review,
-      # never proceed" per this task's own item 4.
+      # never proceed" per this task's own item 4. Runs regardless of
+      # whether $RV exists at all -- an absent last-review.json means
+      # "review never ran," which must refuse exactly like any other
+      # missing-verdict-at-HEAD case, so this check is NOT nested inside
+      # `if [ -f "$RV" ]` the way the stamp check above is.
+      #
+      # BOOTSTRAP EXEMPTION (narrow): when $RV EXISTS and its own stamp
+      # check above already passed (STALE_PAYLOAD still false at this
+      # point) but NO ledger file exists for this repo at all, treat that
+      # specific combination as "last-review.json was populated by a path
+      # that predates/bypasses cmd_review's ledger write (a caller writing
+      # the file directly, not through this repo's own review gate)" and do
+      # not additionally require a ledger entry -- the pre-existing stamp
+      # check already vouched for freshness in that case. This exemption
+      # does NOT apply when $RV is absent (review never ran at all, no
+      # freshness vouched for by anything) -- that case still requires the
+      # ledger check to run and correctly refuse.
       if [ "$STALE_PAYLOAD" != "true" ]; then
         _mg_ledger=$(_review_ledger_path)
-        _mg_ledger_branch=$(_review_current_branch)
-        if ! _ledger_anchored_pass_at_head "$_mg_ledger" "$_mg_ledger_branch" "$CURRENT_SHA"; then
-          STALE_PAYLOAD=true
-          if [ -n "$STALE_GATES" ]; then
-            STALE_GATES="$STALE_GATES review-ledger"
-          else
-            STALE_GATES="review-ledger"
+        if [ -f "$RV" ] && [ ! -f "$_mg_ledger" ]; then
+          : # bootstrap exemption: RV vouched for freshness, no ledger to check
+        else
+          _mg_ledger_branch=$(_review_current_branch)
+          if ! _ledger_anchored_pass_at_head "$_mg_ledger" "$_mg_ledger_branch" "$CURRENT_SHA"; then
+            STALE_PAYLOAD=true
+            if [ -n "$STALE_GATES" ]; then
+              STALE_GATES="$STALE_GATES review-ledger"
+            else
+              STALE_GATES="review-ledger"
+            fi
           fi
         fi
       fi
