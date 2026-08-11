@@ -358,6 +358,46 @@ ds_llm_role_is_bash_unrestricted() {
   esac
 }
 
+# ds_sqlite3 [sqlite3-args...] — the SOLE entry point for every sqlite3
+# invocation against .clagentic/lite/audit.db (lr-c71845).
+#
+# WHY THIS EXISTS: concurrent gate runs (a pre-commit hook and a manual
+# `gates.sh ship` racing, or two hook shims firing back to back) can both
+# try to write to audit.db at the same moment. SQLite's default behavior on
+# a locked database is to return SQLITE_BUSY immediately rather than wait —
+# with no busy timeout set, the SECOND writer fails outright instead of
+# retrying, and every bare `sqlite3 "$AUDIT_DB" ...` call in this codebase
+# was exposed to that failure class with no mitigation. `.timeout N` (a
+# sqlite3 CLI dot-command, fed via `-cmd`) tells SQLite to retry a locked
+# write for up to N milliseconds before giving up, so the second writer
+# waits instead of failing.
+#
+# Same UNWRITABLE-BARE-FORM pattern run_bounded (gates.sh) already
+# established for every external-process timeout in this codebase (reuse
+# first, AGENTS.md code-craft rule 2 — not a second, parallel mechanism):
+# routing every audit.db call through this one named wrapper makes the
+# untimed bare form visibly different from every sibling call, so a future
+# contributor cannot add a tenth bare `sqlite3 "$AUDIT_DB" ...` invocation
+# without it standing out from the rest.
+#
+# Args: forwarded verbatim to sqlite3 (e.g. the DB path, then flags/SQL) —
+# this wrapper only prepends the busy-timeout `-cmd`, it does not otherwise
+# interpret its arguments.
+#
+# Timeout: CLAGENTIC_SQLITE_BUSY_TIMEOUT_MS (milliseconds, default 5000).
+# Non-numeric, empty, or zero falls back to the default via
+# ds_positive_int_or_default (same validation every other timeout/interval
+# var in this codebase uses — gates.sh's run_bounded/cmd_secrets/cmd_deps/
+# cmd_bleed/cmd_sast/get_review_diff/cmd_ship, llm-client.sh's
+# llm_timeout_for) — a bare `case ''|*[!0-9]*` guard would admit "0"
+# unchanged, and `.timeout 0` disables the busy wait entirely, reopening the
+# exact SQLITE_BUSY failure class this wrapper exists to close.
+ds_sqlite3() {
+  _ds3_timeout_ms="${CLAGENTIC_SQLITE_BUSY_TIMEOUT_MS:-5000}"
+  _ds3_timeout_ms=$(ds_positive_int_or_default "$_ds3_timeout_ms" 5000)
+  sqlite3 -cmd ".timeout $_ds3_timeout_ms" "$@"
+}
+
 # Write one row to .clagentic/lite/audit.db. Resolves repo root itself so callers
 # from any cwd (subdirectory hook invocations, etc.) hit the right DB.
 # Args: GATE OUTCOME DETAILS [SESSION_ID]
@@ -372,7 +412,7 @@ ds_audit_log() {
   O_ESC=$(ds_sql_escape "$OUTCOME")
   D_ESC=$(ds_sql_escape "$DETAILS")
   S_ESC=$(ds_sql_escape "$SID")
-  sqlite3 "$DB" \
+  ds_sqlite3 "$DB" \
     "INSERT INTO gate_runs (ts, gate, outcome, details, session_id) VALUES (datetime('now'), '$G_ESC', '$O_ESC', '$D_ESC', '$S_ESC');" 2>/dev/null || true
 }
 

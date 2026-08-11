@@ -159,7 +159,7 @@ AUDIT_DB="$REPO_ROOT/.clagentic/lite/audit.db"
 mkdir -p "$REPO_ROOT/.clagentic/lite"
 
 cmd_init() {
-  sqlite3 "$AUDIT_DB" <<'SQL'
+  ds_sqlite3 "$AUDIT_DB" <<'SQL'
 CREATE TABLE IF NOT EXISTS gate_runs (
   id         INTEGER PRIMARY KEY,
   ts         TEXT NOT NULL,
@@ -193,7 +193,7 @@ cmd_log_run() {
   OUT_ESC=$(ds_sql_escape "$OUTCOME")
   DETAILS_ESC=$(ds_sql_escape "$DETAILS")
   BRANCH_ESC=$(ds_sql_escape "$BRANCH")
-  sqlite3 "$AUDIT_DB" \
+  ds_sqlite3 "$AUDIT_DB" \
     "INSERT INTO gate_runs (ts, gate, outcome, details, branch) VALUES ('$TS', '$GATE_ESC', '$OUT_ESC', '$DETAILS_ESC', '$BRANCH_ESC');"
 }
 
@@ -2430,7 +2430,7 @@ cmd_review() {
     # in the terminal without having to run `digest` or open last-review.json.
     ADB="$REPO_ROOT/.clagentic/lite/audit.db"
     if [ -f "$ADB" ] && command -v sqlite3 >/dev/null 2>&1; then
-      STEP_HINTS=$(sqlite3 "$ADB" \
+      STEP_HINTS=$(ds_sqlite3 "$ADB" \
         "SELECT '  ' || details FROM gate_runs WHERE gate='llm-call' AND outcome='step-failed' AND details LIKE 'reviewer%' ORDER BY id DESC LIMIT 6;" \
         2>/dev/null)
       if [ -n "$STEP_HINTS" ]; then
@@ -3305,7 +3305,7 @@ cmd_merge_gate() {
   # silently bypassed by re-running gates merge-gate again.
   _mg_state_id=$(_mg_state_identity)
   if [ -n "$_mg_state_id" ]; then
-    _mg_cached=$(sqlite3 -separator '|' "$AUDIT_DB" \
+    _mg_cached=$(ds_sqlite3 -separator '|' "$AUDIT_DB" \
       "SELECT outcome, details FROM gate_runs
        WHERE gate IN ('merge-gate','merge-gate recheck')
        ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
@@ -4527,12 +4527,12 @@ cmd_pre_push() {
 cmd_digest() {
   cmd_init
   printf '\n== clagentic-lite gate digest (last 24h) ==\n\n'
-  sqlite3 -header -column "$AUDIT_DB" \
+  ds_sqlite3 -header -column "$AUDIT_DB" \
     "SELECT ts, gate, outcome, substr(details,1,60) AS details
      FROM gate_runs WHERE ts > datetime('now','-1 day') ORDER BY ts DESC;"
   printf '\n'
   printf 'totals:\n'
-  sqlite3 -column "$AUDIT_DB" \
+  ds_sqlite3 -column "$AUDIT_DB" \
     "SELECT outcome, COUNT(*) FROM gate_runs WHERE ts > datetime('now','-1 day') GROUP BY outcome;"
   printf '\n'
 }
@@ -4593,7 +4593,7 @@ cmd_status() {
   # notice "review never ran" rather than silently missing).
   for GATE in bleed secrets deps sast review adversarial merge-gate ship; do
     printf '%s\n' "-- $GATE --"
-    ROWS=$(sqlite3 -separator '|' "$AUDIT_DB" \
+    ROWS=$(ds_sqlite3 -separator '|' "$AUDIT_DB" \
       "SELECT ts, outcome, substr(coalesce(details,''),1,60)
        FROM gate_runs WHERE gate='$GATE' ORDER BY ts DESC LIMIT $N;" 2>/dev/null)
     if [ -z "$ROWS" ]; then
@@ -4631,7 +4631,7 @@ cmd_tail() {
     LAST_ID="$CLAGENTIC_TAIL_WATERMARK"
     case "$LAST_ID" in ''|*[!0-9]*) LAST_ID=0 ;; esac
   else
-    LAST_ID=$(sqlite3 "$AUDIT_DB" "SELECT COALESCE(MAX(id),0) FROM gate_runs;" 2>/dev/null)
+    LAST_ID=$(ds_sqlite3 "$AUDIT_DB" "SELECT COALESCE(MAX(id),0) FROM gate_runs;" 2>/dev/null)
     LAST_ID=${LAST_ID:-0}
   fi
 
@@ -4641,7 +4641,7 @@ cmd_tail() {
     # occurs inside a Claude Code session.
     printf '== clagentic-lite gate tail (--no-follow, one-shot) ==\n'
     printf '   rows with gate_runs.id > %s\n\n' "$LAST_ID"
-    NEW=$(sqlite3 -separator '|' "$AUDIT_DB" \
+    NEW=$(ds_sqlite3 -separator '|' "$AUDIT_DB" \
       "SELECT id, ts, gate, outcome, substr(coalesce(details,''),1,80)
        FROM gate_runs WHERE id > $LAST_ID ORDER BY id ASC;" 2>/dev/null)
     if [ -n "$NEW" ]; then
@@ -4670,7 +4670,7 @@ cmd_tail() {
   trap 'printf "\n[tail] stopped\n"; exit 0' INT TERM
 
   while :; do
-    NEW=$(sqlite3 -separator '|' "$AUDIT_DB" \
+    NEW=$(ds_sqlite3 -separator '|' "$AUDIT_DB" \
       "SELECT id, ts, gate, outcome, substr(coalesce(details,''),1,80)
        FROM gate_runs WHERE id > $LAST_ID ORDER BY id ASC;" 2>/dev/null)
     if [ -n "$NEW" ]; then

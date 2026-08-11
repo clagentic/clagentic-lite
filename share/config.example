@@ -233,6 +233,13 @@ CLAGENTIC_ALLOW_MISSING_SEMGREP=0
 # eventually succeed.
 CLAGENTIC_SAST_FETCH_TIMEOUT_SEC=30
 
+# SQLite busy-retry timeout (milliseconds) for every sqlite3 call against
+# .clagentic/lite/audit.db (ds_sqlite3, scripts/platform.sh, lr-c71845).
+# When two gate runs write to audit.db at the same moment, the second writer
+# retries for up to this many milliseconds instead of failing immediately
+# with SQLITE_BUSY. Non-numeric, empty, or zero falls back to the default.
+CLAGENTIC_SQLITE_BUSY_TIMEOUT_MS=5000
+
 # Strict preflight: make `clagentic-lite init` exit non-zero if any required
 # tool is missing. Off by default so scripted init runs don't fail spuriously.
 CLAGENTIC_STRICT_PREFLIGHT=0
