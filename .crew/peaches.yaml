@@ -25,6 +25,49 @@ reviewer:
   reviewer_bot_login: clagentic-reviewer[bot]
   rules:
     # ------------------------------------------------------------------
+    # SUPPRESSION POLICY (lr-cfc360) — see docs/GATES.md § "Suppression
+    # policy" under Gate 4c for the full sanctioned-form/criteria writeup.
+    # ------------------------------------------------------------------
+    - id: clagentic-lite.bare-or-unjustified-nosemgrep
+      severity: blocking
+      description: >-
+        A `# nosemgrep` suppression with no specific rule id (`# nosemgrep:
+        <rule-id>`), or with a rule id but no adjacent justification comment
+        explaining why the flagged pattern cannot trigger the vulnerability
+        at this site, is a finding. A bare `# nosemgrep` suppresses every
+        registry rule on that line, not just the one the author had in mind
+        — see docs/GATES.md § "Suppression policy" for why this is worse
+        than a single-rule false negative. "False positive" alone is not a
+        justification; the comment must state why, concretely.
+      applies_to:
+        - "**/*.py"
+        - "**/*.sh"
+        - "**/*.go"
+        - "**/*.js"
+        - "**/*.ts"
+
+    - id: clagentic-lite.point-fix-to-class-shaped-finding
+      severity: blocking
+      description: >-
+        A diff that patches only the flagged instance of an evident
+        pattern — the same defect shape is visibly possible at other call
+        sites in the same diff or the surrounding file, and those sibling
+        sites are left untouched — without a shared primitive/sweep/guard
+        (AGENTS.md rule 10, "Class-over-instance: fix the pattern, not the
+        line") or a written deferral recorded in the task/roadmap
+        explaining why the class-level fix is out of scope, is itself a
+        finding. Mirrors AGENTS.md rule 10's required-fix order (shared
+        primitive, sweep of existing sites, guard where feasible) and its
+        sole sanctioned alternative (an explicit written deferral) —
+        PEACHES checks for evidence one of those four was done, not that
+        the point-fix itself is technically correct. See lr-3b06b1 (open,
+        tracked separately) for whether `issue_class`/`class_fix` fields
+        produce real class-level reasoning to lean on here; do not assume
+        that validation is complete when applying this rule.
+      applies_to:
+        - "**/*"
+
+    # ------------------------------------------------------------------
     # EXAMPLE: blocking rule — a pattern that must never appear
     # ------------------------------------------------------------------
     # - id: <project>.no-hardcoded-env-names
@@ -47,10 +90,3 @@ reviewer:
     #     Nit because PEACHES cannot always tell intent from the diff alone.
     #   applies_to:
     #     - "src/api/public/**"
-
-    # ------------------------------------------------------------------
-    # MINIMAL STARTER: no project rules — PEACHES applies only the defaults
-    # ------------------------------------------------------------------
-    # Leave rules: [] (empty array) or remove the key entirely to get
-    # baseline-only behavior. Add rules above the closing bracket as needed.
-    []

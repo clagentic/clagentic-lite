@@ -676,6 +676,36 @@ The fix treats a resolved `origin/<default-branch>` ref as trustworthy only when
 
 Rationale: deterministic tools, well-understood, no LLM in the security path. The LLM-driven `adversarial` layer (Gate 5) is separate and non-blocking by design.
 
+### Suppression policy — inline `# nosemgrep` vs the repo-level exclude ladder (lr-cfc360)
+
+Two mechanisms exist for a registry SAST rule that no correct code can satisfy. Both are legitimate; neither is a default reach-for-first. **A suppression is a claim that a specific finding is a false positive or genuinely unsatisfiable, not a shortcut around review** — see "The suppression-review loop" below for what happens when that claim doesn't hold.
+
+**Sanctioned inline form: `# nosemgrep: <specific-rule-id>` with a same-line-or-adjacent justification comment.**
+
+```python
+query = build_query(table, columns)  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query — table/columns are drawn from an internal enum, never user input; see <file/line> for the enum definition
+```
+
+The rule id is mandatory and must name the exact finding being suppressed. A bare `# nosemgrep` with no rule id is **banned** — semgrep itself treats a bare directive as "suppress every rule on this line," which is strictly worse than a false negative on one known rule: it silently blinds every *future* rule the registry adds to that line too, with no record of which rule the suppression was ever meant to cover. The justification must state *why* the flagged pattern cannot trigger the vulnerability the rule targets at this specific site — "false positive" alone is not a justification; a reviewer must be able to check the claim without spelunking.
+
+**Sanctioned repo-wide form: the rule-exclude ladder** (`.clagentic/semgrep-exclude` / `~/.config/clagentic/semgrep-exclude`, see "Rule-exclude ladder (lr-321e18)" above). Use this when a rule is unsatisfiable **repo-wide**, not at one call site — e.g. a rule whose entire pattern class does not apply to this codebase's stack (no ORM, no shell-out, no template engine the rule targets). Each entry needs the same standard of evidence the inline form needs, just argued at repo scope instead of line scope: a justification citing concrete, verifiable code (or the concrete absence of a code shape) in *this* repo, not a general architectural claim.
+
+**Choosing between the two forms:**
+
+| Use inline `# nosemgrep: <rule-id>` when… | Use the exclude ladder when… |
+|---|---|
+| The unsatisfiable condition is true at this one site, but the rule is still valid and should still fire elsewhere in the repo | The rule's entire pattern class does not and cannot apply anywhere in this codebase |
+| A future, different call site with the same-looking code should still be flagged and individually justified | Blanket-excluding the rule repo-wide will not hide a *different* real vulnerability shape the rule would otherwise have caught |
+| The justification is site-specific ("this table name is drawn from an internal enum, not request input") | The justification is architectural ("this repo has no SQL ORM at all") |
+
+Reaching for the exclude ladder to suppress a single-site false positive is itself a smell: it silences the rule everywhere, including at future sites the original justification never examined. Prefer the narrower inline form unless the repo-wide claim genuinely holds.
+
+**Existing usage: `live_db_harness.py`.** This task's originating description referenced a justified inline `# nosemgrep` in `live_db_harness.py` as prior art this policy should sanction rather than retroactively condemn. That file does not exist in this repo (`git log --all` and a full-tree search both confirm no such path was ever committed) — the only `nosemgrep` occurrences on record are policy references in `AGENTS.md`, this file, `plugins/clagentic-lite/agents/builder.md`, and `plugins/clagentic-lite/skills/infosec-rt/SKILL.md`, none of which is an inline suppression against real source. There is nothing in this repo for the policy above to conform to or condemn; this is stated explicitly here per the task's own instruction to surface the discrepancy rather than silently invent or alter a file to match it.
+
+**The suppression-review loop, and why it is not aspirational.** lr-321e18 shipped `.clagentic/semgrep-exclude` with **zero active entries**. A `python.sqlalchemy.security.sqlalchemy-execute-raw-query` exclusion was proposed with a plausible-sounding justification (injection-safe sqlalchemy/psycopg2/`sql.Identifier` usage); BOBBIE's security review (PR #159) checked the claim against the actual codebase and found no sqlalchemy, psycopg2, or `sql.Identifier` code anywhere in this repo, and the two engram IDs cited alongside the justification did not resolve in LORE. The entry was removed rather than shipped — see `.clagentic/semgrep-exclude`'s own header comment for the retained record. This is the policy working as intended, not an edge case: a suppression's justification is checked against the repo it claims to describe, and an unverifiable justification does not ship, regardless of how reasonable it reads in isolation. BOBBIE's rulebook addition below (`clagentic-lite.new-suppression-review`) makes this the standing expectation for every future suppression, not a one-off catch.
+
+See lr-3b06b1 (open, tracked separately) for whether `issue_class`/`class_fix` on a review finding produce real class-level reasoning rather than surface pattern-matching — relevant background for how a reviewer distinguishes a genuine site-specific justification from a restated instance of the same unverified claim, but that validation is out of scope here.
+
 ### Every external-process invocation is bounded (INV-4)
 
 `scripts/gates.sh`'s `run_bounded` wrapper is the single entry point every gitleaks, osv-scanner, semgrep, `git push`, `gh pr view`, and `gh pr create` invocation runs through — a call site that bypasses it stands out as visibly different from every sibling. Each tool gets its own configurable default (`CLAGENTIC_SECRETS_TIMEOUT_SEC`, `CLAGENTIC_OSV_TIMEOUT_SEC`, `CLAGENTIC_SAST_TIMEOUT_SEC`, `CLAGENTIC_SHIP_TIMEOUT_SEC`; unnamed sites fall back to `CLAGENTIC_EXTERNAL_TIMEOUT_SEC`, default 120s) because a full branch-history gitleaks scan or a rule-downloading `semgrep --config=auto` legitimately needs more headroom than a quick `gh pr view` check.
@@ -977,7 +1007,7 @@ Not wired into `gates ship`'s blocking sequence — it is diagnostic output, run
 | Gate 4a — secrets | False-positive token | Add a path-scoped allowlist entry to `.gitleaks.toml`. Do not use regex allowlists on token literals. |
 | Gate 4b — deps | Pre-existing CVE you accept | Add the ID to `.clagentic/osv-ignore` (repo) or `~/.config/clagentic/osv-ignore` (global). One ID per line. |
 | Gate 4b — deps | Want to ignore below CRITICAL | Set `CLAGENTIC_OSV_SEVERITY=HIGH` (or `MEDIUM`) in `.clagentic/config`. |
-| Gate 4c — SAST | False-positive semgrep rule | Add the file path to `.semgrepignore`, or add `# nosemgrep: <rule-id> — <reason>` inline. |
+| Gate 4c — SAST | False-positive semgrep rule | Add the file path to `.semgrepignore`, or add `# nosemgrep: <rule-id> — <reason>` inline (never a bare `# nosemgrep`); use the rule-exclude ladder instead when the rule is unsatisfiable repo-wide. See "Suppression policy" under Gate 4c above for the criteria. |
 | Gate 4c — SAST | Slow/unreliable network makes the baseline fetch time out, forcing full-tree scans | Set `CLAGENTIC_SAST_FETCH_TIMEOUT_SEC=<seconds>` (default 30) in `.clagentic/config`. A longer timeout only helps if the fetch would otherwise succeed — an unreachable remote still falls back to full-tree regardless of the timeout value, by design. |
 | Gate 2 — bash guard | Legitimate command blocked by a rule | Set `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` in `.clagentic/config`. Multiple rules: comma-separated. Add a comment explaining why in the commit. |
 | Gate 2 — write guard (W-001) | Intentional work on default branch | Set `CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1` in `.clagentic/config`. This is unusual — default-branch protection exists for good reason. |
