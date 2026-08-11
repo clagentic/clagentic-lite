@@ -615,13 +615,33 @@ true` (with `"review-ledger"` appended to `stale_gates` when the ledger
 check is the one that failed) — `cmd_merge_gate` short-circuits on a stale
 payload exactly as before (deterministic refusal, no LLM call, no token
 burn — see "Gate 6 — Merge Gate" below). This closes a gap the single-file
-snapshot check could not: a `last-review.json` stamp match with no
-corresponding ledger entry (a ledger write failure, or a file predating
-this feature) now still stales, and — more importantly — a *prior* passing
+snapshot check could not: once a repo has a ledger at all, a
+`last-review.json` stamp match with no corresponding ledger entry for the
+CURRENT branch/SHA still stales, and — more importantly — a *prior* passing
 round's stamp can never be misread as covering a *later*, unreviewed HEAD,
 because the ledger's latest entry for the branch is checked by identity
 (`head_sha == HEAD`) and by verdict (`"pass"`), not by "a file with this
 name happens to exist."
+
+**Bootstrap exemption.** The ledger-anchored check only activates once
+`.clagentic/lite/review-ledger.jsonl` exists at all for the repo —
+`cmd_review` (the sole ledger writer) creates it on its very first
+successful run. Total absence means this repo has never gone through a
+ledger-aware review (a fresh checkout, or a caller populating
+`last-review.json` directly without ever invoking `cmd_review`); the
+pre-existing single-file stamp check above still governs that case exactly
+as it did before this task, unchanged. This mirrors the same
+absence-is-"not-yet-populated"-not-"populated-and-wrong" bootstrap posture
+every other opt-in-by-first-write gate-state file in this codebase already
+has (`review-seen-keys`, `review-recurrence.json`, `invariants.json`). Once
+a branch's first review runs, the file exists from then on and every
+subsequent merge-gate invocation on that repo is held to the ledger's own
+anchored-verdict bar — the exemption only ever widens what is accepted
+before a repo has adopted the feature, never after. A no-jq/no-python3
+environment also skips the ledger check (which cannot read JSON at all in
+that case) and defers to `build_gate_summary`'s own pre-existing, canonical
+`gate_summary_degraded: true` no-tool signal instead of a generic staleness
+message.
 
 **Stable finding identity across rounds (item 5) — recorded, never used for
 severity demotion.** Every finding written to a ledger entry carries
