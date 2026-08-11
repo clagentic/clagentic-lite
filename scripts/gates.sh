@@ -4340,6 +4340,31 @@ build_gate_summary() {
         fi
       fi
 
+      # LEDGER-ANCHORED CHECK (item 4, lr-01ae73): last-review.json's own
+      # _clagentic_diff_sha stamp above only ever remembers the SINGLE most
+      # recent review run, regardless of whether it passed or blocked, and
+      # is silently overwritten by the next run. The ledger is the durable,
+      # append-only, verdict-aware record — require its latest entry for the
+      # CURRENT branch to be an ANCHORED PASS at CURRENT_SHA, via the one
+      # sanctioned predicate (_ledger_anchored_pass_at_head). This is
+      # strictly ADDITIONAL to the check above, never a replacement: a
+      # last-review.json stamp match with no matching ledger entry (ledger
+      # write failed, or predates lr-01ae73) still stales here, and a
+      # missing/stale verdict-at-HEAD in EITHER check means "re-review,
+      # never proceed" per this task's own item 4.
+      if [ "$STALE_PAYLOAD" != "true" ]; then
+        _mg_ledger=$(_review_ledger_path)
+        _mg_ledger_branch=$(_review_current_branch)
+        if ! _ledger_anchored_pass_at_head "$_mg_ledger" "$_mg_ledger_branch" "$CURRENT_SHA"; then
+          STALE_PAYLOAD=true
+          if [ -n "$STALE_GATES" ]; then
+            STALE_GATES="$STALE_GATES review-ledger"
+          else
+            STALE_GATES="review-ledger"
+          fi
+        fi
+      fi
+
       # Extract SHA from last-adversarial.md (first-line comment).
       # Distinguish two cases:
       #   - File absent: not stale; set ADVERSARIAL_MISSING=true and continue.
@@ -5338,5 +5363,5 @@ case "${1:-}" in
   digest)         cmd_digest ;;
   status)         shift; cmd_status "$@" ;;
   tail)           shift; cmd_tail "$@" ;;
-  *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+  *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
 esac
