@@ -615,33 +615,40 @@ true` (with `"review-ledger"` appended to `stale_gates` when the ledger
 check is the one that failed) — `cmd_merge_gate` short-circuits on a stale
 payload exactly as before (deterministic refusal, no LLM call, no token
 burn — see "Gate 6 — Merge Gate" below). This closes a gap the single-file
-snapshot check could not: once a repo has a ledger at all, a
-`last-review.json` stamp match with no corresponding ledger entry for the
-CURRENT branch/SHA still stales, and — more importantly — a *prior* passing
-round's stamp can never be misread as covering a *later*, unreviewed HEAD,
-because the ledger's latest entry for the branch is checked by identity
-(`head_sha == HEAD`) and by verdict (`"pass"`), not by "a file with this
-name happens to exist."
+snapshot check could not: a `last-review.json` stamp match with no
+corresponding ledger entry for the current branch/SHA — including when the
+ledger file is absent entirely — still stales, and — more importantly — a
+*prior* passing round's stamp can never be misread as covering a *later*,
+unreviewed HEAD, because the ledger's latest entry for the branch is
+checked by identity (`head_sha == HEAD`) and by verdict (`"pass"`), not by
+"a file with this name happens to exist."
 
-**Bootstrap exemption.** The ledger-anchored check only activates once
-`.clagentic/lite/review-ledger.jsonl` exists at all for the repo —
-`cmd_review` (the sole ledger writer) creates it on its very first
-successful run. Total absence means this repo has never gone through a
-ledger-aware review (a fresh checkout, or a caller populating
-`last-review.json` directly without ever invoking `cmd_review`); the
-pre-existing single-file stamp check above still governs that case exactly
-as it did before this task, unchanged. This mirrors the same
-absence-is-"not-yet-populated"-not-"populated-and-wrong" bootstrap posture
-every other opt-in-by-first-write gate-state file in this codebase already
-has (`review-seen-keys`, `review-recurrence.json`, `invariants.json`). Once
-a branch's first review runs, the file exists from then on and every
-subsequent merge-gate invocation on that repo is held to the ledger's own
-anchored-verdict bar — the exemption only ever widens what is accepted
-before a repo has adopted the feature, never after. A no-jq/no-python3
-environment also skips the ledger check (which cannot read JSON at all in
-that case) and defers to `build_gate_summary`'s own pre-existing, canonical
-`gate_summary_degraded: true` no-tool signal instead of a generic staleness
-message.
+**No bootstrap exemption — deliberately.** An earlier revision of this
+check skipped the ledger requirement whenever `review-ledger.jsonl` did not
+yet exist for the repo, reasoning that a fresh checkout should fall back to
+the pre-existing single-file stamp check. Review caught this as a
+permanent escape hatch, not a bootstrap accommodation: "no ledger file
+exists" is indistinguishable from "ledger deleted to bypass the gate," and
+a repo that only ever hand-populates `last-review.json` without ever
+calling `cmd_review` would sail through the anchored-verdict requirement
+forever. There is no such carve-out — the very first review on any branch
+must itself go through `cmd_review` (which creates the branch's first
+ledger entry as part of that same run) before `merge-gate` will ever pass.
+`scripts/test_review_ledger.py`'s
+`TestMergeGateLedgerConsumption.test_hand_written_last_review_with_no_ledger_never_passes`
+pins this directly: a hand-written, correctly-SHA-stamped
+`last-review.json` with no ledger file at all must still refuse.
+
+A no-jq/no-python3 environment is the one remaining exemption, and it is
+orthogonal to the above — not a verdict bypass, a tooling-availability
+accommodation. `_ledger_anchored_pass_at_head` cannot read the ledger at
+all without a JSON tool and fails closed (treats it as no anchored pass),
+but this function already has a dedicated, canonical no-tool signal
+downstream (the "no JSON encoder available" fallback, which emits
+`gate_summary_degraded: true` rather than a bare stale-payload refusal, so
+the merge gate can tell "we could not evaluate this environment at all"
+apart from "we evaluated it and it's stale") — both routes still refuse to
+approve; only the reported cause differs.
 
 **Stable finding identity across rounds (item 5) — recorded, never used for
 severity demotion.** Every finding written to a ledger entry carries

@@ -4297,48 +4297,40 @@ build_gate_summary() {
       # append-only, verdict-aware record — require its latest entry for the
       # CURRENT branch to be an ANCHORED PASS at CURRENT_SHA, via the one
       # sanctioned predicate (_ledger_anchored_pass_at_head). This is
-      # strictly ADDITIONAL to the check above, never a replacement, for any
-      # repo that HAS a ledger: a last-review.json stamp match with no
-      # matching ledger entry still stales here, and a missing/stale
-      # verdict-at-HEAD in EITHER check means "re-review, never proceed"
-      # per this task's own item 4.
+      # strictly ADDITIONAL to the check above, never a replacement: a
+      # last-review.json stamp match with no matching ledger entry (ledger
+      # absent entirely, ledger present but with no entry for this branch/
+      # SHA, or a ledger write failure) still stales here, and a missing/
+      # stale verdict-at-HEAD in EITHER check means "re-review, never
+      # proceed" per this task's own item 4. Deliberately NOT exempted when
+      # the ledger file is simply absent (PEACHES/coordinator finding on
+      # PR #162, comment 5260223912): a "skip when no ledger exists" carve-
+      # out is indistinguishable from "ledger deleted to bypass the gate,"
+      # and a repo that only ever hand-populates last-review.json without
+      # calling cmd_review would sail through this check forever. There is
+      # no bootstrap exemption — the very first review on a branch must
+      # itself go through cmd_review (which creates the ledger entry as
+      # part of that same run) before merge-gate will ever pass.
       #
-      # BOOTSTRAP EXEMPTION: when NO ledger file exists for this repo/branch
-      # at all, skip this check entirely rather than treating total absence
-      # as itself a staleness trigger. `cmd_review` (the sole ledger writer)
-      # creates the file on its very first successful run under THIS
-      # feature — its total absence means this repo has never gone through
-      # a ledger-aware review at all (a fresh checkout, or a caller/fixture
-      # populating last-review.json directly without ever invoking
-      # cmd_review). The pre-existing stamp check above already governs
-      # that case exactly as it did before this task; the ledger check only
-      # ever tightens behavior for a repo that has actually started using
-      # it (once `cmd_review` runs once, the file exists from then on and
-      # every subsequent merge-gate invocation is held to the ledger's own
-      # anchored-verdict bar). This mirrors the same bootstrap posture
-      # every other opt-in-by-first-write gate-state file in this codebase
-      # already has (review-seen-keys, review-recurrence.json, invariants.json)
-      # — absence is "not yet populated," not "populated and wrong."
-      #
-      # NO-JSON-TOOL EXEMPTION: when neither jq nor python3 is available,
-      # _ledger_anchored_pass_at_head cannot read the ledger at all and
-      # fails closed (treats it as no anchored pass) -- but this function
-      # ALREADY has a dedicated, canonical no-tool signal downstream
-      # (the site-1.12 "no JSON encoder available" fallback, which emits
-      # `gate_summary_degraded: true` rather than a bare stale-payload
-      # refusal, so the merge gate can tell "we could not evaluate this
-      # environment at all" apart from "we evaluated it and it's stale").
-      # Pre-empting that with a ledger-driven stale refusal here would
-      # collapse that distinction back to a generic staleness message.
-      # Skip the ledger check in this case and let control fall through to
-      # the existing no-tool path.
+      # NO-JSON-TOOL EXEMPTION (retained, orthogonal to the above): when
+      # neither jq nor python3 is available, _ledger_anchored_pass_at_head
+      # cannot read the ledger at all and fails closed (treats it as no
+      # anchored pass) -- but this function ALREADY has a dedicated,
+      # canonical no-tool signal downstream (the site-1.12 "no JSON encoder
+      # available" fallback, which emits `gate_summary_degraded: true`
+      # rather than a bare stale-payload refusal, so the merge gate can
+      # tell "we could not evaluate this environment at all" apart from "we
+      # evaluated it and it's stale"). Pre-empting that with a
+      # ledger-driven stale refusal here would collapse that distinction
+      # back to a generic staleness message. This is a tooling-availability
+      # accommodation, not a verdict bypass: the environment still refuses
+      # to approve (gate_summary_degraded routes to a refuse decision, see
+      # cmd_merge_gate), it just reports the more specific cause.
       if [ "$STALE_PAYLOAD" != "true" ]; then
-        _mg_ledger=$(_review_ledger_path)
-        if [ ! -f "$_mg_ledger" ]; then
-          : # bootstrap exemption: no ledger for this repo/branch yet
-        elif ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+        if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
           : # no-json-tool exemption: defer to the canonical gate_summary_degraded path
         else
+          _mg_ledger=$(_review_ledger_path)
           _mg_ledger_branch=$(_review_current_branch)
           if ! _ledger_anchored_pass_at_head "$_mg_ledger" "$_mg_ledger_branch" "$CURRENT_SHA"; then
             STALE_PAYLOAD=true
