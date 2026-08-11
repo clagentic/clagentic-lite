@@ -626,20 +626,30 @@ name happens to exist."
 **Stable finding identity across rounds (item 5) — recorded, never used for
 severity demotion.** Every finding written to a ledger entry carries
 `_ledger_recurring: true|false`, computed by `_ledger_mark_recurrence`
-(`scripts/gates.sh`) by re-deriving each finding's content-hash key
-(`finding_content_keys`, `scripts/review-merge.sh` — the SAME key space
-cross-round dedup and recurrence demotion already use) and checking it
-against every PRIOR ledger entry's findings for the same branch. **This is
-recurrence RECORDING, not recurrence-based severity demotion** — the
-`_ledger_recurring` annotation is purely informational history; unlike
-`_recurrence_demoted` (see "Cross-round finding recurrence demotion"
-above), `severity_blockers()` does NOT read `_ledger_recurring` and it has
-no effect on whether a finding blocks. `lr-66e598`'s severity-demotion
-policy is prior art this task deliberately does not resurrect or extend —
-the ledger's own recurrence marker and `_review_recurrence_demote`'s
-blocking-eligibility marker are two independent mechanisms over the same
-key space, exactly the way cross-round dedup and recurrence demotion
-already coexist as two independent uses of one key space.
+(`scripts/gates.sh`) by checking the finding's `(file, category, message)`
+triple against every PRIOR ledger entry's findings for the same branch —
+deliberately NOT `finding_content_keys`' sha256-of-a-diff-context-window key
+(`scripts/review-merge.sh`, used by cross-round dedup and recurrence
+demotion): that key is a function of THIS ROUND's diff content around the
+finding's own line, so a recurring finding in a round whose diff does not
+happen to touch that file again at all (a common case — the model is simply
+re-reporting an unresolved issue while this round's diff is elsewhere)
+would make the content-hash key uncomputable for the comparison, a false
+negative rather than a real absence of recurrence. The `(file, category,
+message)` triple is the SAME match key `_review_recurrence_demote` and
+`_review_deferral_match` already use for the identical "survive rounds
+where the file/line isn't in the current diff" property — see either
+function's own doc comment. **This is recurrence RECORDING, not
+recurrence-based severity demotion** — the `_ledger_recurring` annotation
+is purely informational history; unlike `_recurrence_demoted` (see
+"Cross-round finding recurrence demotion" above), `severity_blockers()`
+does NOT read `_ledger_recurring` and it has no effect on whether a finding
+blocks. `lr-66e598`'s severity-demotion policy is prior art this task
+deliberately does not resurrect or extend — the ledger's own recurrence
+marker and `_review_recurrence_demote`'s blocking-eligibility marker are
+two independent mechanisms, each over its own match key, exactly the way
+cross-round dedup and recurrence demotion already coexist as two
+independent uses of one key space.
 
 **Everything above is proven repo-locally.** Every ledger capability —
 recording an anchored verdict, delta re-review off a prior verdict,

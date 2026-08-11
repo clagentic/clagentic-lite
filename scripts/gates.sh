@@ -1215,16 +1215,27 @@ except Exception:
 # _ledger_mark_recurrence FINDINGS_JSON DIFF_FILE LEDGER_FILE BRANCH
 #
 # Item 5: findings carry stable identity across rounds so the ledger can
-# mark a finding recurring vs new. Reuses finding_content_keys
-# (review-merge.sh) — the SAME content-hash key space cross-round dedup/
-# recurrence-demotion already compute — against every PRIOR ledger entry's
-# findings for BRANCH. RECORDS RECURRENCE ONLY: this function never adjusts
-# severity, never excludes anything from severity_blockers' count, and is
-# entirely independent of _review_recurrence_demote/_recurrence_demoted
-# (that mechanism's SEVERITY-DEMOTION POLICY is explicitly prior art this
-# task must not resurrect — see lr-66e598 and this task's own OUT OF SCOPE).
-# The output is informational annotation only: each finding in the returned
-# array gets `_ledger_recurring: true|false`.
+# mark a finding recurring vs new. RECORDS RECURRENCE ONLY: this function
+# never adjusts severity, never excludes anything from severity_blockers'
+# count, and is entirely independent of
+# _review_recurrence_demote/_recurrence_demoted (that mechanism's
+# SEVERITY-DEMOTION POLICY is explicitly prior art this task must not
+# resurrect — see lr-66e598 and this task's own OUT OF SCOPE). The output
+# is informational annotation only: each finding in the returned array gets
+# `_ledger_recurring: true|false`.
+#
+# MATCH KEY: the (file, category, message) triple — deliberately NOT
+# finding_content_keys' sha256-of-a-diff-context-window key. That key is a
+# function of THIS ROUND's diff content around the finding's line; a
+# recurring finding very often lands in a round whose diff does not touch
+# the finding's file again at all (the model is simply re-reporting an
+# unresolved issue while THIS round's diff is elsewhere), which makes the
+# content-hash key uncomputable for both the live finding and the
+# re-derived prior one — a false negative, not a real absence of
+# recurrence. The (file, category, message) triple is exactly the SAME
+# match key `_review_recurrence_demote` and `_review_deferral_match`
+# already use for the identical "survive rounds where the file/line isn't
+# in the current diff" property (see their own doc comments in this file).
 #
 # stdout: the findings array with `_ledger_recurring` spliced onto every
 # finding object. On any failure (no python3, unparseable input, no prior
@@ -1242,66 +1253,15 @@ _ledger_mark_recurrence() {
     return 0
   fi
 
-  # This round's content-hash keys for the live findings.
-  _lmr_live_tsv=$(mktemp -t clagentic-ledger-live.XXXXXX)
-  printf '%s' "$_lmr_findings_json" | finding_content_keys "$_lmr_diff" > "$_lmr_live_tsv" 2>/dev/null
-
-  # Prior rounds' keys: re-derive content-hash keys for every finding stored
-  # in every PRIOR ledger entry for this branch, against the diff recorded
-  # in the CURRENT round (finding_content_keys' key is a function of the
-  # diff's own content, not the round that produced it — recomputing prior
-  # findings' keys against this round's diff is exactly how dedup_findings'
-  # own SEEN_FILE already establishes cross-round identity, applied here to
-  # the ledger's own persisted history instead of a separate seen-keys file,
-  # since the ledger IS the persisted history this task requires).
-  _lmr_prior_keys=$(mktemp -t clagentic-ledger-prior.XXXXXX)
+  _lmr_prior_entries=$(mktemp -t clagentic-ledger-prior.XXXXXX)
   if [ -f "$_lmr_ledger" ]; then
-    ledger_entries_for_branch "$_lmr_ledger" "$_lmr_branch" | while IFS= read -r _lmr_entry; do
-      [ -n "$_lmr_entry" ] || continue
-      _lmr_entry_findings=$(printf '%s' "$_lmr_entry" | python3 -c 'import json,sys
-try:
-    d = json.load(sys.stdin)
-    print(json.dumps(d.get("findings", [])))
-except Exception:
-    print("[]")' 2>/dev/null)
-      [ -n "$_lmr_entry_findings" ] || continue
-      printf '%s' "$_lmr_entry_findings" | finding_content_keys "$_lmr_diff" 2>/dev/null
-    done >> "$_lmr_prior_keys"
+    ledger_entries_for_branch "$_lmr_ledger" "$_lmr_branch" > "$_lmr_prior_entries" 2>/dev/null
   fi
 
-  if [ ! -s "$_lmr_prior_keys" ]; then
-    # No prior history for this branch (or nothing keyable) — every finding
-    # is new by definition. Still splice the field explicitly (own the
-    # field, per this codebase's established "never leave an annotation
-    # implicit" posture — _review_recurrence_demote's own doc comment) so
-    # downstream readers see a definite false rather than an absent key.
-    _lmr_out=$(python3 - "$_lmr_findings_json" <<'PYEOF'
-import json, sys
-try:
-    findings = json.loads(sys.argv[1])
-    if not isinstance(findings, list):
-        raise ValueError
-except Exception:
-    print(sys.argv[1])
-    sys.exit(0)
-for f in findings:
-    if isinstance(f, dict):
-        f["_ledger_recurring"] = False
-print(json.dumps(findings))
-PYEOF
-)
-    rm -f "$_lmr_live_tsv" "$_lmr_prior_keys"
-    printf '%s' "$_lmr_out"
-    return 0
-  fi
-
-  # Build the set of prior keys (first TSV column), then splice
-  # _ledger_recurring onto every live finding whose recomputed key is in
-  # that set.
-  _lmr_out=$(python3 - "$_lmr_findings_json" "$_lmr_live_tsv" "$_lmr_prior_keys" <<'PYEOF'
+  _lmr_out=$(python3 - "$_lmr_findings_json" "$_lmr_prior_entries" <<'PYEOF'
 import json, sys
 
-findings_json, live_tsv, prior_tsv = sys.argv[1], sys.argv[2], sys.argv[3]
+findings_json, prior_entries_path = sys.argv[1], sys.argv[2]
 
 try:
     findings = json.loads(findings_json)
@@ -1311,48 +1271,38 @@ except Exception:
     print(findings_json)
     sys.exit(0)
 
-prior_keys = set()
+def triple(f):
+    return (str(f.get("file", "")), str(f.get("category", "")), str(f.get("message", "")))
+
+prior_triples = set()
 try:
-    with open(prior_tsv) as f:
-        for line in f:
-            line = line.rstrip("\n")
+    with open(prior_entries_path) as pf:
+        for line in pf:
+            line = line.strip()
             if not line:
                 continue
-            k = line.split("\t", 1)[0]
-            if k:
-                prior_keys.add(k)
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            for prior_f in entry.get("findings", []):
+                if isinstance(prior_f, dict):
+                    prior_triples.add(triple(prior_f))
 except Exception:
     pass
 
-# live key -> finding triple (file, category, message), same join
-# convention _review_recurrence_demote already uses.
-live_key_by_triple = {}
-try:
-    with open(live_tsv) as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) < 4:
-                continue
-            key, fname, category, message = parts[0], parts[1], parts[2], parts[3]
-            live_key_by_triple[(fname, category, message)] = key
-except Exception:
-    pass
-
+# OWN THE FIELD for every finding this loop touches (explicit, definite
+# value), same posture as _review_recurrence_demote's own splice —
+# never leave whatever the object already carried untouched.
 for f in findings:
-    if not isinstance(f, dict):
-        continue
-    triple = (str(f.get("file", "")), str(f.get("category", "")), str(f.get("message", "")))
-    key = live_key_by_triple.get(triple)
-    f["_ledger_recurring"] = bool(key and key in prior_keys)
+    if isinstance(f, dict):
+        f["_ledger_recurring"] = triple(f) in prior_triples
 
 print(json.dumps(findings))
 PYEOF
 )
-  rm -f "$_lmr_live_tsv" "$_lmr_prior_keys"
-  printf '%s' "$_lmr_out"
+  rm -f "$_lmr_prior_entries"
+  [ -n "$_lmr_out" ] && printf '%s' "$_lmr_out" || printf '%s' "$_lmr_findings_json"
   return 0
 }
 
