@@ -233,9 +233,15 @@ def _init_git_repo_with_local_file_remote(tmpdir, project_root):
     Distinct from _init_git_repo_no_remote, which proves the AC6 "no remote
     at all" scenario for the ledger's OWN capabilities (recording,
     delta-scoping off a prior verdict, merge-gate consumption) -- those
-    never need to reach this fallback at all once a first verdict exists."""
+    never need to reach this fallback at all once a first verdict exists.
+
+    project_root must NOT already be an initialized git repo (this creates
+    a fresh one) -- callers use a subdirectory distinct from setUp()'s own
+    self._project fixture, which _init_git_repo_no_remote already seeded
+    and committed into."""
     bare_remote = os.path.join(tmpdir, "origin.git")
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", bare_remote], check=True)
+    os.makedirs(project_root, exist_ok=True)
     _git(["init", "-q", "-b", "main", project_root], cwd=None)
     _git(["remote", "add", "origin", bare_remote], cwd=project_root)
     with open(os.path.join(project_root, "app.py"), "w") as f:
@@ -297,42 +303,43 @@ def _make_stub_llm_client(tmpdir, envelopes_by_round, capture_diffs=False):
     with open(envelopes_json_path, "w") as f:
         json.dump(envelopes_by_round, f)
 
-    capture_line = (
-        f"    with open(os.path.join({diffs_dir!r}, 'round-%d.txt' % n), 'w') as df:\n"
-        f"        df.write(diff_text)\n"
-        if capture_diffs else ""
-    )
+    script = textwrap.dedent(f"""\
+        #!/usr/bin/env python3
+        import json, os, sys
+
+        role = sys.argv[1] if len(sys.argv) > 1 else ""
+        counter_file = {counter_file!r}
+        envelopes_path = {envelopes_json_path!r}
+        diffs_dir = {diffs_dir!r}
+        capture_diffs = {capture_diffs!r}
+
+        diff_text = sys.stdin.read()
+
+        if role != "review":
+            sys.stderr.write("stub llm-client.sh: unexpected role %r\\n" % role)
+            sys.exit(1)
+
+        try:
+            with open(counter_file) as cf:
+                n = int(cf.read().strip() or "0")
+        except FileNotFoundError:
+            n = 0
+        n += 1
+        with open(counter_file, "w") as cf:
+            cf.write(str(n))
+
+        if capture_diffs:
+            with open(os.path.join(diffs_dir, "round-%d.txt" % n), "w") as df:
+                df.write(diff_text)
+
+        with open(envelopes_path) as ef:
+            envelopes = json.load(ef)
+
+        idx = min(n - 1, len(envelopes) - 1)
+        sys.stdout.write(json.dumps(envelopes[idx]))
+    """)
     with open(stub, "w") as f:
-        f.write(textwrap.dedent(f"""\
-            #!/usr/bin/env python3
-            import json, os, sys
-
-            role = sys.argv[1] if len(sys.argv) > 1 else ""
-            counter_file = {counter_file!r}
-            envelopes_path = {envelopes_json_path!r}
-
-            diff_text = sys.stdin.read()
-
-            if role != "review":
-                sys.stderr.write("stub llm-client.sh: unexpected role %r\\n" % role)
-                sys.exit(1)
-
-            try:
-                with open(counter_file) as cf:
-                    n = int(cf.read().strip() or "0")
-            except FileNotFoundError:
-                n = 0
-            n += 1
-            with open(counter_file, "w") as cf:
-                cf.write(str(n))
-
-{capture_line}
-            with open(envelopes_path) as ef:
-                envelopes = json.load(ef)
-
-            idx = min(n - 1, len(envelopes) - 1)
-            sys.stdout.write(json.dumps(envelopes[idx]))
-        """))
+        f.write(script)
     os.chmod(stub, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
     return tmpdir
 
@@ -455,8 +462,15 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
         through to the branch-diff-against-default path, which requires
         proving origin/<default> freshness and cannot on a remoteless repo
         (a PRE-EXISTING gates.sh property, unrelated to this task)."""
+        # HEAD at review time is the seed commit from setUp() -- a staged
+        # (uncommitted) diff is reviewed ON TOP OF that commit, so the
+        # anchor _git_repo_scoped_head_sha resolves (and the ledger
+        # records) is the seed commit's SHA, not a SHA that "contains" the
+        # staged content -- staging never moves HEAD, only committing does
+        # (same anchor semantics _stamp_envelope's pre-existing SHA stamp
+        # already used before this task).
+        head_x = _git(["rev-parse", "HEAD"], cwd=self._project).stdout.strip()
         _stage_file(self._project, "feature.py", "print('hi')\n")
-        head_x = _commit_staged(self._project, "add feature")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
         result = _run_review([], self._tmpdir, self._project)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -513,12 +527,11 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
     # ------------------------------------------------------------------ AC5
     def test_finding_marked_recurring_on_second_round(self):
         """Given a finding that appeared in a prior round on the same
-        branch, when it appears again, the ledger marks it recurring.
-        Round 1 seeds via a staged diff (see test_anchored_pass_verdict...
-        for why); round 2 commits a NEW file and relies on the delta
-        re-review default (prior anchored verdict -> diff <head1>..HEAD,
-        which never touches origin either) rather than --full-review, so
-        this test also exercises the default delta path end to end."""
+        branch, when it appears again, the ledger marks it recurring. Both
+        rounds use a staged diff (get_review_diff's highest-priority path,
+        no remote needed) -- delta-scoping itself is covered separately by
+        test_delta_review_is_default_second_round_scoped_to_new_commit_only;
+        this test is purely about the recurrence ANNOTATION."""
         env_off = {"CLAGENTIC_CROSS_ROUND_DEDUP": "0"}
 
         _stage_file(self._project, "feature.py", "print('hi')\nprint('bye')\n")
@@ -575,19 +588,24 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
         """When a branch has a prior verdicted head_sha, review evaluates
         only that SHA..HEAD by default -- proven by asserting the SECOND
         round's diff sent to the reviewer contains only the second commit's
-        change, not the first commit's. Round 1 seeds via a staged diff (no
-        remote needed); round 2 commits a new file and relies purely on the
-        delta path (also no remote needed -- prior_head resolves as an
-        ancestor of HEAD, so get_review_diff never reaches the
-        branch-diff-against-default fallback at all)."""
-        _stage_file(self._project, "first.py", "first content\n")
+        change, not the first commit's. Round 1 uses a LOCAL-FILE-REMOTE
+        fixture (still fully offline) so its review covers "first.py" via
+        the pre-existing branch-diff-against-default path, establishing a
+        ledger head_sha whose commit genuinely contains first.py's addition
+        -- round 2 then commits a NEW file and relies purely on the delta
+        path (never touches the remote again -- prior_head resolves as an
+        ancestor of HEAD directly)."""
+        project2 = os.path.join(self._tmpdir, "project-with-remote")
+        _init_git_repo_with_local_file_remote(self._tmpdir, project2)
+        _stage_file(project2, "first.py", "first content\n")
+        _commit_staged(project2, "first commit")
+        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=project2)
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE, _CLEAN_ENVELOPE], capture_diffs=True)
-        r1 = _run_review([], self._tmpdir, self._project)
+        r1 = _run_review([], self._tmpdir, project2)
         self.assertEqual(r1.returncode, 0, r1.stderr)
-        _commit_staged(self._project, "first commit")
 
-        _commit_file(self._project, "second.py", "second content\n", "second commit")
-        r2 = _run_review([], self._tmpdir, self._project)
+        _commit_file(project2, "second.py", "second content\n", "second commit")
+        r2 = _run_review([], self._tmpdir, project2)
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertIn("delta re-review", r2.stderr)
 
@@ -603,19 +621,22 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
     def test_full_review_flag_forces_full_range_regardless_of_ledger(self):
         """--full-review forces the full-branch-diff-against-default path
         (pre-existing gates.sh mechanism, requires a resolvable origin/<default>
-        to prove freshness) -- uses the local-file-remote fixture, still
-        fully offline/local, no network host involved."""
-        _init_git_repo_with_local_file_remote(self._tmpdir, self._project)
-        _stage_file(self._project, "first.py", "first content\n")
-        _commit_staged(self._project, "first commit")
-        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=self._project)
+        to prove freshness) -- uses a SEPARATE project fixture (with a
+        local-file-remote), still fully offline/local, no network host
+        involved -- distinct from setUp()'s no-remote self._project, which
+        this path cannot use (already committed/branched with no remote)."""
+        project2 = os.path.join(self._tmpdir, "project-with-remote")
+        _init_git_repo_with_local_file_remote(self._tmpdir, project2)
+        _stage_file(project2, "first.py", "first content\n")
+        _commit_staged(project2, "first commit")
+        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=project2)
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE, _CLEAN_ENVELOPE], capture_diffs=True)
-        r1 = _run_review([], self._tmpdir, self._project)
+        r1 = _run_review([], self._tmpdir, project2)
         self.assertEqual(r1.returncode, 0, r1.stderr)
 
-        _stage_file(self._project, "second.py", "second content\n")
-        _commit_staged(self._project, "second commit")
-        r2 = _run_review(["--full-review"], self._tmpdir, self._project)
+        _stage_file(project2, "second.py", "second content\n")
+        _commit_staged(project2, "second commit")
+        r2 = _run_review(["--full-review"], self._tmpdir, project2)
         self.assertEqual(r2.returncode, 0, r2.stderr)
 
         diff_round2 = os.path.join(self._tmpdir, "diffs", "round-2.txt")
@@ -627,12 +648,13 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
                        "not just the delta since the prior verdict")
 
     def test_no_prior_verdict_first_round_is_full_range_and_says_so(self):
-        _init_git_repo_with_local_file_remote(self._tmpdir, self._project)
-        _stage_file(self._project, "first.py", "first content\n")
-        _commit_staged(self._project, "first commit")
-        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=self._project)
+        project2 = os.path.join(self._tmpdir, "project-with-remote")
+        _init_git_repo_with_local_file_remote(self._tmpdir, project2)
+        _stage_file(project2, "first.py", "first content\n")
+        _commit_staged(project2, "first commit")
+        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=project2)
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
-        r1 = _run_review([], self._tmpdir, self._project)
+        r1 = _run_review([], self._tmpdir, project2)
         self.assertEqual(r1.returncode, 0, r1.stderr)
         self.assertIn("no prior anchored verdict", r1.stderr)
 
@@ -641,25 +663,26 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
         """Given a rebase that invalidates the prior verdicted SHA, when
         review runs, it falls back to full-range review and says so in
         output. The fallback itself needs a resolvable origin/<default>
-        (pre-existing full-range path), so this uses the local-file-remote
-        fixture; the DETECTION of the invalidated SHA is proven purely from
-        local git state (rev-parse + merge-base --is-ancestor), independent
-        of the remote."""
-        _init_git_repo_with_local_file_remote(self._tmpdir, self._project)
-        _stage_file(self._project, "first.py", "first content\n")
-        _commit_staged(self._project, "first commit")
-        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=self._project)
+        (pre-existing full-range path), so this uses a separate
+        local-file-remote project fixture; the DETECTION of the invalidated
+        SHA is proven purely from local git state (rev-parse + merge-base
+        --is-ancestor), independent of the remote."""
+        project2 = os.path.join(self._tmpdir, "project-with-remote")
+        _init_git_repo_with_local_file_remote(self._tmpdir, project2)
+        _stage_file(project2, "first.py", "first content\n")
+        _commit_staged(project2, "first commit")
+        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=project2)
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE, _CLEAN_ENVELOPE], capture_diffs=True)
-        r1 = _run_review([], self._tmpdir, self._project)
+        r1 = _run_review([], self._tmpdir, project2)
         self.assertEqual(r1.returncode, 0, r1.stderr)
 
         # Simulate a rebase/amend: rewrite the tip commit so the prior
         # verdicted SHA is no longer reachable as an ancestor of HEAD.
-        _git(["commit", "--amend", "-q", "-m", "first commit (amended)"], cwd=self._project)
-        _stage_file(self._project, "second.py", "second content\n")
-        _commit_staged(self._project, "second commit")
+        _git(["commit", "--amend", "-q", "-m", "first commit (amended)"], cwd=project2)
+        _stage_file(project2, "second.py", "second content\n")
+        _commit_staged(project2, "second commit")
 
-        r2 = _run_review([], self._tmpdir, self._project)
+        r2 = _run_review([], self._tmpdir, project2)
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertIn("no longer an ancestor of HEAD", r2.stderr,
                        "an amend/rebase must be detected and reported on stderr")
@@ -704,29 +727,28 @@ class TestMergeGateLedgerConsumption(unittest.TestCase):
     def test_passing_verdict_at_head_lets_merge_gate_proceed(self):
         """Given a passing verdict at X and HEAD still X, merge-gate must
         NOT refuse on staleness grounds (it may still call the LLM, which
-        the stub approves). Commits first, then stages a trivial additional
-        edit so get_review_diff's staged-diff path (no remote needed) has
-        something to review, with HEAD already reflecting the reviewed
-        state's true tip once that staged edit is folded in below."""
+        the stub approves). Review runs against a staged diff (no remote
+        needed) -- the ledger's recorded head_sha is the commit BENEATH the
+        staged change (staging never moves HEAD), so HEAD must NOT advance
+        past that commit afterward, or the anchor would legitimately go
+        stale -- this test deliberately leaves the staged edit uncommitted."""
         _stage_file(self._project, "feature.py", "print('hi')\n")
-        _commit_staged(self._project, "add feature")
+        head = _commit_staged(self._project, "add feature")
         _stage_file(self._project, "feature.py", "print('hi')\nprint('again')\n")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
         r1 = _run_review([], self._tmpdir, self._project)
         self.assertEqual(r1.returncode, 0, r1.stderr)
-        _commit_staged(self._project, "add feature (finalize)")
 
         # Also need a last-adversarial.md stamp fresh at the same HEAD, or
         # build_gate_summary's existing adversarial-staleness check fires
         # instead -- write one directly, stamped, matching the existing
         # merge-gate test fixtures' pattern (test_wrapper_staleness.py).
-        head = _git(["rev-parse", "HEAD"], cwd=self._project).stdout.strip()
         ad_path = os.path.join(self._project, ".clagentic", "lite", "last-adversarial.md")
         with open(ad_path, "w") as f:
             f.write(f"<!-- clagentic-diff-sha: {head} -->\n# Adversarial audit\nclean\n")
 
         r2 = _run_merge_gate(self._tmpdir, self._project, decision="approve")
-        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(r2.returncode, 0, f"stdout={r2.stdout!r} stderr={r2.stderr!r}")
         self.assertEqual(self._merge_gate_calls(), 1,
                           "an anchored pass at current HEAD must let merge-gate reach the LLM call")
 
@@ -772,19 +794,18 @@ class TestMergeGateLedgerConsumption(unittest.TestCase):
 
     def test_blocked_verdict_at_head_still_refuses(self):
         """A ledger verdict of 'block' at current HEAD must never be
-        misread as an anchored pass. Commits first, then stages a trivial
-        additional edit (same pattern as test_passing_verdict_at_head_...)
-        so the ledger's recorded head_sha lines up exactly with HEAD after
-        the final commit below."""
+        misread as an anchored pass -- isolates the property from mere
+        staleness (test_new_commit_after_verdict_... already covers that
+        case) by leaving the staged edit uncommitted, so HEAD stays exactly
+        at the SHA the block verdict was recorded against (same pattern as
+        test_passing_verdict_at_head_lets_merge_gate_proceed)."""
         _stage_file(self._project, "feature.py", "print('hi')\n")
-        _commit_staged(self._project, "add feature")
+        head = _commit_staged(self._project, "add feature")
         _stage_file(self._project, "feature.py", "print('hi')\nprint('again')\n")
         _make_stub_llm_client(self._tmpdir, [_envelope([_finding()])])
         r1 = _run_review([], self._tmpdir, self._project)
         self.assertEqual(r1.returncode, 1, r1.stderr)
-        _commit_staged(self._project, "add feature (finalize)")
 
-        head = _git(["rev-parse", "HEAD"], cwd=self._project).stdout.strip()
         ad_path = os.path.join(self._project, ".clagentic", "lite", "last-adversarial.md")
         with open(ad_path, "w") as f:
             f.write(f"<!-- clagentic-diff-sha: {head} -->\n# Adversarial audit\nclean\n")
