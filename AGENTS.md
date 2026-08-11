@@ -71,6 +71,24 @@ This is a project rule and a habit. Read the file in full before modifying it. R
 
 Commit messages, PR descriptions, code comments, log lines — no emojis, no exclamation points, no "Successfully!" Be terse, technical, and accurate. Match the existing tone.
 
+### 9. Definition of done: local gate reproduction, not an approximation
+
+Before reporting a fix or feature complete, you **MUST** run every locally-runnable blocking gate against your branch using the exact invocation the gate uses — `gates.sh sast`, `gates.sh secrets`, `gates.sh deps`, `gates.sh bleed` (each is already an individually invocable subcommand; see Gate 4 in `docs/GATES.md`) — not a hand-rolled approximation of what you think semgrep/gitleaks/osv-scanner/the bleed scan would do. A red local gate means the work is **not done**: do not report completion, and do not commit-and-hope that CI or a later `ship` run will catch it — this codebase has no CI (see "Build / test / run" below), so a local gate is the only check that will ever run.
+
+Your completion report **MUST** include the per-gate local reproduction results (pass/fail for each of `sast`/`secrets`/`deps`/`bleed` you ran). Omitting the results is the same failure as not running the gates at all — the report exists so a reviewer doesn't have to re-derive whether you actually checked.
+
+### 10. Class-over-instance: fix the pattern, not the line
+
+When a review finding or bug is an instance of a pattern — the same defect shape is possible at other call sites, not just the one flagged — a silent point-patch of the flagged line alone is a **contract violation, not a style choice**. The Invariants section below exists because this codebase has hit this failure mode repeatedly: a single reported defect turned out to be one instance of a class, and a line-level fix left every sibling site exposed.
+
+The required fix, in order:
+
+1. **A shared primitive / single sanctioned path** — the one place the corrected behavior lives, so every call site can route through it instead of re-implementing it.
+2. **A sweep of existing sites** — find every other place the same defect shape appears (e.g. via `git ls-files`-driven discovery, matching the convention in "Sweeping-test discovery convention" below) and fix them in the same change.
+3. **Where feasible, a guard that fails the class going forward** — a sweeping test in `scripts/test_invariants.py` (see below) or an equivalent mechanical check, so a future reintroduction of the same shape is caught automatically rather than discovered as a fresh incident.
+
+The only sanctioned alternative to doing all three is an **explicit written deferral**, recorded in the task or roadmap, with rationale for why the class-level fix is out of scope for this change. A deferral must be written down where the next person will find it — silence is not a deferral.
+
 ---
 
 ## Invariants
@@ -154,6 +172,10 @@ There is intentionally no CI. The gates run on the user's machine via git hooks 
 ## When a gate or hook fails
 
 Do not debug a failed gate, hook, or command inline as your own problem. Dispatch the **Troubleshooter** agent (`plugins/clagentic-lite/agents/troubleshooter.md`) first — it is read-only, applies a tiered diagnosis (Tier 0 fast triage → Tier 2 deep diagnosis), and returns a root cause plus a `bounce_target` (you, the Builder, or none — expected behavior). This applies to: a gate exit code that isn't 0, a hook producing an unexpected error, `clagentic-lite gates ship` reporting `BLOCKED`/`INFRA_DEGRADED`, or `clagentic-lite doctor`/`enroll` reporting broken state. The Troubleshooter never fixes — it names the cause and stops; act on its finding yourself.
+
+### Iterate the single gate, never the whole chain
+
+`gates.sh ship` runs the full blocking sequence (secrets, deps, sast, review, merge-gate) in order. When the ship chain goes red on one gate — say `sast` — **iterate that gate standalone** (`gates.sh sast`, re-run after each fix attempt) until it is green, then run `ship` once to confirm the full chain. Never loop the full `ship` chain to debug a single failing gate: re-running secrets/deps/review on every iteration wastes the time those gates take (a network-bound osv-scanner call, an LLM review round) on gates that already passed and tells you nothing new about the one that didn't.
 
 ---
 
