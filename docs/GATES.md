@@ -605,12 +605,9 @@ change-scoped pattern scan (internal-bleed):
 
 **Rule-exclude ladder (lr-321e18).** `cmd_sast` had zero repo-side override
 surface for a single unsatisfiable registry rule — one false-positive
-finding (e.g. `python.sqlalchemy.security.sqlalchemy-execute-raw-query`,
-which rejects even injection-safe parameterized/`sql.Identifier`
-composition) forced multi-round review churn with no sanctioned escape.
-Fixed by mirroring `cmd_deps`' osv-ignore mechanism (above) exactly
-(reuse-first): a two-level, one-rule-id-per-line exclude list, unioned
-across both levels —
+finding forced multi-round review churn with no sanctioned escape. Fixed by
+mirroring `cmd_deps`' osv-ignore mechanism (above) exactly (reuse-first): a
+two-level, one-rule-id-per-line exclude list, unioned across both levels —
 
 - `~/.config/clagentic/semgrep-exclude` (global)
 - `.clagentic/semgrep-exclude` (repo, **committed** — unlike `.clagentic/`'s
@@ -622,7 +619,11 @@ across both levels —
 tolerates them. Each active rule id becomes an `--exclude-rule <id>` flag on
 **both** the baseline-commit and full-tree semgrep invocations —
 `_sast_exclude_rule_flags` (`scripts/gates.sh`) builds the flag list once,
-and both call sites reuse it.
+and both call sites reuse it. This repo's own `.clagentic/semgrep-exclude`
+currently carries no active exclusions (a prior committed exclusion whose
+stated rationale did not correspond to any code actually present in this
+repo was removed during PR #159 review — see that file's own header
+comment); the file stays committed as a live demonstration of the format.
 
 **Visibility: a suppressed rule is never silent.** When the ladder resolves
 at least one exclusion, `cmd_sast` echoes the excluded rule ids to stderr
@@ -636,12 +637,22 @@ matching repo-config key) to a committed policy path to replace
 `--config <path>` instead, and semgrep's registry (`auto`) is never
 contacted. **The default remains `auto` when the var is unset or empty** —
 `clagentic-lite` ships to other people; a specific repo's rule-tuning
-preferences (like this repo's own exclude entry above) are a per-repo
-opt-in, never a value hardcoded into `gates.sh` itself. With no exclude
-files and no `CLAGENTIC_SEMGREP_CONFIG` set, `cmd_sast`'s semgrep argv is
-byte-identical to the pre-lr-321e18 invocation — this is the load-bearing
-no-regression property the ladder and the config override are both built
-around.
+preferences are a per-repo opt-in, never a value hardcoded into `gates.sh`
+itself. With no exclude files and no `CLAGENTIC_SEMGREP_CONFIG` set,
+`cmd_sast`'s semgrep argv is byte-identical to the pre-lr-321e18 invocation
+— this is the load-bearing no-regression property the ladder and the config
+override are both built around.
+
+**A pinned config is never silent either.** A pinned config can replace
+`--config=auto` with a policy path that disables every rule — the same
+silent-suppression exposure the visibility mechanism above closes for the
+exclude ladder, applied to the config pin (BOBBIE, PR #159). When
+`CLAGENTIC_SEMGREP_CONFIG` is active, `cmd_sast` echoes the pinned path to
+stderr (`[gates/sast] using pinned config: <path>`) and appends `; config=
+<path>` to the `gate_runs.details` string on both the baseline and
+full-tree pass branches, alongside the exclusion count/id list when both
+are active. `_sast_pinned_config_from_argv` (`scripts/gates.sh`) detects
+the pin from `cmd_sast`'s own reconstructed argv.
 
 **Baseline scoping (lr-06b87e).** A plain `semgrep --config=auto` with no path argument scans the entire working tree on every run, so pre-existing findings in files the current branch never touched get attributed to that branch and block the gate — a full-tree scan is punished the same as a real regression. `cmd_sast` (`scripts/gates.sh`) narrows this with semgrep's own `--baseline-commit=<ref>`, which reports only findings introduced relative to that commit (semgrep, not clagentic-lite, computes the diff — this correctly follows moved/changed-context findings the way a path-restricted or full-tree-plus-filter approach cannot).
 
