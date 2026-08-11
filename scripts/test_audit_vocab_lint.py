@@ -98,16 +98,19 @@ class TestRealGatesShKnownBacklog(unittest.TestCase):
         )
 
     def test_real_gates_sh_has_exactly_the_documented_known_violations(self):
-        """Sanity check on the allowlist itself: five known VIOLATION SITES
-        from four distinct _KNOWN_VIOLATIONS entries (deps/no-package-
+        """Sanity check on the allowlist itself: six known VIOLATION SITES
+        from five distinct _KNOWN_VIOLATIONS entries (deps/no-package-
         sources, bleed/empty-pattern-file, bleed/git-ls-files-failed --
         matched at TWO call sites, identical text -- and the reviewed
-        sast/unavailable exception) must still be present and still
-        counted as known -- if any disappeared, the allowlist should be
-        trimmed rather than silently going stale (a stale allowlist entry
-        provides no coverage but looks like it does)."""
+        sast/unavailable exception, itself now two literal source variants:
+        the pre-existing unsuffixed form and the lr-321e18 exclude-ladder
+        suffixed form cmd_sast's full-tree branch emits when the exclude
+        ladder is active) must still be present and still counted as known
+        -- if any disappeared, the allowlist should be trimmed rather than
+        silently going stale (a stale allowlist entry provides no coverage
+        but looks like it does)."""
         out, err, rc = _run_lint(GATES_SH)
-        self.assertIn("5 known", out, f"output={out!r}")
+        self.assertIn("6 known", out, f"output={out!r}")
         self.assertIn("no package sources found", out)
         self.assertIn("empty pattern file", out)
         self.assertIn("git ls-files failed", out)
