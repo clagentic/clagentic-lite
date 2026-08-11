@@ -1,10 +1,19 @@
 # clagentic-lite repo-level semgrep --exclude-rule ladder (docs/GATES.md
-# Gate 4c "SAST"). One semgrep rule id per line; # comments and blank lines
-# are stripped.
-
-# python.sqlalchemy.security.sqlalchemy-execute-raw-query rejects even
-# injection-safe parameterized/psycopg2 sql.Identifier composition -- root
-# cause of the 2026-08-11 3-round review churn (lr-321e18; see engrams
-# 2026-07-31-clagentic-lite-26e006 and 2026-08-04-clagentic-lite-fb6433 for
-# prior recurrences of the same false positive).
-python.sqlalchemy.security.sqlalchemy-execute-raw-query
+# Gate 4c "SAST").
+#
+# Format: one semgrep rule id per line; # comments and blank lines are
+# stripped. Each active rule id becomes an --exclude-rule <id> flag on both
+# the baseline-commit and full-tree semgrep invocations (see
+# _sast_exclude_rule_flags, scripts/gates.sh).
+#
+# No exclusions are currently active for this repo. A prior version of this
+# file listed python.sqlalchemy.security.sqlalchemy-execute-raw-query with a
+# justification tying it to injection-safe sqlalchemy/psycopg2/
+# sql.Identifier usage; BOBBIE's PR #159 security review found no such
+# usage anywhere in this codebase, and the engram IDs cited alongside it did
+# not resolve in LORE. Shipping a permanent SAST exclusion whose stated
+# rationale does not correspond to any code in the repo is worse than
+# shipping no exclusion -- it is an unexplained hole in the gate for every
+# downstream user -- so the entry was removed rather than kept unverified.
+# A future exclusion added here must cite a concrete, verifiable finding in
+# THIS repo's own code.
