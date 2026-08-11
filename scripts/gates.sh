@@ -846,6 +846,29 @@ _sast_config_flag() {
   fi
 }
 
+# _sast_pinned_config_from_argv ARG1 ARG2 — extract the pinned config path
+# from cmd_sast's own reconstructed argv (its first two positional
+# parameters, before --exclude-rule tokens are appended), given the shape
+# _sast_config_flag emits: a literal "--config" token followed by the path,
+# when CLAGENTIC_SEMGREP_CONFIG was set, or the single fused
+# "--config=auto" token when it was not (which never matches "--config" as
+# a standalone ARG1, so this prints nothing in the default case).
+#
+# BOBBIE finding (PR #159, comment 5258964196): a pinned config can replace
+# --config=auto with a policy path that disables every rule, and that
+# override used to reach neither stderr nor the audit-log details string --
+# the same silent-suppression failure the task forbids for the exclude
+# ladder, just on the config pin instead. This helper is what cmd_sast now
+# calls to detect the pin so it can surface it, the same way
+# _sast_exclude_rule_flags' output already gets scanned for visibility.
+#
+# stdout: the pinned config path, or empty when --config=auto is active.
+_sast_pinned_config_from_argv() {
+  if [ "${1:-}" = "--config" ]; then
+    printf '%s' "${2:-}"
+  fi
+}
+
 cmd_sast() {
   if ! command -v semgrep >/dev/null 2>&1; then
     if [ "${CLAGENTIC_ALLOW_MISSING_SEMGREP:-0}" = "1" ]; then
@@ -997,15 +1020,28 @@ EOF_EXCL
     echo "[gates/sast] excluding $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS" 1>&2
   fi
 
+  # A pinned config must never be silent either (BOBBIE, PR #159 comment
+  # 5258964196): CLAGENTIC_SEMGREP_CONFIG can replace --config=auto with a
+  # policy path that disables every rule, and that override used to reach
+  # neither stderr nor the audit-log details string -- the same
+  # silent-suppression failure the task forbids for the exclude ladder,
+  # applied to the config pin. See _sast_pinned_config_from_argv's own
+  # doc comment for how the pin is detected from the reconstructed argv.
+  _SAST_PINNED_CONFIG=$(_sast_pinned_config_from_argv "${1:-}" "${2:-}")
+  if [ -n "$_SAST_PINNED_CONFIG" ]; then
+    echo "[gates/sast] using pinned config: $_SAST_PINNED_CONFIG" 1>&2
+  fi
+
   # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
   if [ -n "$_SAST_BASELINE" ]; then
     echo "[gates/sast] scoping to diff-introduced findings (baseline-commit=$_SAST_BASELINE)" 1>&2
     if run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE"; then
+      _SAST_PASS_DETAILS="baseline-commit=$_SAST_BASELINE"
+      [ -n "$_SAST_PINNED_CONFIG" ] && _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; config=$_SAST_PINNED_CONFIG"
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
-        cmd_log_run sast pass "baseline-commit=$_SAST_BASELINE; excluded $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS"
-      else
-        cmd_log_run sast pass "baseline-commit=$_SAST_BASELINE"
+        _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; excluded $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS"
       fi
+      cmd_log_run sast pass "$_SAST_PASS_DETAILS"
     else
       cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE (or timed out after ${_SAST_TIMEOUT}s)"
       return 1
@@ -1013,11 +1049,12 @@ EOF_EXCL
   else
     echo "[gates/sast] full-tree scan (baseline scoping unavailable: $_SAST_BASELINE_SKIP_REASON)" 1>&2
     if run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR; then
+      _SAST_PASS_DETAILS="full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"
+      [ -n "$_SAST_PINNED_CONFIG" ] && _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; config=$_SAST_PINNED_CONFIG"
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
-        cmd_log_run sast pass "full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON); excluded $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS"
-      else
-        cmd_log_run sast pass "full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"
+        _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; excluded $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS"
       fi
+      cmd_log_run sast pass "$_SAST_PASS_DETAILS"
     else
       cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON; or timed out after ${_SAST_TIMEOUT}s)"
       return 1
@@ -4462,27 +4499,25 @@ _FAILURE_WORDS = (
 # silently absorbed by this allowlist -- only an EXACT match to one of
 # these known lines is suppressed from the warning output below.
 #
-# sast/"unavailable" is a reviewed, INTENTIONAL exception, not the same
-# lie-class as the other three: semgrep genuinely ran (full-tree, not
-# baseline-scoped) and the pass outcome is honest -- "unavailable" here
-# describes why the SCOPE is full-tree, not that the scan itself is fake.
-# It matches the mechanical word-list (this lint enumerates by vocabulary,
-# not by judgment of each site's actual honesty) and is allowlisted here
-# rather than narrowing the word-list, which would risk missing a future
-# genuine "scan unavailable" lie elsewhere that happens to use the same word.
-#
-# The second sast/"unavailable" entry below (with the "; excluded N rule(s)"
-# suffix, lr-321e18) is the identical reviewed exception on the SAME literal
-# source line -- cmd_sast's full-tree branch appends the suffix only when
-# the exclude ladder is active (see _sast_exclude_rule_flags), so both the
-# suffixed and unsuffixed forms are genuine source text this lint's static
-# regex can match, and both need their own key.
+# sast/"unavailable" WAS a reviewed, intentional exception here (semgrep
+# genuinely ran full-tree; "unavailable" described why the SCOPE was
+# full-tree, not that the scan was fake) but is REMOVED as of lr-321e18's
+# BOBBIE fold-in: cmd_sast's two `cmd_log_run sast pass ...` call sites now
+# build their details string into a variable ($_SAST_PASS_DETAILS) so the
+# config-pin visibility fix (below) can conditionally append to it, and pass
+# that variable -- `cmd_log_run sast pass "$_SAST_PASS_DETAILS"` -- rather
+# than a literal string. This lint's regex only matches a literal
+# double-quoted details string; a variable reference contains no failure
+# word literally, so this call site is no longer statically flagged at all
+# and the two entries that used to allowlist it are dead (their exact
+# literal source text no longer appears anywhere in gates.sh). Per this
+# section's own contract ("if any disappeared, the allowlist should be
+# trimmed rather than silently going stale"), removed rather than left
+# behind as no-op entries.
 _KNOWN_VIOLATIONS = {
     ("deps", "no package sources found"),
     ("bleed", "empty pattern file"),
     ("bleed", "git ls-files failed (non-blocking)"),
-    ("sast", "full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"),
-    ("sast", "full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON); excluded $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS"),
 }
 
 findings = []
