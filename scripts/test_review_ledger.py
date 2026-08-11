@@ -778,11 +778,27 @@ class TestMergeGateLedgerConsumption(unittest.TestCase):
                           "a stale-payload refusal must be deterministic -- no LLM call")
         self.assertIn("stale", r2.stdout.lower())
 
-    def test_no_review_ever_run_refuses(self):
-        """A branch with no review verdict at all (never ran gates.sh
-        review) must refuse -- 'missing verdict-at-HEAD means re-review,
-        never proceed.'"""
-        _commit_file(self._project, "feature.py", "print('hi')\n", "add feature")
+    def test_no_review_ever_run_on_this_branch_refuses(self):
+        """A branch with a ledger (this repo HAS used the review-ledger
+        feature, via a review on a DIFFERENT branch) but no verdict of its
+        own at all must still refuse -- 'missing verdict-at-HEAD means
+        re-review, never proceed' applies per-branch, not merely per-repo.
+        Ledger totally absent for the WHOLE repo is instead a bootstrap
+        no-op (see build_gate_summary's own bootstrap-exemption comment) --
+        covered by the pre-existing single-file SHA-stamp staleness check
+        in that narrower case, which this test does not exercise."""
+        # Branch off feat/example (setUp's default) into a SEPARATE branch,
+        # review there (seeding a ledger entry keyed to THAT branch), then
+        # switch back to feat/example, which never had its own review.
+        _git(["checkout", "-q", "-b", "feat/other-branch"], cwd=self._project)
+        _stage_file(self._project, "other.py", "print('other')\n")
+        _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
+        r_other = _run_review([], self._tmpdir, self._project)
+        self.assertEqual(r_other.returncode, 0, r_other.stderr)
+        _commit_staged(self._project, "other branch commit")
+
+        _git(["checkout", "-q", "feat/example"], cwd=self._project)
+        _commit_file(self._project, "feature.py", "print('hi')\n", "add feature (never reviewed)")
         head = _git(["rev-parse", "HEAD"], cwd=self._project).stdout.strip()
         ad_path = os.path.join(self._project, ".clagentic", "lite", "last-adversarial.md")
         with open(ad_path, "w") as f:

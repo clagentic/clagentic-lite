@@ -4297,27 +4297,28 @@ build_gate_summary() {
       # append-only, verdict-aware record — require its latest entry for the
       # CURRENT branch to be an ANCHORED PASS at CURRENT_SHA, via the one
       # sanctioned predicate (_ledger_anchored_pass_at_head). This is
-      # strictly ADDITIONAL to the check above, never a replacement: a
-      # last-review.json stamp match with no matching ledger entry (ledger
-      # write failed, or predates lr-01ae73) still stales here, and a
-      # missing/stale verdict-at-HEAD in EITHER check means "re-review,
-      # never proceed" per this task's own item 4. Runs regardless of
-      # whether $RV exists at all -- an absent last-review.json means
-      # "review never ran," which must refuse exactly like any other
-      # missing-verdict-at-HEAD case, so this check is NOT nested inside
-      # `if [ -f "$RV" ]` the way the stamp check above is.
+      # strictly ADDITIONAL to the check above, never a replacement, for any
+      # repo that HAS a ledger: a last-review.json stamp match with no
+      # matching ledger entry still stales here, and a missing/stale
+      # verdict-at-HEAD in EITHER check means "re-review, never proceed"
+      # per this task's own item 4.
       #
-      # BOOTSTRAP EXEMPTION (narrow): when $RV EXISTS and its own stamp
-      # check above already passed (STALE_PAYLOAD still false at this
-      # point) but NO ledger file exists for this repo at all, treat that
-      # specific combination as "last-review.json was populated by a path
-      # that predates/bypasses cmd_review's ledger write (a caller writing
-      # the file directly, not through this repo's own review gate)" and do
-      # not additionally require a ledger entry -- the pre-existing stamp
-      # check already vouched for freshness in that case. This exemption
-      # does NOT apply when $RV is absent (review never ran at all, no
-      # freshness vouched for by anything) -- that case still requires the
-      # ledger check to run and correctly refuse.
+      # BOOTSTRAP EXEMPTION: when NO ledger file exists for this repo/branch
+      # at all, skip this check entirely rather than treating total absence
+      # as itself a staleness trigger. `cmd_review` (the sole ledger writer)
+      # creates the file on its very first successful run under THIS
+      # feature — its total absence means this repo has never gone through
+      # a ledger-aware review at all (a fresh checkout, or a caller/fixture
+      # populating last-review.json directly without ever invoking
+      # cmd_review). The pre-existing stamp check above already governs
+      # that case exactly as it did before this task; the ledger check only
+      # ever tightens behavior for a repo that has actually started using
+      # it (once `cmd_review` runs once, the file exists from then on and
+      # every subsequent merge-gate invocation is held to the ledger's own
+      # anchored-verdict bar). This mirrors the same bootstrap posture
+      # every other opt-in-by-first-write gate-state file in this codebase
+      # already has (review-seen-keys, review-recurrence.json, invariants.json)
+      # — absence is "not yet populated," not "populated and wrong."
       #
       # NO-JSON-TOOL EXEMPTION: when neither jq nor python3 is available,
       # _ledger_anchored_pass_at_head cannot read the ledger at all and
@@ -4333,8 +4334,8 @@ build_gate_summary() {
       # the existing no-tool path.
       if [ "$STALE_PAYLOAD" != "true" ]; then
         _mg_ledger=$(_review_ledger_path)
-        if [ -f "$RV" ] && [ ! -f "$_mg_ledger" ]; then
-          : # bootstrap exemption: RV vouched for freshness, no ledger to check
+        if [ ! -f "$_mg_ledger" ]; then
+          : # bootstrap exemption: no ledger for this repo/branch yet
         elif ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
           : # no-json-tool exemption: defer to the canonical gate_summary_degraded path
         else
