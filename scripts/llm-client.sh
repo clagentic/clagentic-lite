@@ -2191,13 +2191,24 @@ walk_chain() {
       ANY_UNWRAP_FAILED=1
       ERR_HINT="model returned more than one candidate JSON block matching role shape -- ambiguous, not silently picked (role=$ROLE_L mode=$MODE)"
     elif [ -s "$TMP_ERR" ]; then
-      # Strip ANSI CSI sequences (ESC [ ... m) then take the first non-empty line.
-      # sed -E is not POSIX but is available on every target (GNU + BSD sed both
-      # support it). POSIX fallback: if sed -E fails, fall back to head -1.
+      # Strip ANSI CSI sequences (ESC [ ... m) first (lr-4fb1). Then prefer
+      # the LAST line matching ^ERROR: when one exists: codex unconditionally
+      # prints a fixed version banner ("OpenAI Codex vX.Y.Z ...") as the
+      # FIRST lines of this stream on every invocation (stdout+stderr are
+      # merged into TMP_ERR by design -- see invoke_codex's header comment
+      # ~1376), so "first non-blank line" is structurally always the banner,
+      # never the real error. codex also emits repeated "ERROR: Reconnecting
+      # ... N/5" retry noise BEFORE the substantive final ERROR: line, so we
+      # take the LAST match (tail -1), not the first. When no ^ERROR: line is
+      # present at all (e.g. claude's error path, which has no banner
+      # problem), fall back to the prior first-non-blank-line behavior
+      # unchanged (lr-d5b322).
       ANY_INVOCATION_FAILED=1
-      ERR_HINT=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$TMP_ERR" 2>/dev/null \
-        | grep -v '^[[:space:]]*$' | head -1 | cut -c1-200) || \
-        ERR_HINT=$(head -1 "$TMP_ERR" | cut -c1-200)
+      _stripped_err=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$TMP_ERR" 2>/dev/null) || _stripped_err=$(cat "$TMP_ERR")
+      ERR_HINT=$(printf '%s\n' "$_stripped_err" | grep '^ERROR:' | tail -1 | cut -c1-200)
+      if [ -z "$ERR_HINT" ]; then
+        ERR_HINT=$(printf '%s\n' "$_stripped_err" | grep -v '^[[:space:]]*$' | head -1 | cut -c1-200)
+      fi
       [ -z "$ERR_HINT" ] && ERR_HINT="non-empty stderr (exit=$EXIT_CODE)"
     elif [ -s "$TMP_OUT" ]; then
       # SCHEMA-INVALID (the third of the minimum three failure classes,
