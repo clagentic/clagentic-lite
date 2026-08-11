@@ -34,6 +34,11 @@ clagentic-lite has two distinct steps.
 
 If you only run `init` and skip `enroll`, the tool is installed but inert.
 
+**Setting this up on someone else's behalf via an AI coding assistant?** See
+[`docs/LLM-USAGE.md`](docs/LLM-USAGE.md) — a checklist written for an LLM/agent
+session, not a human, covering exactly this two-step sequence plus the checks
+to run before assuming either step already happened.
+
 ---
 
 ## What you get
@@ -391,7 +396,8 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
 │   ├── DESIGN.md                               architecture and non-goals
 │   ├── GATES.md                                what each gate does, what it blocks
 │   ├── DEMO-SCRIPT.md                          5-minute walkthrough
-│   └── PORTABILITY.md                          GNU vs BSD tool table
+│   ├── PORTABILITY.md                          GNU vs BSD tool table
+│   └── LLM-USAGE.md                            checklist for an LLM/agent setting this up or operating it for a user
 ├── .claude/
 │   ├── settings.json                           hook wiring
 │   ├── commands/recall.md

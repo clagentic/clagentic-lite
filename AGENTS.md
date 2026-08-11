@@ -185,7 +185,7 @@ Do not debug a failed gate, hook, or command inline as your own problem. Dispatc
 | `scripts/llm-client.sh` | role-aware LLM wrapper with model_chain fallback |
 | `scripts/gates.sh` | gate orchestrator + digest + ship + merge-gate |
 | `scripts/smoke.sh` | non-interactive end-to-end (local sanity check) |
-| `docs/` | DESIGN, GATES, DEMO-SCRIPT, PORTABILITY |
+| `docs/` | DESIGN, GATES, DEMO-SCRIPT, PORTABILITY, LLM-USAGE (checklist for an LLM/agent setting up or operating clagentic-lite on a user's behalf) |
 | `examples/{python,node,go}/` | demo projects with planted issues |
 | `media/logo/` | brand assets (lockup, icon) |
 | `LICENSE` | FSL-1.1-MIT (free personal/internal; commercial licensing at clagentic.ai) |

@@ -55,7 +55,7 @@ If macOS users have Homebrew GNU tools on PATH ahead of system tools, clagentic-
 
 - `jq` **or** `python3` for JSON parsing in PreToolUse hooks. The previous `sed`-based JSON parser was a known security bypass surface (escaped-quote truncation). Without a real validator the hooks fail closed and block every Bash/Write/Edit tool call. `clagentic-lite doctor` flags this as a hard miss.
 - `sqlite3` for the memory and audit databases. macOS ships an old SQLite; we use only features available since 3.35 (no JSON1, no FTS5, no window functions).
-- `timeout` or `gtimeout` for LLM-call timeouts. If absent, calls run without timeouts — degraded but not broken, and `clagentic-lite doctor` warns.
+- `timeout` or `gtimeout` for LLM-call timeouts. If absent, `$DS_TIMEOUT_CMD` resolves to `ds_timeout_missing`, which **fails closed**: it refuses to run the wrapped command at all and returns exit 99, rather than running it unbounded (see the `timeout` row above and AGENTS.md Invariants, INV-1a). `clagentic-lite doctor` flags a missing `timeout`/`gtimeout` so you can install one before this bites you.
 
 ## Shell idioms in bin/clagentic-lite
 
