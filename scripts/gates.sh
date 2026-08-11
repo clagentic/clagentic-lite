@@ -4318,10 +4318,25 @@ build_gate_summary() {
       # does NOT apply when $RV is absent (review never ran at all, no
       # freshness vouched for by anything) -- that case still requires the
       # ledger check to run and correctly refuse.
+      #
+      # NO-JSON-TOOL EXEMPTION: when neither jq nor python3 is available,
+      # _ledger_anchored_pass_at_head cannot read the ledger at all and
+      # fails closed (treats it as no anchored pass) -- but this function
+      # ALREADY has a dedicated, canonical no-tool signal downstream
+      # (the site-1.12 "no JSON encoder available" fallback, which emits
+      # `gate_summary_degraded: true` rather than a bare stale-payload
+      # refusal, so the merge gate can tell "we could not evaluate this
+      # environment at all" apart from "we evaluated it and it's stale").
+      # Pre-empting that with a ledger-driven stale refusal here would
+      # collapse that distinction back to a generic staleness message.
+      # Skip the ledger check in this case and let control fall through to
+      # the existing no-tool path.
       if [ "$STALE_PAYLOAD" != "true" ]; then
         _mg_ledger=$(_review_ledger_path)
         if [ -f "$RV" ] && [ ! -f "$_mg_ledger" ]; then
           : # bootstrap exemption: RV vouched for freshness, no ledger to check
+        elif ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+          : # no-json-tool exemption: defer to the canonical gate_summary_degraded path
         else
           _mg_ledger_branch=$(_review_current_branch)
           if ! _ledger_anchored_pass_at_head "$_mg_ledger" "$_mg_ledger_branch" "$CURRENT_SHA"; then
