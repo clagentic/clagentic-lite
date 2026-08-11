@@ -888,6 +888,8 @@ Reads the last assistant turn from the Claude Code transcript path, passes it th
 
 ## Auditing what happened
 
+**Concurrent writers and the busy timeout (lr-c71845).** Every `sqlite3` invocation against `.clagentic/lite/audit.db` inside `scripts/gates.sh` and `scripts/platform.sh` (`ds_audit_log`) routes through one shared wrapper, `ds_sqlite3` (`scripts/platform.sh`), which prepends `-cmd ".timeout N"` — SQLite's own busy-retry mechanism — so a writer that finds the database locked (e.g. two gate runs racing) retries for up to `N` milliseconds instead of failing immediately with `SQLITE_BUSY`. `N` is configurable via `CLAGENTIC_SQLITE_BUSY_TIMEOUT_MS` (default `5000`), validated through `ds_positive_int_or_default` — an unset, non-numeric, or zero value falls back to the default rather than silently disabling the busy wait. This mirrors `run_bounded`'s unwritable-bare-form pattern: every call site in this codebase goes through the named wrapper, so a future bare `sqlite3 "$AUDIT_DB" ...` call would be visibly different from every sibling. Out of scope for this fix, and a real follow-up worth filing separately: SQLite's default rollback-journal mode still serializes writers even with a busy timeout in place (only one writer proceeds at a time; the timeout just makes the second one wait instead of failing) — WAL mode (`PRAGMA journal_mode=WAL`) would let readers and a single writer proceed concurrently and is the more complete fix for write contention, but is a schema/mode migration with its own compatibility considerations (older SQLite versions, network filesystems) and was intentionally not bundled into this change.
+
 ```sh
 # every gate run today
 sqlite3 .clagentic/lite/audit.db \
