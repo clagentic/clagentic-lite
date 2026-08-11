@@ -1062,16 +1062,400 @@ EOF_EXCL
   fi
 }
 
+# ---------------------------------------------------------------- review ledger --
+#
+# The review ledger (lr-01ae73) is the append-only, per-branch history of
+# every `gates.sh review` verdict: base_sha, head_sha, pass/block outcome,
+# structured findings, timestamp, and the gate config in effect. It replaces
+# floating, unanchored review state with an immutable record keyed to the
+# exact (base_sha, head_sha) pair a verdict evaluated — the same property
+# that makes a crew change-request review trustworthy across rounds (see
+# this task's own WHY). Storage and read/write primitives live in
+# review-merge.sh (ledger_append / ledger_entries_for_branch /
+# ledger_latest_for_branch) — gates.sh only builds entries and interprets
+# them; JSONL append/read is generic and belongs alongside this file's other
+# shared persistence helpers (dedup_findings' SEEN_FILE,
+# finding_recurrence_bump's COUNTS_FILE).
+#
+# FILE: .clagentic/lite/review-ledger.jsonl (gitignored local gate state,
+# same directory convention as last-review.json/review-seen-keys/
+# review-recurrence.json). One JSON object per line, oldest first.
+#
+# ANCHORED VERDICTS: a ledger entry's `verdict` field is one of:
+#   "pass"       — review ran, resolved a real head_sha, findings below the
+#                  block threshold.
+#   "block"      — review ran, resolved a real head_sha, findings at or
+#                  above the block threshold (or a degraded/infra failure).
+#   "unanchored" — review ran but HEAD's SHA could not be resolved (REPO_ROOT
+#                  not a git repo, or _git_repo_scoped_head_sha otherwise
+#                  came back empty). An unanchored entry is recorded for
+#                  audit-trail completeness but MUST NEVER be read as a
+#                  passing verdict by any consumer (_ledger_anchored_pass_at_head
+#                  below is the one sanctioned check) — a verdict with no
+#                  resolvable head SHA has nothing to anchor to and is
+#                  treated as NO verdict at all, per this task's own
+#                  acceptance criterion.
+#
+# _review_ledger_path — the one place the ledger's on-disk path is spelled,
+# so every reader/writer agrees on it.
+_review_ledger_path() {
+  printf '%s/.clagentic/lite/review-ledger.jsonl' "$REPO_ROOT"
+}
+
+# _review_current_branch — current branch name, or empty when REPO_ROOT is
+# not (provably) a git repo or HEAD is detached. Repo-scoped (lr-da1f28
+# sweep posture): guards on _git_repo_root_is_scoped exactly like every
+# other branch-name read in this file.
+_review_current_branch() {
+  _rcb_branch=""
+  if _git_repo_root_is_scoped; then
+    _rcb_branch=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  fi
+  [ "$_rcb_branch" = "HEAD" ] && _rcb_branch=""
+  printf '%s' "$_rcb_branch"
+}
+
+# _resolve_base_sha DEFAULT_BRANCH TIMEOUT_SEC — merge-base(origin/DEFAULT_BRANCH,
+# HEAD), using the SAME provably-current freshness precondition cmd_sast's
+# --baseline-commit scoping already established
+# (_gate_resolve_fresh_default_branch_ref) — reuse, not a second freshness
+# check. Prints the merge-base SHA on success; prints nothing on any
+# resolution failure (detached HEAD, on the default branch itself, fetch
+# failure/timeout, unverifiable freshness, shallow clone with no common
+# ancestor). Callers treat empty as "base_sha unresolvable" and must not
+# treat that as a hard error — a ledger entry with an empty base_sha is
+# still a valid, anchored entry as long as head_sha resolved; base_sha is
+# provenance (which merge-base a verdict was computed relative to), not the
+# anchor itself (head_sha is).
+_resolve_base_sha() {
+  _rbs_default_branch="$1"
+  _rbs_timeout="$2"
+
+  if ! _git_repo_root_is_scoped; then
+    return 0
+  fi
+  _rbs_current_branch=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  if [ -z "$_rbs_current_branch" ] || [ "$_rbs_current_branch" = "HEAD" ] || [ "$_rbs_current_branch" = "$_rbs_default_branch" ]; then
+    return 0
+  fi
+
+  _rbs_fresh_err_tmp=$(mktemp -t clagentic-basesha-err.XXXXXX)
+  _rbs_fresh_tip=$(_gate_resolve_fresh_default_branch_ref "$_rbs_default_branch" "$_rbs_timeout" 2>"$_rbs_fresh_err_tmp") || true
+  rm -f "$_rbs_fresh_err_tmp"
+  [ -n "$_rbs_fresh_tip" ] || return 0
+
+  _git merge-base "$_rbs_fresh_tip" HEAD 2>/dev/null || true
+}
+
+# _ledger_config_snapshot — one-line JSON object of the gate config in
+# effect for this review run (item 1's "gate config in effect" requirement).
+# Deliberately narrow: only the knobs that change WHAT was evaluated or HOW
+# a verdict was scored, not every CLAGENTIC_* var in the process environment
+# (an unbounded env dump would itself be an injection/bloat surface into a
+# file later read back and rendered).
+_ledger_config_snapshot() {
+  _lcs_threshold="${CLAGENTIC_BLOCK_SEVERITY:-high}"
+  _lcs_dedup="${CLAGENTIC_CROSS_ROUND_DEDUP:-1}"
+  _lcs_recurrence_threshold=$(_review_recurrence_threshold)
+  printf '{"block_severity":"%s","cross_round_dedup":%s,"recurrence_threshold":%s}' \
+    "$_lcs_threshold" \
+    "$([ "$_lcs_dedup" = "1" ] && echo true || echo false)" \
+    "$_lcs_recurrence_threshold"
+}
+
+# _ledger_anchored_pass_at_head LEDGER_FILE BRANCH HEAD_SHA — exit 0 (true)
+# only when the MOST RECENT ledger entry for BRANCH is anchored to HEAD_SHA
+# (its head_sha field equals HEAD_SHA) AND its verdict is "pass". This is
+# the one sanctioned "is there a currently-valid verdict" predicate — every
+# consumer (build_gate_summary) must route through this rather than
+# re-deriving the same check inline, mirroring this file's existing
+# "one shared helper, not a re-derivation per call site" discipline
+# (_git_repo_root_is_scoped, _gate_resolve_fresh_default_branch_ref).
+#
+# An "unanchored" verdict (empty/unresolvable head_sha at record time) can
+# never satisfy this check even if HEAD_SHA is also empty — an empty
+# head_sha never equals HEAD_SHA because HEAD_SHA is only ever passed in
+# from a resolved _git_repo_scoped_head_sha call, which is non-empty
+# whenever this function is worth calling at all; callers with no resolvable
+# HEAD_SHA should not call this function (there is nothing to anchor to).
+_ledger_anchored_pass_at_head() {
+  _laph_file="$1"
+  _laph_branch="$2"
+  _laph_head="$3"
+  [ -n "$_laph_head" ] || return 1
+
+  _laph_latest=$(ledger_latest_for_branch "$_laph_file" "$_laph_branch")
+  [ -n "$_laph_latest" ] || return 1
+
+  _laph_entry_head=""
+  _laph_entry_verdict=""
+  if command -v jq >/dev/null 2>&1; then
+    _laph_entry_head=$(printf '%s' "$_laph_latest" | jq -r '.head_sha // ""' 2>/dev/null)
+    _laph_entry_verdict=$(printf '%s' "$_laph_latest" | jq -r '.verdict // ""' 2>/dev/null)
+  elif command -v python3 >/dev/null 2>&1; then
+    _laph_entry_head=$(printf '%s' "$_laph_latest" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("head_sha",""))
+except Exception:
+    print("")' 2>/dev/null)
+    _laph_entry_verdict=$(printf '%s' "$_laph_latest" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("verdict",""))
+except Exception:
+    print("")' 2>/dev/null)
+  else
+    return 1
+  fi
+
+  [ -n "$_laph_entry_head" ] || return 1
+  [ "$_laph_entry_head" = "$_laph_head" ] || return 1
+  [ "$_laph_entry_verdict" = "pass" ]
+}
+
+# _ledger_mark_recurrence FINDINGS_JSON DIFF_FILE LEDGER_FILE BRANCH
+#
+# Item 5: findings carry stable identity across rounds so the ledger can
+# mark a finding recurring vs new. Reuses finding_content_keys
+# (review-merge.sh) — the SAME content-hash key space cross-round dedup/
+# recurrence-demotion already compute — against every PRIOR ledger entry's
+# findings for BRANCH. RECORDS RECURRENCE ONLY: this function never adjusts
+# severity, never excludes anything from severity_blockers' count, and is
+# entirely independent of _review_recurrence_demote/_recurrence_demoted
+# (that mechanism's SEVERITY-DEMOTION POLICY is explicitly prior art this
+# task must not resurrect — see lr-66e598 and this task's own OUT OF SCOPE).
+# The output is informational annotation only: each finding in the returned
+# array gets `_ledger_recurring: true|false`.
+#
+# stdout: the findings array with `_ledger_recurring` spliced onto every
+# finding object. On any failure (no python3, unparseable input, no prior
+# entries) prints FINDINGS_JSON unchanged (conservative passthrough — a
+# recurrence-marking failure must never alter which findings exist or their
+# severity, only whether the informational annotation is present).
+_ledger_mark_recurrence() {
+  _lmr_findings_json="$1"
+  _lmr_diff="$2"
+  _lmr_ledger="$3"
+  _lmr_branch="$4"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$_lmr_findings_json"
+    return 0
+  fi
+
+  # This round's content-hash keys for the live findings.
+  _lmr_live_tsv=$(mktemp -t clagentic-ledger-live.XXXXXX)
+  printf '%s' "$_lmr_findings_json" | finding_content_keys "$_lmr_diff" > "$_lmr_live_tsv" 2>/dev/null
+
+  # Prior rounds' keys: re-derive content-hash keys for every finding stored
+  # in every PRIOR ledger entry for this branch, against the diff recorded
+  # in the CURRENT round (finding_content_keys' key is a function of the
+  # diff's own content, not the round that produced it — recomputing prior
+  # findings' keys against this round's diff is exactly how dedup_findings'
+  # own SEEN_FILE already establishes cross-round identity, applied here to
+  # the ledger's own persisted history instead of a separate seen-keys file,
+  # since the ledger IS the persisted history this task requires).
+  _lmr_prior_keys=$(mktemp -t clagentic-ledger-prior.XXXXXX)
+  if [ -f "$_lmr_ledger" ]; then
+    ledger_entries_for_branch "$_lmr_ledger" "$_lmr_branch" | while IFS= read -r _lmr_entry; do
+      [ -n "$_lmr_entry" ] || continue
+      _lmr_entry_findings=$(printf '%s' "$_lmr_entry" | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print(json.dumps(d.get("findings", [])))
+except Exception:
+    print("[]")' 2>/dev/null)
+      [ -n "$_lmr_entry_findings" ] || continue
+      printf '%s' "$_lmr_entry_findings" | finding_content_keys "$_lmr_diff" 2>/dev/null
+    done >> "$_lmr_prior_keys"
+  fi
+
+  if [ ! -s "$_lmr_prior_keys" ]; then
+    # No prior history for this branch (or nothing keyable) — every finding
+    # is new by definition. Still splice the field explicitly (own the
+    # field, per this codebase's established "never leave an annotation
+    # implicit" posture — _review_recurrence_demote's own doc comment) so
+    # downstream readers see a definite false rather than an absent key.
+    _lmr_out=$(python3 - "$_lmr_findings_json" <<'PYEOF'
+import json, sys
+try:
+    findings = json.loads(sys.argv[1])
+    if not isinstance(findings, list):
+        raise ValueError
+except Exception:
+    print(sys.argv[1])
+    sys.exit(0)
+for f in findings:
+    if isinstance(f, dict):
+        f["_ledger_recurring"] = False
+print(json.dumps(findings))
+PYEOF
+)
+    rm -f "$_lmr_live_tsv" "$_lmr_prior_keys"
+    printf '%s' "$_lmr_out"
+    return 0
+  fi
+
+  # Build the set of prior keys (first TSV column), then splice
+  # _ledger_recurring onto every live finding whose recomputed key is in
+  # that set.
+  _lmr_out=$(python3 - "$_lmr_findings_json" "$_lmr_live_tsv" "$_lmr_prior_keys" <<'PYEOF'
+import json, sys
+
+findings_json, live_tsv, prior_tsv = sys.argv[1], sys.argv[2], sys.argv[3]
+
+try:
+    findings = json.loads(findings_json)
+    if not isinstance(findings, list):
+        raise ValueError
+except Exception:
+    print(findings_json)
+    sys.exit(0)
+
+prior_keys = set()
+try:
+    with open(prior_tsv) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            k = line.split("\t", 1)[0]
+            if k:
+                prior_keys.add(k)
+except Exception:
+    pass
+
+# live key -> finding triple (file, category, message), same join
+# convention _review_recurrence_demote already uses.
+live_key_by_triple = {}
+try:
+    with open(live_tsv) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            key, fname, category, message = parts[0], parts[1], parts[2], parts[3]
+            live_key_by_triple[(fname, category, message)] = key
+except Exception:
+    pass
+
+for f in findings:
+    if not isinstance(f, dict):
+        continue
+    triple = (str(f.get("file", "")), str(f.get("category", "")), str(f.get("message", "")))
+    key = live_key_by_triple.get(triple)
+    f["_ledger_recurring"] = bool(key and key in prior_keys)
+
+print(json.dumps(findings))
+PYEOF
+)
+  rm -f "$_lmr_live_tsv" "$_lmr_prior_keys"
+  printf '%s' "$_lmr_out"
+  return 0
+}
+
+# _ledger_record_review_verdict OUT_FILE DIFF_FILE OUTCOME BASE_SHA HEAD_SHA
+#
+# Item 1/2/5: builds and appends one ledger entry for this review run.
+# OUTCOME is "pass" or "block" (the caller's own severity_blockers/degraded
+# determination — this function does not re-derive it). HEAD_SHA empty means
+# the verdict is UNANCHORED (see "review ledger" above) regardless of
+# OUTCOME — recorded for audit-trail completeness but never readable as a
+# passing verdict by _ledger_anchored_pass_at_head.
+#
+# Fail-open: a ledger write failure (no python3/jq, malformed OUT_FILE) must
+# never abort or alter the review gate's own pass/block decision — the
+# ledger is a durability/history layer on top of that decision, not a
+# precondition for it. Matches every other on-disk gate-state writer's
+# posture in this file.
+_ledger_record_review_verdict() {
+  _lrrv_out="$1"
+  _lrrv_diff="$2"
+  _lrrv_outcome="$3"
+  _lrrv_base_sha="$4"
+  _lrrv_head_sha="$5"
+
+  _lrrv_verdict="$_lrrv_outcome"
+  [ -n "$_lrrv_head_sha" ] || _lrrv_verdict="unanchored"
+
+  _lrrv_ledger=$(_review_ledger_path)
+  _lrrv_branch=$(_review_current_branch)
+  _lrrv_ts=$(ds_date_iso)
+  _lrrv_config=$(_ledger_config_snapshot)
+
+  _lrrv_findings='[]'
+  if [ -f "$_lrrv_out" ]; then
+    _lrrv_findings=$(_extract_findings_json "$_lrrv_out")
+    [ -n "$_lrrv_findings" ] || _lrrv_findings='[]'
+  fi
+
+  # Recurrence marking (item 5) — informational only, see
+  # _ledger_mark_recurrence's own doc comment.
+  _lrrv_findings=$(_ledger_mark_recurrence "$_lrrv_findings" "$_lrrv_diff" "$_lrrv_ledger" "$_lrrv_branch")
+  [ -n "$_lrrv_findings" ] || _lrrv_findings='[]'
+
+  _lrrv_line=""
+  if command -v jq >/dev/null 2>&1; then
+    _lrrv_line=$(jq -nc \
+      --arg ts "$_lrrv_ts" \
+      --arg branch "$_lrrv_branch" \
+      --arg base "$_lrrv_base_sha" \
+      --arg head "$_lrrv_head_sha" \
+      --arg verdict "$_lrrv_verdict" \
+      --argjson findings "$_lrrv_findings" \
+      --argjson config "$_lrrv_config" \
+      '{ts: $ts, branch: $branch, base_sha: $base, head_sha: $head, verdict: $verdict, findings: $findings, config: $config}' 2>/dev/null)
+  elif command -v python3 >/dev/null 2>&1; then
+    _lrrv_line=$(python3 - "$_lrrv_ts" "$_lrrv_branch" "$_lrrv_base_sha" "$_lrrv_head_sha" "$_lrrv_verdict" "$_lrrv_findings" "$_lrrv_config" <<'PYEOF'
+import json, sys
+ts, branch, base, head, verdict, findings_json, config_json = sys.argv[1:8]
+try:
+    findings = json.loads(findings_json)
+    if not isinstance(findings, list):
+        findings = []
+except Exception:
+    findings = []
+try:
+    config = json.loads(config_json)
+except Exception:
+    config = {}
+print(json.dumps({
+    "ts": ts, "branch": branch, "base_sha": base, "head_sha": head,
+    "verdict": verdict, "findings": findings, "config": config,
+}))
+PYEOF
+)
+  fi
+
+  [ -n "$_lrrv_line" ] || return 0
+
+  _lrrv_max="${CLAGENTIC_LEDGER_MAX_PER_BRANCH:-0}"
+  case "$_lrrv_max" in ''|*[!0-9]*) _lrrv_max=0 ;; esac
+  ledger_append "$_lrrv_ledger" "$_lrrv_line" "$_lrrv_max"
+  ds_audit_log "review-ledger" "pass" "branch=${_lrrv_branch:-<none>} verdict=${_lrrv_verdict} head=${_lrrv_head_sha:-<unresolved>}"
+  return 0
+}
+
 # get_review_diff — prints the best available diff to stdout for use by
 # cmd_review and cmd_adversarial.
 #
 # Priority:
 #   1. Staged diff (git diff --cached) — normal pre-commit path.
-#   2. --since-last-review: when REVIEW_SINCE_LAST=1 is set (by cmd_review
-#      parsing the --since-last-review flag) AND .clagentic/lite/last-review.json
-#      contains a _clagentic_diff_sha, diff <that-sha>..HEAD instead of the
-#      full origin/<default>..HEAD branch diff. This is the structural fix for
-#      the death-spiral (many fix-commits accumulating into an unreviewed diff).
+#   2. Delta re-review (default-on, lr-01ae73; generalizes the former
+#      --since-last-review opt-in flag into the default mode): when the
+#      current branch has a prior ANCHORED ledger verdict (see "review
+#      ledger" above) whose head_sha resolves as an ancestor of HEAD in
+#      THIS repo, diff <that head_sha>..HEAD instead of the full
+#      origin/<default>..HEAD branch diff. This is the structural fix for
+#      the death-spiral (many fix-commits accumulating into an unreviewed
+#      diff). --full-review forces full-range regardless of ledger state.
+#      A prior head_sha that no longer resolves as an ancestor of HEAD
+#      (rebase, amend, force-push) is NOT usable as a delta base — falls
+#      through to full-range and says so on stderr (fail toward MORE
+#      coverage, matching cmd_sast/cmd_bleed doctrine — see REVIEW_FULL
+#      handling below).
 #   3. Branch diff against origin/<default_branch> — PR path when index is
 #      clean but we are on a feature branch with committed changes.
 #   4. Empty — on the default branch with no staged changes; review will see
@@ -1106,26 +1490,57 @@ get_review_diff() {
     return 0
   fi
 
-  # --since-last-review: diff from the SHA in last-review.json..HEAD.
-  # Activated only when REVIEW_SINCE_LAST=1 (set by cmd_review's flag parsing).
-  if [ "${REVIEW_SINCE_LAST:-0}" = "1" ]; then
-    _grd_last_json="$REPO_ROOT/.clagentic/lite/last-review.json"
-    _grd_last_sha=""
-    if [ -f "$_grd_last_json" ]; then
-      if command -v jq >/dev/null 2>&1; then
-        _grd_last_sha=$(jq -r '._clagentic_diff_sha // ""' "$_grd_last_json" 2>/dev/null)
-      elif command -v python3 >/dev/null 2>&1; then
-        _grd_last_sha=$(python3 -c \
-          'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("_clagentic_diff_sha",""))' \
-          "$_grd_last_json" 2>/dev/null)
+  # Delta re-review (default-on, lr-01ae73 — generalizes the former
+  # --since-last-review opt-in into the default mode; the flag itself
+  # remains accepted as a backward-compatible no-op, since it now names the
+  # default behavior rather than a distinct one). REVIEW_FULL=1 (set by
+  # cmd_review's --full-review flag parsing) opts back out to full-range.
+  #
+  # SOURCE OF TRUTH: the review ledger's latest ANCHORED verdict for the
+  # current branch (_review_ledger_path / ledger_latest_for_branch,
+  # review-merge.sh) — not last-review.json's _clagentic_diff_sha stamp,
+  # which only ever remembers the SINGLE most recent run and is overwritten
+  # on every call regardless of outcome. The ledger is append-only and
+  # verdict-aware, so this reads the same value the "generalize, don't
+  # parallel" reuse-seam instruction points at, just from the durable
+  # record rather than the single mutable snapshot.
+  if [ "${REVIEW_FULL:-0}" != "1" ]; then
+    _grd_ledger=$(_review_ledger_path)
+    _grd_prior_head=""
+    if [ -f "$_grd_ledger" ]; then
+      _grd_latest_entry=$(ledger_latest_for_branch "$_grd_ledger" "$CURRENT_BRANCH")
+      if [ -n "$_grd_latest_entry" ]; then
+        if command -v jq >/dev/null 2>&1; then
+          _grd_prior_head=$(printf '%s' "$_grd_latest_entry" | jq -r '.head_sha // ""' 2>/dev/null)
+        elif command -v python3 >/dev/null 2>&1; then
+          _grd_prior_head=$(printf '%s' "$_grd_latest_entry" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("head_sha",""))
+except Exception:
+    print("")' 2>/dev/null)
+        fi
       fi
     fi
-    if [ -n "$_grd_last_sha" ]; then
-      printf '[gates/review] --since-last-review: diffing %s..HEAD\n' "$_grd_last_sha" 1>&2
-      _git diff "${_grd_last_sha}..HEAD" --unified=3 2>/dev/null
-      return 0
+
+    if [ -n "$_grd_prior_head" ]; then
+      # UNRESOLVABLE PRIOR SHA (rebase/amend/force-push): a prior head_sha
+      # this repo can no longer parse as a commit, or that is not an
+      # ancestor of current HEAD, cannot anchor a delta diff — `git diff
+      # A..B` between two unrelated/missing points is not "the delta since
+      # the prior verdict," it is either a hard error or a misleading
+      # unrelated-history diff. Fail toward MORE coverage: fall through to
+      # full-range below and SAY SO, matching cmd_sast/cmd_bleed's own
+      # "never silently narrow on a resolution failure" doctrine.
+      if _git rev-parse --verify -q "${_grd_prior_head}^{commit}" >/dev/null 2>&1 \
+         && _git merge-base --is-ancestor "$_grd_prior_head" HEAD 2>/dev/null; then
+        printf '[gates/review] delta re-review: diffing %s..HEAD (prior anchored verdict on this branch)\n' "$_grd_prior_head" 1>&2
+        _git diff "${_grd_prior_head}..HEAD" --unified=3 2>/dev/null
+        return 0
+      else
+        printf '[gates/review] delta re-review: prior verdict SHA %s is no longer an ancestor of HEAD (rebase/amend/force-push) — falling back to full-range review\n' "$_grd_prior_head" 1>&2
+      fi
     else
-      printf '[gates/review] --since-last-review: no prior review SHA found; falling through to branch diff\n' 1>&2
+      printf '[gates/review] delta re-review: no prior anchored verdict for branch %s — full-range review\n' "${CURRENT_BRANCH:-<none>}" 1>&2
     fi
   fi
 
@@ -2242,15 +2657,25 @@ _invariant_feed_distill() {
 
 cmd_review() {
   # Parse flags; all args consumed by the subcommand dispatcher.
-  REVIEW_SINCE_LAST=0
+  #
+  # --since-last-review: RETAINED as a backward-compatible no-op (lr-01ae73
+  # generalized the behavior it used to opt into — diffing since the prior
+  # verdicted SHA — into the DEFAULT mode; see get_review_diff). A caller
+  # that still passes it gets exactly the behavior it always asked for,
+  # silently, rather than an "unknown flag" surprise.
+  # --full-review: the new opt-OUT, replacing the old opt-IN's role — forces
+  # get_review_diff to skip the ledger-anchored delta and use the full
+  # branch-diff-against-default (or staged-diff) path instead.
+  REVIEW_FULL=0
   _crv_reset_dedup=0
   for _crv_arg in "$@"; do
     case "$_crv_arg" in
-      --since-last-review) REVIEW_SINCE_LAST=1 ;;
-      --reset-dedup)       _crv_reset_dedup=1 ;;
+      --full-review)        REVIEW_FULL=1 ;;
+      --since-last-review)  : ;;  # no-op: this is the default now
+      --reset-dedup)        _crv_reset_dedup=1 ;;
     esac
   done
-  export REVIEW_SINCE_LAST
+  export REVIEW_FULL
 
   # --reset-dedup: delete the persisted seen-keys file (and the recurrence
   # counts file, which is derived from the same content-hash key space and
@@ -2296,7 +2721,7 @@ cmd_review() {
 
   # Squash hint: warn the operator when the diff is large, before the chunking decision.
   if [ "$_crv_diff_bytes" -gt "$_crv_chunk_bytes" ]; then
-    printf '[gates/review] diff is %d bytes (threshold %d) — consider --since-last-review or squashing commits to reduce review scope\n' \
+    printf '[gates/review] diff is %d bytes (threshold %d) — delta re-review (default) or squashing commits reduces review scope\n' \
       "$_crv_diff_bytes" "$_crv_chunk_bytes" 1>&2
   fi
 
@@ -2398,6 +2823,14 @@ cmd_review() {
       if [ -n "$_review_sha" ]; then
         _stamp_envelope "$OUT" "$_review_sha"
       fi
+      # base_sha for the ledger entry (item 1/2) — merge-base against the
+      # default branch, the SAME provably-current resolution cmd_sast's
+      # baseline scoping uses. Empty on any resolution failure; a ledger
+      # entry with empty base_sha is still valid as long as head_sha
+      # resolved (see _resolve_base_sha's own doc comment).
+      _crv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
+      _crv_fetch_timeout=$(ds_positive_int_or_default "$_crv_fetch_timeout" 30)
+      _crv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_crv_fetch_timeout")
 
       # Cross-round dedup (default-on). Suppresses findings already seen in a prior
       # round when the relevant diff lines are unchanged (content-hash strategy).
@@ -2453,6 +2886,12 @@ cmd_review() {
         fi
         echo "[gates/review] Check LLM CLI config/auth. Set CLAGENTIC_REVIEWER_REQUIRED=1 to make this a hard gate error." 1>&2
         echo "[gates/review] full details: $OUT  |  scripts/gates.sh digest" 1>&2
+        # Degraded: no real verdict was reached. Record as unanchored/block
+        # rather than skipping the ledger entirely — the audit trail should
+        # show a degraded round happened, and an unresolved head_sha
+        # (or a resolved one paired with outcome "block" below) can never
+        # be read as a passing verdict either way.
+        _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
         rm -f "$_crv_diff_tmp"
         rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
         return 2
@@ -2464,12 +2903,14 @@ cmd_review() {
         cmd_log_run review block "review-blocked: $BLOCKERS finding(s) at >= $THRESHOLD"
         echo "[gates/review] REVIEW_BLOCKED: $BLOCKERS finding(s) at or above severity '$THRESHOLD'." 1>&2
         cmd_render_review "$OUT" 1>&2
+        _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
         rm -f "$_crv_diff_tmp"
         rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
         return 1
       fi
       cmd_log_run review pass "0 findings at >= $THRESHOLD (chunked)"
       cmd_render_review "$OUT"
+      _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "pass" "$_crv_base_sha" "$_review_sha"
       rm -f "$_crv_diff_tmp"
       rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
       return 0
@@ -2506,6 +2947,11 @@ cmd_review() {
   if [ -n "$_review_sha" ]; then
     _stamp_envelope "$OUT" "$_review_sha"
   fi
+  # base_sha for the ledger entry (item 1/2) — see the chunked-path comment
+  # above for the full rationale (same logic, single-pass path).
+  _crv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
+  _crv_fetch_timeout=$(ds_positive_int_or_default "$_crv_fetch_timeout" 30)
+  _crv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_crv_fetch_timeout")
 
   # Cross-round dedup (default-on). Suppresses findings already seen in a prior
   # round when the relevant diff lines are unchanged (content-hash strategy).
@@ -2535,7 +2981,10 @@ cmd_review() {
   # unconditionally, outside the CLAGENTIC_CROSS_ROUND_DEDUP gate above.
   _review_deferral_match "$OUT"
 
-  rm -f "$_crv_diff_tmp"
+  # NOTE: $_crv_diff_tmp is deleted at each exit point below (not here) —
+  # _ledger_record_review_verdict (item 1/2/5) still needs it for recurrence
+  # marking (finding_content_keys reads the diff to recompute content-hash
+  # keys) at every one of the three exits that follow.
 
   # Reject degraded envelopes outright. An LLM wrapper that failed every
   # chain step emits valid JSON with findings:[] — schema-valid but
@@ -2578,6 +3027,10 @@ cmd_review() {
       fi
     fi
     echo "[gates/review] full details: $OUT  |  scripts/gates.sh digest" 1>&2
+    # Degraded: no real verdict was reached — see the chunked-path comment
+    # at its own degraded exit for why this is still recorded.
+    _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
+    rm -f "$_crv_diff_tmp"
     return 2
   fi
   # Severity gate: count findings >= configured threshold.
@@ -2587,10 +3040,14 @@ cmd_review() {
     cmd_log_run review block "review-blocked: $BLOCKERS finding(s) at >= $THRESHOLD"
     echo "[gates/review] REVIEW_BLOCKED: $BLOCKERS finding(s) at or above severity '$THRESHOLD'." 1>&2
     cmd_render_review "$OUT" 1>&2
+    _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
+    rm -f "$_crv_diff_tmp"
     return 1
   fi
   cmd_log_run review pass "0 findings at >= $THRESHOLD"
   cmd_render_review "$OUT"
+  _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "pass" "$_crv_base_sha" "$_review_sha"
+  rm -f "$_crv_diff_tmp"
 }
 
 # _stamp_envelope FILE SHA — add _clagentic_diff_sha to a JSON envelope file.
