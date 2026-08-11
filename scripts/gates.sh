@@ -1790,6 +1790,16 @@ _extract_findings_json() {
 # on a synthetic error" (severity_blockers' own sentinel-99 path already
 # owns fail-closed for genuinely unparseable JSON; this function's job is
 # narrower than that and must not duplicate or fight it).
+#
+# ISSUE_CLASS / CLASS_FIX (lr-3eb18c): two additional string fields, same
+# bare-name (string-only) allowlist shape as the original five -- every
+# finding must name the recurring issue class it belongs to and, if any,
+# the structural fix that eliminates the class (see ds_review_prompt,
+# scripts/llm-client.sh). validate_output enforces PRESENCE (a review
+# missing either field is malformed and the step fails); this allowlist
+# only prevents a model from smuggling an unrelated field under either
+# name. Neither field is read by severity_blockers -- see that function's
+# own comment for why this stays mandatory-but-non-blocking by construction.
 _sanitize_review_findings_envelope() {
   _srfe_file="$1"
   [ -f "$_srfe_file" ] || return 0
@@ -1798,7 +1808,8 @@ _sanitize_review_findings_envelope() {
   [ -n "$_srfe_findings" ] || return 0
 
   _srfe_clean=$(_llm_json_array_allowlist_fields "$_srfe_findings" \
-    severity file "line:number" category message evidence suggestion)
+    severity file "line:number" category message evidence suggestion \
+    issue_class class_fix)
   [ -n "$_srfe_clean" ] || return 0
 
   if command -v jq >/dev/null 2>&1; then
@@ -3546,6 +3557,11 @@ severity_rank() {
   esac
 }
 
+# ISSUE_CLASS / CLASS_FIX (lr-3eb18c): deliberately NOT read anywhere in
+# this function. issue_class/class_fix are mandatory-but-non-blocking by
+# design (presence is enforced by validate_output, scripts/llm-client.sh) --
+# an unresolved class escalation must never become a new way to gate /ship.
+# Do not add either field to this function's selection logic.
 severity_blockers() {
   FILE="$1"; THRESHOLD="$2"
   TR=$(severity_rank "$THRESHOLD")
@@ -4116,6 +4132,14 @@ cmd_render_review() {
     # suppression, must be legible" posture. Findings without either
     # annotation (feature off, no match, or first report) render exactly as
     # before — this is purely additive text on the same line.
+    #
+    # issue_class/class_fix (lr-3eb18c): rendered as a second, indented line
+    # under the finding so the class-level answer is visible without adding
+    # noise to findings that are genuinely isolated ("none — isolated" is
+    # suppressed from this line entirely -- it is the expected, honest
+    # majority case and would otherwise drown out the findings that DO name
+    # a real class). This is display only, mandatory-but-non-blocking per
+    # severity_blockers' own comment above -- never gates /ship.
     jq -r '"== clagentic-lite review ==\nsummary: " + .summary + "\nfindings: " + (.findings | length | tostring) + "\n",
            (.findings[] | "[" + .severity + "] " + .file + ":" + (.line|tostring) + " " + .message +
              (if ._recurrence_demoted == true
@@ -4123,6 +4147,9 @@ cmd_render_review() {
               else "" end) +
              (if ._deferral_matched == true
               then " (matched deferral " + (._deferral_id // "?") + ")"
+              else "" end) +
+             (if (.issue_class != null) and (.issue_class != "none — isolated")
+              then "\n    class: " + .issue_class + (if (.class_fix != null) and (.class_fix != "") then " -> " + .class_fix else "" end)
               else "" end))' \
       "$FILE"
   else
