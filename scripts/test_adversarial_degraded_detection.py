@@ -204,11 +204,32 @@ class TestCmdAdversarialDegradedCheck(unittest.TestCase):
         self.assertIn("Degraded output", out)
 
 
+_FAKE_LLM_CLIENT_CLEAN_REVIEW = """\
+#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{"summary": "clean", "checked": ["security"], "findings": []}
+EOF
+exit 0
+"""
+
+
 class TestBuildGateSummaryAdversarialDegradedField(unittest.TestCase):
     """build_gate_summary must surface adversarial_degraded independent of
     cmd_adversarial's own exit status -- a later run of build_gate_summary
     (e.g. via `gates ship`'s merge-gate step) reads last-adversarial.md
-    fresh, it does not receive cmd_adversarial's return code directly."""
+    fresh, it does not receive cmd_adversarial's return code directly.
+
+    Drives a REAL cmd_review call (lr-01ae73 fold-in, PEACHES/coordinator
+    finding on PR #162 comment 5260223912) to seed an anchored ledger pass
+    before each fixture's own last-adversarial.md setup, rather than
+    hand-writing last-review.json directly -- since lr-01ae73 removed the
+    merge-gate's ledger bootstrap exemption, build_gate_summary now refuses
+    with stale_payload for ANY repo that has never gone through cmd_review
+    at all, regardless of what last-review.json itself contains. This is a
+    strengthening of the test setup (it now exercises the real path a
+    caller would actually take), not a weakening of any assertion below --
+    every existing assertion in this class is unchanged."""
 
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp(prefix="clagentic-test-bgs-adv-degraded-")
@@ -216,6 +237,46 @@ class TestBuildGateSummaryAdversarialDegradedField(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _seed_anchored_review_pass(self):
+        """Run the real cmd_review (clean stub envelope, staged diff -- see
+        _stage_a_change's own doc comment for why staged, not committed)
+        against self._tmpdir so build_gate_summary's ledger-anchored check
+        (lr-01ae73) finds a genuine passing verdict at current HEAD. Uses
+        the full gates.sh subcommand dispatcher (not _functions_only_source)
+        since cmd_review's own flag-parsing/dispatch path is what a real
+        caller invokes -- build_gate_summary itself is still exercised via
+        the functions-only source in _run_build_gate_summary below, in the
+        SAME project directory, so it sees the ledger cmd_review just wrote."""
+        _stage_a_change(self._tmpdir)
+        fake_tool_home = tempfile.mkdtemp(prefix="clagentic-test-bgs-adv-degraded-review-home-")
+        try:
+            scripts_dir = os.path.join(fake_tool_home, "scripts")
+            os.makedirs(scripts_dir)
+            real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
+            for fname in os.listdir(real_scripts_dir):
+                if fname.endswith(".sh") and fname != "llm-client.sh":
+                    os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(scripts_dir, fname))
+            real_share = os.path.join(TOOL_HOME, "share")
+            if os.path.isdir(real_share):
+                os.symlink(real_share, os.path.join(fake_tool_home, "share"))
+            stub_path = os.path.join(scripts_dir, "llm-client.sh")
+            with open(stub_path, "w") as f:
+                f.write(_FAKE_LLM_CLIENT_CLEAN_REVIEW)
+            os.chmod(stub_path, 0o755)
+
+            env = os.environ.copy()
+            env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
+            env["CLAGENTIC_ALLOW_MISSING_GITLEAKS"] = "1"
+            env["CLAGENTIC_ALLOW_MISSING_SEMGREP"] = "1"
+            env["CLAGENTIC_ALLOW_MISSING_OSV"] = "1"
+            r = subprocess.run(
+                ["sh", os.path.join(scripts_dir, "gates.sh"), "review"],
+                capture_output=True, text=True, env=env, cwd=self._tmpdir,
+            )
+            self.assertEqual(r.returncode, 0, f"seed cmd_review failed: {r.stderr}")
+        finally:
+            shutil.rmtree(fake_tool_home, ignore_errors=True)
 
     def _write_adversarial_md(self, content, marked=False):
         """Write a last-adversarial.md fixture, stamp-prepended exactly as
@@ -229,7 +290,12 @@ class TestBuildGateSummaryAdversarialDegradedField(unittest.TestCase):
         property the hardening exists to provide -- see
         test_clean_markdown_sets_adversarial_degraded_false and the new
         test_unmarked_degraded_banner_text_is_not_treated_as_degraded
-        below, which pins that property explicitly)."""
+        below, which pins that property explicitly).
+
+        Called AFTER _seed_anchored_review_pass, so it stamps the SAME
+        current HEAD the ledger entry is anchored to -- cmd_review's own
+        staged-diff review does not create a new commit, so HEAD is
+        unchanged by seeding."""
         clagentic_dir = os.path.join(self._tmpdir, ".clagentic", "lite")
         os.makedirs(clagentic_dir, exist_ok=True)
         sha = _head_sha(self._tmpdir)
@@ -259,6 +325,7 @@ class TestBuildGateSummaryAdversarialDegradedField(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_degraded_markdown_sets_adversarial_degraded_true(self):
+        self._seed_anchored_review_pass()
         self._write_adversarial_md(
             "# Degraded output\n\nclagentic-lite role-call wrapper could not "
             "produce a real response: all chain steps failed for role auditor.\n",
@@ -272,6 +339,7 @@ class TestBuildGateSummaryAdversarialDegradedField(unittest.TestCase):
         )
 
     def test_clean_markdown_sets_adversarial_degraded_false(self):
+        self._seed_anchored_review_pass()
         self._write_adversarial_md("# Adversarial findings\n\nNo exploitable issues found.\n")
         payload = self._run_build_gate_summary()
         self.assertFalse(payload["adversarial_degraded"])
@@ -285,6 +353,7 @@ class TestBuildGateSummaryAdversarialDegradedField(unittest.TestCase):
         verbatim -- must NOT be classified as degraded. Before this fix,
         build_gate_summary's own hand-rolled `grep -qF` check had no
         marker-byte gate and WOULD have misclassified this as degraded."""
+        self._seed_anchored_review_pass()
         self._write_adversarial_md(
             "# Degraded output\n\nthis text was written by a prompt-injected "
             "auditor response, not by emit_degraded -- it carries no marker byte.\n",
@@ -303,7 +372,12 @@ class TestBuildGateSummaryAdversarialDegradedField(unittest.TestCase):
         """File-absent (adversarial gate never ran) is ADVERSARIAL_MISSING's
         job, a distinct state from ADVERSARIAL_DEGRADED -- a file that was
         never written is not the same failure as a file that WAS written
-        but records a dead auditor."""
+        but records a dead auditor. Still needs a seeded review pass (lr-01ae73)
+        so build_gate_summary reaches the adversarial-missing/degraded logic
+        at all instead of refusing earlier on stale_payload -- last-adversarial.md
+        itself is deliberately never written here, which is the property
+        under test."""
+        self._seed_anchored_review_pass()
         payload = self._run_build_gate_summary()
         self.assertTrue(payload["adversarial_missing"])
         self.assertFalse(payload["adversarial_degraded"])

@@ -504,6 +504,193 @@ notion of sameness.
 
 Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/config` (global). See `share/config.example` for the full entry.
 
+### Review ledger and anchored verdicts (lr-01ae73)
+
+**Why this exists.** Before this task, a review verdict was a single mutable
+file (`last-review.json`) stamped with the HEAD SHA it was computed against
+— every new run overwrote the prior one, so there was no durable record of
+what a PAST round found, only what the MOST RECENT round found. That is the
+opposite of what makes a crew change-request review trustworthy across
+rounds: an immutable artifact, at a specific SHA, with persistent findings
+history. The review ledger closes that gap without inventing a parallel
+mechanism — it generalizes the SAME seam `--since-last-review` already
+established (the `_clagentic_diff_sha` stamp `get_review_diff` reads to
+scope a delta diff), turning "diff since the last run" from an opt-in flag
+into the default, and turning "the last run's stamp" from a single mutable
+snapshot into a durable, append-only history.
+
+**File:** `.clagentic/lite/review-ledger.jsonl` (gitignored local gate
+state, same directory convention as `last-review.json`/`review-seen-keys`).
+[JSON Lines](https://jsonlines.org/) format — one JSON object per line,
+oldest first (`ledger_append`, `scripts/review-merge.sh`, only ever appends;
+file order is chronological order by construction). **Local-only, no host,
+no network, no running session** — every capability below is proven purely
+against the on-disk repo and this file, including on a repo with no `git
+remote` configured at all.
+
+**Entry schema (one JSON object per line):**
+
+```json
+{
+  "ts": "2026-08-11T20:15:00Z",
+  "branch": "feat/example",
+  "base_sha": "a1b2c3d...",
+  "head_sha": "e4f5a6b...",
+  "verdict": "pass",
+  "findings": [
+    {"severity": "medium", "file": "app.py", "line": 12, "category": "style",
+     "message": "...", "issue_class": "...", "class_fix": "...",
+     "_ledger_recurring": false}
+  ],
+  "config": {"block_severity": "high", "cross_round_dedup": true, "recurrence_threshold": 2}
+}
+```
+
+| Field | Description |
+|---|---|
+| `ts` | ISO-8601 timestamp of the review run (`ds_date_iso`, `scripts/platform.sh`) |
+| `branch` | Branch name the review ran on (`_review_current_branch`, `scripts/gates.sh`); empty on a detached HEAD or a non-git `REPO_ROOT` |
+| `base_sha` | `merge-base(origin/<default-branch>, HEAD)`, resolved via the SAME provably-current freshness precondition `cmd_sast`'s `--baseline-commit` scoping uses (`_gate_resolve_fresh_default_branch_ref`) — reuse, not a parallel freshness check. Empty when unresolvable (detached HEAD, on the default branch itself, unreachable remote, shallow clone) — provenance, not the anchor itself; a ledger entry with an empty `base_sha` is still a valid, anchored entry as long as `head_sha` resolved. |
+| `head_sha` | The commit SHA this verdict evaluated, via `_git_repo_scoped_head_sha` (same repo-scoping discipline as every other SHA read in this file). **This is the anchor** — see "Anchored verdicts" below. |
+| `verdict` | `"pass"`, `"block"`, or `"unanchored"` (see below) |
+| `findings` | The exact structured findings array from this round's `last-review.json`, each annotated with `_ledger_recurring` (see "Stable finding identity" below) |
+| `config` | The gate config in effect for this run: `block_severity` (`CLAGENTIC_BLOCK_SEVERITY`), `cross_round_dedup` (`CLAGENTIC_CROSS_ROUND_DEDUP`), `recurrence_threshold` (`CLAGENTIC_RECURRENCE_THRESHOLD`) |
+
+**Append-only; prior entries retained.** `ledger_append` never rewrites or
+removes an entry except for the optional per-branch cap
+(`CLAGENTIC_LEDGER_MAX_PER_BRANCH`, default unlimited — see
+`share/config.example`) — this is what makes finding recurrence across
+rounds visible after the fact: every prior round's findings for a branch
+stay on disk, not just the latest one.
+
+**Anchored verdicts (item 2).** `cmd_review` always records the
+`(base_sha, head_sha)` pair it evaluated — every call to
+`_ledger_record_review_verdict` (`scripts/gates.sh`) passes both, resolved
+fresh for that run, regardless of outcome. A verdict with NO resolvable
+`head_sha` (`_git_repo_scoped_head_sha` came back empty — `REPO_ROOT` is not
+a git repo, or some other resolution failure) is recorded with
+`verdict: "unanchored"` rather than silently reusing the caller's own
+`"pass"`/`"block"` determination — an unanchored entry exists for
+audit-trail completeness only and **is treated as NO verdict by every
+consumer**: `_ledger_anchored_pass_at_head` (`scripts/gates.sh`), the one
+sanctioned predicate for "does an anchored pass exist for this branch at
+this SHA," requires both a non-empty stored `head_sha` matching the
+queried SHA AND `verdict == "pass"` — an `"unanchored"` entry can never
+satisfy either half.
+
+**Delta re-review is now the default (item 3).** `get_review_diff`
+(`scripts/gates.sh`) generalizes the former `--since-last-review` opt-in
+flag: when the current branch has a prior ANCHORED ledger verdict (i.e.
+`ledger_latest_for_branch` returns an entry with a non-empty `head_sha`),
+review diffs `<that head_sha>..HEAD` by default instead of the full
+`origin/<default>..HEAD` branch diff. `--since-last-review` is still
+accepted (as a backward-compatible no-op — it names the same behavior that
+is now the default). `gates.sh review --full-review` forces the full-range
+branch diff regardless of ledger state — the explicit opt-out this task
+requires stays available.
+
+**Unresolvable prior SHA falls back to full-range (fail toward MORE
+coverage).** A prior `head_sha` this repo can no longer resolve as a real
+commit, or that is not an ancestor of current HEAD (`git merge-base
+--is-ancestor`) — the shape a rebase, `commit --amend`, or force-push
+produces — cannot anchor a delta diff: `git diff A..B` between two
+unrelated or missing points is not "the delta since the prior verdict," it
+is either a hard error or a misleading unrelated-history diff. `get_review_diff`
+detects this and falls back to the full branch-diff path, **and says so on
+stderr** (`delta re-review: prior verdict SHA ... is no longer an ancestor
+of HEAD (rebase/amend/force-push) — falling back to full-range review`) —
+the same "never silently narrow on a resolution failure, always widen and
+announce it" doctrine `cmd_sast`'s baseline scoping and `cmd_bleed`'s branch
+scoping already established for their own freshness-resolution failures.
+
+**Merge-gate consumption (item 4) — stale or missing verdict-at-HEAD means
+re-review, never proceed.** `build_gate_summary` (`scripts/gates.sh`)
+already compared `last-review.json`'s `_clagentic_diff_sha` stamp against
+current HEAD before this task (a single-snapshot staleness check). The
+ledger adds a SECOND, additional check on top of that one, never a
+replacement: after the existing stamp comparison, `build_gate_summary` also
+requires `_ledger_anchored_pass_at_head(<ledger>, <current branch>,
+<current HEAD SHA>)` to hold. Either check failing sets `stale_payload:
+true` (with `"review-ledger"` appended to `stale_gates` when the ledger
+check is the one that failed) — `cmd_merge_gate` short-circuits on a stale
+payload exactly as before (deterministic refusal, no LLM call, no token
+burn — see "Gate 6 — Merge Gate" below). This closes a gap the single-file
+snapshot check could not: a `last-review.json` stamp match with no
+corresponding ledger entry for the current branch/SHA — including when the
+ledger file is absent entirely — still stales, and — more importantly — a
+*prior* passing round's stamp can never be misread as covering a *later*,
+unreviewed HEAD, because the ledger's latest entry for the branch is
+checked by identity (`head_sha == HEAD`) and by verdict (`"pass"`), not by
+"a file with this name happens to exist."
+
+**No bootstrap exemption — deliberately.** An earlier revision of this
+check skipped the ledger requirement whenever `review-ledger.jsonl` did not
+yet exist for the repo, reasoning that a fresh checkout should fall back to
+the pre-existing single-file stamp check. Review caught this as a
+permanent escape hatch, not a bootstrap accommodation: "no ledger file
+exists" is indistinguishable from "ledger deleted to bypass the gate," and
+a repo that only ever hand-populates `last-review.json` without ever
+calling `cmd_review` would sail through the anchored-verdict requirement
+forever. There is no such carve-out — the very first review on any branch
+must itself go through `cmd_review` (which creates the branch's first
+ledger entry as part of that same run) before `merge-gate` will ever pass.
+`scripts/test_review_ledger.py`'s
+`TestMergeGateLedgerConsumption.test_hand_written_last_review_with_no_ledger_never_passes`
+pins this directly: a hand-written, correctly-SHA-stamped
+`last-review.json` with no ledger file at all must still refuse.
+
+A no-jq/no-python3 environment is the one remaining exemption, and it is
+orthogonal to the above — not a verdict bypass, a tooling-availability
+accommodation. `_ledger_anchored_pass_at_head` cannot read the ledger at
+all without a JSON tool and fails closed (treats it as no anchored pass),
+but this function already has a dedicated, canonical no-tool signal
+downstream (the "no JSON encoder available" fallback, which emits
+`gate_summary_degraded: true` rather than a bare stale-payload refusal, so
+the merge gate can tell "we could not evaluate this environment at all"
+apart from "we evaluated it and it's stale") — both routes still refuse to
+approve; only the reported cause differs.
+
+**Stable finding identity across rounds (item 5) — recorded, never used for
+severity demotion.** Every finding written to a ledger entry carries
+`_ledger_recurring: true|false`, computed by `_ledger_mark_recurrence`
+(`scripts/gates.sh`) by checking the finding's `(file, category, message)`
+triple against every PRIOR ledger entry's findings for the same branch —
+deliberately NOT `finding_content_keys`' sha256-of-a-diff-context-window key
+(`scripts/review-merge.sh`, used by cross-round dedup and recurrence
+demotion): that key is a function of THIS ROUND's diff content around the
+finding's own line, so a recurring finding in a round whose diff does not
+happen to touch that file again at all (a common case — the model is simply
+re-reporting an unresolved issue while this round's diff is elsewhere)
+would make the content-hash key uncomputable for the comparison, a false
+negative rather than a real absence of recurrence. The `(file, category,
+message)` triple is the SAME match key `_review_recurrence_demote` and
+`_review_deferral_match` already use for the identical "survive rounds
+where the file/line isn't in the current diff" property — see either
+function's own doc comment. **This is recurrence RECORDING, not
+recurrence-based severity demotion** — the `_ledger_recurring` annotation
+is purely informational history; unlike `_recurrence_demoted` (see
+"Cross-round finding recurrence demotion" above), `severity_blockers()`
+does NOT read `_ledger_recurring` and it has no effect on whether a finding
+blocks. `lr-66e598`'s severity-demotion policy is prior art this task
+deliberately does not resurrect or extend — the ledger's own recurrence
+marker and `_review_recurrence_demote`'s blocking-eligibility marker are
+two independent mechanisms, each over its own match key, exactly the way
+cross-round dedup and recurrence demotion already coexist as two
+independent uses of one key space.
+
+**Everything above is proven repo-locally.** Every ledger capability —
+recording an anchored verdict, delta re-review off a prior verdict,
+merge-gate refusal on a stale/missing verdict-at-HEAD, fallback to
+full-range on an unresolvable prior SHA, and recurrence marking — is
+exercised in the test suite against temporary git repositories with no
+remote configured, matching the existing `scripts/test_*.py` harness
+pattern (`test_merge_gate_state_cache.py`, `test_wrapper_staleness.py`).
+None of it depends on an enrolled host, a live git remote, or a running
+Claude Code session; a `base_sha` that cannot be resolved (no remote, or
+the freshness precondition cannot be proven) degrades to an empty
+`base_sha` on an otherwise fully valid, anchored ledger entry, never to a
+missing or broken capability.
+
 **Ingest sanitization — closing a self-exempting-suppression gap (BOBBIE-caught follow-up).** `last-review.json` is written directly from the LLM's raw structured JSON output; the pre-write validation (`validate_output`, `scripts/llm-client.sh`) checks that `.findings` is an array, that each `.severity`, if present, is a legal enum value, and (lr-3eb18c, reviewer role only — see "Class-level review findings" below) that every finding carries a non-empty `issue_class` and `class_fix` — it does not allowlist the rest of the object's field set. Before this fix, a model (compromised, manipulated by attacker-influenced code under review, or simply emitting whatever the prompt schema loosely tolerates) could include `_recurrence_demoted: true` directly in its own JSON response. `_review_recurrence_demote`'s splice only *overwrites* `_recurrence_count`/`_recurrence_demoted` on a finding whose `(file, category, message)` triple matches a row in the current round's content-hash-keyed TSV (i.e. whose cited line falls inside `finding_content_keys`' diff-context window); a finding outside that window was left untouched, so a self-forged `_recurrence_demoted: true` on a **first-ever-reported** finding survived verbatim into `last-review.json`, and `severity_blockers()` (which reads `._recurrence_demoted` with no provenance check) excluded it from the block count — a finding could self-exempt from blocking with zero actual repetition.
 
 The fix has two independent layers:

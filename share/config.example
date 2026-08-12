@@ -377,6 +377,22 @@ CLAGENTIC_DEFAULT_BRANCH=main
 #
 # CLAGENTIC_RECURRENCE_THRESHOLD=2
 
+# ---------- review ledger (lr-01ae73) ----------
+# Append-only, per-branch history of every `gates.sh review` verdict:
+# base_sha, head_sha, pass/block/unanchored outcome, structured findings,
+# timestamp, and the gate config in effect. File:
+# .clagentic/lite/review-ledger.jsonl (gitignored, JSON-Lines, one entry per
+# line, oldest first). Always on -- there is no opt-out flag, since the
+# ledger is what makes a review verdict anchored to a specific commit state
+# at all (see docs/GATES.md "Review ledger and anchored verdicts").
+#
+# Cap the number of retained entries PER BRANCH (oldest dropped first).
+# Unset/0 (default) means unlimited -- the ledger exists to make finding
+# recurrence and verdict history visible across a branch's full review
+# lifetime, so unbounded is the correct default for most repos; set this on
+# a repo with unusually long-lived branches and many review rounds.
+# CLAGENTIC_LEDGER_MAX_PER_BRANCH=0
+
 # ---------- adversarial invariant-feed ----------
 # File: .clagentic/lite/invariants.json in the enrolled repo (gitignored —
 # already under .clagentic/lite/, same convention as last-review.json,

@@ -182,6 +182,61 @@ def _run_merge_gate(fake_tool_home, project_root, cwd, extra_env=None):
     return result
 
 
+def _seed_anchored_review_pass(base_dir, project_root, cwd):
+    """Run the real cmd_review (lr-01ae73 fold-in, PEACHES/coordinator
+    finding on PR #162 comment 5260223912) against project_root via the
+    full gates.sh subcommand dispatcher, with a stub llm-client.sh
+    returning a clean envelope, so build_gate_summary's ledger-anchored
+    check finds a genuine passing verdict at the repo's current HEAD.
+    Stages a trivial change first so get_review_diff takes its highest-
+    priority staged-diff path (no remote/fetch needed); the staged edit is
+    left in place afterward, matching this test file's own fixtures, which
+    never commit further. Returns the review subprocess result so the
+    caller can assert on it.
+
+    Uses its OWN fake tool home (a subdirectory of base_dir, distinct from
+    the caller's merge-gate fake_tool_home) -- sharing one tool home would
+    overwrite the merge-gate's approve-stub llm-client.sh with this
+    function's own clean-review stub, corrupting the SUBSEQUENT merge-gate
+    call the caller makes."""
+    review_tool_home = os.path.join(base_dir, "review-seed-toolhome")
+    scripts_dir = os.path.join(review_tool_home, "scripts")
+    os.makedirs(scripts_dir, exist_ok=True)
+    real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
+    for fname in os.listdir(real_scripts_dir):
+        if fname.endswith(".sh") and fname != "llm-client.sh":
+            os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(scripts_dir, fname))
+    real_share = os.path.join(TOOL_HOME, "share")
+    if os.path.isdir(real_share):
+        os.symlink(real_share, os.path.join(review_tool_home, "share"))
+
+    payload = json.dumps({"summary": "clean", "checked": ["security"], "findings": []})
+    stub = os.path.join(scripts_dir, "llm-client.sh")
+    with open(stub, "w") as f:
+        f.write(textwrap.dedent(f"""\
+            #!/bin/sh
+            cat > /dev/null
+            printf '%s\\n' '{payload}'
+        """))
+    os.chmod(stub, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+
+    target = os.path.join(project_root, "seed-review-change.txt")
+    with open(target, "w") as f:
+        f.write("seed change for lr-01ae73 ledger fixture\n")
+    subprocess.run(["git", "-C", project_root, "add", "seed-review-change.txt"], check=True)
+
+    env = os.environ.copy()
+    env["CLAGENTIC_PROJECT_ROOT"] = project_root
+    env["CLAGENTIC_ALLOW_MISSING_GITLEAKS"] = "1"
+    env["CLAGENTIC_ALLOW_MISSING_SEMGREP"] = "1"
+    env["CLAGENTIC_ALLOW_MISSING_OSV"] = "1"
+    fake_gates = os.path.join(scripts_dir, "gates.sh")
+    return subprocess.run(
+        ["sh", fake_gates, "review"],
+        capture_output=True, text=True, env=env, cwd=cwd,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test cases
 # ---------------------------------------------------------------------------
@@ -284,8 +339,18 @@ class TestWrapperStaleness(unittest.TestCase):
 
     # ------------------------------------------------------------------ test 3
     def test_fresh_artifacts_pass(self):
-        """Artifacts stamped with the current HEAD SHA pass the staleness check."""
-        # Re-stamp artifacts with the new (current) SHA.
+        """Artifacts stamped with the current HEAD SHA pass the staleness
+        check. Seeds a REAL anchored ledger pass via cmd_review (lr-01ae73
+        fold-in, PEACHES/coordinator finding on PR #162 comment 5260223912)
+        rather than only hand-stamping last-review.json -- since lr-01ae73
+        removed the merge-gate's ledger bootstrap exemption, a hand-written
+        stamp with no ledger entry no longer passes on its own."""
+        seed = _seed_anchored_review_pass(self._base, self._repo, self._wrapper)
+        self.assertEqual(seed.returncode, 0, f"seed cmd_review failed: {seed.stderr}")
+
+        # Re-stamp artifacts with the new (current) SHA -- last-adversarial.md
+        # still needs its own fresh stamp, which cmd_review does not write
+        # (that is cmd_adversarial's job, out of scope for this fixture).
         _stamp_artifacts(self._lite_dir, self._new_sha)
 
         result = _run_merge_gate(
