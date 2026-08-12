@@ -642,8 +642,8 @@ class TestRouterSettingsStampPreservesExistingFileOnRefusal(unittest.TestCase):
         silently exercises stale pre-fix code. cmd_update's own `git pull
         --ff-only` requires a real clone with an upstream, which is why a
         plain `git init` + working-tree copy (no clone) is not a viable
-        substitute here the way it is for test_router_agent_model_injection.py's
-        `cmd_init` tests (init never pulls)."""
+        substitute here the way it would be for a plain `cmd_init` test
+        (init never pulls)."""
         fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")
         subprocess.run(["git", "clone", "-q", TOOL_HOME, fake_tool_home],
                         check=True, capture_output=True)

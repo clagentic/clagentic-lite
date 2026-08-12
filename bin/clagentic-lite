@@ -225,6 +225,17 @@ CLAUDE_WRAPPER_VERSION="v2"
 # Bump on any content change to trigger restamp via _restamp_repo_artifacts.
 CLAUDE_WRAPPER_SETTINGS_VERSION="v1"
 
+# Rendered plugins/clagentic-lite agent-file template version. Bump on any
+# change to the RENDER LOGIC in _render_clagentic_lite_plugin_dir (e.g. the
+# injection point, the triple list, the plugin.json shape) — NOT on every
+# content edit to plugins/clagentic-lite/agents/*.md, which are re-read from
+# the checkout on every render regardless (lr-1b5a31: single-plugin,
+# config-aware render, replacing the old dual-plugin clagentic-lite-router
+# design). Combined with a live config fingerprint (_render_config_fingerprint)
+# into the stamp written to the rendered plugin.json's "clagenticStamp" field
+# — see "Render stamp + self-heal" in AGENTS.md.
+PLUGIN_RENDER_VERSION="v1"
+
 # Claude Code lifecycle hook scripts (session-start.sh, pre-write-guard.sh,
 # etc). Source of truth: share/hook-shims/<name>.template (lr-57db23 —
 # relocated out of the live, tracked $CLAGENTIC_LITE_HOME/.claude/hooks/ so
@@ -807,112 +818,200 @@ _stamp_claude_settings() {
   mv -f "$_scs_tmp" "$_scs_target"
 }
 
-# ---------------------------------------------------------------- router agent-model injection
+# ---------------------------------------------------------------- clagentic-lite plugin render (config-aware, single plugin)
 #
-# UNVERIFIED (see README.md "Verifying on your machine" and share/config.example
-# CLAGENTIC_ROUTER_INJECT_AGENT_MODEL): whether Claude Code actually honors a
-# subagent frontmatter `model:` field set to a non-standard string like
-# "role:reviewer-chain" — versus silently ignoring it and dispatching on the
-# parent session's model instead — has not been confirmed against a live
-# interactive session from this codebase. This is claude-code GH#44385
-# territory. Gated behind its own key, separate from CLAGENTIC_ROUTER_URL, so
-# that setting the router URL alone (the settings.json env-block passthrough)
-# carries zero risk from this unverified injection path.
+# lr-1b5a31: previously two plugins existed — the checked-in clagentic-lite
+# (never carrying `model:`) and a separately-installed clagentic-lite-router
+# overlay (carrying `model: role:<role>-chain` in frontmatter when
+# CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1). Both registered agents under
+# identical short names ("reviewer", "auditor", "merge-gate"); Claude Code's
+# auto-dispatch between two same-name plugins is load-order-determined, not
+# intent-determined, so router injection was silently inert whenever the
+# base plugin happened to win dispatch. Fix: ONE plugin. init/update always
+# renders plugins/clagentic-lite's agent files into a config-aware copy —
+# `model:` is injected when router injection is active, omitted otherwise —
+# and installs THAT rendered copy as the one and only `clagentic-lite`
+# plugin. The collision is now structurally impossible: there is only ever
+# one plugin named clagentic-lite, so there is nothing for Claude Code's
+# dispatch to choose between.
 #
-# _ROUTER_AGENTS_DIR is generated install-tree state (gitignored via the
+# UNVERIFIED half (see README.md "Verifying on your machine" and
+# share/config.example CLAGENTIC_ROUTER_INJECT_AGENT_MODEL): whether Claude
+# Code actually honors a subagent frontmatter `model:` field set to a
+# non-standard string like "role:reviewer-chain" — versus silently ignoring
+# it and dispatching on the parent session's model instead — has not been
+# confirmed against a live interactive session from this codebase. This is
+# claude-code GH#44385 territory. The injection is still gated behind its
+# own key, separate from CLAGENTIC_ROUTER_URL, so that setting the router
+# URL alone (the settings.json env-block passthrough) carries zero risk from
+# this unverified injection path.
+#
+# _RENDERED_PLUGIN_DIR is generated install-tree state (gitignored via the
 # repo's own .clagentic/* pattern, mirrored here under CLAGENTIC_LITE_HOME
 # for the same reason: it is a build artifact re-derived from the checked-in
 # plugins/clagentic-lite/agents/*.md files plus live config, never a source
-# of truth in its own right).
-_ROUTER_AGENTS_DIR="$CLAGENTIC_LITE_HOME/.clagentic/router-agents"
-_ROUTER_PLUGIN_NAME="clagentic-lite-router"
+# of truth in its own right). It is the marketplace source for the ONE
+# `clagentic-lite` plugin from lr-1b5a31 onward — the checked-in
+# plugins/clagentic-lite/ tree in the repo itself is no longer registered as
+# a marketplace source directly (see _install_clagentic_lite_plugin).
+_RENDERED_PLUGIN_DIR="$CLAGENTIC_LITE_HOME/.clagentic/rendered-plugin"
+_RENDERED_PLUGIN_NAME="clagentic-lite"
+# Legacy plugin name from the pre-lr-1b5a31 dual-plugin design. Migration
+# (_migrate_legacy_router_plugin) removes any install still carrying this
+# name so a machine converges to the single-plugin model in one update run.
+_LEGACY_ROUTER_PLUGIN_NAME="clagentic-lite-router"
 
-# _router_agent_needs_injection ROLE_ENV_PREFIX
-# Returns 0 (needs model: injected) when CLAGENTIC_<PREFIX>_CMD is set and
-# not "claude" — a role already on claude inherits the session model, same
-# as the checked-in agent files today (builder.md/reviewer.md's own comment:
-# "model_chain is not a Claude Code frontmatter field — do not add it here").
-_router_agent_needs_injection() {
-  _rani_prefix="$1"
-  _rani_cmd=$(eval "printf '%s' \"\${CLAGENTIC_${_rani_prefix}_CMD:-}\"")
-  [ -n "$_rani_cmd" ] && [ "$_rani_cmd" != "claude" ]
+# _plugin_agent_needs_injection ROLE_ENV_PREFIX
+# Returns 0 (needs model: injected) when router injection is active
+# (CLAGENTIC_ROUTER_URL set AND CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1) AND
+# CLAGENTIC_<PREFIX>_CMD is set to something other than "claude" — a role
+# already on claude inherits the session model, same as the checked-in
+# agent files' own comment: "model_chain is not a Claude Code frontmatter
+# field — do not add it here".
+_plugin_agent_needs_injection() {
+  _pani_prefix="$1"
+  [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" = "1" ] || return 1
+  _pani_cmd=$(eval "printf '%s' \"\${CLAGENTIC_${_pani_prefix}_CMD:-}\"")
+  [ -n "$_pani_cmd" ] && [ "$_pani_cmd" != "claude" ]
 }
 
-# _render_router_agents_dir
-# Materializes a parallel plugin directory tree under _ROUTER_AGENTS_DIR:
-# one rendered copy of each of reviewer.md/auditor.md/merge-gate.md (the
-# three roles clagentic-router's router.example.yaml ships example chains
-# for — reviewer-chain, auditor-chain), a plugin.json, and a marketplace.json
-# pointing at that rendered plugin directory. Checked-in files under
-# plugins/clagentic-lite/agents/ are read-only inputs here — NEVER modified
-# on disk (they are re-read from the real checkout every render, so a
-# maintainer edit to the checked-in agent contract always flows through).
+# _render_config_fingerprint
+# Short, stable string summarizing every live config knob that changes the
+# rendered plugin's OUTPUT — not every CLAGENTIC_* var, only the ones this
+# render function actually branches on. Any future config knob that changes
+# render output must be added to this list (generalizes beyond router mode
+# per lr-1b5a31 comment #1: "ANY future config knob that changes render
+# output is covered"). Deliberately excludes CLAGENTIC_ROUTER_TOKEN — token
+# rotation must not force a plugin re-render (the frontmatter text is
+# identical either way; only reachability/auth changes, which doctor's
+# router probe already covers separately).
+_render_config_fingerprint() {
+  _rcf_reviewer=$(_plugin_agent_needs_injection REVIEWER && echo 1 || echo 0)
+  _rcf_auditor=$(_plugin_agent_needs_injection AUDITOR && echo 1 || echo 0)
+  _rcf_gate=$(_plugin_agent_needs_injection GATE && echo 1 || echo 0)
+  printf 'reviewer=%s,auditor=%s,gate=%s' "$_rcf_reviewer" "$_rcf_auditor" "$_rcf_gate"
+}
+
+# _render_stamp
+# Combines the render-logic version with the live config fingerprint into
+# one comparable string. This is the "render stamp" from lr-1b5a31: written
+# into the rendered plugin.json's clagenticStamp field at render time, and
+# recomputed fresh (against CURRENT config) by doctor/update to detect
+# staleness. Class mechanism, not router-specific — any future config knob
+# that changes render output flows through _render_config_fingerprint, so
+# this stamp covers it automatically without a new comparison site.
+_render_stamp() {
+  printf '%s;%s' "$PLUGIN_RENDER_VERSION" "$(_render_config_fingerprint)"
+}
+
+# _render_clagentic_lite_plugin_dir
+# Materializes a plugin directory tree under _RENDERED_PLUGIN_DIR: one
+# rendered copy of every agent file under plugins/clagentic-lite/agents/,
+# plus a plugin.json and marketplace.json pointing at that rendered plugin
+# directory. Checked-in files under plugins/clagentic-lite/agents/ are
+# read-only inputs here — NEVER modified on disk (they are re-read from the
+# real checkout on every render, so a maintainer edit to the checked-in
+# agent contract always flows through).
 #
-# Injection point: `model: role:<role>-chain` is inserted as a new frontmatter
-# line immediately after `name: <role>` (line 2 of every agent file in this
-# repo — a stable anchor) ONLY when the role's CLAGENTIC_<ROLE>_CMD is set to
-# a non-claude CLI. builder.md is never touched by this function — the task
-# spec is explicit that a tool-using role must not be routed (routed mode
-# drops tool-calling through clagentic-router's CLI adapters).
-_render_router_agents_dir() {
-  _rrad_agents_src="$CLAGENTIC_LITE_HOME/plugins/clagentic-lite/agents"
-  _rrad_out_agents="$_ROUTER_AGENTS_DIR/plugins/$_ROUTER_PLUGIN_NAME/agents"
-  rm -rf "$_ROUTER_AGENTS_DIR" 2>/dev/null || true
-  mkdir -p "$_rrad_out_agents" || { warn "cannot create $_rrad_out_agents"; return 1; }
+# Injection point: `model: role:<role>-chain` is inserted as a new
+# frontmatter line immediately after `name: <role>` (line 2 of every agent
+# file in this repo — a stable anchor) ONLY when _plugin_agent_needs_injection
+# says so (router injection active AND the role's CLAGENTIC_<ROLE>_CMD is a
+# non-claude CLI). builder.md and troubleshooter.md are never candidates for
+# injection (see the triple list below) — the task spec is explicit that a
+# tool-using role must not be routed (routed mode drops tool-calling through
+# clagentic-router's CLI adapters), and troubleshooter has no CLAGENTIC_*_CMD
+# role mapping of its own. Both are still copied byte-for-byte into the
+# rendered plugin so the single plugin carries the full five-agent set.
+_render_clagentic_lite_plugin_dir() {
+  _rcpd_agents_src="$CLAGENTIC_LITE_HOME/plugins/clagentic-lite/agents"
+  _rcpd_out_agents="$_RENDERED_PLUGIN_DIR/plugins/$_RENDERED_PLUGIN_NAME/agents"
+  rm -rf "$_RENDERED_PLUGIN_DIR" 2>/dev/null || true
+  mkdir -p "$_rcpd_out_agents" || { warn "cannot create $_rcpd_out_agents"; return 1; }
 
-  # ROLE_ENV_PREFIX:agent-filename:chain-name triples. Builder deliberately
-  # excluded (see doc comment above); troubleshooter has no CLAGENTIC_*_CMD
-  # role mapping of its own (it is read-only diagnosis, not a gate role) and
-  # is out of scope for this injection.
-  for _rrad_triple in "REVIEWER:reviewer:reviewer-chain" "AUDITOR:auditor:auditor-chain" "GATE:merge-gate:merge-gate-chain"; do
-    _rrad_prefix="${_rrad_triple%%:*}"
-    _rrad_rest="${_rrad_triple#*:}"
-    _rrad_file="${_rrad_rest%%:*}"
-    _rrad_chain="${_rrad_rest#*:}"
+  # ROLE_ENV_PREFIX:agent-filename:chain-name triples for the three roles
+  # eligible for model: injection. builder/troubleshooter are handled in the
+  # plain-copy loop below since they never take a chain name.
+  for _rcpd_triple in "REVIEWER:reviewer:reviewer-chain" "AUDITOR:auditor:auditor-chain" "GATE:merge-gate:merge-gate-chain"; do
+    _rcpd_prefix="${_rcpd_triple%%:*}"
+    _rcpd_rest="${_rcpd_triple#*:}"
+    _rcpd_file="${_rcpd_rest%%:*}"
+    _rcpd_chain="${_rcpd_rest#*:}"
 
-    _rrad_src_file="$_rrad_agents_src/${_rrad_file}.md"
-    _rrad_dst_file="$_rrad_out_agents/${_rrad_file}.md"
-    [ -f "$_rrad_src_file" ] || { warn "router agent render: source missing: $_rrad_src_file"; continue; }
+    _rcpd_src_file="$_rcpd_agents_src/${_rcpd_file}.md"
+    _rcpd_dst_file="$_rcpd_out_agents/${_rcpd_file}.md"
+    [ -f "$_rcpd_src_file" ] || { warn "plugin render: source missing: $_rcpd_src_file"; continue; }
 
-    if _router_agent_needs_injection "$_rrad_prefix"; then
+    if _plugin_agent_needs_injection "$_rcpd_prefix"; then
       # Insert "model: role:<chain>" as the line immediately after "name: <role>"
       # (line 2 in every checked-in agent file). awk, not sed -i, so this works
       # identically on GNU and BSD without a DS_SED_INPLACE branch.
-      awk -v model_line="model: role:${_rrad_chain}" \
+      awk -v model_line="model: role:${_rcpd_chain}" \
         'NR==2 { print; print model_line; next } { print }' \
-        "$_rrad_src_file" > "$_rrad_dst_file"
+        "$_rcpd_src_file" > "$_rcpd_dst_file"
     else
-      cp "$_rrad_src_file" "$_rrad_dst_file"
+      cp "$_rcpd_src_file" "$_rcpd_dst_file"
     fi
   done
 
-  # Minimal plugin manifest — deliberately does not track the main plugin's
-  # version; this is a derived render, not an independently versioned
-  # artifact. Regenerated in full on every init/update run.
-  mkdir -p "$_ROUTER_AGENTS_DIR/plugins/$_ROUTER_PLUGIN_NAME/.claude-plugin"
-  cat > "$_ROUTER_AGENTS_DIR/plugins/$_ROUTER_PLUGIN_NAME/.claude-plugin/plugin.json" <<-EOF
+  # Roles never eligible for injection (builder: tool-using, must not be
+  # routed; troubleshooter: no CLAGENTIC_*_CMD role mapping) — copied
+  # verbatim so the rendered plugin still carries the full agent set.
+  for _rcpd_plain in builder troubleshooter; do
+    _rcpd_src_file="$_rcpd_agents_src/${_rcpd_plain}.md"
+    _rcpd_dst_file="$_rcpd_out_agents/${_rcpd_plain}.md"
+    [ -f "$_rcpd_src_file" ] || { warn "plugin render: source missing: $_rcpd_src_file"; continue; }
+    cp "$_rcpd_src_file" "$_rcpd_dst_file"
+  done
+
+  # Skills are never config-rendered (no injection applies to them) — copy
+  # the checked-in tree verbatim so the single plugin still ships them.
+  _rcpd_skills_src="$CLAGENTIC_LITE_HOME/plugins/clagentic-lite/skills"
+  if [ -d "$_rcpd_skills_src" ]; then
+    _rcpd_out_skills="$_RENDERED_PLUGIN_DIR/plugins/$_RENDERED_PLUGIN_NAME/skills"
+    mkdir -p "$_rcpd_out_skills"
+    cp -R "$_rcpd_skills_src"/. "$_rcpd_out_skills"/ 2>/dev/null || true
+  fi
+
+  _rcpd_stamp="$(_render_stamp)"
+
+  # Plugin manifest carries the checked-in version (source of maintainer
+  # truth for plugin-level version bumps) plus the render stamp (source of
+  # truth for "does this rendered copy match current config/template?").
+  # The two are orthogonal: plugin.json's own "version" is bumped by
+  # maintainer PRs that change agent/skill content; clagenticStamp changes
+  # whenever the render LOGIC or the LIVE CONFIG that feeds it changes,
+  # independent of any maintainer version bump.
+  _rcpd_base_version=$(grep -o '"version": *"[^"]*"' \
+    "$CLAGENTIC_LITE_HOME/plugins/clagentic-lite/.claude-plugin/plugin.json" 2>/dev/null \
+    | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+  [ -z "$_rcpd_base_version" ] && _rcpd_base_version="0.0.0"
+
+  mkdir -p "$_RENDERED_PLUGIN_DIR/plugins/$_RENDERED_PLUGIN_NAME/.claude-plugin"
+  cat > "$_RENDERED_PLUGIN_DIR/plugins/$_RENDERED_PLUGIN_NAME/.claude-plugin/plugin.json" <<-EOF
 	{
 	  "\$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
-	  "name": "$_ROUTER_PLUGIN_NAME",
-	  "version": "0.0.0-generated",
-	  "description": "Generated by clagentic-lite init/update when CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1. Rendered copies of reviewer/auditor/merge-gate with model: role:<role>-chain injected into frontmatter. Regenerated on every run -- do not edit by hand."
+	  "name": "$_RENDERED_PLUGIN_NAME",
+	  "version": "$_rcpd_base_version",
+	  "description": "The five clagentic-lite role agents (builder, reviewer, auditor, merge-gate, troubleshooter) plus commentary skills (/infosec-rt, /eng-consult). Rendered by clagentic-lite init/update -- config-aware: carries model: role:<role>-chain frontmatter on reviewer/auditor/merge-gate when CLAGENTIC_ROUTER_URL + CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1 are both set and the role's own CLAGENTIC_<ROLE>_CMD is non-claude; omits it otherwise. Regenerated on every init/update run -- do not edit by hand.",
+	  "clagenticStamp": "$_rcpd_stamp"
 	}
 	EOF
 
-  mkdir -p "$_ROUTER_AGENTS_DIR/.claude-plugin"
-  cat > "$_ROUTER_AGENTS_DIR/.claude-plugin/marketplace.json" <<-EOF
+  mkdir -p "$_RENDERED_PLUGIN_DIR/.claude-plugin"
+  cat > "$_RENDERED_PLUGIN_DIR/.claude-plugin/marketplace.json" <<-EOF
 	{
-	  "name": "$_ROUTER_PLUGIN_NAME",
+	  "name": "$_RENDERED_PLUGIN_NAME",
 	  "owner": { "name": "clagentic-lite (generated)" },
 	  "metadata": {
-	    "description": "Generated marketplace for router-injected agent variants. Not committed to any repo -- regenerated by clagentic-lite init/update."
+	    "description": "Generated marketplace for the rendered clagentic-lite plugin. Not committed to any repo -- regenerated by clagentic-lite init/update."
 	  },
 	  "plugins": [
 	    {
-	      "name": "$_ROUTER_PLUGIN_NAME",
-	      "source": "./plugins/$_ROUTER_PLUGIN_NAME",
-	      "description": "Rendered reviewer/auditor/merge-gate with model: role:<role>-chain injected for non-claude CLAGENTIC_<ROLE>_CMD roles.",
-	      "version": "0.0.0-generated"
+	      "name": "$_RENDERED_PLUGIN_NAME",
+	      "source": "./plugins/$_RENDERED_PLUGIN_NAME",
+	      "description": "The five clagentic-lite role agents plus commentary skills, config-aware rendered.",
+	      "version": "$_rcpd_base_version"
 	    }
 	  ]
 	}
@@ -921,33 +1020,158 @@ _render_router_agents_dir() {
   return 0
 }
 
-# _install_router_agents_plugin
-# Registers the generated marketplace and installs/updates the router-variant
-# plugin. Mirrors the exact claude plugin marketplace add / install sequence
-# already used for the main clagentic-lite plugin (cmd_init / cmd_update) so
-# there is exactly one pattern to reason about, not two. Called ONLY when
-# CLAGENTIC_ROUTER_URL and CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1 are both set.
-_install_router_agents_plugin() {
-  command -v claude >/dev/null 2>&1 || { warn "claude not on PATH — skipping router-agent plugin install"; return 0; }
+# _installed_plugin_render_stamp
+# Reads the clagenticStamp field back out of the currently-installed
+# rendered plugin.json, if any. Empty string when not found (no prior
+# render, or a pre-lr-1b5a31 install of the checked-in tree directly, which
+# never carried this field). Used by doctor's stamp-staleness check and by
+# update to decide whether a re-render is actually needed.
+_installed_plugin_render_stamp() {
+  _iprs_file="$_RENDERED_PLUGIN_DIR/plugins/$_RENDERED_PLUGIN_NAME/.claude-plugin/plugin.json"
+  [ -f "$_iprs_file" ] || { printf ''; return; }
+  grep -o '"clagenticStamp": *"[^"]*"' "$_iprs_file" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
 
-  _render_router_agents_dir || { warn "router-agent render failed — skipping plugin install"; return 1; }
+# _doctor_check_plugin_collision OK_FN FAIL_FN
+# Generic backstop (lr-1b5a31): the single-plugin render makes the
+# clagentic-lite-vs-clagentic-lite-router collision structurally impossible
+# (there is only ever one clagentic-lite plugin now), but a THIRD-PARTY
+# plugin the operator installs separately could still register an agent
+# under the same short name (e.g. its own "reviewer") — Claude Code's
+# dispatch between two same-name agents is load-order-determined, not
+# intent-determined, same failure class as the original bug. Inspects
+# `claude plugin list` output for any agent short name that appears to come
+# from more than one enabled plugin.
+#
+# `claude plugin list` output format is not guaranteed stable across
+# versions — this check is advisory (WARN via the caller's fail_fn, not a
+# hard abort) and degrades to a skip (not a false positive) when the
+# command's output does not parse into the expected "name@plugin" token
+# shape. OK_FN/FAIL_FN are the names of the caller's reporting functions
+# (cmd_doctor's _ok/_fail closures) so doctor's running tally stays
+# accurate; a test harness can pass its own stand-ins.
+_doctor_check_plugin_collision() {
+  _dcpc_ok_fn="$1"
+  _dcpc_fail_fn="$2"
+  if ! command -v claude >/dev/null 2>&1; then
+    printf '  (claude not on PATH — skipping)\n'
+    return 0
+  fi
+  _dcpc_list=$(claude plugin list 2>/dev/null || true)
+  if [ -z "$_dcpc_list" ]; then
+    printf '  (no plugins installed, or `claude plugin list` produced no output — skipping)\n'
+    return 0
+  fi
+  _dcpc_collisions=$(printf '%s\n' "$_dcpc_list" \
+    | grep -oE '[A-Za-z0-9_-]+@[A-Za-z0-9_-]+' 2>/dev/null \
+    | awk -F'@' '{print $1}' | sort | uniq -d || true)
+  if [ -n "$_dcpc_collisions" ]; then
+    "$_dcpc_fail_fn" "same-name agent/plugin collision detected — Claude Code's dispatch between two same-name plugins is load-order-determined, not intent-determined:"
+    printf '%s\n' "$_dcpc_collisions" | while IFS= read -r _dcpc_name; do
+      [ -z "$_dcpc_name" ] && continue
+      printf '       %s: %s\n' "$_dcpc_name" "$(printf '%s\n' "$_dcpc_list" | grep -F "${_dcpc_name}@" | tr '\n' ' ')"
+    done
+    printf '       Uninstall the duplicate/third-party plugin, or rename its agents, so exactly one plugin owns each agent short name.\n'
+  else
+    _dcpc_count=$(printf '%s\n' "$_dcpc_list" | grep -oE '@[A-Za-z0-9_-]+' 2>/dev/null | sort -u | wc -l | tr -d ' ')
+    "$_dcpc_ok_fn" "no same-name agent/plugin collisions detected across $_dcpc_count installed plugin(s)"
+  fi
+}
 
-  claude plugin marketplace add "$_ROUTER_AGENTS_DIR" --scope user 2>/dev/null || true
+# _doctor_check_render_stamp_staleness OK_FN FAIL_FN
+# Class mechanism (lr-1b5a31): compares the currently-installed rendered
+# plugin.json's clagenticStamp against what CURRENT config/template would
+# produce right now. A mismatch means the installed plugin was rendered
+# under different config (router injection toggled, a CLAGENTIC_<ROLE>_CMD
+# changed, or PLUGIN_RENDER_VERSION was bumped by a maintainer PR) and
+# `update` will re-render/heal it on next run — this check exists so
+# staleness is visible on a `doctor` run BEFORE the operator wonders why
+# routing behavior does not match their current config. Not FAIL-worthy
+# (stale-but-healable is not a broken state), so mismatch prints WARN
+# without calling FAIL_FN.
+_doctor_check_render_stamp_staleness() {
+  _dcrss_ok_fn="$1"
+  _dcrss_current="$(_render_stamp)"
+  _dcrss_installed="$(_installed_plugin_render_stamp)"
+  if [ -z "$_dcrss_installed" ]; then
+    printf '  INFO rendered plugin not found or carries no stamp — run `clagentic-lite update` to render it (current stamp would be: %s)\n' "$_dcrss_current"
+  elif [ "$_dcrss_installed" != "$_dcrss_current" ]; then
+    printf '  WARN rendered plugin stamp is STALE — installed: %s ; current config/template: %s\n' "$_dcrss_installed" "$_dcrss_current"
+    printf '       run `clagentic-lite update` to re-render and re-install the plugin under current config.\n'
+  else
+    "$_dcrss_ok_fn" "rendered plugin stamp up to date ($_dcrss_current)"
+  fi
+}
 
-  if claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_ROUTER_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
-    claude plugin marketplace update "$_ROUTER_PLUGIN_NAME" 2>/dev/null || true
-    if claude plugin update "${_ROUTER_PLUGIN_NAME}@${_ROUTER_PLUGIN_NAME}"; then
-      say "updated plugin: $_ROUTER_PLUGIN_NAME (model: role:<role>-chain injected — reviewer/auditor/merge-gate)"
+# _migrate_legacy_router_plugin
+# lr-1b5a31 migration: detects a pre-lr-1b5a31 clagentic-lite-router install
+# (the old overlay plugin) and uninstalls it. Runs unconditionally in both
+# cmd_init and cmd_update, before the unified plugin install, regardless of
+# current router config — a machine that had the legacy plugin installed and
+# has since turned router injection off must still lose the stale overlay,
+# not just stop refreshing it. One update run converges any machine to the
+# single-plugin model, whichever direction its config changed.
+_migrate_legacy_router_plugin() {
+  command -v claude >/dev/null 2>&1 || return 0
+  if claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_LEGACY_ROUTER_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
+    say "migrating: removing legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME (superseded by config-aware single-plugin render, lr-1b5a31)..."
+    claude plugin uninstall "${_LEGACY_ROUTER_PLUGIN_NAME}@${_LEGACY_ROUTER_PLUGIN_NAME}" 2>/dev/null || \
+      claude plugin uninstall "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || \
+      warn "could not uninstall legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME — remove manually: claude plugin uninstall $_LEGACY_ROUTER_PLUGIN_NAME"
+    claude plugin marketplace remove "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || true
+  fi
+}
+
+# _install_clagentic_lite_plugin
+# Renders the config-aware plugin dir, then registers/installs/updates the
+# ONE clagentic-lite plugin from that rendered source — replacing both the
+# old "install the checked-in tree directly" path and the old
+# "separately install a router overlay" path. From lr-1b5a31 onward this is
+# the ONLY plugin-install call site in cmd_init/cmd_update; there is no
+# router-specific branch left to call separately.
+_install_clagentic_lite_plugin() {
+  command -v claude >/dev/null 2>&1 || { warn "claude not on PATH — skipping clagentic-lite plugin install"; return 0; }
+
+  _migrate_legacy_router_plugin
+
+  _render_clagentic_lite_plugin_dir || { warn "plugin render failed — skipping plugin install"; return 1; }
+
+  claude plugin marketplace add "$_RENDERED_PLUGIN_DIR" --scope user 2>/dev/null || true
+
+  # Migration: uninstall the pre-v1.2.0 plugin name (clagentic-lite-agents)
+  # before the exact-match check below. Without this, its presence causes
+  # the check to fall through to 'plugin update', which fails because the
+  # current name was never installed under the old label.
+  if claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite-agents(@|[[:space:]]|$)'; then
+    say "migrating: removing old plugin name clagentic-lite-agents..."
+    claude plugin uninstall "clagentic-lite-agents@clagentic-lite" 2>/dev/null || \
+      claude plugin uninstall "clagentic-lite-agents" 2>/dev/null || \
+      warn "could not uninstall old plugin clagentic-lite-agents — remove manually: claude plugin uninstall clagentic-lite-agents"
+  fi
+
+  # Exact-match check: grep for the current plugin name as a whole token, not
+  # a substring. "clagentic-lite-agents" contains "clagentic-lite" as a
+  # prefix; substring grep would falsely match it and skip the install of
+  # the renamed plugin.
+  if claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_RENDERED_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
+    claude plugin marketplace update "$_RENDERED_PLUGIN_NAME" 2>/dev/null || \
+      warn "claude plugin marketplace update failed — plugin may be stale"
+    if claude plugin update "${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"; then
+      say "updated plugin: $_RENDERED_PLUGIN_NAME"
     else
-      warn "claude plugin update failed for $_ROUTER_PLUGIN_NAME; run manually: claude plugin update ${_ROUTER_PLUGIN_NAME}@${_ROUTER_PLUGIN_NAME}"
+      warn "claude plugin update failed for $_RENDERED_PLUGIN_NAME; run manually: claude plugin update ${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"
     fi
   else
-    if claude plugin marketplace add "$_ROUTER_AGENTS_DIR" --scope user && claude plugin install "${_ROUTER_PLUGIN_NAME}@${_ROUTER_PLUGIN_NAME}"; then
-      say "installed plugin: $_ROUTER_PLUGIN_NAME (model: role:<role>-chain injected — reviewer/auditor/merge-gate)"
-      say "UNVERIFIED: whether Claude Code honors this frontmatter model: field has not been confirmed on this machine — see README 'Verifying on your machine'"
+    if claude plugin install "${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"; then
+      say "installed plugin: $_RENDERED_PLUGIN_NAME (agents and skills available globally)"
     else
-      warn "claude plugin install failed for $_ROUTER_PLUGIN_NAME; run manually: claude plugin marketplace add $_ROUTER_AGENTS_DIR && claude plugin install ${_ROUTER_PLUGIN_NAME}@${_ROUTER_PLUGIN_NAME}"
+      warn "claude plugin install failed — run manually: claude plugin marketplace add $_RENDERED_PLUGIN_DIR && claude plugin install ${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"
     fi
+  fi
+
+  if [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" = "1" ]; then
+    say "router agent-model injection active (model: role:<role>-chain on reviewer/auditor/merge-gate where CLAGENTIC_<ROLE>_CMD is non-claude)"
+    say "UNVERIFIED: whether Claude Code honors this frontmatter model: field has not been confirmed on this machine — see README 'Verifying on your machine'"
   fi
 }
 
@@ -1289,52 +1513,13 @@ cmd_init() {
   # 5. Symlink ~/.local/bin/clagentic-lite -> $CLAGENTIC_LITE_HOME/bin/clagentic-lite.
   _install_symlink
 
-  # 6. Register the clagentic-lite marketplace and install the agent plugin so
-  # Claude Code discovers the five role agents globally in every session.
-  # Sequence: marketplace add (registers source) -> plugin install by name.
-  # 'claude plugin marketplace add' is idempotent — re-running init is safe.
-  if command -v claude >/dev/null 2>&1; then
-    # Best-effort pre-registration so the subsequent list check can find the plugin
-    # even when the marketplace was not previously registered.
-    claude plugin marketplace add "$CLAGENTIC_LITE_HOME" --scope user 2>/dev/null || true
-
-    # Migration: uninstall the old plugin name (clagentic-lite-agents, shipped before v1.2.0)
-    # before checking for or installing the current name. The old name contains "clagentic-lite"
-    # as a substring, so a naive grep match would incorrectly treat it as "already installed"
-    # and skip the install of the renamed plugin.
-    if claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite-agents(@|[[:space:]]|$)'; then
-      say "migrating: removing old plugin name clagentic-lite-agents..."
-      claude plugin uninstall "clagentic-lite-agents@clagentic-lite" 2>/dev/null || \
-        claude plugin uninstall "clagentic-lite-agents" 2>/dev/null || \
-        warn "could not uninstall old plugin clagentic-lite-agents — remove manually: claude plugin uninstall clagentic-lite-agents"
-    fi
-
-    # Exact-match check: grep for the new plugin name as a whole token, not a substring.
-    # "clagentic-lite-agents" contains "clagentic-lite" as a prefix; substring grep would
-    # falsely match it and skip the install of the renamed plugin.
-    if claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite(@|[[:space:]]|$)'; then
-      say "plugin clagentic-lite already installed"
-    else
-      if claude plugin marketplace add "$CLAGENTIC_LITE_HOME" --scope user; then
-        if claude plugin install "clagentic-lite@clagentic-lite"; then
-          say "installed plugin: clagentic-lite (agents and skills available globally)"
-        else
-          warn "claude plugin install failed — run manually: claude plugin install clagentic-lite@clagentic-lite"
-        fi
-      else
-        warn "claude plugin marketplace add failed — run manually: claude plugin marketplace add $CLAGENTIC_LITE_HOME && claude plugin install clagentic-lite@clagentic-lite"
-      fi
-    fi
-  else
-    warn "claude not on PATH — skipping plugin install; after adding to PATH run: claude plugin marketplace add $CLAGENTIC_LITE_HOME && claude plugin install clagentic-lite@clagentic-lite"
-  fi
-
-  # 6b. Router agent-model injection — opt-in, off by default even when
-  # CLAGENTIC_ROUTER_URL is set (see _install_router_agents_plugin doc
-  # comment: this half is UNVERIFIED, gated behind its own separate key).
-  if [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" = "1" ]; then
-    _install_router_agents_plugin
-  fi
+  # 6. Render and install the ONE clagentic-lite plugin (config-aware —
+  # lr-1b5a31). Replaces the old two-call sequence (install the checked-in
+  # tree directly, then separately install a router overlay plugin): now
+  # there is exactly one plugin-install call site, and it always renders
+  # from the checked-in agent files into a config-aware copy before
+  # installing, whether or not router injection is active.
+  _install_clagentic_lite_plugin
 
   say "init complete"
   if [ -f "$GLOBAL_CONFIG" ] && [ "$RECONFIGURE" -eq 0 ]; then
@@ -2504,6 +2689,19 @@ cmd_doctor() {
     fi
   fi
 
+  # 9d. Same-agent-name plugin collision check (generic backstop, lr-1b5a31)
+  # and 9e. render-stamp staleness check. Both factored into standalone
+  # functions (below _RNB_V1_BLOCK_LINES / near update helpers) so they are
+  # independently unit-testable against constructed `claude plugin list`
+  # fixtures without executing cmd_doctor's own dispatch. Each takes the
+  # caller's _ok/_fail closures by name (same convention cmd_doctor already
+  # uses internally) so doctor's running OK/FAIL tally stays accurate.
+  printf '\nplugin agent-name collision check:\n'
+  _doctor_check_plugin_collision _ok _fail
+
+  printf '\nrendered plugin stamp:\n'
+  _doctor_check_render_stamp_staleness _ok _fail
+
   # 10. Memory tunables.
   printf '\nmemory tunables:\n'
   _ok "CLAGENTIC_RECALL_LIMIT=${CLAGENTIC_RECALL_LIMIT:-5 (default)}"
@@ -2854,58 +3052,24 @@ cmd_update() {
   say "checking prerequisites post-update..."
   _run_prereq_checks update
 
-  # Install or update the agent plugin. This runs before the registry check so
-  # it works on machines with no enrolled repos (e.g. freshly cloned installs
-  # where init was run before the plugin system existed).
-  _plugin_json="$CLAGENTIC_LITE_HOME/plugins/clagentic-lite/.claude-plugin/plugin.json"
-  if [ -f "$_plugin_json" ]; then
+  # Render and install the ONE clagentic-lite plugin (config-aware —
+  # lr-1b5a31). Runs before the registry check so it works on machines with
+  # no enrolled repos. Always re-renders and re-installs: _render_stamp
+  # inside the render function reflects current config on every run, so a
+  # config change (e.g. flipping CLAGENTIC_ROUTER_INJECT_AGENT_MODEL, or
+  # rotating a CLAGENTIC_<ROLE>_CMD) is picked up automatically without a
+  # separate version-compare gate here — the render itself is cheap and
+  # idempotent when nothing changed. Also runs the legacy-router-plugin
+  # migration (inside _install_clagentic_lite_plugin) unconditionally, so a
+  # machine with a stale clagentic-lite-router install converges in one run.
+  _base_plugin_json="$CLAGENTIC_LITE_HOME/plugins/clagentic-lite/.claude-plugin/plugin.json"
+  if [ -f "$_base_plugin_json" ]; then
     # plugin.json version is bumped by maintainer PRs that change agent or skill files.
-    # cmd_update does not touch the version — local bumps drift from upstream
-    # and break cache invalidation when the repo ships a real version change.
-
-    if command -v claude >/dev/null 2>&1; then
-      # Ensure marketplace is registered (idempotent).
-      claude plugin marketplace add "$CLAGENTIC_LITE_HOME" --scope user 2>/dev/null || true
-
-      # Migration: uninstall old plugin name (clagentic-lite-agents, pre-v1.2.0) before
-      # the exact-match check below. Without this, the old name's presence causes the
-      # check to fall through to 'plugin update' which fails because the current name
-      # was never installed under the old label.
-      if claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite-agents(@|[[:space:]]|$)'; then
-        say "migrating: removing old plugin name clagentic-lite-agents..."
-        claude plugin uninstall "clagentic-lite-agents@clagentic-lite" 2>/dev/null || \
-          claude plugin uninstall "clagentic-lite-agents" 2>/dev/null || \
-          warn "could not uninstall old plugin clagentic-lite-agents — remove manually: claude plugin uninstall clagentic-lite-agents"
-      fi
-
-      # Exact-match check: look for the current plugin name as a whole token.
-      # Substring grep would match the old name clagentic-lite-agents (which contains
-      # "clagentic-lite" as a prefix) and falsely branch into 'plugin update' even when
-      # the current plugin was never installed.
-      if claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite(@|[[:space:]]|$)'; then
-        claude plugin marketplace update clagentic-lite && \
-          say "refreshed marketplace: clagentic-lite" || \
-          warn "claude plugin marketplace update failed — plugin may be stale"
-        claude plugin update "clagentic-lite@clagentic-lite" && \
-          say "updated plugin: clagentic-lite" || \
-          warn "claude plugin update failed; run: claude plugin update clagentic-lite@clagentic-lite"
-      else
-        claude plugin install "clagentic-lite@clagentic-lite" && \
-          say "installed plugin: clagentic-lite (agents and skills now available globally)" || \
-          warn "claude plugin install failed; run: claude plugin install clagentic-lite@clagentic-lite"
-      fi
-    else
-      warn "claude not on PATH — skipping plugin install/update (run manually: claude plugin marketplace add $CLAGENTIC_LITE_HOME && claude plugin install clagentic-lite@clagentic-lite)"
-    fi
+    # cmd_update does not touch the checked-in version — local bumps drift from
+    # upstream and break cache invalidation when the repo ships a real version change.
+    _install_clagentic_lite_plugin
   else
-    warn "plugin manifest not found: $_plugin_json — skipping plugin update"
-  fi
-
-  # Router agent-model injection — opt-in, off by default even when
-  # CLAGENTIC_ROUTER_URL is set. See _install_router_agents_plugin doc
-  # comment: this half is UNVERIFIED, gated behind its own separate key.
-  if [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" = "1" ]; then
-    _install_router_agents_plugin
+    warn "plugin manifest not found: $_base_plugin_json — skipping plugin update"
   fi
 
   # Re-stamp $CLAGENTIC_LITE_HOME/.claude/hooks/*.sh if any hook template
