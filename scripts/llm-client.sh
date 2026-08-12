@@ -1566,6 +1566,229 @@ invoke_generic() {
     $DS_TIMEOUT_CMD "$CALL_TIMEOUT" $NON_CLAUDE_ENV_STRIP "$CLI_BIN" -p - > "$OUTPUT_FILE" 2> "$ERR_FILE"
 }
 
+# ROUTER-PATH INVOCATION (lr-02f048).
+#
+# OPT-IN, PER-ROLE, THREE ROLES ONLY: reviewer, auditor, gate (merge-gate's
+# internal role literal). Gated at the call site in walk_chain by
+# CLAGENTIC_<ROLE>_VIA_ROUTER=1 -- this function itself has no role
+# allowlist of its own; it is never reached for builder/summarizer because
+# walk_chain never checks the router opt-in for those roles (see
+# _llm_role_routable below). Builder is deliberately excluded: it holds
+# unrestricted Bash and does real multi-turn tool-calling, and every router
+# adapter currently declares SupportsTools=false (lr-be9454) -- a
+# tool-bearing routed request 422s. Reviewer/Auditor/Merge-Gate are already
+# tool-restricted AND single-shot (see invoke_claude/invoke_codex's own
+# TOOL_ROLE handling), so they never carry a `tools` field and never trip
+# that refusal.
+#
+# WIRE SHAPE: POSTs the combined prompt+input (identical construction to
+# invoke_codex's TMP_COMBINED, reused rather than re-derived) as a single
+# user-role message to clagentic-router's Anthropic-compatible
+# /v1/messages endpoint, model "role:<role>-chain" (matches
+# router.example.yaml's routed-mode chain-name convention, established by
+# lr-1c3822/lr-49f25e and already used for CLAGENTIC_ROUTER_INJECT_AGENT_MODEL's
+# frontmatter injection -- same convention, second consumer). NO "tools"
+# field is ever sent -- see the exclusion note above; this is not a
+# capability check at call time, it is a structural property of what this
+# function's three permitted callers ever pass it.
+#
+# OUTPUT SHAPE: writes the response's first text content block VERBATIM to
+# OUTPUT_FILE -- no --output-format-json-style envelope, matching
+# invoke_codex's raw-text output shape (not invoke_claude's). This is
+# deliberate: walk_chain's downstream pipeline (_llm_unwrap_json_envelope,
+# validate_output) already handles "bare CLI output, possibly fenced JSON"
+# uniformly for every non-claude-envelope carrier -- inventing a second
+# envelope shape here would require a THIRD unwrap branch for no benefit,
+# since the router-path response is never Claude Code's own
+# --output-format json wrapper (that flag is a `claude` CLI feature, not
+# part of the Anthropic Messages API this function speaks).
+#
+# RETURN: 0 on a 200 response with a parseable text content block; non-zero
+# otherwise (curl failure, non-200, empty/malformed response body) --
+# ERR_FILE carries a diagnostic line in every non-zero case so the caller's
+# existing ERR_HINT extraction (walk_chain's stderr-parsing branch) has
+# something to read, exactly like every other invoke_* failure path.
+# CALL_TIMEOUT bounds the whole request via $DS_TIMEOUT_CMD, same as every
+# other invoke_* (INV-4).
+#
+# NOT a fallback layer itself -- this function only ever executes ONE
+# attempt against ONE URL. The router's own scored/health-aware chain
+# advance between backends (Layer 1) happens entirely inside the router
+# process and is invisible here by design (see call site in walk_chain for
+# the Layer 2 -- router-unreachable -- fallback this function's failure
+# feeds).
+#
+# LAYER 0 -- URL VALIDATION, BEFORE ANY POST (lr-02f048, BOBBIE finding on
+# PR #167). CLAGENTIC_ROUTER_URL was previously used here to build
+# ROUTER_URL with NO validation at all -- this function sources only
+# platform.sh (never bin/clagentic-lite, which held the only validator that
+# existed at the time), so the gate-path POST sent the bearer token plus
+# prompt+diff to whatever the value resolved to, unvalidated. Same bypass
+# class as PR #146/lr-49f25e (userinfo not stripped, "127.*" glob-prefix
+# match): a string-shaped read of a fully attacker/operator-controlled value
+# standing in for real validation. FIX IS A CLASS FIX, not a copy-paste of
+# the validator: ds_router_url_classify (scripts/platform.sh) is the ONE
+# implementation both bin/clagentic-lite and this file consult -- see that
+# function's own doc comment for the full classification rules.
+#
+# TWO REFUSAL CASES, BOTH NON-BLOCKING FOR THE GATE, BOTH DISTINCT FROM
+# LAYER 2 (router-unreachable):
+#   malformed -- not a well-formed http(s):// URL. Refused: there is no
+#     connection to even attempt.
+#   nonlocal  -- well-formed, but the host is not localhost/127.0.0.0/8/::1.
+#     Refused HERE (unlike bin/clagentic-lite's stamp-time check, which
+#     WARNS-but-allows a nonlocal host for the INTERACTIVE session -- see
+#     docs/DESIGN.md "Layer 0" for the full reasoning): the gate path runs
+#     unattended inside a merge gate with no human-in-the-loop moment to
+#     absorb a warning, so "this URL looks like exfiltration" and
+#     "operator deliberately configured a LAN router" are not
+#     distinguishable here the way they are at interactive-stamp time.
+#     FAIL TOWARD REFUSING, not toward warn-and-send: the two failure costs
+#     are not symmetric (a missed legitimate LAN router costs a support
+#     question; a real exfiltration target costs the bearer token and the
+#     diff).
+# Both cases write ERR_FILE and return 99 (the same "structural refusal, not
+# a subprocess status" sentinel ds_timeout_missing uses, scripts/platform.sh)
+# -- never a curl-shaped exit code, so this is never mistaken for "the
+# router process itself returned this status." walk_chain's caller
+# distinguishes 99 as its own "router-refused" audit outcome, loudly
+# labeled and never folded into "router-fallback" (see that call site's own
+# comment for why the two must never share a label) -- an operator reading
+# audit.db or stderr must be able to tell "we refused to POST to a
+# suspicious URL" apart from "the router happened to be down."
+invoke_router() {
+  ROLE_L="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"
+
+  ds_router_url_classify "${CLAGENTIC_ROUTER_URL:-}"
+  case "$DS_ROUTER_URL_CLASS" in
+    malformed)
+      printf 'router-refused: CLAGENTIC_ROUTER_URL is not a well-formed http:// or https:// URL: %s -- refusing to POST (no bearer token, no prompt/diff sent).\n' \
+        "${CLAGENTIC_ROUTER_URL:-}" > "$ERR_FILE"
+      return 99
+      ;;
+    nonlocal)
+      printf 'router-refused: CLAGENTIC_ROUTER_URL points at a NON-LOCAL host for the gate path: %s (host: %s) -- refusing to POST the bearer token and prompt/diff to an unattended, non-local target. This is stricter than the interactive-session stamp check (which warns but allows), because the gate path has no human-in-the-loop moment to absorb that warning. If clagentic-router legitimately runs on another box, this refusal still falls back to the direct-CLI chain below (non-blocking) -- it does not block the gate.\n' \
+        "${CLAGENTIC_ROUTER_URL:-}" "$DS_ROUTER_URL_HOST" > "$ERR_FILE"
+      return 99
+      ;;
+  esac
+
+  ROUTER_URL="${CLAGENTIC_ROUTER_URL%/}"
+  ROUTER_MODEL="role:${ROLE_L}-chain"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    printf 'curl not on PATH -- cannot reach clagentic-router\n' > "$ERR_FILE"
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'python3 not on PATH -- cannot build/parse the router request\n' > "$ERR_FILE"
+    return 1
+  fi
+
+  TMP_ROUTER_COMBINED=$(mktemp -t clagentic-router-combined.XXXXXX)
+  TMP_ROUTER_BODY=$(mktemp -t clagentic-router-body.XXXXXX)
+  TMP_ROUTER_RESP=$(mktemp -t clagentic-router-resp.XXXXXX)
+  { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } > "$TMP_ROUTER_COMBINED"
+
+  # Build the request JSON via python3 (never shell string interpolation --
+  # the combined prompt+input is untrusted diff/transcript content, and
+  # json.dumps is the same discipline this file already uses for every
+  # other JSON-emitting site, e.g. _llm_json_array_sanitize_fields).
+  # Deliberately no "tools" key at all -- see this function's doc comment.
+  python3 -c '
+import json, sys
+
+model, combined_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(combined_path).read()
+body = {
+    "model": model,
+    "max_tokens": 8192,
+    "messages": [{"role": "user", "content": text}],
+}
+open(out_path, "w").write(json.dumps(body))
+' "$ROUTER_MODEL" "$TMP_ROUTER_COMBINED" "$TMP_ROUTER_BODY" 2>>"$ERR_FILE"
+
+  AUTH_HEADER="Authorization: Bearer ${CLAGENTIC_ROUTER_TOKEN:-}"
+  _router_http=""
+  if _router_http=$($DS_TIMEOUT_CMD "$CALL_TIMEOUT" curl -s -o "$TMP_ROUTER_RESP" -w '%{http_code}' \
+      -X POST "$ROUTER_URL/v1/messages" \
+      -H 'content-type: application/json' \
+      -H "$AUTH_HEADER" \
+      --data-binary "@$TMP_ROUTER_BODY" 2>>"$ERR_FILE"); then
+    _router_rc=0
+  else
+    _router_rc=$?
+  fi
+
+  rm -f "$TMP_ROUTER_COMBINED" "$TMP_ROUTER_BODY"
+
+  if [ "$_router_rc" -ne 0 ]; then
+    printf 'router request failed (curl exit=%s, timeout=%ss): %s\n' "$_router_rc" "$CALL_TIMEOUT" "$ROUTER_URL/v1/messages" >> "$ERR_FILE"
+    rm -f "$TMP_ROUTER_RESP"
+    # PROPAGATE THE RAW EXIT STATUS (same contract as invoke_claude/
+    # invoke_codex/invoke_generic, test_invoke_exit_status_sweep.py): curl's
+    # own exit code (124 on a $DS_TIMEOUT_CMD-enforced timeout, 7 on
+    # connection-refused, etc.) is more diagnostic than a flattened 1 --
+    # walk_chain's caller-side classification (EXIT_CODE -eq 124 -> "timeout"
+    # ERR_HINT) already keys off this exact code for every other carrier.
+    return "$_router_rc"
+  fi
+  if [ "$_router_http" != "200" ]; then
+    printf 'router responded %s (expected 200) for model %s at %s: %s\n' \
+      "$_router_http" "$ROUTER_MODEL" "$ROUTER_URL/v1/messages" \
+      "$(head -c 500 "$TMP_ROUTER_RESP" 2>/dev/null | tr -d '\n')" >> "$ERR_FILE"
+    rm -f "$TMP_ROUTER_RESP"
+    return 1
+  fi
+
+  # Extract the first text content block, verbatim, to OUTPUT_FILE. Anthropic
+  # Messages API response shape: {"content":[{"type":"text","text":"..."}],...}.
+  # No tools were ever sent (see doc comment), so a tool_use block is not an
+  # expected shape here -- if the router ever returned one anyway, the
+  # absence of a text block below is treated as a parse failure, same as any
+  # other malformed response, not silently accepted.
+  if ! python3 -c '
+import json, sys
+
+resp_path, out_path = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(resp_path))
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)
+blocks = d.get("content")
+if not isinstance(blocks, list):
+    sys.exit(1)
+for block in blocks:
+    if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+        open(out_path, "w").write(block["text"])
+        sys.exit(0)
+sys.exit(1)
+' "$TMP_ROUTER_RESP" "$OUTPUT_FILE" 2>>"$ERR_FILE"; then
+    printf 'router response had no parseable text content block: %s\n' \
+      "$(head -c 500 "$TMP_ROUTER_RESP" 2>/dev/null | tr -d '\n')" >> "$ERR_FILE"
+    rm -f "$TMP_ROUTER_RESP"
+    return 1
+  fi
+
+  rm -f "$TMP_ROUTER_RESP"
+  return 0
+}
+
+# _llm_role_routable ROLE_L
+# The router opt-in enumeration (task constraint: builder excluded, see
+# invoke_router's doc comment). True (0) only for the three roles this
+# integration covers; false for everything else, including a future new
+# role -- fail toward the existing direct-CLI path, never toward routing
+# something this list does not name.
+_llm_role_routable() {
+  case "$1" in
+    reviewer|auditor|gate) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Dispatch a single chain step.
 # Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE CALL_TIMEOUT [MODE]
 #
@@ -2088,6 +2311,107 @@ walk_chain() {
   PROMPT_BYTES=$(ds_file_size "$TMP_PROMPT")
   CALL_BYTES=$(( INPUT_BYTES + PROMPT_BYTES + 2 ))
   CALL_TIMEOUT=$(llm_timeout_for "$ROLE_U" "$CALL_BYTES")
+
+  # ROUTER PATH, OPT-IN (lr-02f048). CLAGENTIC_<ROLE>_VIA_ROUTER=1, scoped to
+  # reviewer/auditor/gate (_llm_role_routable) and requiring
+  # CLAGENTIC_ROUTER_URL. Unset (either the per-role opt-in or the router
+  # URL) leaves this whole block byte-for-byte inert -- the existing
+  # direct-CLI chain loop below runs completely unmodified, exactly as it
+  # did before this task.
+  #
+  # THREE-WAY DISTINGUISHABLE OUTCOME, all non-blocking, all verbose, all
+  # LOGGED (operator directive, task lr-02f048; LAYER 0 added on the same
+  # task, BOBBIE finding on PR #167):
+  #   LAYER 0 -- invoke_router refused to POST at all: CLAGENTIC_ROUTER_URL
+  #     is malformed, or is well-formed but points at a non-local host
+  #     (ds_router_url_classify, scripts/platform.sh). Signaled by
+  #     invoke_router's own sentinel exit status 99 (never a curl-shaped
+  #     code). Logged "router-refused" -- deliberately a THIRD label, never
+  #     folded into "router-fallback": "we refused to send credentials to a
+  #     suspicious URL" and "the router process was unreachable" are
+  #     different conditions an operator must be able to tell apart from
+  #     audit.db/stderr alone (see invoke_router's own doc comment for the
+  #     full Layer 0 rationale).
+  #   LAYER 1 -- the router's OWN in-chain advance between backends
+  #     (scored/health-aware policy). Entirely internal to the router
+  #     process; invisible here by construction (invoke_router's own doc
+  #     comment). Not duplicated on this side -- the router's /logs
+  #     (call_log.fallback_count/backend_id) is the source of truth for
+  #     that signal, per the task's own framing.
+  #   LAYER 2 -- the router itself is unreachable/degraded at call time (a
+  #     genuinely different condition from Layer 0's refusal), so THIS gate
+  #     falls back to the pre-existing direct-CLI chain below. On any OTHER
+  #     invoke_router failure, log "router-fallback" (never the plain
+  #     "step-failed"/"fallback" labels the direct-CLI loop uses below --
+  #     a shared label would make the layers indistinguishable in
+  #     audit.db, which the task names as the explicit failure this must
+  #     not repeat) and fall through to the unmodified chain loop.
+  # NO SELF-HEAL (task constraint, explicitly out of scope): this block
+  # only ever probes-and-reports via invoke_router's own single attempt --
+  # it never restarts, respawns, or retries a router process. Every
+  # non-pass outcome here is loud (stderr) and logged, never silently
+  # absorbed -- INCLUDING Layer 0: a malformed/nonlocal URL still falls
+  # through to the direct-CLI chain (non-blocking for the gate), but never
+  # silently -- the refusal is as loud as a Layer-2 unreachability event.
+  if [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && _llm_role_routable "$ROLE_L"; then
+    ROUTER_VIA_KEY="CLAGENTIC_$(printf '%s' "$ROLE_U" | tr '[:lower:]-' '[:upper:]_')_VIA_ROUTER"
+    ROUTER_VIA=$(eval "printf '%s' \"\${${ROUTER_VIA_KEY}:-0}\"")
+    if [ "$ROUTER_VIA" = "1" ]; then
+      : > "$TMP_ERR"
+      : > "$TMP_OUT"
+      ROUTER_EXIT=0
+      invoke_router "$ROLE_L" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" || ROUTER_EXIT=$?
+
+      # LAYER 0: invoke_router's own sentinel for "refused before any POST"
+      # -- checked BEFORE the unwrap/validate path below (there is no
+      # output to unwrap; invoke_router wrote ERR_FILE and nothing else).
+      if [ "$ROUTER_EXIT" -eq 99 ]; then
+        ROUTER_REFUSAL_HINT=$(tail -1 "$TMP_ERR" 2>/dev/null | cut -c1-300)
+        [ -z "$ROUTER_REFUSAL_HINT" ] && ROUTER_REFUSAL_HINT="router URL refused (exit=99)"
+        printf '[clagentic-lite/llm-client] LAYER-0 REFUSAL: clagentic-router POST refused for role=%s (%s) -- falling back to direct-CLI chain. This is NOT a Layer-2 unreachability event -- CLAGENTIC_ROUTER_URL itself failed validation (malformed, or non-local for the unattended gate path) and no request was ever sent. Fix CLAGENTIC_ROUTER_URL if this is unexpected.\n' \
+          "$ROLE_L" "$ROUTER_REFUSAL_HINT" 1>&2
+        log_attempt "$ROLE_L" "router" "role:${ROLE_L}-chain" "router-refused" "$ROUTER_REFUSAL_HINT"
+        : > "$TMP_ERR"
+        : > "$TMP_OUT"
+      else
+        ROUTER_UNWRAP_CODE=0
+        if [ "$ROUTER_EXIT" -eq 0 ]; then
+          _llm_unwrap_json_envelope "$MODE" "$TMP_OUT" "$ROLE_L" || ROUTER_UNWRAP_CODE=$?
+        fi
+        if [ "$ROUTER_EXIT" -eq 0 ] && [ "$ROUTER_UNWRAP_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
+          log_attempt "$ROLE_L" "router" "role:${ROLE_L}-chain" "pass" "via clagentic-router"
+          cat "$TMP_OUT"
+          rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
+          return 0
+        fi
+        # LAYER 2: the router path did not produce a usable result (curl
+        # failure, non-200, malformed response, or a response that failed
+        # unwrap/schema validation) -- fall back to the direct-CLI chain
+        # below. "router-fallback" is a distinct outcome label from every
+        # label the direct-CLI loop uses (pass/fallback/step-failed/
+        # degraded) AND from Layer 0's "router-refused", so a query against
+        # audit.db can tell "the router advanced internally" (invisible
+        # here, Layer 1) apart from "we refused to send this" (Layer 0)
+        # apart from "this gate bypassed the router entirely" (Layer 2,
+        # this row) apart from "the direct-CLI chain itself also failed"
+        # (the loop's own rows, unchanged, still written below if this
+        # fallback also fails).
+        if [ "$ROUTER_EXIT" -ne 0 ]; then
+          ROUTER_ERR_HINT=$(tail -1 "$TMP_ERR" 2>/dev/null | cut -c1-300)
+          [ -z "$ROUTER_ERR_HINT" ] && ROUTER_ERR_HINT="router request failed (exit=$ROUTER_EXIT)"
+        elif [ "$ROUTER_UNWRAP_CODE" -ne 0 ]; then
+          ROUTER_ERR_HINT="router response could not be reduced to parseable role-shaped JSON (unwrap_code=$ROUTER_UNWRAP_CODE)"
+        else
+          ROUTER_ERR_HINT="router response failed schema validation for role $ROLE_L"
+        fi
+        printf '[clagentic-lite/llm-client] LAYER-2 FALLBACK: clagentic-router degraded or unreachable for role=%s (%s) -- falling back to direct-CLI chain. This is NOT the router advancing its own internal chain (that would produce no signal here at all) -- this gate bypassed the router entirely for this call. Check clagentic-router health (its own /health, /logs) if this repeats.\n' \
+          "$ROLE_L" "$ROUTER_ERR_HINT" 1>&2
+        log_attempt "$ROLE_L" "router" "role:${ROLE_L}-chain" "router-fallback" "$ROUTER_ERR_HINT"
+        : > "$TMP_ERR"
+        : > "$TMP_OUT"
+      fi
+    fi
+  fi
 
   if [ ! -s "$TMP_CHAIN" ]; then
     if [ "$ROLE_U" = "SUMMARIZER" ]; then

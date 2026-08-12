@@ -144,6 +144,18 @@ _INVOKE_CALL_SHAPES = {
         "stub_name": "some-generic-cli",
         "call": 'invoke_step "some-generic-cli" "" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" 5 "markdown" "auditor"',
     },
+    # invoke_router (lr-02f048) speaks HTTP via curl, not a bare CLI exit
+    # code -- but it propagates curl's OWN exit status verbatim on a
+    # request-level failure (same contract as every other carrier here), so
+    # stubbing `curl` to exit with the injected code exercises the same
+    # property. python3 is also required (invoke_router builds/parses JSON
+    # via python3 -c, same as this file's own real installs) -- present in
+    # this test environment already (every other class in this file
+    # depends on it transitively via _functions_only_source's platform.sh).
+    "invoke_router": {
+        "stub_name": "curl",
+        "call": 'CLAGENTIC_ROUTER_URL="http://127.0.0.1:19999" CLAGENTIC_ROUTER_TOKEN="test-token" invoke_router "reviewer" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" 5',
+    },
 }
 
 
