@@ -235,28 +235,70 @@ class TestCmdAdversarialDistinguishesModelOutputUnparseableFromInfraDegraded(uni
         self.assertNotIn("MODEL_OUTPUT_UNPARSEABLE", err)
 
 
+_FAKE_LLM_CLIENT_CLEAN_REVIEW = """\
+#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{"summary": "clean", "checked": ["security"], "findings": []}
+EOF
+exit 0
+"""
+
+
 class TestCmdMergeGateDistinguishesModelOutputUnparseableFromInfraDegraded(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp(prefix="clagentic-test-unparseable-mg-")
         _init_git_repo(self._tmpdir)
         _stage_a_change(self._tmpdir)
-        # cmd_merge_gate calls build_gate_summary first, which needs at
-        # least last-review.json to exist to avoid the stale/absent-review
-        # short circuits swallowing this test's fake merge-gate call.
-        lite_dir = os.path.join(self._tmpdir, ".clagentic", "lite")
-        os.makedirs(lite_dir, exist_ok=True)
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-            cwd=self._tmpdir, check=True,
-        ).stdout.strip()
-        with open(os.path.join(lite_dir, "last-review.json"), "w") as f:
-            f.write(
-                '{"summary": "clean", "checked": [], "findings": [], '
-                '"_clagentic_diff_sha": "%s"}' % head
-            )
+        # cmd_merge_gate calls build_gate_summary first, which requires an
+        # ANCHORED ledger pass (lr-01ae73) as well as a fresh last-review.json
+        # stamp to avoid the stale/absent-review short circuits swallowing
+        # this test's fake merge-gate call. Seeds via a REAL cmd_review run
+        # (PEACHES/coordinator finding on PR #162, comment 5260223912) rather
+        # than hand-writing last-review.json directly -- since lr-01ae73
+        # removed the merge-gate's ledger bootstrap exemption, a hand-written
+        # last-review.json with no ledger entry no longer passes at all.
+        self._seed_anchored_review_pass()
 
     def tearDown(self):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _seed_anchored_review_pass(self):
+        """Run the real cmd_review (clean stub envelope) against
+        self._tmpdir via the full gates.sh subcommand dispatcher so
+        build_gate_summary's ledger-anchored check finds a genuine passing
+        verdict at current HEAD. The staged change from setUp (_stage_a_change)
+        is what cmd_review reviews; it is left staged afterward (uncommitted),
+        matching this class's own fake-merge-gate calls, which never commit
+        either -- HEAD stays exactly the SHA the ledger entry is anchored to."""
+        fake_tool_home = tempfile.mkdtemp(prefix="clagentic-test-unparseable-mg-review-home-")
+        try:
+            scripts_dir = os.path.join(fake_tool_home, "scripts")
+            os.makedirs(scripts_dir)
+            real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
+            for fname in os.listdir(real_scripts_dir):
+                if fname.endswith(".sh") and fname != "llm-client.sh":
+                    os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(scripts_dir, fname))
+            real_share = os.path.join(TOOL_HOME, "share")
+            if os.path.isdir(real_share):
+                os.symlink(real_share, os.path.join(fake_tool_home, "share"))
+            stub_path = os.path.join(scripts_dir, "llm-client.sh")
+            with open(stub_path, "w") as f:
+                f.write(_FAKE_LLM_CLIENT_CLEAN_REVIEW)
+            os.chmod(stub_path, 0o755)
+
+            env = os.environ.copy()
+            env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
+            env["CLAGENTIC_ALLOW_MISSING_GITLEAKS"] = "1"
+            env["CLAGENTIC_ALLOW_MISSING_SEMGREP"] = "1"
+            env["CLAGENTIC_ALLOW_MISSING_OSV"] = "1"
+            r = subprocess.run(
+                ["sh", os.path.join(scripts_dir, "gates.sh"), "review"],
+                capture_output=True, text=True, env=env, cwd=self._tmpdir,
+            )
+            self.assertEqual(r.returncode, 0, f"seed cmd_review failed: {r.stderr}")
+        finally:
+            shutil.rmtree(fake_tool_home, ignore_errors=True)
 
     def test_unwrap_cause_reports_model_output_unparseable(self):
         out, err, rc = _run_gates_cmd(self._tmpdir, _FAKE_LLM_CLIENT_UNWRAP_DEGRADED_JSON, "cmd_merge_gate")
