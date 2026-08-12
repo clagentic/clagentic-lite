@@ -480,6 +480,209 @@ class TestHostAdapterContractDirect(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# INV-6 regression: REPO_ROOT as a subdirectory of an ancestor git repo with
+# a DIFFERENT origin must never resolve against the ancestor.
+#
+# PEACHES (PR #163, comment 5260814028) proved this concretely: an unscoped
+# `git -C "$REPO_ROOT" remote get-url origin` walks UP past REPO_ROOT to the
+# ancestor's .git when REPO_ROOT itself is not a git repo (or is a
+# subdirectory of one) -- host_adapter_available reported SUCCESS against
+# the ancestor's remote instead of failing gracefully. In the publish path
+# that is wrong-repo disclosure of review findings, silently.
+# ---------------------------------------------------------------------------
+
+def _init_ancestor_repo_with_unrelated_subdir(tmpdir, ancestor_remote_url):
+    """A git repo at <tmpdir>/ancestor with its OWN origin remote
+    (ancestor_remote_url), containing a plain (non-git) subdirectory
+    <tmpdir>/ancestor/subdir/repo_root -- the exact wrapper-layout shape
+    INV-6 exists to guard: REPO_ROOT points at a directory that is NOT
+    itself a git repo, but IS nested inside one that is. Returns the
+    subdir path to use as REPO_ROOT."""
+    ancestor = os.path.join(tmpdir, "ancestor")
+    _git(["init", "-q", "-b", "main", ancestor], cwd=None)
+    _git(["remote", "add", "origin", ancestor_remote_url], cwd=ancestor)
+    with open(os.path.join(ancestor, "README.md"), "w") as f:
+        f.write("ancestor repo\n")
+    _git(["add", "README.md"], cwd=ancestor)
+    _git(["commit", "-q", "-m", "seed"], cwd=ancestor)
+    repo_root = os.path.join(ancestor, "subdir", "repo_root")
+    os.makedirs(repo_root, exist_ok=True)
+    return repo_root
+
+
+class TestHostAdapterRepoScopingSweep(unittest.TestCase):
+    """INV-6 (AGENTS.md): every repo-state git call in host-adapter.sh must
+    gate on _host_adapter_repo_root_is_scoped -- both a direct regression
+    reproduction of PEACHES's finding, and a defensive sweep (same shape as
+    TestHostNeutralGrep below) so a future repo-state git call added to
+    this file without the guard fails a test immediately, not just on the
+    day someone happens to notice."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp(prefix="clagentic-test-inv6-scoping-")
+        self._bin = os.path.join(self._tmpdir, "bin")
+        self._calls = os.path.join(self._tmpdir, "calls.txt")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_available_does_not_succeed_against_an_ancestor_repos_remote(self):
+        """The direct PEACHES-scenario reproduction: REPO_ROOT is a
+        subdirectory of an ancestor git repo whose origin is a DIFFERENT
+        repository. host_adapter_available must NOT report success against
+        the ancestor's github.com remote."""
+        repo_root = _init_ancestor_repo_with_unrelated_subdir(
+            self._tmpdir, "https://github.com/ancestor/wrong.git"
+        )
+        _make_fake_gh(self._bin, self._calls)
+        r = _run_review_merge_fn(
+            "host_adapter_available",
+            env_overrides={"REPO_ROOT": repo_root},
+            path_prepend=self._bin,
+        )
+        self.assertNotEqual(
+            r.returncode, 0,
+            "host_adapter_available must refuse, not silently resolve the "
+            "ancestor repo's remote, when REPO_ROOT is not itself a git repo",
+        )
+
+    def test_post_comment_does_not_target_an_ancestor_repos_branch(self):
+        """Same scenario, the publish path: post_comment must not resolve
+        (and therefore must not post to) a branch name read from the
+        ancestor repo instead of REPO_ROOT."""
+        repo_root = _init_ancestor_repo_with_unrelated_subdir(
+            self._tmpdir, "https://github.com/ancestor/wrong.git"
+        )
+        _make_fake_gh(self._bin, self._calls)
+        body_file = os.path.join(self._tmpdir, "body.txt")
+        with open(body_file, "w") as f:
+            f.write("verdict: pass\n")
+        r = _run_review_merge_fn(
+            "host_adapter_post_comment '%s'" % body_file,
+            env_overrides={"REPO_ROOT": repo_root},
+            path_prepend=self._bin,
+        )
+        self.assertNotEqual(r.returncode, 0)
+        calls = _read_calls(self._calls)
+        self.assertFalse(
+            any(c.startswith("pr comment") for c in calls),
+            "must never reach gh pr comment when REPO_ROOT is unscoped: %r" % calls,
+        )
+
+    def test_available_succeeds_when_repo_root_is_the_real_toplevel(self):
+        """Negative control: the identical ancestor/subdir layout, but
+        REPO_ROOT correctly pointed at the ancestor repo's own toplevel
+        (not a subdirectory) must still succeed -- proves the scoping
+        predicate isn't just failing everything."""
+        ancestor = os.path.join(self._tmpdir, "ancestor")
+        _git(["init", "-q", "-b", "main", ancestor], cwd=None)
+        _git(["remote", "add", "origin", "https://github.com/real/repo.git"], cwd=ancestor)
+        with open(os.path.join(ancestor, "README.md"), "w") as f:
+            f.write("real repo\n")
+        _git(["add", "README.md"], cwd=ancestor)
+        _git(["commit", "-q", "-m", "seed"], cwd=ancestor)
+        _make_fake_gh(self._bin, self._calls)
+        r = _run_review_merge_fn(
+            "host_adapter_available",
+            env_overrides={"REPO_ROOT": ancestor},
+            path_prepend=self._bin,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_repo_root_is_scoped_predicate_exists(self):
+        r = _run_review_merge_fn(
+            "command -v _host_adapter_repo_root_is_scoped",
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    # How many lines above a `git -C` call the guard token is allowed to
+    # appear on -- the codebase's real idiom (see _host_adapter_gh_post_comment,
+    # _host_adapter_detect) is `if command -v git ... && _host_adapter_repo_root_is_scoped; then`
+    # on one line with the actual `git -C ...` call on the NEXT line inside
+    # the `if` body, not both on one line. A small backward window (rather
+    # than requiring the guard token on the exact same line) matches that
+    # real shape without becoming so wide it would silently accept a guard
+    # that has nothing to do with the call it happens to precede.
+    _GIT_C_GUARD_LOOKBACK = 2
+
+    @staticmethod
+    def _sweep_unscoped_git_c_calls(lines):
+        """Sweep primitive, standalone so the fixture test below can drive
+        it directly against a synthetic snippet. Returns (line_no,
+        line_text) violations: any `git -C ...` call whose own line, or one
+        of the _GIT_C_GUARD_LOOKBACK lines immediately before it, does not
+        mention _host_adapter_repo_root_is_scoped. Lines inside the
+        predicate's own function body are exempt (its internal
+        toplevel-resolution call is what implements the guard, not a call
+        that needs guarding itself)."""
+        in_predicate_body = False
+        brace_depth = 0
+        violations = []
+        for i, raw_line in enumerate(lines):
+            stripped = raw_line.strip()
+            if stripped.startswith("#"):
+                continue
+            if "_host_adapter_repo_root_is_scoped()" in stripped:
+                in_predicate_body = True
+                brace_depth = 0
+            if in_predicate_body:
+                brace_depth += stripped.count("{") - stripped.count("}")
+                if brace_depth <= 0 and "}" in stripped and "{" not in stripped:
+                    in_predicate_body = False
+                continue
+            if "git -C" not in stripped:
+                continue
+            window_start = max(0, i - TestHostAdapterRepoScopingSweep._GIT_C_GUARD_LOOKBACK)
+            window = lines[window_start:i + 1]
+            if not any("_host_adapter_repo_root_is_scoped" in w for w in window):
+                violations.append((i + 1, raw_line.rstrip("\n")))
+        return violations
+
+    def test_every_repo_state_git_call_in_host_adapter_sh_is_scoped(self):
+        """Class-wide sweep (AGENTS.md rule 10 -- fix the class, not the
+        three sites PEACHES named): every `git -C ...` repo-state call in
+        scripts/host-adapter.sh must be guarded by
+        _host_adapter_repo_root_is_scoped, either on the same line or on
+        the enclosing `if` line immediately above it. A future contributor
+        adding a fourth unscoped `git -C "$REPO_ROOT"` call anywhere in
+        this file fails this test immediately."""
+        with open(HOST_ADAPTER_SH, encoding="utf-8") as f:
+            lines = f.readlines()
+        violations = self._sweep_unscoped_git_c_calls(lines)
+        self.assertEqual(
+            violations, [],
+            "found git -C repo-state call(s) in host-adapter.sh not guarded "
+            "by _host_adapter_repo_root_is_scoped within "
+            f"{self._GIT_C_GUARD_LOOKBACK} line(s) above (INV-6):\n" +
+            "\n".join(f"  host-adapter.sh:{ln}: {txt}" for ln, txt in violations),
+        )
+
+    def test_sweep_flags_a_synthetic_unscoped_sibling_call(self):
+        """Proves the sweep above actually catches what it claims to, and
+        does NOT flag the real codebase's own guarded shape (guard on the
+        `if` line above, call on the next line)."""
+        unscoped_fixture = (
+            '_host_adapter_new_thing() {\n'
+            '  _x=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)\n'
+            '}\n'
+        ).splitlines(keepends=True)
+        violations = self._sweep_unscoped_git_c_calls(unscoped_fixture)
+        self.assertTrue(violations, "sweep fixture itself must contain a flaggable line")
+
+        scoped_fixture = (
+            '_host_adapter_new_thing() {\n'
+            '  if command -v git >/dev/null 2>&1 && _host_adapter_repo_root_is_scoped; then\n'
+            '    _x=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)\n'
+            '  fi\n'
+            '}\n'
+        ).splitlines(keepends=True)
+        self.assertEqual(
+            self._sweep_unscoped_git_c_calls(scoped_fixture), [],
+            "the real codebase's guard-on-if-line-above shape must not be flagged",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Layer 2: publish via real cmd_review, stub llm-client.sh + stub gh.
 # ---------------------------------------------------------------------------
 

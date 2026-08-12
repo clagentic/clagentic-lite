@@ -51,6 +51,56 @@
 # recognition arm to _host_adapter_detect, and document the new adapter in
 # docs/GATES.md's adapter table -- no other file changes needed. Gate logic
 # (gates.sh, review-merge.sh) must never reference the new vendor by name.
+# EVERY repo-state git call added here must gate on
+# _host_adapter_repo_root_is_scoped first (INV-6, see that function's own
+# doc comment) -- scripts/test_host_adapter_publish.py's
+# TestHostAdapterRepoScopingSweep enforces this class-wide.
+
+# _host_adapter_repo_root_is_scoped — INV-6 (AGENTS.md), mirrored from
+# gates.sh's _git_repo_root_is_scoped (same predicate, same rationale, this
+# file's own local copy rather than a cross-file call): true (exit 0) only
+# when REPO_ROOT itself is the git repo `git -C "$REPO_ROOT" ...` will
+# actually operate on. `-C <dir>` only changes cwd before git's own repo
+# discovery runs -- it still walks UP the filesystem looking for a `.git`
+# directory. On a host where an ancestor of REPO_ROOT happens to be a git
+# repo (a valid wrapper layout this workspace itself uses) -- or REPO_ROOT
+# is not a git repo at all -- any repo-state git call here would silently
+# resolve that unrelated ANCESTOR repo instead of the intended one: a
+# wrong-repo result, not a git error, so nothing about the call itself
+# signals the mistake. In this file specifically, an unscoped
+# `git remote get-url origin` in _host_adapter_detect can make
+# host_adapter_available report success against the wrong repo's remote,
+# and an unscoped rev-parse in the gh adapter's comment paths can post a
+# review verdict's findings to the WRONG repository's change-request thread
+# -- wrong-repo disclosure of findings content, silently. Every repo-state
+# git call in this file must gate on this predicate first.
+#
+# Why a local copy instead of calling gates.sh's version: host-adapter.sh is
+# sourced by gates.sh near the very top of that file, BEFORE REPO_ROOT is
+# resolved and BEFORE gates.sh's own `_git_repo_root_is_scoped` is defined
+# later in the file, so an inter-file call is not reliably available at
+# source time, and this file is also sourced/tested standalone (see
+# scripts/test_host_adapter_publish.py). A local, self-contained mirror
+# avoids a load-order dependency and keeps this file usable on its own —
+# the same reasoning review-merge.sh's own local helpers already follow.
+#
+# `git rev-parse --show-toplevel` always prints an absolute, canonical
+# (symlink-resolved) path; REPO_ROOT is not guaranteed to be either (it can
+# come verbatim from CLAGENTIC_PROJECT_ROOT, or ds_repo_root's
+# wrapper/.clagentic-project fallback) -- canonicalize with `cd DIR && pwd -P`
+# (POSIX `pwd -P`, not plain `pwd`) to match. `cd` failing (REPO_ROOT does
+# not exist / not a directory) falls back to the raw value, which will
+# simply continue to correctly mismatch below. An EMPTY REPO_ROOT (never
+# set) is treated as unscoped too -- `${REPO_ROOT:-.}`'s bare "." fallback
+# elsewhere in this file's individual git calls is exactly the unscoped
+# shape this predicate exists to refuse; it deliberately does NOT default
+# REPO_ROOT to "." itself.
+_host_adapter_repo_root_is_scoped() {
+  [ -n "${REPO_ROOT:-}" ] || return 1
+  _harris_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
+  _harris_git_toplevel=$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || echo "")
+  [ -n "$_harris_git_toplevel" ] && [ "$_harris_git_toplevel" = "$_harris_repo_root_canon" ]
+}
 
 # _host_adapter_detect — sets _HOST_ADAPTER to a known adapter id ("gh" is
 # the only one shipped; see file header) or "" when none is usable. Config
@@ -73,9 +123,11 @@ _host_adapter_detect() {
   # host name, or the configured host's CLI is missing) -- fall through to
   # remote-URL sniffing rather than failing outright, so an un-configured
   # repo still gets adapter behavior when the tooling is actually there.
+  # INV-6: refuse rather than resolve an ancestor repo's remote when
+  # REPO_ROOT is not itself the git repo `-C` would operate on.
   _had_remote=""
-  if command -v git >/dev/null 2>&1; then
-    _had_remote=$(git -C "${REPO_ROOT:-.}" remote get-url origin 2>/dev/null || echo "")
+  if command -v git >/dev/null 2>&1 && _host_adapter_repo_root_is_scoped; then
+    _had_remote=$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || echo "")
   fi
   [ -n "$_had_remote" ] || return 1
 
@@ -156,8 +208,12 @@ _host_adapter_gh_post_comment() {
   _hagpc_body_file="$1"
   [ -f "$_hagpc_body_file" ] || return 1
   _hagpc_branch=""
-  if command -v git >/dev/null 2>&1; then
-    _hagpc_branch=$(git -C "${REPO_ROOT:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  # INV-6: refuse rather than resolve an ancestor repo's branch when
+  # REPO_ROOT is not itself the git repo `-C` would operate on -- an
+  # unscoped read here would post a review verdict's findings to the WRONG
+  # repository's change-request thread.
+  if command -v git >/dev/null 2>&1 && _host_adapter_repo_root_is_scoped; then
+    _hagpc_branch=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
   fi
   [ -n "$_hagpc_branch" ] || return 1
   run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr comment "$_hagpc_branch" --body-file "$_hagpc_body_file"
@@ -165,8 +221,9 @@ _host_adapter_gh_post_comment() {
 
 _host_adapter_gh_read_comments() {
   _hagrc_branch=""
-  if command -v git >/dev/null 2>&1; then
-    _hagrc_branch=$(git -C "${REPO_ROOT:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  # INV-6: same scoping requirement as _host_adapter_gh_post_comment above.
+  if command -v git >/dev/null 2>&1 && _host_adapter_repo_root_is_scoped; then
+    _hagrc_branch=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
   fi
   [ -n "$_hagrc_branch" ] || return 1
   run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$_hagrc_branch" --json comments --jq '.comments[] | {body: .body}'
