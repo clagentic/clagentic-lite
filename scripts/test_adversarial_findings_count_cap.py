@@ -56,7 +56,7 @@ def _functions_only_source_gates(dest_dir):
     with open(dest, "w") as f:
         f.writelines(lines[:cut])
     real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
-    for fname in ("platform.sh", "review-merge.sh"):
+    for fname in ("platform.sh", "review-merge.sh", "host-adapter.sh"):
         os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(dest_dir, fname))
     return dest
 
