@@ -1566,6 +1566,175 @@ invoke_generic() {
     $DS_TIMEOUT_CMD "$CALL_TIMEOUT" $NON_CLAUDE_ENV_STRIP "$CLI_BIN" -p - > "$OUTPUT_FILE" 2> "$ERR_FILE"
 }
 
+# ROUTER-PATH INVOCATION (lr-02f048).
+#
+# OPT-IN, PER-ROLE, THREE ROLES ONLY: reviewer, auditor, gate (merge-gate's
+# internal role literal). Gated at the call site in walk_chain by
+# CLAGENTIC_<ROLE>_VIA_ROUTER=1 -- this function itself has no role
+# allowlist of its own; it is never reached for builder/summarizer because
+# walk_chain never checks the router opt-in for those roles (see
+# _llm_role_routable below). Builder is deliberately excluded: it holds
+# unrestricted Bash and does real multi-turn tool-calling, and every router
+# adapter currently declares SupportsTools=false (lr-be9454) -- a
+# tool-bearing routed request 422s. Reviewer/Auditor/Merge-Gate are already
+# tool-restricted AND single-shot (see invoke_claude/invoke_codex's own
+# TOOL_ROLE handling), so they never carry a `tools` field and never trip
+# that refusal.
+#
+# WIRE SHAPE: POSTs the combined prompt+input (identical construction to
+# invoke_codex's TMP_COMBINED, reused rather than re-derived) as a single
+# user-role message to clagentic-router's Anthropic-compatible
+# /v1/messages endpoint, model "role:<role>-chain" (matches
+# router.example.yaml's routed-mode chain-name convention, established by
+# lr-1c3822/lr-49f25e and already used for CLAGENTIC_ROUTER_INJECT_AGENT_MODEL's
+# frontmatter injection -- same convention, second consumer). NO "tools"
+# field is ever sent -- see the exclusion note above; this is not a
+# capability check at call time, it is a structural property of what this
+# function's three permitted callers ever pass it.
+#
+# OUTPUT SHAPE: writes the response's first text content block VERBATIM to
+# OUTPUT_FILE -- no --output-format-json-style envelope, matching
+# invoke_codex's raw-text output shape (not invoke_claude's). This is
+# deliberate: walk_chain's downstream pipeline (_llm_unwrap_json_envelope,
+# validate_output) already handles "bare CLI output, possibly fenced JSON"
+# uniformly for every non-claude-envelope carrier -- inventing a second
+# envelope shape here would require a THIRD unwrap branch for no benefit,
+# since the router-path response is never Claude Code's own
+# --output-format json wrapper (that flag is a `claude` CLI feature, not
+# part of the Anthropic Messages API this function speaks).
+#
+# RETURN: 0 on a 200 response with a parseable text content block; non-zero
+# otherwise (curl failure, non-200, empty/malformed response body) --
+# ERR_FILE carries a diagnostic line in every non-zero case so the caller's
+# existing ERR_HINT extraction (walk_chain's stderr-parsing branch) has
+# something to read, exactly like every other invoke_* failure path.
+# CALL_TIMEOUT bounds the whole request via $DS_TIMEOUT_CMD, same as every
+# other invoke_* (INV-4).
+#
+# NOT a fallback layer itself -- this function only ever executes ONE
+# attempt against ONE URL. The router's own scored/health-aware chain
+# advance between backends (Layer 1) happens entirely inside the router
+# process and is invisible here by design (see call site in walk_chain for
+# the Layer 2 -- router-unreachable -- fallback this function's failure
+# feeds).
+invoke_router() {
+  ROLE_L="$1"; PROMPT_FILE="$2"; INPUT_FILE="$3"; OUTPUT_FILE="$4"; ERR_FILE="$5"; CALL_TIMEOUT="$6"
+  ROUTER_URL="${CLAGENTIC_ROUTER_URL%/}"
+  ROUTER_MODEL="role:${ROLE_L}-chain"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    printf 'curl not on PATH -- cannot reach clagentic-router\n' > "$ERR_FILE"
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'python3 not on PATH -- cannot build/parse the router request\n' > "$ERR_FILE"
+    return 1
+  fi
+
+  TMP_ROUTER_COMBINED=$(mktemp -t clagentic-router-combined.XXXXXX)
+  TMP_ROUTER_BODY=$(mktemp -t clagentic-router-body.XXXXXX)
+  TMP_ROUTER_RESP=$(mktemp -t clagentic-router-resp.XXXXXX)
+  { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } > "$TMP_ROUTER_COMBINED"
+
+  # Build the request JSON via python3 (never shell string interpolation --
+  # the combined prompt+input is untrusted diff/transcript content, and
+  # json.dumps is the same discipline this file already uses for every
+  # other JSON-emitting site, e.g. _llm_json_array_sanitize_fields).
+  # Deliberately no "tools" key at all -- see this function's doc comment.
+  python3 -c '
+import json, sys
+
+model, combined_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(combined_path).read()
+body = {
+    "model": model,
+    "max_tokens": 8192,
+    "messages": [{"role": "user", "content": text}],
+}
+open(out_path, "w").write(json.dumps(body))
+' "$ROUTER_MODEL" "$TMP_ROUTER_COMBINED" "$TMP_ROUTER_BODY" 2>>"$ERR_FILE"
+
+  AUTH_HEADER="Authorization: Bearer ${CLAGENTIC_ROUTER_TOKEN:-}"
+  _router_http=""
+  if _router_http=$($DS_TIMEOUT_CMD "$CALL_TIMEOUT" curl -s -o "$TMP_ROUTER_RESP" -w '%{http_code}' \
+      -X POST "$ROUTER_URL/v1/messages" \
+      -H 'content-type: application/json' \
+      -H "$AUTH_HEADER" \
+      --data-binary "@$TMP_ROUTER_BODY" 2>>"$ERR_FILE"); then
+    _router_rc=0
+  else
+    _router_rc=$?
+  fi
+
+  rm -f "$TMP_ROUTER_COMBINED" "$TMP_ROUTER_BODY"
+
+  if [ "$_router_rc" -ne 0 ]; then
+    printf 'router request failed (curl exit=%s, timeout=%ss): %s\n' "$_router_rc" "$CALL_TIMEOUT" "$ROUTER_URL/v1/messages" >> "$ERR_FILE"
+    rm -f "$TMP_ROUTER_RESP"
+    # PROPAGATE THE RAW EXIT STATUS (same contract as invoke_claude/
+    # invoke_codex/invoke_generic, test_invoke_exit_status_sweep.py): curl's
+    # own exit code (124 on a $DS_TIMEOUT_CMD-enforced timeout, 7 on
+    # connection-refused, etc.) is more diagnostic than a flattened 1 --
+    # walk_chain's caller-side classification (EXIT_CODE -eq 124 -> "timeout"
+    # ERR_HINT) already keys off this exact code for every other carrier.
+    return "$_router_rc"
+  fi
+  if [ "$_router_http" != "200" ]; then
+    printf 'router responded %s (expected 200) for model %s at %s: %s\n' \
+      "$_router_http" "$ROUTER_MODEL" "$ROUTER_URL/v1/messages" \
+      "$(head -c 500 "$TMP_ROUTER_RESP" 2>/dev/null | tr -d '\n')" >> "$ERR_FILE"
+    rm -f "$TMP_ROUTER_RESP"
+    return 1
+  fi
+
+  # Extract the first text content block, verbatim, to OUTPUT_FILE. Anthropic
+  # Messages API response shape: {"content":[{"type":"text","text":"..."}],...}.
+  # No tools were ever sent (see doc comment), so a tool_use block is not an
+  # expected shape here -- if the router ever returned one anyway, the
+  # absence of a text block below is treated as a parse failure, same as any
+  # other malformed response, not silently accepted.
+  if ! python3 -c '
+import json, sys
+
+resp_path, out_path = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(resp_path))
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)
+blocks = d.get("content")
+if not isinstance(blocks, list):
+    sys.exit(1)
+for block in blocks:
+    if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+        open(out_path, "w").write(block["text"])
+        sys.exit(0)
+sys.exit(1)
+' "$TMP_ROUTER_RESP" "$OUTPUT_FILE" 2>>"$ERR_FILE"; then
+    printf 'router response had no parseable text content block: %s\n' \
+      "$(head -c 500 "$TMP_ROUTER_RESP" 2>/dev/null | tr -d '\n')" >> "$ERR_FILE"
+    rm -f "$TMP_ROUTER_RESP"
+    return 1
+  fi
+
+  rm -f "$TMP_ROUTER_RESP"
+  return 0
+}
+
+# _llm_role_routable ROLE_L
+# The router opt-in enumeration (task constraint: builder excluded, see
+# invoke_router's doc comment). True (0) only for the three roles this
+# integration covers; false for everything else, including a future new
+# role -- fail toward the existing direct-CLI path, never toward routing
+# something this list does not name.
+_llm_role_routable() {
+  case "$1" in
+    reviewer|auditor|gate) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Dispatch a single chain step.
 # Args: CLI MODEL PROMPT_FILE INPUT_FILE OUTPUT_FILE ERR_FILE CALL_TIMEOUT [MODE]
 #
