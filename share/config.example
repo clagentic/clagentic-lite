@@ -605,7 +605,23 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # itself. `clagentic-lite doctor` warns when both are configured for the
 # same role, so this is visible rather than silently ignored.
 #
-# TWO-LAYER FALLBACK, both non-blocking, both logged, distinguishable:
+# CLAGENTIC_ROUTER_URL IS VALIDATED BEFORE EVERY GATE-PATH POST (lr-02f048):
+# invoke_router runs it through the same ds_router_url_classify
+# (scripts/platform.sh) bin/clagentic-lite uses at stamp/probe time. A
+# malformed URL, or a well-formed URL pointing at a non-local host, is
+# REFUSED for the gate path -- stricter than the interactive-session stamp,
+# which warns-but-allows a non-local host, because the gate path runs
+# unattended with no operator to read that warning. Refusal never blocks
+# the gate (falls through to the direct-CLI chain, same as Layer 2 below)
+# but is always logged and loud -- see "THREE-WAY" below.
+#
+# THREE-WAY OUTCOME, all non-blocking, all logged, distinguishable:
+#   Layer 0 -- invoke_router refused to POST at all (malformed/non-local
+#     CLAGENTIC_ROUTER_URL). No request was sent; the bearer token was
+#     never placed in a curl argument. Logged to audit.db with outcome
+#     "router-refused" -- a distinct label from Layer 2's "router-fallback"
+#     so "we refused this URL" is never indistinguishable from "the router
+#     happened to be down."
 #   Layer 1 -- the router's own scored/health-aware advance between
 #     backends within its role:<role>-chain. Internal to the router
 #     process; not observable from clagentic-lite at all (query the
@@ -613,10 +629,10 @@ CLAGENTIC_DEFAULT_BRANCH=main
 #   Layer 2 -- the router itself is unreachable or degraded at call time,
 #     so THIS gate falls back to the direct-CLI chain
 #     (CLAGENTIC_<ROLE>_CMD/_CHAIN/_TIER) instead of blocking. Logged to
-#     audit.db with outcome "router-fallback" (distinct from the direct
-#     path's own pass/fallback/step-failed/degraded labels) and printed
-#     loudly to stderr. No self-healing: the gate never restarts or
-#     retries the router process, only probes once and reports.
+#     audit.db with outcome "router-fallback" (distinct from Layer 0 and
+#     from the direct path's own pass/fallback/step-failed/degraded labels)
+#     and printed loudly to stderr. No self-healing: the gate never
+#     restarts or retries the router process, only probes once and reports.
 # CLAGENTIC_REVIEWER_VIA_ROUTER=0
 # CLAGENTIC_AUDITOR_VIA_ROUTER=0
 # CLAGENTIC_GATE_VIA_ROUTER=0
