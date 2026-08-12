@@ -37,6 +37,15 @@ standing in for clagentic-router):
      _llm_role_routable's enumeration), so a router opt-in accidentally set
      for builder is silently correctly ignored rather than routing a
      tool-bearing role.
+  6. LAYER 0 URL VALIDATION (lr-02f048 fold-in, BOBBIE finding on PR #167):
+     invoke_router validates CLAGENTIC_ROUTER_URL via ds_router_url_classify
+     BEFORE ever placing the bearer token in a curl argument or POSTing
+     prompt/diff content. A malformed URL, or the exact userinfo/glob-prefix
+     bypass shapes from PR #146/lr-49f25e, is refused -- proved mechanically
+     via a curl-call-count sentinel, not merely by asserting stderr text --
+     and logged as a THIRD, distinct "router-refused" outcome, never folded
+     into "router-fallback" (Layer 2, an unreachable router is a different
+     condition from a refused URL).
 
 Run with: python3 -m unittest scripts.test_router_gate_path -v
 """
@@ -146,6 +155,28 @@ def _write_curl_failure_stub(bin_dir):
     with open(path, "w") as f:
         f.write(textwrap.dedent("""\
             #!/bin/sh
+            printf 'curl: (7) Failed to connect\\n' 1>&2
+            exit 7
+        """))
+    os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+    return path
+
+
+def _write_curl_sentinel_stub(bin_dir, call_log_path):
+    """A fake `curl` that appends one line to call_log_path every time it is
+    invoked, then fails (same shape as _write_curl_failure_stub) -- used to
+    MECHANICALLY prove a Layer-0 refusal never reaches curl at all (the
+    task's own bar: "prove it with a test, do not assert it"). A test
+    asserting only stderr text or the audit-row label could still pass on a
+    build that validated-but-POSTed-anyway; this stub makes "curl was never
+    invoked" a directly observable fact -- the same property BOBBIE's
+    finding turns on (the bearer token must never even reach a curl
+    argument for a refused URL)."""
+    path = os.path.join(bin_dir, "curl")
+    with open(path, "w") as f:
+        f.write(textwrap.dedent(f"""\
+            #!/bin/sh
+            printf 'invoked\\n' >> '{call_log_path}'
             printf 'curl: (7) Failed to connect\\n' 1>&2
             exit 7
         """))
@@ -364,6 +395,183 @@ class TestRouterPathLayer2Fallback(_RouterGatePathTestBase):
             f"event, per the task's explicit distinguishability requirement. "
             f"stderr={result.stderr!r}",
         )
+
+
+class TestRouterPathLayer0UrlValidation(_RouterGatePathTestBase):
+    """Layer 0 (lr-02f048, BOBBIE finding on PR #167): invoke_router must
+    validate CLAGENTIC_ROUTER_URL via ds_router_url_classify BEFORE ever
+    placing the bearer token in a curl argument or POSTing prompt/diff
+    content. Covers the exact two bypass shapes named in the task and in
+    PR #146/lr-49f25e's own bypass suite:
+        - RFC 3986 userinfo not stripped (http://127.0.0.1:x@evil.com/
+          connects to evil.com while a naive host read yields 127.0.0.1)
+        - '127.*' matched as a shell glob prefix rather than an IP range
+          (http://127.0.0.1.evil.com/ classifies as local)
+
+    Each assertion here is MECHANICAL, not merely textual: the curl-call
+    sentinel proves curl was never invoked at all for a refused URL (the
+    load-bearing property -- a build that "validated" but still POSTed
+    would still pass a stderr-text-only assertion; this would not)."""
+
+    def test_userinfo_bypass_url_never_reaches_curl(self):
+        call_log = os.path.join(self._tmpdir, "curl-calls.log")
+        open(call_log, "w").close()
+        _write_curl_sentinel_stub(self._bin_dir, call_log)
+        _write_success_claude(self._bin_dir)
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:x@evil.com/",
+                "CLAGENTIC_ROUTER_TOKEN": "super-secret-token",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0,
+                          f"a Layer-0 refusal must NOT block the gate -- "
+                          f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        with open(call_log) as f:
+            calls = f.read()
+        self.assertEqual(calls, "",
+                          "curl must NEVER be invoked for a userinfo-bypass URL -- "
+                          "the bearer token must never reach a curl argument")
+        self.assertEqual(self._claude_call_count(), 1,
+                          "direct-CLI fallback must still run exactly once")
+
+    def test_glob_prefix_bypass_url_never_reaches_curl(self):
+        call_log = os.path.join(self._tmpdir, "curl-calls.log")
+        open(call_log, "w").close()
+        _write_curl_sentinel_stub(self._bin_dir, call_log)
+        _write_success_claude(self._bin_dir)
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1.evil.com/",
+                "CLAGENTIC_ROUTER_TOKEN": "super-secret-token",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0,
+                          f"a Layer-0 refusal must NOT block the gate -- "
+                          f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        with open(call_log) as f:
+            calls = f.read()
+        self.assertEqual(calls, "",
+                          "curl must NEVER be invoked for a glob-prefix-bypass URL -- "
+                          "'127.0.0.1.evil.com' must not be treated as local")
+        self.assertEqual(self._claude_call_count(), 1,
+                          "direct-CLI fallback must still run exactly once")
+
+    def test_malformed_url_never_reaches_curl(self):
+        call_log = os.path.join(self._tmpdir, "curl-calls.log")
+        open(call_log, "w").close()
+        _write_curl_sentinel_stub(self._bin_dir, call_log)
+        _write_success_claude(self._bin_dir)
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "not-a-url",
+                "CLAGENTIC_ROUTER_TOKEN": "super-secret-token",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0, f"stderr={result.stderr!r}")
+        with open(call_log) as f:
+            calls = f.read()
+        self.assertEqual(calls, "", "curl must never be invoked for a malformed URL")
+        self.assertEqual(self._claude_call_count(), 1)
+
+    def test_valid_local_url_does_reach_curl(self):
+        """Control case: a genuinely local, well-formed URL must still
+        reach curl -- proves the sentinel stub and test harness actually
+        distinguish refused-vs-attempted, rather than curl simply never
+        firing for any reason (e.g. a broken PATH/stub wiring bug)."""
+        call_log = os.path.join(self._tmpdir, "curl-calls.log")
+        open(call_log, "w").close()
+        _write_curl_sentinel_stub(self._bin_dir, call_log)
+        _write_success_claude(self._bin_dir)
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:19999",
+                "CLAGENTIC_ROUTER_TOKEN": "test-token",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0, f"stderr={result.stderr!r}")
+        with open(call_log) as f:
+            calls = f.read()
+        self.assertIn("invoked", calls,
+                       "a genuinely local URL must still reach curl -- the "
+                       "sentinel/harness must distinguish refused from attempted")
+
+    def test_layer0_refusal_writes_distinct_router_refused_outcome(self):
+        _write_curl_failure_stub(self._bin_dir)
+        _write_success_claude(self._bin_dir)
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:x@evil.com/",
+                "CLAGENTIC_ROUTER_TOKEN": "test-token",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0, f"stderr={result.stderr!r}")
+        rows = self._audit_rows()
+        outcomes = [o for o, _ in rows]
+        self.assertIn(
+            "router-refused", outcomes,
+            f"a Layer-0 refusal must write its OWN 'router-refused' outcome, "
+            f"distinct from 'router-fallback' (Layer 2) -- rows={rows!r}",
+        )
+        self.assertNotIn(
+            "router-fallback", outcomes,
+            f"a Layer-0 refusal must NOT also be logged as 'router-fallback' -- "
+            f"the two conditions (refused vs. unreachable) must never share a "
+            f"label. rows={rows!r}",
+        )
+
+    def test_layer0_stderr_warning_is_distinguishable_from_layer2(self):
+        _write_curl_failure_stub(self._bin_dir)
+        _write_success_claude(self._bin_dir)
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1.evil.com/",
+                "CLAGENTIC_ROUTER_TOKEN": "test-token",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        self.assertIn("LAYER-0 REFUSAL", result.stderr,
+                       f"a Layer-0 event must be labeled distinctly from a "
+                       f"Layer-2 fallback. stderr={result.stderr!r}")
+        self.assertNotIn("LAYER-2 FALLBACK", result.stderr,
+                          f"a Layer-0 refusal must not ALSO print the Layer-2 "
+                          f"label. stderr={result.stderr!r}")
+
+    def test_bearer_token_never_appears_in_stderr_for_refused_url(self):
+        """The token must never even reach a curl argument for a refused
+        URL -- this asserts it also never leaks into ERR_FILE/stderr via
+        any diagnostic path."""
+        call_log = os.path.join(self._tmpdir, "curl-calls.log")
+        open(call_log, "w").close()
+        _write_curl_sentinel_stub(self._bin_dir, call_log)
+        _write_success_claude(self._bin_dir)
+        secret_token = "sk-super-secret-do-not-leak-12345"
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://localhost:pw@evil.com/",
+                "CLAGENTIC_ROUTER_TOKEN": secret_token,
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0, f"stderr={result.stderr!r}")
+        self.assertNotIn(secret_token, result.stderr,
+                          "the bearer token must never appear in stderr/diagnostics "
+                          "for a refused URL")
+        self.assertNotIn(secret_token, result.stdout,
+                          "the bearer token must never appear in stdout for a "
+                          "refused URL")
 
 
 class TestRouterPathLoggingParity(_RouterGatePathTestBase):
