@@ -1383,6 +1383,44 @@ invoke_claude() {
   return $EXIT_CODE
 }
 
+# NON-CLAUDE ROUTER-ENV STRIP (lr-b20c0a).
+#
+# ROOT CAUSE: bin/clagentic-lite stamps a Bedrock-mode env block into
+# .claude/settings.json (AWS_BEARER_TOKEN_BEDROCK plus the ANTHROPIC_* trio)
+# so Claude Code's OWN outbound calls route through the router. That
+# settings.json env block is process-wide for the session, not scoped to
+# Claude Code's traffic -- every subprocess this session spawns inherits it,
+# including `codex exec`. codex's amazon-bedrock provider reads
+# AWS_BEARER_TOKEN_BEDROCK itself (standard AWS SDK bearer-token var) and
+# prefers it over SSO-derived creds, so codex sends the router's local admin
+# token to the real Bedrock endpoint, which 401s -- 100% failure for every
+# codex-backed Reviewer/Auditor call on a Bedrock-mode host, silently
+# falling back to claude:flagship with no signal but audit.db step-failed
+# rows.
+#
+# FIX: strip the four router-scoped vars before shelling out to any
+# NON-CLAUDE CLI. Deliberately NOT applied to invoke_claude -- Claude Code's
+# CLI is the intended consumer of that env block, and stripping there would
+# break router routing entirely. This asymmetry is the whole point.
+#
+# ONE NAMED PLACE (code-craft rule 1, reuse first) rather than four repeated
+# `env -u X -u Y -u Z -u W` literals across invoke_codex's three call sites
+# plus invoke_generic: a future fifth router-scoped var is added here once,
+# every call site picks it up automatically.
+#
+# ORDERING (do not move `env -u ...` to wrap $DS_TIMEOUT_CMD itself):
+# DS_TIMEOUT_CMD (platform.sh) is exported as one of three tokens --
+# "timeout", "gtimeout", or "ds_timeout_missing" -- and the last of those is
+# a SHELL FUNCTION, not a binary on PATH. `env` can only exec real binaries;
+# `env -u ... ds_timeout_missing ...` would fail with "No such file or
+# directory" on a host with neither timeout(1) nor gtimeout(1), silently
+# defeating INV-1a's fail-closed diagnostic instead of triggering it. Every
+# call site below therefore keeps `$DS_TIMEOUT_CMD "$CALL_TIMEOUT"` as the
+# outermost wrapper and places `env -u ...` AFTER it, wrapping only the
+# actual CLI invocation -- correct whether DS_TIMEOUT_CMD resolved to a real
+# timeout binary or to the shell-function fallback.
+NON_CLAUDE_ENV_STRIP="env -u AWS_BEARER_TOKEN_BEDROCK -u ANTHROPIC_BEDROCK_BASE_URL -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN"
+
 # Codex non-interactive.
 #
 # We combine prompt and input into a single temp file and feed it via stdin
@@ -1474,11 +1512,11 @@ invoke_codex() {
     # Full flag set: version is known-compatible.
     if [ -n "$MODEL" ]; then
       # shellcheck disable=SC2086
-      $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec --skip-git-repo-check -m "$MODEL" \
+      $DS_TIMEOUT_CMD "$CALL_TIMEOUT" $NON_CLAUDE_ENV_STRIP codex exec --skip-git-repo-check -m "$MODEL" \
         --color never $CODEX_TOOL_FLAGS -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1 || _codex_exit=$?
     else
       # shellcheck disable=SC2086
-      $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec --skip-git-repo-check \
+      $DS_TIMEOUT_CMD "$CALL_TIMEOUT" $NON_CLAUDE_ENV_STRIP codex exec --skip-git-repo-check \
         --color never $CODEX_TOOL_FLAGS -o "$TMP_RAW" - < "$TMP_COMBINED" > "$ERR_FILE" 2>&1 || _codex_exit=$?
     fi
   else
@@ -1486,7 +1524,8 @@ invoke_codex() {
     # have been removed. Output goes to stdout (captured as TMP_RAW via
     # redirect) rather than -o flag to sidestep any flag-surface change.
     # ERR_FILE receives stderr; the caller reads it for the ERR_HINT.
-    $DS_TIMEOUT_CMD "$CALL_TIMEOUT" codex exec - \
+    # shellcheck disable=SC2086
+    $DS_TIMEOUT_CMD "$CALL_TIMEOUT" $NON_CLAUDE_ENV_STRIP codex exec - \
       < "$TMP_COMBINED" > "$TMP_RAW" 2> "$ERR_FILE" || _codex_exit=$?
     # Prepend a version-mismatch note to ERR_FILE so the ERR_HINT in the
     # audit row is precise and actionable regardless of what codex printed.
@@ -1512,10 +1551,19 @@ invoke_codex() {
 
 # Generic: pipe prompt+input via stdin to `<cli> -p -`. If the CLI does not
 # accept that invocation, the step fails and the chain advances.
+#
+# ROUTER-ENV STRIP (lr-b20c0a): same hazard class as invoke_codex, above --
+# CLI_BIN here is whatever CLAGENTIC_<ROLE>_CMD names, always a non-Claude
+# CLI (invoke_step routes "claude" to invoke_claude directly; anything else,
+# including a future third-party CLI, lands here). Reuses
+# NON_CLAUDE_ENV_STRIP rather than a second copy of the same `-u` list --
+# see that variable's doc comment for the full rationale and the
+# DS_TIMEOUT_CMD ordering constraint, which applies identically here.
 invoke_generic() {
   CLI_BIN="$1"; MODEL="$2"; PROMPT_FILE="$3"; INPUT_FILE="$4"; OUTPUT_FILE="$5"; ERR_FILE="$6"; CALL_TIMEOUT="$7"
+  # shellcheck disable=SC2086
   { cat "$PROMPT_FILE"; printf '\n\n'; cat "$INPUT_FILE"; } | \
-    $DS_TIMEOUT_CMD "$CALL_TIMEOUT" "$CLI_BIN" -p - > "$OUTPUT_FILE" 2> "$ERR_FILE"
+    $DS_TIMEOUT_CMD "$CALL_TIMEOUT" $NON_CLAUDE_ENV_STRIP "$CLI_BIN" -p - > "$OUTPUT_FILE" 2> "$ERR_FILE"
 }
 
 # Dispatch a single chain step.
