@@ -722,6 +722,39 @@ The fix has two independent layers:
 
 The structural reason the two gates needed different treatment: the adversarial-findings path never decodes attacker-supplied JSON — it builds each finding as a code-controlled dict literal with a fixed key set, so an extra key cannot exist on the object at all (the `_llm_json_array_sanitize_fields`-only treatment `_sanitize_adversarial_findings_json` uses is safe *because* of this). The review-findings path decodes the model's own raw JSON response directly — a field set an attacker (or a manipulated/miscalibrated model) can freely add to — which is exactly the shape `_llm_json_array_allowlist_fields` exists to close (the same reasoning `docs/GATES.md` "Reviewer-consulted deferrals" already documents for `deferrals.json`, a different attacker-influenced-field-set case). Before this fix, review findings were the one remaining consumer of externally-authored JSON with no allowlist step — a third state alongside "closed code-controlled field set" (adversarial findings) and "allowlist-then-sanitize" (deferrals) that the standing invariant does not permit.
 
+### Host adapter contract and review-verdict publish (lr-2b07a8)
+
+**Why this exists.** A review verdict from the ledger above is only visible to whoever runs `gates.sh` locally, unless it is also published somewhere a team already looks — the change-request thread. This closes that gap without coupling gate logic to any one git-hosting vendor.
+
+**Host-neutral by contract.** `scripts/gates.sh` and `scripts/review-merge.sh` (gate logic) never name a git-hosting vendor, CLI, or API directly. `scripts/host-adapter.sh` is the one file that is allowed to — every vendor-specific detail (which CLI, which subcommands, which flags) lives there and only there. `scripts/test_host_adapter_publish.py`'s `TestHostNeutralGrep` pins this as an enforced property: it greps `gates.sh` and `review-merge.sh` for vendor host tokens (`github.com`, `gitlab.com`, `gitea.`, `forgejo.`, and the `gh pr ...` CLI invocation shape) and fails if any appear outside `scripts/host-adapter.sh`.
+
+**The contract — four functions, all in `scripts/host-adapter.sh`:**
+
+| Function | Contract |
+|---|---|
+| `host_adapter_available` | Exit 0 iff a usable adapter is discovered for the current repo's `origin` remote; exit 1 otherwise. Gate logic MUST check this before calling any of the three functions below — none of them degrade gracefully to "no adapter" on their own. |
+| `host_adapter_open_change_request BASE HEAD` | Open (or find and reuse) a PR/MR for `HEAD` against `BASE`. This is the refactored seam `cmd_ship`'s PR-open step now calls — before this task it called `gh pr view`/`gh pr create` directly. |
+| `host_adapter_post_comment BODY_FILE` | Post `BODY_FILE`'s contents as one comment on the current branch's change-request thread. |
+| `host_adapter_read_comments` | Print existing comment bodies for the current branch's change request, one JSON object per line. Contract-completeness (not required by the publish path below, which only ever appends). |
+
+**Discovery — config-first, then remote-sniff (`_host_adapter_detect`, `scripts/host-adapter.sh`):**
+
+1. `CLAGENTIC_REPO_HOST` (`share/config.example`; previously documented as "where `gates ship` opens PRs" but read by nothing before this task) wins outright when set to a value with a matching shipped adapter and that adapter's CLI is on `PATH`.
+2. Otherwise, sniff `git remote get-url origin` for a recognizable hostname and require the matching CLI to ALSO be on `PATH`. A hostname match with no working CLI is not a usable adapter — this falls through to "no adapter," never a partial one.
+3. No remote, no config match, no CLI match — no adapter. The fallback contract below applies.
+
+**Adding a new host.** Implement three functions following the `gh` example in `scripts/host-adapter.sh` (`_host_adapter_gh_open_change_request` / `_host_adapter_gh_post_comment` / `_host_adapter_gh_read_comments`), add one recognition arm to `_host_adapter_detect`, and add a row to this table. No other file needs to change — gate logic calls only the four host-neutral functions above, never a new adapter's internals directly. Per this task's own scope, only a `gh` (GitHub) adapter ships; adapters for hosts nobody has enrolled are explicitly out of scope until a repo actually uses one.
+
+**Publish (item 3) — one comment per review run.** After `_ledger_record_review_verdict` (see "Review ledger and anchored verdicts" above) appends a ledger entry, it calls `_publish_review_verdict` (`scripts/gates.sh`) exactly once, which — when `host_adapter_available` — renders a comment body (verdict, `head_sha`, a per-severity findings count, and a "Recurring from a prior round" section listing every finding whose `_ledger_recurring` flag `_ledger_mark_recurrence` already set) and posts it via `host_adapter_post_comment`. One call per review run, by construction: `_publish_review_verdict` is called from exactly one place, once per `_ledger_record_review_verdict` invocation, which itself runs once per `cmd_review` pass — never comment spam, and never a second comment for findings that were merely re-rendered (recurring findings are marked in the SAME comment as the round that reported them, not given their own follow-up comment).
+
+**Fallback contract (item 4) — the local ledger IS the complete flow, not a degraded one.** When `host_adapter_available` returns false (no remote, no auth, no matching adapter, or the adapter's CLI is missing), `_publish_review_verdict` prints one line — `no host adapter available for this remote — verdict recorded to the local ledger only` — and returns success. This is not an error path: the ledger write already completed before publish is ever attempted, so a repo with no enrolled remote gets exactly the same review/ledger/merge-gate behavior lr-01ae73 established, plus this one notice.
+
+**Publish failures never gate.** `_publish_review_verdict`'s return value is never checked by its caller — a `host_adapter_post_comment` failure (expired auth, network down, rate limit) logs one `review-publish`/`block` row to `.clagentic/lite/audit.db` (`ds_audit_log`) and prints a warning to stderr, but the ledger entry already recorded above stands unchanged and `cmd_review`'s own exit code is unaffected. Publishing is observability layered on top of the ledger, never a precondition for a passing (or blocking) verdict. `scripts/test_host_adapter_publish.py`'s `test_publish_failure_never_changes_verdict_or_blocks_gate` and `test_publish_failure_logged_to_audit_db` pin both halves of this directly.
+
+**cmd_ship's PR-open path (item 2) — same adapter, not a parallel one.** `cmd_ship` (`scripts/gates.sh`) calls `host_adapter_open_change_request` after a successful push, replacing what was previously a direct `gh pr view`/`gh pr create` call — the reuse seam this task's scope names explicitly. `host_adapter_available` gates the call the same way it gates publish; no adapter prints the same manual-PR-instructions template `cmd_ship` always has.
+
+**Verification (task comment #4).** This host has no enrolled repos and no authenticated remote to a real change-request thread. Every adapter-contract property above — discovery, one-comment-per-run, the fallback notice, and failure-never-gates — is proven repo-locally in `scripts/test_host_adapter_publish.py` against a stub `gh` executable placed on `PATH` ahead of any real one, so no network call or real credential is ever touched. Behavior against a real git host is operator-side post-ship validation on an enrolled machine, not builder acceptance criteria.
+
 ### Exit-code contract for `gates.sh review` and `gates.sh ship`
 
 `gates.sh review` distinguishes two failure classes with separate exit codes. CI and operator scripts should branch on these:
