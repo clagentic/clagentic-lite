@@ -11,9 +11,11 @@ existing single-purpose files.
 THIS PASS covers INV-1a and INV-4 (class-4 foundry fix, the last of a
 four-PR class-level sequence): every external-process invocation in
 scripts/gates.sh that was previously untimed (gitleaks x3, osv-scanner x3,
-semgrep x2, git push, gh pr view, gh pr create) now runs through the
-run_bounded wrapper, and $DS_TIMEOUT_CMD (scripts/platform.sh) can never
-resolve to a silent-unbounded no-op.
+semgrep x2, git push -- the former gh pr view/gh pr create sites moved to
+scripts/host-adapter.sh under lr-2b07a8's host-adapter contract, swept
+separately below, still via the same run_bounded wrapper) now runs through
+the run_bounded wrapper, and $DS_TIMEOUT_CMD (scripts/platform.sh) can
+never resolve to a silent-unbounded no-op.
 
 ALSO COVERS INV-5 (lr-37282a/lr-8a28e0, extended same-PR by a PEACHES
 fold-in, PR #144 review comment 5207862165): every reviewer-capable
@@ -43,6 +45,7 @@ TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
 PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
+HOST_ADAPTER_SH = os.path.join(TOOL_HOME, "scripts", "host-adapter.sh")
 
 # ---------------------------------------------------------------------- #
 # INV-4: every external-process invocation carries an explicit wall-clock
@@ -55,7 +58,9 @@ LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
 # timed directly via $DS_TIMEOUT_CMD inside
 # _gate_resolve_fresh_default_branch_ref (predating this task, see that
 # function's own docstring) -- a genuinely different, already-covered site,
-# not an omission from this sweep's scope.
+# not an omission from this sweep's scope. `gh` invocations now live in
+# scripts/host-adapter.sh (lr-2b07a8), not gates.sh -- this same regex is
+# reused by the host-adapter-scoped sweep below.
 #
 # INVOCATION SHAPE, not bare substring presence: the binary name must
 # appear as the FIRST TOKEN of a statement -- immediately after `if `,
@@ -81,17 +86,33 @@ def _iter_gates_sh_lines():
         return f.readlines()
 
 
+def _iter_host_adapter_sh_lines():
+    with open(HOST_ADAPTER_SH, encoding="utf-8") as f:
+        return f.readlines()
+
+
+# A `case` arm label of the exact shape `gh) ...` (scripts/host-adapter.sh's
+# adapter-id dispatch, e.g. `gh) _host_adapter_gh_open_change_request ...`)
+# matches _INVOCATION_RE's statement-start + word-boundary shape but is not
+# an invocation at all -- `gh` here is a case PATTERN, not a command. This
+# shape does not occur in gates.sh (no per-host case dispatch there), which
+# is why the original sweep never needed this exclusion.
+_CASE_ARM_LABEL_RE = re.compile(r'^\s*(?:gitleaks|osv-scanner|semgrep|gh)\)\s')
+
+
 def _find_unbound_external_invocations(lines):
     """Sweep primitive: every live (non-comment) line in gates.sh whose
     STATEMENT-START token is one of the INV-4-covered binaries (a real
-    invocation, not a substring appearing inside a log message or
-    comment), that is not itself a capability probe, and has no
+    invocation, not a substring appearing inside a log message, comment, or
+    case-arm label), that is not itself a capability probe, and has no
     run_bounded/$DS_TIMEOUT_CMD prefix captured as part of the same match.
     Returns a list of (line_no, line_text) violations."""
     violations = []
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith('#'):
+            continue
+        if _CASE_ARM_LABEL_RE.match(stripped):
             continue
         m = _INVOCATION_RE.search(stripped)
         if not m:
@@ -116,7 +137,10 @@ class TestEveryExternalInvocationInGatesShIsBounded(unittest.TestCase):
     scripts/gates.sh may lack a run_bounded/$DS_TIMEOUT_CMD prefix. Sweeps
     the real, current gates.sh -- not a snapshot of today's known sites --
     so a future contributor adding an eleventh unbounded invocation trips
-    this test immediately."""
+    this test immediately. (`gh pr view`/`gh pr create` moved to
+    scripts/host-adapter.sh under lr-2b07a8 -- swept separately by
+    TestEveryExternalInvocationInHostAdapterShIsBounded below, since that
+    file, not gates.sh, is where those two sites now live.)"""
 
     def setUp(self):
         self.lines = _iter_gates_sh_lines()
@@ -141,10 +165,10 @@ class TestEveryExternalInvocationInGatesShIsBounded(unittest.TestCase):
             if _INVOCATION_RE.search(stripped) and '--help' not in line and '--version' not in line:
                 found += 1
         self.assertGreaterEqual(
-            found, 11,
-            f"expected at least 11 real invocation sites (gitleaks x3, "
-            f"osv-scanner x3, semgrep x2, git push, gh pr view, gh pr "
-            f"create, plus the legacy osv-scanner fallback); found {found}",
+            found, 9,
+            f"expected at least 9 real invocation sites in gates.sh "
+            f"(gitleaks x3, osv-scanner x3, semgrep x2, git push, plus the "
+            f"legacy osv-scanner fallback); found {found}",
         )
 
     def test_no_unbound_external_invocation_in_gates_sh(self):
@@ -155,6 +179,42 @@ class TestEveryExternalInvocationInGatesShIsBounded(unittest.TestCase):
             f"gates.sh with no run_bounded/$DS_TIMEOUT_CMD prefix -- this "
             f"reintroduces the unbounded-external-call class (INV-4):\n" +
             "\n".join(f"  gates.sh:{ln}: {txt}" for ln, txt in violations),
+        )
+
+
+class TestEveryExternalInvocationInHostAdapterShIsBounded(unittest.TestCase):
+    """INV-4, extended to scripts/host-adapter.sh (lr-2b07a8): the `gh pr
+    view`/`gh pr create`/`gh pr comment` sites that used to live in
+    gates.sh now live here, still behind run_bounded -- this sweep proves
+    the move didn't quietly drop the bound."""
+
+    def setUp(self):
+        self.lines = _iter_host_adapter_sh_lines()
+
+    def test_sweep_discovers_at_least_the_known_bound_sites(self):
+        found = 0
+        for line in self.lines:
+            stripped = line.strip()
+            if stripped.startswith('#'):
+                continue
+            if _CASE_ARM_LABEL_RE.match(stripped):
+                continue
+            if _INVOCATION_RE.search(stripped) and '--help' not in line and '--version' not in line:
+                found += 1
+        self.assertGreaterEqual(
+            found, 2,
+            f"expected at least 2 real gh invocation sites in "
+            f"host-adapter.sh (pr view, pr create/comment); found {found}",
+        )
+
+    def test_no_unbound_external_invocation_in_host_adapter_sh(self):
+        violations = _find_unbound_external_invocations(self.lines)
+        self.assertEqual(
+            violations, [],
+            f"found {len(violations)} external-process invocation(s) in "
+            f"host-adapter.sh with no run_bounded/$DS_TIMEOUT_CMD prefix -- "
+            f"this reintroduces the unbounded-external-call class (INV-4):\n" +
+            "\n".join(f"  host-adapter.sh:{ln}: {txt}" for ln, txt in violations),
         )
 
 

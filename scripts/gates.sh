@@ -25,6 +25,7 @@
 set -e
 . "$(dirname "$0")/platform.sh"
 . "$(dirname "$0")/review-merge.sh"
+. "$(dirname "$0")/host-adapter.sh"
 
 # Tool home: the directory containing scripts/ — resolved from this script's
 # own location so it's correct whether invoked via PATH, symlink, or directly.
@@ -101,8 +102,10 @@ _git_repo_scoped_head_sha() {
 #
 # INV-1a/INV-2 enforcement (class-4 foundry fix): the SOLE entry point for
 # every external-process invocation in this file that was previously
-# untimed — gitleaks, osv-scanner, semgrep, `git push`, `gh pr view`, `gh pr
-# create`. (`git fetch`/`git ls-remote` inside
+# untimed — gitleaks, osv-scanner, semgrep, `git push`, and (at the time of
+# that fix) the host's PR-open CLI, since generalized behind the host
+# adapter (lr-2b07a8; every adapter call still routes through run_bounded —
+# see scripts/host-adapter.sh). (`git fetch`/`git ls-remote` inside
 # _gate_resolve_fresh_default_branch_ref were already timed via
 # $DS_TIMEOUT_CMD directly, predating this task — not converted here since
 # they were never part of the untimed set, but they benefit from the same
@@ -1385,7 +1388,125 @@ PYEOF
   case "$_lrrv_max" in ''|*[!0-9]*) _lrrv_max=0 ;; esac
   ledger_append "$_lrrv_ledger" "$_lrrv_line" "$_lrrv_max"
   ds_audit_log "review-ledger" "pass" "branch=${_lrrv_branch:-<none>} verdict=${_lrrv_verdict} head=${_lrrv_head_sha:-<unresolved>}"
+
+  # Publish (lr-2b07a8): observability only, never gating -- see
+  # _publish_review_verdict's own doc comment for the fallback contract.
+  _publish_review_verdict "$_lrrv_branch" "$_lrrv_verdict" "$_lrrv_head_sha" "$_lrrv_findings"
+
   return 0
+}
+
+# _publish_review_verdict BRANCH VERDICT HEAD_SHA FINDINGS_JSON
+#
+# Item 3/4: after a verdict lands in the ledger, publish it through the host
+# adapter as ONE comment per review run -- verdict, head_sha, a findings
+# summary, and recurring-finding markers (the `_ledger_recurring` annotation
+# _ledger_mark_recurrence already computed on FINDINGS_JSON). One comment
+# per invocation of this function, which is called exactly once per
+# _ledger_record_review_verdict call, which is called exactly once per
+# `cmd_review` run -- never comment spam.
+#
+# FALLBACK CONTRACT (item 4): no remote, no auth, or no adapter for the host
+# means the local ledger IS the complete flow, not a degraded one --
+# host_adapter_available's "no adapter" case prints a single one-line notice
+# and returns 0 (success), not a failure. A publish FAILURE (adapter present
+# but the call itself errored -- auth expired, network down, rate limit)
+# NEVER changes the verdict already recorded above and NEVER blocks the
+# gate: this function's return value is deliberately never checked by its
+# caller. Publish failures are logged to the audit db (ds_audit_log) so
+# they're visible without being load-bearing.
+_publish_review_verdict() {
+  _prv_branch="$1"
+  _prv_verdict="$2"
+  _prv_head="$3"
+  _prv_findings="$4"
+
+  if ! host_adapter_available; then
+    echo "[gates/review] no host adapter available for this remote — verdict recorded to the local ledger only"
+    return 0
+  fi
+
+  _prv_body_file=$(mktemp -t clagentic-review-verdict-comment.XXXXXX)
+  if ! _build_review_verdict_comment_body "$_prv_verdict" "$_prv_head" "$_prv_findings" > "$_prv_body_file" 2>/dev/null; then
+    rm -f "$_prv_body_file"
+    ds_audit_log "review-publish" "block" "branch=${_prv_branch:-<none>} head=${_prv_head:-<unresolved>} reason=body-render-failed"
+    return 0
+  fi
+
+  if host_adapter_post_comment "$_prv_body_file"; then
+    ds_audit_log "review-publish" "pass" "branch=${_prv_branch:-<none>} head=${_prv_head:-<unresolved>} verdict=${_prv_verdict}"
+  else
+    echo "[gates/review] publish to host adapter failed — local ledger verdict stands, gate outcome unaffected" 1>&2
+    ds_audit_log "review-publish" "block" "branch=${_prv_branch:-<none>} head=${_prv_head:-<unresolved>} reason=adapter-post-comment-failed"
+  fi
+  rm -f "$_prv_body_file"
+  return 0
+}
+
+# _build_review_verdict_comment_body VERDICT HEAD_SHA FINDINGS_JSON — renders
+# the one-comment-per-run body: verdict, head_sha, a per-severity findings
+# count, and which findings are recurring from a prior round
+# (`_ledger_recurring`, set by _ledger_mark_recurrence before this is
+# called). Fails closed (prints nothing, non-zero exit) with no jq/python3
+# rather than posting a malformed/empty comment.
+_build_review_verdict_comment_body() {
+  _brvcb_verdict="$1"
+  _brvcb_head="$2"
+  _brvcb_findings="$3"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$_brvcb_verdict" "$_brvcb_head" "$_brvcb_findings" <<'PYEOF'
+import json, sys
+
+verdict, head, findings_json = sys.argv[1:4]
+try:
+    findings = json.loads(findings_json)
+    if not isinstance(findings, list):
+        findings = []
+except Exception:
+    findings = []
+
+by_severity = {}
+recurring = []
+for f in findings:
+    if not isinstance(f, dict):
+        continue
+    sev = str(f.get("severity", "unknown"))
+    by_severity[sev] = by_severity.get(sev, 0) + 1
+    if f.get("_ledger_recurring"):
+        recurring.append(f)
+
+lines = []
+lines.append("**clagentic-lite review verdict: %s**" % verdict)
+lines.append("")
+lines.append("head_sha: `%s`" % (head or "<unresolved>"))
+lines.append("")
+if findings:
+    lines.append("Findings: %d total (%s)" % (
+        len(findings),
+        ", ".join("%s: %d" % (k, v) for k, v in sorted(by_severity.items())),
+    ))
+else:
+    lines.append("Findings: none")
+if recurring:
+    lines.append("")
+    lines.append("Recurring from a prior round (%d):" % len(recurring))
+    for f in recurring:
+        lines.append("- [%s] %s: %s" % (
+            f.get("severity", "unknown"), f.get("file", "?"), f.get("message", ""),
+        ))
+
+print("\n".join(lines))
+PYEOF
+    return $?
+  fi
+
+  # No python3 -- jq alone cannot format multi-line prose cleanly enough for
+  # a readable comment body, so this path fails closed (no partial/garbled
+  # comment) rather than emitting something malformed. host_adapter_available
+  # having returned true is not itself gated on python3, so this is a real,
+  # distinct degraded case, logged by the caller.
+  return 1
 }
 
 # get_review_diff — prints the best available diff to stdout for use by
@@ -5095,28 +5216,27 @@ cmd_ship() {
     return 0
   fi
 
-  # Bound every network-touching git/gh invocation below (INV-1a/INV-2,
-  # class-4 foundry fix): `git push`, `gh pr view`, `gh pr create` were all
-  # previously untimed -- a hung push or a stalled gh API call would block
-  # `ship` indefinitely with no diagnostic, the last step of an otherwise
-  # fully-bounded gate sequence.
+  # Bound every network-touching git/adapter invocation below (INV-1a/INV-2,
+  # class-4 foundry fix): `git push` and the host-adapter's open-change-request
+  # call were both previously untimed -- a hung push or a stalled host API
+  # call would block `ship` indefinitely with no diagnostic, the last step
+  # of an otherwise fully-bounded gate sequence.
   _SHIP_TIMEOUT="${CLAGENTIC_SHIP_TIMEOUT_SEC:-120}"
   _SHIP_TIMEOUT=$(ds_positive_int_or_default "$_SHIP_TIMEOUT" 120)
 
-  # Push + open PR if gh is available, else print a template.
+  # Push + open a change request via the host adapter (lr-2b07a8), else
+  # print a template. Host-neutral by contract (docs/GATES.md "Host adapter
+  # contract"): gate logic never names a vendor CLI/API directly -- see
+  # scripts/host-adapter.sh for the one place that's allowed.
   if _git remote get-url origin >/dev/null 2>&1; then
     run_bounded "$_SHIP_TIMEOUT" -- _git push -u origin "$BRANCH" || { echo "[gates/ship] push failed or timed out after ${_SHIP_TIMEOUT}s"; cmd_log_run ship block "push failed"; exit 1; }
   fi
-  if command -v gh >/dev/null 2>&1; then
-    if run_bounded "$_SHIP_TIMEOUT" -- gh pr view "$BRANCH" >/dev/null 2>&1; then
-      echo "[gates/ship] PR already open for $BRANCH"
-    else
-      run_bounded "$_SHIP_TIMEOUT" -- gh pr create --fill --base "$DEFAULT_BRANCH" --head "$BRANCH" || \
-        echo "[gates/ship] gh pr create failed or timed out after ${_SHIP_TIMEOUT}s — open the PR manually"
-    fi
+  if host_adapter_available; then
+    host_adapter_open_change_request "$DEFAULT_BRANCH" "$BRANCH" || \
+      echo "[gates/ship] host-adapter open-change-request failed or timed out after ${_SHIP_TIMEOUT}s — open the PR manually"
   else
     REMOTE=$(_git remote get-url origin 2>/dev/null || echo "<remote>")
-    echo "[gates/ship] gh not installed — open a PR manually:"
+    echo "[gates/ship] no host adapter available — open a PR manually:"
     echo "  base=$DEFAULT_BRANCH head=$BRANCH remote=$REMOTE"
   fi
   cmd_log_run ship pass "gates green; pushed $BRANCH"

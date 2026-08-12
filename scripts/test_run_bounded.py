@@ -1,7 +1,8 @@
 """
 Regression coverage for run_bounded (scripts/gates.sh), the class-4 foundry
 fix's single entry point for every previously-untimed external-process
-invocation (gitleaks, osv-scanner, semgrep, git push, gh pr view/create).
+invocation (gitleaks, osv-scanner, semgrep, git push, the host adapter's
+open-change-request call).
 
 Exercises the REAL run_bounded function (sourced via `sh -c`, truncated at
 gates.sh's own subcommand dispatch the same way every other gates.sh-sourcing
@@ -33,8 +34,9 @@ def _functions_only_gates_source(dest_dir):
     """Copy gates.sh into dest_dir with its trailing subcommand dispatch
     (`case "${1:-}" in init) ... esac`) stripped off -- mirrors every
     llm-client.sh test's identical technique, applied to gates.sh instead.
-    Also copies platform.sh and a minimal review-merge.sh stub alongside
-    (gates.sh sources both unconditionally near the top)."""
+    Also copies platform.sh and minimal review-merge.sh/host-adapter.sh
+    stubs alongside (gates.sh sources all three unconditionally near the
+    top)."""
     with open(GATES_SH) as f:
         lines = f.readlines()
     cut = None
@@ -49,12 +51,16 @@ def _functions_only_gates_source(dest_dir):
     platform_dest = os.path.join(dest_dir, "platform.sh")
     with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
         dst.write(src.read())
-    # review-merge.sh: gates.sh sources it unconditionally
-    # (". $(dirname "$0")/review-merge.sh") but run_bounded/cmd_init do not
-    # need anything it defines -- a stub file satisfies the source line
-    # without pulling in unrelated machinery this test does not exercise.
+    # review-merge.sh / host-adapter.sh: gates.sh sources both unconditionally
+    # (". $(dirname "$0")/review-merge.sh", ". $(dirname "$0")/host-adapter.sh")
+    # but run_bounded/cmd_init do not need anything either one defines -- stub
+    # files satisfy the source lines without pulling in unrelated machinery
+    # this test does not exercise.
     review_merge_dest = os.path.join(dest_dir, "review-merge.sh")
     with open(review_merge_dest, "w") as f:
+        f.write("#!/bin/sh\n# stub for run_bounded tests\n")
+    host_adapter_dest = os.path.join(dest_dir, "host-adapter.sh")
+    with open(host_adapter_dest, "w") as f:
         f.write("#!/bin/sh\n# stub for run_bounded tests\n")
     return dest
 
