@@ -2258,6 +2258,77 @@ walk_chain() {
   CALL_BYTES=$(( INPUT_BYTES + PROMPT_BYTES + 2 ))
   CALL_TIMEOUT=$(llm_timeout_for "$ROLE_U" "$CALL_BYTES")
 
+  # ROUTER PATH, OPT-IN (lr-02f048). CLAGENTIC_<ROLE>_VIA_ROUTER=1, scoped to
+  # reviewer/auditor/gate (_llm_role_routable) and requiring
+  # CLAGENTIC_ROUTER_URL. Unset (either the per-role opt-in or the router
+  # URL) leaves this whole block byte-for-byte inert -- the existing
+  # direct-CLI chain loop below runs completely unmodified, exactly as it
+  # did before this task.
+  #
+  # TWO-LAYER FALLBACK, both non-blocking, both verbose, both LOGGED,
+  # DISTINGUISHABLE (operator directive, task lr-02f048):
+  #   LAYER 1 -- the router's OWN in-chain advance between backends
+  #     (scored/health-aware policy). Entirely internal to the router
+  #     process; invisible here by construction (invoke_router's own doc
+  #     comment). Not duplicated on this side -- the router's /logs
+  #     (call_log.fallback_count/backend_id) is the source of truth for
+  #     that signal, per the task's own framing.
+  #   LAYER 2 -- the router itself is unreachable/degraded at call time, so
+  #     THIS gate falls back to the pre-existing direct-CLI chain below.
+  #     That is exactly the branch this block implements: on any
+  #     invoke_router failure, log "router-fallback" (never the plain
+  #     "step-failed"/"fallback" labels the direct-CLI loop uses below --
+  #     a shared label would make the two layers indistinguishable in
+  #     audit.db, which the task names as the explicit failure this must
+  #     not repeat) and fall through to the unmodified chain loop.
+  # NO SELF-HEAL (task constraint, explicitly out of scope): this block
+  # only ever probes-and-reports via invoke_router's own single attempt --
+  # it never restarts, respawns, or retries a router process. A
+  # LAYER-2 event is loud (stderr) and logged, never silently absorbed.
+  if [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && _llm_role_routable "$ROLE_L"; then
+    ROUTER_VIA_KEY="CLAGENTIC_$(printf '%s' "$ROLE_U" | tr '[:lower:]-' '[:upper:]_')_VIA_ROUTER"
+    ROUTER_VIA=$(eval "printf '%s' \"\${${ROUTER_VIA_KEY}:-0}\"")
+    if [ "$ROUTER_VIA" = "1" ]; then
+      : > "$TMP_ERR"
+      : > "$TMP_OUT"
+      ROUTER_EXIT=0
+      invoke_router "$ROLE_L" "$TMP_PROMPT" "$TMP_IN" "$TMP_OUT" "$TMP_ERR" "$CALL_TIMEOUT" || ROUTER_EXIT=$?
+      ROUTER_UNWRAP_CODE=0
+      if [ "$ROUTER_EXIT" -eq 0 ]; then
+        _llm_unwrap_json_envelope "$MODE" "$TMP_OUT" "$ROLE_L" || ROUTER_UNWRAP_CODE=$?
+      fi
+      if [ "$ROUTER_EXIT" -eq 0 ] && [ "$ROUTER_UNWRAP_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
+        log_attempt "$ROLE_L" "router" "role:${ROLE_L}-chain" "pass" "via clagentic-router"
+        cat "$TMP_OUT"
+        rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
+        return 0
+      fi
+      # LAYER 2: the router path did not produce a usable result (curl
+      # failure, non-200, malformed response, or a response that failed
+      # unwrap/schema validation) -- fall back to the direct-CLI chain
+      # below. "router-fallback" is a distinct outcome label from every
+      # label the direct-CLI loop uses (pass/fallback/step-failed/
+      # degraded), so a query against audit.db can tell "the router
+      # advanced internally" (invisible here, Layer 1) apart from "this
+      # gate bypassed the router entirely" (Layer 2, this row) apart from
+      # "the direct-CLI chain itself also failed" (the loop's own rows,
+      # unchanged, still written below if this fallback also fails).
+      if [ "$ROUTER_EXIT" -ne 0 ]; then
+        ROUTER_ERR_HINT=$(tail -1 "$TMP_ERR" 2>/dev/null | cut -c1-300)
+        [ -z "$ROUTER_ERR_HINT" ] && ROUTER_ERR_HINT="router request failed (exit=$ROUTER_EXIT)"
+      elif [ "$ROUTER_UNWRAP_CODE" -ne 0 ]; then
+        ROUTER_ERR_HINT="router response could not be reduced to parseable role-shaped JSON (unwrap_code=$ROUTER_UNWRAP_CODE)"
+      else
+        ROUTER_ERR_HINT="router response failed schema validation for role $ROLE_L"
+      fi
+      printf '[clagentic-lite/llm-client] LAYER-2 FALLBACK: clagentic-router degraded or unreachable for role=%s (%s) -- falling back to direct-CLI chain. This is NOT the router advancing its own internal chain (that would produce no signal here at all) -- this gate bypassed the router entirely for this call. Check clagentic-router health (its own /health, /logs) if this repeats.\n' \
+        "$ROLE_L" "$ROUTER_ERR_HINT" 1>&2
+      log_attempt "$ROLE_L" "router" "role:${ROLE_L}-chain" "router-fallback" "$ROUTER_ERR_HINT"
+      : > "$TMP_ERR"
+      : > "$TMP_OUT"
+    fi
+  fi
+
   if [ ! -s "$TMP_CHAIN" ]; then
     if [ "$ROLE_U" = "SUMMARIZER" ]; then
       # Best-effort role with no chain (and no Builder fallback): emit nothing
