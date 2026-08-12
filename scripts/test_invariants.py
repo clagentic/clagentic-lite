@@ -637,7 +637,18 @@ _INVOKE_FUNC_DEF_RE = re.compile(r'^invoke_(\w+)\(\)\s*\{')
 #     invoke_codex/invoke_generic by CLI name (see its own case statement).
 #     It has no role/tool-restriction decision of its own to make; its
 #     callees are what this sweep actually verifies, one function down.
-_KNOWN_UNRESTRICTABLE_CARRIERS = {"generic", "step"}
+#   router -- invoke_router (lr-02f048) has no local Bash-capable subprocess
+#     to restrict at all: it POSTs to clagentic-router's Anthropic Messages
+#     API over HTTP and never spawns a CLI with any tool access, so there is
+#     no --allowedTools/--disallowedTools-shaped flag surface for
+#     ds_llm_role_is_bash_unrestricted to gate. Its own doc comment in
+#     scripts/llm-client.sh instead enforces the equivalent property one
+#     layer up, structurally: walk_chain only ever reaches invoke_router for
+#     reviewer/auditor/gate (_llm_role_routable's fixed enumeration,
+#     builder deliberately excluded), and none of those three roles ever
+#     attaches a "tools" field to the request body invoke_router builds --
+#     there is no Bash-availability toggle here to silently omit.
+_KNOWN_UNRESTRICTABLE_CARRIERS = {"generic", "step", "router"}
 
 
 def _iter_llm_client_sh_lines_raw():
