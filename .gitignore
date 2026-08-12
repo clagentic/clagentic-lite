@@ -40,6 +40,10 @@ build/
 # LORE local state (we use lore during dev but don't ship it)
 .lore
 
+# Host truth for this checkout's crew+loadout process (lr-78bd52) -- content
+# is host-specific by design, never tracked. See CLAUDE.md for the pointer.
+CLAUDE.local.md
+
 # Claude Code lifecycle hooks + settings.json are installer-materialized
 # (lr-57db23) from share/hook-shims/*.template via `clagentic-lite init` /
 # `update` / `enroll --self` — never tracked source. .claude/commands/ stays
