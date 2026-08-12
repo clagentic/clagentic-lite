@@ -580,3 +580,43 @@ CLAGENTIC_DEFAULT_BRANCH=main
 #
 # Requires CLAGENTIC_ROUTER_URL also set -- this key alone does nothing.
 # CLAGENTIC_ROUTER_BEDROCK_MODE=0
+
+# ---------- gate-path routing (optional, lr-02f048) ----------
+# CLAGENTIC_<ROLE>_VIA_ROUTER: separate opt-in, OFF by default even when
+# CLAGENTIC_ROUTER_URL is set. A THIRD, distinct integration point from
+# both keys above (those affect an INTERACTIVE Claude Code session; this
+# affects the GATE-PATH one-shot scripts/llm-client.sh call). Scoped to
+# exactly three roles: reviewer, auditor, gate (merge-gate's internal role
+# name). Builder is deliberately excluded -- it holds unrestricted Bash and
+# does real multi-turn tool-calling, and every clagentic-router adapter
+# currently declares SupportsTools=false (a routed request carrying tools
+# gets refused with a 422, not silently degraded -- see clagentic-router's
+# own adapter-capability work). Reviewer/Auditor/Merge-Gate never carry a
+# tools field on either CLI carrier today, so this is safe for them.
+#
+# When set to 1 for a role, that role's llm-client.sh calls POST to
+# CLAGENTIC_ROUTER_URL's /v1/messages (model: role:<role>-chain, matching
+# router.example.yaml's chain-name convention) instead of shelling out to
+# CLAGENTIC_<ROLE>_CMD. Requires CLAGENTIC_ROUTER_URL to be set -- this key
+# alone does nothing.
+#
+# CLAGENTIC_<ROLE>_CHAIN/_TIER become NO-OPS for a routed role -- they are
+# only consulted by the FALLBACK path below, never by the router path
+# itself. `clagentic-lite doctor` warns when both are configured for the
+# same role, so this is visible rather than silently ignored.
+#
+# TWO-LAYER FALLBACK, both non-blocking, both logged, distinguishable:
+#   Layer 1 -- the router's own scored/health-aware advance between
+#     backends within its role:<role>-chain. Internal to the router
+#     process; not observable from clagentic-lite at all (query the
+#     router's own /logs for that signal).
+#   Layer 2 -- the router itself is unreachable or degraded at call time,
+#     so THIS gate falls back to the direct-CLI chain
+#     (CLAGENTIC_<ROLE>_CMD/_CHAIN/_TIER) instead of blocking. Logged to
+#     audit.db with outcome "router-fallback" (distinct from the direct
+#     path's own pass/fallback/step-failed/degraded labels) and printed
+#     loudly to stderr. No self-healing: the gate never restarts or
+#     retries the router process, only probes once and reports.
+# CLAGENTIC_REVIEWER_VIA_ROUTER=0
+# CLAGENTIC_AUDITOR_VIA_ROUTER=0
+# CLAGENTIC_GATE_VIA_ROUTER=0
