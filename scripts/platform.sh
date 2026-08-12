@@ -1274,3 +1274,202 @@ print(json.dumps(arr[:max_n]))
   # matching every other JSON-tool-dependent helper in this codebase.
   printf '%s' "$_ljac_json"
 }
+
+# ---------------------------------------------------------------- router URL classification (lr-02f048)
+#
+# CLASS-LEVEL FIX (lr-02f048, BOBBIE finding on PR #167): these three
+# functions used to live ONLY in bin/clagentic-lite, private to the
+# enroll/update/doctor stamp-and-probe call sites. scripts/llm-client.sh's
+# invoke_router (the gate-path router POST, opt-in via
+# CLAGENTIC_<ROLE>_VIA_ROUTER=1) sources ONLY this file, never
+# bin/clagentic-lite -- so it built its request URL directly from
+# CLAGENTIC_ROUTER_URL with no validation at all, reopening the exact
+# credential-and-diff exfiltration bypass class PR #146/lr-49f25e closed at
+# the stamp site (RFC 3986 userinfo not stripped; "127.*" matched as a shell
+# glob prefix rather than a real 127.0.0.0/8 test). Moving the classifier
+# here -- the one file both bin/clagentic-lite and scripts/llm-client.sh
+# already source -- makes it structurally impossible for a second call site
+# to exist unvalidated: there is now exactly ONE implementation in the tree,
+# consulted by every consumer of CLAGENTIC_ROUTER_URL that builds a network
+# target from it.
+#
+# bin/clagentic-lite's own _validate_router_url (stamp-time die/warn
+# wrapper) stays in bin/clagentic-lite -- it is specific to that context
+# (settings.json stamping) and calls ds_router_url_classify from here,
+# unchanged in behavior. This move is a pure relocation: every case branch,
+# comment, and byte of classification LOGIC below is unchanged from the
+# pre-move bin/clagentic-lite version, only the `_` internal-name prefix
+# became `ds_`/`_ds_` to match this file's existing public/private naming
+# convention (ds_* exported helpers, _ds*/local-prefixed internals) --
+# scripts/test_router_settings_stamp.py's TestRouterUrlClassifierBypasses
+# (the 17-case bypass suite from PR #146) exercises this purely through the
+# bin/clagentic-lite CLI (enroll/doctor subprocess calls), so it is
+# unaffected by the relocation as long as behavior is preserved byte-for-byte
+# -- which this move deliberately is.
+
+# ds_ipv4_octet_in_range OCTET
+# Exact-value helper for ds_host_is_local_ip4: true (0) only when OCTET is
+# ALL-DECIMAL-DIGIT (rejects octal/hex/leading-zero-ambiguous forms like
+# "0177" or "0x7f" outright — those are handled by falling through to
+# "not recognized -> nonlocal" in the caller, never by trying to interpret
+# them) and numerically in 0-255. Empty or non-digit input is false.
+ds_ipv4_octet_in_range() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -le 255 ] 2>/dev/null
+}
+
+# ds_host_is_local_ip4 HOST
+# True (0) only when HOST is EXACTLY four decimal octets (a.b.c.d, each
+# 0-255, no extra characters before/after) and the first octet is exactly
+# 127 — real 127.0.0.0/8 membership, not a "starts with 127." string
+# prefix (bobbie.sast.access-control-bypass finding 2, PR #146 review
+# 5209002495: "http://127.0.0.1.evil.com/" must NOT match). Any host that
+# is not cleanly four decimal octets (extra labels, non-numeric, wrong
+# segment count, IPv6, hex/octal encodings) returns false and falls through
+# to the caller's nonlocal branch — never treated as local by inference.
+ds_host_is_local_ip4() {
+  _hli4_host="$1"
+  _hli4_rest="$_hli4_host"
+  _hli4_i=0
+  _hli4_o1=""; _hli4_o2=""; _hli4_o3=""; _hli4_o4=""
+  while [ "$_hli4_i" -lt 3 ]; do
+    case "$_hli4_rest" in
+      *.*) ;;
+      *) return 1 ;;  # fewer than 4 dot-separated segments
+    esac
+    _hli4_seg="${_hli4_rest%%.*}"
+    _hli4_rest="${_hli4_rest#*.}"
+    _hli4_i=$((_hli4_i+1))
+    case "$_hli4_i" in
+      1) _hli4_o1="$_hli4_seg" ;;
+      2) _hli4_o2="$_hli4_seg" ;;
+      3) _hli4_o3="$_hli4_seg" ;;
+    esac
+  done
+  _hli4_o4="$_hli4_rest"
+  # Reject if the 4th segment itself contains a further dot (5+ segments,
+  # e.g. the "127.0.0.1.evil.com" bypass) or any other stray character.
+  case "$_hli4_o4" in
+    *.*) return 1 ;;
+  esac
+
+  ds_ipv4_octet_in_range "$_hli4_o1" || return 1
+  ds_ipv4_octet_in_range "$_hli4_o2" || return 1
+  ds_ipv4_octet_in_range "$_hli4_o3" || return 1
+  ds_ipv4_octet_in_range "$_hli4_o4" || return 1
+
+  [ "$_hli4_o1" = "127" ]
+}
+
+# ds_router_url_classify URL
+# Pure classifier, no side effects (no die/warn/print) — the single source
+# of truth for "is this CLAGENTIC_ROUTER_URL well-formed, and is its host
+# local", shared by bin/clagentic-lite's _validate_router_url (stamp-time
+# enforcement) and cmd_doctor's router probe (diagnostic-only, must never
+# abort the doctor run) AND scripts/llm-client.sh's invoke_router (gate-path
+# POST, must never send credentials/diff to an unvalidated target). Sets
+# DS_ROUTER_URL_CLASS to one of:
+#   malformed  — not a well-formed http:// or https:// URL, or empty host
+#   local      — well-formed, host is EXACTLY localhost/0.0.0.0/127.0.0.0/8
+#                (real octet-bounded match, see ds_host_is_local_ip4)/::1
+#   nonlocal   — well-formed, host is anything else, INCLUDING any host
+#                shape this classifier does not confidently recognize
+# Also sets DS_ROUTER_URL_HOST (empty on malformed) for callers that want to
+# name the offending host in their own message.
+#
+# CLASS-LEVEL FIX (bobbie.sast.access-control-bypass, PR #146 review
+# 5209002495, second round on this function): both reported bypasses were
+# the SAME underlying defect — string-shaped matching (glob prefix, naive
+# first-":" split) standing in for structured parsing of a value an
+# attacker can fully control. This rewrite eliminates that shape rather
+# than patching the two reported inputs:
+#   1. USERINFO STRIPPING: RFC 3986 allows "scheme://user:pass@host/" —
+#      "http://127.0.0.1:x@evil.com/" has REAL host evil.com, but a naive
+#      split on the first ":" reads "127.0.0.1" as the host. Userinfo is
+#      now stripped up to the LAST unescaped "@" before the first "/"
+#      (${_ruc_hostport##*@}, greedy-prefix removal — handles
+#      "http://a@b@evil.com/" -> evil.com correctly, not "b@evil.com").
+#   2. EXACT/BOUNDED HOST MATCHING: "127.*" was a shell GLOB PREFIX, so
+#      "127.0.0.1.evil.com" matched. Local IPv4 now requires
+#      ds_host_is_local_ip4 — exactly four decimal octets, numerically
+#      bounded, first octet exactly 127 — not a string prefix.
+# FAIL TOWARD WARNING: any host form this function does not confidently
+# recognize as local (IPv4-mapped IPv6 like [::ffff:127.0.0.1], octal
+# "0177.0.0.1", decimal "2130706433", hex encodings, anything else) is
+# classified nonlocal, not local. A false "nonlocal" costs one warning
+# line; a false "local" silently forwards real credentials — the two
+# outcomes are not symmetric, so ambiguity always resolves toward the
+# cheaper mistake.
+ds_router_url_classify() {
+  _ruc_url="$1"
+  DS_ROUTER_URL_HOST=""
+
+  case "$_ruc_url" in
+    http://*/*|http://*|https://*/*|https://*)
+      : # well-formed scheme prefix — fall through to host extraction
+      ;;
+    *)
+      DS_ROUTER_URL_CLASS="malformed"
+      return 0
+      ;;
+  esac
+
+  # Strip scheme, then strip any path/query after the host[:port] segment.
+  _ruc_hostport="${_ruc_url#http://}"
+  _ruc_hostport="${_ruc_hostport#https://}"
+  _ruc_hostport="${_ruc_hostport%%/*}"
+
+  # Strip userinfo up to the LAST unescaped "@" (RFC 3986: everything before
+  # the final "@" in the authority component is userinfo, not host). Greedy
+  # "##*@" removes the longest "*@" prefix, i.e. up to the LAST "@" —
+  # "a@b@evil.com" -> "evil.com", not "b@evil.com".
+  case "$_ruc_hostport" in
+    *@*) _ruc_hostport="${_ruc_hostport##*@}" ;;
+  esac
+
+  # IPv6 literal in brackets carries its own colons (port, if any, follows
+  # the closing bracket: "[::1]:8765") — strip the bracketed host first so
+  # the later ":" strip below only ever removes a PORT, never part of an
+  # IPv6 address. A BARE (unbracketed) IPv6 literal such as "::1" also
+  # contains multiple colons of its own; RFC 3986 requires bracket
+  # notation whenever a port follows an IPv6 host, so an unbracketed host
+  # containing more than one colon cannot have a trailing ":port" to strip
+  # at all -- treat the WHOLE string as the host in that case, rather than
+  # naively splitting on the first colon and truncating "::1" to "".
+  case "$_ruc_hostport" in
+    \[*\]*)
+      _ruc_host="${_ruc_hostport%%]*}]"
+      ;;
+    *:*:*)
+      # Two or more colons, no brackets: bare IPv6 literal, no port.
+      _ruc_host="$_ruc_hostport"
+      ;;
+    *)
+      _ruc_host="${_ruc_hostport%%:*}"
+      ;;
+  esac
+
+  if [ -z "$_ruc_host" ]; then
+    DS_ROUTER_URL_CLASS="malformed"
+    return 0
+  fi
+  DS_ROUTER_URL_HOST="$_ruc_host"
+
+  # "Local" is deliberately narrow: localhost, 0.0.0.0, real 127.0.0.0/8
+  # membership, and ::1/[::1] — not private RFC1918 ranges generally,
+  # because a 192.168.x.x/10.x.x.x address is exactly the "another box on
+  # the LAN" case the nonlocal warning exists for, not silently equivalent
+  # to loopback. Any host shape not exactly one of these (including
+  # IPv4-mapped IPv6, non-decimal IP encodings, or anything else) falls
+  # through to nonlocal — see the FAIL TOWARD WARNING note above.
+  if [ "$_ruc_host" = "localhost" ] || [ "$_ruc_host" = "0.0.0.0" ] \
+    || [ "$_ruc_host" = "::1" ] || [ "$_ruc_host" = "[::1]" ]; then
+    DS_ROUTER_URL_CLASS="local"
+  elif ds_host_is_local_ip4 "$_ruc_host"; then
+    DS_ROUTER_URL_CLASS="local"
+  else
+    DS_ROUTER_URL_CLASS="nonlocal"
+  fi
+}
