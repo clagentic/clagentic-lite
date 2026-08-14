@@ -273,5 +273,258 @@ class TestSyntheticFixtures(unittest.TestCase):
             os.unlink(path)
 
 
+def _run_checked_pass(gate, details, extra_env=None):
+    """Sources the real _cmd_log_run_checked_pass (and its cmd_log_run/
+    cmd_init dependencies) from gates.sh via the same functions-only-source
+    technique as _run_lint, then calls it with GATE and DETAILS. Runs with
+    cwd inside this repo's own scripts/ dir (a real git checkout) so
+    REPO_ROOT resolution at the top of gates.sh succeeds; CLAGENTIC_PROJECT_ROOT
+    is pinned to a throwaway tmpdir git repo so the audit DB write (cmd_init/
+    cmd_log_run) never touches this checkout's own .clagentic/lite/audit.db.
+
+    Returns (stdout, stderr, returncode, tmpdir, project_dir). The caller
+    owns tmpdir cleanup (via a `finally: shutil.rmtree(tmpdir, ...)` of its
+    own) -- deleting it here, before the caller reads project_dir's audit
+    DB, would remove the very file the caller needs to assert against."""
+    tmpdir = tempfile.mkdtemp(prefix="clagentic-test-checked-pass-")
+    src_dir = os.path.join(tmpdir, "src")
+    os.makedirs(src_dir)
+    sourced_gates = _functions_only_source(src_dir)
+    project_dir = os.path.join(tmpdir, "project")
+    os.makedirs(project_dir)
+    subprocess.run(["git", "init", "-q", project_dir], check=True)
+    script = textwrap.dedent(f"""\
+        . '{sourced_gates}'
+        _cmd_log_run_checked_pass '{gate}' '{details}'
+    """)
+    env = os.environ.copy()
+    env["CLAGENTIC_PROJECT_ROOT"] = project_dir
+    if extra_env:
+        env.update(extra_env)
+    r = subprocess.run(
+        ["sh", "-c", script, sourced_gates],
+        capture_output=True, text=True, env=env,
+        cwd=os.path.join(TOOL_HOME, "scripts"),
+    )
+    return r.stdout, r.stderr, r.returncode, tmpdir, project_dir
+
+
+def _audit_db_last_row(project_dir):
+    """Reads the single most recent gate_runs row (outcome, details) written
+    by cmd_log_run under CLAGENTIC_PROJECT_ROOT=project_dir."""
+    import sqlite3
+    db_path = os.path.join(project_dir, ".clagentic", "lite", "audit.db")
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT outcome, details FROM gate_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return row
+    finally:
+        conn.close()
+
+
+class TestCheckedPassHelperRuntimeVocabularyCheck(unittest.TestCase):
+    """_cmd_log_run_checked_pass GATE DETAILS -- proves the runtime check
+    examines the FULLY ASSEMBLED details string (not source text), and
+    downgrades pass->warn on a hit rather than silently reporting a
+    false-clean pass. This is the direct regression test for BOBBIE's PR 159
+    false-clean finding: cmd_sast's variable-assembled details string now
+    goes through this exact function."""
+
+    def test_clean_details_logs_as_pass(self):
+        out, err, rc, tmpdir, project_dir = _run_checked_pass(
+            "fixture-gate", "0 findings, config=auto"
+        )
+        try:
+            self.assertEqual(rc, 0, err)
+            row = _audit_db_last_row(project_dir)
+            self.assertIsNotNone(row, "expected a gate_runs row to be written")
+            outcome, details = row
+            self.assertEqual(outcome, "pass")
+            self.assertEqual(details, "0 findings, config=auto")
+            self.assertNotIn("logging as 'warn' instead", err)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_failure_word_in_assembled_details_downgrades_to_warn(self):
+        """The exact false-clean shape this task closes: a details string
+        whose failure-word content only exists after variable interpolation
+        (never literally in gates.sh's own source text) must still be
+        caught -- because this check runs on the ASSEMBLED string at
+        runtime, not on source text."""
+        assembled = "full-tree (baseline unavailable: no origin remote)"
+        out, err, rc, tmpdir, project_dir = _run_checked_pass("sast", assembled)
+        try:
+            self.assertEqual(rc, 0, err)
+            row = _audit_db_last_row(project_dir)
+            outcome, details = row
+            self.assertEqual(
+                outcome, "warn",
+                f"a failure-word details string must be logged as warn, not pass; row={row!r}",
+            )
+            self.assertEqual(details, assembled, "the real details text must still be recorded, not suppressed")
+            self.assertIn("logging as 'warn' instead", err)
+            self.assertIn("unavailable", err)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_mixed_literal_and_variable_failure_word_downgrades_to_warn(self):
+        """The partially-visible class (cmd_bleed's $_BLEED_SCOPE_REASON,
+        cmd_merge_gate's suffix sites): the failure word lives in the
+        interpolated half, not the literal half -- must still be caught."""
+        assembled = "no files to scan (git ls-files failed, non-blocking)"
+        out, err, rc, tmpdir, project_dir = _run_checked_pass("bleed", assembled)
+        try:
+            self.assertEqual(rc, 0, err)
+            outcome, details = _audit_db_last_row(project_dir)
+            self.assertEqual(outcome, "warn")
+            self.assertEqual(details, assembled)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_details_with_no_failure_word_is_unaffected(self):
+        assembled = "branch diff vs origin/main; excluded 2 rule(s): a.b.c,d.e.f"
+        out, err, rc, tmpdir, project_dir = _run_checked_pass("sast", assembled)
+        try:
+            self.assertEqual(rc, 0, err)
+            outcome, details = _audit_db_last_row(project_dir)
+            self.assertEqual(outcome, "pass")
+            self.assertEqual(details, assembled)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestUnifiedFailureWordVocabulary(unittest.TestCase):
+    """The shell _AUDIT_FAILURE_WORDS list (scripts/gates.sh, consulted by
+    _cmd_log_run_checked_pass at runtime) and the Python _FAILURE_WORDS
+    tuple (inside cmd_audit_vocab_lint's embedded lint, consulted
+    statically) must name the exact same vocabulary -- a runtime check that
+    is more lenient than the static one would silently let a failure word
+    through the ONE path (the checked helper) built specifically to examine
+    content the static lint cannot see."""
+
+    def test_shell_and_python_failure_word_lists_match(self):
+        with open(GATES_SH) as f:
+            content = f.read()
+
+        shell_start = content.index('_AUDIT_FAILURE_WORDS="')
+        shell_end = content.index('"\n\n_cmd_log_run_checked_pass', shell_start)
+        shell_block = content[shell_start + len('_AUDIT_FAILURE_WORDS="'):shell_end]
+        shell_words = set(w for w in shell_block.splitlines() if w)
+
+        py_start = content.index("_FAILURE_WORDS = (")
+        py_end = content.index(")", py_start)
+        py_block = content[py_start + len("_FAILURE_WORDS = ("):py_end]
+        py_words = set(
+            w.strip().strip('"').strip("'")
+            for w in py_block.replace("\n", " ").split(",")
+            if w.strip()
+        )
+
+        self.assertEqual(
+            shell_words, py_words,
+            f"shell _AUDIT_FAILURE_WORDS and Python _FAILURE_WORDS have diverged: "
+            f"shell-only={shell_words - py_words!r} python-only={py_words - shell_words!r}",
+        )
+        # Sanity: both extractions must have actually found something, or a
+        # parse-anchor drift would silently pass this test with two empty sets.
+        self.assertTrue(shell_words, "shell vocabulary extraction found nothing -- anchor drifted")
+        self.assertTrue(py_words, "python vocabulary extraction found nothing -- anchor drifted")
+
+
+class TestUncheckedDirectCallSweep(unittest.TestCase):
+    """Second static check inside cmd_audit_vocab_lint: any direct
+    `cmd_log_run <gate> pass ...` call site whose details argument contains
+    a `$` bypasses `_cmd_log_run_checked_pass` and is flagged as a
+    regression -- its runtime content can never be vocabulary-checked by
+    either mechanism."""
+
+    def _write_fixture(self, content):
+        fd, path = tempfile.mkstemp(prefix="clagentic-test-unchecked-fixture-", suffix=".sh")
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        return path
+
+    def test_bare_variable_pass_call_is_flagged_unchecked(self):
+        fixture = (
+            'cmd_fixture() {\n'
+            '  cmd_log_run fixture-gate pass "$_FX_DETAILS"\n'
+            '}\n'
+        )
+        path = self._write_fixture(fixture)
+        try:
+            out, err, rc = _run_lint(path)
+            self.assertEqual(rc, 0)
+            self.assertIn("1 UNCHECKED variable-assembled", out, f"output={out!r}")
+        finally:
+            os.unlink(path)
+
+    def test_mixed_literal_variable_pass_call_is_flagged_unchecked(self):
+        fixture = (
+            'cmd_fixture() {\n'
+            '  cmd_log_run fixture-gate pass "scope reduced ($_FX_REASON)"\n'
+            '}\n'
+        )
+        path = self._write_fixture(fixture)
+        try:
+            out, err, rc = _run_lint(path)
+            self.assertEqual(rc, 0)
+            self.assertIn("1 UNCHECKED variable-assembled", out, f"output={out!r}")
+        finally:
+            os.unlink(path)
+
+    def test_all_literal_pass_call_is_not_flagged_unchecked(self):
+        """A fully-literal details string (no `$` at all) is already
+        completely covered by the vocabulary check itself -- routing it
+        through the checked helper too would be pure churn, so it must not
+        be flagged by this second check."""
+        fixture = (
+            'cmd_fixture() {\n'
+            '  cmd_log_run fixture-gate pass "0 findings"\n'
+            '}\n'
+        )
+        path = self._write_fixture(fixture)
+        try:
+            out, err, rc = _run_lint(path)
+            self.assertEqual(rc, 0)
+            self.assertIn("no unchecked variable-assembled pass call sites", out, f"output={out!r}")
+        finally:
+            os.unlink(path)
+
+    def test_checked_helper_call_site_itself_is_not_flagged(self):
+        """A call routed through the checked helper (`_cmd_log_run_checked_pass
+        GATE "$VAR"`) is the FIX, not a violation -- must never be flagged."""
+        fixture = (
+            'cmd_fixture() {\n'
+            '  _cmd_log_run_checked_pass fixture-gate "$_FX_DETAILS"\n'
+            '}\n'
+        )
+        path = self._write_fixture(fixture)
+        try:
+            out, err, rc = _run_lint(path)
+            self.assertEqual(rc, 0)
+            self.assertIn("no unchecked variable-assembled pass call sites", out, f"output={out!r}")
+        finally:
+            os.unlink(path)
+
+    def test_real_gates_sh_has_zero_unchecked_variable_assembled_call_sites(self):
+        """The actual regression guard: after lr-2e8444's sast/bleed/
+        merge-gate rewiring, gates.sh itself must have zero direct
+        cmd_log_run pass calls with a variable-assembled details string --
+        every one goes through _cmd_log_run_checked_pass. The ONE sanctioned
+        exception (_cmd_log_run_checked_pass's own final line, which IS the
+        checked helper's implementation) is excluded by the lint itself via
+        exact call-site text match, not a blanket allowance."""
+        out, err, rc = _run_lint(GATES_SH)
+        self.assertEqual(rc, 0, err)
+        self.assertIn(
+            "no unchecked variable-assembled pass call sites", out,
+            f"gates.sh has an unchecked variable-assembled pass call site "
+            f"(the lr-2e8444 sast/bleed/merge-gate sweep is incomplete or a "
+            f"new one was introduced): output={out!r}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
