@@ -691,6 +691,22 @@ the freshness precondition cannot be proven) degrades to an empty
 `base_sha` on an otherwise fully valid, anchored ledger entry, never to a
 missing or broken capability.
 
+**What the ledger is not: a control against a user who edits it.**
+`review-ledger.jsonl` is an unsigned local JSONL file, writable by anyone
+with write access to the working tree — a passing entry hand-written at the
+current HEAD is indistinguishable from one `cmd_review` produced. This is
+consistent with clagentic-lite's local-dev-tool threat model throughout —
+the same posture as `.git/hooks`, `last-review.json`, and `audit.db` — and
+not a new gap this feature introduces: a user who wants to bypass their own
+local gate can already just not run it. What the ledger's anchoring and
+append-only history actually defend against is a STALE or UNANCHORED
+verdict — a prior round's pass being misread as covering a later,
+unreviewed HEAD, or a `last-review.json` stamp with no corresponding review
+having actually run. It is not, and does not attempt to be, tamper-evident
+against a hostile local user. A team that needs that property should enforce
+review at the host side — CI, or a server-side check on the change-request
+thread — which is where tamper-resistance belongs.
+
 **Ingest sanitization — closing a self-exempting-suppression gap (BOBBIE-caught follow-up).** `last-review.json` is written directly from the LLM's raw structured JSON output; the pre-write validation (`validate_output`, `scripts/llm-client.sh`) checks that `.findings` is an array, that each `.severity`, if present, is a legal enum value, and (lr-3eb18c, reviewer role only — see "Class-level review findings" below) that every finding carries a non-empty `issue_class` and `class_fix` — it does not allowlist the rest of the object's field set. Before this fix, a model (compromised, manipulated by attacker-influenced code under review, or simply emitting whatever the prompt schema loosely tolerates) could include `_recurrence_demoted: true` directly in its own JSON response. `_review_recurrence_demote`'s splice only *overwrites* `_recurrence_count`/`_recurrence_demoted` on a finding whose `(file, category, message)` triple matches a row in the current round's content-hash-keyed TSV (i.e. whose cited line falls inside `finding_content_keys`' diff-context window); a finding outside that window was left untouched, so a self-forged `_recurrence_demoted: true` on a **first-ever-reported** finding survived verbatim into `last-review.json`, and `severity_blockers()` (which reads `._recurrence_demoted` with no provenance check) excluded it from the block count — a finding could self-exempt from blocking with zero actual repetition.
 
 The fix has two independent layers:
