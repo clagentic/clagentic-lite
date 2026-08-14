@@ -1592,6 +1592,30 @@ invoke_generic() {
 # capability check at call time, it is a structural property of what this
 # function's three permitted callers ever pass it.
 #
+# REPO-SCOPING (lr-4a6268, consumer half of clagentic-router's lr-009423).
+# The request body also carries "working_dir": REPO_ROOT (this file's own
+# module-level REPO_ROOT, scripts/llm-client.sh:120-127 -- the same value
+# every other repo-scoped read in this file uses, INV-6). Before lr-009423
+# landed upstream, a routed reviewer/auditor call reached the model with
+# only the diff text and no filesystem access to the repo under review --
+# every gate-path call through codex_cli inherited the router daemon's own
+# cwd (measured: review block rate on project-coldest-tea fell from a
+# historical 10-40% to 0% the day router opt-in went live). REPO_ROOT is
+# always an absolute, already-git-resolved path by the time invoke_router
+# runs (ds_repo_root/CLAGENTIC_PROJECT_ROOT), so it satisfies the router's
+# own ResolveWorkingDir validator (absolute, exists, is-a-directory) by
+# construction -- this function does not re-validate it locally, the
+# router's fail-loud 4xx is the single source of truth for "was this
+# accepted" (see the 4xx handling below).
+#
+# KNOWN RESIDUAL, NOT SOLVED BY THIS FIELD (documented upstream, repeated
+# here so it is never overclaimed in this file's own comments): routed mode
+# remains one-shot text-in/text-out with no tool loop. working_dir helps
+# only insofar as the CLI reads the filesystem during its single turn --
+# this is NOT equivalent to the direct-CLI path (invoke_codex), which runs
+# from a process whose cwd is already the enrolled repo across a real
+# multi-turn tool loop.
+#
 # OUTPUT SHAPE: writes the response's first text content block VERBATIM to
 # OUTPUT_FILE -- no --output-format-json-style envelope, matching
 # invoke_codex's raw-text output shape (not invoke_claude's). This is
@@ -1695,18 +1719,22 @@ invoke_router() {
   # json.dumps is the same discipline this file already uses for every
   # other JSON-emitting site, e.g. _llm_json_array_sanitize_fields).
   # Deliberately no "tools" key at all -- see this function's doc comment.
+  # "working_dir" is REPO_ROOT (lr-4a6268) -- see this function's own doc
+  # comment "REPO-SCOPING" for why, and the 4xx handling below for what
+  # happens if the router rejects it.
   python3 -c '
 import json, sys
 
-model, combined_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+model, combined_path, out_path, working_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 text = open(combined_path).read()
 body = {
     "model": model,
     "max_tokens": 8192,
     "messages": [{"role": "user", "content": text}],
+    "working_dir": working_dir,
 }
 open(out_path, "w").write(json.dumps(body))
-' "$ROUTER_MODEL" "$TMP_ROUTER_COMBINED" "$TMP_ROUTER_BODY" 2>>"$ERR_FILE"
+' "$ROUTER_MODEL" "$TMP_ROUTER_COMBINED" "$TMP_ROUTER_BODY" "$REPO_ROOT" 2>>"$ERR_FILE"
 
   AUTH_HEADER="Authorization: Bearer ${CLAGENTIC_ROUTER_TOKEN:-}"
   _router_http=""
@@ -1737,6 +1765,33 @@ open(out_path, "w").write(json.dumps(body))
     printf 'router responded %s (expected 200) for model %s at %s: %s\n' \
       "$_router_http" "$ROUTER_MODEL" "$ROUTER_URL/v1/messages" \
       "$(head -c 500 "$TMP_ROUTER_RESP" 2>/dev/null | tr -d '\n')" >> "$ERR_FILE"
+    # WORKING_DIR REJECTION, CALLED OUT EXPLICITLY (lr-4a6268, fail-loud
+    # half). A 4xx here MAY be the router's own ResolveWorkingDir validator
+    # refusing the value this function just sent (not absolute, does not
+    # exist, or is not a directory -- upstream lr-009423's fail-loud
+    # contract). This is diagnostically distinct from any other 4xx/5xx
+    # cause (auth, malformed model name, router-side outage) and from a
+    # router that is simply older than lr-009423 and silently ignores an
+    # unrecognized key -- so it is surfaced with its own labeled line in
+    # ERR_FILE, written LAST (walk_chain's caller reads only the final line
+    # via `tail -1`, so the more specific diagnostic must be the one that
+    # survives) rather than folded into the generic "router responded
+    # non-200" line above. Detection is a substring match on the response
+    # body, not a hard requirement -- the router's exact 4xx error-body
+    # shape is not part of this file's contract, and a substring miss must
+    # never suppress the generic diagnostic already written above. Either
+    # way, this remains non-blocking for the gate: same "return 1" as any
+    # other non-200, which walk_chain's Layer 2 logic already treats as a
+    # loud, logged "router-fallback" to the direct-CLI chain -- silent-wrong
+    # is the defect class being fixed, not "block the gate on a rejected
+    # field."
+    case "$(head -c 2000 "$TMP_ROUTER_RESP" 2>/dev/null)" in
+      *working_dir*|*WorkingDir*|*working*directory*)
+        printf 'router REJECTED working_dir=%s (http=%s) -- the router'"'"'s ResolveWorkingDir validator refused this request'"'"'s repo-scoping field (must be absolute, exist, and be a directory). This is a distinct failure from a generic non-200: %s\n' \
+          "$REPO_ROOT" "$_router_http" \
+          "$(head -c 500 "$TMP_ROUTER_RESP" 2>/dev/null | tr -d '\n')" >> "$ERR_FILE"
+        ;;
+    esac
     rm -f "$TMP_ROUTER_RESP"
     return 1
   fi

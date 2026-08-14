@@ -252,12 +252,14 @@ reachable. `clagentic-lite doctor` warns when a role has both
 configured, since leaving them set is not wrong but is worth surfacing
 rather than silently ignoring.
 
-**Verification status.** Live in production use. This is also the switch
-implicated in a measured, silent quality regression when routed roles lost
+**Verification status.** Live in production use. This path was previously
+implicated in a measured, silent quality regression — routed roles lost
 filesystem access to the repo under review (Reviewer/Auditor calls made
 via this path reached the model with no filesystem access; measured
-review block rate fell 10-40% → ~0%). Know what you're routing before you
-enable it for `reviewer`/`auditor` on a repo whose reviews you rely on.
+review block rate fell 10-40% → ~0%). **This is now fixed** — see
+"Repo-scoping via `working_dir`" below — but the regression class it
+belongs to is worth understanding before you enable this switch for
+`reviewer`/`auditor` on a repo whose reviews you rely on.
 
 **Builder is deliberately excluded.** It holds unrestricted Bash and does
 real multi-turn agentic tool-calling; every clagentic-router adapter
@@ -267,6 +269,55 @@ Reviewer/Auditor/Merge-Gate are already tool-restricted and single-shot on
 both CLI carriers (`invoke_claude`'s `--allowedTools`/`--disallowedTools`,
 `invoke_codex`'s `--disable shell_tool -s read-only`) and never send a
 `tools` field either way, so routing them carries no tool-drop risk.
+
+### Repo-scoping via `working_dir` (lr-4a6268) — FIXED, read this before relying on it
+
+**The regression, precisely.** `invoke_router` (`scripts/llm-client.sh`)
+builds its POST body from only the prompt and the diff text. Combined with
+a bug in clagentic-router itself (its `codex_cli` adapter never set the
+spawned subprocess's cwd, so it inherited the router daemon's own cwd —
+fixed upstream as `lr-009423`), every gate-path call made with
+`CLAGENTIC_REVIEWER_VIA_ROUTER=1` / `CLAGENTIC_AUDITOR_VIA_ROUTER=1`
+reached the model with the diff text only and **no filesystem access to
+the repo under review**. This was silent: no error, no timeout, no gate
+failure — reviews simply got worse. Measured impact on project-coldest-tea:
+block rate on active days fell from a historical 10-40% to 0% (0/25) the
+day router opt-in went live, ~4% the next day. Closest miss: a PR passed
+review with zero findings and failed CI seven minutes later on a missing
+transitive dependency — exactly the class of finding that requires reading
+a caller and a CI config a diff-only reviewer cannot see.
+
+**The fix.** `invoke_router` now sends `working_dir: <REPO_ROOT>` in every
+routed request body, where `REPO_ROOT` is the same absolute, already
+git-resolved path every other repo-scoped operation in `llm-client.sh`
+uses (`CLAGENTIC_PROJECT_ROOT` if set, else `git rev-parse
+--show-toplevel`). clagentic-router's `/v1/messages` endpoint honors
+`working_dir` **in routed mode only** (the gate path's mode — passthrough
+mode never decodes it) and sets it as the spawned CLI subprocess's cwd
+across all four subprocess adapters, replacing the daemon-inherited/
+hardcoded-`/` defaults the regression above depended on.
+
+**Fail-loud, not silent, on rejection.** clagentic-router validates
+`working_dir` server-side (must be absolute, must exist, must be a
+directory) and responds 4xx on a bad value rather than silently ignoring
+it or exec'ing elsewhere. `invoke_router` detects a 4xx response whose body
+mentions `working_dir`/`WorkingDir` and writes a distinctly labeled
+diagnostic line to the gate's error log naming the rejection explicitly —
+never folded into the generic "router responded non-200" hint. This
+remains **non-blocking for the gate itself**: exactly like every other
+`invoke_router` failure mode, a rejected `working_dir` falls through to
+Layer 2 (direct-CLI fallback, see below), logged and loud, never a silent
+degrade back to the pre-fix behavior.
+
+**Residual limitation, NOT solved by this field — do not document this
+away.** Routed mode remains one-shot text-in/text-out with no tool loop
+(clagentic-router's own documented non-goal). `working_dir` helps only
+insofar as the CLI reads the filesystem during its single turn — this is
+**not equivalent** to the direct-CLI path (`invoke_codex`), which runs
+from a process whose cwd is already the enrolled repo across a real
+multi-turn tool loop. A routed Reviewer/Auditor can now `cat` a caller or
+a CI config in its one turn; it still cannot open a second file after
+reading the first one and deciding it needs more context.
 
 ### Layer 0 — URL validation, never conflated with Layer 2 unreachability
 
