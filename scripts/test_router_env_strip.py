@@ -3,7 +3,10 @@ Regression coverage for lr-b20c0a: invoke_codex (all three `codex exec` call
 sites) and invoke_generic (scripts/llm-client.sh) must strip the four
 router-scoped env vars -- AWS_BEARER_TOKEN_BEDROCK, ANTHROPIC_BEDROCK_BASE_URL,
 ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN -- before shelling out, while
-invoke_claude must keep carrying them unchanged.
+invoke_claude must keep carrying them unchanged. Extended by lr-d7c74e to
+also cover codex_version_check's `codex --version` probe, the one spawn
+lr-b20c0a left out of scope (no network call, so no live exposure, but the
+same hazard class).
 
 ROOT CAUSE: bin/clagentic-lite stamps those four vars into the enrolled
 repo's .claude/settings.json env block under CLAGENTIC_ROUTER_BEDROCK_MODE=1
@@ -204,6 +207,80 @@ class TestInvokeCodexStripsRouterEnv(_RouterEnvStripTestBase):
             self.assertNotIn(
                 var, child_env,
                 f"invoke_codex (MODEL empty) leaked {var} into the codex child env",
+            )
+
+
+def _write_version_probe_environ_dump_stub(bin_dir, name, out_path):
+    """Write a stub `codex` binary that dumps its OWN environ on the
+    `--version` invocation specifically (unlike _write_environ_dump_stub
+    above, whose `--version` branch answers with a fixed version string and
+    does NOT dump env -- that shape exists so the exec-call environ dump
+    captures the real invoke_codex exec, not the version probe. This
+    variant is the version-probe-specific mirror of that: it exists to
+    capture codex_version_check's OWN `codex --version` child env, so the
+    other branch (the real exec call, never reached here) is irrelevant and
+    left unimplemented."""
+    path = os.path.join(bin_dir, name)
+    with open(path, "w") as f:
+        f.write(textwrap.dedent(f"""\
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then
+              env > '{out_path}'
+              echo "{name} 99.0.0"
+              exit 0
+            fi
+            exit 0
+        """))
+    os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+    return path
+
+
+class TestCodexVersionCheckStripsRouterEnv(unittest.TestCase):
+    """codex_version_check's `codex --version` probe (:105, lr-d7c74e
+    follow-up to lr-b20c0a) -- same hazard class as invoke_codex/
+    invoke_generic even though this spawn makes no network call today."""
+
+    def test_strips_all_four_router_vars(self):
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-router-env-strip-")
+        try:
+            bin_dir = os.path.join(tmpdir, "bin")
+            os.makedirs(bin_dir)
+            dump_path = os.path.join(tmpdir, "child-environ.txt")
+            _write_version_probe_environ_dump_stub(bin_dir, "codex", dump_path)
+
+            src_dir = os.path.join(tmpdir, "src")
+            os.makedirs(src_dir)
+            sourced = _functions_only_source(src_dir)
+
+            env = dict(os.environ)
+            env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+            env.update(_PARENT_ROUTER_ENV)
+
+            script = textwrap.dedent(f"""\
+                . '{sourced}'
+                codex_version_check
+            """)
+            r = subprocess.run(
+                ["sh", "-c", script, sourced],
+                capture_output=True,
+                text=True,
+                cwd=TOOL_HOME,
+                env=env,
+            )
+            self.assertTrue(
+                os.path.exists(dump_path),
+                f"codex_version_check never invoked the stub `codex --version`. "
+                f"stdout={r.stdout!r} stderr={r.stderr!r}",
+            )
+            child_env = _read_environ_dump(dump_path)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        for var in ROUTER_SCOPED_VARS:
+            self.assertNotIn(
+                var, child_env,
+                f"codex_version_check leaked {var} into the `codex --version` child env",
             )
 
 

@@ -102,7 +102,22 @@ codex_version_check() {
     return 0
   fi
   # Extract version: `codex --version` emits "codex X.Y.Z" or just "X.Y.Z".
-  _cvraw=$(codex --version 2>/dev/null || true)
+  #
+  # ROUTER-ENV STRIP (lr-d7c74e, uniformity follow-up to lr-b20c0a): this
+  # probe makes no network call today, so it carries no live exposure — but
+  # it is still a non-Claude subprocess spawn in this file, the same hazard
+  # class NON_CLAUDE_ENV_STRIP (defined below, in scope by the time this
+  # function is actually called — see that variable's own doc comment)
+  # closes for invoke_codex/invoke_generic. Applying it here removes the
+  # need to reason per-spawn about whether egress is reachable today: no
+  # future change to this probe, or a codex version that phones home on
+  # --version, can silently reopen the credential-leak class lr-b20c0a fixed.
+  #
+  # NOT timeout-wrapped (unlike invoke_codex's exec calls), so the
+  # DS_TIMEOUT_CMD/`env -u` ordering constraint documented on
+  # NON_CLAUDE_ENV_STRIP does not apply to this call site.
+  # shellcheck disable=SC2086
+  _cvraw=$($NON_CLAUDE_ENV_STRIP codex --version 2>/dev/null || true)
   # Parse: take the first token that looks like a dotted version number.
   _CODEX_VERSION_STR=$(printf '%s' "$_cvraw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
   if [ -z "$_CODEX_VERSION_STR" ]; then
