@@ -1,6 +1,9 @@
 """
 Regression coverage for lr-7047bf (PR-B, task item 4): cmd_audit_vocab_lint,
-the warn-only audit-vocabulary lint (scripts/gates.sh).
+the warn-only audit-vocabulary lint (scripts/gates.sh). Widened by lr-2e8444
+for the runtime-checked-helper fix -- see that task's own class writeup for
+the three visibility classes (fully opaque / partially visible / fully
+literal) this file now covers.
 
 Root cause class (foundry sub-class 1.6-1.11): several gates log
 `cmd_log_run <gate> pass "<details>"` where the details string itself names
@@ -18,6 +21,26 @@ cover: (1) the real gates.sh backlog is exactly the known set, no more, no
 less; (2) a synthetic new violation is correctly flagged; (3) a "warn"
 outcome (already honestly labeled, e.g. cross-round dedup's "splice
 failed" warning) is correctly NOT flagged -- the lint targets "pass" only.
+
+lr-2e8444 WIDENING: the static lint above can only see a LITERAL
+double-quoted details string -- a variable-assembled details string (bare,
+as cmd_sast's pre-fix `"$_SAST_PASS_DETAILS"`, or mixed literal+variable, as
+cmd_bleed's `"...($_BLEED_SCOPE_REASON)"` sites and cmd_merge_gate's
+class/state-suffix sites) is invisible to it in whole or in part. This is
+closed from the runtime side: `_cmd_log_run_checked_pass` (scripts/gates.sh)
+checks the fully-assembled, post-interpolation details string at the moment
+it actually exists, downgrading pass->warn on a vocabulary hit rather than
+silently reporting a false-clean pass. A second static check inside
+cmd_audit_vocab_lint (`_UNCHECKED_DIRECT_CALL_RE`) is the regression guard:
+it flags any direct `cmd_log_run <gate> pass ...` call whose details
+argument contains a `$` and therefore bypasses the checked helper. New test
+classes below cover: (4) the checked helper's own runtime vocabulary check
+(pass/warn downgrade, exact non-substitution of an all-literal or all-clean
+string); (5) the second static check's detection of an unchecked
+variable-assembled call site and non-flagging of the sanctioned choke point
+and of a checked call; (6) the real gates.sh has zero unchecked
+variable-assembled pass sites (the sast/bleed/merge-gate sweep is complete);
+(7) the shell and Python failure-word vocabularies stay in sync.
 
 Sources the REAL sh function from gates.sh (not a Python mirror), mirroring
 test_deferrals_sanitize.py's established functions-only-source technique.
