@@ -540,7 +540,7 @@ cmd_deps() {
           return 1
         fi
         echo "[gates] osv-scanner reported vulnerabilities below $SEVERITY threshold" 1>&2
-        cmd_log_run deps pass "osv-scanner findings below $SEVERITY threshold"
+        _cmd_log_run_checked_pass deps "osv-scanner findings below $SEVERITY threshold"
         ;;
       128)
         # v2.x exits 128 when no package sources are found (e.g. all paths
@@ -816,7 +816,7 @@ cmd_bleed() {
 
   if [ -z "$_BLEED_FILES" ]; then
     rm -f "$_BLEED_TMP"
-    cmd_log_run bleed pass "no files to scan ($_BLEED_SCOPE_REASON)"
+    _cmd_log_run_checked_pass bleed "no files to scan ($_BLEED_SCOPE_REASON)"
     return 0
   fi
 
@@ -831,7 +831,7 @@ cmd_bleed() {
 
   if [ -z "$_BLEED_FILES" ]; then
     rm -f "$_BLEED_TMP"
-    cmd_log_run bleed pass "all files excluded ($_BLEED_SCOPE_REASON)"
+    _cmd_log_run_checked_pass bleed "all files excluded ($_BLEED_SCOPE_REASON)"
     return 0
   fi
 
@@ -842,7 +842,7 @@ cmd_bleed() {
 
   if [ -z "$_BLEED_FILES" ]; then
     rm -f "$_BLEED_TMP"
-    cmd_log_run bleed pass "no existing files to scan ($_BLEED_SCOPE_REASON)"
+    _cmd_log_run_checked_pass bleed "no existing files to scan ($_BLEED_SCOPE_REASON)"
     return 0
   fi
 
@@ -860,7 +860,7 @@ cmd_bleed() {
   fi
 
   echo "[gates/bleed] clean"
-  cmd_log_run bleed pass "no bleed patterns found ($_BLEED_SCOPE_REASON)"
+  _cmd_log_run_checked_pass bleed "no bleed patterns found ($_BLEED_SCOPE_REASON)"
   return 0
 }
 
@@ -1104,7 +1104,7 @@ EOF_EXCL
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
         _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; excluded $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS"
       fi
-      cmd_log_run sast pass "$_SAST_PASS_DETAILS"
+      _cmd_log_run_checked_pass sast "$_SAST_PASS_DETAILS"
     else
       cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE (or timed out after ${_SAST_TIMEOUT}s)"
       return 1
@@ -1117,7 +1117,7 @@ EOF_EXCL
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
         _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; excluded $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS"
       fi
-      cmd_log_run sast pass "$_SAST_PASS_DETAILS"
+      _cmd_log_run_checked_pass sast "$_SAST_PASS_DETAILS"
     else
       cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON; or timed out after ${_SAST_TIMEOUT}s)"
       return 1
@@ -3039,7 +3039,7 @@ cmd_review() {
         rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
         return 1
       fi
-      cmd_log_run review pass "0 findings at >= $THRESHOLD (chunked)"
+      _cmd_log_run_checked_pass review "0 findings at >= $THRESHOLD (chunked)"
       cmd_render_review "$OUT"
       _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "pass" "$_crv_base_sha" "$_review_sha"
       rm -f "$_crv_diff_tmp"
@@ -3175,7 +3175,7 @@ cmd_review() {
     rm -f "$_crv_diff_tmp"
     return 1
   fi
-  cmd_log_run review pass "0 findings at >= $THRESHOLD"
+  _cmd_log_run_checked_pass review "0 findings at >= $THRESHOLD"
   cmd_render_review "$OUT"
   _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "pass" "$_crv_base_sha" "$_review_sha"
   rm -f "$_crv_diff_tmp"
@@ -4246,9 +4246,9 @@ print("; ".join(parts))
         fi
       fi
       if [ "${ACK_COUNT:-0}" -gt 0 ]; then
-        cmd_log_run "$_mg_gate_name" pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL$_mg_class_suffix$_mg_state_suffix"
+        _cmd_log_run_checked_pass "$_mg_gate_name" "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL$_mg_class_suffix$_mg_state_suffix"
       else
-        cmd_log_run "$_mg_gate_name" pass "approve$_mg_class_suffix$_mg_state_suffix"
+        _cmd_log_run_checked_pass "$_mg_gate_name" "approve$_mg_class_suffix$_mg_state_suffix"
       fi
       ;;
     refuse)
@@ -5272,7 +5272,7 @@ cmd_ship() {
   DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
   if [ "$BRANCH" = "$DEFAULT_BRANCH" ] || [ -z "$BRANCH" ]; then
     echo "[gates/ship] on '$BRANCH' — not pushing or opening a PR; create a feature branch first"
-    cmd_log_run ship pass "gates green; no push (branch=$BRANCH)"
+    _cmd_log_run_checked_pass ship "gates green; no push (branch=$BRANCH)"
     return 0
   fi
 
@@ -5299,7 +5299,7 @@ cmd_ship() {
     echo "[gates/ship] no host adapter available — open a PR manually:"
     echo "  base=$DEFAULT_BRANCH head=$BRANCH remote=$REMOTE"
   fi
-  cmd_log_run ship pass "gates green; pushed $BRANCH"
+  _cmd_log_run_checked_pass ship "gates green; pushed $BRANCH"
 }
 
 cmd_pre_push() {
