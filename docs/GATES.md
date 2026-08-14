@@ -162,7 +162,7 @@ committed, audited suppression.
     "message": "hardcoded credential in seed-demo.sh",
     "description": "Planted demo credential — intentional fixture, not production code.",
     "expires": "2026-12-31",
-    "acknowledged_by": "akuehner",
+    "acknowledged_by": "maintainer",
     "scope": "stable-contract",
     "file_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   }
