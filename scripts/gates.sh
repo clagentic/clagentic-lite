@@ -200,6 +200,66 @@ cmd_log_run() {
     "INSERT INTO gate_runs (ts, gate, outcome, details, branch) VALUES ('$TS', '$GATE_ESC', '$OUT_ESC', '$DETAILS_ESC', '$BRANCH_ESC');"
 }
 
+# _cmd_log_run_checked_pass GATE DETAILS (lr-2e8444)
+#
+# THE CHECKED PATH for logging a "pass" outcome whose details string is
+# assembled at runtime (fully or partly from a variable) rather than a
+# static literal. cmd_audit_vocab_lint (below) is a STATIC lint over
+# gates.sh's own source text -- its regex can only see a literal
+# double-quoted string, so a `cmd_log_run <gate> pass "$SOME_VAR"` or
+# `cmd_log_run <gate> pass "literal ($SOME_VAR)"` call site is invisible to
+# it in whole (bare variable) or in part (mixed literal+variable): the lint
+# reports a clean scan of the literal half while the interpolated half --
+# which is exactly where a suppression reason like "scope reduced" or
+# "config replaced" lives -- goes unexamined. See docs/GATES.md
+# "Audit-vocabulary lint" for the full class writeup.
+#
+# This closes that hole from the RUNTIME side instead of teaching the
+# static matcher to resolve shell variables (open-ended, and cannot see
+# values that only exist after interpolation at call time): every
+# non-literal "pass" call site in this file must route through this
+# function rather than calling `cmd_log_run <gate> pass ...` directly. It
+# checks the FULLY ASSEMBLED, POST-INTERPOLATION details string -- so a
+# variable's actual runtime content is examined, not its source-text name
+# -- against the same failure vocabulary cmd_audit_vocab_lint enforces
+# statically. A hit downgrades the logged outcome from "pass" to "warn"
+# (never silently promotes a real pass; matches this lint's existing
+# warn-only, non-blocking product posture -- see cmd_audit_vocab_lint's own
+# doc comment) so the audit trail records the contradiction honestly
+# instead of a false-clean "pass".
+#
+# _AUDIT_FAILURE_WORDS below must stay in sync with cmd_audit_vocab_lint's
+# Python _FAILURE_WORDS list -- test_audit_vocab_lint.py's
+# TestUnifiedFailureWordVocabulary sweeps both and fails if they diverge.
+_AUDIT_FAILURE_WORDS="failed
+not found
+empty
+no package sources
+skipped
+unavailable"
+
+_cmd_log_run_checked_pass() {
+  _clrcp_gate="$1"
+  _clrcp_details="$2"
+  _clrcp_details_lower=$(printf '%s' "$_clrcp_details" | tr '[:upper:]' '[:lower:]')
+  _clrcp_hit=""
+  _clrcp_old_ifs="$IFS"
+  IFS='
+'
+  for _clrcp_word in $_AUDIT_FAILURE_WORDS; do
+    case "$_clrcp_details_lower" in
+      *"$_clrcp_word"*) _clrcp_hit="$_clrcp_word"; break ;;
+    esac
+  done
+  IFS="$_clrcp_old_ifs"
+  if [ -n "$_clrcp_hit" ]; then
+    echo "[gates/audit-vocab] $_clrcp_gate: 'pass' details contain failure word '$_clrcp_hit' at runtime -- logging as 'warn' instead: $_clrcp_details" 1>&2
+    cmd_log_run "$_clrcp_gate" warn "$_clrcp_details"
+    return 0
+  fi
+  cmd_log_run "$_clrcp_gate" pass "$_clrcp_details"
+}
+
 # _gate_resolve_fresh_default_branch_ref DEFAULT_BRANCH TIMEOUT_SEC
 #
 # Resolves `origin/<DEFAULT_BRANCH>` and prints it to stdout ONLY when it can
@@ -480,7 +540,7 @@ cmd_deps() {
           return 1
         fi
         echo "[gates] osv-scanner reported vulnerabilities below $SEVERITY threshold" 1>&2
-        cmd_log_run deps pass "osv-scanner findings below $SEVERITY threshold"
+        _cmd_log_run_checked_pass deps "osv-scanner findings below $SEVERITY threshold"
         ;;
       128)
         # v2.x exits 128 when no package sources are found (e.g. all paths
@@ -756,7 +816,7 @@ cmd_bleed() {
 
   if [ -z "$_BLEED_FILES" ]; then
     rm -f "$_BLEED_TMP"
-    cmd_log_run bleed pass "no files to scan ($_BLEED_SCOPE_REASON)"
+    _cmd_log_run_checked_pass bleed "no files to scan ($_BLEED_SCOPE_REASON)"
     return 0
   fi
 
@@ -771,7 +831,7 @@ cmd_bleed() {
 
   if [ -z "$_BLEED_FILES" ]; then
     rm -f "$_BLEED_TMP"
-    cmd_log_run bleed pass "all files excluded ($_BLEED_SCOPE_REASON)"
+    _cmd_log_run_checked_pass bleed "all files excluded ($_BLEED_SCOPE_REASON)"
     return 0
   fi
 
@@ -782,7 +842,7 @@ cmd_bleed() {
 
   if [ -z "$_BLEED_FILES" ]; then
     rm -f "$_BLEED_TMP"
-    cmd_log_run bleed pass "no existing files to scan ($_BLEED_SCOPE_REASON)"
+    _cmd_log_run_checked_pass bleed "no existing files to scan ($_BLEED_SCOPE_REASON)"
     return 0
   fi
 
@@ -800,7 +860,7 @@ cmd_bleed() {
   fi
 
   echo "[gates/bleed] clean"
-  cmd_log_run bleed pass "no bleed patterns found ($_BLEED_SCOPE_REASON)"
+  _cmd_log_run_checked_pass bleed "no bleed patterns found ($_BLEED_SCOPE_REASON)"
   return 0
 }
 
@@ -1044,7 +1104,7 @@ EOF_EXCL
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
         _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; excluded $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS"
       fi
-      cmd_log_run sast pass "$_SAST_PASS_DETAILS"
+      _cmd_log_run_checked_pass sast "$_SAST_PASS_DETAILS"
     else
       cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE (or timed out after ${_SAST_TIMEOUT}s)"
       return 1
@@ -1057,7 +1117,7 @@ EOF_EXCL
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
         _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; excluded $_SAST_EXCL_COUNT rule(s): $_SAST_EXCL_IDS"
       fi
-      cmd_log_run sast pass "$_SAST_PASS_DETAILS"
+      _cmd_log_run_checked_pass sast "$_SAST_PASS_DETAILS"
     else
       cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON; or timed out after ${_SAST_TIMEOUT}s)"
       return 1
@@ -2979,7 +3039,7 @@ cmd_review() {
         rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
         return 1
       fi
-      cmd_log_run review pass "0 findings at >= $THRESHOLD (chunked)"
+      _cmd_log_run_checked_pass review "0 findings at >= $THRESHOLD (chunked)"
       cmd_render_review "$OUT"
       _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "pass" "$_crv_base_sha" "$_review_sha"
       rm -f "$_crv_diff_tmp"
@@ -3115,7 +3175,7 @@ cmd_review() {
     rm -f "$_crv_diff_tmp"
     return 1
   fi
-  cmd_log_run review pass "0 findings at >= $THRESHOLD"
+  _cmd_log_run_checked_pass review "0 findings at >= $THRESHOLD"
   cmd_render_review "$OUT"
   _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "pass" "$_crv_base_sha" "$_review_sha"
   rm -f "$_crv_diff_tmp"
@@ -4186,9 +4246,9 @@ print("; ".join(parts))
         fi
       fi
       if [ "${ACK_COUNT:-0}" -gt 0 ]; then
-        cmd_log_run "$_mg_gate_name" pass "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL$_mg_class_suffix$_mg_state_suffix"
+        _cmd_log_run_checked_pass "$_mg_gate_name" "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL$_mg_class_suffix$_mg_state_suffix"
       else
-        cmd_log_run "$_mg_gate_name" pass "approve$_mg_class_suffix$_mg_state_suffix"
+        _cmd_log_run_checked_pass "$_mg_gate_name" "approve$_mg_class_suffix$_mg_state_suffix"
       fi
       ;;
     refuse)
@@ -5009,7 +5069,8 @@ PYEOF
   return $?
 }
 
-# cmd_audit_vocab_lint [FILE] (lr-7047bf, foundry sub-class 1.6-1.11)
+# cmd_audit_vocab_lint [FILE] (lr-7047bf, foundry sub-class 1.6-1.11; widened
+# lr-2e8444)
 #
 # WARN-ONLY lint over gates.sh's own source: flags every `cmd_log_run <gate>
 # pass "<details>"` call whose details string contains a failure word
@@ -5037,6 +5098,31 @@ PYEOF
 # explicit rather than invisible. Never returns non-zero on its own --
 # wire a nonzero-on-new-violation caller separately if this needs to become
 # a real gate; today it is diagnostic output only (see docs/GATES.md).
+#
+# SECOND CHECK -- unchecked variable-assembled "pass" call sites (lr-2e8444).
+# The vocabulary check above is purely static: it can only see a LITERAL
+# double-quoted details string, so a `cmd_log_run <gate> pass "$SOME_VAR"`
+# or `cmd_log_run <gate> pass "literal ($SOME_VAR)"` call site is invisible
+# to it in whole or in part -- exactly the false-clean class BOBBIE flagged
+# on PR 159 (cmd_sast's `"$_SAST_PASS_DETAILS"`) and the wider sweep this
+# task's own comment thread names (cmd_bleed's four `$_BLEED_SCOPE_REASON`
+# sites, cmd_merge_gate's two `$_mg_class_suffix$_mg_state_suffix` sites,
+# plus cmd_deps/cmd_review/cmd_ship's own variable-assembled pass sites
+# found by the same sweep). `_cmd_log_run_checked_pass` (defined earlier in
+# this file) closes that gap from the RUNTIME side: it checks the
+# fully-assembled, post-interpolation details string against the same
+# vocabulary, at the moment the string actually exists, and downgrades
+# pass->warn on a hit. This second check closes the corresponding
+# REGRESSION gap -- it flags any DIRECT `cmd_log_run <gate> pass ...` call
+# site (bare literal, mixed literal+variable, or bare variable) that
+# bypasses that checked helper, so a future contributor adding a new
+# variable-assembled pass call cannot silently regress back to the
+# unchecked (and thus invisible-either-way) form just by calling
+# `cmd_log_run` directly instead of `_cmd_log_run_checked_pass`. A direct
+# call passing an all-literal details string (no `$` at all) is NOT
+# flagged by this second check -- the vocabulary check above already
+# covers that case completely, and requiring every literal pass call to
+# route through the helper too would be pure churn with no coverage gain.
 cmd_audit_vocab_lint() {
   _cavl_file="${1:-$TOOL_HOME/scripts/gates.sh}"
   [ -f "$_cavl_file" ] || { echo "[gates/audit-vocab-lint] no file at $_cavl_file"; return 0; }
@@ -5056,9 +5142,30 @@ with open(path) as f:
 
 # Matches `cmd_log_run <gate> pass "<details>"` or `cmd_log_run <gate> pass ""`
 # (also the "$_mg_gate_name" quoted-variable gate-name form) -- captures the
-# gate name and the details string for the failure-word check below.
+# gate name and the details string for the failure-word check below. This
+# regex only ever sees a LITERAL double-quoted details string; a bare or
+# partially-interpolated variable is invisible to it by construction -- see
+# _UNCHECKED_DIRECT_CALL_RE below for the second, complementary check that
+# covers exactly that gap.
 _CALL_RE = re.compile(
     r'cmd_log_run\s+(?:"([^"]+)"|(\S+))\s+pass\s+"([^"]*)"'
+)
+
+# Matches a DIRECT `cmd_log_run <gate> pass ...` call site (not routed
+# through `_cmd_log_run_checked_pass`) whose details argument contains a `$`
+# -- i.e. is wholly or partly variable-assembled. This is the regression
+# guard for the runtime-checked-helper fix (lr-2e8444): every such call site
+# must go through `_cmd_log_run_checked_pass` instead, so its fully
+# assembled, post-interpolation content is examined against the same
+# vocabulary at the moment it actually exists. A literal-only details string
+# (no `$`) is deliberately excluded -- `_CALL_RE` above already covers that
+# case completely. No lookbehind needed to exclude
+# `_cmd_log_run_checked_pass` call sites themselves: this regex requires
+# whitespace immediately after the literal text "cmd_log_run", and
+# `_cmd_log_run_checked_pass` has "_checked_pass" (not whitespace) in that
+# position, so it never matches the helper's own call sites.
+_UNCHECKED_DIRECT_CALL_RE = re.compile(
+    r'cmd_log_run\s+(?:"[^"]+"|\S+)\s+pass\s+"[^"]*\$[^"]*"'
 )
 
 # The exact vocabulary the foundry sweep named: a tool/gate that never
@@ -5085,16 +5192,25 @@ _FAILURE_WORDS = (
 # full-tree, not that the scan was fake) but is REMOVED as of lr-321e18's
 # BOBBIE fold-in: cmd_sast's two `cmd_log_run sast pass ...` call sites now
 # build their details string into a variable ($_SAST_PASS_DETAILS) so the
-# config-pin visibility fix (below) can conditionally append to it, and pass
-# that variable -- `cmd_log_run sast pass "$_SAST_PASS_DETAILS"` -- rather
-# than a literal string. This lint's regex only matches a literal
-# double-quoted details string; a variable reference contains no failure
-# word literally, so this call site is no longer statically flagged at all
-# and the two entries that used to allowlist it are dead (their exact
-# literal source text no longer appears anywhere in gates.sh). Per this
-# section's own contract ("if any disappeared, the allowlist should be
-# trimmed rather than silently going stale"), removed rather than left
-# behind as no-op entries.
+# config-pin visibility fix (below) can conditionally append to it. This
+# lint's _CALL_RE regex only matches a literal double-quoted details string;
+# a variable reference contains no failure word literally, so a bare
+# `cmd_log_run sast pass "$_SAST_PASS_DETAILS"` call site would no longer be
+# statically flagged by _CALL_RE at all -- the entries that used to
+# allowlist it are correctly dead here (their exact literal source text no
+# longer appears anywhere in gates.sh) per this section's own contract ("if
+# any disappeared, the allowlist should be trimmed rather than silently
+# going stale"), removed rather than left behind as no-op entries.
+#
+# THAT BLINDNESS IS NOW CLOSED FROM THE RUNTIME SIDE INSTEAD (lr-2e8444):
+# cmd_sast (and cmd_bleed's four $_BLEED_SCOPE_REASON sites, and
+# cmd_merge_gate's two class/state-suffix sites) call
+# `_cmd_log_run_checked_pass` rather than `cmd_log_run ... pass ...`
+# directly -- see that function's own doc comment. This _KNOWN_VIOLATIONS
+# set stays scoped to the STATIC vocabulary check's literal-only backlog;
+# it is not where runtime-checked-helper coverage is asserted (that is
+# `_UNCHECKED_DIRECT_CALL_RE` below, and scripts/test_audit_vocab_lint.py's
+# checked-helper-routing tests).
 _KNOWN_VIOLATIONS = {
     ("deps", "no package sources found"),
     ("bleed", "empty pattern file"),
@@ -5133,6 +5249,37 @@ if new_violations:
     print("[gates/audit-vocab-lint] add the (gate, details) pair shown above to _KNOWN_VIOLATIONS in cmd_audit_vocab_lint if this is an intentional, reviewed exception; otherwise fix the gate to log block/warn instead of pass.")
 else:
     print("[gates/audit-vocab-lint] no new violations ({} known, allowlisted)".format(len(known_violations)))
+
+# Second check (lr-2e8444): any DIRECT cmd_log_run pass call with a
+# variable-assembled details string, bypassing the runtime-checked helper.
+#
+# ONE sanctioned exemption: _cmd_log_run_checked_pass's own internal call to
+# cmd_log_run IS the choke point this whole mechanism routes through -- it
+# is not a bypass of the checked helper, it is the checked helper's own
+# implementation, called only after the vocabulary check above it has
+# already run against the fully-assembled details string. Identified by its
+# use of the `_clrcp_`-prefixed local variables that are unique to that one
+# function's own body (never used anywhere else in gates.sh) -- not by a
+# literal reproduction of the call text, which would itself contain the
+# shell-call shape this check searches for and self-match when this lint
+# scans its own source (this file's default lint target).
+unchecked_direct = []
+for i, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped.startswith('#'):
+        continue
+    if "_clrcp_gate" in line and "_clrcp_details" in line:
+        continue
+    if _UNCHECKED_DIRECT_CALL_RE.search(line):
+        unchecked_direct.append(i + 1)
+
+if unchecked_direct:
+    print("[gates/audit-vocab-lint] {} UNCHECKED variable-assembled 'pass' call site(s) -- bypasses _cmd_log_run_checked_pass, so runtime content is never vocabulary-checked:".format(len(unchecked_direct)))
+    for ln in unchecked_direct:
+        print("  gates.sh:{}".format(ln))
+    print("[gates/audit-vocab-lint] route this call through _cmd_log_run_checked_pass GATE DETAILS instead of calling cmd_log_run GATE pass ... directly.")
+else:
+    print("[gates/audit-vocab-lint] no unchecked variable-assembled pass call sites")
 PYEOF
   return 0
 }
@@ -5212,7 +5359,7 @@ cmd_ship() {
   DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
   if [ "$BRANCH" = "$DEFAULT_BRANCH" ] || [ -z "$BRANCH" ]; then
     echo "[gates/ship] on '$BRANCH' — not pushing or opening a PR; create a feature branch first"
-    cmd_log_run ship pass "gates green; no push (branch=$BRANCH)"
+    _cmd_log_run_checked_pass ship "gates green; no push (branch=$BRANCH)"
     return 0
   fi
 
@@ -5239,7 +5386,7 @@ cmd_ship() {
     echo "[gates/ship] no host adapter available — open a PR manually:"
     echo "  base=$DEFAULT_BRANCH head=$BRANCH remote=$REMOTE"
   fi
-  cmd_log_run ship pass "gates green; pushed $BRANCH"
+  _cmd_log_run_checked_pass ship "gates green; pushed $BRANCH"
 }
 
 cmd_pre_push() {
