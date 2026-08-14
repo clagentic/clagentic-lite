@@ -338,9 +338,14 @@ passthrough mode. Do not suppress or silently pass through that warning;
 surface it to the user verbatim.
 
 Do not enable `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1` without reading
-README.md's "Agent-model injection (separate opt-in, UNVERIFIED)" section
-first — this feature's core mechanism (Claude Code honoring a non-standard
+`docs/ROUTER.md`'s "Agent-model injection (UNVERIFIED)" section first —
+this feature's core mechanism (Claude Code honoring a non-standard
 `model:` frontmatter value) is explicitly unverified upstream.
+
+There is also a third, independent opt-in — `CLAGENTIC_<ROLE>_VIA_ROUTER`,
+which routes the gate path (`clagentic-lite gates review`/`ship`) rather
+than the interactive session. See `docs/ROUTER.md` for all three opt-ins
+in full, including the Bedrock-mode variable pair.
 
 ---
 
@@ -355,7 +360,7 @@ first — this feature's core mechanism (Claude Code honoring a non-standard
 | `enroll` refuses with "is already enrolled" | Not a failure — repo is enrolled | Nothing to do, or pass `--force` to re-stamp. |
 | `enroll` refuses with "refusing to enroll $CLAGENTIC_LITE_HOME itself" | Tried to enroll the tool's own checkout without `--self` | Only pass `--self` if the user explicitly wants to dogfood the tool against its own repo. |
 | `git pull --ff-only failed` during `clagentic-lite update` | Local checkout at `$CLAGENTIC_LITE_HOME` has diverged or has uncommitted changes | This is the tool's own checkout, not the user's project — `cd "$CLAGENTIC_LITE_HOME"` and resolve the git state there (stash or reset local edits) before retrying `update`. |
-| Router configured but Claude Code traffic never routes | `CLAGENTIC_ROUTER_URL` set but repo not re-enrolled since, or Bedrock-mode session (`CLAUDE_CODE_USE_BEDROCK=1`) which ignores `ANTHROPIC_BASE_URL` entirely | Re-run `enroll --force`/`update --restamp`. For Bedrock-mode sessions, also set `CLAGENTIC_ROUTER_BEDROCK_MODE=1` — see README.md. |
+| Router configured but Claude Code traffic never routes | `CLAGENTIC_ROUTER_URL` set but repo not re-enrolled since, or Bedrock-mode session (`CLAUDE_CODE_USE_BEDROCK=1`) which ignores `ANTHROPIC_BASE_URL` entirely | Re-run `enroll --force`/`update --restamp`. For Bedrock-mode sessions, also set `CLAGENTIC_ROUTER_BEDROCK_MODE=1` — see `docs/ROUTER.md`. |
 | A security gate (gitleaks/semgrep/osv-scanner) blocks and the tool isn't installed | Missing required security tool, and no opt-out set | Either install the tool (`doctor` prints the exact command) or set the matching `CLAGENTIC_ALLOW_MISSING_*=1` to explicitly skip it — never silently work around a block by disabling the hook itself. |
 | `doctor` reports a stale artifact version (`CLAUDE.md`, `builder-contract.md`, hook shims) | The tool was updated after this repo was enrolled | `clagentic-lite update --restamp`, or `enroll --force` for a single repo. |
 
@@ -390,6 +395,9 @@ first — this feature's core mechanism (Claude Code honoring a non-standard
 - `docs/DESIGN.md` — architecture, non-goals, the config trust-boundary
   reasoning, the clagentic-router interactive-path gap in full.
 - `docs/GATES.md` — every gate's trigger, blocking behavior, and override.
+- `docs/ROUTER.md` — clagentic-router integration, operator-facing: all
+  three opt-ins (`CLAGENTIC_ROUTER_URL`, `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL`,
+  `CLAGENTIC_<ROLE>_VIA_ROUTER`), what each turns on, verification status.
 - `docs/PORTABILITY.md` — GNU/BSD differences, what's required per-platform.
 - `share/config.example` — canonical, commented list of every configurable
   setting (`$CLAGENTIC_LITE_HOME/share/config.example` once installed).
