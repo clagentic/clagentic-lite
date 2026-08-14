@@ -148,6 +148,73 @@ BODY
     return path
 
 
+def _write_curl_success_capture_stub(bin_dir, findings_payload, body_capture_path):
+    """Same as _write_curl_success_stub, but additionally copies the POST
+    body (the file named by --data-binary's @-prefixed path) to
+    body_capture_path -- lets a test inspect exactly what invoke_router
+    sent, e.g. proving a "working_dir" key is present and holds the right
+    value (lr-4a6268), not merely that the call succeeded."""
+    path = os.path.join(bin_dir, "curl")
+    body = json.dumps({
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": findings_payload}],
+    })
+    with open(path, "w") as f:
+        f.write(textwrap.dedent(f"""\
+            #!/bin/sh
+            OUT_FILE=""
+            DATA_FILE=""
+            PREV=""
+            for arg in "$@"; do
+              if [ "$PREV" = "-o" ]; then
+                OUT_FILE="$arg"
+              fi
+              case "$arg" in
+                @*) DATA_FILE="${{arg#@}}" ;;
+              esac
+              PREV="$arg"
+            done
+            [ -n "$DATA_FILE" ] && cp "$DATA_FILE" '{body_capture_path}'
+            cat <<'BODY' > "$OUT_FILE"
+{body}
+BODY
+            printf '200'
+            exit 0
+        """))
+    os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+    return path
+
+
+def _write_curl_working_dir_rejected_stub(bin_dir):
+    """A fake `curl` simulating clagentic-router's fail-loud 4xx rejection
+    of an invalid working_dir (upstream lr-009423's ResolveWorkingDir
+    validator) -- a 422 with an error body naming the field, exactly the
+    shape invoke_router's 4xx-labeling branch (lr-4a6268) looks for."""
+    path = os.path.join(bin_dir, "curl")
+    body = json.dumps({"error": "invalid working_dir: not an absolute path"})
+    with open(path, "w") as f:
+        f.write(textwrap.dedent(f"""\
+            #!/bin/sh
+            OUT_FILE=""
+            PREV=""
+            for arg in "$@"; do
+              if [ "$PREV" = "-o" ]; then
+                OUT_FILE="$arg"
+              fi
+              PREV="$arg"
+            done
+            cat <<'BODY' > "$OUT_FILE"
+{body}
+BODY
+            printf '422'
+            exit 0
+        """))
+    os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+    return path
+
+
 def _write_curl_failure_stub(bin_dir):
     """A fake `curl` that always fails (connection-refused shaped exit 7),
     simulating clagentic-router being unreachable -- the Layer-2 trigger."""
@@ -669,6 +736,117 @@ class TestBuilderExcludedFromRouting(_RouterGatePathTestBase):
         self.assertIn("direct-cli builder output", result.stdout,
                        "builder must always use the direct-CLI path, "
                        "even with CLAGENTIC_BUILDER_VIA_ROUTER=1 set")
+
+
+class TestRouterPathWorkingDir(_RouterGatePathTestBase):
+    """lr-4a6268: invoke_router must send REPO_ROOT as "working_dir" in the
+    POST body (scope A), and must surface a fail-loud, distinctly-labeled
+    diagnostic -- never a silent pass -- when the router rejects it (scope
+    B). Both properties are proved mechanically against the real request
+    body / real ERR_FILE content the router path produces, not merely
+    asserted from a returncode."""
+
+    def test_working_dir_key_sent_with_repo_root_value(self):
+        body_capture = os.path.join(self._tmpdir, "captured-body.json")
+        findings_json = json.dumps({"summary": "clean", "checked": ["security"], "findings": []})
+        _write_curl_success_capture_stub(self._bin_dir, findings_json, body_capture)
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+                "CLAGENTIC_ROUTER_TOKEN": "test-token",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0,
+                          f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        with open(body_capture) as f:
+            sent_body = json.load(f)
+        self.assertIn("working_dir", sent_body,
+                       f"invoke_router must send a working_dir key: body={sent_body!r}")
+        # self._repo IS REPO_ROOT here: CLAGENTIC_PROJECT_ROOT is set to it
+        # directly by _run_walk_chain, and it is a real (bare) git repo, so
+        # REPO_ROOT's canonicalized value equals the repo path verbatim --
+        # no ds_repo_root fallback or symlink resolution is exercised by
+        # this fixture's layout.
+        self.assertEqual(sent_body["working_dir"], self._repo,
+                          f"working_dir must equal REPO_ROOT: body={sent_body!r}")
+
+    def test_working_dir_rejected_writes_distinct_diagnostic_not_silent(self):
+        _write_curl_working_dir_rejected_stub(self._bin_dir)
+        _write_success_claude(self._bin_dir)
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+                "CLAGENTIC_ROUTER_TOKEN": "test-token",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        # Non-blocking: a rejected working_dir must fall through to the
+        # direct-CLI chain (Layer 2), never fail the gate outright.
+        self.assertEqual(result.returncode, 0,
+                          f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        self.assertEqual(self._claude_call_count(), 1,
+                          "direct-CLI fallback must still run exactly once "
+                          "after a working_dir rejection")
+        # FAIL LOUD, NOT SILENT: the working_dir-specific diagnostic must
+        # actually reach the operator-visible surface (walk_chain's Layer-2
+        # stderr line, sourced from the LAST line of ERR_FILE) -- proving
+        # this is the mechanical bar this task's scope B requires, not a
+        # returncode-only check that would also pass for a build that
+        # silently swallowed the rejection.
+        self.assertIn("working_dir", result.stderr,
+                       f"a rejected working_dir must produce a distinctly "
+                       f"labeled diagnostic, not a generic non-200 notice "
+                       f"alone: stderr={result.stderr!r}")
+        rows = self._audit_rows()
+        fallback_rows = [d for o, d in rows if o == "router-fallback"]
+        self.assertTrue(fallback_rows, f"expected a router-fallback row: rows={rows!r}")
+        self.assertTrue(
+            any("working_dir" in d for d in fallback_rows),
+            f"the router-fallback audit row's details must carry the "
+            f"working_dir-specific diagnostic, not a generic hint: "
+            f"rows={fallback_rows!r}",
+        )
+
+    def test_ordinary_4xx_without_working_dir_mention_stays_generic(self):
+        """Control case: a 4xx whose body does NOT mention working_dir
+        (e.g. an auth failure) must NOT be mislabeled as a working_dir
+        rejection -- proves the substring detection does not over-fire."""
+        path = os.path.join(self._bin_dir, "curl")
+        with open(path, "w") as f:
+            f.write(textwrap.dedent("""\
+                #!/bin/sh
+                OUT_FILE=""
+                PREV=""
+                for arg in "$@"; do
+                  if [ "$PREV" = "-o" ]; then
+                    OUT_FILE="$arg"
+                  fi
+                  PREV="$arg"
+                done
+                printf '{"error":"unauthorized"}' > "$OUT_FILE"
+                printf '401'
+                exit 0
+            """))
+        os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        _write_success_claude(self._bin_dir)
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+                "CLAGENTIC_ROUTER_TOKEN": "test-token",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0, f"stderr={result.stderr!r}")
+        self.assertNotIn("working_dir", result.stderr,
+                          f"an unrelated 401 must not be mislabeled as a "
+                          f"working_dir rejection: stderr={result.stderr!r}")
+        self.assertIn("responded 401", result.stderr,
+                       f"the generic non-200 diagnostic must still fire: "
+                       f"stderr={result.stderr!r}")
 
 
 if __name__ == "__main__":

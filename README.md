@@ -309,71 +309,17 @@ CLAGENTIC_MODEL_OLLAMA_DEFAULT=llama3.1:8b
 
 ### Optional: clagentic-router integration
 
-Everything above (`CLAGENTIC_<ROLE>_CMD`/`_TIER`/`_CHAIN`, `invoke_<cli>`) controls the **gate path** — `scripts/llm-client.sh`, invoked by `clagentic-lite gates review`/`ship`/etc. It does not touch the **interactive path**: when you dispatch a subagent (Reviewer, Auditor, …) via Claude Code's own Agent/Task tool mid-session, that dispatch goes straight to Anthropic (or wherever `ANTHROPIC_BASE_URL` points), never through `llm-client.sh`. clagentic-lite is not Claude Code's parent process, so there is no interception point on that path short of Claude Code's own settings.json.
+[clagentic-router](https://github.com/clagentic/clagentic-router) is a separate, optionally-run local proxy that lets Claude Code's *interactive* subagent dispatch (Reviewer, Auditor, … invoked mid-session via the Agent/Task tool) route through a chosen backend the same way the gate path (`CLAGENTIC_<ROLE>_CMD`/`_TIER`/`_CHAIN`, `scripts/llm-client.sh`) already does — a gap that exists because clagentic-lite is not Claude Code's parent process and has no interception point on that path otherwise. It is a separate repo, not installed or started by clagentic-lite — you run it yourself.
 
-[clagentic-router](https://github.com/clagentic/clagentic-router) is a separate, optionally-run local proxy that closes this gap. It is not installed or started by clagentic-lite — you run it yourself.
+There are **three independent opt-ins**, not one switch, and enabling one does not enable the others:
 
-**What it does.** When `CLAGENTIC_ROUTER_URL` is set, `clagentic-lite enroll`/`update` stamps an `env` block into the enrolled repo's `.claude/settings.json` (`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`) so Claude Code — including interactive subagent dispatch — routes every request through the router. In passthrough mode (the default, no per-role chain reference) this is a transparent reverse proxy; your session behaves exactly as it does today. `clagentic-router` also supports *routed* mode: reference a named chain (`role:reviewer-chain`, matching `router.example.yaml` in the clagentic-router repo) and the router picks a backend per its own scoring/fallback policy instead of forwarding straight to Anthropic.
+1. `CLAGENTIC_ROUTER_URL` — stamps the router into `.claude/settings.json` as a transparent proxy for the interactive session (passthrough by default; routed mode with a named chain if you configure one).
+2. `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` — additionally injects `model: role:<role>-chain` into the Reviewer/Auditor/Merge-Gate subagent frontmatter. **Unverified** — whether Claude Code actually honors this is unconfirmed ([claude-code GH#44385](https://github.com/anthropics/claude-code/issues/44385)).
+3. `CLAGENTIC_<ROLE>_VIA_ROUTER` — the separate gate-path switch, scoped to `reviewer`/`auditor`/`gate`. See `docs/ROUTER.md`.
 
-**`CLAGENTIC_ROUTER_URL` is validated before it is ever stamped.** This value redirects your entire Claude Code session and, in passthrough mode, forwards your real Anthropic credentials to whatever host it names — it is a traffic-interception primitive, not an ordinary config string. `clagentic-lite enroll`/`update`/`doctor` all validate it the same way:
+Full detail — setup, the Bedrock-mode variable pair, the URL validation rules, the agent-model-injection verification procedure, and the gate-path routing switch — lives in **[`docs/ROUTER.md`](docs/ROUTER.md)**.
 
-- **Malformed** (not a well-formed `http://` or `https://` URL) — **refused**. Enroll/update stop with an error rather than stamping a value that would silently break every session opened against the repo afterward.
-- **Well-formed, non-local host** (anything other than exactly `localhost`, `0.0.0.0`, a real `127.0.0.0/8` address, or `::1`/`[::1]`) — **allowed, but warned loudly**, at both stamp time and every `clagentic-lite doctor` run, naming exactly what gets forwarded. The router is designed to run locally (this is why every example below uses `127.0.0.1`), but running it on another box on your own LAN is a legitimate setup, not a mistake — so this is a warning, not a refusal. A silent accept would be the wrong failure mode here: an operator should never discover after the fact that their credentials have been going to a remote host they forgot they configured.
-- **Well-formed, local host** — silent, same as any other correctly-configured value.
-
-The host check parses the URL structurally (strips RFC 3986 userinfo, e.g. `user:pass@`, before ever looking at the host; matches `127.0.0.0/8` by real numeric octet range, not a string prefix) rather than pattern-matching the raw string — `http://127.0.0.1:x@evil.com/` and `http://127.0.0.1.evil.com/` both correctly classify as non-local (evil.com), not local. Any host form the check does not confidently recognize (IPv4-mapped IPv6 like `[::ffff:127.0.0.1]`, non-decimal IP encodings) is treated as non-local — a false "non-local" costs one warning line, a false "local" would silently forward real credentials, so ambiguity always resolves toward the warning.
-
-**Setup:**
-
-```sh
-# 1. Run clagentic-router (see that repo's README for build/run instructions).
-#    It listens on 127.0.0.1:8765 by default.
-
-# 2. Set the two config keys (~/.config/clagentic/config or .clagentic/config):
-CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765
-CLAGENTIC_ROUTER_TOKEN=<your router's proxy.token / CLAGENTIC_ROUTER_TOKEN>
-
-# 3. Re-run enroll (or update) so settings.json picks up the env block:
-clagentic-lite enroll --force    # per enrolled repo
-# or: clagentic-lite update --restamp
-
-# 4. Verify:
-clagentic-lite doctor            # probes GET /version, reports reachable/unreachable
-```
-
-**Bedrock-mode sessions need a second variable pair — the direct-API pair above does NOT work for them.** If you run Claude Code with `CLAUDE_CODE_USE_BEDROCK=1` (e.g. an AWS SSO profile), it ignores `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` entirely and speaks the AWS Bedrock Runtime `InvokeModel` wire protocol instead. Setting `CLAGENTIC_ROUTER_URL` alone will look like it worked (`clagentic-lite doctor` reports the router reachable) while every Bedrock-mode session silently never talks to it — no error, no warning, nothing routed. Set a third config key to fix this:
-
-```sh
-CLAGENTIC_ROUTER_BEDROCK_MODE=1
-```
-
-When set (alongside `CLAGENTIC_ROUTER_URL`), `enroll`/`update` additionally stamp `ANTHROPIC_BEDROCK_BASE_URL` (the Bedrock-mode equivalent of `ANTHROPIC_BASE_URL`) and `AWS_BEARER_TOKEN_BEDROCK` (a bearer-token alternative to full AWS SigV4 signing — Claude Code's documented ["Option E: Amazon Bedrock API keys"](https://code.claude.com/docs/en/amazon-bedrock)) into the same `env` block, reusing `CLAGENTIC_ROUTER_TOKEN` verbatim as the Bedrock bearer token. `AWS_BEARER_TOKEN_BEDROCK` is not optional: without it, Bedrock-mode Claude Code signs requests with full SigV4 instead of a bearer token, which fails the router's auth check and 401s even though `ANTHROPIC_BEDROCK_BASE_URL` correctly pointed traffic at the router.
-
-Both pairs are stamped together, not one instead of the other — a single `settings.json` may be opened by sessions running in either auth mode (direct API/OAuth vs. Bedrock), and each mode only reads the pair it understands. `CLAGENTIC_ROUTER_BEDROCK_MODE` is validated through the exact same `CLAGENTIC_ROUTER_URL` classifier and atomic settings-stamp writer as the direct-API pair — it stamps the same URL value into a second variable name, not a second independently-configured URL.
-
-**Honest limitation.** Routed roles lose tool-calling and true streaming through clagentic-router's CLI adapters — fine for a one-shot Reviewer/Auditor/Merge-Gate pass that only reads a diff and returns text, wrong for a tool-using Builder that needs to read/write files mid-conversation. Do not point the Builder role through the router. This is why `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` (below) only ever touches Reviewer, Auditor, and Merge Gate.
-
-**Agent-model injection (separate opt-in, UNVERIFIED).** `CLAGENTIC_ROUTER_URL` alone gets you the settings.json passthrough above with no further risk. A second, independent key — `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1` — additionally causes `clagentic-lite init`/`update` to render the Reviewer/Auditor/Merge-Gate subagent definitions with `model: role:<role>-chain` injected into frontmatter (matching `router.example.yaml`'s `reviewer-chain`/`auditor-chain` examples). There is exactly one `clagentic-lite` plugin at all times — this key changes what that ONE plugin's render looks like, it does not install a second plugin alongside it (pre-lr-1b5a31 versions installed a separate `clagentic-lite-router` overlay plugin; that design is retired — `update` on an older install automatically detects and removes the stale overlay). The checked-in `plugins/clagentic-lite/agents/*.md` files are never modified on disk — only a generated copy under `$CLAGENTIC_LITE_HOME/.clagentic/rendered-plugin/` is, and that generated copy is what actually gets installed via `claude plugin install`.
-
-This is explicitly **unverified**: whether Claude Code actually honors a subagent frontmatter `model:` field set to a non-standard string like `role:reviewer-chain` — versus silently ignoring it and dispatching the subagent on the parent session's own model — has not been confirmed against a live interactive session from this codebase. This is [claude-code GH#44385](https://github.com/anthropics/claude-code/issues/44385) territory: that issue reports subagent frontmatter `model:` being ignored in some contexts. Leave `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` unset until you've run the verification below at least once.
-
-#### Verifying on your machine
-
-This is the one part of the router integration that could not be tested from this development environment (no route to a fresh interactive Claude Code session or a local HTTP capture listener from a crew-dispatched build). Run this on a real machine with `claude` installed:
-
-1. Stand up a minimal capture listener, e.g. `python3 -m http.server 8765` in a scratch directory, or any tool that logs the raw HTTP request it receives (headers + body).
-2. In a scratch repo (or the wrapper CLAUDE.md dir), enroll with the router pointed at your capture listener and injection turned on:
-   ```sh
-   CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765 CLAGENTIC_ROUTER_TOKEN=test-token \
-     CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1 CLAGENTIC_REVIEWER_CMD=codex \
-     clagentic-lite enroll --force
-   ```
-3. Open a fresh interactive Claude Code session in that repo (a plain session — not something that itself intercepts the request).
-4. Dispatch the Reviewer subagent (e.g. ask it to review a diff, or invoke it directly via the Task/Agent tool).
-5. Inspect what your capture listener received:
-   - **The `model` field in the request body, verbatim.** If it reads `role:reviewer-chain`, the injection point works as designed. If it reads a normal model alias/ID (e.g. `claude-sonnet-4-6`), Claude Code silently ignored the frontmatter field and fell back to the parent session's model — this is the GH#44385 failure mode. Either way, record what you saw as a comment on lr-49f25e (or the equivalent follow-up task) so the next person doesn't have to re-run this.
-   - **Which auth header arrived**: `x-api-key` or `Authorization: Bearer <token>`. clagentic-router's routed-mode auth (`internal/server/messages.go` in that repo) accepts either, keyed off the same token value — but confirming which one Claude Code actually sends closes a documentation gap on the router side too, independent of the model-field outcome.
-6. If the model field does NOT arrive verbatim: do not "fix" this by editing the router or the injection code to compensate — file a task naming the concrete alternative injection point (the Task/Agent tool's own `model` parameter, if callable with a custom string; or accept that this specific mechanism has no equivalent for interactive dispatch and scope it back to gate-path-only). Leave `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` off in your own config either way until it's confirmed working.
+**`CLAGENTIC_ROUTER_URL` is validated before it is ever stamped.** This value redirects your entire Claude Code session and, in passthrough mode, forwards your real Anthropic credentials to whatever host it names — it is a traffic-interception primitive, not an ordinary config string. A malformed URL is refused outright. A well-formed but non-local host (anything other than `localhost`/`127.0.0.0/8`/`::1`) is allowed but warned loudly, at both stamp time and every `clagentic-lite doctor` run — an operator must not have to follow a link to learn their real Anthropic credentials may be forwarded to a remote host. See `docs/ROUTER.md` for the full classification rules.
 
 ---
 
@@ -395,6 +341,7 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
 ├── docs/
 │   ├── DESIGN.md                               architecture and non-goals
 │   ├── GATES.md                                what each gate does, what it blocks
+│   ├── ROUTER.md                               clagentic-router integration: all three opt-ins, operator-facing
 │   ├── DEMO-SCRIPT.md                          5-minute walkthrough
 │   ├── PORTABILITY.md                          GNU vs BSD tool table
 │   └── LLM-USAGE.md                            checklist for an LLM/agent setting this up or operating it for a user
