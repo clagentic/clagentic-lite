@@ -200,6 +200,66 @@ cmd_log_run() {
     "INSERT INTO gate_runs (ts, gate, outcome, details, branch) VALUES ('$TS', '$GATE_ESC', '$OUT_ESC', '$DETAILS_ESC', '$BRANCH_ESC');"
 }
 
+# _cmd_log_run_checked_pass GATE DETAILS (lr-2e8444)
+#
+# THE CHECKED PATH for logging a "pass" outcome whose details string is
+# assembled at runtime (fully or partly from a variable) rather than a
+# static literal. cmd_audit_vocab_lint (below) is a STATIC lint over
+# gates.sh's own source text -- its regex can only see a literal
+# double-quoted string, so a `cmd_log_run <gate> pass "$SOME_VAR"` or
+# `cmd_log_run <gate> pass "literal ($SOME_VAR)"` call site is invisible to
+# it in whole (bare variable) or in part (mixed literal+variable): the lint
+# reports a clean scan of the literal half while the interpolated half --
+# which is exactly where a suppression reason like "scope reduced" or
+# "config replaced" lives -- goes unexamined. See docs/GATES.md
+# "Audit-vocabulary lint" for the full class writeup.
+#
+# This closes that hole from the RUNTIME side instead of teaching the
+# static matcher to resolve shell variables (open-ended, and cannot see
+# values that only exist after interpolation at call time): every
+# non-literal "pass" call site in this file must route through this
+# function rather than calling `cmd_log_run <gate> pass ...` directly. It
+# checks the FULLY ASSEMBLED, POST-INTERPOLATION details string -- so a
+# variable's actual runtime content is examined, not its source-text name
+# -- against the same failure vocabulary cmd_audit_vocab_lint enforces
+# statically. A hit downgrades the logged outcome from "pass" to "warn"
+# (never silently promotes a real pass; matches this lint's existing
+# warn-only, non-blocking product posture -- see cmd_audit_vocab_lint's own
+# doc comment) so the audit trail records the contradiction honestly
+# instead of a false-clean "pass".
+#
+# _AUDIT_FAILURE_WORDS below must stay in sync with cmd_audit_vocab_lint's
+# Python _FAILURE_WORDS list -- test_audit_vocab_lint.py's
+# TestUnifiedFailureWordVocabulary sweeps both and fails if they diverge.
+_AUDIT_FAILURE_WORDS="failed
+not found
+empty
+no package sources
+skipped
+unavailable"
+
+_cmd_log_run_checked_pass() {
+  _clrcp_gate="$1"
+  _clrcp_details="$2"
+  _clrcp_details_lower=$(printf '%s' "$_clrcp_details" | tr '[:upper:]' '[:lower:]')
+  _clrcp_hit=""
+  _clrcp_old_ifs="$IFS"
+  IFS='
+'
+  for _clrcp_word in $_AUDIT_FAILURE_WORDS; do
+    case "$_clrcp_details_lower" in
+      *"$_clrcp_word"*) _clrcp_hit="$_clrcp_word"; break ;;
+    esac
+  done
+  IFS="$_clrcp_old_ifs"
+  if [ -n "$_clrcp_hit" ]; then
+    echo "[gates/audit-vocab] $_clrcp_gate: 'pass' details contain failure word '$_clrcp_hit' at runtime -- logging as 'warn' instead: $_clrcp_details" 1>&2
+    cmd_log_run "$_clrcp_gate" warn "$_clrcp_details"
+    return 0
+  fi
+  cmd_log_run "$_clrcp_gate" pass "$_clrcp_details"
+}
+
 # _gate_resolve_fresh_default_branch_ref DEFAULT_BRANCH TIMEOUT_SEC
 #
 # Resolves `origin/<DEFAULT_BRANCH>` and prints it to stdout ONLY when it can
