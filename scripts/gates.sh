@@ -5069,7 +5069,8 @@ PYEOF
   return $?
 }
 
-# cmd_audit_vocab_lint [FILE] (lr-7047bf, foundry sub-class 1.6-1.11)
+# cmd_audit_vocab_lint [FILE] (lr-7047bf, foundry sub-class 1.6-1.11; widened
+# lr-2e8444)
 #
 # WARN-ONLY lint over gates.sh's own source: flags every `cmd_log_run <gate>
 # pass "<details>"` call whose details string contains a failure word
@@ -5097,6 +5098,31 @@ PYEOF
 # explicit rather than invisible. Never returns non-zero on its own --
 # wire a nonzero-on-new-violation caller separately if this needs to become
 # a real gate; today it is diagnostic output only (see docs/GATES.md).
+#
+# SECOND CHECK -- unchecked variable-assembled "pass" call sites (lr-2e8444).
+# The vocabulary check above is purely static: it can only see a LITERAL
+# double-quoted details string, so a `cmd_log_run <gate> pass "$SOME_VAR"`
+# or `cmd_log_run <gate> pass "literal ($SOME_VAR)"` call site is invisible
+# to it in whole or in part -- exactly the false-clean class BOBBIE flagged
+# on PR 159 (cmd_sast's `"$_SAST_PASS_DETAILS"`) and the wider sweep this
+# task's own comment thread names (cmd_bleed's four `$_BLEED_SCOPE_REASON`
+# sites, cmd_merge_gate's two `$_mg_class_suffix$_mg_state_suffix` sites,
+# plus cmd_deps/cmd_review/cmd_ship's own variable-assembled pass sites
+# found by the same sweep). `_cmd_log_run_checked_pass` (defined earlier in
+# this file) closes that gap from the RUNTIME side: it checks the
+# fully-assembled, post-interpolation details string against the same
+# vocabulary, at the moment the string actually exists, and downgrades
+# pass->warn on a hit. This second check closes the corresponding
+# REGRESSION gap -- it flags any DIRECT `cmd_log_run <gate> pass ...` call
+# site (bare literal, mixed literal+variable, or bare variable) that
+# bypasses that checked helper, so a future contributor adding a new
+# variable-assembled pass call cannot silently regress back to the
+# unchecked (and thus invisible-either-way) form just by calling
+# `cmd_log_run` directly instead of `_cmd_log_run_checked_pass`. A direct
+# call passing an all-literal details string (no `$` at all) is NOT
+# flagged by this second check -- the vocabulary check above already
+# covers that case completely, and requiring every literal pass call to
+# route through the helper too would be pure churn with no coverage gain.
 cmd_audit_vocab_lint() {
   _cavl_file="${1:-$TOOL_HOME/scripts/gates.sh}"
   [ -f "$_cavl_file" ] || { echo "[gates/audit-vocab-lint] no file at $_cavl_file"; return 0; }
@@ -5116,9 +5142,30 @@ with open(path) as f:
 
 # Matches `cmd_log_run <gate> pass "<details>"` or `cmd_log_run <gate> pass ""`
 # (also the "$_mg_gate_name" quoted-variable gate-name form) -- captures the
-# gate name and the details string for the failure-word check below.
+# gate name and the details string for the failure-word check below. This
+# regex only ever sees a LITERAL double-quoted details string; a bare or
+# partially-interpolated variable is invisible to it by construction -- see
+# _UNCHECKED_DIRECT_CALL_RE below for the second, complementary check that
+# covers exactly that gap.
 _CALL_RE = re.compile(
     r'cmd_log_run\s+(?:"([^"]+)"|(\S+))\s+pass\s+"([^"]*)"'
+)
+
+# Matches a DIRECT `cmd_log_run <gate> pass ...` call site (not routed
+# through `_cmd_log_run_checked_pass`) whose details argument contains a `$`
+# -- i.e. is wholly or partly variable-assembled. This is the regression
+# guard for the runtime-checked-helper fix (lr-2e8444): every such call site
+# must go through `_cmd_log_run_checked_pass` instead, so its fully
+# assembled, post-interpolation content is examined against the same
+# vocabulary at the moment it actually exists. A literal-only details string
+# (no `$`) is deliberately excluded -- `_CALL_RE` above already covers that
+# case completely. No lookbehind needed to exclude
+# `_cmd_log_run_checked_pass` call sites themselves: this regex requires
+# whitespace immediately after the literal text "cmd_log_run", and
+# `_cmd_log_run_checked_pass` has "_checked_pass" (not whitespace) in that
+# position, so it never matches the helper's own call sites.
+_UNCHECKED_DIRECT_CALL_RE = re.compile(
+    r'cmd_log_run\s+(?:"[^"]+"|\S+)\s+pass\s+"[^"]*\$[^"]*"'
 )
 
 # The exact vocabulary the foundry sweep named: a tool/gate that never
@@ -5145,16 +5192,25 @@ _FAILURE_WORDS = (
 # full-tree, not that the scan was fake) but is REMOVED as of lr-321e18's
 # BOBBIE fold-in: cmd_sast's two `cmd_log_run sast pass ...` call sites now
 # build their details string into a variable ($_SAST_PASS_DETAILS) so the
-# config-pin visibility fix (below) can conditionally append to it, and pass
-# that variable -- `cmd_log_run sast pass "$_SAST_PASS_DETAILS"` -- rather
-# than a literal string. This lint's regex only matches a literal
-# double-quoted details string; a variable reference contains no failure
-# word literally, so this call site is no longer statically flagged at all
-# and the two entries that used to allowlist it are dead (their exact
-# literal source text no longer appears anywhere in gates.sh). Per this
-# section's own contract ("if any disappeared, the allowlist should be
-# trimmed rather than silently going stale"), removed rather than left
-# behind as no-op entries.
+# config-pin visibility fix (below) can conditionally append to it. This
+# lint's _CALL_RE regex only matches a literal double-quoted details string;
+# a variable reference contains no failure word literally, so a bare
+# `cmd_log_run sast pass "$_SAST_PASS_DETAILS"` call site would no longer be
+# statically flagged by _CALL_RE at all -- the entries that used to
+# allowlist it are correctly dead here (their exact literal source text no
+# longer appears anywhere in gates.sh) per this section's own contract ("if
+# any disappeared, the allowlist should be trimmed rather than silently
+# going stale"), removed rather than left behind as no-op entries.
+#
+# THAT BLINDNESS IS NOW CLOSED FROM THE RUNTIME SIDE INSTEAD (lr-2e8444):
+# cmd_sast (and cmd_bleed's four $_BLEED_SCOPE_REASON sites, and
+# cmd_merge_gate's two class/state-suffix sites) call
+# `_cmd_log_run_checked_pass` rather than `cmd_log_run ... pass ...`
+# directly -- see that function's own doc comment. This _KNOWN_VIOLATIONS
+# set stays scoped to the STATIC vocabulary check's literal-only backlog;
+# it is not where runtime-checked-helper coverage is asserted (that is
+# `_UNCHECKED_DIRECT_CALL_RE` below, and scripts/test_audit_vocab_lint.py's
+# checked-helper-routing tests).
 _KNOWN_VIOLATIONS = {
     ("deps", "no package sources found"),
     ("bleed", "empty pattern file"),
@@ -5193,6 +5249,37 @@ if new_violations:
     print("[gates/audit-vocab-lint] add the (gate, details) pair shown above to _KNOWN_VIOLATIONS in cmd_audit_vocab_lint if this is an intentional, reviewed exception; otherwise fix the gate to log block/warn instead of pass.")
 else:
     print("[gates/audit-vocab-lint] no new violations ({} known, allowlisted)".format(len(known_violations)))
+
+# Second check (lr-2e8444): any DIRECT cmd_log_run pass call with a
+# variable-assembled details string, bypassing the runtime-checked helper.
+#
+# ONE sanctioned exemption: _cmd_log_run_checked_pass's own internal call to
+# cmd_log_run IS the choke point this whole mechanism routes through -- it
+# is not a bypass of the checked helper, it is the checked helper's own
+# implementation, called only after the vocabulary check above it has
+# already run against the fully-assembled details string. Identified by its
+# use of the `_clrcp_`-prefixed local variables that are unique to that one
+# function's own body (never used anywhere else in gates.sh) -- not by a
+# literal reproduction of the call text, which would itself contain the
+# shell-call shape this check searches for and self-match when this lint
+# scans its own source (this file's default lint target).
+unchecked_direct = []
+for i, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped.startswith('#'):
+        continue
+    if "_clrcp_gate" in line and "_clrcp_details" in line:
+        continue
+    if _UNCHECKED_DIRECT_CALL_RE.search(line):
+        unchecked_direct.append(i + 1)
+
+if unchecked_direct:
+    print("[gates/audit-vocab-lint] {} UNCHECKED variable-assembled 'pass' call site(s) -- bypasses _cmd_log_run_checked_pass, so runtime content is never vocabulary-checked:".format(len(unchecked_direct)))
+    for ln in unchecked_direct:
+        print("  gates.sh:{}".format(ln))
+    print("[gates/audit-vocab-lint] route this call through _cmd_log_run_checked_pass GATE DETAILS instead of calling cmd_log_run GATE pass ... directly.")
+else:
+    print("[gates/audit-vocab-lint] no unchecked variable-assembled pass call sites")
 PYEOF
   return 0
 }
