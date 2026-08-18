@@ -1733,6 +1733,11 @@ _enroll_one() {
   fi
 
   CLAGENTIC_PROJECT_ROOT="$_canon" "$CLAGENTIC_LITE_HOME/scripts/memory.sh" init
+  # lr-bdddcf: gates.sh is invoked as a script here, never sourced. An
+  # ambiently exported CLAGENTIC_GATES_SOURCE_ONLY (e.g. from a developer's
+  # shell profile) would otherwise reach gates.sh's own fail-closed check
+  # and abort enroll's init step instead of running it.
+  unset CLAGENTIC_GATES_SOURCE_ONLY CLAGENTIC_GATES_DELIBERATE_SOURCE
   CLAGENTIC_PROJECT_ROOT="$_canon" "$CLAGENTIC_LITE_HOME/scripts/gates.sh" init
 
   # Stamp hook shims.
@@ -3529,6 +3534,12 @@ case "${1:-}" in
     # enrolled-repo command docs and CLAUDE.md files route through this
     # subcommand rather than referencing the bare scripts/ relative path.
     shift
+    # lr-bdddcf: gates.sh is exec'd as a script here, never sourced. An
+    # ambiently exported CLAGENTIC_GATES_SOURCE_ONLY (e.g. from a
+    # developer's shell profile) would otherwise reach gates.sh's own
+    # fail-closed check and abort this subcommand instead of running the
+    # requested gate.
+    unset CLAGENTIC_GATES_SOURCE_ONLY CLAGENTIC_GATES_DELIBERATE_SOURCE
     exec "$SCRIPTS_DIR/gates.sh" "$@"
     ;;
   "")

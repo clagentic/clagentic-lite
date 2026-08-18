@@ -16,6 +16,16 @@
 # absolute path. Do not edit the installed copy by hand.
 
 : "${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}"
+
+# lr-bdddcf: this hook invokes llm-client.sh as a script (summarize call
+# below), never sources it. An ambiently exported
+# CLAGENTIC_LLM_CLIENT_SOURCE_ONLY (e.g. from a developer's shell profile,
+# left over from sourcing llm-client.sh in a test/debug session) would
+# otherwise reach llm-client.sh's own fail-closed check and abort the
+# summarize call instead of running it -- stop the leak here so this
+# non-blocking hook never depends on llm-client.sh's own defense.
+unset CLAGENTIC_LLM_CLIENT_SOURCE_ONLY CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE
+
 # Explicit existence guard before sourcing: `.` is a POSIX special builtin,
 # so a file-not-found inside a bare `. "$X" 2>/dev/null || exit 0` is a
 # FATAL shell error that terminates the whole script immediately (exit 2,
