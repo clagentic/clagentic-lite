@@ -2409,10 +2409,50 @@ cmd_doctor() {
   # The whole point of clagentic-lite is that Builder and Reviewer are different
   # CLIs so they don't share blind spots. Warn (not fail) when they match —
   # a single-CLI setup still works, but the cross-vendor property is gone.
+  #
+  # ROUTER-BLIND FIX (lr-964f7f): CLAGENTIC_REVIEWER_CMD names the
+  # direct-CLI FALLBACK only. When CLAGENTIC_REVIEWER_VIA_ROUTER=1 and
+  # CLAGENTIC_ROUTER_URL is set, the live reviewer vendor is decided by
+  # scripts/llm-client.sh's router path (_llm_role_routable + role_chain,
+  # dispatched as model: role:reviewer-chain) instead — comparing
+  # *_CMD alone produced a false "same vendor" WARN on a genuinely
+  # cross-vendor routed setup (and, in 9b below, an OK naming the wrong
+  # CLI's tool-restriction posture).
+  #
+  # PREFERRED FIX WOULD BE: reuse role_chain/_llm_role_routable directly so
+  # doctor and llm-client.sh resolve the chain identically, never a second
+  # parser. NOT done: scripts/llm-client.sh is not safe to `.` source from
+  # this bootstrap-early doctor path (same constraint the 9b comment below
+  # already documented, now verified concretely, not just asserted). The
+  # file runs `set -e` and unconditionally executes a
+  # `case "${1:-}" in build|review|...|*) exit 1; esac` dispatch at the
+  # bottom with NO guard against being sourced — sourcing it here would
+  # dispatch on doctor's own "doctor" argument, fall to the `*)` arm, and
+  # `exit 1` out of the entire `clagentic-lite doctor` run before any
+  # further checks printed. (scripts/test_llm_client_sh.py's own
+  # `_functions_only_source` helper works around this by writing a
+  # dispatch-truncated COPY to a throwaway tempdir for test harnesses only
+  # — replicating that at doctor runtime would mean doctor itself
+  # text-searching llm-client.sh for the exact dispatch line and writing a
+  # temp copy every run, which is a second, fragile parse of that file's
+  # structure, not a reuse of it.) Falling back to the documented minimal
+  # alternative instead: when a role is routed, SUPPRESS the *_CMD-based
+  # assertion and print an INFO naming CLAGENTIC_<ROLE>_CHAIN as the
+  # variable that actually governs the live vendor. This removes the false
+  # negative/wrong-vendor-OK without teaching doctor a second chain parser.
   printf '\ncross-vendor check:\n'
   _builder_cmd="${CLAGENTIC_BUILDER_CMD:-}"
   _reviewer_cmd="${CLAGENTIC_REVIEWER_CMD:-}"
-  if [ -z "$_builder_cmd" ] || [ -z "$_reviewer_cmd" ]; then
+  _reviewer_routed=0
+  if [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && [ "${CLAGENTIC_REVIEWER_VIA_ROUTER:-0}" = "1" ]; then
+    _reviewer_routed=1
+  fi
+  if [ "$_reviewer_routed" = "1" ]; then
+    printf '  INFO CLAGENTIC_REVIEWER_VIA_ROUTER=1 — the live Reviewer vendor is governed by CLAGENTIC_REVIEWER_CHAIN (dispatched as model: role:reviewer-chain via clagentic-router), not by CLAGENTIC_REVIEWER_CMD.\n'
+    printf '       CLAGENTIC_REVIEWER_CHAIN=%s\n' "${CLAGENTIC_REVIEWER_CHAIN:-(unset)}"
+    printf '       Cross-vendor status cannot be asserted from *_CMD alone on a routed role — compare CLAGENTIC_BUILDER_CMD (%s) against the chain above yourself, or against clagentic-router'"'"'s own /logs backend_id for a live call.\n' "${_builder_cmd:-(unset)}"
+    printf '       CLAGENTIC_REVIEWER_CMD=%s remains configured as the direct-CLI FALLBACK for when the router is unreachable at call time.\n' "${_reviewer_cmd:-(unset)}"
+  elif [ -z "$_builder_cmd" ] || [ -z "$_reviewer_cmd" ]; then
     printf '  (Builder or Reviewer CMD not configured — skipping cross-vendor check)\n'
   elif [ "$_builder_cmd" = "$_reviewer_cmd" ]; then
     printf '  WARN Builder and Reviewer both use "%s" — cross-vendor review is disabled.\n' "$_builder_cmd"
@@ -2424,25 +2464,51 @@ cmd_doctor() {
   fi
 
   # 9b. Reviewer tool-restriction check (lr-49df97 fold-in, BOBBIE finding
-  # 1; UPDATED lr-37282a). invoke_claude's --allowedTools/--disallowedTools
-  # restriction (AGENTS.md INV-2) enforces on the claude CLI path.
-  # invoke_codex now ALSO enforces (--disable shell_tool -s read-only,
-  # verified against the installed codex CLI, codex-cli 0.142.5 — see that
-  # function's own doc comment in scripts/llm-client.sh for the full
-  # verification record), but only on codex's version-gated flag-surface
-  # path (CODEX_MIN_VERSION, scripts/llm-client.sh) — an installed codex
-  # older than that, or a third CLI outside claude/codex entirely, is still
-  # genuinely unrestricted. Doctor cannot cheaply re-run llm-client.sh's own
-  # cached version_ge comparison here without sourcing that file (which
-  # this bootstrap-early code path deliberately does not do), so this check
-  # names codex as restricted-when-current and points at the authoritative
-  # per-call warning (llm-client.sh's own stderr warning, which DOES run the
-  # real version check) for the precise version-gated case. Warn loudly
-  # here, not just at call time, so the exposure is visible on a `doctor`
-  # run before any review ever executes — same "fail-safe, not silent"
-  # posture as the cross-vendor check above.
+  # 1; UPDATED lr-37282a, UPDATED lr-964f7f). invoke_claude's
+  # --allowedTools/--disallowedTools restriction (AGENTS.md INV-2) enforces
+  # on the claude CLI path. invoke_codex now ALSO enforces (--disable
+  # shell_tool -s read-only, verified against the installed codex CLI,
+  # codex-cli 0.142.5 — see that function's own doc comment in
+  # scripts/llm-client.sh for the full verification record), but only on
+  # codex's version-gated flag-surface path (CODEX_MIN_VERSION,
+  # scripts/llm-client.sh) — an installed codex older than that, or a third
+  # CLI outside claude/codex entirely, is still genuinely unrestricted.
+  # Doctor cannot cheaply re-run llm-client.sh's own cached version_ge
+  # comparison here without sourcing that file (which this bootstrap-early
+  # code path deliberately does not do — see the concrete "why" in the
+  # cross-vendor check's comment above), so this check names codex as
+  # restricted-when-current and points at the authoritative per-call
+  # warning (llm-client.sh's own stderr warning, which DOES run the real
+  # version check) for the precise version-gated case. Warn loudly here,
+  # not just at call time, so the exposure is visible on a `doctor` run
+  # before any review ever executes — same "fail-safe, not silent" posture
+  # as the cross-vendor check above.
+  #
+  # ROUTER-BLIND FIX (lr-964f7f): same false-positive family as 9 above,
+  # but security-relevant rather than merely informational — this check
+  # exists to warn when a reviewer reading an attacker-influenceable diff
+  # may hold unrestricted Bash, and branching on _reviewer_cmd answered
+  # that question for the FALLBACK CLI, not the live routed reviewer, whose
+  # tool-restriction posture is governed by the router adapter, not by
+  # invoke_claude/invoke_codex's flag logic at all. When routed, this
+  # doctor process has no visibility into the router adapter's own
+  # tool-restriction posture — asserting either OK or WARN about it would
+  # be a guess. Under-claim instead: suppress the *_CMD-keyed assertion and
+  # name the router adapter as the thing that actually governs posture.
   printf '\nreviewer tool-restriction check:\n'
-  if [ -z "$_reviewer_cmd" ]; then
+  if [ "$_reviewer_routed" = "1" ]; then
+    printf '  INFO CLAGENTIC_REVIEWER_VIA_ROUTER=1 — tool-restriction posture for the live routed Reviewer is delegated to the clagentic-router adapter, not to invoke_claude/invoke_codex'"'"'s --allowedTools/--disallowedTools or --disable shell_tool flags (those apply only to the direct-CLI fallback below).\n'
+    printf '       Backend: CLAGENTIC_REVIEWER_CHAIN=%s. Verify this backend'"'"'s own Bash/tool-execution posture against clagentic-router'"'"'s own docs/config — doctor cannot see inside the router adapter from here.\n' "${CLAGENTIC_REVIEWER_CHAIN:-(unset)}"
+    if [ -n "$_reviewer_cmd" ]; then
+      if [ "$_reviewer_cmd" = "claude" ]; then
+        printf '       Direct-CLI FALLBACK (used only if the router is unreachable at call time): Reviewer=%s (tool-restriction enforced: --allowedTools Read,Grep,Glob --disallowedTools Bash)\n' "$_reviewer_cmd"
+      elif [ "$_reviewer_cmd" = "codex" ]; then
+        printf '       Direct-CLI FALLBACK (used only if the router is unreachable at call time): Reviewer=%s (tool-restriction enforced when codex >= CODEX_MIN_VERSION: --disable shell_tool -s read-only)\n' "$_reviewer_cmd"
+      else
+        printf '       Direct-CLI FALLBACK (used only if the router is unreachable at call time): Reviewer=%s has no known tool-restriction flag.\n' "$_reviewer_cmd"
+      fi
+    fi
+  elif [ -z "$_reviewer_cmd" ]; then
     printf '  (Reviewer CMD not configured — skipping)\n'
   elif [ "$_reviewer_cmd" = "claude" ]; then
     _ok "Reviewer=$_reviewer_cmd (tool-restriction enforced: --allowedTools Read,Grep,Glob --disallowedTools Bash)"
