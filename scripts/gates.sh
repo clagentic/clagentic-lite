@@ -5586,27 +5586,56 @@ cmd_tail() {
 # Every other branch below still gets the full, unchanged, combined
 # ds_load_env exactly as before this fold-in -- POST-ENROLLMENT BEHAVIOR
 # HERE IS UNCHANGED, this is a migration for the init-time path only.
-if [ "${1:-}" != "init" ]; then
-  ds_load_env
-fi
+# SOURCE GUARD (lr-bdddcf): everything above this line (functions, version
+# constants, REPO_ROOT/_git resolution) is safe and correct to run at
+# source time -- a caller that wants to reuse a function needs exactly
+# that. Only the block below is execute-as-a-script behavior: the
+# ds_load_env call branches on the SOURCING shell's own "$1", and the case
+# statement reads it again and calls `exit` -- both wrong/destructive for a
+# caller that dot-sources this file to reuse functions.
+#
+# POSIX sh has no $BASH_SOURCE (or any other sourced-vs-executed
+# introspection primitive), so "was this file sourced" cannot be detected
+# automatically -- the portable idiom is an explicit opt-in env sentinel the
+# caller sets before sourcing. CLAGENTIC_GATES_SOURCE_ONLY=1 is that
+# sentinel: unset/empty (the default, and every real `sh gates.sh
+# <subcommand>` invocation) runs both blocks exactly as before this guard
+# was added -- byte-identical executed-as-a-script behavior, pinned by
+# test_gates_source_guard.py. Set only by a caller that is dot-sourcing
+# this file on purpose.
+#
+# TRADE-OFF (named per lr-bdddcf task instructions, see also the PR body):
+# the alternative was moving this dispatch into a `main "$@"` invoked only
+# when not sourced -- see llm-client.sh's identical guard comment for why
+# that was rejected here too: POSIX sh's lack of $BASH_SOURCE means "not
+# sourced" still has to be spelled as the same env sentinel, just moved one
+# layer down and adding a `main()` wrapper + reindent around this exact
+# ds_load_env/case pair, a larger diff against gate-path code for no
+# behavioral gain. The sentinel-before-dispatch form keeps both existing
+# blocks completely untouched.
+if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
+  if [ "${1:-}" != "init" ]; then
+    ds_load_env
+  fi
 
-case "${1:-}" in
-  init)           cmd_init ;;
-  bleed)          shift; cmd_bleed "$@" ;;
-  secrets)        cmd_secrets ;;
-  deps)           cmd_deps ;;
-  sast)           cmd_sast ;;
-  review)         shift; cmd_review "$@" ;;
-  adversarial)    cmd_adversarial ;;
-  merge-gate)     shift; cmd_merge_gate "$@" ;;
-  render-review)  shift; cmd_render_review "$@" ;;
-  deferrals-lint) shift; cmd_deferrals_lint "$@" ;;
-  audit-vocab-lint) shift; cmd_audit_vocab_lint "$@" ;;
-  ship)           cmd_ship ;;
-  pre-push)       cmd_pre_push ;;
-  log-run)        shift; cmd_log_run "$@" ;;
-  digest)         cmd_digest ;;
-  status)         shift; cmd_status "$@" ;;
-  tail)           shift; cmd_tail "$@" ;;
-  *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
-esac
+  case "${1:-}" in
+    init)           cmd_init ;;
+    bleed)          shift; cmd_bleed "$@" ;;
+    secrets)        cmd_secrets ;;
+    deps)           cmd_deps ;;
+    sast)           cmd_sast ;;
+    review)         shift; cmd_review "$@" ;;
+    adversarial)    cmd_adversarial ;;
+    merge-gate)     shift; cmd_merge_gate "$@" ;;
+    render-review)  shift; cmd_render_review "$@" ;;
+    deferrals-lint) shift; cmd_deferrals_lint "$@" ;;
+    audit-vocab-lint) shift; cmd_audit_vocab_lint "$@" ;;
+    ship)           cmd_ship ;;
+    pre-push)       cmd_pre_push ;;
+    log-run)        shift; cmd_log_run "$@" ;;
+    digest)         cmd_digest ;;
+    status)         shift; cmd_status "$@" ;;
+    tail)           shift; cmd_tail "$@" ;;
+    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+  esac
+fi

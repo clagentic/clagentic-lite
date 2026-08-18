@@ -2973,11 +2973,40 @@ cmd_summarize() {
 cmd_adversarial() { walk_chain auditor    markdown ds_adversarial_prompt; }
 cmd_merge_gate()  { walk_chain gate       json     ds_merge_gate_prompt; }
 
-case "${1:-}" in
-  build)        cmd_build ;;
-  review)       cmd_review ;;
-  summarize)    cmd_summarize ;;
-  adversarial)  cmd_adversarial ;;
-  merge-gate)   cmd_merge_gate ;;
-  *) echo "usage: llm-client.sh {build|review|summarize|adversarial|merge-gate}" 1>&2; exit 1 ;;
-esac
+# SOURCE GUARD (lr-bdddcf): everything above this line (functions, version
+# constants, REPO_ROOT resolution) is safe and correct to run at source time
+# -- a caller that wants to reuse a function (e.g. role_chain,
+# _llm_role_routable) needs exactly that. Only the block below is
+# execute-as-a-script behavior: it reads the SOURCING shell's own "$1" and
+# calls `exit`, which is wrong/destructive for a caller that dot-sources
+# this file to reuse functions.
+#
+# POSIX sh has no $BASH_SOURCE (or any other sourced-vs-executed
+# introspection primitive), so "was this file sourced" cannot be detected
+# automatically -- the portable idiom is an explicit opt-in env sentinel the
+# caller sets before sourcing. CLAGENTIC_LLM_CLIENT_SOURCE_ONLY=1 is that
+# sentinel: unset/empty (the default, and every real `sh llm-client.sh
+# <subcommand>` invocation) runs the dispatch exactly as before this guard
+# was added -- byte-identical executed-as-a-script behavior, pinned by
+# test_llm_client_source_guard.py. Set only by a caller that is
+# dot-sourcing this file on purpose.
+#
+# TRADE-OFF (named per lr-bdddcf task instructions, see also the PR body):
+# the alternative was moving this dispatch into a `main "$@"` invoked only
+# when not sourced. Rejected here because POSIX sh's lack of $BASH_SOURCE
+# means "not sourced" still has to be spelled as an env sentinel or a `$0`
+# comparison against argv[0] passed by the caller -- the same fundamental
+# mechanism, just moved one layer down and adding a `main()` wrapper +
+# reindent around this exact case statement, which is a larger diff against
+# gate-path code for no behavioral gain. The sentinel-before-dispatch form
+# keeps the existing dispatch block completely untouched.
+if [ -z "${CLAGENTIC_LLM_CLIENT_SOURCE_ONLY:-}" ]; then
+  case "${1:-}" in
+    build)        cmd_build ;;
+    review)       cmd_review ;;
+    summarize)    cmd_summarize ;;
+    adversarial)  cmd_adversarial ;;
+    merge-gate)   cmd_merge_gate ;;
+    *) echo "usage: llm-client.sh {build|review|summarize|adversarial|merge-gate}" 1>&2; exit 1 ;;
+  esac
+fi
