@@ -30,13 +30,19 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 
 # Exit codes to inject and assert propagate unchanged. 124 is the timeout
 # sentinel this task's acceptance criteria calls out explicitly (the 124
@@ -63,29 +69,6 @@ def _discover_invoke_functions():
                 names.append(m.group(1))
     assert names, "no invoke_* functions found in llm-client.sh -- grep pattern broken?"
     return names
-
-
-def _functions_only_source(dest_dir):
-    """Copy llm-client.sh into dest_dir with its trailing subcommand dispatch
-    stripped off, so it is safe to `.` source without executing cmd_build/
-    cmd_review/etc or calling `exit`. Mirrors test_llm_client_sh.py's
-    _functions_only_source (same technique, reused rather than duplicated
-    logic diverging over time)."""
-    with open(LLM_CLIENT_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in llm-client.sh"
-    dest = os.path.join(dest_dir, "llm-client.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    platform_dest = os.path.join(dest_dir, "platform.sh")
-    with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
-        dst.write(src.read())
-    return dest
 
 
 def _write_stub_binary(bin_dir, name, exit_code):
@@ -151,7 +134,8 @@ _INVOKE_CALL_SHAPES = {
     # property. python3 is also required (invoke_router builds/parses JSON
     # via python3 -c, same as this file's own real installs) -- present in
     # this test environment already (every other class in this file
-    # depends on it transitively via _functions_only_source's platform.sh).
+    # depends on it transitively via the real platform.sh, sourced directly
+    # per test_source_helpers.py -- see LLM_CLIENT_SH/source_env above).
     "invoke_router": {
         "stub_name": "curl",
         "call": 'CLAGENTIC_ROUTER_URL="http://127.0.0.1:19999" CLAGENTIC_ROUTER_TOKEN="test-token" invoke_router "reviewer" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" 5',
@@ -184,9 +168,7 @@ class TestEveryInvokeFunctionPropagatesExitStatus(unittest.TestCase):
             os.makedirs(bin_dir)
             _write_stub_binary(bin_dir, stub_name, injected_code)
 
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced = _functions_only_source(src_dir)
+            sourced = LLM_CLIENT_SH
 
             prompt_file = os.path.join(tmpdir, "prompt.txt")
             input_file = os.path.join(tmpdir, "input.txt")
@@ -214,11 +196,14 @@ class TestEveryInvokeFunctionPropagatesExitStatus(unittest.TestCase):
                 {shape['call']} || RC=$?
                 exit "$RC"
             """)
+            env = os.environ.copy()
+            env.update(source_env(llm_client=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced],
                 capture_output=True,
                 text=True,
                 cwd=TOOL_HOME,
+                env=env,
             )
             return r
         finally:

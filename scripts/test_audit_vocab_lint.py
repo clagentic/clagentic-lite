@@ -50,39 +50,25 @@ Run with: python3 -m unittest scripts.test_audit_vocab_lint -v
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import GATES_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
-
-
-def _functions_only_source(dest_dir):
-    """Same truncation/symlink pattern as test_build_gate_summary_change_class.py."""
-    with open(GATES_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in gates.sh"
-    dest = os.path.join(dest_dir, "gates.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
-    for fname in ("platform.sh", "review-merge.sh", "host-adapter.sh"):
-        os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(dest_dir, fname))
-    return dest
 
 
 def _run_lint(target_file, project_root=None):
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-vocab-lint-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced_gates = _functions_only_source(src_dir)
+        sourced_gates = GATES_SH
         script = textwrap.dedent(f"""\
             . '{sourced_gates}'
             cmd_audit_vocab_lint '{target_file}'
@@ -90,6 +76,7 @@ def _run_lint(target_file, project_root=None):
         env = os.environ.copy()
         if project_root:
             env["CLAGENTIC_PROJECT_ROOT"] = project_root
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True, text=True, env=env,
@@ -287,9 +274,7 @@ def _run_checked_pass(gate, details, extra_env=None):
     own) -- deleting it here, before the caller reads project_dir's audit
     DB, would remove the very file the caller needs to assert against."""
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-checked-pass-")
-    src_dir = os.path.join(tmpdir, "src")
-    os.makedirs(src_dir)
-    sourced_gates = _functions_only_source(src_dir)
+    sourced_gates = GATES_SH
     project_dir = os.path.join(tmpdir, "project")
     os.makedirs(project_dir)
     subprocess.run(["git", "init", "-q", project_dir], check=True)
@@ -301,6 +286,7 @@ def _run_checked_pass(gate, details, extra_env=None):
     env["CLAGENTIC_PROJECT_ROOT"] = project_dir
     if extra_env:
         env.update(extra_env)
+    env.update(source_env(gates=True))
     r = subprocess.run(
         ["sh", "-c", script, sourced_gates],
         capture_output=True, text=True, env=env,

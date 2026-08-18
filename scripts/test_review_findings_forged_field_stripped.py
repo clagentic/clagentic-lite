@@ -59,13 +59,19 @@ import os
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import GATES_SH, PLATFORM_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 
 
 # --------------------------------------------------------------------------
@@ -74,45 +80,21 @@ PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 # of the full cmd_review harness.
 # --------------------------------------------------------------------------
 
-def _functions_only_source(dest_dir):
-    with open(GATES_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in gates.sh"
-    dest = os.path.join(dest_dir, "gates.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
-    for fname in ("platform.sh", "review-merge.sh", "host-adapter.sh"):
-        os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(dest_dir, fname))
-    return dest
-
-
 def _call_sanitize_envelope(envelope_path):
-    tmpdir = tempfile.mkdtemp(prefix="clagentic-test-srfe-")
-    try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced_gates = _functions_only_source(src_dir)
-        script = textwrap.dedent(f"""\
-            . '{PLATFORM_SH}'
-            ds_load_env 2>/dev/null || true
-            . '{sourced_gates}'
-            _sanitize_review_findings_envelope '{envelope_path}'
-        """)
-        r = subprocess.run(
-            ["sh", "-c", script, sourced_gates],
-            capture_output=True, text=True,
-            cwd=os.path.join(TOOL_HOME, "scripts"),
-        )
-        return r.stdout, r.stderr, r.returncode
-    finally:
-        import shutil
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    script = textwrap.dedent(f"""\
+        . '{PLATFORM_SH}'
+        ds_load_env 2>/dev/null || true
+        . '{GATES_SH}'
+        _sanitize_review_findings_envelope '{envelope_path}'
+    """)
+    env = os.environ.copy()
+    env.update(source_env(gates=True))
+    r = subprocess.run(
+        ["sh", "-c", script, GATES_SH],
+        capture_output=True, text=True,
+        cwd=os.path.join(TOOL_HOME, "scripts"), env=env,
+    )
+    return r.stdout, r.stderr, r.returncode
 
 
 class TestSanitizeReviewFindingsEnvelopeDirect(unittest.TestCase):
@@ -587,42 +569,22 @@ class TestForgedRecurrenceFlagCannotSelfExempt(unittest.TestCase):
 # ... you must update all THREE call sites" warning.
 # --------------------------------------------------------------------------
 
-def _functions_only_source_llm_client(dest_dir):
-    llm_client_sh = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
-    with open(llm_client_sh) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in llm-client.sh"
-    dest = os.path.join(dest_dir, "llm-client.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    platform_dest = os.path.join(dest_dir, "platform.sh")
-    with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
-        dst.write(src.read())
-    return dest
-
-
 def _call_validate_output(envelope, role="reviewer", mode="json", jq_available=True):
-    """Write envelope to a temp file, source llm-client.sh (functions only),
-    and call validate_output directly. jq_available=False forces the
-    python3-only branch: a fresh bin/ directory is populated with a symlink
-    to every executable on the real PATH EXCEPT jq (dirname/cat/sed/etc, all
-    needed by llm-client.sh/platform.sh at source time, stay available), so
-    `command -v jq` genuinely fails inside the subprocess without also
-    breaking every other tool this script depends on."""
+    """Write envelope to a temp file, source llm-client.sh (source-guard
+    sentinel set), and call validate_output directly. jq_available=False
+    forces the python3-only branch: a fresh bin/ directory is populated with
+    a symlink to every executable on the real PATH EXCEPT jq (dirname/cat/
+    sed/etc, all needed by llm-client.sh/platform.sh at source time, stay
+    available), so `command -v jq` genuinely fails inside the subprocess
+    without also breaking every other tool this script depends on."""
     import shutil as _shutil
+    from test_source_helpers import LLM_CLIENT_SH
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-validate-output-")
     try:
         env_path = os.path.join(tmpdir, "envelope.json")
         with open(env_path, "w") as f:
             json.dump(envelope, f)
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced = _functions_only_source_llm_client(src_dir)
+        sourced = LLM_CLIENT_SH
 
         sh_path = _shutil.which("sh") or "/bin/sh"
         path_env = os.environ.get("PATH", "")
@@ -647,6 +609,7 @@ def _call_validate_output(envelope, role="reviewer", mode="json", jq_available=T
         script = f". '{sourced}'\nvalidate_output '{mode}' '{env_path}' '{role}'\n"
         env = os.environ.copy()
         env["PATH"] = path_env
+        env.update(source_env(llm_client=True))
         r = subprocess.run(
             [sh_path, "-c", script, sourced],
             capture_output=True, text=True, cwd=TOOL_HOME, env=env,

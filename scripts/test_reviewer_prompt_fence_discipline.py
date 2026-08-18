@@ -17,39 +17,30 @@ Run with: python3 -m unittest scripts.test_reviewer_prompt_fence_discipline -v
 """
 import os
 import subprocess
+import sys
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
 
 
 def _run_prompt_func(func_name):
-    """Source llm-client.sh (functions only, same truncation technique
-    every other llm-client.sh test in this suite uses) and print the named
-    prompt function's stdout."""
-    with open(LLM_CLIENT_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in llm-client.sh"
-    import tempfile
-    tmpdir = tempfile.mkdtemp(prefix="clagentic-test-prompt-fence-")
-    try:
-        dest = os.path.join(tmpdir, "llm-client.sh")
-        with open(dest, "w") as f:
-            f.writelines(lines[:cut])
-        platform_dest = os.path.join(tmpdir, "platform.sh")
-        with open(os.path.join(TOOL_HOME, "scripts", "platform.sh")) as src, open(platform_dest, "w") as dst:
-            dst.write(src.read())
-        script = f". '{dest}'\n{func_name}\n"
-        r = subprocess.run(["sh", "-c", script, dest], capture_output=True, text=True, cwd=TOOL_HOME)
-        return r.stdout, r.stderr, r.returncode
-    finally:
-        import shutil
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    """Source the real llm-client.sh (source-guard sentinel set) and print
+    the named prompt function's stdout."""
+    script = f". '{LLM_CLIENT_SH}'\n{func_name}\n"
+    env = os.environ.copy()
+    env.update(source_env(llm_client=True))
+    r = subprocess.run(
+        ["sh", "-c", script, LLM_CLIENT_SH],
+        capture_output=True, text=True, cwd=TOOL_HOME, env=env,
+    )
+    return r.stdout, r.stderr, r.returncode
 
 
 class TestReviewerPromptDemandsExactlyOneFencedBlockOrNone(unittest.TestCase):

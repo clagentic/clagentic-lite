@@ -24,6 +24,16 @@ ds_load_env
 REPO_ROOT=$(ds_repo_root || { echo "smoke: not in a git repo" 1>&2; exit 1; })
 cd "$REPO_ROOT"
 
+# lr-bdddcf: every gates.sh/llm-client.sh invocation below runs them as
+# scripts, never sourced. An ambiently exported CLAGENTIC_GATES_SOURCE_ONLY
+# / CLAGENTIC_LLM_CLIENT_SOURCE_ONLY (e.g. from a developer's shell
+# profile) would otherwise reach each file's own fail-closed check and
+# abort every smoke step instead of exercising the real gate -- stop the
+# leak once here rather than depending on each of the ~15 call sites below
+# to notice.
+unset CLAGENTIC_GATES_SOURCE_ONLY CLAGENTIC_GATES_DELIBERATE_SOURCE
+unset CLAGENTIC_LLM_CLIENT_SOURCE_ONLY CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE
+
 MODE="${1:-full}"
 PASS=0
 FAIL=0

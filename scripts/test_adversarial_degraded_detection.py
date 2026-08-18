@@ -37,36 +37,24 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import GATES_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
     "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
 }
-
-
-def _functions_only_source(dest_dir):
-    """Same truncation/symlink pattern as test_build_gate_summary_change_class.py."""
-    with open(GATES_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in gates.sh"
-    dest = os.path.join(dest_dir, "gates.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
-    for fname in ("platform.sh", "review-merge.sh", "host-adapter.sh"):
-        os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(dest_dir, fname))
-    return dest
 
 
 def _init_git_repo(path):
@@ -102,9 +90,7 @@ def _run_cmd_adversarial(project_root, fake_llm_client_sh):
     cmd_adversarial directly. Returns (stdout, stderr, returncode)."""
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-adv-degraded-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced_gates = _functions_only_source(src_dir)
+        sourced_gates = GATES_SH
 
         # cmd_adversarial calls "$TOOL_HOME/scripts/llm-client.sh" by
         # absolute path derived from gates.sh's own location -- point
@@ -123,6 +109,7 @@ def _run_cmd_adversarial(project_root, fake_llm_client_sh):
         """)
         env = os.environ.copy()
         env["CLAGENTIC_PROJECT_ROOT"] = project_root
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True, text=True, env=env,
@@ -243,11 +230,12 @@ class TestBuildGateSummaryAdversarialDegradedField(unittest.TestCase):
         _stage_a_change's own doc comment for why staged, not committed)
         against self._tmpdir so build_gate_summary's ledger-anchored check
         (lr-01ae73) finds a genuine passing verdict at current HEAD. Uses
-        the full gates.sh subcommand dispatcher (not _functions_only_source)
-        since cmd_review's own flag-parsing/dispatch path is what a real
-        caller invokes -- build_gate_summary itself is still exercised via
-        the functions-only source in _run_build_gate_summary below, in the
-        SAME project directory, so it sees the ledger cmd_review just wrote."""
+        the full gates.sh subcommand dispatcher (executed as a script,
+        sentinel unset) since cmd_review's own flag-parsing/dispatch path is
+        what a real caller invokes -- build_gate_summary itself is still
+        exercised via the source-guard-sentinel path in
+        _run_build_gate_summary below, in the SAME project directory, so it
+        sees the ledger cmd_review just wrote."""
         _stage_a_change(self._tmpdir)
         fake_tool_home = tempfile.mkdtemp(prefix="clagentic-test-bgs-adv-degraded-review-home-")
         try:
@@ -308,12 +296,11 @@ class TestBuildGateSummaryAdversarialDegradedField(unittest.TestCase):
     def _run_build_gate_summary(self):
         tmpdir = tempfile.mkdtemp(prefix="clagentic-test-bgs-adv-degraded-src-")
         try:
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced_gates = _functions_only_source(src_dir)
+            sourced_gates = GATES_SH
             script = f". '{sourced_gates}'\nbuild_gate_summary\n"
             env = os.environ.copy()
             env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
+            env.update(source_env(gates=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced_gates],
                 capture_output=True, text=True, env=env,
@@ -408,9 +395,7 @@ class TestGateSummaryDegradedNoToolFallback(unittest.TestCase):
     def test_no_tool_fallback_emits_gate_summary_degraded_true(self):
         tmpdir = tempfile.mkdtemp(prefix="clagentic-test-bgs-notool-src-")
         try:
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced_gates = _functions_only_source(src_dir)
+            sourced_gates = GATES_SH
             no_json_bin = os.path.join(tmpdir, "no-json-bin")
             os.makedirs(no_json_bin)
             self._no_json_tool_path(no_json_bin)
@@ -421,6 +406,7 @@ class TestGateSummaryDegradedNoToolFallback(unittest.TestCase):
                 build_gate_summary
             """)
             env = {"CLAGENTIC_PROJECT_ROOT": self._tmpdir, "HOME": os.environ.get("HOME", "/tmp")}
+            env.update(source_env(gates=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced_gates],
                 capture_output=True, text=True, env=env,
@@ -450,9 +436,7 @@ class TestGateSummaryDegradedNoToolFallback(unittest.TestCase):
         test here, so it is the wrong path to exercise this scenario."""
         tmpdir = tempfile.mkdtemp(prefix="clagentic-test-mg-notool-")
         try:
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced_gates = _functions_only_source(src_dir)
+            sourced_gates = GATES_SH
             no_json_bin = os.path.join(tmpdir, "no-json-bin")
             os.makedirs(no_json_bin)
             self._no_json_tool_path(no_json_bin)
@@ -463,6 +447,7 @@ class TestGateSummaryDegradedNoToolFallback(unittest.TestCase):
                 cmd_merge_gate
             """)
             env = {"CLAGENTIC_PROJECT_ROOT": self._tmpdir, "HOME": os.environ.get("HOME", "/tmp")}
+            env.update(source_env(gates=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced_gates],
                 capture_output=True, text=True, env=env,

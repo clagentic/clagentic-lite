@@ -24,37 +24,24 @@ Run with: python3 -m unittest scripts.test_model_output_unparseable_classificati
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import GATES_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
     "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
 }
-
-
-def _functions_only_source(dest_dir):
-    """Identical truncation/symlink pattern to
-    test_adversarial_degraded_detection.py -- reused, not reimplemented."""
-    with open(GATES_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in gates.sh"
-    dest = os.path.join(dest_dir, "gates.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
-    for fname in ("platform.sh", "review-merge.sh", "host-adapter.sh"):
-        os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(dest_dir, fname))
-    return dest
 
 
 def _init_git_repo(path):
@@ -80,9 +67,7 @@ def _run_gates_cmd(project_root, fake_llm_client_sh, cmd):
     (stdout, stderr, returncode)."""
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-unparseable-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced_gates = _functions_only_source(src_dir)
+        sourced_gates = GATES_SH
 
         fake_tool_home = os.path.join(tmpdir, "fake-tool-home")
         os.makedirs(os.path.join(fake_tool_home, "scripts"))
@@ -98,6 +83,7 @@ def _run_gates_cmd(project_root, fake_llm_client_sh, cmd):
         """)
         env = os.environ.copy()
         env["CLAGENTIC_PROJECT_ROOT"] = project_root
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True, text=True, env=env,

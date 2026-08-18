@@ -67,13 +67,19 @@ Run with: python3 -m unittest scripts.test_reviewer_tool_restriction -v
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import LLM_CLIENT_SH, PLATFORM_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 
 
 def _write_fake_claude(bin_dir, argv_file):
@@ -91,26 +97,6 @@ def _write_fake_claude(bin_dir, argv_file):
     return fake
 
 
-def _functions_only_source(dest_dir):
-    """Identical to test_llm_client_sh.py's helper -- reused, not
-    reimplemented."""
-    with open(LLM_CLIENT_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in llm-client.sh"
-    dest = os.path.join(dest_dir, "llm-client.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    platform_dest = os.path.join(dest_dir, "platform.sh")
-    with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
-        dst.write(src.read())
-    return dest
-
-
 def _run_invoke_claude(call_role, call_mode="json", model=""):
     """Identical call shape to test_llm_client_sh.py's _run_invoke_claude --
     reused, not reimplemented (that file's own fixture already proves
@@ -124,9 +110,7 @@ def _run_invoke_claude(call_role, call_mode="json", model=""):
         os.makedirs(bin_dir)
         _write_fake_claude(bin_dir, argv_file)
 
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced_llm_client = _functions_only_source(src_dir)
+        sourced_llm_client = LLM_CLIENT_SH
 
         prompt_file = os.path.join(tmpdir, "prompt.txt")
         input_file = os.path.join(tmpdir, "input.txt")
@@ -142,11 +126,14 @@ def _run_invoke_claude(call_role, call_mode="json", model=""):
             . '{sourced_llm_client}'
             invoke_claude '{model}' '{prompt_file}' '{input_file}' '{output_file}' '{err_file}' 60 '{call_mode}' '{call_role}'
         """)
+        env = os.environ.copy()
+        env.update(source_env(llm_client=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_llm_client],
             capture_output=True,
             text=True,
             cwd=TOOL_HOME,
+            env=env,
         )
         with open(argv_file) as f:
             recorded = [line.rstrip("\n") for line in f if line.strip()]
@@ -395,9 +382,7 @@ def _run_walk_chain_reviewer(bin_dir, argv_file):
     fixtures above already prove that half)."""
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-walkchain-toolrole-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced = _functions_only_source(src_dir)
+        sourced = LLM_CLIENT_SH
 
         script = textwrap.dedent(f"""\
             export PATH='{bin_dir}':"$PATH"
@@ -406,9 +391,11 @@ def _run_walk_chain_reviewer(bin_dir, argv_file):
             . '{sourced}'
             printf 'stdin diff content' | walk_chain reviewer json _fixture_prompt
         """)
+        env = os.environ.copy()
+        env.update(source_env(llm_client=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced],
-            capture_output=True, text=True, cwd=TOOL_HOME,
+            capture_output=True, text=True, cwd=TOOL_HOME, env=env,
         )
         with open(argv_file) as f:
             recorded = [line.rstrip("\n") for line in f if line.strip()]
@@ -548,9 +535,7 @@ class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
             os.makedirs(bin_dir)
             _write_fake_codex_json_reviewer(bin_dir, argv_file)
 
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced = _functions_only_source(src_dir)
+            sourced = LLM_CLIENT_SH
 
             script = textwrap.dedent(f"""\
                 export PATH='{bin_dir}':"$PATH"
@@ -559,9 +544,11 @@ class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
                 . '{sourced}'
                 printf 'stdin diff content' | walk_chain reviewer json _fixture_prompt
             """)
+            env = os.environ.copy()
+            env.update(source_env(llm_client=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced],
-                capture_output=True, text=True, cwd=TOOL_HOME,
+                capture_output=True, text=True, cwd=TOOL_HOME, env=env,
             )
             self.assertIn(
                 "UNRESTRICTED", r.stderr,
@@ -589,9 +576,7 @@ class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
             os.makedirs(bin_dir)
             _write_fake_claude_json_reviewer(bin_dir, argv_file)
 
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced = _functions_only_source(src_dir)
+            sourced = LLM_CLIENT_SH
 
             script = textwrap.dedent(f"""\
                 export PATH='{bin_dir}':"$PATH"
@@ -600,9 +585,11 @@ class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
                 . '{sourced}'
                 printf 'stdin diff content' | walk_chain reviewer json _fixture_prompt
             """)
+            env = os.environ.copy()
+            env.update(source_env(llm_client=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced],
-                capture_output=True, text=True, cwd=TOOL_HOME,
+                capture_output=True, text=True, cwd=TOOL_HOME, env=env,
             )
             self.assertNotIn(
                 "UNRESTRICTED", r.stderr,
@@ -638,9 +625,7 @@ class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
             os.makedirs(bin_dir)
             _write_fake_codex_json_reviewer(bin_dir, argv_file)
 
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced = _functions_only_source(src_dir)
+            sourced = LLM_CLIENT_SH
 
             script = textwrap.dedent(f"""\
                 export PATH='{bin_dir}':"$PATH"
@@ -649,9 +634,11 @@ class TestReviewerOnUnrestrictableCliWarnsLoudly(unittest.TestCase):
                 . '{sourced}'
                 printf 'stdin diff content' | walk_chain auditor json _fixture_prompt
             """)
+            env = os.environ.copy()
+            env.update(source_env(llm_client=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced],
-                capture_output=True, text=True, cwd=TOOL_HOME,
+                capture_output=True, text=True, cwd=TOOL_HOME, env=env,
             )
             self.assertIn(
                 "UNRESTRICTED", r.stderr,
@@ -708,9 +695,7 @@ def _run_walk_chain_with_codex_fixture(role_lower, cli_cmd_env_var, fixture_writ
         os.makedirs(bin_dir)
         fixture_writer(bin_dir, argv_file)
 
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced = _functions_only_source(src_dir)
+        sourced = LLM_CLIENT_SH
 
         script = textwrap.dedent(f"""\
             export PATH='{bin_dir}':"$PATH"
@@ -719,9 +704,11 @@ def _run_walk_chain_with_codex_fixture(role_lower, cli_cmd_env_var, fixture_writ
             . '{sourced}'
             printf 'stdin diff content' | walk_chain {role_lower} {mode} _fixture_prompt
         """)
+        env = os.environ.copy()
+        env.update(source_env(llm_client=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced],
-            capture_output=True, text=True, cwd=TOOL_HOME,
+            capture_output=True, text=True, cwd=TOOL_HOME, env=env,
         )
         with open(argv_file) as f:
             recorded = [line.rstrip("\n") for line in f if line.strip()]
@@ -828,9 +815,7 @@ def _run_walk_chain_with_role(role_lower, bin_dir, argv_file):
     TestNonReviewerRolesAreUntouched above) happens to restrict too."""
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-walkchain-rolecheck-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced = _functions_only_source(src_dir)
+        sourced = LLM_CLIENT_SH
 
         role_upper = role_lower.upper().replace("-", "_")
         script = textwrap.dedent(f"""\
@@ -840,9 +825,11 @@ def _run_walk_chain_with_role(role_lower, bin_dir, argv_file):
             . '{sourced}'
             printf 'stdin diff content' | walk_chain '{role_lower}' json _fixture_prompt
         """)
+        env = os.environ.copy()
+        env.update(source_env(llm_client=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced],
-            capture_output=True, text=True, cwd=TOOL_HOME,
+            capture_output=True, text=True, cwd=TOOL_HOME, env=env,
         )
         with open(argv_file) as f:
             recorded = [line.rstrip("\n") for line in f if line.strip()]

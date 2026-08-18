@@ -6,4 +6,11 @@ if [ ! -x "$CLAGENTIC_LITE_HOME/scripts/gates.sh" ]; then
   printf 'clagentic-lite missing at %s — run `clagentic-lite doctor`\n' "$CLAGENTIC_LITE_HOME" >&2
   exit 1
 fi
+# lr-bdddcf: gates.sh is executed as a script here, never sourced. An
+# ambiently exported CLAGENTIC_GATES_SOURCE_ONLY (e.g. from a developer's
+# shell profile, left over from sourcing gates.sh in a test/debug session)
+# would otherwise reach gates.sh's own fail-closed check and abort this
+# hook with an error instead of running the gate -- stop the leak here so
+# the security-critical hook path never depends on gates.sh's own defense.
+unset CLAGENTIC_GATES_SOURCE_ONLY CLAGENTIC_GATES_DELIBERATE_SOURCE
 exec "$CLAGENTIC_LITE_HOME/scripts/gates.sh" secrets

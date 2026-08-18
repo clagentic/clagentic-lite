@@ -41,12 +41,19 @@ Run with: python3 -m unittest scripts.test_llm_output_degraded_detector -v
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import GATES_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
 
 # Coreutils gates.sh's own sourcing preamble and _llm_output_is_degraded's
 # own body need on PATH (dirname for the `. "$(dirname "$0")/platform.sh"`
@@ -73,33 +80,12 @@ def _build_no_json_tool_path(dest_bin_dir):
     return dest_bin_dir
 
 
-def _functions_only_source(dest_dir):
-    """Same truncation/symlink pattern as test_adversarial_findings_sanitize.py."""
-    with open(GATES_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in gates.sh"
-    dest = os.path.join(dest_dir, "gates.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
-    for fname in ("platform.sh", "review-merge.sh", "host-adapter.sh"):
-        os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(dest_dir, fname))
-    return dest
-
-
 def _run_sh_function(call_line, extra_script="", extra_env=None):
     """Source gates.sh (functions only) and run an arbitrary call line
     against it, returning (stdout, stderr, returncode)."""
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-degraded-detector-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced_gates = _functions_only_source(src_dir)
+        sourced_gates = GATES_SH
 
         script = textwrap.dedent(f"""\
             . '{sourced_gates}'
@@ -109,6 +95,7 @@ def _run_sh_function(call_line, extra_script="", extra_env=None):
         env = os.environ.copy()
         if extra_env:
             env.update(extra_env)
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True,
@@ -341,17 +328,18 @@ class TestFailClosedOnNoValidator(unittest.TestCase):
             no_json_bin = os.path.join(tmpdir, "no-json-bin")
             os.makedirs(no_json_bin)
             _build_no_json_tool_path(no_json_bin)
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced_gates = _functions_only_source(src_dir)
+            sourced_gates = GATES_SH
             script = textwrap.dedent(f"""\
                 export PATH='{no_json_bin}'
                 . '{sourced_gates}'
                 {call_line}
             """)
+            env = os.environ.copy()
+            env.update(source_env(gates=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced_gates],
                 capture_output=True, text=True, cwd=os.path.join(TOOL_HOME, "scripts"),
+                env=env,
             )
             return r.stdout, r.stderr, r.returncode
         finally:

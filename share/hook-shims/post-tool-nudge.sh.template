@@ -32,6 +32,15 @@ set +e
 
 : "${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}"
 
+# lr-bdddcf: this hook invokes llm-client.sh as a script (auto-summarize,
+# below), never sources it. An ambiently exported
+# CLAGENTIC_LLM_CLIENT_SOURCE_ONLY (e.g. from a developer's shell profile,
+# left over from sourcing llm-client.sh in a test/debug session) would
+# otherwise reach llm-client.sh's own fail-closed check and abort the
+# summarize call instead of running it -- stop the leak here so this
+# non-blocking hook never depends on llm-client.sh's own defense.
+unset CLAGENTIC_LLM_CLIENT_SOURCE_ONLY CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE
+
 # Load platform shims for ds_json_field, ds_repo_root, ds_load_env.
 # If platform.sh is missing or broken, skip everything — non-blocking.
 #

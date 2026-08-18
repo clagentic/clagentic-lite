@@ -2973,11 +2973,94 @@ cmd_summarize() {
 cmd_adversarial() { walk_chain auditor    markdown ds_adversarial_prompt; }
 cmd_merge_gate()  { walk_chain gate       json     ds_merge_gate_prompt; }
 
-case "${1:-}" in
-  build)        cmd_build ;;
-  review)       cmd_review ;;
-  summarize)    cmd_summarize ;;
-  adversarial)  cmd_adversarial ;;
-  merge-gate)   cmd_merge_gate ;;
-  *) echo "usage: llm-client.sh {build|review|summarize|adversarial|merge-gate}" 1>&2; exit 1 ;;
-esac
+# SOURCE GUARD (lr-bdddcf): everything above this line (functions, version
+# constants, REPO_ROOT resolution) is safe and correct to run at source time
+# -- a caller that wants to reuse a function (e.g. role_chain,
+# _llm_role_routable) needs exactly that. Only the block below is
+# execute-as-a-script behavior: it reads the SOURCING shell's own "$1" and
+# calls `exit`, which is wrong/destructive for a caller that dot-sources
+# this file to reuse functions.
+#
+# POSIX sh has no $BASH_SOURCE (or any other sourced-vs-executed
+# introspection primitive), so "was this file sourced" cannot be detected
+# automatically -- the portable idiom is an explicit opt-in env sentinel the
+# caller sets before sourcing. CLAGENTIC_LLM_CLIENT_SOURCE_ONLY=1 is that
+# sentinel: unset/empty (the default, and every real `sh llm-client.sh
+# <subcommand>` invocation) runs the dispatch exactly as before this guard
+# was added -- byte-identical executed-as-a-script behavior, pinned by
+# test_llm_client_source_guard.py. Set only by a caller that is
+# dot-sourcing this file on purpose.
+#
+# TRADE-OFF (named per lr-bdddcf task instructions, see also the PR body):
+# the alternative was moving this dispatch into a `main "$@"` invoked only
+# when not sourced. Rejected here because POSIX sh's lack of $BASH_SOURCE
+# means "not sourced" still has to be spelled as an env sentinel or a `$0`
+# comparison against argv[0] passed by the caller -- the same fundamental
+# mechanism, just moved one layer down and adding a `main()` wrapper +
+# reindent around this exact case statement, which is a larger diff against
+# gate-path code for no behavioral gain. The sentinel-before-dispatch form
+# keeps the existing dispatch block completely untouched.
+#
+# FAIL-CLOSED AMENDMENT (lr-bdddcf PR #177 fold-in, coordinator-authorized
+# after BOBBIE's original exit-status claim for this branch was
+# independently found wrong -- see PR body): a bare `if ... fi` with no
+# else and a false condition exits 0. That made EXECUTING this file
+# directly (`sh llm-client.sh <subcmd>`, not sourcing it) with
+# CLAGENTIC_LLM_CLIENT_SOURCE_ONLY ambiently set (e.g. exported in a
+# developer's shell profile, never intentionally, and forgotten) a
+# SILENT no-op indistinguishable from a clean gate run to every
+# exit-status-only consumer (scripts/smoke.sh, the pre-push/pre-commit
+# hook-shim templates via post-tool-nudge/stop-summarize,
+# bin/clagentic-lite's gates subcommand).
+#
+# The file cannot detect "am I being sourced right now" in POSIX sh (see
+# above, and confirmed empirically: dash's own `(return 0 2>/dev/null)`
+# top-level-return probe, the textbook portable idiom, does NOT
+# discriminate reliably on this project's actual /bin/sh -- it reports
+# success even for a directly executed script file, not just a sourced
+# one). What the file CAN do is require the caller to say WHY the
+# suppress-sentinel is set, via a second, purpose-specific signal:
+# CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE=1 asserts "I am dot-sourcing
+# this file on purpose right now" -- distinct from
+# CLAGENTIC_LLM_CLIENT_SOURCE_ONLY, which only means "suppress dispatch."
+# Provenance is information the caller has and the file does not;
+# encoding it explicitly, rather than inferring it, is what makes this
+# fail closed regardless of shell.
+#
+#   suppress sentinel set + deliberate signal set     -> silent, no
+#     dispatch (real sourcing; current behavior, unchanged)
+#   suppress sentinel set + deliberate signal ABSENT   -> loud stderr
+#     naming both variables, exit 1 (ambient leak, refuse to report a
+#     false pass)
+#   neither set                                        -> dispatch
+#     exactly as before this whole guard existed, byte-identical
+#
+# KNOWN RESIDUAL LIMITATION (named per operator instruction, not papered
+# over): this two-signal scheme is itself defeatable by a caller/shell
+# profile that ambiently exports BOTH variables together -- nothing in
+# POSIX sh can distinguish that from genuine deliberate sourcing, since
+# both signals are just env vars indistinguishable-by-origin from any
+# other ambient export. This amendment closes the SILENT-single-sentinel
+# leak (the realistic case: a developer exports only the original
+# suppress sentinel, e.g. copy-pasted from a test helper, without the
+# second signal) and turns it loud instead of silent. It does not, and
+# structurally cannot, defend against a caller that deliberately or
+# accidentally exports both. Defense against that residual case is
+# scripts/smoke.sh + the hook-shim templates + bin/clagentic-lite
+# explicitly unsetting both CLAGENTIC_LLM_CLIENT_SOURCE_ONLY and
+# CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE before invoking this file as a
+# script (same PR, same task) -- stopping the leak from reaching the gate
+# at all, rather than relying on this file alone to detect it.
+if [ -z "${CLAGENTIC_LLM_CLIENT_SOURCE_ONLY:-}" ]; then
+  case "${1:-}" in
+    build)        cmd_build ;;
+    review)       cmd_review ;;
+    summarize)    cmd_summarize ;;
+    adversarial)  cmd_adversarial ;;
+    merge-gate)   cmd_merge_gate ;;
+    *) echo "usage: llm-client.sh {build|review|summarize|adversarial|merge-gate}" 1>&2; exit 1 ;;
+  esac
+elif [ -z "${CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE:-}" ]; then
+  echo "llm-client.sh: CLAGENTIC_LLM_CLIENT_SOURCE_ONLY is set but CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE is not -- dispatch suppressed with no provenance asserting deliberate sourcing, refusing to report a false pass. If dot-sourcing this file on purpose, set both variables. If you did not mean to set CLAGENTIC_LLM_CLIENT_SOURCE_ONLY, unset it." 1>&2
+  exit 1
+fi

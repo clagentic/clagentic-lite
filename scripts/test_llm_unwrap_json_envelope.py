@@ -36,36 +36,19 @@ Run with: python3 -m unittest scripts.test_llm_unwrap_json_envelope -v
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
-
-
-def _functions_only_source(dest_dir):
-    """Copy llm-client.sh into dest_dir with its trailing subcommand
-    dispatch stripped off. Mirrors every other llm-client.sh test's
-    identical helper (test_llm_client_sh.py, test_invoke_exit_status_
-    sweep.py, test_walk_chain_degraded_status.py) -- reused, not
-    reimplemented."""
-    with open(LLM_CLIENT_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in llm-client.sh"
-    dest = os.path.join(dest_dir, "llm-client.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    platform_dest = os.path.join(dest_dir, "platform.sh")
-    with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
-        dst.write(src.read())
-    return dest
 
 
 def _run_unwrap(result_value, mode="json", role="reviewer"):
@@ -87,9 +70,7 @@ def _run_unwrap(result_value, mode="json", role="reviewer"):
     }
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-unwrap-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced = _functions_only_source(src_dir)
+        sourced = LLM_CLIENT_SH
 
         target_file = os.path.join(tmpdir, "output.json")
         with open(target_file, "w") as f:
@@ -101,11 +82,14 @@ def _run_unwrap(result_value, mode="json", role="reviewer"):
             _llm_unwrap_json_envelope '{mode}' '{target_file}' '{role}' || RC=$?
             exit "$RC"
         """)
+        env = os.environ.copy()
+        env.update(source_env(llm_client=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced],
             capture_output=True,
             text=True,
             cwd=TOOL_HOME,
+            env=env,
         )
         with open(target_file) as f:
             final_content = f.read()
@@ -299,9 +283,7 @@ class TestNonEnvelopeAndNonJsonModePassthrough(unittest.TestCase):
     def test_non_json_mode_is_a_no_op(self):
         tmpdir = tempfile.mkdtemp(prefix="clagentic-test-unwrap-nomode-")
         try:
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced = _functions_only_source(src_dir)
+            sourced = LLM_CLIENT_SH
             target_file = os.path.join(tmpdir, "output.md")
             original = "# Some markdown\n\nNot JSON at all."
             with open(target_file, "w") as f:
@@ -312,7 +294,9 @@ class TestNonEnvelopeAndNonJsonModePassthrough(unittest.TestCase):
                 _llm_unwrap_json_envelope 'markdown' '{target_file}' 'auditor' || RC=$?
                 exit "$RC"
             """)
-            r = subprocess.run(["sh", "-c", script, sourced], capture_output=True, text=True, cwd=TOOL_HOME)
+            env = os.environ.copy()
+            env.update(source_env(llm_client=True))
+            r = subprocess.run(["sh", "-c", script, sourced], capture_output=True, text=True, cwd=TOOL_HOME, env=env)
             self.assertEqual(r.returncode, 0, f"markdown mode must be a no-op. stderr={r.stderr!r}")
             with open(target_file) as f:
                 self.assertEqual(f.read(), original)
@@ -326,9 +310,7 @@ class TestNonEnvelopeAndNonJsonModePassthrough(unittest.TestCase):
         validate_output handles it directly."""
         tmpdir = tempfile.mkdtemp(prefix="clagentic-test-unwrap-bare-")
         try:
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced = _functions_only_source(src_dir)
+            sourced = LLM_CLIENT_SH
             target_file = os.path.join(tmpdir, "output.json")
             with open(target_file, "w") as f:
                 f.write(_REVIEWER_JSON)
@@ -338,7 +320,9 @@ class TestNonEnvelopeAndNonJsonModePassthrough(unittest.TestCase):
                 _llm_unwrap_json_envelope 'json' '{target_file}' 'reviewer' || RC=$?
                 exit "$RC"
             """)
-            r = subprocess.run(["sh", "-c", script, sourced], capture_output=True, text=True, cwd=TOOL_HOME)
+            env = os.environ.copy()
+            env.update(source_env(llm_client=True))
+            r = subprocess.run(["sh", "-c", script, sourced], capture_output=True, text=True, cwd=TOOL_HOME, env=env)
             self.assertEqual(r.returncode, 0, f"bare JSON (no envelope) must be a no-op. stderr={r.stderr!r}")
             with open(target_file) as f:
                 self.assertEqual(json.loads(f.read()), json.loads(_REVIEWER_JSON))

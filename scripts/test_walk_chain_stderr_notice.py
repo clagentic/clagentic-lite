@@ -31,33 +31,19 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
-
-
-def _functions_only_source(dest_dir):
-    """Identical helper to test_walk_chain_unwrap_cause.py -- reused, not
-    reimplemented."""
-    with open(LLM_CLIENT_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in llm-client.sh"
-    dest = os.path.join(dest_dir, "llm-client.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    platform_dest = os.path.join(dest_dir, "platform.sh")
-    with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
-        dst.write(src.read())
-    return dest
 
 
 def _write_always_failing_claude(bin_dir):
@@ -162,9 +148,7 @@ def _run_walk_chain(role_lower, mode, claude_writer, chain=""):
         os.makedirs(bin_dir)
         claude_writer(bin_dir)
 
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced = _functions_only_source(src_dir)
+        sourced = LLM_CLIENT_SH
 
         role_upper = role_lower.upper()
         chain_export = f"export CLAGENTIC_{role_upper}_CHAIN='{chain}'" if chain else ""
@@ -176,11 +160,14 @@ def _run_walk_chain(role_lower, mode, claude_writer, chain=""):
             . '{sourced}'
             printf 'stdin diff content' | walk_chain '{role_lower}' '{mode}' _fixture_prompt
         """)
+        env = os.environ.copy()
+        env.update(source_env(llm_client=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced],
             capture_output=True,
             text=True,
             cwd=TOOL_HOME,
+            env=env,
         )
         return r.stdout, r.stderr, r.returncode
     finally:

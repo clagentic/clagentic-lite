@@ -5586,27 +5586,108 @@ cmd_tail() {
 # Every other branch below still gets the full, unchanged, combined
 # ds_load_env exactly as before this fold-in -- POST-ENROLLMENT BEHAVIOR
 # HERE IS UNCHANGED, this is a migration for the init-time path only.
-if [ "${1:-}" != "init" ]; then
-  ds_load_env
-fi
+# SOURCE GUARD (lr-bdddcf): everything above this line (functions, version
+# constants, REPO_ROOT/_git resolution) is safe and correct to run at
+# source time -- a caller that wants to reuse a function needs exactly
+# that. Only the block below is execute-as-a-script behavior: the
+# ds_load_env call branches on the SOURCING shell's own "$1", and the case
+# statement reads it again and calls `exit` -- both wrong/destructive for a
+# caller that dot-sources this file to reuse functions.
+#
+# POSIX sh has no $BASH_SOURCE (or any other sourced-vs-executed
+# introspection primitive), so "was this file sourced" cannot be detected
+# automatically -- the portable idiom is an explicit opt-in env sentinel the
+# caller sets before sourcing. CLAGENTIC_GATES_SOURCE_ONLY=1 is that
+# sentinel: unset/empty (the default, and every real `sh gates.sh
+# <subcommand>` invocation) runs both blocks exactly as before this guard
+# was added -- byte-identical executed-as-a-script behavior, pinned by
+# test_gates_source_guard.py. Set only by a caller that is dot-sourcing
+# this file on purpose.
+#
+# TRADE-OFF (named per lr-bdddcf task instructions, see also the PR body):
+# the alternative was moving this dispatch into a `main "$@"` invoked only
+# when not sourced -- see llm-client.sh's identical guard comment for why
+# that was rejected here too: POSIX sh's lack of $BASH_SOURCE means "not
+# sourced" still has to be spelled as the same env sentinel, just moved one
+# layer down and adding a `main()` wrapper + reindent around this exact
+# ds_load_env/case pair, a larger diff against gate-path code for no
+# behavioral gain. The sentinel-before-dispatch form keeps both existing
+# blocks completely untouched.
+#
+# FAIL-CLOSED AMENDMENT (lr-bdddcf PR #177 fold-in, coordinator-authorized
+# after BOBBIE's original exit-status claim for this branch was
+# independently found wrong -- see PR body): a bare `if ... fi` with no
+# else and a false condition exits 0. That made EXECUTING this file
+# directly (`sh gates.sh <subcmd>`, not sourcing it) with
+# CLAGENTIC_GATES_SOURCE_ONLY ambiently set (e.g. exported in a
+# developer's shell profile, never intentionally, and forgotten) a
+# SILENT no-op indistinguishable from a clean gate run to every
+# exit-status-only consumer (scripts/smoke.sh, the pre-push/pre-commit
+# hook-shim templates, bin/clagentic-lite's gates subcommand).
+#
+# The file cannot detect "am I being sourced right now" in POSIX sh (see
+# above, and confirmed empirically: dash's own `(return 0 2>/dev/null)`
+# top-level-return probe, the textbook portable idiom, does NOT
+# discriminate reliably on this project's actual /bin/sh -- it reports
+# success even for a directly executed script file, not just a sourced
+# one). What the file CAN do is require the caller to say WHY the
+# suppress-sentinel is set, via a second, purpose-specific signal:
+# CLAGENTIC_GATES_DELIBERATE_SOURCE=1 asserts "I am dot-sourcing this
+# file on purpose right now" -- distinct from CLAGENTIC_GATES_SOURCE_ONLY,
+# which only means "suppress dispatch." Provenance is information the
+# caller has and the file does not; encoding it explicitly, rather than
+# inferring it, is what makes this fail closed regardless of shell.
+#
+#   suppress sentinel set + deliberate signal set     -> silent, no
+#     dispatch (real sourcing; current behavior, unchanged)
+#   suppress sentinel set + deliberate signal ABSENT   -> loud stderr
+#     naming both variables, exit 1 (ambient leak, refuse to report a
+#     false pass)
+#   neither set                                        -> dispatch
+#     exactly as before this whole guard existed, byte-identical
+#
+# KNOWN RESIDUAL LIMITATION (named per operator instruction, not papered
+# over): this two-signal scheme is itself defeatable by a caller/shell
+# profile that ambiently exports BOTH variables together -- nothing in
+# POSIX sh can distinguish that from genuine deliberate sourcing, since
+# both signals are just env vars indistinguishable-by-origin from any
+# other ambient export. This amendment closes the SILENT-single-sentinel
+# leak (the realistic case: a developer exports only the original
+# suppress sentinel, e.g. copy-pasted from a test helper, without the
+# second signal) and turns it loud instead of silent. It does not, and
+# structurally cannot, defend against a caller that deliberately or
+# accidentally exports both. Defense against that residual case is
+# scripts/smoke.sh + the hook-shim templates + bin/clagentic-lite
+# explicitly unsetting both CLAGENTIC_GATES_SOURCE_ONLY and
+# CLAGENTIC_GATES_DELIBERATE_SOURCE before invoking this file as a
+# script (same PR, same task) -- stopping the leak from reaching the gate
+# at all, rather than relying on this file alone to detect it.
+if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
+  if [ "${1:-}" != "init" ]; then
+    ds_load_env
+  fi
 
-case "${1:-}" in
-  init)           cmd_init ;;
-  bleed)          shift; cmd_bleed "$@" ;;
-  secrets)        cmd_secrets ;;
-  deps)           cmd_deps ;;
-  sast)           cmd_sast ;;
-  review)         shift; cmd_review "$@" ;;
-  adversarial)    cmd_adversarial ;;
-  merge-gate)     shift; cmd_merge_gate "$@" ;;
-  render-review)  shift; cmd_render_review "$@" ;;
-  deferrals-lint) shift; cmd_deferrals_lint "$@" ;;
-  audit-vocab-lint) shift; cmd_audit_vocab_lint "$@" ;;
-  ship)           cmd_ship ;;
-  pre-push)       cmd_pre_push ;;
-  log-run)        shift; cmd_log_run "$@" ;;
-  digest)         cmd_digest ;;
-  status)         shift; cmd_status "$@" ;;
-  tail)           shift; cmd_tail "$@" ;;
-  *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
-esac
+  case "${1:-}" in
+    init)           cmd_init ;;
+    bleed)          shift; cmd_bleed "$@" ;;
+    secrets)        cmd_secrets ;;
+    deps)           cmd_deps ;;
+    sast)           cmd_sast ;;
+    review)         shift; cmd_review "$@" ;;
+    adversarial)    cmd_adversarial ;;
+    merge-gate)     shift; cmd_merge_gate "$@" ;;
+    render-review)  shift; cmd_render_review "$@" ;;
+    deferrals-lint) shift; cmd_deferrals_lint "$@" ;;
+    audit-vocab-lint) shift; cmd_audit_vocab_lint "$@" ;;
+    ship)           cmd_ship ;;
+    pre-push)       cmd_pre_push ;;
+    log-run)        shift; cmd_log_run "$@" ;;
+    digest)         cmd_digest ;;
+    status)         shift; cmd_status "$@" ;;
+    tail)           shift; cmd_tail "$@" ;;
+    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+  esac
+elif [ -z "${CLAGENTIC_GATES_DELIBERATE_SOURCE:-}" ]; then
+  echo "gates.sh: CLAGENTIC_GATES_SOURCE_ONLY is set but CLAGENTIC_GATES_DELIBERATE_SOURCE is not -- dispatch suppressed with no provenance asserting deliberate sourcing, refusing to report a false pass. If dot-sourcing this file on purpose, set both variables. If you did not mean to set CLAGENTIC_GATES_SOURCE_ONLY, unset it." 1>&2
+  exit 1
+fi

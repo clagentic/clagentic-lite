@@ -22,8 +22,9 @@ THIS IS AN ENV-INSPECTION TEST, NOT AN EXIT-CODE TEST (the task's own
 acceptance shape): the stub CLI dumps its own environ verbatim so the test
 can assert on PRESENCE/ABSENCE of specific vars in the child process, not
 merely on whether the call succeeded or failed. Follows
-test_invoke_exit_status_sweep.py's stub-CLI-on-PATH convention (same
-_functions_only_source technique, reused rather than duplicated).
+test_invoke_exit_status_sweep.py's stub-CLI-on-PATH convention (sources the
+real llm-client.sh via test_source_helpers.py's guard-sentinel technique,
+same as every other llm-client.sh-sourcing test in this suite).
 
 THE NEGATIVE HALF IS REQUIRED: an over-broad strip that also stripped these
 vars from invoke_claude's child would silently break router routing for the
@@ -36,13 +37,19 @@ Run with: python3 -m unittest scripts.test_router_env_strip -v
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 
 # The four router-scoped vars the fix must strip from every non-Claude
 # subprocess. Kept as a plain tuple here (test-side), independent of the
@@ -64,29 +71,6 @@ _PARENT_ROUTER_ENV = {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:9999/router",
     "ANTHROPIC_AUTH_TOKEN": "router-anthropic-token-value",
 }
-
-
-def _functions_only_source(dest_dir):
-    """Copy llm-client.sh into dest_dir with its trailing subcommand dispatch
-    stripped off, so it is safe to `.` source without executing cmd_build/
-    cmd_review/etc or calling `exit`. Mirrors
-    test_invoke_exit_status_sweep.py's helper of the same name (same
-    technique, reused rather than a diverging duplicate)."""
-    with open(LLM_CLIENT_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in llm-client.sh"
-    dest = os.path.join(dest_dir, "llm-client.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    platform_dest = os.path.join(dest_dir, "platform.sh")
-    with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
-        dst.write(src.read())
-    return dest
 
 
 def _write_environ_dump_stub(bin_dir, name, out_path):
@@ -139,9 +123,7 @@ class _RouterEnvStripTestBase(unittest.TestCase):
             dump_path = os.path.join(tmpdir, "child-environ.txt")
             _write_environ_dump_stub(bin_dir, stub_name, dump_path)
 
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced = _functions_only_source(src_dir)
+            sourced = LLM_CLIENT_SH
 
             prompt_file = os.path.join(tmpdir, "prompt.txt")
             input_file = os.path.join(tmpdir, "input.txt")
@@ -155,6 +137,7 @@ class _RouterEnvStripTestBase(unittest.TestCase):
             env = dict(os.environ)
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
             env.update(_PARENT_ROUTER_ENV)
+            env.update(source_env(llm_client=True))
 
             script = textwrap.dedent(f"""\
                 export PROMPT_FILE='{prompt_file}'
@@ -248,13 +231,12 @@ class TestCodexVersionCheckStripsRouterEnv(unittest.TestCase):
             dump_path = os.path.join(tmpdir, "child-environ.txt")
             _write_version_probe_environ_dump_stub(bin_dir, "codex", dump_path)
 
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced = _functions_only_source(src_dir)
+            sourced = LLM_CLIENT_SH
 
             env = dict(os.environ)
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
             env.update(_PARENT_ROUTER_ENV)
+            env.update(source_env(llm_client=True))
 
             script = textwrap.dedent(f"""\
                 . '{sourced}'

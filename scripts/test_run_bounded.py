@@ -16,53 +16,24 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import GATES_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
     "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
 }
-
-
-def _functions_only_gates_source(dest_dir):
-    """Copy gates.sh into dest_dir with its trailing subcommand dispatch
-    (`case "${1:-}" in init) ... esac`) stripped off -- mirrors every
-    llm-client.sh test's identical technique, applied to gates.sh instead.
-    Also copies platform.sh and minimal review-merge.sh/host-adapter.sh
-    stubs alongside (gates.sh sources all three unconditionally near the
-    top)."""
-    with open(GATES_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in gates.sh"
-    dest = os.path.join(dest_dir, "gates.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    platform_dest = os.path.join(dest_dir, "platform.sh")
-    with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
-        dst.write(src.read())
-    # review-merge.sh / host-adapter.sh: gates.sh sources both unconditionally
-    # (". $(dirname "$0")/review-merge.sh", ". $(dirname "$0")/host-adapter.sh")
-    # but run_bounded/cmd_init do not need anything either one defines -- stub
-    # files satisfy the source lines without pulling in unrelated machinery
-    # this test does not exercise.
-    review_merge_dest = os.path.join(dest_dir, "review-merge.sh")
-    with open(review_merge_dest, "w") as f:
-        f.write("#!/bin/sh\n# stub for run_bounded tests\n")
-    host_adapter_dest = os.path.join(dest_dir, "host-adapter.sh")
-    with open(host_adapter_dest, "w") as f:
-        f.write("#!/bin/sh\n# stub for run_bounded tests\n")
-    return dest
 
 
 def _write_fake_timeout(bin_dir, argv_file, name="timeout"):
@@ -102,9 +73,7 @@ class TestRunBoundedAppliesTheConfiguredTimeout(unittest.TestCase):
         os.makedirs(self._bin)
         _write_fake_timeout(self._bin, self._argv_file)
 
-        self._src_dir = os.path.join(self._tmp, "src")
-        os.makedirs(self._src_dir)
-        self._sourced_gates = _functions_only_gates_source(self._src_dir)
+        self._sourced_gates = GATES_SH
 
     def tearDown(self):
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -113,6 +82,7 @@ class TestRunBoundedAppliesTheConfiguredTimeout(unittest.TestCase):
         env = os.environ.copy()
         env["PATH"] = self._bin + os.pathsep + env["PATH"]
         env["CLAGENTIC_PROJECT_ROOT"] = self._repo
+        env.update(source_env(gates=True))
         script = textwrap.dedent(f"""\
             . '{self._sourced_gates}'
             {script_body}
@@ -150,6 +120,7 @@ class TestRunBoundedAppliesTheConfiguredTimeout(unittest.TestCase):
         env["PATH"] = self._bin + os.pathsep + env["PATH"]
         env["CLAGENTIC_PROJECT_ROOT"] = self._repo
         env["CLAGENTIC_EXTERNAL_TIMEOUT_SEC"] = "77"
+        env.update(source_env(gates=True))
         script = textwrap.dedent(f"""\
             . '{self._sourced_gates}'
             run_bounded -- echo hello
@@ -196,9 +167,7 @@ class TestRunBoundedFailsClosedWithNoTimeoutBinary(unittest.TestCase):
         self._repo = os.path.join(self._tmp, "repo")
         os.makedirs(self._repo)
         _init_repo(self._repo)
-        self._src_dir = os.path.join(self._tmp, "src")
-        os.makedirs(self._src_dir)
-        self._sourced_gates = _functions_only_gates_source(self._src_dir)
+        self._sourced_gates = GATES_SH
 
     def tearDown(self):
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -207,6 +176,7 @@ class TestRunBoundedFailsClosedWithNoTimeoutBinary(unittest.TestCase):
         marker = os.path.join(self._tmp, "should-not-be-created")
         env = os.environ.copy()
         env["CLAGENTIC_PROJECT_ROOT"] = self._repo
+        env.update(source_env(gates=True))
         # PATH is stripped INSIDE the script (not via subprocess.run's env=
         # kwarg) so the subprocess LAUNCH itself can still resolve `/bin/sh`
         # via the outer, unmodified environment -- only platform.sh's own

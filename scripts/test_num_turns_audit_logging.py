@@ -21,38 +21,24 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
     "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
 }
-
-
-def _functions_only_source(dest_dir):
-    """Identical helper to every other llm-client.sh test file -- reused,
-    not reimplemented."""
-    with open(LLM_CLIENT_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in llm-client.sh"
-    dest = os.path.join(dest_dir, "llm-client.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    platform_dest = os.path.join(dest_dir, "platform.sh")
-    with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
-        dst.write(src.read())
-    return dest
 
 
 def _write_success_claude(bin_dir, num_turns):
@@ -123,9 +109,7 @@ class TestNumTurnsLoggedOnSuccessfulReviewerCall(unittest.TestCase):
         os.makedirs(self._bin_dir)
         _write_success_claude(self._bin_dir, num_turns=9)
 
-        self._src_dir = os.path.join(self._tmpdir, "src")
-        os.makedirs(self._src_dir)
-        self._sourced = _functions_only_source(self._src_dir)
+        self._sourced = LLM_CLIENT_SH
 
     def tearDown(self):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
@@ -148,9 +132,11 @@ class TestNumTurnsLoggedOnSuccessfulReviewerCall(unittest.TestCase):
         # from TOOL_HOME would silently write (or fail to write, if
         # TOOL_HOME is not a git repo boundary matching self._repo) to the
         # wrong audit.db.
+        env = os.environ.copy()
+        env.update(source_env(llm_client=True))
         return subprocess.run(
             ["sh", "-c", script, self._sourced],
-            capture_output=True, text=True, cwd=self._repo,
+            capture_output=True, text=True, cwd=self._repo, env=env,
         )
 
     def test_num_turns_appears_in_the_llm_call_audit_row(self):
