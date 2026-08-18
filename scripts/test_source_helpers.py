@@ -24,6 +24,19 @@ the sentinel is set in the environment BEFORE the `.` line runs. This module
 is the one place that env-sentinel contract is expressed, so a future rename
 or relocation of either file only needs to change it here.
 
+FAIL-CLOSED AMENDMENT (lr-bdddcf PR #177 fold-in): each guard now also
+requires a second, purpose-specific signal --
+CLAGENTIC_GATES_DELIBERATE_SOURCE / CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE
+-- asserting that the *_SOURCE_ONLY suppress-sentinel is set because this
+file is being dot-sourced on purpose, not because it leaked in ambiently
+from a shell profile or inherited environment. Without the deliberate
+signal, the guarded .sh file treats a set suppress-sentinel as an ambient
+leak and fails loudly (non-zero exit, stderr naming both variables) instead
+of silently no-op'ing. `source_env()` below emits BOTH variables for every
+flag it's asked for, so every real sourcing call site in this test suite
+continues to work with no per-call-site changes -- this module is still the
+only place either contract is expressed.
+
 Usage (mirrors the pattern every test in this suite already uses to build a
 `sh -c` script string and hand it to subprocess.run):
 
@@ -55,9 +68,13 @@ def source_env(gates=False, llm_client=False):
     """Return the source-guard sentinel env vars to merge into a subprocess
     environment before dot-sourcing the requested real script(s).
 
-    gates=True adds CLAGENTIC_GATES_SOURCE_ONLY=1 (guards scripts/gates.sh's
-    trailing ds_load_env-branch + subcommand dispatch).
-    llm_client=True adds CLAGENTIC_LLM_CLIENT_SOURCE_ONLY=1 (guards
+    gates=True adds CLAGENTIC_GATES_SOURCE_ONLY=1 and
+    CLAGENTIC_GATES_DELIBERATE_SOURCE=1 (guards scripts/gates.sh's trailing
+    ds_load_env-branch + subcommand dispatch, and asserts the suppression is
+    deliberate rather than an ambient leak -- see the fail-closed amendment
+    in this module's docstring).
+    llm_client=True adds CLAGENTIC_LLM_CLIENT_SOURCE_ONLY=1 and
+    CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE=1 (same pair, for
     scripts/llm-client.sh's trailing subcommand dispatch).
 
     Neither flag alone implies the other -- gates.sh sources llm-client.sh
@@ -67,6 +84,8 @@ def source_env(gates=False, llm_client=False):
     env = {}
     if gates:
         env["CLAGENTIC_GATES_SOURCE_ONLY"] = "1"
+        env["CLAGENTIC_GATES_DELIBERATE_SOURCE"] = "1"
     if llm_client:
         env["CLAGENTIC_LLM_CLIENT_SOURCE_ONLY"] = "1"
+        env["CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE"] = "1"
     return env
