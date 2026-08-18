@@ -309,6 +309,24 @@ def _read_posted_bodies(tmpdir):
     return out
 
 
+def _read_posted_create_bodies(tmpdir):
+    """Every `pr create --body-file` body the fake `gh` intercepted, in call
+    order -- mirrors _read_posted_bodies but for the create path
+    (lr-429b32)."""
+    bodies_dir = os.path.join(tmpdir, "posted-bodies")
+    if not os.path.isdir(bodies_dir):
+        return []
+    names = sorted(
+        (n for n in os.listdir(bodies_dir) if n.startswith("create-body-")),
+        key=lambda n: int(n.split("-")[2].split(".")[0]),
+    )
+    out = []
+    for name in names:
+        with open(os.path.join(bodies_dir, name)) as f:
+            out.append(f.read())
+    return out
+
+
 _CLEAN_ENVELOPE = {"summary": "clean", "checked": ["security"], "findings": []}
 
 
