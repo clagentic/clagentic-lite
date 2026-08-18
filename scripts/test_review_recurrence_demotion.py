@@ -58,38 +58,19 @@ import os
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import GATES_SH, PLATFORM_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
-
-
-# --------------------------------------------------------------------------
-# Shared "source gates.sh functions only" helper (mirrors
-# test_adversarial_tier_parsing.py's _functions_only_source exactly, since
-# both need to call an internal gates.sh function directly without
-# triggering its trailing subcommand dispatch / exit calls).
-# --------------------------------------------------------------------------
-
-def _functions_only_source(dest_dir):
-    with open(GATES_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in gates.sh"
-    dest = os.path.join(dest_dir, "gates.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
-    for fname in ("platform.sh", "review-merge.sh", "host-adapter.sh"):
-        os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(dest_dir, fname))
-    return dest
 
 
 def _call_recurrence_demote(envelope_path, diff_path, counts_path):
@@ -99,19 +80,20 @@ def _call_recurrence_demote(envelope_path, diff_path, counts_path):
     callers rely on."""
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-rrd-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced_gates = _functions_only_source(src_dir)
+        sourced_gates = GATES_SH
         script = textwrap.dedent(f"""\
             . '{PLATFORM_SH}'
             ds_load_env 2>/dev/null || true
             . '{sourced_gates}'
             _review_recurrence_demote '{envelope_path}' '{diff_path}' '{counts_path}'
         """)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True, text=True,
             cwd=os.path.join(TOOL_HOME, "scripts"),
+            env=env,
         )
         return r.stdout, r.stderr, r.returncode
     finally:
@@ -608,9 +590,7 @@ def _parse_adversarial_findings(markdown_text):
     test_adversarial_tier_parsing.py uses."""
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-advfloor-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced_gates = _functions_only_source(src_dir)
+        sourced_gates = GATES_SH
         md_file = os.path.join(tmpdir, "adversarial.md")
         with open(md_file, "w") as f:
             f.write(markdown_text)
@@ -619,10 +599,13 @@ def _parse_adversarial_findings(markdown_text):
             . '{sourced_gates}'
             _parse_adversarial_findings '{md_file}' > '{out_file}'
         """)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True, text=True,
             cwd=os.path.join(TOOL_HOME, "scripts"),
+            env=env,
         )
         assert r.returncode == 0, f"sourcing/parsing failed: {r.stderr}"
         with open(out_file) as f:
