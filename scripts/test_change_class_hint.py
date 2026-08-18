@@ -16,37 +16,24 @@ Run with: python3 -m unittest scripts.test_change_class_hint -v
 """
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
     "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
 }
-
-
-def _functions_only_source(dest_dir):
-    """Same truncation pattern as test_llm_client_sh.py."""
-    with open(LLM_CLIENT_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in llm-client.sh"
-    dest = os.path.join(dest_dir, "llm-client.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    platform_dest = os.path.join(dest_dir, "platform.sh")
-    with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
-        dst.write(src.read())
-    return dest
 
 
 def _init_repo_with_commit(tmpdir, commit_message):
@@ -67,14 +54,13 @@ def _run_change_class_hint(commit_message):
     (stdout_stripped, stderr, returncode)."""
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-class-hint-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced = _functions_only_source(src_dir)
+        sourced = LLM_CLIENT_SH
         repo = _init_repo_with_commit(tmpdir, commit_message)
 
         script = f". '{sourced}'\n_change_class_hint\n"
         env = os.environ.copy()
         env["CLAGENTIC_PROJECT_ROOT"] = repo
+        env.update(source_env(llm_client=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced],
             capture_output=True, text=True, env=env, cwd=repo,
@@ -144,14 +130,13 @@ class TestPromptInjectionWiring(unittest.TestCase):
     def _run_prompt_fn(self, fn_name, commit_message):
         tmpdir = tempfile.mkdtemp(prefix="clagentic-test-class-hint-prompt-")
         try:
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced = _functions_only_source(src_dir)
+            sourced = LLM_CLIENT_SH
             repo = _init_repo_with_commit(tmpdir, commit_message)
 
             script = f". '{sourced}'\n{fn_name}\n"
             env = os.environ.copy()
             env["CLAGENTIC_PROJECT_ROOT"] = repo
+            env.update(source_env(llm_client=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced],
                 capture_output=True, text=True, env=env, cwd=repo,
@@ -250,9 +235,7 @@ class TestPromptInjectionWiring(unittest.TestCase):
         call site (not just that the function exists)."""
         tmpdir = tempfile.mkdtemp(prefix="clagentic-test-class-hint-ctrl-")
         try:
-            src_dir = os.path.join(tmpdir, "src")
-            os.makedirs(src_dir)
-            sourced = _functions_only_source(src_dir)
+            sourced = LLM_CLIENT_SH
             repo = os.path.join(tmpdir, "repo")
             os.makedirs(repo)
             subprocess.run(["git", "init", "-q", repo], check=True)
@@ -268,6 +251,7 @@ class TestPromptInjectionWiring(unittest.TestCase):
             script = f". '{sourced}'\nds_review_prompt\n"
             run_env = os.environ.copy()
             run_env["CLAGENTIC_PROJECT_ROOT"] = repo
+            run_env.update(source_env(llm_client=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced],
                 capture_output=True, text=True, env=run_env, cwd=repo,

@@ -18,13 +18,19 @@ Run with: python3 -m unittest scripts/test_llm_client_sh.py -v
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.join(os.path.dirname(__file__), "..")
-LLM_CLIENT_SH = os.path.join(TOOL_HOME, "scripts", "llm-client.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 
 
 def _write_fake_claude(bin_dir, argv_file):
@@ -45,38 +51,6 @@ def _write_fake_claude(bin_dir, argv_file):
     return fake
 
 
-def _functions_only_source(dest_dir):
-    """Copy llm-client.sh into dest_dir with its trailing subcommand dispatch
-    (`case "${1:-}" in build) ... esac`) stripped off.
-
-    That dispatch runs unconditionally at source time (it is not guarded by
-    a function or `[ "$0" = ... ]` check), so simply `. llm-client.sh`-ing the
-    real file from a test harness executes cmd_build/cmd_review/etc based on
-    whatever $1 happens to be in the sourcing shell and calls `exit`, which
-    would abort the harness before invoke_claude can be called directly.
-    Truncating at the dispatch line preserves every real function body
-    byte-for-byte (this is still the actual invoke_claude implementation,
-    not a copy) while making the file safe to source for targeted function
-    tests. platform.sh is copied alongside unchanged so the relative
-    `. "$(dirname "$0")/platform.sh"` self-source at the top still resolves.
-    """
-    with open(LLM_CLIENT_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in llm-client.sh"
-    dest = os.path.join(dest_dir, "llm-client.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    platform_dest = os.path.join(dest_dir, "platform.sh")
-    with open(PLATFORM_SH) as src, open(platform_dest, "w") as dst:
-        dst.write(src.read())
-    return dest
-
-
 def _run_invoke_claude(call_role, call_mode="markdown", model=""):
     """Source llm-client.sh (functions only) and call invoke_claude directly
     with a fake claude on PATH. Returns (recorded_argv_lines, stderr, rc)."""
@@ -88,9 +62,7 @@ def _run_invoke_claude(call_role, call_mode="markdown", model=""):
         os.makedirs(bin_dir)
         _write_fake_claude(bin_dir, argv_file)
 
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced_llm_client = _functions_only_source(src_dir)
+        sourced_llm_client = LLM_CLIENT_SH
 
         prompt_file = os.path.join(tmpdir, "prompt.txt")
         input_file = os.path.join(tmpdir, "input.txt")
@@ -109,11 +81,14 @@ def _run_invoke_claude(call_role, call_mode="markdown", model=""):
         # Pass sourced_llm_client as $0 (sh -c's second arg) so its own
         # `. "$(dirname "$0")/platform.sh"` resolves correctly — under plain
         # `sh -c script`, $0 is "sh" and that self-source would fail.
+        env = os.environ.copy()
+        env.update(source_env(llm_client=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_llm_client],
             capture_output=True,
             text=True,
             cwd=TOOL_HOME,
+            env=env,
         )
         with open(argv_file) as f:
             recorded = [line.rstrip("\n") for line in f if line.strip()]
