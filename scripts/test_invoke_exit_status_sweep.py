@@ -134,7 +134,8 @@ _INVOKE_CALL_SHAPES = {
     # property. python3 is also required (invoke_router builds/parses JSON
     # via python3 -c, same as this file's own real installs) -- present in
     # this test environment already (every other class in this file
-    # depends on it transitively via _functions_only_source's platform.sh).
+    # depends on it transitively via the real platform.sh, sourced directly
+    # per test_source_helpers.py -- see LLM_CLIENT_SH/source_env above).
     "invoke_router": {
         "stub_name": "curl",
         "call": 'CLAGENTIC_ROUTER_URL="http://127.0.0.1:19999" CLAGENTIC_ROUTER_TOKEN="test-token" invoke_router "reviewer" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" 5',

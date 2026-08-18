@@ -22,8 +22,9 @@ THIS IS AN ENV-INSPECTION TEST, NOT AN EXIT-CODE TEST (the task's own
 acceptance shape): the stub CLI dumps its own environ verbatim so the test
 can assert on PRESENCE/ABSENCE of specific vars in the child process, not
 merely on whether the call succeeded or failed. Follows
-test_invoke_exit_status_sweep.py's stub-CLI-on-PATH convention (same
-_functions_only_source technique, reused rather than duplicated).
+test_invoke_exit_status_sweep.py's stub-CLI-on-PATH convention (sources the
+real llm-client.sh via test_source_helpers.py's guard-sentinel technique,
+same as every other llm-client.sh-sourcing test in this suite).
 
 THE NEGATIVE HALF IS REQUIRED: an over-broad strip that also stripped these
 vars from invoke_claude's child would silently break router routing for the

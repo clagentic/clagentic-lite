@@ -230,11 +230,12 @@ class TestBuildGateSummaryAdversarialDegradedField(unittest.TestCase):
         _stage_a_change's own doc comment for why staged, not committed)
         against self._tmpdir so build_gate_summary's ledger-anchored check
         (lr-01ae73) finds a genuine passing verdict at current HEAD. Uses
-        the full gates.sh subcommand dispatcher (not _functions_only_source)
-        since cmd_review's own flag-parsing/dispatch path is what a real
-        caller invokes -- build_gate_summary itself is still exercised via
-        the functions-only source in _run_build_gate_summary below, in the
-        SAME project directory, so it sees the ledger cmd_review just wrote."""
+        the full gates.sh subcommand dispatcher (executed as a script,
+        sentinel unset) since cmd_review's own flag-parsing/dispatch path is
+        what a real caller invokes -- build_gate_summary itself is still
+        exercised via the source-guard-sentinel path in
+        _run_build_gate_summary below, in the SAME project directory, so it
+        sees the ledger cmd_review just wrote."""
         _stage_a_change(self._tmpdir)
         fake_tool_home = tempfile.mkdtemp(prefix="clagentic-test-bgs-adv-degraded-review-home-")
         try:
