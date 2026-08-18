@@ -9,12 +9,26 @@
 #   host_adapter_available          -- exit 0 iff a usable adapter is
 #                                       discovered for REPO_ROOT's origin
 #                                       remote, exit 1 otherwise (fallback).
-#   host_adapter_open_change_request BASE HEAD
+#   host_adapter_open_change_request BASE HEAD [BODY_FILE]
 #                                    -- open (or find an existing) PR/MR for
-#                                       HEAD against BASE. Prints nothing of
-#                                       significance to stdout; status via
-#                                       exit code + stderr, same posture as
-#                                       the rest of gates.sh.
+#                                       HEAD against BASE. BODY_FILE, when
+#                                       given, is a path to a file whose
+#                                       contents become the PR body on
+#                                       CREATE only (lr-429b32) -- an
+#                                       already-open PR is reused as-is, body
+#                                       unchanged, matching this function's
+#                                       existing find-or-open contract. The
+#                                       caller renders BODY_FILE's contents
+#                                       (gate side, e.g. gates.sh's
+#                                       _build_ship_pr_body) -- this file
+#                                       only transports it, never composes
+#                                       it, per the file-header contract
+#                                       above. Omitted BODY_FILE preserves
+#                                       the pre-lr-429b32 behavior exactly.
+#                                       Prints nothing of significance to
+#                                       stdout; status via exit code +
+#                                       stderr, same posture as the rest of
+#                                       gates.sh.
 #   host_adapter_post_comment BODY_FILE
 #                                    -- post BODY_FILE's contents as ONE
 #                                       comment on the change-request thread
@@ -148,15 +162,17 @@ host_adapter_available() {
   _host_adapter_detect
 }
 
-# host_adapter_open_change_request BASE HEAD — open (or reuse) a PR for
-# HEAD against BASE. This is the refactored seam cmd_ship's PR-open path now
-# calls instead of invoking `gh` directly (item 2).
+# host_adapter_open_change_request BASE HEAD [BODY_FILE] — open (or reuse) a
+# PR for HEAD against BASE. This is the refactored seam cmd_ship's PR-open
+# path now calls instead of invoking `gh` directly (item 2). BODY_FILE is
+# optional (lr-429b32) — see the file-header contract table above.
 host_adapter_open_change_request() {
   _haocr_base="$1"
   _haocr_head="$2"
+  _haocr_body_file="${3:-}"
   _host_adapter_detect || return 1
   case "$_HOST_ADAPTER" in
-    gh) _host_adapter_gh_open_change_request "$_haocr_base" "$_haocr_head" ;;
+    gh) _host_adapter_gh_open_change_request "$_haocr_base" "$_haocr_head" "$_haocr_body_file" ;;
     *)  return 1 ;;
   esac
 }
@@ -197,11 +213,20 @@ _HOST_ADAPTER_SHIP_TIMEOUT="${CLAGENTIC_SHIP_TIMEOUT_SEC:-120}"
 _host_adapter_gh_open_change_request() {
   _hagocr_base="$1"
   _hagocr_head="$2"
+  _hagocr_body_file="${3:-}"
   if run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$_hagocr_head" >/dev/null 2>&1; then
     echo "[host-adapter/gh] PR already open for $_hagocr_head"
     return 0
   fi
-  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr create --fill --base "$_hagocr_base" --head "$_hagocr_head"
+  # A rendered body file (lr-429b32) wins over --fill's commit-message
+  # scrape -- --fill supplies no review-provenance section at all, which is
+  # the defect this task exists to close. --title still comes from --fill's
+  # own commit-derived title; only the body is replaced.
+  if [ -n "$_hagocr_body_file" ] && [ -f "$_hagocr_body_file" ]; then
+    run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr create --fill-first --base "$_hagocr_base" --head "$_hagocr_head" --body-file "$_hagocr_body_file"
+  else
+    run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr create --fill --base "$_hagocr_base" --head "$_hagocr_head"
+  fi
 }
 
 _host_adapter_gh_post_comment() {
