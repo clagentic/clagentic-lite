@@ -3,7 +3,7 @@
 # Blocks writes to the default branch, outside the repo, or to sensitive paths.
 # Exit 2 = block.
 #
-# managed-by: clagentic · clagentic-hooks-version: v1
+# managed-by: clagentic · clagentic-hooks-version: v2
 # Source of truth: share/hook-shims/pre-write-guard.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/pre-write-guard.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -16,7 +16,26 @@
 # If platform.sh is missing or broken the hook fails open (allow + no audit).
 
 : "${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}"
-if ! . "$CLAGENTIC_LITE_HOME/scripts/platform.sh" 2>/dev/null; then
+# Explicit existence guard before sourcing: `.` is a POSIX special builtin,
+# so a file-not-found inside a bare `if ! . "$X" 2>/dev/null; then ...` is
+# a FATAL shell error that terminates the whole script immediately (exit
+# 2, no stdout/stderr) -- the `if !` never gets to evaluate because
+# control never returns to it. `[ -f ... ]` proves the file exists first,
+# so `.` never hits that path. Posture is UNCHANGED by this fix: this
+# guard fails OPEN by design (AGENTS.md non-negotiable 3 -- do not flip to
+# fail-closed without asking) -- a missing/stale CLAGENTIC_LITE_HOME still
+# lets the Write/Edit through with no validation and no audit row, exactly
+# as before, just via exit 0 instead of an undiagnosable exit 2. This
+# defect class recurs across all six hook shim templates (GH #174) --
+# see the identical guard in the other five for the fix repeated at
+# every site it was found.
+_CLAGENTIC_PLATFORM_SH="$CLAGENTIC_LITE_HOME/scripts/platform.sh"
+if [ ! -f "$_CLAGENTIC_PLATFORM_SH" ]; then
+  printf '[clagentic-lite/pre-write-guard] CLAGENTIC_LITE_HOME does not resolve to a real checkout: %s (missing scripts/platform.sh) -- failing OPEN (call allowed, unaudited). Run `clagentic-lite doctor`, and check ~/.bashrc and ~/.config/clagentic/config for a stale CLAGENTIC_LITE_HOME.\n' "$CLAGENTIC_LITE_HOME" 1>&2
+  exit 0
+fi
+# shellcheck disable=SC1090
+if ! . "$_CLAGENTIC_PLATFORM_SH" 2>/dev/null; then
   exit 0
 fi
 ds_load_env 2>/dev/null || true

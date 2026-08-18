@@ -9,7 +9,7 @@
 #
 # Non-blocking — any failure exits 0 silently.
 #
-# managed-by: clagentic · clagentic-hooks-version: v1
+# managed-by: clagentic · clagentic-hooks-version: v2
 # Source of truth: share/hook-shims/session-start.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/session-start.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -18,8 +18,21 @@
 # absolute path. Do not edit the installed copy by hand.
 
 : "${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}"
-# shellcheck disable=SC1091
-. "$CLAGENTIC_LITE_HOME/scripts/platform.sh" 2>/dev/null || true
+# Explicit existence guard before sourcing: `.` is a POSIX special builtin,
+# so a file-not-found inside a bare `. "$X" 2>/dev/null || true` is a FATAL
+# shell error that terminates the whole script immediately (exit 2, no
+# stdout/stderr) -- `|| true` never runs because control never returns to
+# it. `[ -f ... ] &&` proves the file exists first, so `.` never hits that
+# path. This defect class recurs across all six hook shim templates
+# (GH #174) -- see the identical guard in the other five for the fix
+# repeated at every site it was found.
+_CLAGENTIC_PLATFORM_SH="$CLAGENTIC_LITE_HOME/scripts/platform.sh"
+if [ -f "$_CLAGENTIC_PLATFORM_SH" ]; then
+  # shellcheck disable=SC1090
+  . "$_CLAGENTIC_PLATFORM_SH" 2>/dev/null || true
+else
+  printf '[clagentic-lite/session-start] CLAGENTIC_LITE_HOME does not resolve to a real checkout: %s (missing scripts/platform.sh). Run `clagentic-lite doctor`, and check ~/.bashrc and ~/.config/clagentic/config for a stale CLAGENTIC_LITE_HOME.\n' "$CLAGENTIC_LITE_HOME" 1>&2
+fi
 
 MEMORY_DB="${PWD}/.clagentic/lite/memory.db"
 CONTRACT_MD="${PWD}/.clagentic/lite/builder-contract.md"

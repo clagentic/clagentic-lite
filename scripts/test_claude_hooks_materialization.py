@@ -297,8 +297,20 @@ class TestUpdateRestampsOnlyOnVersionChange(unittest.TestCase):
         self.assertEqual(rc2, 0, msg=f"stdout={out2!r} stderr={err2!r}")
         with open(target) as f:
             restamped = f.read()
+        # Read the current version off the tracked template rather than
+        # hardcoding a literal -- the marker tracks CLAUDE_HOOKS_VERSION in
+        # bin/clagentic-lite, which this same fix bumped (lr-24f649); a
+        # hardcoded "v1" here would go stale on every future bump.
+        current_template = os.path.join(
+            TOOL_HOME, "share", "hook-shims", "pre-write-guard.sh.template"
+        )
+        with open(current_template) as f:
+            template_content = f.read()
+        current_marker = re.search(
+            r"clagentic-hooks-version: v\d+", template_content
+        ).group(0)
         self.assertIn(
-            "clagentic-hooks-version: v1", restamped,
+            current_marker, restamped,
             "a stale version marker on even one hook script must trigger a "
             "full restamp back to the current CLAUDE_HOOKS_VERSION",
         )

@@ -246,7 +246,7 @@ PLUGIN_RENDER_VERSION="v1"
 # path (enrolled repos never receive their own copy of these scripts).
 # Bump on any content change to any hook template so `clagentic-lite update`
 # re-stamps existing installs.
-CLAUDE_HOOKS_VERSION="v1"
+CLAUDE_HOOKS_VERSION="v2"
 
 # Single source of truth for which hook scripts are stamped into
 # $CLAGENTIC_LITE_HOME/.claude/hooks/. Space-separated POSIX-sh string (no
