@@ -258,6 +258,15 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False):
         if argv[:2] == ["pr", "view"]:
             sys.exit(0 if pr_exists else 1)
         if argv[:2] == ["pr", "create"]:
+            # Persist a --body-file's contents the same way `pr comment`
+            # does below (lr-429b32), so tests can assert on what
+            # _build_ship_pr_body actually rendered into a newly created PR.
+            if "--body-file" in argv:
+                src = argv[argv.index("--body-file") + 1]
+                os.makedirs(bodies_dir, exist_ok=True)
+                dst = os.path.join(bodies_dir, "create-body-%d.txt" % len(open(calls_file).readlines()))
+                with open(src) as sf, open(dst, "w") as df:
+                    df.write(sf.read())
             sys.exit(0)
         if argv[:2] == ["pr", "comment"]:
             # Persist the posted body BEFORE the caller's own cleanup can
@@ -293,6 +302,24 @@ def _read_posted_bodies(tmpdir):
     if not os.path.isdir(bodies_dir):
         return []
     names = sorted(os.listdir(bodies_dir), key=lambda n: int(n.split("-")[1].split(".")[0]))
+    out = []
+    for name in names:
+        with open(os.path.join(bodies_dir, name)) as f:
+            out.append(f.read())
+    return out
+
+
+def _read_posted_create_bodies(tmpdir):
+    """Every `pr create --body-file` body the fake `gh` intercepted, in call
+    order -- mirrors _read_posted_bodies but for the create path
+    (lr-429b32)."""
+    bodies_dir = os.path.join(tmpdir, "posted-bodies")
+    if not os.path.isdir(bodies_dir):
+        return []
+    names = sorted(
+        (n for n in os.listdir(bodies_dir) if n.startswith("create-body-")),
+        key=lambda n: int(n.split("-")[2].split(".")[0]),
+    )
     out = []
     for name in names:
         with open(os.path.join(bodies_dir, name)) as f:
@@ -430,6 +457,64 @@ class TestHostAdapterContractDirect(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = _read_calls(self._calls)
         self.assertTrue(any(c.startswith("pr create") for c in calls))
+
+    def test_open_change_request_with_body_file_uses_fill_first_and_body_file(self):
+        """lr-429b32: a BODY_FILE third arg must reach `gh pr create` as
+        --body-file, and must NOT fall back to a bare --fill (which would
+        silently discard the rendered body)."""
+        _make_fake_gh(self._bin, self._calls, pr_exists=False)
+        body_file = os.path.join(self._tmpdir, "pr-body.txt")
+        with open(body_file, "w") as f:
+            f.write("## What changed and why\n\nsomething\n")
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_open_change_request main feat/example '%s'" % (self._repo, body_file),
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = _read_calls(self._calls)
+        create_calls = [c for c in calls if c.startswith("pr create")]
+        self.assertEqual(len(create_calls), 1)
+        self.assertIn("--body-file", create_calls[0])
+        self.assertNotIn("--fill ", create_calls[0] + " ",
+                          "a rendered BODY_FILE must win over the commit-scrape --fill default")
+        bodies = _read_posted_create_bodies(self._tmpdir)
+        self.assertEqual(len(bodies), 1)
+        self.assertIn("What changed and why", bodies[0])
+
+    def test_open_change_request_without_body_file_still_uses_fill(self):
+        """Omitting BODY_FILE (the pre-lr-429b32 call shape) must preserve
+        the original --fill behavior exactly -- no regression for a caller
+        that never learned about the new optional arg."""
+        _make_fake_gh(self._bin, self._calls, pr_exists=False)
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_open_change_request main feat/example" % self._repo,
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = _read_calls(self._calls)
+        create_calls = [c for c in calls if c.startswith("pr create")]
+        self.assertEqual(len(create_calls), 1)
+        self.assertIn("--fill", create_calls[0])
+        self.assertNotIn("--body-file", create_calls[0])
+
+    def test_open_change_request_reuses_existing_pr_ignoring_body_file(self):
+        """An already-open PR is reused as-is per the contract -- a BODY_FILE
+        argument must never trigger a second call to set/replace its body."""
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
+        body_file = os.path.join(self._tmpdir, "pr-body.txt")
+        with open(body_file, "w") as f:
+            f.write("## What changed and why\n\nsomething\n")
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_open_change_request main feat/example '%s'" % (self._repo, body_file),
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = _read_calls(self._calls)
+        self.assertFalse(any(c.startswith("pr create") for c in calls),
+                          "an existing PR must never trigger a create call, body file or not")
 
     def test_post_comment_posts_body_file_contents(self):
         _make_fake_gh(self._bin, self._calls)

@@ -1503,22 +1503,29 @@ _publish_review_verdict() {
   return 0
 }
 
-# _build_review_verdict_comment_body VERDICT HEAD_SHA FINDINGS_JSON — renders
-# the one-comment-per-run body: verdict, head_sha, a per-severity findings
-# count, and which findings are recurring from a prior round
-# (`_ledger_recurring`, set by _ledger_mark_recurrence before this is
-# called). Fails closed (prints nothing, non-zero exit) with no jq/python3
-# rather than posting a malformed/empty comment.
-_build_review_verdict_comment_body() {
-  _brvcb_verdict="$1"
-  _brvcb_head="$2"
-  _brvcb_findings="$3"
+# _render_review_verdict_lines VERDICT HEAD_SHA FINDINGS_JSON — the shared
+# rendering core both _build_review_verdict_comment_body (one comment per
+# review run) and _build_ship_pr_body's review-provenance section (lr-429b32)
+# reuse rather than each re-deriving the same head/per-severity/recurring-
+# findings formatting. Prints newline-separated lines to stdout: head_sha, a
+# per-severity findings count, and a "Recurring from a prior round" block for
+# any finding _ledger_mark_recurrence already flagged. Deliberately does NOT
+# print a verdict header line -- callers frame the verdict differently (a
+# bold comment title vs. a PR-body subsection heading) and VERDICT is still
+# taken as a parameter only so the caller doesn't have to duplicate the
+# argument-passing contract; it composes into either a standalone comment or
+# a PR-body subsection without any string-surgery on the output. Fails
+# closed (no output, non-zero exit) with no python3 -- same posture as the
+# function it was extracted from.
+_render_review_verdict_lines() {
+  _rrvl_head="$1"
+  _rrvl_findings="$2"
 
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$_brvcb_verdict" "$_brvcb_head" "$_brvcb_findings" <<'PYEOF'
+    python3 - "$_rrvl_head" "$_rrvl_findings" <<'PYEOF'
 import json, sys
 
-verdict, head, findings_json = sys.argv[1:4]
+head, findings_json = sys.argv[1:3]
 try:
     findings = json.loads(findings_json)
     if not isinstance(findings, list):
@@ -1537,8 +1544,6 @@ for f in findings:
         recurring.append(f)
 
 lines = []
-lines.append("**clagentic-lite review verdict: %s**" % verdict)
-lines.append("")
 lines.append("head_sha: `%s`" % (head or "<unresolved>"))
 lines.append("")
 if findings:
@@ -1562,11 +1567,113 @@ PYEOF
   fi
 
   # No python3 -- jq alone cannot format multi-line prose cleanly enough for
-  # a readable comment body, so this path fails closed (no partial/garbled
-  # comment) rather than emitting something malformed. host_adapter_available
-  # having returned true is not itself gated on python3, so this is a real,
-  # distinct degraded case, logged by the caller.
+  # a readable body, so this path fails closed (no partial/garbled output)
+  # rather than emitting something malformed. host_adapter_available having
+  # returned true is not itself gated on python3, so this is a real, distinct
+  # degraded case, logged by the caller.
   return 1
+}
+
+# _build_review_verdict_comment_body VERDICT HEAD_SHA FINDINGS_JSON — renders
+# the one-comment-per-run body: a bold verdict title, then
+# _render_review_verdict_lines' shared head_sha/findings/recurring core.
+_build_review_verdict_comment_body() {
+  _brvcb_verdict="$1"
+  _brvcb_head="$2"
+  _brvcb_findings="$3"
+
+  _brvcb_body=$(_render_review_verdict_lines "$_brvcb_head" "$_brvcb_findings") || return 1
+  printf '**clagentic-lite review verdict: %s**\n\n%s\n' "$_brvcb_verdict" "$_brvcb_body"
+}
+
+# _build_ship_pr_body BRANCH HEAD_SHA (lr-429b32) — renders the four-section
+# PR body cmd_ship hands to host_adapter_open_change_request, replacing the
+# adapter's prior commit-message-scrape default (which produced no review
+# provenance at all -- see docs/GATES.md "Ship-time PR body"). Gate-side by
+# contract (host-adapter.sh's own doc comment: adapters transport, they
+# never render) -- this function knows nothing about which host or CLI ends
+# up posting the body it returns.
+#
+# DEGRADE HONESTLY, not a nicety here -- the acceptance bar (lr-429b32):
+# every section this function cannot populate from what the tool actually
+# recorded says so in plain words rather than rendering an empty heading or
+# implying a check ran that did not. Section 2 (review provenance) is the
+# only section with real data behind it -- it reuses
+# _ledger_anchored_pass_at_head/ledger_latest_for_branch/
+# _render_review_verdict_lines (the SAME lookup cmd_merge_gate and
+# _publish_review_verdict already use) rather than re-deriving a verdict.
+# Sections 1/3/4 (what-changed, trade-offs, out-of-scope) have no mechanical
+# source in this codebase -- no commit-log/diff-summary synthesis exists
+# here (by design: AGENTS.md's non-goals list forbids adding one just for
+# this) -- so each renders an explicit placeholder naming that gap, never a
+# fabricated summary and never a bare empty heading.
+_build_ship_pr_body() {
+  _bspb_branch="$1"
+  _bspb_head="$2"
+
+  _bspb_ledger=$(_review_ledger_path)
+  _bspb_review_section=""
+  if [ -n "$_bspb_head" ] && { command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; }; then
+    _bspb_latest=$(ledger_latest_for_branch "$_bspb_ledger" "$_bspb_branch")
+    if [ -n "$_bspb_latest" ]; then
+      _bspb_entry_head=""
+      _bspb_entry_verdict=""
+      _bspb_entry_findings="[]"
+      if command -v jq >/dev/null 2>&1; then
+        _bspb_entry_head=$(printf '%s' "$_bspb_latest" | jq -r '.head_sha // ""' 2>/dev/null)
+        _bspb_entry_verdict=$(printf '%s' "$_bspb_latest" | jq -r '.verdict // ""' 2>/dev/null)
+        _bspb_entry_findings=$(printf '%s' "$_bspb_latest" | jq -c '.findings // []' 2>/dev/null)
+      elif command -v python3 >/dev/null 2>&1; then
+        _bspb_entry_head=$(printf '%s' "$_bspb_latest" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("head_sha",""))
+except Exception:
+    print("")' 2>/dev/null)
+        _bspb_entry_verdict=$(printf '%s' "$_bspb_latest" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("verdict",""))
+except Exception:
+    print("")' 2>/dev/null)
+        _bspb_entry_findings=$(printf '%s' "$_bspb_latest" | python3 -c 'import json,sys
+try:
+    print(json.dumps(json.load(sys.stdin).get("findings",[])))
+except Exception:
+    print("[]")' 2>/dev/null)
+      fi
+      [ -n "$_bspb_entry_findings" ] || _bspb_entry_findings="[]"
+
+      if [ -n "$_bspb_entry_head" ] && [ "$_bspb_entry_head" = "$_bspb_head" ]; then
+        # An anchored entry exists at THIS exact head_sha -- the review this
+        # section describes actually evaluated the code being shipped, not a
+        # stale prior round. Reuse the same rendering core the posted
+        # review-verdict comment uses (reuse, not re-derivation).
+        _bspb_lines=$(_render_review_verdict_lines "$_bspb_entry_head" "$_bspb_entry_findings" 2>/dev/null)
+        if [ -n "$_bspb_lines" ]; then
+          _bspb_review_section=$(printf 'verdict: %s\n\n%s\n' "$_bspb_entry_verdict" "$_bspb_lines")
+        fi
+      else
+        # A ledger entry exists for this branch but not at this head_sha --
+        # honest reporting requires saying the review is stale relative to
+        # what is being shipped, not silently reusing an older verdict.
+        _bspb_review_section="reviewer: prior verdict recorded (head \`${_bspb_entry_head:-<unresolved>}\`), but it does not cover this PR's head (\`${_bspb_head:-<unresolved>}\`) -- treat review as not yet run for this head."
+      fi
+    fi
+  fi
+  if [ -z "$_bspb_review_section" ]; then
+    # No usable ledger entry for this branch at all (never reviewed, no
+    # JSON tool available to read the ledger, or ledger absent) -- this is
+    # lr-964f7f's motivating failure mode inverted: never imply a review
+    # posture the tool cannot back with a recorded verdict.
+    _bspb_review_section="reviewer: none -- no recorded review verdict for this branch. Run \`clagentic-lite gates review\` (or \`gates ship\`, which runs it) before merging if cross-vendor review is expected."
+  fi
+
+  printf '## What changed and why\n\n'
+  printf '_Not recorded by tooling -- clagentic-lite has no commit-log or diff summarizer; fill in by hand before merging._\n\n'
+  printf '## Review provenance\n\n%s\n\n' "$_bspb_review_section"
+  printf '## Trade-offs taken and rejected\n\n'
+  printf '_Not recorded by tooling; fill in by hand, or state "none" if none were seriously considered._\n\n'
+  printf '## Explicitly out of scope\n\n'
+  printf '_Not recorded by tooling; fill in by hand, or state "none" if the change is fully self-contained._\n'
 }
 
 # get_review_diff — prints the best available diff to stdout for use by
@@ -5379,8 +5486,20 @@ cmd_ship() {
     run_bounded "$_SHIP_TIMEOUT" -- _git push -u origin "$BRANCH" || { echo "[gates/ship] push failed or timed out after ${_SHIP_TIMEOUT}s"; cmd_log_run ship block "push failed"; exit 1; }
   fi
   if host_adapter_available; then
-    host_adapter_open_change_request "$DEFAULT_BRANCH" "$BRANCH" || \
+    # Render the PR body gate-side (lr-429b32) before handing off to the
+    # adapter -- host-adapter.sh transports, it never composes (file-header
+    # contract). A render failure (no jq/python3 -- the same exemption
+    # _build_review_verdict_comment_body already has) still opens the PR;
+    # it just falls back to no body file, same as pre-lr-429b32 behavior.
+    _SHIP_HEAD_SHA=$(_git_repo_scoped_head_sha)
+    _SHIP_BODY_FILE=$(mktemp -t clagentic-ship-pr-body.XXXXXX)
+    if ! _build_ship_pr_body "$BRANCH" "$_SHIP_HEAD_SHA" > "$_SHIP_BODY_FILE" 2>/dev/null || [ ! -s "$_SHIP_BODY_FILE" ]; then
+      rm -f "$_SHIP_BODY_FILE"
+      _SHIP_BODY_FILE=""
+    fi
+    host_adapter_open_change_request "$DEFAULT_BRANCH" "$BRANCH" "$_SHIP_BODY_FILE" || \
       echo "[gates/ship] host-adapter open-change-request failed or timed out after ${_SHIP_TIMEOUT}s — open the PR manually"
+    [ -n "$_SHIP_BODY_FILE" ] && rm -f "$_SHIP_BODY_FILE"
   else
     REMOTE=$(_git remote get-url origin 2>/dev/null || echo "<remote>")
     echo "[gates/ship] no host adapter available — open a PR manually:"

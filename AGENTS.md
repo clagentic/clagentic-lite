@@ -102,6 +102,7 @@ This checkout does not ship a tracked, live `.claude/hooks/*.sh` + `.claude/sett
 | `.claude/commands/recall.md` | `/recall` slash command — different from the hooks above: this file IS the source of truth at this path, symlinked directly into enrolled repos, no template/materialization step |
 | `.codex/config.toml` | Codex sandbox + role config — operator-facing documentation only; not auto-loaded by the codex binary and never read by `invoke_codex` |
 | `.gitleaks.toml` | gitleaks config — extends defaults, narrow path+token allowlist |
+| `.github/pull_request_template.md` | governs this repo's own PRs opened through the GitHub web UI (four required sections: what changed/why, review provenance, trade-offs, out of scope). `_build_ship_pr_body` (`scripts/gates.sh`, lr-429b32) renders the equivalent structure automatically for a `gates ship`-opened PR — see `docs/GATES.md` "Ship-time PR body" |
 | `scripts/platform.sh` | GNU/BSD shims + shared helpers (`ds_load_env`, `ds_sql_escape`, `ds_audit_log`, `ds_json_field`, `ds_check_tool`, `ds_offer_install`, `$DS_TIMEOUT_CMD`) |
 | `scripts/memory.sh` | SQLite session memory CRUD |
 | `scripts/llm-client.sh` | role-aware LLM wrapper with model_chain fallback |
