@@ -19,42 +19,19 @@ Run with: python3 -m unittest scripts.test_adversarial_tier_parsing -v
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import GATES_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
-
-
-def _functions_only_source(dest_dir):
-    """Copy gates.sh into dest_dir with its trailing subcommand dispatch
-    (`case "${1:-}" in init) ... esac`) stripped off, mirroring the pattern
-    test_llm_client_sh.py uses for llm-client.sh. Sourcing the real file
-    unmodified would execute cmd_init/cmd_review/etc based on whatever $1
-    happens to be in the sourcing shell and call `exit`.
-
-    gates.sh unconditionally self-sources platform.sh and review-merge.sh
-    relative to its own `dirname "$0")` at the top of the file (before any
-    function definitions), so both real files are symlinked alongside the
-    truncated copy — otherwise sourcing fails before _parse_adversarial_findings
-    is even defined.
-    """
-    with open(GATES_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in gates.sh"
-    dest = os.path.join(dest_dir, "gates.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
-    for fname in ("platform.sh", "review-merge.sh", "host-adapter.sh"):
-        os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(dest_dir, fname))
-    return dest
 
 
 def _parse_findings(markdown_text):
@@ -71,9 +48,7 @@ def _parse_findings(markdown_text):
     """
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-adv-tier-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced_gates = _functions_only_source(src_dir)
+        sourced_gates = GATES_SH
 
         md_file = os.path.join(tmpdir, "adversarial.md")
         with open(md_file, "w") as f:
@@ -87,11 +62,14 @@ def _parse_findings(markdown_text):
         # Pass sourced_gates as $0 so gates.sh's own
         # `. "$(dirname "$0")/platform.sh"` self-source resolves — under
         # plain `sh -c script`, $0 would be "sh".
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True,
             text=True,
             cwd=os.path.join(TOOL_HOME, "scripts"),
+            env=env,
         )
         assert r.returncode == 0, f"sourcing/parsing failed: {r.stderr}"
         with open(out_file) as f:
@@ -251,14 +229,15 @@ def _run_sh_function_for_rank(severity_value):
     """Source gates.sh (functions only) and call severity_rank directly."""
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-sevrank-")
     try:
-        src_dir = os.path.join(tmpdir, "src")
-        os.makedirs(src_dir)
-        sourced_gates = _functions_only_source(src_dir)
+        sourced_gates = GATES_SH
         script = f". '{sourced_gates}'\nseverity_rank '{severity_value}'\n"
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True, text=True,
             cwd=os.path.join(TOOL_HOME, "scripts"),
+            env=env,
         )
         return r.stdout, r.stderr, r.returncode
     finally:

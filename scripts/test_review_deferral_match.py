@@ -48,32 +48,19 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
+# IMPORT-PATH ROBUSTNESS: see test_llm_client_source_guard.py's identical
+# comment -- this repo has no scripts/__init__.py, so a bare sibling import
+# only resolves reliably once this file's own directory is on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import GATES_SH, PLATFORM_SH, source_env  # noqa: E402
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
-PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
-
-
-def _functions_only_source(dest_dir):
-    """Same truncation pattern as test_review_recurrence_demotion.py."""
-    with open(GATES_SH) as f:
-        lines = f.readlines()
-    cut = None
-    for i, line in enumerate(lines):
-        if line.startswith('case "${1:-}" in'):
-            cut = i
-            break
-    assert cut is not None, "could not locate subcommand dispatch in gates.sh"
-    dest = os.path.join(dest_dir, "gates.sh")
-    with open(dest, "w") as f:
-        f.writelines(lines[:cut])
-    real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
-    for fname in ("platform.sh", "review-merge.sh", "host-adapter.sh"):
-        os.symlink(os.path.join(real_scripts_dir, fname), os.path.join(dest_dir, fname))
-    return dest
 
 
 def _write_envelope(path, findings):
@@ -119,9 +106,7 @@ class _RepoHarness(unittest.TestCase):
         self._deferrals_path = os.path.join(self._repo, ".clagentic", "deferrals.json")
         os.makedirs(os.path.dirname(self._deferrals_path), exist_ok=True)
         self._envelope_path = os.path.join(self._tmpdir, "env.json")
-        src_dir = os.path.join(self._tmpdir, "src")
-        os.makedirs(src_dir)
-        self._sourced_gates = _functions_only_source(src_dir)
+        self._sourced_gates = GATES_SH
 
     def tearDown(self):
         import shutil
@@ -160,10 +145,13 @@ class _RepoHarness(unittest.TestCase):
             _git() {{ git -C "$REPO_ROOT" "$@"; }}
             _review_deferral_match '{self._envelope_path}'
         """)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, self._sourced_gates],
             capture_output=True, text=True,
             cwd=os.path.join(TOOL_HOME, "scripts"),
+            env=env,
         )
         return r.stdout, r.stderr, r.returncode
 
@@ -357,9 +345,7 @@ class TestSeverityBlockersExcludesDeferralMatched(unittest.TestCase):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def _run_blockers(self, findings):
-        src_dir = os.path.join(self._tmpdir, "src")
-        os.makedirs(src_dir, exist_ok=True)
-        sourced = _functions_only_source(src_dir)
+        sourced = GATES_SH
         review_path = os.path.join(self._tmpdir, "review.json")
         with open(review_path, "w") as f:
             json.dump({"summary": "x", "findings": findings}, f)
@@ -369,10 +355,13 @@ class TestSeverityBlockersExcludesDeferralMatched(unittest.TestCase):
             . '{sourced}'
             severity_blockers '{review_path}' high
         """)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced],
             capture_output=True, text=True,
             cwd=os.path.join(TOOL_HOME, "scripts"),
+            env=env,
         )
         return r.stdout.strip(), r.stderr, r.returncode
 
@@ -422,9 +411,7 @@ class TestDeferralsLint(unittest.TestCase):
 
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp(prefix="clagentic-test-lint-")
-        src_dir = os.path.join(self._tmpdir, "src")
-        os.makedirs(src_dir)
-        self._sourced_gates = _functions_only_source(src_dir)
+        self._sourced_gates = GATES_SH
         self._deferrals_path = os.path.join(self._tmpdir, "deferrals.json")
 
     def tearDown(self):
@@ -440,10 +427,13 @@ class TestDeferralsLint(unittest.TestCase):
             . '{self._sourced_gates}'
             cmd_deferrals_lint '{self._deferrals_path}'
         """)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, self._sourced_gates],
             capture_output=True, text=True,
             cwd=os.path.join(TOOL_HOME, "scripts"),
+            env=env,
         )
         return r.stdout, r.stderr, r.returncode
 
@@ -523,10 +513,13 @@ class TestDeferralsLint(unittest.TestCase):
             . '{self._sourced_gates}'
             cmd_deferrals_lint '{self._deferrals_path}'
         """)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, self._sourced_gates],
             capture_output=True, text=True,
             cwd=os.path.join(TOOL_HOME, "scripts"),
+            env=env,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
 
