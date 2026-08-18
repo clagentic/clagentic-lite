@@ -84,6 +84,118 @@ class TestExecutedAsScriptDispatchUnchanged(unittest.TestCase):
         self.assertIn("clagentic-lite gate digest", r.stdout)
 
 
+class TestExecutedAsScriptWithAmbientSentinelFailsClosed(unittest.TestCase):
+    """BOBBIE fold-in (lr-bdddcf PR #177, comment 5333162549, bobbie.uncat.1)
+    PLUS the coordinator-authorized A1 fail-closed amendment that followed:
+    pins the scenario this task's whole risk framing is about -- gates.sh
+    EXECUTED AS A SCRIPT (not sourced) while CLAGENTIC_GATES_SOURCE_ONLY is
+    ambiently set in the environment (e.g. inherited from a parent shell or
+    a shell profile), with NO CLAGENTIC_GATES_DELIBERATE_SOURCE asserting
+    that the suppression is on purpose -- i.e. exactly the leak a developer
+    with the sentinel exported would hit.
+
+    BOBBIE's original comment asserted the guarded `if ... fi` (no else)
+    already failed closed here because "the failed test becomes the
+    script's exit status." That is wrong for an `if/fi` block (a false
+    condition with no else exits 0, not the condition test's own status) --
+    independently re-verified by the coordinator reading gates.sh directly.
+    Empirical proof-of-gap: this exact scenario, run against gates.sh BEFORE
+    the A1 amendment, exited 0 in every case (both a real subcommand and no
+    subcommand at all) -- see PR #177 history. The A1 amendment added an
+    `elif` that fires precisely when the suppress-sentinel is set without
+    the deliberate-source signal, printing a stderr message naming both
+    variables and exiting 1. This test pins THAT fixed behavior, not the
+    guard's literal-last-statement structure BOBBIE's comment relied on.
+
+    Consumers gate on exit status alone (scripts/smoke.sh, the pre-push/
+    pre-commit hook-shim templates, bin/clagentic-lite's gates subcommand) --
+    a neutered run that exited 0 would be misread as "gate passed" instead
+    of "gate never ran." B (same PR) additionally has those consumers
+    explicitly unset both variables before invoking gates.sh as a script, so
+    this scenario should not reach them in practice; this test pins the
+    file's own fail-closed behavior as defense-in-depth regardless.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-gates-guard-amb-")
+        self._repo = os.path.join(self._tmp, "repo")
+        os.makedirs(self._repo)
+        _init_repo(self._repo)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _run_as_script_with_ambient_sentinel(self, args):
+        env = os.environ.copy()
+        # Deliberately only the suppress-sentinel, NOT the deliberate-source
+        # signal -- this is the ambient-leak shape, not real sourcing.
+        env["CLAGENTIC_GATES_SOURCE_ONLY"] = "1"
+        env.pop("CLAGENTIC_GATES_DELIBERATE_SOURCE", None)
+        env["CLAGENTIC_PROJECT_ROOT"] = self._repo
+        return subprocess.run(
+            [GATES_SH, *args],
+            capture_output=True, text=True, env=env, cwd=self._repo,
+            timeout=30,
+        )
+
+    def test_ambient_sentinel_with_real_subcommand_does_not_exit_0(self):
+        # Under the old unguarded dispatch this would run cmd_digest and
+        # exit 0. With the sentinel ambiently set and no deliberate-source
+        # signal, dispatch is skipped -- the requested subcommand never runs
+        # at all, so exiting 0 here would be silently misread as "digest
+        # passed."
+        r = self._run_as_script_with_ambient_sentinel(["digest"])
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+
+    def test_ambient_sentinel_with_real_subcommand_names_both_vars_on_stderr(self):
+        r = self._run_as_script_with_ambient_sentinel(["digest"])
+        self.assertIn("CLAGENTIC_GATES_SOURCE_ONLY", r.stderr)
+        self.assertIn("CLAGENTIC_GATES_DELIBERATE_SOURCE", r.stderr)
+
+    def test_ambient_sentinel_with_no_subcommand_does_not_exit_0(self):
+        r = self._run_as_script_with_ambient_sentinel([])
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+
+
+class TestSourceGuardWithDeliberateSignalStaysSilent(unittest.TestCase):
+    """A1's other direction, pinned explicitly: suppress-sentinel set AND
+    CLAGENTIC_GATES_DELIBERATE_SOURCE set together -- the real sourcing
+    shape every existing test helper (via source_env(gates=True), which now
+    emits both variables) and any real production reuser uses. Must stay
+    completely silent and non-failing, unchanged from pre-amendment
+    behavior, or A1 would have broken the ~30 migrated sourcing call sites
+    it was supposed to leave untouched.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-gates-guard-delib-")
+        self._repo = os.path.join(self._tmp, "repo")
+        os.makedirs(self._repo)
+        _init_repo(self._repo)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _source_and_call(self, script_body):
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
+        env["CLAGENTIC_PROJECT_ROOT"] = self._repo
+        script = f". '{GATES_SH}'\n{script_body}\n"
+        return subprocess.run(
+            ["sh", "-c", script, GATES_SH],
+            capture_output=True, text=True, env=env, cwd=self._repo,
+            timeout=30,
+        )
+
+    def test_deliberate_source_signal_keeps_sourcing_silent_and_exit_0(self):
+        r = self._source_and_call("echo SOURCED_OK")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "")
+        self.assertIn("SOURCED_OK", r.stdout)
+
+
 class TestSourceGuardSuppressesDispatch(unittest.TestCase):
     """CLAGENTIC_GATES_SOURCE_ONLY=1 -- the new opt-in path a test harness
     (or a future in-process reuser) sets before dot-sourcing."""
