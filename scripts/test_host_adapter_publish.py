@@ -258,6 +258,15 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False):
         if argv[:2] == ["pr", "view"]:
             sys.exit(0 if pr_exists else 1)
         if argv[:2] == ["pr", "create"]:
+            # Persist a --body-file's contents the same way `pr comment`
+            # does below (lr-429b32), so tests can assert on what
+            # _build_ship_pr_body actually rendered into a newly created PR.
+            if "--body-file" in argv:
+                src = argv[argv.index("--body-file") + 1]
+                os.makedirs(bodies_dir, exist_ok=True)
+                dst = os.path.join(bodies_dir, "create-body-%d.txt" % len(open(calls_file).readlines()))
+                with open(src) as sf, open(dst, "w") as df:
+                    df.write(sf.read())
             sys.exit(0)
         if argv[:2] == ["pr", "comment"]:
             # Persist the posted body BEFORE the caller's own cleanup can
