@@ -315,7 +315,7 @@ There are **three independent opt-ins**, not one switch, and enabling one does n
 
 1. `CLAGENTIC_ROUTER_URL` — stamps the router into `.claude/settings.json` as a transparent proxy for the interactive session (passthrough by default; routed mode with a named chain if you configure one).
 2. `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` — additionally injects `model: role:<role>-chain` into the Reviewer/Auditor/Merge-Gate subagent frontmatter. **Unverified** — whether Claude Code actually honors this is unconfirmed ([claude-code GH#44385](https://github.com/anthropics/claude-code/issues/44385)).
-3. `CLAGENTIC_<ROLE>_VIA_ROUTER` — the separate gate-path switch, scoped to `reviewer`/`auditor`/`gate`. See `docs/ROUTER.md`.
+3. `CLAGENTIC_<ROLE>_VIA_ROUTER` — the separate gate-path switch, scoped to `reviewer`/`auditor` only (Merge-Gate is deliberately excluded — it needs the same unrestricted Bash/multi-turn tool-calling Builder does on the direct-CLI path). See `docs/ROUTER.md`.
 
 Full detail — setup, the Bedrock-mode variable pair, the URL validation rules, the agent-model-injection verification procedure, and the gate-path routing switch — lives in **[`docs/ROUTER.md`](docs/ROUTER.md)**.
 
