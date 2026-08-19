@@ -30,6 +30,14 @@ subprocess (same technique as scripts/test_router_settings_stamp.py) -- a
 Python reimplementation of the shell branching would not catch a regression
 in the real shell code.
 
+Also covers a related lr-250d9d fold-in: doctor's per-role
+CLAGENTIC_<ROLE>_VIA_ROUTER loop originally iterated REVIEWER/AUDITOR/GATE
+and printed the same "this role's gate-path calls POST to clagentic-router"
+INFO line for all three. Once gate was removed from _llm_role_routable's
+enumeration (scripts/llm-client.sh), that INFO line would have been false
+for gate -- CLAGENTIC_GATE_VIA_ROUTER=1 is now always a no-op. doctor gets
+its own dedicated WARN for gate instead (TestGateViaRouterIsAlwaysReportedAsANoOp).
+
 Run with: python3 -m unittest scripts.test_doctor_router_blind_checks -v
 """
 import os
@@ -223,6 +231,63 @@ class TestRoutedPathRemovesFalseNegativeAndWrongVendorOk(_DoctorTestBase):
         self.assertNotIn('WARN Builder and Reviewer both use "claude"', out, msg=out)
         self.assertNotIn("OK   Reviewer=claude (tool-restriction enforced", out, msg=out)
         self.assertIn("(unset)", out, msg=out)
+
+
+class TestGateViaRouterIsAlwaysReportedAsANoOp(_DoctorTestBase):
+    """lr-250d9d: CLAGENTIC_GATE_VIA_ROUTER=1 must NEVER be reported the same
+    way as a genuinely routable role's opt-in -- gate was removed from
+    _llm_role_routable's enumeration, so the pre-existing per-role loop's
+    "this role's gate-path calls POST to clagentic-router" INFO line would
+    be actively false if gate still went through it. doctor gets its own,
+    differently-worded WARN for gate instead of silently reusing the
+    reviewer/auditor INFO text."""
+
+    def test_gate_via_router_prints_a_no_op_warning_not_the_routed_info(self):
+        rc, out, err = _run_doctor(
+            cwd=self.repo, home=self.home,
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:19999",
+                "CLAGENTIC_GATE_VIA_ROUTER": "1",
+            },
+        )
+        self.assertIn(
+            "WARN CLAGENTIC_GATE_VIA_ROUTER=1 is set but has NO EFFECT",
+            out, msg=out,
+        )
+        self.assertNotIn(
+            "CLAGENTIC_GATE_VIA_ROUTER=1 — this role's gate-path calls POST",
+            out, msg=out,
+        )
+
+    def test_gate_via_router_unset_prints_neither_message(self):
+        """Control case: with the var unset (default), neither the no-op
+        warning nor the routed-role INFO fires for gate."""
+        rc, out, err = _run_doctor(
+            cwd=self.repo, home=self.home,
+            env_extra={"CLAGENTIC_ROUTER_URL": "http://127.0.0.1:19999"},
+        )
+        self.assertNotIn("CLAGENTIC_GATE_VIA_ROUTER", out, msg=out)
+
+    def test_reviewer_via_router_still_gets_the_routed_info_unaffected(self):
+        """Negative control: gate's new WARN branch must not interfere with
+        the pre-existing reviewer/auditor INFO path in the same doctor
+        section."""
+        rc, out, err = _run_doctor(
+            cwd=self.repo, home=self.home,
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:19999",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+                "CLAGENTIC_GATE_VIA_ROUTER": "1",
+            },
+        )
+        self.assertIn(
+            "CLAGENTIC_REVIEWER_VIA_ROUTER=1 — this role's gate-path calls POST",
+            out, msg=out,
+        )
+        self.assertIn(
+            "WARN CLAGENTIC_GATE_VIA_ROUTER=1 is set but has NO EFFECT",
+            out, msg=out,
+        )
 
 
 if __name__ == "__main__":

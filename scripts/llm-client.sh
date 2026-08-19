@@ -1581,23 +1581,33 @@ invoke_generic() {
     $DS_TIMEOUT_CMD "$CALL_TIMEOUT" $NON_CLAUDE_ENV_STRIP "$CLI_BIN" -p - > "$OUTPUT_FILE" 2> "$ERR_FILE"
 }
 
-# ROUTER-PATH INVOCATION (lr-02f048).
+# ROUTER-PATH INVOCATION (lr-02f048, gate removed by lr-250d9d).
 #
-# OPT-IN, PER-ROLE, THREE ROLES ONLY: reviewer, auditor, gate (merge-gate's
-# internal role literal). Gated at the call site in walk_chain by
-# CLAGENTIC_<ROLE>_VIA_ROUTER=1 -- this function itself has no role
-# allowlist of its own; it is never reached for builder/summarizer because
-# walk_chain never checks the router opt-in for those roles (see
-# _llm_role_routable below). Builder is deliberately excluded: it holds
-# unrestricted Bash and does real multi-turn tool-calling, and every router
-# adapter currently declares SupportsTools=false (lr-be9454) -- a
-# tool-bearing routed request 422s. Reviewer/Auditor/Merge-Gate are already
-# tool-restricted AND single-shot (see invoke_claude/invoke_codex's own
-# TOOL_ROLE handling), so they never carry a `tools` field and never trip
-# that refusal.
+# OPT-IN, PER-ROLE, TWO ROLES ONLY: reviewer, auditor. Gated at the call
+# site in walk_chain by CLAGENTIC_<ROLE>_VIA_ROUTER=1 -- this function
+# itself has no role allowlist of its own; it is never reached for
+# builder/gate/summarizer because walk_chain never checks the router opt-in
+# for those roles (see _llm_role_routable below). Builder is deliberately
+# excluded: it holds unrestricted Bash and does real multi-turn
+# tool-calling, and every router adapter currently declares
+# SupportsTools=false (lr-be9454) -- a tool-bearing routed request 422s.
+# Gate (merge-gate's internal role literal) is excluded for the IDENTICAL
+# reason as Builder -- ds_llm_role_is_bash_unrestricted (scripts/
+# platform.sh) marks gate Bash-unrestricted too, so its direct-CLI
+# invocation also holds full Bash and does real multi-turn tool-calling.
+# lr-02f048 originally included gate here on the mistaken claim that all
+# three routed roles were tool-restricted and single-shot; that was true
+# for reviewer/auditor only. See _llm_role_routable's own doc comment
+# (below) for the full correction and the decision record. Reviewer/Auditor
+# are already tool-restricted AND single-shot (see invoke_claude/
+# invoke_codex's own TOOL_ROLE handling), so they never carry a `tools`
+# field and never trip that refusal.
 #
-# WIRE SHAPE: POSTs the combined prompt+input (identical construction to
-# invoke_codex's TMP_COMBINED, reused rather than re-derived) as a single
+# WIRE SHAPE: POSTs the combined prompt+input (byte-identical construction
+# to invoke_codex's TMP_COMBINED -- own separate mktemp
+# (clagentic-router-combined.XXXXXX below), own cat/printf rebuild, NOT the
+# same tempfile or a shared reference; the two are two independent copies
+# built the same way, not one reused across both call paths) as a single
 # user-role message to clagentic-router's Anthropic-compatible
 # /v1/messages endpoint, model "role:<role>-chain" (matches
 # router.example.yaml's routed-mode chain-name convention, established by
@@ -1847,14 +1857,48 @@ sys.exit(1)
 }
 
 # _llm_role_routable ROLE_L
-# The router opt-in enumeration (task constraint: builder excluded, see
-# invoke_router's doc comment). True (0) only for the three roles this
-# integration covers; false for everything else, including a future new
-# role -- fail toward the existing direct-CLI path, never toward routing
-# something this list does not name.
+# The router opt-in enumeration. True (0) only for reviewer/auditor; false
+# for everything else, including a future new role -- fail toward the
+# existing direct-CLI path, never toward routing something this list does
+# not name.
+#
+# GATE REMOVED (lr-250d9d, correcting lr-02f048). lr-02f048 justified
+# routing reviewer/auditor/gate together on the claim that all three "are
+# already tool-restricted AND single-shot" on both CLI carriers. That is
+# true for reviewer and auditor: invoke_claude strips Bash via
+# --allowedTools/--disallowedTools and invoke_codex via --disable
+# shell_tool -s read-only for both roles (ds_llm_role_is_bash_unrestricted,
+# scripts/platform.sh, returns false for them). It was FALSE for gate the
+# whole time -- ds_llm_role_is_bash_unrestricted returns TRUE for gate, so
+# the merge-gate's direct-CLI invocation runs with full, unrestricted Bash
+# and does real multi-turn tool-calling (see invoke_claude's own comment
+# just above TOOLS_FLAGS, and walk_chain's Bash-unrestricted warning gate,
+# both of which single gate out for exactly this reason). Routing gate
+# therefore did not merely lose a small amount of tool access the way
+# reviewer/auditor's Read/Grep/Glob-minus-Bash restriction would -- it
+# silently swapped a Bash-capable, multi-turn merge-authorization step for
+# a one-shot, tool-free text completion, logged as an ordinary "pass" row
+# indistinguishable from a full-capability run (invoke_router never sends a
+# "tools" key at all; see that function's own doc comment).
+#
+# DECISION (not a mechanical fix -- see the task's own framing): a
+# loud-but-still-routable option was considered and rejected. Making the
+# capability loss loud (a stderr warning, a distinct audit outcome) would
+# tell an operator AFTER the fact that a given merge was authorized by a
+# gate that could not run Bash -- but the merge would already have gone
+# through on that weaker check, on the one gate whose entire job is to be
+# the final authorization before code lands on the default branch. A
+# warning does not hand Bash back to the model that needed it. This
+# mirrors, exactly, why Builder was excluded from this enumeration in the
+# first place (unrestricted Bash + real multi-turn tool-calling) -- gate
+# shares both properties Builder was excluded for, and inherits the same
+# fail-closed answer: keep it off the routable list entirely rather than
+# degrade it with a label. Reviewer/Auditor remain routable because
+# routing them is genuinely lossless -- they never had Bash to begin with
+# on either carrier.
 _llm_role_routable() {
   case "$1" in
-    reviewer|auditor|gate) return 0 ;;
+    reviewer|auditor) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2382,12 +2426,17 @@ walk_chain() {
   CALL_BYTES=$(( INPUT_BYTES + PROMPT_BYTES + 2 ))
   CALL_TIMEOUT=$(llm_timeout_for "$ROLE_U" "$CALL_BYTES")
 
-  # ROUTER PATH, OPT-IN (lr-02f048). CLAGENTIC_<ROLE>_VIA_ROUTER=1, scoped to
-  # reviewer/auditor/gate (_llm_role_routable) and requiring
-  # CLAGENTIC_ROUTER_URL. Unset (either the per-role opt-in or the router
-  # URL) leaves this whole block byte-for-byte inert -- the existing
-  # direct-CLI chain loop below runs completely unmodified, exactly as it
-  # did before this task.
+  # ROUTER PATH, OPT-IN (lr-02f048; gate removed from the routable set by
+  # lr-250d9d -- see _llm_role_routable's own doc comment for why).
+  # CLAGENTIC_<ROLE>_VIA_ROUTER=1, scoped to reviewer/auditor
+  # (_llm_role_routable) and requiring CLAGENTIC_ROUTER_URL. Unset (either
+  # the per-role opt-in or the router URL) leaves this whole block
+  # byte-for-byte inert -- the existing direct-CLI chain loop below runs
+  # completely unmodified, exactly as it did before this task. gate is
+  # simply never reachable here regardless of CLAGENTIC_GATE_VIA_ROUTER --
+  # _llm_role_routable returns false for it, so the merge-gate always keeps
+  # its unrestricted Bash and multi-turn tool-calling on the direct-CLI
+  # path below.
   #
   # THREE-WAY DISTINGUISHABLE OUTCOME, all non-blocking, all verbose, all
   # LOGGED (operator directive, task lr-02f048; LAYER 0 added on the same

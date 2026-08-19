@@ -351,6 +351,19 @@ ds_positive_int_or_default() {
 # return. This is the opposite polarity of an opt-in list, where anything
 # NOT recognized would silently fall through to unrestricted -- exactly
 # the fail-open shape BOBBIE's audit flagged.
+#
+# CROSS-CHECK AGAINST THE ROUTER OPT-IN (lr-250d9d): gate returning true
+# here means the merge-gate's direct-CLI invocation always keeps
+# unrestricted Bash -- which is exactly why _llm_role_routable
+# (scripts/llm-client.sh) does NOT include gate in its routable-role
+# enumeration. Routing gate through clagentic-router would silently trade
+# this function's TRUE for gate against a one-shot, tool-free router call,
+# with no signal anywhere that the swap happened. If gate is ever added to
+# _llm_role_routable in the future, this function's TRUE for gate must be
+# reconciled first -- see _llm_role_routable's own doc comment for the full
+# decision record. This is a lint-by-comment cross-reference, not a runtime
+# check: the two functions live in different files and have no shared call
+# path to assert this invariant mechanically.
 ds_llm_role_is_bash_unrestricted() {
   case "$1" in
     gate|builder|summarizer) return 0 ;;
