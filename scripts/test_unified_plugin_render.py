@@ -14,6 +14,18 @@ clagentic-lite plugin, always rendered from the checked-in agent files, with
 `model: role:<role>-chain` injected into frontmatter only when router
 injection is live. The collision is structurally impossible post-fix.
 
+lr-35315f HARDENING: the migration above converged `claude plugin list`
+state but left a real enrolled machine with an ORPHANED-BUT-RESOLVABLE
+legacy cache directory on disk -- `claude plugin uninstall` is a
+package-manager call, not a filesystem removal, and an orphaned entry can
+drop out of `plugin list` output while its cache directory (and the
+router-model-carrying agent files inside it) remains resolvable by Claude
+Code's agent resolver. TestLegacyRouterPluginCacheConvergence and
+TestDoctorOrphanedRouterPluginCheck below construct that exact fixture
+state (cache dir present, `.orphaned_at` present, injection flag unset)
+directly on disk under a fixture HOME (never the real environment's HOME)
+and assert convergence, idempotency, and doctor detection against it.
+
 VERIFICATION SCOPE (per lr-1b5a31 comment #2): this host is the dev host —
 clagentic-lite is never run enrolled here, and bin/clagentic-lite itself
 must never be executed as a subprocess for any purpose (dispatch
@@ -72,6 +84,7 @@ def _extract_render_functions():
         "_installed_plugin_render_stamp() {",
         "_doctor_check_plugin_collision() {",
         "_doctor_check_render_stamp_staleness() {",
+        "_doctor_check_orphaned_router_plugin() {",
         "_migrate_legacy_router_plugin() {",
         "_install_clagentic_lite_plugin() {",
     ):
@@ -134,6 +147,37 @@ class _RenderTestBase(unittest.TestCase):
         self.argv_log = os.path.join(self.tmp, "claude-argv.log")
         open(self.argv_log, "w").close()
 
+        # Fixture $HOME -- distinct from fake_home (CLAGENTIC_LITE_HOME).
+        # _LEGACY_ROUTER_PLUGIN_CACHE_DIR = $HOME/.claude/plugins/cache/
+        # clagentic-lite-router resolves under this fixture root only; see
+        # _run's unconditional HOME pin above.
+        self.fake_home_dir = os.path.join(self.tmp, "fake-home")
+        os.makedirs(self.fake_home_dir)
+
+    def _legacy_cache_dir(self):
+        return os.path.join(
+            self.fake_home_dir, ".claude", "plugins", "cache", "clagentic-lite-router",
+        )
+
+    def _write_legacy_cache_fixture(self, with_model_override=True):
+        """Constructs the exact broken state from lr-35315f: a legacy plugin
+        cache directory present on disk with a resolvable reviewer.md,
+        carrying `model: role:reviewer-chain` when with_model_override."""
+        agents_dir = os.path.join(
+            self._legacy_cache_dir(), "clagentic-lite-router", "0.0.0-generated", "agents",
+        )
+        os.makedirs(agents_dir)
+        body = "---\nname: reviewer\n"
+        if with_model_override:
+            body += "model: role:reviewer-chain\n"
+        body += "---\nReviewer agent body.\n"
+        with open(os.path.join(agents_dir, "reviewer.md"), "w") as f:
+            f.write(body)
+        orphan_marker = os.path.join(self._legacy_cache_dir(), ".orphaned_at")
+        with open(orphan_marker, "w") as f:
+            f.write("2026-08-12T12:39:56Z\n")
+        return agents_dir
+
     def _write_claude(self, list_output=""):
         _write_fake_claude(self.bin_dir, self.argv_log, list_output=list_output)
 
@@ -144,6 +188,14 @@ class _RenderTestBase(unittest.TestCase):
     def _run(self, script_body, extra_env=None):
         env = os.environ.copy()
         env["CLAGENTIC_LITE_HOME"] = self.fake_home
+        # HOME is ALWAYS pinned to a fixture dir under self.tmp, never the
+        # real environment's HOME -- _LEGACY_ROUTER_PLUGIN_CACHE_DIR derives
+        # from $HOME (see bin/clagentic-lite), and several tests below
+        # exercise `rm -rf` against that path. Pinning here, unconditionally,
+        # for every _run call (not just the fixture-cache tests) means a
+        # real HOME value can never reach that rm -rf regardless of which
+        # test runs or what order they run in.
+        env["HOME"] = self.fake_home_dir
         env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
         env.pop("CLAGENTIC_ROUTER_URL", None)
         env.pop("CLAGENTIC_ROUTER_INJECT_AGENT_MODEL", None)
@@ -466,6 +518,179 @@ class TestLegacyRouterPluginMigration(_RenderTestBase):
                 for l in argv if l.startswith("plugin install") or l.startswith("plugin update")),
             msg=f"a second router plugin was installed/updated: {argv}",
         )
+
+
+class TestLegacyRouterPluginCacheConvergence(_RenderTestBase):
+    """lr-35315f regression: reproduces the state that survived lr-1b5a31's
+    migration on a real enrolled machine -- legacy plugin cache directory
+    PRESENT on disk, `.orphaned_at` PRESENT, and CLAGENTIC_ROUTER_INJECT_
+    AGENT_MODEL UNSET -- and asserts convergence + idempotency against it."""
+
+    def test_orphaned_cache_present_but_plugin_list_silent_still_converges(self):
+        """The exact gap this task closes: `claude plugin list` no longer
+        mentions the legacy name (this is what "orphaned" meant on the real
+        machine -- Claude Code dropped it from the list but not from disk),
+        so the OLD code's list-gated branch never fires. The directory
+        removal must still run and must still remove the fixture."""
+        self._write_claude(list_output="clagentic-lite@clagentic-lite\n")  # no legacy entry
+        self._write_legacy_cache_fixture(with_model_override=True)
+        self.assertTrue(os.path.isdir(self._legacy_cache_dir()))
+
+        result = self._run("_migrate_legacy_router_plugin")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        self.assertFalse(
+            os.path.isdir(self._legacy_cache_dir()),
+            msg="orphaned legacy cache directory survived migration despite "
+                "not appearing in `claude plugin list` output",
+        )
+
+    def test_no_resolvable_role_chain_agent_survives_convergence(self):
+        """AC: after update, zero resolvable reviewer/auditor agents
+        carrying a role:*-chain model override remain anywhere under the
+        fixture HOME, and the base plugin render is the single live copy."""
+        self._write_claude(list_output="clagentic-lite-router@clagentic-lite-router\n")
+        self._write_legacy_cache_fixture(with_model_override=True)
+
+        result = self._run(
+            "_install_clagentic_lite_plugin",
+            extra_env={"CLAGENTIC_ROUTER_INJECT_AGENT_MODEL": "0"},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        self.assertFalse(os.path.isdir(self._legacy_cache_dir()))
+        # Base render is the single live copy: exactly one reviewer.md exists
+        # anywhere under the fixture tool home, with no model: override
+        # (injection is unset in this fixture).
+        matches = []
+        for root, _dirs, files in os.walk(self.fake_home):
+            for fn in files:
+                if fn == "reviewer.md":
+                    matches.append(os.path.join(root, fn))
+        rendered = [m for m in matches if ".clagentic/rendered-plugin" in m.replace(os.sep, "/")]
+        self.assertEqual(len(rendered), 1, msg=f"expected exactly one rendered reviewer.md: {matches}")
+        with open(rendered[0]) as f:
+            self.assertNotIn("model:", f.read())
+
+    def test_migration_idempotent_second_run_is_a_noop_on_the_fixture(self):
+        """AC: running update twice against the same fixture produces an
+        identical result -- the second run finds no legacy directory and
+        does nothing further to it (no error, no re-creation)."""
+        self._write_claude(list_output="clagentic-lite-router@clagentic-lite-router\n")
+        self._write_legacy_cache_fixture(with_model_override=True)
+
+        first = self._run("_migrate_legacy_router_plugin")
+        self.assertEqual(first.returncode, 0, msg=first.stderr)
+        self.assertFalse(os.path.isdir(self._legacy_cache_dir()))
+
+        second = self._run("_migrate_legacy_router_plugin")
+        self.assertEqual(second.returncode, 0, msg=second.stderr)
+        self.assertFalse(
+            os.path.isdir(self._legacy_cache_dir()),
+            msg="second migration run recreated the legacy cache directory",
+        )
+
+    def test_no_legacy_cache_directory_is_a_clean_noop(self):
+        """No fixture written at all -- migration must not fail or create
+        anything when there is nothing to converge."""
+        self._write_claude(list_output="clagentic-lite@clagentic-lite\n")
+        result = self._run("_migrate_legacy_router_plugin")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertFalse(os.path.isdir(self._legacy_cache_dir()))
+
+    def _no_claude_path(self):
+        """A PATH with no fake claude AND no real claude reachable -- excludes
+        self.bin_dir (where _write_claude would have put a fake one) but
+        still resolves `sh`/coreutils via the real system PATH tail."""
+        return "/usr/bin" + os.pathsep + "/bin"
+
+    def test_cache_removed_even_when_claude_not_on_path_migrate_function_directly(self):
+        """PEACHES amos.path-choice.4, reproduced at the function level: no
+        fake claude written at all, PATH excludes self.bin_dir. The
+        plugin-manager calls inside _migrate_legacy_router_plugin correctly
+        cannot run (no claude to call), but the filesystem cache-directory
+        removal must still fire -- that step never needed claude in the
+        first place."""
+        self._write_legacy_cache_fixture(with_model_override=True)
+        self.assertTrue(os.path.isdir(self._legacy_cache_dir()))
+
+        result = self._run(
+            "_migrate_legacy_router_plugin",
+            extra_env={"PATH": self._no_claude_path()},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertFalse(
+            os.path.isdir(self._legacy_cache_dir()),
+            msg="legacy cache directory survived migration with claude not on PATH",
+        )
+
+    def test_cache_removed_even_when_claude_not_on_path_full_install_flow(self):
+        """The regression PEACHES actually caught: _install_clagentic_lite_
+        plugin (the ONLY real dispatch call site, from cmd_init/cmd_update)
+        used to gate ITS OWN entry on `claude` being on PATH, before ever
+        reaching _migrate_legacy_router_plugin -- so the unconditional
+        removal inside that function was still dead code from the real
+        caller's perspective whenever claude was absent. Exercises the full
+        call path PEACHES's fixture used, not just the inner function."""
+        self._write_legacy_cache_fixture(with_model_override=True)
+        self.assertTrue(os.path.isdir(self._legacy_cache_dir()))
+
+        result = self._run(
+            "_install_clagentic_lite_plugin",
+            extra_env={"PATH": self._no_claude_path()},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertFalse(
+            os.path.isdir(self._legacy_cache_dir()),
+            msg="legacy cache directory survived a full _install_clagentic_lite_plugin "
+                "run with claude not on PATH -- PEACHES amos.path-choice.4",
+        )
+        # No rendered plugin either -- the install itself correctly still
+        # skips (no claude to install it with); only the filesystem cleanup
+        # is unconditional, not the plugin install/render.
+        self.assertFalse(os.path.isdir(os.path.join(self.fake_home, ".clagentic", "rendered-plugin")))
+
+
+class TestDoctorOrphanedRouterPluginCheck(_RenderTestBase):
+    """AC: given the orphaned-resolvable state deliberately constructed,
+    doctor reports it explicitly (lr-35315f)."""
+
+    def _script_with_reporters(self, body):
+        reporters = (
+            "test_ok()   { printf 'OK:%s\\n' \"$*\"; }\n"
+            "test_fail() { printf 'FAIL:%s\\n' \"$*\"; }\n"
+        )
+        return reporters + body
+
+    def test_orphaned_resolvable_cache_reported_as_fail(self):
+        self._write_legacy_cache_fixture(with_model_override=True)
+        result = self._run(
+            self._script_with_reporters("_doctor_check_orphaned_router_plugin test_ok test_fail"),
+            extra_env={"CLAGENTIC_ROUTER_INJECT_AGENT_MODEL": "0"},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("FAIL:", result.stdout, msg=result.stdout)
+        self.assertIn("reviewer.md", result.stdout)
+        self.assertNotIn("OK:", result.stdout)
+
+    def test_no_cache_directory_reported_as_ok(self):
+        result = self._run(
+            self._script_with_reporters("_doctor_check_orphaned_router_plugin test_ok test_fail"),
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK:", result.stdout, msg=result.stdout)
+        self.assertNotIn("FAIL:", result.stdout)
+
+    def test_cache_directory_without_model_override_still_flagged(self):
+        """Even without a model: line, a leftover legacy cache directory
+        should not exist post-migration -- flag it as FAIL too, just with
+        the narrower message (no injection-specific framing)."""
+        self._write_legacy_cache_fixture(with_model_override=False)
+        result = self._run(
+            self._script_with_reporters("_doctor_check_orphaned_router_plugin test_ok test_fail"),
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("FAIL:", result.stdout, msg=result.stdout)
 
 
 class TestDoctorPluginCollisionCheck(_RenderTestBase):

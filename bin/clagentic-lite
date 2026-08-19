@@ -708,6 +708,18 @@ _RENDERED_PLUGIN_NAME="clagentic-lite"
 # (_migrate_legacy_router_plugin) removes any install still carrying this
 # name so a machine converges to the single-plugin model in one update run.
 _LEGACY_ROUTER_PLUGIN_NAME="clagentic-lite-router"
+# Claude Code's own plugin cache root (lr-35315f) — where `claude plugin
+# install`/`uninstall` actually materialize/remove a plugin's rendered
+# files. FIXED, never derived from config/env: built from $HOME (the same
+# base every other fixed state path in this file uses, see REGISTRY/
+# GLOBAL_CONFIG/LOCAL_BIN above) plus a hardcoded literal segment
+# ("plugins/cache") plus $_LEGACY_ROUTER_PLUGIN_NAME, itself a hardcoded
+# shell constant one line up — no interpolation from a config value, repo
+# content, or CLAGENTIC_* env var reaches this path at any point. Per BOBBIE's
+# PR #164 safety constraint: a filesystem removal must target a fixed
+# literal name, never an interpolated/config-derived path — this satisfies
+# that by construction, not by convention.
+_LEGACY_ROUTER_PLUGIN_CACHE_DIR="$HOME/.claude/plugins/cache/$_LEGACY_ROUTER_PLUGIN_NAME"
 
 # _plugin_agent_needs_injection ROLE_ENV_PREFIX
 # Returns 0 (needs model: injected) when router injection is active
@@ -951,22 +963,111 @@ _doctor_check_render_stamp_staleness() {
   fi
 }
 
+# _doctor_check_orphaned_router_plugin OK_FN FAIL_FN
+# lr-35315f: detects the specific silent-failure class that slipped past
+# _doctor_check_plugin_collision above — a legacy $_LEGACY_ROUTER_PLUGIN_NAME
+# cache directory that is RESOLVABLE (its agent files are still on disk
+# under $_LEGACY_ROUTER_PLUGIN_CACHE_DIR, carrying `model: role:*-chain`
+# overrides) while CLAGENTIC_ROUTER_INJECT_AGENT_MODEL is unset on this
+# machine right now. The collision check above only catches two plugins
+# both showing up in `claude plugin list` at once; an ORPHANED cache entry
+# (Claude Code marked it orphaned but did not delete it — see
+# _migrate_legacy_router_plugin's lr-35315f notes) can be invisible to
+# `plugin list` while still shadowing the base plugin's same-named agent at
+# resolution time. This check reads the cache directory directly, not
+# `plugin list`, so it catches exactly the state `plugin list`-based
+# detection cannot.
+#
+# Not gated on injection being off — a resolvable legacy copy is wrong
+# regardless of current config (with injection ON, the base plugin's own
+# render already carries the correct chain names; a leftover legacy copy is
+# still a same-name duplicate). The unset-injection framing in the message
+# names the most confusing manifestation (silent misrouting with no
+# obviously-wrong config) but the FAIL fires whenever the directory exists.
+_doctor_check_orphaned_router_plugin() {
+  _dcorp_ok_fn="$1"
+  _dcorp_fail_fn="$2"
+
+  if [ ! -d "$_LEGACY_ROUTER_PLUGIN_CACHE_DIR" ]; then
+    "$_dcorp_ok_fn" "no orphaned $_LEGACY_ROUTER_PLUGIN_NAME cache directory found"
+    return 0
+  fi
+
+  # -print0/-0 (GNU find/xargs) rather than plain -print/xargs, so a path
+  # containing whitespace under the cache directory can't split across two
+  # xargs arguments (BOBBIE, PR #179 review: read-only diagnostic fragility,
+  # not a security finding, but worth closing while in this function).
+  _dcorp_model_files=$(find "$_LEGACY_ROUTER_PLUGIN_CACHE_DIR" -type f -name '*.md' -print0 2>/dev/null \
+    | xargs -0 grep -lE '^model:[[:space:]]*role:' 2>/dev/null || true)
+
+  if [ -n "$_dcorp_model_files" ]; then
+    "$_dcorp_fail_fn" "orphaned legacy plugin cache is RESOLVABLE and still carries router model: overrides — this shadows the base clagentic-lite plugin's same-named agents:"
+    printf '       %s\n' "$_LEGACY_ROUTER_PLUGIN_CACHE_DIR"
+    printf '%s\n' "$_dcorp_model_files" | while IFS= read -r _dcorp_f; do
+      [ -n "$_dcorp_f" ] && printf '         %s\n' "$_dcorp_f"
+    done
+    if [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" != "1" ]; then
+      printf '       CLAGENTIC_ROUTER_INJECT_AGENT_MODEL is UNSET on this machine — any dispatch that resolves to this orphaned copy sends a router model: string with no injection intended, which 422s at clagentic-router in routed mode.\n'
+    fi
+    printf '       run `clagentic-lite update` to remove it (lr-35315f hardened migration).\n'
+  else
+    "$_dcorp_fail_fn" "orphaned legacy plugin cache directory found (no resolvable model: override detected in it, but it should not exist post-migration):"
+    printf '       %s\n' "$_LEGACY_ROUTER_PLUGIN_CACHE_DIR"
+    printf '       run `clagentic-lite update` to remove it.\n'
+  fi
+}
+
 # _migrate_legacy_router_plugin
-# lr-1b5a31 migration: detects a pre-lr-1b5a31 clagentic-lite-router install
-# (the old overlay plugin) and uninstalls it. Runs unconditionally in both
-# cmd_init and cmd_update, before the unified plugin install, regardless of
-# current router config — a machine that had the legacy plugin installed and
-# has since turned router injection off must still lose the stale overlay,
-# not just stop refreshing it. One update run converges any machine to the
-# single-plugin model, whichever direction its config changed.
+# lr-1b5a31 migration, hardened by lr-35315f: detects a pre-lr-1b5a31
+# clagentic-lite-router install (the old overlay plugin) and removes it.
+# Runs unconditionally in both cmd_init and cmd_update, before the unified
+# plugin install, regardless of current router config — a machine that had
+# the legacy plugin installed and has since turned router injection off
+# must still lose the stale overlay, not just stop refreshing it.
+#
+# lr-35315f REGRESSION FIX: `claude plugin uninstall` is a package-manager
+# call, not a filesystem removal — on a real enrolled machine it left the
+# plugin's cache directory in place, marked ORPHANED (Claude Code's own
+# `.orphaned_at` marker) rather than removed, and an orphaned-but-present
+# cache entry was still RESOLVABLE by Claude Code's agent resolver (its
+# reviewer.md, still carrying `model: role:reviewer-chain`, shadowed the
+# correct base-plugin copy). Two independent gaps, both closed here:
+#
+#   1. The old code only acted when `claude plugin list` still showed the
+#      legacy name. An orphaned entry can drop out of `plugin list` entirely
+#      while its cache directory and agent files remain on disk and
+#      resolvable — so the uninstall call was never even attempted on the
+#      machine that needed it. The cache-directory removal below now runs
+#      UNCONDITIONALLY (not gated on the `plugin list` grep), so it
+#      converges even when `plugin list` no longer mentions the legacy name.
+#   2. `claude plugin uninstall`/`marketplace remove` remain the FIRST step
+#      (the correct, supported way to deregister a plugin) — but are no
+#      longer trusted alone to have removed the cache entry. After they run,
+#      $_LEGACY_ROUTER_PLUGIN_CACHE_DIR (a FIXED path — see its definition
+#      above; never interpolated from config/env) is removed directly if
+#      still present, so no orphaned-but-resolvable copy can survive a
+#      migration run. One update run converges any machine to the
+#      single-plugin model regardless of prior drift direction or whatever
+#      state Claude Code's own plugin manager left the cache in.
 _migrate_legacy_router_plugin() {
-  command -v claude >/dev/null 2>&1 || return 0
-  if claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_LEGACY_ROUTER_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
+  if command -v claude >/dev/null 2>&1 && \
+     claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_LEGACY_ROUTER_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
     say "migrating: removing legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME (superseded by config-aware single-plugin render, lr-1b5a31)..."
     claude plugin uninstall "${_LEGACY_ROUTER_PLUGIN_NAME}@${_LEGACY_ROUTER_PLUGIN_NAME}" 2>/dev/null || \
       claude plugin uninstall "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || \
-      warn "could not uninstall legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME — remove manually: claude plugin uninstall $_LEGACY_ROUTER_PLUGIN_NAME"
+      warn "could not uninstall legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME via the plugin manager — cache directory will still be removed directly below"
     claude plugin marketplace remove "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || true
+  fi
+
+  # Cache-directory removal runs regardless of whether `claude` is on PATH
+  # or the plugin still showed up in `plugin list` above (lr-35315f gap 1) —
+  # this is the actual convergence step. Fixed literal path only; see
+  # _LEGACY_ROUTER_PLUGIN_CACHE_DIR's definition for why this can never
+  # become an interpolated/config-derived delete.
+  if [ -d "$_LEGACY_ROUTER_PLUGIN_CACHE_DIR" ]; then
+    say "migrating: removing orphaned legacy plugin cache directory $_LEGACY_ROUTER_PLUGIN_CACHE_DIR..."
+    rm -rf "$_LEGACY_ROUTER_PLUGIN_CACHE_DIR" 2>/dev/null || \
+      warn "could not remove legacy plugin cache directory $_LEGACY_ROUTER_PLUGIN_CACHE_DIR — remove manually"
   fi
 }
 
@@ -978,9 +1079,25 @@ _migrate_legacy_router_plugin() {
 # the ONLY plugin-install call site in cmd_init/cmd_update; there is no
 # router-specific branch left to call separately.
 _install_clagentic_lite_plugin() {
-  command -v claude >/dev/null 2>&1 || { warn "claude not on PATH — skipping clagentic-lite plugin install"; return 0; }
-
+  # lr-35315f (PEACHES amos.path-choice.4): _migrate_legacy_router_plugin
+  # MUST run before the `claude` availability check below, not after. Its
+  # cache-directory removal step is meant to be unconditional -- the whole
+  # point of this hardening -- but the ONLY call site in the real dispatch
+  # path (cmd_init/cmd_update both go through this function) was gating
+  # entry to this function on `claude` being on PATH, so a machine with no
+  # `claude` binary (uninstalled, PATH-restricted context, etc.) never
+  # reached the migration call at all: the exact "convergence step is still
+  # conditional" defect shape as the bug this migration exists to fix, one
+  # level up the call stack from where PR #164 first made it. The
+  # plugin-manager calls inside _migrate_legacy_router_plugin (`claude
+  # plugin uninstall`/`marketplace remove`) still legitimately require
+  # `claude` and remain internally guarded by their own `command -v claude`
+  # check; only the filesystem cache-directory removal is meant to survive
+  # `claude`'s absence, and it now does regardless of where this function's
+  # own claude-availability early-return falls.
   _migrate_legacy_router_plugin
+
+  command -v claude >/dev/null 2>&1 || { warn "claude not on PATH — skipping clagentic-lite plugin install"; return 0; }
 
   _render_clagentic_lite_plugin_dir || { warn "plugin render failed — skipping plugin install"; return 1; }
 
@@ -2642,18 +2759,23 @@ cmd_doctor() {
     done
   fi
 
-  # 9d. Same-agent-name plugin collision check (generic backstop, lr-1b5a31)
-  # and 9e. render-stamp staleness check. Both factored into standalone
-  # functions (below _RNB_V1_BLOCK_LINES / near update helpers) so they are
+  # 9d. Same-agent-name plugin collision check (generic backstop, lr-1b5a31),
+  # 9e. render-stamp staleness check, and 9f. orphaned-but-resolvable legacy
+  # router plugin check (lr-35315f). All factored into standalone functions
+  # (below _RNB_V1_BLOCK_LINES / near update helpers) so they are
   # independently unit-testable against constructed `claude plugin list`
-  # fixtures without executing cmd_doctor's own dispatch. Each takes the
-  # caller's _ok/_fail closures by name (same convention cmd_doctor already
-  # uses internally) so doctor's running OK/FAIL tally stays accurate.
+  # fixtures / fixture cache directories without executing cmd_doctor's own
+  # dispatch. Each takes the caller's _ok/_fail closures by name (same
+  # convention cmd_doctor already uses internally) so doctor's running
+  # OK/FAIL tally stays accurate.
   printf '\nplugin agent-name collision check:\n'
   _doctor_check_plugin_collision _ok _fail
 
   printf '\nrendered plugin stamp:\n'
   _doctor_check_render_stamp_staleness _ok _fail
+
+  printf '\norphaned legacy router plugin check:\n'
+  _doctor_check_orphaned_router_plugin _ok _fail
 
   # 10. Memory tunables.
   printf '\nmemory tunables:\n'
