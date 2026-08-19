@@ -1,13 +1,22 @@
 """
 Regression coverage for lr-02f048: opt-in gate-path routing through
-clagentic-router for reviewer/auditor/gate (merge-gate's internal role
-literal), via CLAGENTIC_<ROLE>_VIA_ROUTER=1.
+clagentic-router for reviewer/auditor, via CLAGENTIC_<ROLE>_VIA_ROUTER=1.
 
-Five properties this file proves, exercised through the real walk_chain
-function end to end (mirroring the established fake-binary-on-PATH
-technique test_walk_chain_stderr_notice.py / test_num_turns_audit_logging.py
-already use -- a real audit.db, a real sourced llm-client.sh, a fake `curl`
-standing in for clagentic-router):
+gate (merge-gate's internal role literal) was ORIGINALLY included alongside
+reviewer/auditor by lr-02f048, then REMOVED by lr-250d9d: gate holds
+unrestricted Bash and does real multi-turn tool-calling on the direct-CLI
+path (ds_llm_role_is_bash_unrestricted, scripts/platform.sh, returns TRUE
+for it) -- the exact property that excludes Builder from this same
+enumeration. Routing it would have silently swapped a Bash-capable,
+multi-turn merge-authorization step for a one-shot, tool-free router call,
+indistinguishable from a full-capability run in audit.db. See
+TestGateExcludedFromRouting below, which mirrors TestBuilderExcludedFromRouting.
+
+Properties this file proves, exercised through the real walk_chain function
+end to end (mirroring the established fake-binary-on-PATH technique
+test_walk_chain_stderr_notice.py / test_num_turns_audit_logging.py already
+use -- a real audit.db, a real sourced llm-client.sh, a fake `curl` standing
+in for clagentic-router):
 
   1. INERT WHEN UNSET (proved mechanically, not asserted): with
      CLAGENTIC_<ROLE>_VIA_ROUTER unset, walk_chain never invokes curl at
@@ -46,6 +55,17 @@ standing in for clagentic-router):
      and logged as a THIRD, distinct "router-refused" outcome, never folded
      into "router-fallback" (Layer 2, an unreachable router is a different
      condition from a refused URL).
+  7. GATE IS EXCLUDED (lr-250d9d): CLAGENTIC_GATE_VIA_ROUTER=1 has no
+     effect, even with a reachable, healthy router -- curl is never invoked
+     (mechanical proof, same sentinel technique as Layer 0), the direct-CLI
+     chain always runs, and no audit row for the gate role ever carries
+     CLI='router'.
+  8. ROUTER PAYLOAD KEY-SET INVARIANT (lr-250d9d): the POST body
+     invoke_router builds carries EXACTLY {model, max_tokens, messages,
+     working_dir} and never a "tools" key, for any routable role -- the
+     structural property the entire routable-role allowlist depends on,
+     now asserted directly against the captured request body rather than
+     resting on code comments alone.
 
 Run with: python3 -m unittest scripts.test_router_gate_path -v
 """
@@ -386,24 +406,23 @@ class TestRouterPathHappyPath(_RouterGatePathTestBase):
                           "direct-CLI must never be invoked when the router path succeeds")
         self.assertIn('"findings": []', result.stdout)
 
-    def test_auditor_and_gate_roles_also_routable(self):
-        for role, mode in (("auditor", "markdown"), ("gate", "json")):
-            with self.subTest(role=role):
-                self.setUp()
-                payload = "clean audit, no findings" if role == "auditor" else \
-                    json.dumps({"decision": "approve", "reason": "all green"})
-                _write_curl_success_stub(self._bin_dir, payload)
-                result = self._run_walk_chain(
-                    role, mode,
-                    env_extra={
-                        "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
-                        "CLAGENTIC_ROUTER_TOKEN": "test-token",
-                        f"CLAGENTIC_{role.upper()}_VIA_ROUTER": "1",
-                    },
-                )
-                self.assertEqual(result.returncode, 0,
-                                  f"role={role} stdout={result.stdout!r} stderr={result.stderr!r}")
-                self.tearDown()
+    def test_auditor_role_also_routable(self):
+        """gate is deliberately NOT covered here -- lr-250d9d removed it
+        from _llm_role_routable's enumeration; see TestGateExcludedFromRouting
+        below for its own dedicated coverage, mirroring the existing
+        TestBuilderExcludedFromRouting pattern."""
+        payload = "clean audit, no findings"
+        _write_curl_success_stub(self._bin_dir, payload)
+        result = self._run_walk_chain(
+            "auditor", "markdown",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+                "CLAGENTIC_ROUTER_TOKEN": "test-token",
+                "CLAGENTIC_AUDITOR_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0,
+                          f"stdout={result.stdout!r} stderr={result.stderr!r}")
 
 
 class TestRouterPathLayer2Fallback(_RouterGatePathTestBase):
