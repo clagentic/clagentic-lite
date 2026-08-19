@@ -598,6 +598,58 @@ class TestLegacyRouterPluginCacheConvergence(_RenderTestBase):
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertFalse(os.path.isdir(self._legacy_cache_dir()))
 
+    def _no_claude_path(self):
+        """A PATH with no fake claude AND no real claude reachable -- excludes
+        self.bin_dir (where _write_claude would have put a fake one) but
+        still resolves `sh`/coreutils via the real system PATH tail."""
+        return "/usr/bin" + os.pathsep + "/bin"
+
+    def test_cache_removed_even_when_claude_not_on_path_migrate_function_directly(self):
+        """PEACHES amos.path-choice.4, reproduced at the function level: no
+        fake claude written at all, PATH excludes self.bin_dir. The
+        plugin-manager calls inside _migrate_legacy_router_plugin correctly
+        cannot run (no claude to call), but the filesystem cache-directory
+        removal must still fire -- that step never needed claude in the
+        first place."""
+        self._write_legacy_cache_fixture(with_model_override=True)
+        self.assertTrue(os.path.isdir(self._legacy_cache_dir()))
+
+        result = self._run(
+            "_migrate_legacy_router_plugin",
+            extra_env={"PATH": self._no_claude_path()},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertFalse(
+            os.path.isdir(self._legacy_cache_dir()),
+            msg="legacy cache directory survived migration with claude not on PATH",
+        )
+
+    def test_cache_removed_even_when_claude_not_on_path_full_install_flow(self):
+        """The regression PEACHES actually caught: _install_clagentic_lite_
+        plugin (the ONLY real dispatch call site, from cmd_init/cmd_update)
+        used to gate ITS OWN entry on `claude` being on PATH, before ever
+        reaching _migrate_legacy_router_plugin -- so the unconditional
+        removal inside that function was still dead code from the real
+        caller's perspective whenever claude was absent. Exercises the full
+        call path PEACHES's fixture used, not just the inner function."""
+        self._write_legacy_cache_fixture(with_model_override=True)
+        self.assertTrue(os.path.isdir(self._legacy_cache_dir()))
+
+        result = self._run(
+            "_install_clagentic_lite_plugin",
+            extra_env={"PATH": self._no_claude_path()},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertFalse(
+            os.path.isdir(self._legacy_cache_dir()),
+            msg="legacy cache directory survived a full _install_clagentic_lite_plugin "
+                "run with claude not on PATH -- PEACHES amos.path-choice.4",
+        )
+        # No rendered plugin either -- the install itself correctly still
+        # skips (no claude to install it with); only the filesystem cleanup
+        # is unconditional, not the plugin install/render.
+        self.assertFalse(os.path.isdir(os.path.join(self.fake_home, ".clagentic", "rendered-plugin")))
+
 
 class TestDoctorOrphanedRouterPluginCheck(_RenderTestBase):
     """AC: given the orphaned-resolvable state deliberately constructed,
