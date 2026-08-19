@@ -743,6 +743,162 @@ class TestBuilderExcludedFromRouting(_RouterGatePathTestBase):
                        "even with CLAGENTIC_BUILDER_VIA_ROUTER=1 set")
 
 
+class TestGateExcludedFromRouting(_RouterGatePathTestBase):
+    """lr-250d9d: gate is REMOVED from _llm_role_routable's enumeration.
+    lr-02f048 originally included it alongside reviewer/auditor on the
+    mistaken claim that all three were tool-restricted and single-shot on
+    the direct-CLI path -- true for reviewer/auditor, false for gate
+    (ds_llm_role_is_bash_unrestricted returns TRUE for gate, meaning the
+    direct-CLI merge-gate invocation holds unrestricted Bash and does real
+    multi-turn tool-calling). Routing it would have silently swapped that
+    for a one-shot, tool-free router call logged as an ordinary pass.
+
+    Mirrors TestBuilderExcludedFromRouting exactly: CLAGENTIC_GATE_VIA_ROUTER=1
+    must have NO effect at all, even with a reachable, healthy router and a
+    valid opt-in-shaped env var name -- curl must never be invoked."""
+
+    def test_gate_via_router_is_a_no_op(self):
+        call_log = os.path.join(self._tmpdir, "curl-calls.log")
+        open(call_log, "w").close()
+        _write_curl_sentinel_stub(self._bin_dir, call_log)
+        path = os.path.join(self._bin_dir, "claude")
+        with open(path, "w") as f:
+            f.write(textwrap.dedent("""\
+                #!/bin/sh
+                if [ "$1" = "--version" ]; then
+                  echo "claude 99.0.0"
+                  exit 0
+                fi
+                cat > /dev/null 2>&1
+                printf 'x' >> "$CLAGENTIC_TEST_CLAUDE_CALL_LOG"
+                printf 'direct-cli gate output\\n'
+                exit 0
+            """))
+        os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+
+        result = self._run_walk_chain(
+            "gate", "markdown",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+                "CLAGENTIC_ROUTER_TOKEN": "test-token",
+                "CLAGENTIC_GATE_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0, f"stderr={result.stderr!r}")
+        self.assertIn("direct-cli gate output", result.stdout,
+                       "gate must always use the direct-CLI path, "
+                       "even with CLAGENTIC_GATE_VIA_ROUTER=1 set and a "
+                       "reachable router")
+        # THE LOAD-BEARING ASSERTION: curl must never even be invoked -- a
+        # build that "handled" gate by making the router call and then
+        # discarding its result would still pass a returncode/stdout-only
+        # check. This proves the router call itself never happens, the same
+        # mechanical bar TestRouterPathLayer0UrlValidation uses for the
+        # bearer-token-never-leaves-this-process property.
+        with open(call_log) as f:
+            calls = f.read()
+        self.assertEqual(calls, "",
+                          "curl must NEVER be invoked for the gate role, "
+                          "regardless of CLAGENTIC_GATE_VIA_ROUTER or "
+                          "router reachability")
+
+    def test_gate_pass_row_never_carries_router_cli_field(self):
+        """Cross-check against the audit trail: even with the opt-in set,
+        no llm-call row for this invocation may carry CLI='router' -- every
+        row must show the real resolved CLI (claude)."""
+        _write_curl_success_stub(self._bin_dir, "some gate output")
+        _write_success_claude(self._bin_dir)
+        result = self._run_walk_chain(
+            "gate", "markdown",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+                "CLAGENTIC_ROUTER_TOKEN": "test-token",
+                "CLAGENTIC_GATE_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0, f"stderr={result.stderr!r}")
+        rows = self._audit_rows()
+        self.assertTrue(rows, "no llm-call audit rows written")
+        self.assertTrue(
+            all(details.split(":")[1] != "router" for _, details in rows if ":" in details),
+            f"no row should ever carry CLI='router' for the gate role: rows={rows!r}",
+        )
+
+
+class TestRouterPayloadKeySet(_RouterGatePathTestBase):
+    """The invariant behind the entire routable-role allowlist: the router
+    payload MUST NEVER carry a "tools" key, for any routable role, on any
+    call. Before this test, that property rested only on a hand-written
+    python dict literal inside invoke_router (scripts/llm-client.sh) and
+    three surrounding code comments -- no test asserted it. This is the
+    guard that makes a future regression of this class (e.g. someone adding
+    tool support to invoke_router without re-auditing _llm_role_routable's
+    membership) fail the build instead of shipping silently.
+
+    Asserts the exact key set the real invoke_router POSTs, captured via the
+    established _write_curl_success_capture_stub technique (same one
+    TestRouterPathWorkingDir uses to prove the working_dir value) -- not
+    merely "no tools key present" in isolation, since an exact-key-set
+    assertion also catches an unexpected key silently added or removed."""
+
+    def test_router_payload_has_exact_key_set_and_no_tools_key(self):
+        body_capture = os.path.join(self._tmpdir, "captured-body.json")
+        findings_json = json.dumps({"summary": "clean", "checked": ["security"], "findings": []})
+        _write_curl_success_capture_stub(self._bin_dir, findings_json, body_capture)
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+                "CLAGENTIC_ROUTER_TOKEN": "test-token",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0,
+                          f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        with open(body_capture) as f:
+            sent_body = json.load(f)
+        self.assertEqual(
+            set(sent_body.keys()),
+            {"model", "max_tokens", "messages", "working_dir"},
+            f"invoke_router's POST body must carry exactly this key set, "
+            f"no more and no less -- an unexpected key (e.g. a future "
+            f"\"tools\" field) must fail this test rather than ship "
+            f"silently: body={sent_body!r}",
+        )
+        self.assertNotIn("tools", sent_body,
+                          f"invoke_router must NEVER send a tools key -- "
+                          f"this is the structural property the entire "
+                          f"routable-role allowlist (reviewer/auditor only, "
+                          f"gate/builder excluded) depends on: "
+                          f"body={sent_body!r}")
+
+    def test_router_payload_message_shape_is_single_user_message(self):
+        """Narrower companion assertion: exactly one message, role 'user',
+        content is the combined prompt+input as a plain string -- not a
+        content-block-array shape that could smuggle a tool_use/tool_result
+        block in through "messages" instead of a top-level "tools" key."""
+        body_capture = os.path.join(self._tmpdir, "captured-body.json")
+        findings_json = json.dumps({"summary": "clean", "checked": ["security"], "findings": []})
+        _write_curl_success_capture_stub(self._bin_dir, findings_json, body_capture)
+        result = self._run_walk_chain(
+            "reviewer", "json",
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+                "CLAGENTIC_ROUTER_TOKEN": "test-token",
+                "CLAGENTIC_REVIEWER_VIA_ROUTER": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0, f"stderr={result.stderr!r}")
+        with open(body_capture) as f:
+            sent_body = json.load(f)
+        self.assertEqual(len(sent_body["messages"]), 1,
+                          f"exactly one message expected: {sent_body!r}")
+        self.assertEqual(sent_body["messages"][0]["role"], "user")
+        self.assertIsInstance(sent_body["messages"][0]["content"], str,
+                               f"content must be a plain string, not a "
+                               f"content-block array: {sent_body!r}")
+
+
 class TestRouterPathWorkingDir(_RouterGatePathTestBase):
     """lr-4a6268: invoke_router must send REPO_ROOT as "working_dir" in the
     POST body (scope A), and must surface a fail-loud, distinctly-labeled
