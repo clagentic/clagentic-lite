@@ -230,14 +230,37 @@ build). Run this on a real machine with `claude` installed:
 
 **What it turns on.** A third, distinct integration point from the two
 above (both of which affect an *interactive* Claude Code session).
-`CLAGENTIC_<ROLE>_VIA_ROUTER=1`, scoped to exactly three role literals —
-`reviewer`, `auditor`, `gate` (merge-gate's internal role literal) — makes
-`scripts/llm-client.sh`'s `walk_chain` POST to
-`${CLAGENTIC_ROUTER_URL}/v1/messages` (`invoke_router`, model
+`CLAGENTIC_<ROLE>_VIA_ROUTER=1`, scoped to exactly two role literals —
+`reviewer`, `auditor` — makes `scripts/llm-client.sh`'s `walk_chain` POST
+to `${CLAGENTIC_ROUTER_URL}/v1/messages` (`invoke_router`, model
 `role:<role>-chain`) instead of shelling out to `CLAGENTIC_<ROLE>_CMD` for
 that role's gate-path calls (`clagentic-lite gates review`/`ship`/etc.).
 Requires `CLAGENTIC_ROUTER_URL` to also be set — this key alone does
 nothing.
+
+**Merge-Gate is excluded (`lr-250d9d`, correcting `lr-02f048`).**
+`CLAGENTIC_GATE_VIA_ROUTER` still exists as a config key so `doctor` can
+warn on it, but setting it to `1` has **no effect** — `gate` was removed
+from `_llm_role_routable`'s enumeration. The original `lr-02f048` task
+justified routing reviewer/auditor/gate together on the claim that all
+three are "already tool-restricted and single-shot" on both CLI carriers.
+That is true for reviewer and auditor. It was **false for gate**: the
+merge-gate's direct-CLI invocation holds **unrestricted Bash** and does
+**real multi-turn tool-calling** (`ds_llm_role_is_bash_unrestricted`,
+`scripts/platform.sh`, returns `true` for `gate` — the same predicate that
+makes `invoke_claude` skip the `--allowedTools`/`--disallowedTools`
+restriction for it). Routing gate would have silently converted a
+Bash-capable, multi-turn merge-authorization step into a one-shot,
+tool-free text completion, logged as an ordinary `pass` row
+indistinguishable from a full-capability run — `invoke_router` never sends
+a `tools` key at all (§ "Repo-scoping" below), so there was nothing in the
+wire protocol that would have surfaced the loss. A loud warning at call
+time was considered and rejected: it would tell an operator, after the
+fact, that a merge had already been authorized by a gate that could not
+run Bash — the one gate whose entire job is the final check before code
+lands on the default branch. Gate now shares the same fail-closed answer
+Builder already has: excluded from the routable set entirely, not merely
+labeled when the capability loss occurs.
 
 **What it does NOT turn on.** Unset (either the per-role key or
 `CLAGENTIC_ROUTER_URL`), this path is **byte-for-byte inert** — the
@@ -261,14 +284,16 @@ review block rate fell 10-40% → ~0%). **This is now fixed** — see
 belongs to is worth understanding before you enable this switch for
 `reviewer`/`auditor` on a repo whose reviews you rely on.
 
-**Builder is deliberately excluded.** It holds unrestricted Bash and does
-real multi-turn agentic tool-calling; every clagentic-router adapter
-currently declares `SupportsTools=false` (`lr-be9454`), so a tool-bearing
-routed request gets refused (422), not silently degraded.
-Reviewer/Auditor/Merge-Gate are already tool-restricted and single-shot on
-both CLI carriers (`invoke_claude`'s `--allowedTools`/`--disallowedTools`,
-`invoke_codex`'s `--disable shell_tool -s read-only`) and never send a
-`tools` field either way, so routing them carries no tool-drop risk.
+**Builder and Merge-Gate are both deliberately excluded, for the same
+reason.** Both hold unrestricted Bash and do real multi-turn agentic
+tool-calling; every clagentic-router adapter currently declares
+`SupportsTools=false` (`lr-be9454`), so a tool-bearing routed request gets
+refused (422), not silently degraded — a defense Builder/Merge-Gate never
+reach because they never route in the first place. Reviewer/Auditor are
+already tool-restricted and single-shot on both CLI carriers
+(`invoke_claude`'s `--allowedTools`/`--disallowedTools`, `invoke_codex`'s
+`--disable shell_tool -s read-only`) and never send a `tools` field either
+way, so routing them carries no tool-drop risk.
 
 ### Repo-scoping via `working_dir` (lr-4a6268) — FIXED, read this before relying on it
 
@@ -392,7 +417,7 @@ log destination.
 ```sh
 CLAGENTIC_REVIEWER_VIA_ROUTER=0
 CLAGENTIC_AUDITOR_VIA_ROUTER=0
-CLAGENTIC_GATE_VIA_ROUTER=0
+CLAGENTIC_GATE_VIA_ROUTER=0   # kept for `doctor` to warn on; always a no-op — see "Merge-Gate is excluded" above
 ```
 
 See `share/config.example`'s router section for the full commented config
@@ -403,11 +428,16 @@ surface (`$CLAGENTIC_LITE_HOME/share/config.example` once installed).
 ## Honest limitation across all three
 
 Routed roles lose tool-calling and true streaming through
-clagentic-router's CLI adapters — fine for a one-shot Reviewer/Auditor/
-Merge-Gate pass that only reads a diff and returns text, wrong for a
-tool-using Builder that needs to read/write files mid-conversation. Do not
-point the Builder role through the router. This is why neither §2 nor §3
-ever touches anything but Reviewer, Auditor, and Merge Gate.
+clagentic-router's CLI adapters — fine for a one-shot pass that only reads
+a diff and returns text, wrong for a role that needs to read/write files
+or run commands mid-conversation. Do not point the Builder role through
+the router — this is why §2's frontmatter injection still touches
+Reviewer/Auditor/Merge-Gate (it changes what model a subagent's
+frontmatter *names*, not whether the gate path routes), but §3's gate-path
+switch touches only Reviewer/Auditor: Merge-Gate needs the same
+tool-calling Builder does on the direct-CLI path (§3 "Merge-Gate is
+excluded"), so it stays off §3's routable set even though §2's injection
+key still applies to it.
 
 ---
 
