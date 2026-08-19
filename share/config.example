@@ -586,13 +586,17 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # CLAGENTIC_ROUTER_URL is set. A THIRD, distinct integration point from
 # both keys above (those affect an INTERACTIVE Claude Code session; this
 # affects the GATE-PATH one-shot scripts/llm-client.sh call). Scoped to
-# exactly three roles: reviewer, auditor, gate (merge-gate's internal role
-# name). Builder is deliberately excluded -- it holds unrestricted Bash and
-# does real multi-turn tool-calling, and every clagentic-router adapter
-# currently declares SupportsTools=false (a routed request carrying tools
-# gets refused with a 422, not silently degraded -- see clagentic-router's
-# own adapter-capability work). Reviewer/Auditor/Merge-Gate never carry a
-# tools field on either CLI carrier today, so this is safe for them.
+# exactly two roles: reviewer, auditor. Builder AND Merge-Gate are both
+# deliberately excluded -- both hold unrestricted Bash and do real
+# multi-turn tool-calling, and every clagentic-router adapter currently
+# declares SupportsTools=false (a routed request carrying tools gets
+# refused with a 422, not silently degraded -- see clagentic-router's own
+# adapter-capability work). Setting CLAGENTIC_GATE_VIA_ROUTER=1 below is a
+# harmless no-op, not a working opt-in -- see docs/ROUTER.md §3
+# "Merge-Gate is excluded" (lr-250d9d) for why it stays that way even
+# though the key still exists for doctor to warn about a stale config.
+# Reviewer/Auditor never carry a tools field on either CLI carrier today,
+# so routing them is safe.
 #
 # When set to 1 for a role, that role's llm-client.sh calls POST to
 # CLAGENTIC_ROUTER_URL's /v1/messages (model: role:<role>-chain, matching
