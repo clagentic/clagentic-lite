@@ -2724,10 +2724,11 @@ cmd_doctor() {
       printf '       This injection point is UNVERIFIED against a live interactive session (claude-code GH#44385 territory). See README "Verifying on your machine".\n'
     fi
 
-    # GATE-PATH ROUTER OPT-IN, per-role (lr-02f048): CLAGENTIC_<ROLE>_VIA_ROUTER=1
-    # for reviewer/auditor/gate makes scripts/llm-client.sh POST to this
-    # router instead of shelling out to a CLI directly — a SEPARATE opt-in
-    # from CLAGENTIC_ROUTER_INJECT_AGENT_MODEL above (that one is the
+    # GATE-PATH ROUTER OPT-IN, per-role (lr-02f048; gate carved out by
+    # lr-250d9d): CLAGENTIC_<ROLE>_VIA_ROUTER=1 for reviewer/auditor makes
+    # scripts/llm-client.sh POST to this router instead of shelling out to
+    # a CLI directly — a SEPARATE opt-in from
+    # CLAGENTIC_ROUTER_INJECT_AGENT_MODEL above (that one is the
     # interactive-subagent frontmatter injection; this one is the
     # gate-path, one-shot llm-client.sh call). CLAGENTIC_<ROLE>_CHAIN/_TIER
     # become no-ops for a routed role — surfaced here so that is visible
@@ -2735,7 +2736,23 @@ cmd_doctor() {
     # never enforced/refused: an operator who leaves both configured (e.g.
     # mid-migration) still gets a working gate, just with the CHAIN/TIER
     # values unused for that role.
-    for _vr_role in REVIEWER AUDITOR GATE; do
+    #
+    # GATE IS DELIBERATELY NOT IN THE LOOP LIST BELOW (lr-250d9d): unlike
+    # reviewer/auditor, the merge-gate role holds unrestricted Bash and does
+    # real multi-turn tool-calling on the direct-CLI path
+    # (ds_llm_role_is_bash_unrestricted, scripts/platform.sh) — routing it
+    # would silently swap that for a one-shot, tool-free router call.
+    # _llm_role_routable (scripts/llm-client.sh) never routes gate
+    # regardless of this env var's value, so CLAGENTIC_GATE_VIA_ROUTER=1 is
+    # ALWAYS a no-op, not merely "no-op when CHAIN/TIER also set" the way
+    # reviewer/auditor's no-op case is. Reporting it via the same INFO line
+    # the routable roles get ("this role's gate-path calls POST to
+    # clagentic-router") would be actively false for gate, so it gets its
+    # own, differently-worded check instead of joining the loop.
+    if [ "${CLAGENTIC_GATE_VIA_ROUTER:-0}" = "1" ]; then
+      printf '  WARN CLAGENTIC_GATE_VIA_ROUTER=1 is set but has NO EFFECT — the merge-gate role is never routed through clagentic-router (it holds unrestricted Bash and does real multi-turn tool-calling; routing it would silently drop both). Gate-path calls for this role always use CLAGENTIC_GATE_CMD/_TIER/_CHAIN directly. Unset this var to avoid the false impression that gate is being routed.\n'
+    fi
+    for _vr_role in REVIEWER AUDITOR; do
       _vr_key="CLAGENTIC_${_vr_role}_VIA_ROUTER"
       _vr_on=$(eval "printf '%s' \"\${${_vr_key}:-0}\"")
       [ "$_vr_on" = "1" ] || continue
