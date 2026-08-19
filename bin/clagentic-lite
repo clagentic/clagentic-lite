@@ -993,8 +993,12 @@ _doctor_check_orphaned_router_plugin() {
     return 0
   fi
 
-  _dcorp_model_files=$(find "$_LEGACY_ROUTER_PLUGIN_CACHE_DIR" -type f -name '*.md' -print 2>/dev/null \
-    | xargs grep -lE '^model:[[:space:]]*role:' 2>/dev/null || true)
+  # -print0/-0 (GNU find/xargs) rather than plain -print/xargs, so a path
+  # containing whitespace under the cache directory can't split across two
+  # xargs arguments (BOBBIE, PR #179 review: read-only diagnostic fragility,
+  # not a security finding, but worth closing while in this function).
+  _dcorp_model_files=$(find "$_LEGACY_ROUTER_PLUGIN_CACHE_DIR" -type f -name '*.md' -print0 2>/dev/null \
+    | xargs -0 grep -lE '^model:[[:space:]]*role:' 2>/dev/null || true)
 
   if [ -n "$_dcorp_model_files" ]; then
     "$_dcorp_fail_fn" "orphaned legacy plugin cache is RESOLVABLE and still carries router model: overrides — this shadows the base clagentic-lite plugin's same-named agents:"
@@ -1075,9 +1079,25 @@ _migrate_legacy_router_plugin() {
 # the ONLY plugin-install call site in cmd_init/cmd_update; there is no
 # router-specific branch left to call separately.
 _install_clagentic_lite_plugin() {
-  command -v claude >/dev/null 2>&1 || { warn "claude not on PATH — skipping clagentic-lite plugin install"; return 0; }
-
+  # lr-35315f (PEACHES amos.path-choice.4): _migrate_legacy_router_plugin
+  # MUST run before the `claude` availability check below, not after. Its
+  # cache-directory removal step is meant to be unconditional -- the whole
+  # point of this hardening -- but the ONLY call site in the real dispatch
+  # path (cmd_init/cmd_update both go through this function) was gating
+  # entry to this function on `claude` being on PATH, so a machine with no
+  # `claude` binary (uninstalled, PATH-restricted context, etc.) never
+  # reached the migration call at all: the exact "convergence step is still
+  # conditional" defect shape as the bug this migration exists to fix, one
+  # level up the call stack from where PR #164 first made it. The
+  # plugin-manager calls inside _migrate_legacy_router_plugin (`claude
+  # plugin uninstall`/`marketplace remove`) still legitimately require
+  # `claude` and remain internally guarded by their own `command -v claude`
+  # check; only the filesystem cache-directory removal is meant to survive
+  # `claude`'s absence, and it now does regardless of where this function's
+  # own claude-availability early-return falls.
   _migrate_legacy_router_plugin
+
+  command -v claude >/dev/null 2>&1 || { warn "claude not on PATH — skipping clagentic-lite plugin install"; return 0; }
 
   _render_clagentic_lite_plugin_dir || { warn "plugin render failed — skipping plugin install"; return 1; }
 
