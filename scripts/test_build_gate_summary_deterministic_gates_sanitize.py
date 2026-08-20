@@ -47,18 +47,19 @@ TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 # unconditionally defangs), and prompt-injection-shaped imperative text
 # riding along in otherwise-plausible gate output.
 #
-# DELIBERATELY SINGLE-LINE (no embedded \n): _read_deterministic_gates reads
-# `outcome`/`details` back out of a single `sqlite3 -separator '|'` row via
-# `cut -d'|'`, which -- pre-existing this fold-in, unrelated to sanitization
-# -- mis-splits when `details` itself contains a newline (cut operates
-# line-by-line; a multi-line details value corrupts `outcome` with the
-# details' own trailing lines). That is a real, separate defect in the
-# row-parsing step, out of scope for this sanitize-only fold-in (reproduced
-# even with plain multi-line text, no hostile content required) -- filed as
-# a followup rather than fixed here. Newline-stripping itself is still
-# covered directly, at the sanitizer unit level, by
-# TestLlmFieldSanitizeDirect below, which calls _llm_field_sanitize alone
-# and never touches the DB round-trip this limitation lives in.
+# DELIBERATELY SINGLE-LINE (no embedded \n): this fixture predates lr-acf632,
+# which fixed _read_deterministic_gates's row-parsing shape (it used to read
+# `outcome`/`details` out of one `sqlite3 -separator '|'` row via `cut`,
+# which mis-split on an embedded newline in `details`; fixed by querying
+# `outcome` and `details` as separate single-column queries, so there is no
+# second column to mis-split against). This fixture stays single-line
+# because it is specifically about hostile CONTENT (ANSI escapes, forged
+# fence labels, injection-shaped text), not about newline-splitting -- that
+# is now covered end-to-end, through the real DB round-trip on both emitter
+# branches, by test_build_gate_summary_deterministic_gates_newline.py.
+# Newline-stripping itself is still covered directly, at the sanitizer unit
+# level, by TestLlmFieldSanitizeDirect below, which calls
+# _llm_field_sanitize alone.
 _HOSTILE_DETAILS = (
     "semgrep clean; "
     "\x1b[31mFAKE ERROR\x1b[0m; "
