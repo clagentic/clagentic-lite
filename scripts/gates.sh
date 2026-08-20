@@ -4522,6 +4522,18 @@ print(json.dumps(block))
 # callers (cmd_merge_gate, ds_merge_gate_prompt) proceed to the LLM call
 # exactly as they do today when this block is entirely absent -- adding this
 # field never introduces a new fail-closed path.
+#
+# ROUND-TRIP SANITIZATION (lr-367a21 fold-in, BOBBIE): each gate's "details"
+# text is attacker-reachable (e.g. .clagentic/semgrep-exclude rule-id lines
+# -> _SAST_EXCL_IDS -> cmd_sast's pass details string -> gate_runs -> here)
+# and, unlike every sibling external-text round-trip into an LLM prompt in
+# this codebase (adversarial findings, invariant feed, change-class hint),
+# was not routed through _llm_field_sanitize (platform.sh:710) before this
+# fold-in. Sanitized once, at this single shared read point below, so both
+# build_gate_summary emitter branches (jq and python3) see identical
+# already-clean text and cannot diverge. "outcome" is a closed 4-value set
+# (pass/warn/skip/block) written only by cmd_log_run's own callers, never
+# free text, so it is deliberately NOT sanitized — only "details" is.
 _read_deterministic_gates() {
   _rdg_db="$REPO_ROOT/.clagentic/lite/audit.db"
   _rdg_unavailable=false
@@ -4535,6 +4547,21 @@ _read_deterministic_gates() {
       if [ -n "$_rdg_row" ]; then
         _rdg_outcome=$(printf '%s' "$_rdg_row" | cut -d'|' -f1)
         _rdg_details=$(printf '%s' "$_rdg_row" | cut -d'|' -f2-)
+        # SECURITY (lr-367a21 fold-in, BOBBIE): details is attacker-reachable
+        # free text -- e.g. .clagentic/semgrep-exclude rule-id lines flow
+        # into _SAST_EXCL_IDS (cmd_sast), into the sast pass details string,
+        # into this gate_runs row, into this payload field, into the
+        # merge-gate prompt. Route it through the SAME sanitizer every other
+        # external-text round-trip into an LLM prompt in this codebase uses
+        # (_llm_field_sanitize, platform.sh:710 -- see its call sites at
+        # gates.sh's own _invariant_feed_append and llm-client.sh's
+        # change-class-hint/deferrals-fallback sites) before it ever reaches
+        # the JSON entry below. Sanitizing here, at the single shared read
+        # point, means both emitter branches of build_gate_summary (jq and
+        # python3) receive already-clean text -- neither can diverge from
+        # the other, and outcome is untouched (closed 4-value set, not free
+        # text, nothing to sanitize).
+        _rdg_details=$(_llm_field_sanitize "$_rdg_details")
         if command -v jq >/dev/null 2>&1; then
           _rdg_entry=$(jq -cn --arg o "$_rdg_outcome" --arg d "$_rdg_details" '{"outcome": $o, "details": $d}')
         elif command -v python3 >/dev/null 2>&1; then
