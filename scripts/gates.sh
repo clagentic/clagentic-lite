@@ -4499,6 +4499,94 @@ print(json.dumps(block))
   printf '""'
 }
 
+# _read_deterministic_gates (lr-367a21) — INFORMATIONAL ONLY.
+#
+# Reads the latest gate_runs row for each deterministic gate (secrets, deps,
+# sast) from audit.db and prints a JSON object on stdout:
+#
+#   {"secrets": {"outcome": "pass", "details": "..."}, "deps": null,
+#    "sast": {"outcome": "warn", "details": "..."}, "audit_db_unavailable": false}
+#
+# A gate with no row at all (never ran) is null — distinct from an outcome
+# string, so the payload can tell "absent" apart from any real outcome
+# (pass/warn/skip/block). Nothing here changes a merge decision: this
+# function only reads what cmd_secrets/cmd_deps/cmd_sast already wrote via
+# cmd_log_run; it does not re-run them, does not re-derive their outcome,
+# and its own read failure never blocks (see below).
+#
+# DEGRADE, NEVER BLOCK (same pattern as gates.sh:3258's per-step-failure
+# hint read, and platform.sh's ds_audit_log/ds_sqlite3 -- audit-db access is
+# best-effort by contract everywhere else in this codebase). No sqlite3, no
+# audit.db, or an unreadable/corrupt DB all degrade the same way: every gate
+# field is null and audit_db_unavailable is true. build_gate_summary's
+# callers (cmd_merge_gate, ds_merge_gate_prompt) proceed to the LLM call
+# exactly as they do today when this block is entirely absent -- adding this
+# field never introduces a new fail-closed path.
+#
+# ROUND-TRIP SANITIZATION (lr-367a21 fold-in, BOBBIE): each gate's "details"
+# text is attacker-reachable (e.g. .clagentic/semgrep-exclude rule-id lines
+# -> _SAST_EXCL_IDS -> cmd_sast's pass details string -> gate_runs -> here)
+# and, unlike every sibling external-text round-trip into an LLM prompt in
+# this codebase (adversarial findings, invariant feed, change-class hint),
+# was not routed through _llm_field_sanitize (platform.sh:710) before this
+# fold-in. Sanitized once, at this single shared read point below, so both
+# build_gate_summary emitter branches (jq and python3) see identical
+# already-clean text and cannot diverge. "outcome" is a closed 4-value set
+# (pass/warn/skip/block) written only by cmd_log_run's own callers, never
+# free text, so it is deliberately NOT sanitized — only "details" is.
+_read_deterministic_gates() {
+  _rdg_db="$REPO_ROOT/.clagentic/lite/audit.db"
+  _rdg_unavailable=false
+  _rdg_secrets='null'
+  _rdg_deps='null'
+  _rdg_sast='null'
+  if [ -f "$_rdg_db" ] && command -v sqlite3 >/dev/null 2>&1; then
+    for _rdg_gate in secrets deps sast; do
+      _rdg_row=$(ds_sqlite3 -separator '|' "$_rdg_db" \
+        "SELECT outcome, details FROM gate_runs WHERE gate='$_rdg_gate' ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
+      if [ -n "$_rdg_row" ]; then
+        _rdg_outcome=$(printf '%s' "$_rdg_row" | cut -d'|' -f1)
+        _rdg_details=$(printf '%s' "$_rdg_row" | cut -d'|' -f2-)
+        # SECURITY (lr-367a21 fold-in, BOBBIE): details is attacker-reachable
+        # free text -- e.g. .clagentic/semgrep-exclude rule-id lines flow
+        # into _SAST_EXCL_IDS (cmd_sast), into the sast pass details string,
+        # into this gate_runs row, into this payload field, into the
+        # merge-gate prompt. Route it through the SAME sanitizer every other
+        # external-text round-trip into an LLM prompt in this codebase uses
+        # (_llm_field_sanitize, platform.sh:710 -- see its call sites at
+        # gates.sh's own _invariant_feed_append and llm-client.sh's
+        # change-class-hint/deferrals-fallback sites) before it ever reaches
+        # the JSON entry below. Sanitizing here, at the single shared read
+        # point, means both emitter branches of build_gate_summary (jq and
+        # python3) receive already-clean text -- neither can diverge from
+        # the other, and outcome is untouched (closed 4-value set, not free
+        # text, nothing to sanitize).
+        _rdg_details=$(_llm_field_sanitize "$_rdg_details")
+        if command -v jq >/dev/null 2>&1; then
+          _rdg_entry=$(jq -cn --arg o "$_rdg_outcome" --arg d "$_rdg_details" '{"outcome": $o, "details": $d}')
+        elif command -v python3 >/dev/null 2>&1; then
+          _rdg_entry=$(python3 -c 'import json,sys; print(json.dumps({"outcome": sys.argv[1], "details": sys.argv[2]}))' "$_rdg_outcome" "$_rdg_details")
+        else
+          # No JSON encoder to safely build the entry -- degrade this gate's
+          # field to null rather than risk unescaped interpolation; the
+          # caller's own no-JSON-tool branch already marks the whole payload
+          # gate_summary_degraded in this case.
+          _rdg_entry='null'
+        fi
+        case "$_rdg_gate" in
+          secrets) _rdg_secrets="$_rdg_entry" ;;
+          deps) _rdg_deps="$_rdg_entry" ;;
+          sast) _rdg_sast="$_rdg_entry" ;;
+        esac
+      fi
+    done
+  else
+    _rdg_unavailable=true
+  fi
+  printf '{"secrets": %s, "deps": %s, "sast": %s, "audit_db_unavailable": %s}' \
+    "$_rdg_secrets" "$_rdg_deps" "$_rdg_sast" "$_rdg_unavailable"
+}
+
 build_gate_summary() {
   RV="$REPO_ROOT/.clagentic/lite/last-review.json"
   AD="$REPO_ROOT/.clagentic/lite/last-adversarial.md"
@@ -4823,6 +4911,10 @@ build_gate_summary() {
     # instructions — belt-and-suspenders alongside the stdin/system-prompt
     # channel separation the wrapper already provides.
     ADF_FENCED_PAYLOAD=$(_fence_adversarial_findings "$ADF_PAYLOAD")
+    # INFORMATIONAL ONLY (lr-367a21): see _read_deterministic_gates's doc
+    # comment. Never gates a decision -- read failure degrades to nulls +
+    # audit_db_unavailable, never a block.
+    DETERMINISTIC_GATES_PAYLOAD=$(_read_deterministic_gates)
     cat <<EOF
 {
   "review": $RV_PAYLOAD,
@@ -4839,7 +4931,8 @@ build_gate_summary() {
   "adversarial_acks": $ACKS_PAYLOAD,
   "accepted_risks": $AR_PAYLOAD,
   "introduces_ack_file": $INTRODUCES_ACK_FILE,
-  "threshold": "$THRESHOLD"
+  "threshold": "$THRESHOLD",
+  "deterministic_gates": $DETERMINISTIC_GATES_PAYLOAD
 }
 EOF
     return 0
@@ -4858,7 +4951,13 @@ EOF
     [ -f "$ADF_META" ] && ADF_META_ARG="$ADF_META"
     [ -f "$ACKS_FILE" ] && ACKS_ARG="$ACKS_FILE"
     [ -f "$AR_FILE" ] && AR_ARG="$AR_FILE"
-    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" <<'PY'
+    # INFORMATIONAL ONLY (lr-367a21): computed in sh (same helper the jq
+    # branch above calls) and handed in pre-built, rather than re-querying
+    # audit.db inside the python heredoc -- one read site, one degrade
+    # posture, for both emitter branches. See _read_deterministic_gates's
+    # doc comment.
+    DETERMINISTIC_GATES_PAYLOAD=$(_read_deterministic_gates)
+    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" "$DETERMINISTIC_GATES_PAYLOAD" <<'PY'
 import json, sys
 threshold           = sys.argv[1]
 introduces_ack      = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
@@ -4870,6 +4969,15 @@ ar_path             = sys.argv[7] if len(sys.argv) > 7 else ""
 adf_path            = sys.argv[8] if len(sys.argv) > 8 else ""
 adversarial_degraded = sys.argv[9].lower() == "true" if len(sys.argv) > 9 else False
 adf_meta_path       = sys.argv[10] if len(sys.argv) > 10 else ""
+# Pre-built by _read_deterministic_gates (sh) -- fail-open to an
+# audit-db-unavailable envelope if this somehow arrives empty/unparseable
+# (defense in depth; the sh helper always emits valid JSON on this path).
+try:
+    deterministic_gates = json.loads(sys.argv[11]) if len(sys.argv) > 11 and sys.argv[11] else {
+        "secrets": None, "deps": None, "sast": None, "audit_db_unavailable": True,
+    }
+except Exception:
+    deterministic_gates = {"secrets": None, "deps": None, "sast": None, "audit_db_unavailable": True}
 review = None
 if rv_path:
     try:
@@ -4973,6 +5081,7 @@ print(json.dumps({
     "adversarial_findings_dropped_count": adv_dropped_count,
     "adversarial_acks": acks,
     "accepted_risks": ar,
+    "deterministic_gates": deterministic_gates,
     "introduces_ack_file": introduces_ack,
     "threshold": threshold,
 }))
