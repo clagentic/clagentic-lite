@@ -2801,19 +2801,49 @@ walk_chain() {
         ERR_HINT=$(printf '%s\n' "$_stripped_err" | grep -v '^[[:space:]]*$' | head -1 | cut -c1-200)
       fi
       [ -z "$ERR_HINT" ] && ERR_HINT="non-empty stderr (exit=$EXIT_CODE)"
-    elif [ -s "$TMP_OUT" ]; then
+    elif [ "$EXIT_CODE" -ne 0 ] && [ -s "$TMP_OUT" ]; then
+      # INVOCATION-FAILED, empty stderr (lr-c0c9f3): the CLI exited non-zero
+      # but wrote nothing to TMP_ERR -- e.g. invoke_claude pipes the input
+      # file into the CLI (`cat "$INPUT_FILE" | ...`), which suppresses the
+      # CLI's own no-stdin warning, the one thing that would otherwise have
+      # populated TMP_ERR. Claude Code's auth failure has exactly this
+      # shape: exit 1, "Failed to authenticate. API Error: 401 Invalid
+      # bearer token" on STDOUT, stderr empty. Without this branch, that
+      # case fell through to SCHEMA-INVALID below and was misreported as an
+      # output schema mismatch rather than an invocation failure -- a
+      # 100%-reproducible auth failure presented as a model-quality problem.
+      # Requires TMP_OUT to be non-empty (there is a diagnostic to surface)
+      # so a nonzero exit with BOTH streams empty still falls through to the
+      # pre-existing final else below ("empty output (exit=$EXIT_CODE)"),
+      # unchanged. Never a vendor auth string match (see non-goals) --
+      # SCHEMA-INVALID below stays reachable only at EXIT_CODE=0, matching
+      # its own documentation and its two unwrap siblings above. Hint
+      # selection mirrors the TMP_ERR branch's ANSI-strip +
+      # first-non-blank-line fallback, but deliberately does NOT copy that
+      # branch's ^ERROR:-preferring tail -1 heuristic -- that exists for
+      # codex's banner-plus-retry-noise STDERR stream and has no counterpart
+      # on a STDOUT diagnostic.
+      ANY_INVOCATION_FAILED=1
+      _stripped_out=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$TMP_OUT" 2>/dev/null) || _stripped_out=$(cat "$TMP_OUT")
+      ERR_HINT=$(printf '%s\n' "$_stripped_out" | grep -v '^[[:space:]]*$' | head -1 | cut -c1-200)
+      if [ -z "$ERR_HINT" ]; then
+        ERR_HINT="no diagnostic output"
+      fi
+      ERR_HINT="cli exited $EXIT_CODE: $ERR_HINT"
+    elif [ "$EXIT_CODE" -eq 0 ] && [ -s "$TMP_OUT" ]; then
       # SCHEMA-INVALID (the third of the minimum three failure classes,
       # lr-33958f): unwrap SUCCEEDED (UNWRAP_CODE=0, or the mode has no
       # unwrap contract) but the resulting JSON still failed
       # validate_output's per-role shape check -- e.g. valid JSON like
       # {"error":"auth expired"} that is not a findings/decision envelope
       # at all. Distinct from unwrap-failed (no parseable JSON existed) and
-      # from invocation-failed (the CLI itself errored). Grouped with the
-      # "infra" cause for the OVERALL chain classification below (a
-      # schema-invalid step still means the caller cannot trust the model
-      # output any more than an invocation failure can), but logged with
-      # its own precise ERR_HINT so the audit row does not conflate it with
-      # a prose-only unwrap failure.
+      # from invocation-failed (the CLI itself errored) -- reachable only at
+      # EXIT_CODE=0 now that the branch above claims every nonzero-exit,
+      # empty-stderr case (lr-c0c9f3). Grouped with the "infra" cause for
+      # the OVERALL chain classification below (a schema-invalid step still
+      # means the caller cannot trust the model output any more than an
+      # invocation failure can), but logged with its own precise ERR_HINT so
+      # the audit row does not conflate it with a prose-only unwrap failure.
       ANY_INVOCATION_FAILED=1
       case "$ROLE_L" in
         reviewer|auditor)
