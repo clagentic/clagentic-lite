@@ -1378,13 +1378,13 @@ invoke_claude() {
   if [ -n "$MODEL" ]; then
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
-      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG --model "$MODEL" \
+      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" $CLAUDE_ROUTER_ENV_ENSURE claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG --model "$MODEL" \
         $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" $TOOLS_FLAGS ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE" || _claude_exit=$?
   else
     # shellcheck disable=SC2086
     ( unset CLAUDE_CODE_SESSION_ID
-      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG \
+      cat "$INPUT_FILE" | $DS_TIMEOUT_CMD "$CALL_TIMEOUT" $CLAUDE_ROUTER_ENV_ENSURE claude --print $OUTPUT_FORMAT_FLAG $BARE_FLAG \
         $SYSTEM_PROMPT_FLAG "$(cat "$PROMPT_FILE")" $TOOLS_FLAGS ) \
       > "$OUTPUT_FILE" 2> "$ERR_FILE" || _claude_exit=$?
   fi
@@ -1457,6 +1457,72 @@ invoke_claude() {
 # actual CLI invocation -- correct whether DS_TIMEOUT_CMD resolved to a real
 # timeout binary or to the shell-function fallback.
 NON_CLAUDE_ENV_STRIP="env -u AWS_BEARER_TOKEN_BEDROCK -u ANTHROPIC_BEDROCK_BASE_URL -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN"
+
+# CLAUDE ROUTER-ENV ENSURE (lr-0ac353) -- the MIRROR case of
+# NON_CLAUDE_ENV_STRIP directly above: a subprocess that MUST have a var the
+# ambient session may not supply, instead of one that must NOT inherit vars
+# it does carry.
+#
+# ROOT CAUSE: invoke_claude spawns `claude --print` relying entirely on
+# ambient session env for auth mode. On a Bedrock-mode host (operator has
+# CLAGENTIC_ROUTER_BEDROCK_MODE=1 configured -- see bin/clagentic-lite's
+# settings.json stamp and docs/ROUTER.md "Bedrock-mode sessions"), an
+# operator whose CURRENT interactive session happens to be in
+# Enterprise/OAuth mode (CLAUDE_CODE_USE_BEDROCK unset in THIS shell) leaves
+# that var unset when this gate-path call spawns. The claude CLI then speaks
+# Anthropic-native /v1/messages to the router instead of the Bedrock
+# /model/<id>/invoke path -- the router only routes role:/chain:/backend:
+# -prefixed models, so a concrete model name passes straight through to
+# api.anthropic.com carrying the router's local admin token as the
+# Authorization header. Upstream 401s. Deterministic, every call, regardless
+# of the operator's own interactive claude-switch state -- which is exactly
+# why detection must NOT read the operator's ambient CLAUDE_CODE_USE_BEDROCK
+# (gate behavior must not depend on what mode the human's OWN shell happens
+# to be in right now).
+#
+# DETECTION PREDICATE (design call, lr-0ac353): key off ANTHROPIC_BEDROCK_BASE_URL
+# being non-empty in the environment this script itself runs in, rather than
+# grepping router.env or adding a fourth, independent CLAGENTIC_* boolean.
+# bin/clagentic-lite already stamps ANTHROPIC_BEDROCK_BASE_URL into the
+# enrolled repo's .claude/settings.json env block specifically and only when
+# CLAGENTIC_ROUTER_BEDROCK_MODE=1 was set at enroll/update time (see
+# scripts/test_router_bedrock_settings_stamp.py) -- that settings.json env
+# block is process-wide for the session (the same fact that makes
+# NON_CLAUDE_ENV_STRIP necessary above), so by the time this script runs,
+# ANTHROPIC_BEDROCK_BASE_URL is ALREADY the live, host-declared source of
+# truth for "this host is enrolled in Bedrock mode" -- clagentic-lite wrote
+# it, clagentic-lite already inherits it, and invoke_claude is the one call
+# site deliberately NOT stripping it (NON_CLAUDE_ENV_STRIP's docstring: "the
+# whole point of the asymmetry"). Reusing it here needs no new config knob,
+# no new file to keep in sync with the stamp, and cannot drift from the
+# stamp the way a fourth independent boolean or a router.env grep could.
+# Rejected alternatives: (1) grepping
+# ${CLAGENTIC_ROUTER_ENV_FILE:-$HOME/.config/clagentic/router.env} for
+# ^CLAUDE_CODE_USE_BEDROCK=1 -- no such file exists anywhere in this
+# codebase (confirmed: nothing writes a router.env), so this would be a new
+# file format and a new writer with no prior art; (2) a fourth
+# CLAGENTIC_CLAUDE_BEDROCK_MODE config key -- functionally identical to
+# reading ANTHROPIC_BEDROCK_BASE_URL directly but adds a second value an
+# operator must keep synchronized with CLAGENTIC_ROUTER_BEDROCK_MODE, a
+# drift hazard the settings.json stamp already makes unnecessary.
+# CLAGENTIC_ROUTER_BEDROCK_ENSURE_VAR is still env-overridable (AGENTS.md
+# invariant 6) for a host that sets CLAUDE_CODE_USE_BEDROCK via some other
+# signal entirely and wants to opt this predicate onto a different variable
+# name without a code change.
+#
+# ORDERING: same constraint NON_CLAUDE_ENV_STRIP documents above --
+# DS_TIMEOUT_CMD may resolve to ds_timeout_missing, a SHELL FUNCTION `env`
+# cannot exec. CLAUDE_ROUTER_ENV_ENSURE is therefore placed AFTER
+# $DS_TIMEOUT_CMD "$CALL_TIMEOUT" at both invoke_claude call sites, wrapping
+# only the `claude` invocation itself, exactly like NON_CLAUDE_ENV_STRIP.
+#
+# Empty by default (no Bedrock declaration -> no env prefix -> spawned
+# command byte-identical to today's, acceptance test 3). Non-empty only when
+# the host-declared predicate is true.
+CLAGENTIC_ROUTER_BEDROCK_ENSURE_VAR="${CLAGENTIC_ROUTER_BEDROCK_ENSURE_VAR:-ANTHROPIC_BEDROCK_BASE_URL}"
+CLAUDE_ROUTER_ENV_ENSURE=""
+eval "_crbev=\"\${${CLAGENTIC_ROUTER_BEDROCK_ENSURE_VAR}:-}\""
+[ -n "$_crbev" ] && CLAUDE_ROUTER_ENV_ENSURE="env CLAUDE_CODE_USE_BEDROCK=1"
 
 # Codex non-interactive.
 #
