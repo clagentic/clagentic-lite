@@ -4534,6 +4534,26 @@ print(json.dumps(block))
 # already-clean text and cannot diverge. "outcome" is a closed 4-value set
 # (pass/warn/skip/block) written only by cmd_log_run's own callers, never
 # free text, so it is deliberately NOT sanitized — only "details" is.
+#
+# NEWLINE-SAFE ROW READ (lr-acf632): outcome and details used to be read via
+# ONE query ("SELECT outcome, details ...") with -separator '|', then split
+# with `cut -d'|' -f1`/`-f2-`. cut is LINE-oriented: a details value with an
+# embedded newline made its own trailing lines bleed into the outcome field
+# on the next cut invocation, corrupting the very pass/warn/skip/block
+# distinction this function exists to preserve (the lr-367a21 root-cause
+# invariant). No current cmd_secrets/cmd_deps/cmd_sast call site actually
+# writes a literal newline into details today (confirmed: _SAST_EXCL_IDS,
+# the one attacker-reachable path BOBBIE traced, is built by reading
+# .clagentic/semgrep-exclude one line at a time via `read -r`, which cannot
+# hand a single token an embedded \n), so this was latent, not live -- but
+# ds_sql_escape only escapes quotes, not newlines, so a future/renamed
+# caller writing multi-line details would have silently corrupted outcome.
+# Fixed by querying outcome and details SEPARATELY, one column per query --
+# there is no second column to mis-split against, so an embedded newline in
+# details can never bleed into outcome, regardless of its content. This
+# avoids `-json` (never used elsewhere in this codebase, and requires
+# sqlite3 >= 3.33 -- not a floor this script asserts anywhere) and avoids
+# python3 (the jq-only emitter path must keep working without it).
 _read_deterministic_gates() {
   _rdg_db="$REPO_ROOT/.clagentic/lite/audit.db"
   _rdg_unavailable=false
@@ -4542,11 +4562,13 @@ _read_deterministic_gates() {
   _rdg_sast='null'
   if [ -f "$_rdg_db" ] && command -v sqlite3 >/dev/null 2>&1; then
     for _rdg_gate in secrets deps sast; do
-      _rdg_row=$(ds_sqlite3 -separator '|' "$_rdg_db" \
-        "SELECT outcome, details FROM gate_runs WHERE gate='$_rdg_gate' ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
-      if [ -n "$_rdg_row" ]; then
-        _rdg_outcome=$(printf '%s' "$_rdg_row" | cut -d'|' -f1)
-        _rdg_details=$(printf '%s' "$_rdg_row" | cut -d'|' -f2-)
+      _rdg_id=$(ds_sqlite3 "$_rdg_db" \
+        "SELECT id FROM gate_runs WHERE gate='$_rdg_gate' ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
+      if [ -n "$_rdg_id" ]; then
+        _rdg_outcome=$(ds_sqlite3 "$_rdg_db" \
+          "SELECT outcome FROM gate_runs WHERE id=$_rdg_id;" 2>/dev/null || echo "")
+        _rdg_details=$(ds_sqlite3 "$_rdg_db" \
+          "SELECT details FROM gate_runs WHERE id=$_rdg_id;" 2>/dev/null || echo "")
         # SECURITY (lr-367a21 fold-in, BOBBIE): details is attacker-reachable
         # free text -- e.g. .clagentic/semgrep-exclude rule-id lines flow
         # into _SAST_EXCL_IDS (cmd_sast), into the sast pass details string,
