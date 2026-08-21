@@ -581,6 +581,80 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # Requires CLAGENTIC_ROUTER_URL also set -- this key alone does nothing.
 # CLAGENTIC_ROUTER_BEDROCK_MODE=0
 
+# CLAGENTIC_ROUTER_BEDROCK_TOKEN: dedicated bearer-token source for the
+# Bedrock pair (AWS_BEARER_TOKEN_BEDROCK) stamped above, DISTINCT from
+# CLAGENTIC_ROUTER_TOKEN (which continues to feed only ANTHROPIC_AUTH_TOKEN,
+# the direct-API pair). Prior to this key, CLAGENTIC_ROUTER_TOKEN was reused
+# verbatim for both variable names -- nothing could distinguish a router
+# admin token from a real AWS Bedrock bearer token by value alone (this was
+# the root cause of an incident where the router's own local token was sent
+# straight to a real Bedrock endpoint and 401'd). Leave unset to stamp an
+# empty AWS_BEARER_TOKEN_BEDROCK (matching the pre-existing behavior for an
+# unset CLAGENTIC_ROUTER_TOKEN) -- clagentic-lite never falls back to
+# CLAGENTIC_ROUTER_TOKEN's value for this key.
+# CLAGENTIC_ROUTER_BEDROCK_TOKEN=
+
+# ---------- host auth-mode declaration (CLAGENTIC_AUTH_MODE) ----------
+# ONE declared value, consumed everywhere a Bedrock-vs-direct-API auth
+# decision is made, instead of every consumption site re-deriving it from
+# ambient env. Unset by default (UNDECLARED) -- and UNDECLARED is defined to
+# be exactly today's behavior for every existing install: no code path in
+# this repo branches on CLAGENTIC_AUTH_MODE being unset, only on it matching
+# one of the four values below.
+#
+# Values (closed set -- any other value is treated as UNDECLARED and
+# `doctor` warns about the typo):
+#   anthropic-oauth  — direct Anthropic API via OAuth (the common case;
+#                       Claude Code's default auth, no router, no Bedrock).
+#   enterprise       — direct Anthropic API via an Enterprise/API-key setup.
+#   bedrock-sso      — Amazon Bedrock auth via an AWS SSO profile
+#                       (CLAUDE_CODE_USE_BEDROCK=1, credentials sourced from
+#                       an AWS SSO token cache -- see the SSO-cache
+#                       preflight below).
+#   bedrock-api-key  — Amazon Bedrock auth via a Bedrock API key/bearer
+#                       token (Claude Code's documented "Option E"), no SSO
+#                       cache involved.
+#
+# WHAT THIS DOES NOT DO: this key is deliberately NOT a value you should
+# copy from documentation or another machine. It describes what auth THIS
+# HOST actually uses. Set it once, on the machine where it is true, in
+# ~/.config/clagentic/config or the enrolled repo's .clagentic/config --
+# never hardcode a value here in a committed file, and never propagate one
+# host's value to another host's config by copy-paste without checking it
+# is still true there (AGENTS.md invariant 6: nothing host-specific
+# hardcoded in code or shared defaults).
+#
+# CONSUMERS:
+#   - scripts/llm-client.sh's invoke_claude: when CLAGENTIC_AUTH_MODE is
+#     bedrock-sso or bedrock-api-key, every claude --print gate-path call
+#     ensures CLAUDE_CODE_USE_BEDROCK=1 regardless of the calling session's
+#     own ambient value -- this REPLACES the earlier, narrower predicate
+#     (keying off ANTHROPIC_BEDROCK_BASE_URL being non-empty), which is
+#     inert under an Enterprise/OAuth session-blanking payload that sets
+#     the sentinel var to an EMPTY (but present) string.
+#   - scripts/llm-client.sh's walk_chain: a mode-implied readiness preflight
+#     runs before any review/gate LLM call. bedrock-sso reads the AWS SSO
+#     token cache's expiresAt and fails fast (a degraded envelope, not a
+#     hang) naming the expiry timestamp when it has already passed. Every
+#     other mode (including UNDECLARED) is a no-op -- this preflight never
+#     runs at all unless CLAGENTIC_AUTH_MODE=bedrock-sso specifically.
+#   - `clagentic-lite doctor`: reports a contradiction when the declared
+#     mode does not match observed ambient env (e.g. declared
+#     anthropic-oauth but CLAUDE_CODE_USE_BEDROCK=1 is set in the shell
+#     doctor runs in), naming both sources so the mismatch is visible
+#     instead of silently trusted.
+#
+# CLAGENTIC_AUTH_MODE=
+
+# CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR: override the directory the bedrock-sso
+# preflight scans for AWS SSO token cache files (each a JSON file with an
+# "expiresAt" ISO-8601 field -- the standard `aws sso login` cache shape,
+# https://docs.aws.amazon.com/cli/latest/userguide/sso-configure-profile-token.html).
+# Defaults to $HOME/.aws/sso/cache, the AWS CLI's own default location.
+# Override only if your SSO cache lives somewhere non-standard on this host
+# (AGENTS.md invariant 6 -- never hardcode a host-specific path in code).
+# CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR=
+
 # ---------- gate-path routing (optional, lr-02f048) ----------
 # CLAGENTIC_<ROLE>_VIA_ROUTER: separate opt-in, OFF by default even when
 # CLAGENTIC_ROUTER_URL is set. A THIRD, distinct integration point from

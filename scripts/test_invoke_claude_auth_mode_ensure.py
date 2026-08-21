@@ -1,32 +1,29 @@
 """
-Regression coverage for lr-0ac353: invoke_claude never sets
-CLAUDE_CODE_USE_BEDROCK, so on a Bedrock-mode router host every
-non-routable role (notably gate/merge-gate) 401s.
+Regression coverage for lr-6d4a1f, REPLACING scripts/test_invoke_claude_bedrock_env_ensure.py
+(deleted by this same change -- see that file's history / this task's PR body).
 
-ROOT CAUSE: invoke_claude (scripts/llm-client.sh) spawns `claude --print
---model <concrete-model>` relying entirely on AMBIENT session env for auth
-mode. On a Bedrock-mode router host, an operator whose CURRENT interactive
-session happens to be in Enterprise/OAuth mode leaves CLAUDE_CODE_USE_BEDROCK
-unset, so the CLI speaks Anthropic-native /v1/messages to the router instead
-of the Bedrock /model/<id>/invoke path. The router only routes
-role:/chain:/backend:-prefixed models; a concrete model name is
-passthrough-forwarded to api.anthropic.com carrying the router's local admin
-token as the caller's Authorization header. Upstream 401s. Deterministic,
-regardless of the operator's OWN interactive claude-switch state.
+BACKGROUND: lr-0ac353 shipped a detection predicate keying off
+ANTHROPIC_BEDROCK_BASE_URL being non-empty via an eval-spliced indirect
+variable read. AVASARALA's fold-in (lr-6d4a1f comment #1)
+PROVED that predicate INERT under the exact Enterprise/OAuth session-blanking
+payload it targeted: that payload sets the four router-scoped vars
+(including ANTHROPIC_BEDROCK_BASE_URL) to EMPTY STRINGS, not unset -- set=yes
+value_len=0. `${VAR:-}` collapses set-but-empty with unset, so the predicate
+never fired. The bug lr-0ac353 targeted was UNCHANGED on the host class it
+targeted.
 
-DETECTION PREDICATE (this task's design call): key off
-ANTHROPIC_BEDROCK_BASE_URL being non-empty in the environment invoke_claude
-itself runs in. bin/clagentic-lite's _render_claude_settings_body already
-stamps that var into the enrolled repo's .claude/settings.json env block
-specifically and only when CLAGENTIC_ROUTER_BEDROCK_MODE=1 was set at
-enroll/update time (scripts/test_router_bedrock_settings_stamp.py) -- that
-settings.json env block is process-wide for the session (the same fact that
-makes NON_CLAUDE_ENV_STRIP, immediately above CLAUDE_ROUTER_ENV_ENSURE in
-llm-client.sh, necessary), so ANTHROPIC_BEDROCK_BASE_URL is already the
-live, host-declared source of truth for Bedrock mode by the time this script
-runs -- clagentic-lite wrote it, clagentic-lite already inherits it
-unchanged (invoke_claude is deliberately NOT covered by NON_CLAUDE_ENV_STRIP
--- see that constant's own docstring, "the whole point of the asymmetry").
+THE FIX (this task): a single declared config key, CLAGENTIC_AUTH_MODE
+(enum: anthropic-oauth | enterprise | bedrock-sso | bedrock-api-key,
+UNDECLARED default). invoke_claude's CLAUDE_ROUTER_ENV_ENSURE now reads this
+declaration directly instead of an env var a settings payload can blank --
+CLAGENTIC_AUTH_MODE is never carried in the stamped settings.json env block
+at all, so no session-blanking payload can zero it out. This REPLACES the
+old predicate, per the builder directive in lr-6d4a1f comment #1 ("the
+predicate block ... is REPLACED by the declaration read, not augmented -- do
+not run two predicates"). It also removes the
+CLAGENTIC_ROUTER_BEDROCK_ENSURE_VAR eval-splice entirely, closing lr-fe9b3d
+as superseded (there is no longer a configurable variable NAME to splice
+into an eval, only a fixed, closed-enum config VALUE read with `case`).
 
 These tests source the REAL scripts/llm-client.sh (test_source_helpers.py's
 guard-sentinel technique, same as every other llm-client.sh-sourcing test in
@@ -34,29 +31,46 @@ this suite) with a stub `claude` on PATH that both dumps its own environ
 (proving/disproving CLAUDE_CODE_USE_BEDROCK's presence) and answers a valid
 JSON envelope so walk_chain-driven tests (2, 4) see a clean primary pass.
 
-Six acceptance cases (task's own enumeration):
-  1. Host whose settings.json declares Bedrock mode (ANTHROPIC_BEDROCK_BASE_URL
-     set), invoke_claude called from a NON-Bedrock interactive session (this
-     test's own shell does not itself set CLAUDE_CODE_USE_BEDROCK) -> the
-     spawned claude child process has CLAUDE_CODE_USE_BEDROCK=1 in ITS OWN
-     environ, proving the fix, not merely that the step "passed".
-  2. role=gate completes with cli=claude as PRIMARY, no "fallback:" stderr
-     line, on that host.
-  3. Host with no Bedrock declaration -> spawned command's env carries no
-     CLAUDE_CODE_USE_BEDROCK at all -- byte-identical to today's behavior.
-  4. Reviewer run forced past the router (router unreachable) succeeds via
+Acceptance cases (task's own enumeration, description ACs 1-6 + comment #1's
+folded-in ACs 7-9):
+  1. UNDECLARED CLAGENTIC_AUTH_MODE -> spawned command's env carries no
+     CLAUDE_CODE_USE_BEDROCK at all -- byte-identical to today's behavior
+     for every existing install (no install predating this task has ever
+     set CLAGENTIC_AUTH_MODE).
+  2. CLAGENTIC_AUTH_MODE=bedrock-sso -> the spawned claude child process has
+     CLAUDE_CODE_USE_BEDROCK=1 in ITS OWN environ, regardless of the calling
+     session's own ambient value.
+  3. CLAGENTIC_AUTH_MODE=bedrock-api-key -> same ensure fires (both
+     bedrock-* values are equivalent for this specific ensure; they differ
+     only for the SSO-cache readiness preflight, covered elsewhere).
+  4. role=gate completes with cli=claude as PRIMARY, no "fallback:" stderr
+     line, on a bedrock-sso-declared host.
+  5. Reviewer run forced past the router (router unreachable) succeeds via
      the claude:flagship layer-2 direct-CLI fallback instead of
      INFRA_DEGRADED, and still carries CLAUDE_CODE_USE_BEDROCK into that
-     fallback call on a Bedrock-declared host.
-  5. NON_CLAUDE_ENV_STRIP behavior for a non-Claude CLI (invoke_generic) is
+     fallback call on a bedrock-sso-declared host.
+  6. NON_CLAUDE_ENV_STRIP behavior for a non-Claude CLI (invoke_generic) is
      unchanged by this addition -- the two constants do not interact.
-  6. DS_TIMEOUT_CMD resolving to the ds_timeout_missing shell function still
+  7. DS_TIMEOUT_CMD resolving to the ds_timeout_missing shell function still
      triggers INV-1a's fail-closed diagnostic (exit 99, distinct stderr)
      rather than "env: No such file or directory" -- proving the ORDERING
      requirement (CLAUDE_ROUTER_ENV_ENSURE placed AFTER $DS_TIMEOUT_CMD
      "$CALL_TIMEOUT", never wrapping it).
+  8. THE EXACT REGRESSION CASE (AC 7 from lr-6d4a1f comment #1): the
+     Enterprise/OAuth blanking payload sets ANTHROPIC_BEDROCK_BASE_URL and
+     its siblings to EMPTY STRINGS (set-but-empty, not unset) -- with
+     CLAGENTIC_AUTH_MODE=bedrock-sso declared, CLAUDE_CODE_USE_BEDROCK=1
+     must still be ensured. This is the exact fixture gap that let the old
+     predicate's inertness through undetected (the old 662-line test file
+     covered only unset and non-empty ANTHROPIC_BEDROCK_BASE_URL).
+  9. Anything OTHER than the two bedrock-* values (anthropic-oauth,
+     enterprise, an unrecognized typo'd value, or unset) never ensures
+     CLAUDE_CODE_USE_BEDROCK, even when ANTHROPIC_BEDROCK_BASE_URL happens
+     to be non-empty in the environment -- the declaration is authoritative,
+     not the old env-derived sentinel (which is deliberately no longer read
+     at all).
 
-Run with: python3 -m unittest scripts.test_invoke_claude_bedrock_env_ensure -v
+Run with: python3 -m unittest scripts.test_invoke_claude_auth_mode_ensure -v
 """
 import json
 import os
@@ -76,19 +90,12 @@ from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-# The Bedrock-declaration var this task's detection predicate reads. Kept as
-# a plain literal here (test-side), independent of the
-# CLAGENTIC_ROUTER_BEDROCK_ENSURE_VAR default in llm-client.sh -- a
-# divergence between the two would itself be a regression this test exists
-# to catch (test_default_ensure_var_is_anthropic_bedrock_base_url below).
-_BEDROCK_DECLARATION_VAR = "ANTHROPIC_BEDROCK_BASE_URL"
-
 
 def _write_environ_dump_success_claude(bin_dir, out_path, num_turns=5):
     """Stub `claude` that dumps its OWN environ to out_path, then emits a
     valid --output-format json envelope on stdout and exits 0 -- lets a
-    single call site prove BOTH env-content (acceptance 1/3/4) and
-    walk_chain pass/fallback behavior (acceptance 2/4) without two stubs."""
+    single call site prove BOTH env-content (acceptance 2/3/8/9) and
+    walk_chain pass/fallback behavior (acceptance 4/5) without two stubs."""
     path = os.path.join(bin_dir, "claude")
     inner = json.dumps({"summary": "clean diff", "checked": ["security"], "findings": []})
     envelope = json.dumps({
@@ -120,10 +127,7 @@ ENVELOPE
 def _write_environ_dump_success_claude_gate_decision(bin_dir, out_path, num_turns=3):
     """Stub `claude` for the gate role specifically: gate mode expects a
     decision/reason-shaped JSON object (merge-gate.md's schema), not the
-    findings-array shape reviewer/auditor use -- an unwrap against the
-    wrong shape fails (zero role-shaped fenced candidates), which is a
-    genuine walk_chain outcome, not a fixture bug, so the gate-role test
-    needs its own correctly-shaped stub."""
+    findings-array shape reviewer/auditor use."""
     path = os.path.join(bin_dir, "claude")
     inner = json.dumps({"decision": "approve", "reason": "clean"})
     envelope = json.dumps({
@@ -152,6 +156,28 @@ ENVELOPE
     return path
 
 
+def _write_valid_sso_cache(cache_dir):
+    """Write one AWS SSO token-cache-shaped JSON file with expiresAt far in
+    the future -- the mode-implied readiness preflight (_llm_auth_mode_preflight)
+    treats this as 'ready'. Tests that exercise CLAGENTIC_AUTH_MODE=bedrock-sso
+    for something OTHER than the preflight itself (the CLAUDE_CODE_USE_BEDROCK
+    ensure, the gate no-fallback property, the Layer-2 fallback property) must
+    point CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR at a fixture like this one so the
+    preflight does not trip first and mask what they are actually testing."""
+    import datetime
+    os.makedirs(cache_dir, exist_ok=True)
+    future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+    path = os.path.join(cache_dir, "fixture-token.json")
+    with open(path, "w") as f:
+        json.dump({
+            "startUrl": "https://example.invalid/start",
+            "region": "us-east-1",
+            "accessToken": "fixture-not-a-real-token",
+            "expiresAt": future.strftime("%Y-%m-%dT%H:%M:%SUTC"),
+        }, f)
+    return path
+
+
 def _read_environ_dump(out_path):
     names = {}
     with open(out_path) as f:
@@ -168,7 +194,7 @@ class _InvokeClaudeEnsureTestBase(unittest.TestCase):
     own environ for inspection."""
 
     def _run_invoke_claude_and_capture_child_env(self, extra_parent_env=None):
-        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-bedrock-ensure-")
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-auth-mode-ensure-")
         try:
             bin_dir = os.path.join(tmpdir, "bin")
             os.makedirs(bin_dir)
@@ -187,6 +213,7 @@ class _InvokeClaudeEnsureTestBase(unittest.TestCase):
             env = dict(os.environ)
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
+            env.pop("CLAGENTIC_AUTH_MODE", None)
             if extra_parent_env:
                 env.update(extra_parent_env)
             env.update(source_env(llm_client=True))
@@ -217,83 +244,68 @@ class _InvokeClaudeEnsureTestBase(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-class TestAcceptance1BedrockHostNonBedrockSession(_InvokeClaudeEnsureTestBase):
-    """1. Host whose settings.json declares Bedrock mode, invoke_claude
-    called from a NON-Bedrock interactive session -> the spawned claude
-    child carries CLAUDE_CODE_USE_BEDROCK=1 in its own environ (this is
-    what makes the real CLI select the /model/<id>/invoke wire protocol
-    instead of /v1/messages -- the step-passing shape alone, by itself,
-    would not distinguish this from the pre-fix bug, since the stub always
-    exits 0)."""
-
-    def test_claude_code_use_bedrock_set_in_child_env(self):
-        child_env, r = self._run_invoke_claude_and_capture_child_env(
-            extra_parent_env={_BEDROCK_DECLARATION_VAR: "https://bedrock-mantle.example.invalid"},
-        )
-        self.assertIn(
-            "CLAUDE_CODE_USE_BEDROCK", child_env,
-            f"invoke_claude must ensure CLAUDE_CODE_USE_BEDROCK on a "
-            f"Bedrock-declared host regardless of the calling session's own "
-            f"ambient value. child_env keys={sorted(child_env)!r}",
-        )
-        self.assertEqual(child_env["CLAUDE_CODE_USE_BEDROCK"], "1")
-
-    def test_ambient_claude_code_use_bedrock_unset_in_parent_session(self):
-        """Confirms the fixture actually represents 'a NON-Bedrock
-        interactive session' -- CLAUDE_CODE_USE_BEDROCK is unset in the
-        PARENT shell before invoke_claude runs; the child only gets it
-        because invoke_claude's own env-ensure logic added it, not because
-        it leaked in ambiently."""
-        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-bedrock-ensure-parent-")
-        try:
-            env = dict(os.environ)
-            env.pop("CLAUDE_CODE_USE_BEDROCK", None)
-            env[_BEDROCK_DECLARATION_VAR] = "https://bedrock-mantle.example.invalid"
-            self.assertNotIn("CLAUDE_CODE_USE_BEDROCK", env)
-        finally:
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-class TestAcceptance3NoDeclarationNoChange(_InvokeClaudeEnsureTestBase):
-    """3. Host with no Bedrock declaration -> spawned command's child env
+class TestAcceptance1UndeclaredNoChange(_InvokeClaudeEnsureTestBase):
+    """1. UNDECLARED CLAGENTIC_AUTH_MODE -> spawned command's child env
     carries no CLAUDE_CODE_USE_BEDROCK at all -- byte-identical to today's
     behavior (no env prefix inserted)."""
 
-    def test_no_bedrock_declaration_no_claude_code_use_bedrock_in_child(self):
+    def test_undeclared_auth_mode_no_claude_code_use_bedrock_in_child(self):
         child_env, r = self._run_invoke_claude_and_capture_child_env()
         self.assertNotIn(
             "CLAUDE_CODE_USE_BEDROCK", child_env,
-            f"with no Bedrock declaration, invoke_claude must not inject "
+            f"with CLAGENTIC_AUTH_MODE unset, invoke_claude must not inject "
             f"CLAUDE_CODE_USE_BEDROCK -- spawned command must stay "
             f"byte-identical to pre-fix behavior. child_env "
             f"keys={sorted(child_env)!r}",
         )
 
-    def test_bedrock_declaration_var_empty_string_no_change(self):
-        """Empty-string (not merely unset) ANTHROPIC_BEDROCK_BASE_URL must
-        also be treated as 'no declaration' -- an operator who unstamps
-        Bedrock mode by clearing the var, rather than removing it, must get
-        the same byte-identical behavior."""
+
+class TestAcceptance2And3BedrockValuesEnsure(_InvokeClaudeEnsureTestBase):
+    """2/3. Both bedrock-* declared values ensure CLAUDE_CODE_USE_BEDROCK=1
+    on the spawned claude child, regardless of the calling session's own
+    ambient value."""
+
+    def test_bedrock_sso_ensures_claude_code_use_bedrock(self):
         child_env, r = self._run_invoke_claude_and_capture_child_env(
-            extra_parent_env={_BEDROCK_DECLARATION_VAR: ""},
+            extra_parent_env={"CLAGENTIC_AUTH_MODE": "bedrock-sso"},
         )
-        self.assertNotIn("CLAUDE_CODE_USE_BEDROCK", child_env)
+        self.assertEqual(
+            child_env.get("CLAUDE_CODE_USE_BEDROCK"), "1",
+            f"invoke_claude must ensure CLAUDE_CODE_USE_BEDROCK when "
+            f"CLAGENTIC_AUTH_MODE=bedrock-sso. child_env keys={sorted(child_env)!r}",
+        )
+
+    def test_bedrock_api_key_ensures_claude_code_use_bedrock(self):
+        child_env, r = self._run_invoke_claude_and_capture_child_env(
+            extra_parent_env={"CLAGENTIC_AUTH_MODE": "bedrock-api-key"},
+        )
+        self.assertEqual(child_env.get("CLAUDE_CODE_USE_BEDROCK"), "1")
+
+    def test_ambient_claude_code_use_bedrock_unset_in_parent_session(self):
+        """Confirms the fixture actually represents 'a NON-Bedrock
+        interactive session' -- CLAUDE_CODE_USE_BEDROCK is unset in the
+        PARENT shell before invoke_claude runs; the child only gets it
+        because invoke_claude's own env-ensure logic added it."""
+        env = dict(os.environ)
+        env.pop("CLAUDE_CODE_USE_BEDROCK", None)
+        env["CLAGENTIC_AUTH_MODE"] = "bedrock-sso"
+        self.assertNotIn("CLAUDE_CODE_USE_BEDROCK", env)
 
 
-class TestAcceptance2GateRoleNoFallback(unittest.TestCase):
-    """2. role=gate completes with cli=claude as PRIMARY, no 'fallback:'
-    line, on a Bedrock-declared host -- exercised through the real
-    walk_chain function end to end (mirroring
-    test_walk_chain_stderr_notice.py's established technique)."""
+class TestAcceptance4GateRoleNoFallback(unittest.TestCase):
+    """4. role=gate completes with cli=claude as PRIMARY, no 'fallback:'
+    line, on a bedrock-sso-declared host -- exercised through the real
+    walk_chain function end to end."""
 
     def _run_walk_chain_gate(self, extra_env=None):
-        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-bedrock-gate-")
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-auth-mode-gate-")
         try:
             bin_dir = os.path.join(tmpdir, "bin")
             os.makedirs(bin_dir)
             dump_path = os.path.join(tmpdir, "child-environ.txt")
             _write_environ_dump_success_claude_gate_decision(bin_dir, dump_path)
+            sso_cache_dir = os.path.join(tmpdir, "sso-cache")
+            _write_valid_sso_cache(sso_cache_dir)
 
             script = textwrap.dedent(f"""\
                 export PATH='{bin_dir}':"$PATH"
@@ -304,6 +316,8 @@ class TestAcceptance2GateRoleNoFallback(unittest.TestCase):
             """)
             env = dict(os.environ)
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
+            env.pop("CLAGENTIC_AUTH_MODE", None)
+            env["CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR"] = sso_cache_dir
             if extra_env:
                 env.update(extra_env)
             env.update(source_env(llm_client=True))
@@ -322,13 +336,13 @@ class TestAcceptance2GateRoleNoFallback(unittest.TestCase):
 
     def test_gate_role_primary_pass_no_fallback_notice_on_bedrock_host(self):
         r, child_env = self._run_walk_chain_gate(
-            extra_env={_BEDROCK_DECLARATION_VAR: "https://bedrock-mantle.example.invalid"},
+            extra_env={"CLAGENTIC_AUTH_MODE": "bedrock-sso"},
         )
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout!r} stderr={r.stderr!r}")
         self.assertNotIn(
             "fallback", r.stderr,
             f"role=gate must complete via the PRIMARY (claude) step on a "
-            f"Bedrock-declared host -- a fallback: notice here would mean "
+            f"bedrock-sso-declared host -- a fallback: notice here would mean "
             f"the primary step 401'd and the chain silently advanced past "
             f"it, exactly the class of failure this task fixes. "
             f"stderr={r.stderr!r}",
@@ -336,21 +350,21 @@ class TestAcceptance2GateRoleNoFallback(unittest.TestCase):
         self.assertEqual(child_env.get("CLAUDE_CODE_USE_BEDROCK"), "1")
 
 
-class TestAcceptance4ReviewerLayer2FallbackCarriesEnsure(unittest.TestCase):
-    """4. Reviewer run forced past the router (router stopped/unreachable)
+class TestAcceptance5ReviewerLayer2FallbackCarriesEnsure(unittest.TestCase):
+    """5. Reviewer run forced past the router (router stopped/unreachable)
     succeeds via the claude:flagship layer-2 direct-CLI fallback instead of
     INFRA_DEGRADED -- and that fallback call still carries
-    CLAUDE_CODE_USE_BEDROCK on a Bedrock-declared host, proving the fix
-    reaches the Layer-2 direct-CLI path, not merely a hypothetical primary
-    call that never actually happens when the router is configured."""
+    CLAUDE_CODE_USE_BEDROCK on a bedrock-sso-declared host."""
 
     def test_layer2_fallback_call_carries_claude_code_use_bedrock(self):
-        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-bedrock-layer2-")
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-auth-mode-layer2-")
         try:
             bin_dir = os.path.join(tmpdir, "bin")
             os.makedirs(bin_dir)
             dump_path = os.path.join(tmpdir, "child-environ.txt")
             _write_environ_dump_success_claude(bin_dir, dump_path)
+            sso_cache_dir = os.path.join(tmpdir, "sso-cache")
+            _write_valid_sso_cache(sso_cache_dir)
 
             # CLAGENTIC_ROUTER_URL points at a port nothing listens on, so
             # invoke_router's curl fails fast and walk_chain falls through
@@ -367,7 +381,8 @@ class TestAcceptance4ReviewerLayer2FallbackCarriesEnsure(unittest.TestCase):
             """)
             env = dict(os.environ)
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
-            env[_BEDROCK_DECLARATION_VAR] = "https://bedrock-mantle.example.invalid"
+            env["CLAGENTIC_AUTH_MODE"] = "bedrock-sso"
+            env["CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR"] = sso_cache_dir
             env.update(source_env(llm_client=True))
             r = subprocess.run(
                 ["sh", "-c", script, LLM_CLIENT_SH],
@@ -393,7 +408,7 @@ class TestAcceptance4ReviewerLayer2FallbackCarriesEnsure(unittest.TestCase):
             self.assertEqual(
                 child_env.get("CLAUDE_CODE_USE_BEDROCK"), "1",
                 f"the Layer-2 direct-CLI fallback call must still carry "
-                f"CLAUDE_CODE_USE_BEDROCK on a Bedrock-declared host -- "
+                f"CLAUDE_CODE_USE_BEDROCK on a bedrock-sso-declared host -- "
                 f"this is the reviewer's ONLY non-router fallback path "
                 f"(blast radius note 2 in lr-0ac353). "
                 f"child_env keys={sorted(child_env)!r}",
@@ -403,16 +418,14 @@ class TestAcceptance4ReviewerLayer2FallbackCarriesEnsure(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-class TestAcceptance5NonClaudeEnvStripUnaffected(unittest.TestCase):
-    """5. NON_CLAUDE_ENV_STRIP behavior for codex/generic CLIs is unchanged;
+class TestAcceptance6NonClaudeEnvStripUnaffected(unittest.TestCase):
+    """6. NON_CLAUDE_ENV_STRIP behavior for codex/generic CLIs is unchanged;
     the two constants do not interact -- invoke_generic must still strip the
     four router-scoped vars even when a Bedrock declaration is present, and
-    must never receive CLAUDE_CODE_USE_BEDROCK (that var is Claude-specific;
-    a non-Claude CLI has no use for it and CLAUDE_ROUTER_ENV_ENSURE is only
-    ever applied at invoke_claude's own two call sites)."""
+    must never receive CLAUDE_CODE_USE_BEDROCK."""
 
-    def test_invoke_generic_unaffected_by_bedrock_declaration(self):
-        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-bedrock-non-claude-")
+    def test_invoke_generic_unaffected_by_auth_mode_declaration(self):
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-auth-mode-non-claude-")
         try:
             bin_dir = os.path.join(tmpdir, "bin")
             os.makedirs(bin_dir)
@@ -448,7 +461,7 @@ class TestAcceptance5NonClaudeEnvStripUnaffected(unittest.TestCase):
             env = dict(os.environ)
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
-            env[_BEDROCK_DECLARATION_VAR] = "https://bedrock-mantle.example.invalid"
+            env["CLAGENTIC_AUTH_MODE"] = "bedrock-sso"
             env["AWS_BEARER_TOKEN_BEDROCK"] = "router-admin-token-value"
             env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:9999/router"
             env["ANTHROPIC_AUTH_TOKEN"] = "router-anthropic-token-value"
@@ -474,10 +487,10 @@ class TestAcceptance5NonClaudeEnvStripUnaffected(unittest.TestCase):
         ):
             self.assertNotIn(
                 var, child_env,
-                f"invoke_generic must still strip {var} even when a Bedrock "
-                f"declaration is present -- CLAUDE_ROUTER_ENV_ENSURE must "
-                f"not interact with NON_CLAUDE_ENV_STRIP. "
-                f"child_env keys={sorted(child_env)!r}",
+                f"invoke_generic must still strip {var} even when a "
+                f"CLAGENTIC_AUTH_MODE declaration is present -- "
+                f"CLAUDE_ROUTER_ENV_ENSURE must not interact with "
+                f"NON_CLAUDE_ENV_STRIP. child_env keys={sorted(child_env)!r}",
             )
         self.assertNotIn(
             "CLAUDE_CODE_USE_BEDROCK", child_env,
@@ -487,26 +500,16 @@ class TestAcceptance5NonClaudeEnvStripUnaffected(unittest.TestCase):
         )
 
 
-class TestAcceptance6DsTimeoutMissingStillFailsClosed(unittest.TestCase):
-    """6. DS_TIMEOUT_CMD resolving to the ds_timeout_missing shell function
+class TestAcceptance7DsTimeoutMissingStillFailsClosed(unittest.TestCase):
+    """7. DS_TIMEOUT_CMD resolving to the ds_timeout_missing shell function
     still triggers INV-1a's fail-closed diagnostic (exit 99, distinct
     stderr) rather than 'env: No such file or directory' -- proves
     CLAUDE_ROUTER_ENV_ENSURE is placed AFTER $DS_TIMEOUT_CMD "$CALL_TIMEOUT"
-    in both invoke_claude call sites, never wrapping it (env can only exec
-    real binaries; DS_TIMEOUT_CMD may resolve to a shell function)."""
+    in both invoke_claude call sites, never wrapping it."""
 
     def test_ds_timeout_missing_fails_closed_not_env_exec_error(self):
-        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-bedrock-ds-timeout-")
+        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-auth-mode-ds-timeout-")
         try:
-            # Build an isolated PATH: symlink every real binary from the
-            # host's own /usr/bin and /bin into bin_dir EXCEPT
-            # timeout/gtimeout, so every POSIX utility platform.sh and this
-            # script need (dirname, sed, uname, date, stat, cat, wc, tr,
-            # git, sort, ...) still resolves, but DS_TIMEOUT_CMD detection
-            # (`command -v timeout`/`command -v gtimeout`) genuinely fails
-            # and falls through to ds_timeout_missing -- an empty bin_dir
-            # alone would break the shell/sourcing itself before ever
-            # reaching invoke_claude.
             bin_dir = os.path.join(tmpdir, "bin")
             os.makedirs(bin_dir)
             for src_dir in ("/usr/bin", "/bin"):
@@ -543,11 +546,9 @@ class TestAcceptance6DsTimeoutMissingStillFailsClosed(unittest.TestCase):
                 exit $?
             """)
             env = dict(os.environ)
-            # PATH is bin_dir ONLY -- every real utility is reachable via
-            # the symlinks built above, but timeout/gtimeout are not.
             env["PATH"] = bin_dir
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
-            env[_BEDROCK_DECLARATION_VAR] = "https://bedrock-mantle.example.invalid"
+            env["CLAGENTIC_AUTH_MODE"] = "bedrock-sso"
             env.update(source_env(llm_client=True))
             r = subprocess.run(
                 ["sh", "-c", script, LLM_CLIENT_SH],
@@ -556,11 +557,6 @@ class TestAcceptance6DsTimeoutMissingStillFailsClosed(unittest.TestCase):
                 cwd=TOOL_HOME,
                 env=env,
             )
-            # invoke_claude redirects the subshell's own stderr to ERR_FILE
-            # (2> "$ERR_FILE") -- ds_timeout_missing's diagnostic (printed
-            # from inside that subshell) lands there, not in the outer `sh
-            # -c` process's own stderr (r.stderr), which only carries a
-            # `set -e` abort message, if anything.
             err_file_content = ""
             if os.path.exists(err_file):
                 with open(err_file) as f:
@@ -598,64 +594,75 @@ class TestAcceptance6DsTimeoutMissingStillFailsClosed(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-class TestDefaultEnsureVarIsConfigurable(unittest.TestCase):
-    """AGENTS.md invariant 6 (nothing host-specific hardcoded -- everything
-    user-supplied goes through config/env): CLAGENTIC_ROUTER_BEDROCK_ENSURE_VAR
-    lets an operator point the detection predicate at a different variable
-    name entirely, without a code change."""
+class TestAcceptance8EnterpriseBlankingPayloadFixture(_InvokeClaudeEnsureTestBase):
+    """8. THE EXACT REGRESSION CASE (lr-6d4a1f comment #1, AC 7): the
+    Enterprise/OAuth session-blanking payload sets the four router-scoped
+    vars to EMPTY STRINGS (set-but-empty, not unset). This is the explicit
+    set-but-empty fixture the old 662-line test file was missing -- it
+    covered only unset and non-empty ANTHROPIC_BEDROCK_BASE_URL, which is
+    exactly the gap that let the old predicate's inertness through
+    undetected. With CLAGENTIC_AUTH_MODE=bedrock-sso declared, the ensure
+    must fire regardless of what shape the (now-irrelevant) old sentinel
+    var is in."""
 
-    def test_ensure_var_override_is_honored(self):
-        tmpdir = tempfile.mkdtemp(prefix="clagentic-test-bedrock-ensure-var-")
-        try:
-            bin_dir = os.path.join(tmpdir, "bin")
-            os.makedirs(bin_dir)
-            dump_path = os.path.join(tmpdir, "child-environ.txt")
-            _write_environ_dump_success_claude(bin_dir, dump_path)
-
-            prompt_file = os.path.join(tmpdir, "prompt.txt")
-            input_file = os.path.join(tmpdir, "input.txt")
-            output_file = os.path.join(tmpdir, "output.txt")
-            err_file = os.path.join(tmpdir, "err.txt")
-            with open(prompt_file, "w") as f:
-                f.write("test prompt")
-            with open(input_file, "w") as f:
-                f.write("test diff")
-
-            script = textwrap.dedent(f"""\
-                export PROMPT_FILE='{prompt_file}'
-                export INPUT_FILE='{input_file}'
-                export OUTPUT_FILE='{output_file}'
-                export ERR_FILE='{err_file}'
-                . '{LLM_CLIENT_SH}'
-                invoke_claude "" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" 5 "markdown" "auditor"
-            """)
-            env = dict(os.environ)
-            env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
-            env.pop("CLAUDE_CODE_USE_BEDROCK", None)
-            env.pop(_BEDROCK_DECLARATION_VAR, None)
-            env["CLAGENTIC_ROUTER_BEDROCK_ENSURE_VAR"] = "MY_CUSTOM_BEDROCK_FLAG"
-            env["MY_CUSTOM_BEDROCK_FLAG"] = "1"
-            env.update(source_env(llm_client=True))
-            r = subprocess.run(
-                ["sh", "-c", script, LLM_CLIENT_SH],
-                capture_output=True,
-                text=True,
-                cwd=TOOL_HOME,
-                env=env,
-            )
-            self.assertTrue(os.path.exists(dump_path), f"stdout={r.stdout!r} stderr={r.stderr!r}")
-            child_env = _read_environ_dump(dump_path)
-        finally:
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
+    def test_enterprise_blanking_payload_set_but_empty_still_ensures_bedrock(self):
+        child_env, r = self._run_invoke_claude_and_capture_child_env(
+            extra_parent_env={
+                "CLAGENTIC_AUTH_MODE": "bedrock-sso",
+                # The Enterprise/OAuth blanking payload: all four
+                # router-scoped vars SET TO EMPTY STRING, not unset.
+                "ANTHROPIC_BEDROCK_BASE_URL": "",
+                "AWS_BEARER_TOKEN_BEDROCK": "",
+                "ANTHROPIC_BASE_URL": "",
+                "ANTHROPIC_AUTH_TOKEN": "",
+            },
+        )
         self.assertEqual(
             child_env.get("CLAUDE_CODE_USE_BEDROCK"), "1",
-            f"a custom CLAGENTIC_ROUTER_BEDROCK_ENSURE_VAR override must be "
-            f"honored -- the detection predicate is not hardcoded to "
-            f"ANTHROPIC_BEDROCK_BASE_URL specifically. "
+            f"CLAUDE_CODE_USE_BEDROCK must be ensured even when the "
+            f"legacy ANTHROPIC_BEDROCK_BASE_URL sentinel is set-but-empty "
+            f"(the exact Enterprise/OAuth blanking payload lr-0ac353's "
+            f"predicate was inert under) -- the declaration is read "
+            f"directly and is never carried in the stamped settings.json "
+            f"env block, so it cannot be blanked this way. "
             f"child_env keys={sorted(child_env)!r}",
         )
+
+
+class TestAcceptance9NonBedrockValuesNeverEnsure(_InvokeClaudeEnsureTestBase):
+    """9. anthropic-oauth, enterprise, an unrecognized/typo'd value, and
+    unset all never ensure CLAUDE_CODE_USE_BEDROCK -- even when the old,
+    now-unread ANTHROPIC_BEDROCK_BASE_URL sentinel happens to be non-empty.
+    The declaration is authoritative; the old env-derived sentinel is never
+    consulted at all (report AC 5: 'no AWS/bedrock var stamped or injected
+    for anthropic-oauth or enterprise')."""
+
+    def test_anthropic_oauth_never_ensures(self):
+        child_env, r = self._run_invoke_claude_and_capture_child_env(
+            extra_parent_env={
+                "CLAGENTIC_AUTH_MODE": "anthropic-oauth",
+                "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-mantle.example.invalid",
+            },
+        )
+        self.assertNotIn("CLAUDE_CODE_USE_BEDROCK", child_env)
+
+    def test_enterprise_never_ensures(self):
+        child_env, r = self._run_invoke_claude_and_capture_child_env(
+            extra_parent_env={
+                "CLAGENTIC_AUTH_MODE": "enterprise",
+                "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-mantle.example.invalid",
+            },
+        )
+        self.assertNotIn("CLAUDE_CODE_USE_BEDROCK", child_env)
+
+    def test_unrecognized_value_never_ensures(self):
+        child_env, r = self._run_invoke_claude_and_capture_child_env(
+            extra_parent_env={
+                "CLAGENTIC_AUTH_MODE": "some-typo-value",
+                "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-mantle.example.invalid",
+            },
+        )
+        self.assertNotIn("CLAUDE_CODE_USE_BEDROCK", child_env)
 
 
 if __name__ == "__main__":
