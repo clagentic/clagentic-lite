@@ -2809,6 +2809,49 @@ cmd_doctor() {
     done
   fi
 
+  # 9c2. Host auth-mode declaration contradiction check (lr-6d4a1f, AC 6).
+  # CLAGENTIC_AUTH_MODE is a host-declared claim, not something doctor can
+  # verify is TRUE — but it CAN check whether the declaration contradicts
+  # observed ambient env in the shell doctor itself runs in, and name both
+  # sources when it does, rather than silently trusting a stale or wrong
+  # declaration. Advisory (WARN, not FAIL): the ambient env doctor observes
+  # is only this one shell's snapshot, not necessarily what a real gate-path
+  # invocation will see (the same caveat the existing
+  # CLAUDE_CODE_USE_BEDROCK/CLAGENTIC_ROUTER_BEDROCK_MODE check above
+  # already carries).
+  printf '\nhost auth-mode declaration:\n'
+  case "${CLAGENTIC_AUTH_MODE:-}" in
+    "")
+      _ok "CLAGENTIC_AUTH_MODE is UNDECLARED (default — every gate-path call behaves exactly as it did before this key existed)"
+      ;;
+    anthropic-oauth|enterprise|bedrock-sso|bedrock-api-key)
+      _ok "CLAGENTIC_AUTH_MODE=${CLAGENTIC_AUTH_MODE}"
+      case "$CLAGENTIC_AUTH_MODE" in
+        anthropic-oauth|enterprise)
+          if [ "${CLAUDE_CODE_USE_BEDROCK:-}" = "1" ]; then
+            printf '  WARN contradiction: CLAGENTIC_AUTH_MODE=%s (a direct-API mode) but CLAUDE_CODE_USE_BEDROCK=1 is set in this shell — the declaration says this host is not using Bedrock auth, but the ambient env doctor observes says it is.\n' "$CLAGENTIC_AUTH_MODE"
+            printf '       Fix whichever source is wrong: update CLAGENTIC_AUTH_MODE if this host has actually moved to Bedrock auth, or unset CLAUDE_CODE_USE_BEDROCK in this shell if it was set by mistake.\n'
+          fi
+          ;;
+        bedrock-sso|bedrock-api-key)
+          if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ "${CLAUDE_CODE_USE_BEDROCK:-}" != "1" ]; then
+            printf '  WARN contradiction: CLAGENTIC_AUTH_MODE=%s (a Bedrock mode) but ANTHROPIC_API_KEY is set and CLAUDE_CODE_USE_BEDROCK is not "1" in this shell — the declaration says this host uses Bedrock auth, but the ambient env doctor observes looks like direct-API auth instead.\n' "$CLAGENTIC_AUTH_MODE"
+            printf '       Fix whichever source is wrong: update CLAGENTIC_AUTH_MODE if this host has actually moved to direct-API auth, or check this shell'"'"'s own auth setup if it should be Bedrock.\n'
+          fi
+          if [ "$CLAGENTIC_AUTH_MODE" = "bedrock-sso" ]; then
+            _amsc_dir="${CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR:-$HOME/.aws/sso/cache}"
+            if [ ! -d "$_amsc_dir" ]; then
+              printf '  WARN CLAGENTIC_AUTH_MODE=bedrock-sso but no AWS SSO token cache directory found at %s — every gate-path call will fail the readiness preflight until this is fixed (run `aws sso login`, or set CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR if the cache lives elsewhere).\n' "$_amsc_dir"
+            fi
+          fi
+          ;;
+      esac
+      ;;
+    *)
+      printf '  WARN CLAGENTIC_AUTH_MODE="%s" is not a recognized value — treated as UNDECLARED (no-op) everywhere it is consumed. Recognized values: anthropic-oauth, enterprise, bedrock-sso, bedrock-api-key. Check for a typo.\n' "$CLAGENTIC_AUTH_MODE"
+      ;;
+  esac
+
   # 9d. Same-agent-name plugin collision check (generic backstop, lr-1b5a31),
   # 9e. render-stamp staleness check, and 9f. orphaned-but-resolvable legacy
   # router plugin check (lr-35315f). All factored into standalone functions
