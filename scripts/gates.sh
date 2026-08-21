@@ -12,6 +12,7 @@
 #   adversarial      run non-blocking adversarial pass
 #   ship             run all blocking gates, then push + open PR if green
 #   render-review    pretty-print .clagentic/lite/last-review.json
+#   render-manifest  pretty-print .clagentic/lite/last-gate-manifest.json (gate attestation)
 #   digest           summarize today's audit rows
 #   status           last N runs per gate (default N=10) with color outcomes
 #   tail             follow audit.db, render new gate_runs rows as they land; --no-follow exits after one poll
@@ -1667,9 +1668,21 @@ except Exception:
     _bspb_review_section="reviewer: none -- no recorded review verdict for this branch. Run \`clagentic-lite gates review\` (or \`gates ship\`, which runs it) before merging if cross-vendor review is expected."
   fi
 
+  # Gate attestation section (lr-37a9c8): renders from
+  # .clagentic/lite/last-gate-manifest.json, the arbiter for what actually
+  # ran (see docs/GATES.md "Gate attestation manifest" -- when the ledger/
+  # audit.db/PR-comment/router-journal disagree, the manifest is the record
+  # of what THIS ship invocation observed). Same "degrade honestly, never a
+  # bare heading" discipline as the review-provenance section above.
+  _bspb_manifest_section=$(_render_gate_manifest_lines 2>/dev/null) || true
+  if [ -z "$_bspb_manifest_section" ]; then
+    _bspb_manifest_section="no gate attestation manifest recorded for this run -- run \`clagentic-lite gates ship\` (the manifest is written unconditionally at the start of that command) if attestation is expected. A missing manifest is never inferred as a clean run."
+  fi
+
   printf '## What changed and why\n\n'
   printf '_Not recorded by tooling -- clagentic-lite has no commit-log or diff summarizer; fill in by hand before merging._\n\n'
   printf '## Review provenance\n\n%s\n\n' "$_bspb_review_section"
+  printf '## Gate attestation\n\n%s\n\n' "$_bspb_manifest_section"
   printf '## Trade-offs taken and rejected\n\n'
   printf '_Not recorded by tooling; fill in by hand, or state "none" if none were seriously considered._\n\n'
   printf '## Explicitly out of scope\n\n'
@@ -5590,6 +5603,30 @@ EOF
   fi
 }
 
+# cmd_render_manifest [FILE] (lr-37a9c8) — pretty-print the gate attestation
+# manifest for operator inspection, mirroring cmd_render_review's own
+# posture for last-review.json. A missing/absent manifest is reported as an
+# explicit error (exit 1), never printed as an empty/clean-looking manifest
+# -- consistent with acceptance criterion 4 ("missing manifest is reported
+# as failure, never inferred as success").
+cmd_render_manifest() {
+  FILE="${1:-$(_gate_manifest_path)}"
+  [ -f "$FILE" ] || { echo "no gate attestation manifest at $FILE -- absence is reported, never inferred as a clean run" 1>&2; return 1; }
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '
+      "== clagentic-lite gate attestation manifest ==",
+      ("branch: " + (.branch // "<unknown>")),
+      ("head_sha: " + (.head_sha // "<unresolved>")),
+      ("complete: " + ((.complete // false) | tostring)),
+      ("degraded: " + ((.degraded // false) | tostring)),
+      ""
+    ' "$FILE"
+    _render_gate_manifest_lines
+  else
+    cat "$FILE"
+  fi
+}
+
 cmd_render_review() {
   FILE="${1:-$REPO_ROOT/.clagentic/lite/last-review.json}"
   [ -f "$FILE" ] || { echo "no review file at $FILE" 1>&2; return 1; }
@@ -6383,6 +6420,7 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
     adversarial)    cmd_adversarial ;;
     merge-gate)     shift; cmd_merge_gate "$@" ;;
     render-review)  shift; cmd_render_review "$@" ;;
+    render-manifest) shift; cmd_render_manifest "$@" ;;
     deferrals-lint) shift; cmd_deferrals_lint "$@" ;;
     audit-vocab-lint) shift; cmd_audit_vocab_lint "$@" ;;
     ship)           cmd_ship ;;
@@ -6391,7 +6429,7 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
     digest)         cmd_digest ;;
     status)         shift; cmd_status "$@" ;;
     tail)           shift; cmd_tail "$@" ;;
-    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|render-manifest [FILE]|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
   esac
 elif [ -z "${CLAGENTIC_GATES_DELIBERATE_SOURCE:-}" ]; then
   echo "gates.sh: CLAGENTIC_GATES_SOURCE_ONLY is set but CLAGENTIC_GATES_DELIBERATE_SOURCE is not -- dispatch suppressed with no provenance asserting deliberate sourcing, refusing to report a false pass. If dot-sourcing this file on purpose, set both variables. If you did not mean to set CLAGENTIC_GATES_SOURCE_ONLY, unset it." 1>&2
