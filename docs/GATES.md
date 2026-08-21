@@ -777,7 +777,7 @@ The structural reason the two gates needed different treatment: the adversarial-
 
 **Why this exists.** Before this task, `cmd_ship`'s PR-open call passed no body of its own — the adapter's `gh` implementation fell back to `--fill`, which populates title and body entirely by scraping commit messages. No template (`.github/pull_request_template.md` or otherwise) is consulted by `--fill`, so a template alone accomplishes nothing for a tool-opened PR: there was no hook for one to fill in. This closes that gap the same way item 3 above (review-verdict publish) already closes the equivalent gap for the ledger — render a body gate-side, hand it to the adapter to transport, never let the adapter's own default scrape stand in for it.
 
-**Required sections, always four, in this order:** what changed and why; review provenance; trade-offs taken and rejected; explicitly out of scope. `.github/pull_request_template.md` states the same four sections for a human opening a PR by hand through the web UI — the two surfaces agree on structure, not on data source (the template is filled by a person; `_build_ship_pr_body` fills what it can from recorded tool state and says plainly where it can't).
+**Required sections, in this order:** what changed and why; review provenance; gate attestation (lr-37a9c8, see "Gate attestation manifest" below); trade-offs taken and rejected; explicitly out of scope. `.github/pull_request_template.md` states the original four human-facing sections for a PR opened by hand through the web UI — the tool-rendered body adds the gate-attestation section on top, since a human opening a PR by hand has no `gates ship` run to attest to in the first place.
 
 **`_build_ship_pr_body BRANCH HEAD_SHA` (`scripts/gates.sh`) — gate-side render, adapter-side transport.** Per the host-adapter contract above, `scripts/host-adapter.sh` transports a rendered body, it never composes one — `_build_ship_pr_body` lives in `gates.sh`, is completely host-neutral, and its output is handed to `host_adapter_open_change_request`'s new optional `BODY_FILE` argument exactly the way a rendered review-verdict comment is already handed to `host_adapter_post_comment`.
 
@@ -794,6 +794,54 @@ The structural reason the two gates needed different treatment: the adversarial-
 **No-adapter / non-GitHub / no-host case is unaffected and remains non-degraded.** `_build_ship_pr_body` only ever writes to a local temp file; it runs (or is skipped on render failure) before `host_adapter_available` is even consulted for the open-change-request call, and `cmd_ship`'s existing "no host adapter available — open a PR manually" fallback template is untouched — see `_publish_review_verdict`'s own fallback contract above for the same posture applied to the comment-publish path.
 
 **Render failure falls back to no body file, not a blocked ship.** No `jq`/`python3` on `PATH` — the same exemption `_build_review_verdict_comment_body` already has — makes `_build_ship_pr_body` produce no output; `cmd_ship` detects this (empty temp file) and passes no `BODY_FILE` at all, so the adapter falls back to its pre-lr-429b32 `--fill` default rather than opening a PR with an empty or malformed body. A body-render failure never blocks `ship` — same "gate outcome unaffected" posture the publish path already established for a *post*-comment failure.
+
+### Gate attestation manifest (lr-37a9c8)
+
+**Why this exists.** Exit codes 0/1/2 (see "Exit-code contract" below) fire only at total failure — a same-vendor fallback that still produces a schema-valid pass, a router opt-in that is silently inert for a given role, or a degraded chain that still returns parseable-looking output is invisible to every consumer that only checks the exit code. Before this task, "which brand/model actually produced a given verdict, and did it get there via a fallback" existed only as free text buried in `gate_runs.details` (`log_attempt`, `scripts/llm-client.sh`) — readable with a manual `sqlite3` query, never surfaced as a first-class per-run record.
+
+**File: `.clagentic/lite/last-gate-manifest.json`** (gitignored local gate state, same convention as `last-review.json`). ONE JSON object, overwritten each `gates ship` run — not append-only like the review ledger (`review-ledger.jsonl`), which owns durable cross-round review history; the manifest describes only what THIS run observed.
+
+**Written unconditionally, before any gate runs** (`_manifest_init`, called at the top of `cmd_ship`) — a crashed or killed-mid-run `ship` leaves either no manifest (nothing ran yet) or a visibly incomplete one (`"complete": false`, `"missing_gates": [...]`), never a stale file from a prior successful run standing in for this one. **A missing or incomplete manifest is reported as failure, never inferred as success** — `_manifest_is_complete` (`scripts/gates.sh`) is the sanctioned predicate for a downstream consumer (an operator, `render-manifest`, or a future CI-side reader) to check before trusting the file; `gates.sh render-manifest` refuses loudly (exit 1) when the manifest is absent, rather than printing an empty/clean-looking report.
+
+**Schema — one entry per declared gate under `.gates`:**
+
+```json
+{
+  "ts": "2026-08-21T12:00:00Z",
+  "branch": "feat/example",
+  "head_sha": "abc123...",
+  "complete": true,
+  "missing_gates": [],
+  "degraded": false,
+  "gates": {
+    "secrets": {"outcome": "ran", "path": "n/a", "brand": "", "model": "", "fallback_events": [], "exit_class": "", "details": ""},
+    "review": {"outcome": "ran", "path": "direct", "brand": "codex", "model": "gpt-5.1-codex", "fallback_events": [], "exit_class": "", "details": ""},
+    "merge-gate": {"outcome": "ran", "path": "direct", "brand": "claude", "model": "", "fallback_events": [], "exit_class": "", "details": ""}
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `outcome` | `ran` \| `degraded` \| `failed` \| `skipped` — the closed vocabulary this task requires. |
+| `path` | `"router"` \| `"direct"` \| `"n/a"` — `"n/a"` for a deterministic gate (secrets/deps/sast/bleed), which has no LLM path at all. Never a third value: the router's own in-chain advance between backends (Layer 1, `scripts/llm-client.sh` `invoke_router`'s own doc comment) is invisible on this side by construction and is not reported here. |
+| `brand` | The CLI that actually produced the verdict (`claude`/`codex`/`router`/...), reusing the exact token `log_attempt` already writes — not a new vocabulary. |
+| `model` | The concrete model string `resolve_step` resolved for that call, when known; empty when the CLI used its own default. |
+| `fallback_events` | `[{"from": "...", "to": "...", "reason": "..."}]` — one entry per chain step that failed before the eventual pass. Empty array when the primary succeeded on the first attempt. |
+| `exit_class` | `"degraded"` when this run's own audit trail recorded a degraded outcome for this gate's role; empty otherwise. |
+| `details` | Short human-readable string, reusing the gate's own `cmd_log_run` details text where available. |
+
+**Provenance is reused from `log_attempt`, not re-derived.** `_manifest_llm_provenance` (`scripts/gates.sh`) reads back `gate_runs` rows with `gate='llm-call'` that `log_attempt` (`scripts/llm-client.sh`) already writes unconditionally for every chain-step attempt, scoped to an audit-id watermark captured immediately before each LLM-backed gate's own `llm-client.sh` invocation so a prior run's rows for the same role are never misattributed to this one. This is the same "read back what a lower-level function already recorded" pattern `_read_deterministic_gates` (lr-367a21) already established for the deterministic gates' own `gate_runs` rows — one more consumer of that pattern, not a second one.
+
+**Security gate is fail-closed on degradation; every other gate proceeds with a loud, greppable degraded-but-passed status.** This is a POLICY the manifest records, not one it enforces on its own: `cmd_secrets` already blocks outright on a missing/failing tool (AGENTS.md §4, fail-closed by design) — the manifest's `"outcome": "failed"` for `secrets` is a record of that pre-existing fail-closed behavior, not a new gate. For review/adversarial/merge-gate, a degraded chain is recorded with `"outcome": "degraded"` and the manifest's top-level `"degraded": true` flag — a state distinct from `"outcome": "ran"` (passed-as-configured) at both the per-gate and whole-manifest level, so `grep '"degraded": true'` (the same unforgeable-marker-adjacent discipline `_llm_output_is_degraded`'s `DEGRADED_MARKER` establishes for the envelope itself) finds it without parsing JSON. `review`/`merge-gate` still BLOCK `ship` on a degraded chain (unchanged, pre-existing behavior — see "Exit-code contract" below); `adversarial` remains non-blocking by design (`cmd_adversarial || true` in `cmd_ship`) but its degraded state is now visible in the manifest exactly as loudly as a blocking gate's, never silently folded into an ordinary "ran".
+
+**Inert config-key detection.** `clagentic-lite doctor` already reports `CLAGENTIC_GATE_VIA_ROUTER=1` as a no-op (`bin/clagentic-lite`, "GATE-PATH ROUTER OPT-IN" section) — the merge-gate role is structurally excluded from the routable set (`_llm_role_routable`, `scripts/llm-client.sh`, lr-250d9d) regardless of that variable's value. This manifest does not duplicate that check; `doctor` remains the sanctioned surface for a declared-but-never-consulted routing key, and the manifest's own `path` field for `merge-gate` (always `"direct"` when it ran, never `"router"`) is independent corroborating evidence of the same fact for any given run.
+
+**Manifest is local and unsigned (lr-54cf2d's forgeability caveat).** Like `audit.db`, `last-review.json`, and `review-ledger.jsonl`, this file is a plain, unsigned JSON file writable by anyone with filesystem access to the working tree — see "What the ledger is not: a control against a user who edits it" above for the identical threat-model posture applied to this file. It is not a cryptographic attestation, not independently verifiable by a third party, and carries no per-reviewer credentials (ruled out, lr-96f8ba). What it defends against is an honest but unobservant run silently mis-reporting its own provenance, not a hostile actor with repo write access.
+
+**The manifest is the arbiter for "what ran."** When the review ledger, `audit.db`, a posted PR comment, and (if routed) the router's own journal appear to disagree about what happened on a given `ship` run, `.clagentic/lite/last-gate-manifest.json` for that run's `head_sha` is the authoritative record — it is the one artifact this codebase writes specifically to answer "what actually ran, via which path, produced by which brand/model" as a single, unconditionally-written-per-run object, rather than a log an operator must reconstruct by cross-referencing several sources.
+
+**Inspect with `gates.sh render-manifest [FILE]`** — pretty-prints the current manifest (or a named one), same posture as `render-review` for `last-review.json`.
 
 ### Exit-code contract for `gates.sh review` and `gates.sh ship`
 
