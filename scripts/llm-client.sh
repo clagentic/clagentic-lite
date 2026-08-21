@@ -1120,10 +1120,30 @@ role_chain() {
 
 # Log one chain attempt to audit.db. Goes through ds_audit_log so the
 # string interpolation is SQL-escaped and the repo-root resolution is correct.
-# Args: ROLE CLI TIER OUTCOME [ERR_HINT]
+# Args: ROLE CLI TIER OUTCOME [ERR_HINT] [MODEL]
+#
+# MODEL (lr-37a9c8, gate attestation manifest): a 6th, optional positional —
+# the concrete model string resolve_step resolved for this attempt (may be
+# empty; a CLI invoked with no model flag uses its own default). Appended as
+# its own labeled "model=..." token, never folded into the existing
+# ROLE:CLI:TIER prefix or the free-text HINT — cmd_audit_vocab_lint's static
+# regex (gates.sh) matches `cmd_log_run <gate> pass "<literal>"` shapes
+# elsewhere in this codebase, and _AUDIT_FAILURE_WORDS-style substring checks
+# anywhere that reads this details column must keep matching the SAME
+# ROLE:CLI:TIER prefix this string has always had — a positional model value
+# spliced into the middle of that prefix would be a silent format break for
+# every existing reader (_manifest_llm_provenance, scripts/gates.sh, and any
+# operator query against gate_runs.details LIKE 'role:cli:%'). Absent MODEL
+# (the CLI used its own default, or this call site predates the manifest
+# feature) omits the token entirely rather than emitting "model=" — an empty
+# label is worse than no label for a reader trying to tell "no model
+# resolved" apart from "model resolved to the empty string" (the two are the
+# same thing here, but a future reader should not have to special-case a
+# blank value).
 log_attempt() {
-  ROLE="$1"; CLI="$2"; TIER="$3"; OUTCOME="$4"; HINT="${5:-}"
+  ROLE="$1"; CLI="$2"; TIER="$3"; OUTCOME="$4"; HINT="${5:-}"; MODEL="${6:-}"
   DETAILS="$ROLE:$CLI:$TIER"
+  [ -n "$MODEL" ] && DETAILS="$DETAILS model=$MODEL"
   [ -n "$HINT" ] && DETAILS="$DETAILS — $HINT"
   ds_audit_log llm-call "$OUTCOME" "$DETAILS"
 }
@@ -2943,15 +2963,15 @@ walk_chain() {
     if [ "$EXIT_CODE" -eq 0 ] && [ "$TURN_SUBTYPE" = "error_max_turns" ]; then
       ANY_TURNS_EXHAUSTED=1
       ERR_HINT="turn limit exhausted before completion (num_turns=$TURN_NUM_TURNS, role=$ROLE_L mode=$MODE) -- a truncated run, never a clean pass"
-      log_attempt "$ROLE_L" "$CLI" "$TIER" "step-failed" "$ERR_HINT"
+      log_attempt "$ROLE_L" "$CLI" "$TIER" "step-failed" "$ERR_HINT" "$MODEL"
       notify_step_outcome "step-failed" "$ROLE_L" "$CLI" "$TIER" "$ERR_HINT"
       continue
     fi
     if [ "$EXIT_CODE" -eq 0 ] && [ "$UNWRAP_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
       if [ "$ATTEMPT" -eq 1 ]; then
-        log_attempt "$ROLE_L" "$CLI" "$TIER" "pass" "num_turns=$TURN_NUM_TURNS"
+        log_attempt "$ROLE_L" "$CLI" "$TIER" "pass" "num_turns=$TURN_NUM_TURNS" "$MODEL"
       else
-        log_attempt "$ROLE_L" "$CLI" "$TIER" "fallback" "num_turns=$TURN_NUM_TURNS"
+        log_attempt "$ROLE_L" "$CLI" "$TIER" "fallback" "num_turns=$TURN_NUM_TURNS" "$MODEL"
         notify_step_outcome "fallback" "$ROLE_L" "$CLI" "$TIER" "num_turns=$TURN_NUM_TURNS"
       fi
       cat "$TMP_OUT"
@@ -3065,7 +3085,7 @@ walk_chain() {
       ANY_INVOCATION_FAILED=1
       ERR_HINT="empty output (exit=$EXIT_CODE)"
     fi
-    log_attempt "$ROLE_L" "$CLI" "$TIER" "step-failed" "$ERR_HINT"
+    log_attempt "$ROLE_L" "$CLI" "$TIER" "step-failed" "$ERR_HINT" "$MODEL"
     notify_step_outcome "step-failed" "$ROLE_L" "$CLI" "$TIER" "$ERR_HINT"
   done < "$TMP_CHAIN"
 

@@ -12,6 +12,7 @@
 #   adversarial      run non-blocking adversarial pass
 #   ship             run all blocking gates, then push + open PR if green
 #   render-review    pretty-print .clagentic/lite/last-review.json
+#   render-manifest  pretty-print .clagentic/lite/last-gate-manifest.json (gate attestation)
 #   digest           summarize today's audit rows
 #   status           last N runs per gate (default N=10) with color outcomes
 #   tail             follow audit.db, render new gate_runs rows as they land; --no-follow exits after one poll
@@ -1667,9 +1668,21 @@ except Exception:
     _bspb_review_section="reviewer: none -- no recorded review verdict for this branch. Run \`clagentic-lite gates review\` (or \`gates ship\`, which runs it) before merging if cross-vendor review is expected."
   fi
 
+  # Gate attestation section (lr-37a9c8): renders from
+  # .clagentic/lite/last-gate-manifest.json, the arbiter for what actually
+  # ran (see docs/GATES.md "Gate attestation manifest" -- when the ledger/
+  # audit.db/PR-comment/router-journal disagree, the manifest is the record
+  # of what THIS ship invocation observed). Same "degrade honestly, never a
+  # bare heading" discipline as the review-provenance section above.
+  _bspb_manifest_section=$(_render_gate_manifest_lines 2>/dev/null) || true
+  if [ -z "$_bspb_manifest_section" ]; then
+    _bspb_manifest_section="no gate attestation manifest recorded for this run -- run \`clagentic-lite gates ship\` (the manifest is written unconditionally at the start of that command) if attestation is expected. A missing manifest is never inferred as a clean run."
+  fi
+
   printf '## What changed and why\n\n'
   printf '_Not recorded by tooling -- clagentic-lite has no commit-log or diff summarizer; fill in by hand before merging._\n\n'
   printf '## Review provenance\n\n%s\n\n' "$_bspb_review_section"
+  printf '## Gate attestation\n\n%s\n\n' "$_bspb_manifest_section"
   printf '## Trade-offs taken and rejected\n\n'
   printf '_Not recorded by tooling; fill in by hand, or state "none" if none were seriously considered._\n\n'
   printf '## Explicitly out of scope\n\n'
@@ -4609,6 +4622,462 @@ _read_deterministic_gates() {
     "$_rdg_secrets" "$_rdg_deps" "$_rdg_sast" "$_rdg_unavailable"
 }
 
+# ---------------------------------------------------------- gate attestation manifest --
+#
+# _GATE_MANIFEST_PATH (lr-37a9c8) — one machine-readable per-run record of
+# what ran, via which path (router|direct), which brand+model actually
+# produced the verdict, and any fallback events, for every gate `gates.sh
+# ship` declares. WHY THIS EXISTS: exit codes 0/1/2 (lr-0346) fire only at
+# total failure; a same-vendor fallback that still produces a schema-valid
+# "pass" (lr-b20c0a's codex-401-for-days case) is invisible to every
+# existing consumer -- the PR body's review-provenance section
+# (_render_review_verdict_lines, above) already answers "did findings block
+# /ship" but never "which CLI/model actually produced that verdict, and did
+# it get there via a fallback." This closes that gap as a durable artifact,
+# not a one-off stderr line.
+#
+# FILE: .clagentic/lite/last-gate-manifest.json (gitignored local gate
+# state, same convention as last-review.json/gate-summary.json). ONE JSON
+# object, overwritten each `ship` run (not append-only like the review
+# ledger -- a manifest describes "what happened THIS run," not a durable
+# cross-round history; the review ledger already owns that job for review
+# verdicts specifically, and this file does not duplicate it).
+#
+# WRITTEN UNCONDITIONALLY (acceptance criterion 4): _manifest_init is called
+# at the top of cmd_ship, before any gate runs, so a crashed or
+# killed-mid-run `ship` leaves a manifest on disk that is either absent
+# (nothing ran yet -- a genuinely fresh state) or visibly INCOMPLETE (some
+# gates recorded, others never reached) rather than a stale file from a
+# PRIOR successful run silently standing in for this one. Absence or an
+# incomplete manifest is reported as failure by every consumer
+# (_manifest_is_complete, below) -- NEVER inferred as success.
+#
+# PROVENANCE VOCABULARY, REUSED FROM lr-429b32 (do not invent a second
+# format): "brand" = the CLI (claude/codex/router/<other>) exactly as
+# _render_review_verdict_lines' caller and log_attempt already spell it
+# (the same CLI token walk_chain's chain-step loop resolves via
+# resolve_step, llm-client.sh); "model" = the concrete model string
+# resolve_step resolved (may be empty -- a CLI invoked with no model flag
+# uses its own default); "path" = "router" or "direct", the SAME two-value
+# vocabulary docs/GATES.md "Host adapter contract"/"ROUTER-PATH INVOCATION"
+# already establish (never a third value -- Layer 1's in-router advance is
+# invisible on this side by construction, per invoke_router's own doc
+# comment, so this manifest cannot and does not attempt to report it).
+#
+# MANIFEST IS LOCAL AND UNSIGNED (lr-54cf2d's forgeability caveat, stated
+# here because this is the one artifact this task adds that a later reader
+# might mistake for an attestation in the cryptographic sense): like
+# audit.db, last-review.json, and review-ledger.jsonl, this file is a plain,
+# unsigned JSON file writable by anyone with filesystem access to the
+# working tree. It records what THIS INVOCATION of `gates.sh ship` observed
+# -- not a claim independently verifiable by a third party, not a substitute
+# for host-side CI, and not per-reviewer credentials or attestation (ruled
+# out, lr-96f8ba). A hostile local user who wants to fabricate a clean
+# manifest can already do so, the same way they could hand-edit
+# last-review.json or review-ledger.jsonl today (see docs/GATES.md "What
+# the ledger is not: a control against a user who edits it" for the
+# identical threat-model posture applied to that file). What this manifest
+# defends against is an HONEST but UNOBSERVANT run silently mis-reporting
+# its own provenance -- a same-vendor fallback masquerading as the
+# configured primary, a declared-but-inert router opt-in, a degraded LLM
+# chain reported as an ordinary pass -- not a hostile actor with write
+# access to the repo.
+#
+# NO AGENT NAMES IN SHIPPED PROSE (lr-411a35): every string this module
+# writes or renders is role/CLI/outcome vocabulary already established
+# elsewhere in this codebase (reviewer/auditor/gate, claude/codex/router,
+# pass/degraded/failed/skipped) -- never a crew agent's proper name.
+_gate_manifest_path() {
+  printf '%s/.clagentic/lite/last-gate-manifest.json' "$REPO_ROOT"
+}
+
+# _manifest_init — writes a fresh, mostly-empty manifest at the start of
+# `ship`, unconditionally (see the module doc comment above for why this
+# must happen before any gate runs, not lazily on first gate write).
+# Fail-open on the write itself (no jq/no python3, unwritable directory):
+# same posture as every other on-disk gate-state writer in this file --
+# a manifest-write failure must never abort `ship`, only leave the manifest
+# absent, which _manifest_is_complete already treats as failure downstream.
+_manifest_init() {
+  _mi_path=$(_gate_manifest_path)
+  _mi_ts=$(ds_date_iso)
+  _mi_branch=""
+  _mi_head=""
+  if _git_repo_root_is_scoped; then
+    _mi_branch=$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    _mi_head=$(_git_repo_scoped_head_sha)
+  fi
+  mkdir -p "$REPO_ROOT/.clagentic/lite" 2>/dev/null || true
+  printf '{"ts": "%s", "branch": "%s", "head_sha": "%s", "gates": {}, "complete": false}\n' \
+    "$_mi_ts" "$_mi_branch" "$_mi_head" > "$_mi_path" 2>/dev/null || true
+}
+
+# _manifest_set_gate GATE OUTCOME PATH BRAND MODEL FALLBACK_JSON EXIT_CLASS DETAILS
+#
+# Merges one gate's attestation record into the manifest (read-modify-write
+# -- gates run sequentially within one `ship` invocation, never concurrently,
+# so no locking beyond ds_sqlite3's own busy-timeout precedent is needed).
+#
+# OUTCOME is the closed vocabulary the task requires: ran|degraded|failed|skipped.
+# PATH is "router"|"direct"|"n/a" (deterministic gates -- secrets/deps/sast/
+# bleed -- have no LLM path at all; "n/a", never a fabricated "direct").
+# BRAND/MODEL are empty string for a non-LLM gate. FALLBACK_JSON is a JSON
+# array of {"from":"...","to":"...","reason":"..."} objects (empty array
+# "[]" when no fallback occurred). DETAILS is a short human-readable string,
+# reusing whatever the gate's own cmd_log_run details string already said
+# (reuse, not re-derivation).
+#
+# Fail-open, matching _manifest_init: a merge failure (no jq/python3) drops
+# this gate's record silently rather than corrupting the file -- the
+# resulting manifest is then INCOMPLETE for this gate, which
+# _manifest_is_complete (below) surfaces as a named gap, never inferred as
+# a clean pass.
+_manifest_set_gate() {
+  _msg_gate="$1"; _msg_outcome="$2"; _msg_path="$3"; _msg_brand="$4"
+  _msg_model="$5"; _msg_fallback="${6:-[]}"; _msg_exit_class="${7:-}"; _msg_details="${8:-}"
+  _msg_manifest=$(_gate_manifest_path)
+  [ -f "$_msg_manifest" ] || return 0
+
+  if command -v jq >/dev/null 2>&1; then
+    _msg_tmp=$(mktemp -t clagentic-manifest.XXXXXX)
+    if jq --arg g "$_msg_gate" --arg outcome "$_msg_outcome" --arg path "$_msg_path" \
+        --arg brand "$_msg_brand" --arg model "$_msg_model" --argjson fallback "$_msg_fallback" \
+        --arg exit_class "$_msg_exit_class" --arg details "$_msg_details" \
+        '.gates[$g] = {outcome: $outcome, path: $path, brand: $brand, model: $model,
+                        fallback_events: $fallback, exit_class: $exit_class, details: $details}' \
+        "$_msg_manifest" > "$_msg_tmp" 2>/dev/null; then
+      mv "$_msg_tmp" "$_msg_manifest"
+    else
+      rm -f "$_msg_tmp"
+    fi
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$_msg_manifest" "$_msg_gate" "$_msg_outcome" "$_msg_path" "$_msg_brand" \
+      "$_msg_model" "$_msg_fallback" "$_msg_exit_class" "$_msg_details" <<'PYEOF' 2>/dev/null
+import json, sys
+path, gate, outcome, ptype, brand, model, fallback_raw, exit_class, details = sys.argv[1:10]
+try:
+    with open(path) as f:
+        m = json.load(f)
+except Exception:
+    sys.exit(0)
+try:
+    fallback = json.loads(fallback_raw)
+    if not isinstance(fallback, list):
+        fallback = []
+except Exception:
+    fallback = []
+m.setdefault("gates", {})
+m["gates"][gate] = {
+    "outcome": outcome, "path": ptype, "brand": brand, "model": model,
+    "fallback_events": fallback, "exit_class": exit_class, "details": details,
+}
+try:
+    with open(path, "w") as f:
+        json.dump(m, f)
+except Exception:
+    sys.exit(0)
+PYEOF
+  fi
+  return 0
+}
+
+# _manifest_finalize DECLARED_GATES_SPACE_SEPARATED
+#
+# Marks the manifest "complete" (every declared gate has a record) and sets
+# a top-level "degraded" flag true iff any recorded gate's outcome is
+# "degraded" or "failed" -- the loud, greppable, distinct-from-passed-as-
+# configured status the task's policy requires (acceptance criterion 1).
+# Called once, at the end of cmd_ship's gate sequence, after the last gate
+# that ran (or was skipped) has already called _manifest_set_gate /
+# ship_step_skip.
+_manifest_finalize() {
+  _mf_declared="$1"
+  _mf_manifest=$(_gate_manifest_path)
+  [ -f "$_mf_manifest" ] || return 0
+
+  if command -v jq >/dev/null 2>&1; then
+    _mf_tmp=$(mktemp -t clagentic-manifest-final.XXXXXX)
+    if jq --arg declared "$_mf_declared" '
+        ($declared | split(" ") | map(select(length > 0))) as $names
+        | . + {
+            complete: (($names - (.gates | keys)) | length == 0),
+            missing_gates: ($names - (.gates | keys)),
+            degraded: ([.gates[] | select(.outcome == "degraded" or .outcome == "failed")] | length > 0)
+          }' "$_mf_manifest" > "$_mf_tmp" 2>/dev/null; then
+      mv "$_mf_tmp" "$_mf_manifest"
+    else
+      rm -f "$_mf_tmp"
+    fi
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$_mf_manifest" "$_mf_declared" <<'PYEOF' 2>/dev/null
+import json, sys
+path, declared = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        m = json.load(f)
+except Exception:
+    sys.exit(0)
+names = [n for n in declared.split(" ") if n]
+gates = m.get("gates", {})
+missing = [n for n in names if n not in gates]
+m["complete"] = len(missing) == 0
+m["missing_gates"] = missing
+m["degraded"] = any(g.get("outcome") in ("degraded", "failed") for g in gates.values())
+try:
+    with open(path, "w") as f:
+        json.dump(m, f)
+except Exception:
+    sys.exit(0)
+PYEOF
+  fi
+  return 0
+}
+
+# _manifest_llm_provenance ROLE WATERMARK_ID
+#
+# Reads back audit.db's own gate_runs rows for gate='llm-call' AND
+# details LIKE '<role>:%' with id > WATERMARK_ID (this run's own attempts,
+# never a prior run's -- log_attempt, llm-client.sh, already writes exactly
+# this shape unconditionally; this function reuses that existing record
+# rather than teaching walk_chain a second, parallel reporting channel).
+# WATERMARK_ID isolates THIS invocation's rows from a prior `gates review`
+# run's leftover rows for the same role.
+#
+# Prints one line: PATH<TAB>BRAND<TAB>MODEL<TAB>FALLBACK_JSON<TAB>EXIT_CLASS
+#   PATH        — "router" if any row's CLI token is "router", else "direct"
+#                 (mirrors the log_attempt call sites: the router path logs
+#                 CLI="router" TIER="role:<role>-chain"; every direct-CLI
+#                 step logs the real CLI name).
+#   BRAND/MODEL — from the row whose outcome is "pass" or "fallback" (the
+#                 step that actually produced the verdict) — the highest-id
+#                 (most recent) such row when more than one exists (a
+#                 fallback chain's SUCCESSFUL step, not its earlier
+#                 failures). Empty when no pass/fallback row exists for this
+#                 role in this run (every step failed, or the role never ran
+#                 at all — a genuinely degraded/failed chain).
+#   FALLBACK_JSON — one {"from":X,"to":Y,"reason":Z} object per step that
+#                 preceded the eventual pass (empty array "[]" when the
+#                 primary succeeded on attempt 1, or when no pass exists).
+#   EXIT_CLASS  — "degraded" if the run's own audit trail recorded a
+#                 gate_runs row with outcome="degraded" for this role in
+#                 this run; empty otherwise (the caller already knows
+#                 ran/failed from its own control flow — this field exists
+#                 only to carry the degraded-vs-ordinary-failure distinction
+#                 walk_chain's own exit codes 3/4/5 already draw, since that
+#                 distinction is not otherwise visible from audit.db alone).
+#
+# Fail-open: no sqlite3/no audit.db prints nothing (empty PATH/BRAND/MODEL/
+# empty-array fallback/empty exit_class) -- the caller (_manifest_record_llm_gate)
+# treats an empty read the same as "no LLM call happened this run," which is
+# always the conservative direction for an attestation manifest (never
+# fabricate a brand/model this function could not actually observe).
+_manifest_llm_provenance() {
+  _mlp_role="$1"
+  _mlp_watermark="$2"
+  _mlp_db="$REPO_ROOT/.clagentic/lite/audit.db"
+  [ -f "$_mlp_db" ] && command -v sqlite3 >/dev/null 2>&1 || { printf '\t\t\t[]\t'; return 0; }
+
+  _mlp_rows=$(ds_sqlite3 -separator '|' "$_mlp_db" \
+    "SELECT id, outcome, details FROM gate_runs
+     WHERE gate='llm-call' AND details LIKE '${_mlp_role}:%' AND id > ${_mlp_watermark}
+     ORDER BY id ASC;" 2>/dev/null)
+  [ -n "$_mlp_rows" ] || { printf '\t\t\t[]\t'; return 0; }
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    # No JSON tool -- cannot safely build the fallback_events array or parse
+    # the details string's colon-joined fields. Fail open (empty read),
+    # same posture as no-rows-at-all above; the manifest entry for this
+    # gate falls back to "outcome recorded, provenance unavailable" rather
+    # than a hand-rolled, possibly-corrupting string split.
+    printf '\t\t\t[]\t'
+    return 0
+  fi
+
+  printf '%s\n' "$_mlp_rows" | python3 -c '
+import sys, json
+
+path = ""
+brand = ""
+model = ""
+exit_class = ""
+fallback = []
+prior_steps = []  # (cli, tier) pairs seen before the eventual pass/fallback
+
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    parts = line.split("|", 2)
+    if len(parts) != 3:
+        continue
+    _id, outcome, details = parts
+    # details shape (log_attempt, llm-client.sh): "role:cli:tier[ model=M][ — hint]"
+    head = details.split(" — ", 1)[0]
+    model_tok = ""
+    if " model=" in head:
+        head, _, model_tok = head.partition(" model=")
+    rc = head.split(":", 2)
+    cli = rc[1] if len(rc) > 1 else ""
+    tier = rc[2] if len(rc) > 2 else ""
+
+    if outcome == "degraded":
+        exit_class = "degraded"
+        continue
+    if outcome in ("router-refused", "router-fallback", "hard-failure", "skip"):
+        continue
+    if outcome == "step-failed":
+        prior_steps.append((cli, tier))
+        continue
+    if outcome in ("pass", "fallback"):
+        path = "router" if cli == "router" else "direct"
+        brand = cli
+        model = model_tok
+        for i, (pcli, ptier) in enumerate(prior_steps):
+            nxt_cli = prior_steps[i + 1][0] if i + 1 < len(prior_steps) else cli
+            fallback.append({"from": pcli, "to": nxt_cli, "reason": "step-failed"})
+        prior_steps = []
+
+sys.stdout.write("%s\t%s\t%s\t%s\t%s" % (path, brand, model, json.dumps(fallback), exit_class))
+'
+}
+
+# _manifest_record_llm_gate GATE ROLE OUTCOME WATERMARK_ID [DETAILS]
+#
+# Wires _manifest_llm_provenance's read-back into _manifest_set_gate for one
+# LLM-backed gate (review|adversarial|merge-gate). OUTCOME is the caller's
+# own already-determined ran|degraded|failed|skipped verdict (this function
+# does not re-derive it -- cmd_review/cmd_adversarial/cmd_merge_gate already
+# know their own outcome from walk_chain's exit status, per INV-1b).
+_manifest_record_llm_gate() {
+  _mrlg_gate="$1"; _mrlg_role="$2"; _mrlg_outcome="$3"; _mrlg_watermark="$4"; _mrlg_details="${5:-}"
+  _mrlg_prov=$(_manifest_llm_provenance "$_mrlg_role" "$_mrlg_watermark")
+  _mrlg_path=$(printf '%s' "$_mrlg_prov" | cut -f1)
+  _mrlg_brand=$(printf '%s' "$_mrlg_prov" | cut -f2)
+  _mrlg_model=$(printf '%s' "$_mrlg_prov" | cut -f3)
+  _mrlg_fallback=$(printf '%s' "$_mrlg_prov" | cut -f4)
+  _mrlg_exit_class=$(printf '%s' "$_mrlg_prov" | cut -f5)
+  [ -n "$_mrlg_path" ] || _mrlg_path="n/a"
+  [ -n "$_mrlg_fallback" ] || _mrlg_fallback="[]"
+  _manifest_set_gate "$_mrlg_gate" "$_mrlg_outcome" "$_mrlg_path" "$_mrlg_brand" \
+    "$_mrlg_model" "$_mrlg_fallback" "$_mrlg_exit_class" "$_mrlg_details"
+}
+
+# _manifest_audit_watermark — current MAX(id) in gate_runs, or 0 when
+# unavailable. Captured immediately BEFORE a gate's own llm-client.sh call
+# so _manifest_llm_provenance's "id > WATERMARK" read only ever sees this
+# run's own attempts, never a prior `gates review` run's leftover rows for
+# the same role.
+_manifest_audit_watermark() {
+  _maw_db="$REPO_ROOT/.clagentic/lite/audit.db"
+  if [ -f "$_maw_db" ] && command -v sqlite3 >/dev/null 2>&1; then
+    _maw_id=$(ds_sqlite3 "$_maw_db" "SELECT COALESCE(MAX(id),0) FROM gate_runs;" 2>/dev/null)
+    case "$_maw_id" in ''|*[!0-9]*) _maw_id=0 ;; esac
+    printf '%s' "$_maw_id"
+  else
+    printf '0'
+  fi
+}
+
+# _manifest_is_complete — exit 0 iff a manifest exists, is parseable, and
+# its own "complete" field is true. THE consumer-side predicate for
+# acceptance criterion 4 ("missing or incomplete manifest is reported as
+# failure, never inferred as success").
+#
+# NOT WIRED INTO cmd_merge_gate's OWN STALE-PAYLOAD CHECK (unlike the review
+# ledger's _ledger_anchored_pass_at_head, which cmd_merge_gate DOES consult
+# inline): the manifest is only finalized (its "complete" field only ever
+# becomes true) by _manifest_finalize, called at the END of cmd_ship's gate
+# sequence -- AFTER merge-gate has already run. Gating merge-gate on
+# manifest completeness would be circular: the manifest cannot be complete
+# until merge-gate itself has already recorded a result into it. This
+# predicate is instead the sanctioned check for a DOWNSTREAM consumer that
+# inspects a PAST ship run's manifest after the fact -- NAOMI's merge
+# decision, `clagentic-lite doctor`, or an operator inspecting the file
+# directly (docs/GATES.md names the manifest the arbiter for "what ran";
+# this predicate is how a consumer proves that arbiter itself is trustworthy
+# before reading it) -- never a precondition merge-gate checks on itself.
+_manifest_is_complete() {
+  _mic_manifest=$(_gate_manifest_path)
+  [ -f "$_mic_manifest" ] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    [ "$(jq -r '.complete // false' "$_mic_manifest" 2>/dev/null)" = "true" ]
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+    sys.exit(0 if d.get("complete") is True else 1)
+except Exception:
+    sys.exit(1)' "$_mic_manifest" 2>/dev/null
+  else
+    # No JSON tool -- cannot prove completeness. Fail closed: treat as
+    # incomplete, same posture as every other JSON-tool-dependent gate check
+    # in this file when neither jq nor python3 is available.
+    return 1
+  fi
+}
+
+# _render_gate_manifest_lines — renders the manifest's per-gate attestation
+# as newline-separated lines, reusing the SAME "explicit sentence per state,
+# never a bare heading" discipline _render_review_verdict_lines/
+# _build_ship_pr_body already established (lr-429b32) -- one more consumer
+# of that rendering discipline, not a second one. Prints nothing (and the
+# caller renders its own "no manifest" sentence) when the manifest is
+# absent or unparseable.
+_render_gate_manifest_lines() {
+  _rgml_manifest=$(_gate_manifest_path)
+  [ -f "$_rgml_manifest" ] || return 1
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$_rgml_manifest" <<'PYEOF'
+import json, sys
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        m = json.load(f)
+except Exception:
+    sys.exit(1)
+
+gates = m.get("gates", {})
+if not gates:
+    print("no gate attestation recorded")
+    sys.exit(0)
+
+degraded_overall = m.get("degraded", False)
+complete = m.get("complete", False)
+lines = []
+if not complete:
+    missing = m.get("missing_gates", [])
+    lines.append("INCOMPLETE manifest -- missing gate(s): %s" % (", ".join(missing) or "unknown"))
+if degraded_overall:
+    lines.append("DEGRADED-BUT-PASSED: at least one declared gate ran degraded or failed -- see per-gate detail below, this is distinct from passed-as-configured.")
+
+for name in sorted(gates.keys()):
+    g = gates[name]
+    outcome = g.get("outcome", "unknown")
+    parts = ["%s: %s" % (name, outcome)]
+    gpath = g.get("path")
+    if gpath and gpath != "n/a":
+        parts.append("path=%s" % gpath)
+    brand = g.get("brand")
+    if brand:
+        model = g.get("model")
+        brand_str = "brand=%s" % brand
+        if model:
+            brand_str += " model=%s" % model
+        parts.append(brand_str)
+    fallback = g.get("fallback_events") or []
+    if fallback:
+        parts.append("fallback=%d step(s)" % len(fallback))
+    lines.append("- " + ", ".join(parts))
+
+print("\n".join(lines))
+PYEOF
+    return $?
+  fi
+  return 1
+}
+
 build_gate_summary() {
   RV="$REPO_ROOT/.clagentic/lite/last-review.json"
   AD="$REPO_ROOT/.clagentic/lite/last-adversarial.md"
@@ -5134,6 +5603,30 @@ EOF
   fi
 }
 
+# cmd_render_manifest [FILE] (lr-37a9c8) — pretty-print the gate attestation
+# manifest for operator inspection, mirroring cmd_render_review's own
+# posture for last-review.json. A missing/absent manifest is reported as an
+# explicit error (exit 1), never printed as an empty/clean-looking manifest
+# -- consistent with acceptance criterion 4 ("missing manifest is reported
+# as failure, never inferred as success").
+cmd_render_manifest() {
+  FILE="${1:-$(_gate_manifest_path)}"
+  [ -f "$FILE" ] || { echo "no gate attestation manifest at $FILE -- absence is reported, never inferred as a clean run" 1>&2; return 1; }
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '
+      "== clagentic-lite gate attestation manifest ==",
+      ("branch: " + (.branch // "<unknown>")),
+      ("head_sha: " + (.head_sha // "<unresolved>")),
+      ("complete: " + ((.complete // false) | tostring)),
+      ("degraded: " + ((.degraded // false) | tostring)),
+      ""
+    ' "$FILE"
+    _render_gate_manifest_lines
+  else
+    cat "$FILE"
+  fi
+}
+
 cmd_render_review() {
   FILE="${1:-$REPO_ROOT/.clagentic/lite/last-review.json}"
   [ -f "$FILE" ] || { echo "no review file at $FILE" 1>&2; return 1; }
@@ -5536,11 +6029,18 @@ gate_enabled() {
 
 cmd_ship() {
   echo "[gates/ship] running gate sequence (enabled: ${CLAGENTIC_GATES:-all})"
+  # Gate attestation manifest (lr-37a9c8): written unconditionally, before
+  # any gate runs -- see the module doc comment above _gate_manifest_path
+  # for why absence/incompleteness, not a lazily-created file, is what makes
+  # a crashed or killed-mid-run ship honestly reportable to every consumer.
+  _manifest_init
+  _SHIP_DECLARED_GATES="bleed secrets deps sast review adversarial merge-gate"
   # ship_step_skip: print + audit-log a skipped gate. Every gate decision —
   # including the decision to skip — lands in audit.db per AGENTS.md §6.
   ship_step_skip() {
     echo "[gates/ship] skip $1 (not in CLAGENTIC_GATES)"
     cmd_log_run "$1" skip "not in CLAGENTIC_GATES=${CLAGENTIC_GATES:-}"
+    _manifest_set_gate "$1" skipped "n/a" "" "" "[]" "" "not in CLAGENTIC_GATES=${CLAGENTIC_GATES:-}"
   }
   # ship_step_hint: one-line pointer to the Troubleshooter agent, printed
   # alongside every blocking failure below — same convention as the existing
@@ -5551,23 +6051,34 @@ cmd_ship() {
   ship_step_hint() {
     echo "[gates/ship] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"
   }
-  if gate_enabled bleed;        then cmd_bleed        || { echo "[gates/ship] BLOCKED at internal-bleed"; ship_step_hint; exit 1; }; else ship_step_skip bleed;        fi
-  if gate_enabled secrets;     then cmd_secrets     || { echo "[gates/ship] BLOCKED at secrets";    ship_step_hint; exit 1; }; else ship_step_skip secrets;     fi
-  if gate_enabled deps;        then cmd_deps        || { echo "[gates/ship] BLOCKED at deps";       ship_step_hint; exit 1; }; else ship_step_skip deps;        fi
-  if gate_enabled sast;        then cmd_sast        || { echo "[gates/ship] BLOCKED at sast";       ship_step_hint; exit 1; }; else ship_step_skip sast;        fi
+  # Deterministic gates (secrets/deps/sast/bleed): no LLM path, so "path" is
+  # always "n/a" and brand/model are always empty -- FAIL-CLOSED ON
+  # DEGRADATION per this task's policy (a missing tool already blocks per
+  # AGENTS.md §4; the manifest just records that same outcome under the
+  # shared vocabulary rather than inventing a parallel one).
+  if gate_enabled bleed;   then cmd_bleed   && _manifest_set_gate bleed   ran "n/a" "" "" "[]" "" "" || { _manifest_set_gate bleed failed "n/a" "" "" "[]" "" ""; echo "[gates/ship] BLOCKED at internal-bleed"; ship_step_hint; _manifest_finalize "$_SHIP_DECLARED_GATES"; exit 1; }; else ship_step_skip bleed;   fi
+  if gate_enabled secrets; then cmd_secrets && _manifest_set_gate secrets ran "n/a" "" "" "[]" "" "" || { _manifest_set_gate secrets failed "n/a" "" "" "[]" "" ""; echo "[gates/ship] BLOCKED at secrets";    ship_step_hint; _manifest_finalize "$_SHIP_DECLARED_GATES"; exit 1; }; else ship_step_skip secrets; fi
+  if gate_enabled deps;    then cmd_deps    && _manifest_set_gate deps    ran "n/a" "" "" "[]" "" "" || { _manifest_set_gate deps failed "n/a" "" "" "[]" "" ""; echo "[gates/ship] BLOCKED at deps";       ship_step_hint; _manifest_finalize "$_SHIP_DECLARED_GATES"; exit 1; }; else ship_step_skip deps;    fi
+  if gate_enabled sast;    then cmd_sast    && _manifest_set_gate sast    ran "n/a" "" "" "[]" "" "" || { _manifest_set_gate sast failed "n/a" "" "" "[]" "" ""; echo "[gates/ship] BLOCKED at sast";       ship_step_hint; _manifest_finalize "$_SHIP_DECLARED_GATES"; exit 1; }; else ship_step_skip sast;    fi
   if gate_enabled review; then
+    _review_watermark=$(_manifest_audit_watermark)
     _review_rc=0
     cmd_review || _review_rc=$?
     if [ "$_review_rc" -eq 2 ]; then
       echo "[gates/ship] INFRA_DEGRADED at review — reviewer infrastructure failed, no real review occurred"
       ship_step_hint
       cmd_log_run ship block "infra-degraded at review"
+      _manifest_record_llm_gate review reviewer degraded "$_review_watermark" "infra-degraded at review"
+      _manifest_finalize "$_SHIP_DECLARED_GATES"
       exit 2
     elif [ "$_review_rc" -ne 0 ]; then
       echo "[gates/ship] REVIEW_BLOCKED at review (severity threshold ${CLAGENTIC_BLOCK_SEVERITY:-high})"
       cmd_log_run ship block "review-blocked at review"
+      _manifest_record_llm_gate review reviewer failed "$_review_watermark" "review-blocked at review"
+      _manifest_finalize "$_SHIP_DECLARED_GATES"
       exit 1
     fi
+    _manifest_record_llm_gate review reviewer ran "$_review_watermark" ""
   else
     ship_step_skip review
   fi
@@ -5579,10 +6090,37 @@ cmd_ship() {
   # The degraded state is NOT silently lost: cmd_adversarial's own audit row
   # (outcome=degraded) records it, and build_gate_summary/cmd_merge_gate
   # (adversarial_degraded field) independently surface it to the blocking
-  # merge-gate step that runs immediately after this line.
-  if gate_enabled adversarial; then cmd_adversarial || true; else ship_step_skip adversarial; fi
-  if gate_enabled merge-gate;  then cmd_merge_gate  || { echo "[gates/ship] BLOCKED at merge-gate"; ship_step_hint; exit 1; }; else ship_step_skip merge-gate;  fi
+  # merge-gate step that runs immediately after this line. The manifest
+  # records the same distinction under its own outcome vocabulary
+  # (degraded, not a bare "ran") so a degraded-but-non-blocking auditor is
+  # still visible as a LOUD, greppable state, per this task's policy.
+  if gate_enabled adversarial; then
+    _adv_watermark=$(_manifest_audit_watermark)
+    _adv_rc=0
+    cmd_adversarial || _adv_rc=$?
+    if [ "$_adv_rc" -eq 2 ]; then
+      _manifest_record_llm_gate adversarial auditor degraded "$_adv_watermark" "adversarial ran degraded (non-blocking)"
+    else
+      _manifest_record_llm_gate adversarial auditor ran "$_adv_watermark" ""
+    fi
+  else
+    ship_step_skip adversarial
+  fi
+  if gate_enabled merge-gate; then
+    _mg_watermark=$(_manifest_audit_watermark)
+    if cmd_merge_gate; then
+      _manifest_record_llm_gate merge-gate gate ran "$_mg_watermark" ""
+    else
+      _manifest_record_llm_gate merge-gate gate failed "$_mg_watermark" "merge-gate refused or degraded"
+      echo "[gates/ship] BLOCKED at merge-gate"; ship_step_hint
+      _manifest_finalize "$_SHIP_DECLARED_GATES"
+      exit 1
+    fi
+  else
+    ship_step_skip merge-gate
+  fi
 
+  _manifest_finalize "$_SHIP_DECLARED_GATES"
   echo "[gates/ship] all blocking gates passed"
   # Repo-scoped (lr-da1f28 sweep): a bare `_git rev-parse --abbrev-ref HEAD`
   # would resolve an ancestor repo's branch name when REPO_ROOT is not
@@ -5927,6 +6465,7 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
     adversarial)    cmd_adversarial ;;
     merge-gate)     shift; cmd_merge_gate "$@" ;;
     render-review)  shift; cmd_render_review "$@" ;;
+    render-manifest) shift; cmd_render_manifest "$@" ;;
     deferrals-lint) shift; cmd_deferrals_lint "$@" ;;
     audit-vocab-lint) shift; cmd_audit_vocab_lint "$@" ;;
     ship)           cmd_ship ;;
@@ -5935,7 +6474,7 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
     digest)         cmd_digest ;;
     status)         shift; cmd_status "$@" ;;
     tail)           shift; cmd_tail "$@" ;;
-    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|render-manifest [FILE]|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
   esac
 elif [ -z "${CLAGENTIC_GATES_DELIBERATE_SOURCE:-}" ]; then
   echo "gates.sh: CLAGENTIC_GATES_SOURCE_ONLY is set but CLAGENTIC_GATES_DELIBERATE_SOURCE is not -- dispatch suppressed with no provenance asserting deliberate sourcing, refusing to report a false pass. If dot-sourcing this file on purpose, set both variables. If you did not mean to set CLAGENTIC_GATES_SOURCE_ONLY, unset it." 1>&2
