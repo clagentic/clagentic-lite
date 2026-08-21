@@ -592,6 +592,35 @@ _render_claude_settings_body() {
   _rcs_router_url="${CLAGENTIC_ROUTER_URL:-}"
   _rcs_bedrock_mode="${CLAGENTIC_ROUTER_BEDROCK_MODE:-0}"
 
+  # DE-OVERLOAD (lr-6d4a1f): AWS_BEARER_TOKEN_BEDROCK's token source depends
+  # on whether the host has declared CLAGENTIC_AUTH_MODE.
+  #   UNDECLARED (the default, every pre-existing install): CLAGENTIC_ROUTER_TOKEN
+  #   is reused verbatim, exactly as before this task -- AC1 requires
+  #   byte-identical behavior for every existing install, and no install
+  #   predating this task has ever set CLAGENTIC_ROUTER_BEDROCK_TOKEN.
+  #   DECLARED (any of the four CLAGENTIC_AUTH_MODE values): the overload
+  #   ends. AWS_BEARER_TOKEN_BEDROCK is sourced ONLY from the distinct
+  #   CLAGENTIC_ROUTER_BEDROCK_TOKEN key -- CLAGENTIC_ROUTER_TOKEN is never
+  #   read for it. An operator who has declared an auth mode but left
+  #   CLAGENTIC_ROUTER_BEDROCK_TOKEN unset while still setting
+  #   CLAGENTIC_ROUTER_TOKEN is attempting the OLD overload under a NEW
+  #   declaration -- refused with a clear message (_stamp_claude_settings's
+  #   die() path, same mechanism _validate_router_url already uses) rather
+  #   than silently falling back to the router token, which is exactly the
+  #   confusable-token-value defect this task exists to close (root cause
+  #   of lr-b20c0a: nothing could tell a router admin token from a real AWS
+  #   bearer token by value alone).
+  _rcs_bedrock_token_source="router-token-reused"
+  case "${CLAGENTIC_AUTH_MODE:-}" in
+    anthropic-oauth|enterprise|bedrock-sso|bedrock-api-key)
+      _rcs_bedrock_token_source="declared-distinct"
+      if [ "$_rcs_bedrock_mode" = "1" ] && [ -n "$_rcs_router_url" ] \
+        && [ -n "${CLAGENTIC_ROUTER_TOKEN:-}" ] && [ -z "${CLAGENTIC_ROUTER_BEDROCK_TOKEN:-}" ]; then
+        die "CLAGENTIC_AUTH_MODE=${CLAGENTIC_AUTH_MODE} is declared and CLAGENTIC_ROUTER_BEDROCK_MODE=1, but CLAGENTIC_ROUTER_BEDROCK_TOKEN is unset while CLAGENTIC_ROUTER_TOKEN is set -- refusing to reuse CLAGENTIC_ROUTER_TOKEN as AWS_BEARER_TOKEN_BEDROCK (the old overload: nothing can tell a router token from a real AWS Bedrock bearer token by value alone). Set CLAGENTIC_ROUTER_BEDROCK_TOKEN explicitly (may be the same value if that is genuinely correct on this host), or leave it unset to stamp an empty AWS_BEARER_TOKEN_BEDROCK."
+      fi
+      ;;
+  esac
+
   while IFS= read -r _rcs_line || [ -n "$_rcs_line" ]; do
     case "$_rcs_line" in
       *__CLAGENTIC_ROUTER_ENV_BLOCK__*)
@@ -601,7 +630,11 @@ _render_claude_settings_body() {
           if [ "$_rcs_bedrock_mode" = "1" ]; then
             printf '    "ANTHROPIC_AUTH_TOKEN": "%s",\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
             printf '    "ANTHROPIC_BEDROCK_BASE_URL": "%s",\n' "$_rcs_router_url"
-            printf '    "AWS_BEARER_TOKEN_BEDROCK": "%s"\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
+            if [ "$_rcs_bedrock_token_source" = "declared-distinct" ]; then
+              printf '    "AWS_BEARER_TOKEN_BEDROCK": "%s"\n' "${CLAGENTIC_ROUTER_BEDROCK_TOKEN:-}"
+            else
+              printf '    "AWS_BEARER_TOKEN_BEDROCK": "%s"\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
+            fi
           else
             printf '    "ANTHROPIC_AUTH_TOKEN": "%s"\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
           fi
