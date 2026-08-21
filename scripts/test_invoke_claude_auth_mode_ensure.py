@@ -21,9 +21,13 @@ at all, so no session-blanking payload can zero it out. This REPLACES the
 old predicate, per the builder directive in lr-6d4a1f comment #1 ("the
 predicate block ... is REPLACED by the declaration read, not augmented -- do
 not run two predicates"). It also removes the
-CLAGENTIC_ROUTER_BEDROCK_ENSURE_VAR eval-splice entirely, closing lr-fe9b3d
-as superseded (there is no longer a configurable variable NAME to splice
-into an eval, only a fixed, closed-enum config VALUE read with `case`).
+CLAGENTIC_ROUTER_BEDROCK_ENSURE_VAR eval-splice entirely -- there is no
+longer a configurable variable NAME to splice into an eval for THIS
+predicate, only a fixed, closed-enum config VALUE read with `case`. Note
+this did not close lr-fe9b3d: that task's sweep clause (fix the eval-splice
+SHAPE everywhere it recurs, not just this one site) remained unsatisfied
+until a later change routed the surviving llm-client.sh call sites through
+a shared indirect-read primitive.
 
 These tests source the REAL scripts/llm-client.sh (test_source_helpers.py's
 guard-sentinel technique, same as every other llm-client.sh-sourcing test in

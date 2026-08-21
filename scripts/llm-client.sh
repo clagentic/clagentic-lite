@@ -1000,13 +1000,61 @@ EOF
 
 # ----------------------------------------------------- env / tier resolution --
 
+# _llm_indirect_read VAR_NAME [DEFAULT]
+#
+# POSIX sh has no ${!name} indirection, so reading a variable whose NAME is
+# itself computed at runtime (CLAGENTIC_<ROLE>_<FIELD>,
+# CLAGENTIC_MODEL_<CLI>_<TIER>, a per-role *_VIA_ROUTER/_REQUIRED key, ...)
+# has historically required splicing the computed name into an `eval`
+# string. Every call site in this file builds VAR_NAME from tokens this
+# file itself derives (role literals from the fixed cmd_* dispatch, or a
+# CLI/tier token from role_chain's own uppercase-and-underscore transform
+# of that role's CLAGENTIC_<ROLE>_CMD/_CHAIN config) — see this file's own
+# tracing notes in the lr-fe9b3d PR body for the full per-site provenance —
+# but a config-derived CLI/tier token still reaches this function, so it is
+# validated exactly like an operator-hostile value would be, not merely a
+# self-constructed one, before ever entering an eval.
+#
+# FIX (lr-fe9b3d): ONE shared primitive, not four bespoke evals. Validates
+# VAR_NAME against ^[A-Za-z_][A-Za-z0-9_]*$ — the POSIX portable-variable-name
+# grammar — before ever splicing it into an eval string. A metacharacter-
+# bearing name (quotes, `$`, backticks, `;`, whitespace, ...) fails the
+# regex and this function returns DEFAULT (or empty) without ever reaching
+# eval — fail-closed per AGENTS.md invariant 3, not fail-open on a rejected
+# name. This is scope option (a) from lr-fe9b3d (validate-then-eval), chosen
+# over an eval-free indirect read: POSIX sh has no primitive that reads a
+# runtime-computed variable name without either `eval` or enumerating every
+# possible name in a `case` statement, and these four call sites collectively
+# cover an unbounded combination of ROLE/FIELD/CLI/TIER tokens — a `case`
+# enumeration is not viable here. None of the four call sites are a hot
+# path (each runs at most once per chain step, never in a tight loop), so
+# the eval's own cost is not a concern; only its safety was.
+_llm_indirect_read() {
+  _lir_name="$1"; _lir_default="${2:-}"
+  case "$_lir_name" in
+    [A-Za-z_]*)
+      case "$_lir_name" in
+        *[!A-Za-z0-9_]*)
+          printf '%s' "$_lir_default"
+          return
+          ;;
+      esac
+      ;;
+    *)
+      printf '%s' "$_lir_default"
+      return
+      ;;
+  esac
+  _lir_val=$(eval "printf '%s' \"\${${_lir_name}:-}\"")
+  [ -n "$_lir_val" ] && { printf '%s' "$_lir_val"; return; }
+  printf '%s' "$_lir_default"
+}
+
 # Read CLAGENTIC_<ROLE>_<FIELD> with a fallback default.
 # Args: ROLE_UPPER FIELD DEFAULT
 role_env() {
   RU="$1"; F="$2"; DEF="$3"
-  V=$(eval "printf '%s' \"\${CLAGENTIC_${RU}_${F}-}\"")
-  [ -n "$V" ] && { printf '%s' "$V"; return; }
-  printf '%s' "$DEF"
+  _llm_indirect_read "CLAGENTIC_${RU}_${F}" "$DEF"
 }
 
 # Resolve a "cmd:tier" pair to a concrete (cmd, model) by consulting
@@ -1043,7 +1091,7 @@ resolve_step() {
   # Uppercase via tr (POSIX, no bash ${var^^}).
   CLI_U=$(printf '%s' "$CLI" | tr '[:lower:]-' '[:upper:]_')
   TIER_U=$(printf '%s' "$TIER" | tr '[:lower:]-' '[:upper:]_')
-  MODEL=$(eval "printf '%s' \"\${CLAGENTIC_MODEL_${CLI_U}_${TIER_U}-}\"")
+  MODEL=$(_llm_indirect_read "CLAGENTIC_MODEL_${CLI_U}_${TIER_U}")
 
   # For codex: if no env-var model, probe ~/.codex/models.json.
   # Tier names in models.json mirror clagentic tiers: flagship, mini, spark.
@@ -2721,7 +2769,7 @@ walk_chain() {
   # silently -- the refusal is as loud as a Layer-2 unreachability event.
   if [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && _llm_role_routable "$ROLE_L"; then
     ROUTER_VIA_KEY="CLAGENTIC_$(printf '%s' "$ROLE_U" | tr '[:lower:]-' '[:upper:]_')_VIA_ROUTER"
-    ROUTER_VIA=$(eval "printf '%s' \"\${${ROUTER_VIA_KEY}:-0}\"")
+    ROUTER_VIA=$(_llm_indirect_read "$ROUTER_VIA_KEY" "0")
     if [ "$ROUTER_VIA" = "1" ]; then
       : > "$TMP_ERR"
       : > "$TMP_OUT"
@@ -3096,7 +3144,7 @@ walk_chain() {
     # ensures a claude-only fallback is a detectable gate failure, not a silent
     # same-vendor review.
     REQUIRED_KEY="CLAGENTIC_$(printf '%s' "$ROLE_U" | tr '[:lower:]-' '[:upper:]_')_REQUIRED"
-    IS_REQUIRED=$(eval "printf '%s' \"\${${REQUIRED_KEY}:-0}\"")
+    IS_REQUIRED=$(_llm_indirect_read "$REQUIRED_KEY" "0")
     if [ "$IS_REQUIRED" = "1" ]; then
       printf '[clagentic-lite/llm-client] HARD FAILURE: all chain steps failed for required role %s\n' "$ROLE_L" 1>&2
       log_attempt "$ROLE_L" "" "" "hard-failure" "required role — no fallback permitted"
