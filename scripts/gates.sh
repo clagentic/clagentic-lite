@@ -6029,11 +6029,18 @@ gate_enabled() {
 
 cmd_ship() {
   echo "[gates/ship] running gate sequence (enabled: ${CLAGENTIC_GATES:-all})"
+  # Gate attestation manifest (lr-37a9c8): written unconditionally, before
+  # any gate runs -- see the module doc comment above _gate_manifest_path
+  # for why absence/incompleteness, not a lazily-created file, is what makes
+  # a crashed or killed-mid-run ship honestly reportable to every consumer.
+  _manifest_init
+  _SHIP_DECLARED_GATES="bleed secrets deps sast review adversarial merge-gate"
   # ship_step_skip: print + audit-log a skipped gate. Every gate decision —
   # including the decision to skip — lands in audit.db per AGENTS.md §6.
   ship_step_skip() {
     echo "[gates/ship] skip $1 (not in CLAGENTIC_GATES)"
     cmd_log_run "$1" skip "not in CLAGENTIC_GATES=${CLAGENTIC_GATES:-}"
+    _manifest_set_gate "$1" skipped "n/a" "" "" "[]" "" "not in CLAGENTIC_GATES=${CLAGENTIC_GATES:-}"
   }
   # ship_step_hint: one-line pointer to the Troubleshooter agent, printed
   # alongside every blocking failure below — same convention as the existing
@@ -6044,23 +6051,34 @@ cmd_ship() {
   ship_step_hint() {
     echo "[gates/ship] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"
   }
-  if gate_enabled bleed;        then cmd_bleed        || { echo "[gates/ship] BLOCKED at internal-bleed"; ship_step_hint; exit 1; }; else ship_step_skip bleed;        fi
-  if gate_enabled secrets;     then cmd_secrets     || { echo "[gates/ship] BLOCKED at secrets";    ship_step_hint; exit 1; }; else ship_step_skip secrets;     fi
-  if gate_enabled deps;        then cmd_deps        || { echo "[gates/ship] BLOCKED at deps";       ship_step_hint; exit 1; }; else ship_step_skip deps;        fi
-  if gate_enabled sast;        then cmd_sast        || { echo "[gates/ship] BLOCKED at sast";       ship_step_hint; exit 1; }; else ship_step_skip sast;        fi
+  # Deterministic gates (secrets/deps/sast/bleed): no LLM path, so "path" is
+  # always "n/a" and brand/model are always empty -- FAIL-CLOSED ON
+  # DEGRADATION per this task's policy (a missing tool already blocks per
+  # AGENTS.md §4; the manifest just records that same outcome under the
+  # shared vocabulary rather than inventing a parallel one).
+  if gate_enabled bleed;   then cmd_bleed   && _manifest_set_gate bleed   ran "n/a" "" "" "[]" "" "" || { _manifest_set_gate bleed failed "n/a" "" "" "[]" "" ""; echo "[gates/ship] BLOCKED at internal-bleed"; ship_step_hint; _manifest_finalize "$_SHIP_DECLARED_GATES"; exit 1; }; else ship_step_skip bleed;   fi
+  if gate_enabled secrets; then cmd_secrets && _manifest_set_gate secrets ran "n/a" "" "" "[]" "" "" || { _manifest_set_gate secrets failed "n/a" "" "" "[]" "" ""; echo "[gates/ship] BLOCKED at secrets";    ship_step_hint; _manifest_finalize "$_SHIP_DECLARED_GATES"; exit 1; }; else ship_step_skip secrets; fi
+  if gate_enabled deps;    then cmd_deps    && _manifest_set_gate deps    ran "n/a" "" "" "[]" "" "" || { _manifest_set_gate deps failed "n/a" "" "" "[]" "" ""; echo "[gates/ship] BLOCKED at deps";       ship_step_hint; _manifest_finalize "$_SHIP_DECLARED_GATES"; exit 1; }; else ship_step_skip deps;    fi
+  if gate_enabled sast;    then cmd_sast    && _manifest_set_gate sast    ran "n/a" "" "" "[]" "" "" || { _manifest_set_gate sast failed "n/a" "" "" "[]" "" ""; echo "[gates/ship] BLOCKED at sast";       ship_step_hint; _manifest_finalize "$_SHIP_DECLARED_GATES"; exit 1; }; else ship_step_skip sast;    fi
   if gate_enabled review; then
+    _review_watermark=$(_manifest_audit_watermark)
     _review_rc=0
     cmd_review || _review_rc=$?
     if [ "$_review_rc" -eq 2 ]; then
       echo "[gates/ship] INFRA_DEGRADED at review — reviewer infrastructure failed, no real review occurred"
       ship_step_hint
       cmd_log_run ship block "infra-degraded at review"
+      _manifest_record_llm_gate review reviewer degraded "$_review_watermark" "infra-degraded at review"
+      _manifest_finalize "$_SHIP_DECLARED_GATES"
       exit 2
     elif [ "$_review_rc" -ne 0 ]; then
       echo "[gates/ship] REVIEW_BLOCKED at review (severity threshold ${CLAGENTIC_BLOCK_SEVERITY:-high})"
       cmd_log_run ship block "review-blocked at review"
+      _manifest_record_llm_gate review reviewer failed "$_review_watermark" "review-blocked at review"
+      _manifest_finalize "$_SHIP_DECLARED_GATES"
       exit 1
     fi
+    _manifest_record_llm_gate review reviewer ran "$_review_watermark" ""
   else
     ship_step_skip review
   fi
@@ -6072,10 +6090,37 @@ cmd_ship() {
   # The degraded state is NOT silently lost: cmd_adversarial's own audit row
   # (outcome=degraded) records it, and build_gate_summary/cmd_merge_gate
   # (adversarial_degraded field) independently surface it to the blocking
-  # merge-gate step that runs immediately after this line.
-  if gate_enabled adversarial; then cmd_adversarial || true; else ship_step_skip adversarial; fi
-  if gate_enabled merge-gate;  then cmd_merge_gate  || { echo "[gates/ship] BLOCKED at merge-gate"; ship_step_hint; exit 1; }; else ship_step_skip merge-gate;  fi
+  # merge-gate step that runs immediately after this line. The manifest
+  # records the same distinction under its own outcome vocabulary
+  # (degraded, not a bare "ran") so a degraded-but-non-blocking auditor is
+  # still visible as a LOUD, greppable state, per this task's policy.
+  if gate_enabled adversarial; then
+    _adv_watermark=$(_manifest_audit_watermark)
+    _adv_rc=0
+    cmd_adversarial || _adv_rc=$?
+    if [ "$_adv_rc" -eq 2 ]; then
+      _manifest_record_llm_gate adversarial auditor degraded "$_adv_watermark" "adversarial ran degraded (non-blocking)"
+    else
+      _manifest_record_llm_gate adversarial auditor ran "$_adv_watermark" ""
+    fi
+  else
+    ship_step_skip adversarial
+  fi
+  if gate_enabled merge-gate; then
+    _mg_watermark=$(_manifest_audit_watermark)
+    if cmd_merge_gate; then
+      _manifest_record_llm_gate merge-gate gate ran "$_mg_watermark" ""
+    else
+      _manifest_record_llm_gate merge-gate gate failed "$_mg_watermark" "merge-gate refused or degraded"
+      echo "[gates/ship] BLOCKED at merge-gate"; ship_step_hint
+      _manifest_finalize "$_SHIP_DECLARED_GATES"
+      exit 1
+    fi
+  else
+    ship_step_skip merge-gate
+  fi
 
+  _manifest_finalize "$_SHIP_DECLARED_GATES"
   echo "[gates/ship] all blocking gates passed"
   # Repo-scoped (lr-da1f28 sweep): a bare `_git rev-parse --abbrev-ref HEAD`
   # would resolve an ancestor repo's branch name when REPO_ROOT is not
