@@ -1501,7 +1501,7 @@ NON_CLAUDE_ENV_STRIP="env -u AWS_BEARER_TOKEN_BEDROCK -u ANTHROPIC_BEDROCK_BASE_
 #
 # TWO BEDROCK-* VALUES BOTH FIRE (bedrock-sso, bedrock-api-key) -- the
 # distinction between them matters to the readiness preflight
-# (_llm_bedrock_sso_preflight, below/walk_chain) and to doctor's
+# (_llm_auth_mode_preflight, below/walk_chain) and to doctor's
 # contradiction check, not to this ensure: both need
 # CLAUDE_CODE_USE_BEDROCK=1 on the spawned `claude` process regardless of
 # which Bedrock credential source backs it.
@@ -1987,6 +1987,123 @@ _llm_role_routable() {
     reviewer|auditor) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# _llm_auth_mode_preflight (lr-6d4a1f, description scope item 4)
+#
+# MODE-IMPLIED READINESS PREFLIGHT, called once at the top of walk_chain for
+# every role, before any LLM invocation (router or direct-CLI). Only
+# CLAGENTIC_AUTH_MODE=bedrock-sso does anything here: it reads the AWS SSO
+# token cache's expiresAt and fails fast, with the expiry timestamp named,
+# when the cache has already expired. ALL OTHER MODES (anthropic-oauth,
+# enterprise, bedrock-api-key, and UNDECLARED) ARE A NO-OP -- this is a
+# closed enumeration, not a default-permissive one: only the one literal
+# value "bedrock-sso" triggers any check at all.
+#
+# WHY bedrock-sso SPECIFICALLY, AND NOT bedrock-api-key: an SSO-derived
+# credential has an OBSERVABLE, LOCAL expiry (the token cache file) that
+# silently goes stale on a schedule outside this tool's control -- an
+# operator who ran `aws sso login` hours ago and forgot has no signal until
+# the gate call itself fails deep inside a 180s+ timeout window, which reads
+# as a hung/degraded infra problem, not "your SSO session expired 40 minutes
+# ago." bedrock-api-key has no equivalent local expiry artifact to check
+# (it is a long-lived bearer token by design), so there is nothing this
+# preflight can usefully inspect for that value -- it stays a no-op for it,
+# same as every non-bedrock-sso value.
+#
+# RETURNS 0 (ready, or nothing to check) or 1 (not ready) -- on 1,
+# $_LLM_AUTH_MODE_PREFLIGHT_REASON carries a human-readable reason naming
+# the expiry timestamp, for the caller to fold into its own degraded
+# envelope/log line. Never dies, never exits the process -- same
+# degrade-and-continue posture every other walk_chain failure path uses;
+# the CALLER (walk_chain) decides what a failed preflight means for the
+# gate as a whole.
+_LLM_AUTH_MODE_PREFLIGHT_REASON=""
+_llm_auth_mode_preflight() {
+  _LLM_AUTH_MODE_PREFLIGHT_REASON=""
+  [ "${CLAGENTIC_AUTH_MODE:-}" = "bedrock-sso" ] || return 0
+
+  _lamp_cache_dir="${CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR:-$HOME/.aws/sso/cache}"
+  if [ ! -d "$_lamp_cache_dir" ]; then
+    _LLM_AUTH_MODE_PREFLIGHT_REASON="CLAGENTIC_AUTH_MODE=bedrock-sso but no AWS SSO token cache directory found at $_lamp_cache_dir -- run 'aws sso login' (or set CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR if the cache lives elsewhere on this host)"
+    return 1
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    # FAIL-OPEN, matching every other JSON-tool-dependent helper in this
+    # file (_llm_turn_diagnostics, the validate_output python3 branch,
+    # etc.): without python3, this preflight cannot parse the cache files'
+    # JSON/ISO-8601 content, so it cannot prove EITHER readiness or
+    # staleness -- reporting "not ready" here would be a false positive on
+    # a perfectly healthy host that merely lacks python3, and this preflight
+    # exists to catch a real, provable expiry, not to invent one. The real
+    # 401 (if the SSO session genuinely is expired) still surfaces at the
+    # actual invoke_claude call site, just without this preflight's faster,
+    # more specific diagnosis.
+    return 0
+  fi
+
+  # Scan every *.json file in the cache dir for an "expiresAt" field
+  # (ISO-8601, the documented AWS CLI SSO token-cache shape). Report the
+  # SOONEST expiry found as "not ready" if it has already passed -- a
+  # conservative choice: an operator with multiple SSO profiles cached only
+  # needs ONE to be expired for THIS preflight to be honest that something
+  # in the cache is stale, and naming the soonest (most urgent) expiry is
+  # the most actionable single timestamp to report. A cache dir with zero
+  # parseable expiresAt fields (empty, or every file unparseable) is
+  # reported as "ready" -- fail-open, same rationale as the missing-python3
+  # branch above: this preflight only ever blocks on a PROVEN expiry, never
+  # on an absence of proof.
+  _lamp_result=$(python3 - "$_lamp_cache_dir" <<'PY' 2>/dev/null
+import datetime
+import glob
+import json
+import os
+import sys
+
+cache_dir = sys.argv[1]
+soonest = None
+for path in glob.glob(os.path.join(cache_dir, "*.json")):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        continue
+    expires_at = data.get("expiresAt")
+    if not isinstance(expires_at, str):
+        continue
+    try:
+        # AWS SSO cache format: "2026-08-21T18:30:00UTC" or with a real
+        # offset ("...+00:00"/"...Z"). Normalize the bare "UTC" suffix
+        # (not valid ISO-8601 on its own) before parsing.
+        norm = expires_at.replace("UTC", "+00:00").replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(norm)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        continue
+    if soonest is None or dt < soonest:
+        soonest = dt
+
+if soonest is None:
+    sys.exit(0)
+
+now = datetime.datetime.now(datetime.timezone.utc)
+if soonest <= now:
+    remaining = now - soonest
+    print(f"expired\t{soonest.isoformat()}\t{remaining}")
+    sys.exit(1)
+sys.exit(0)
+PY
+  )
+  _lamp_code=$?
+  if [ "$_lamp_code" -eq 1 ]; then
+    _lamp_expiry=$(printf '%s' "$_lamp_result" | cut -f2)
+    _lamp_ago=$(printf '%s' "$_lamp_result" | cut -f3)
+    _LLM_AUTH_MODE_PREFLIGHT_REASON="AWS SSO token cache expired at $_lamp_expiry (${_lamp_ago} ago) -- run 'aws sso login' to refresh before retrying (cache dir: $_lamp_cache_dir)"
+    return 1
+  fi
+  return 0
 }
 
 # Dispatch a single chain step.
@@ -2504,6 +2621,30 @@ walk_chain() {
   cat > "$TMP_IN"
   $PFUNC > "$TMP_PROMPT"
   role_chain "$ROLE_U" > "$TMP_CHAIN"
+
+  # MODE-IMPLIED READINESS PREFLIGHT (lr-6d4a1f, description scope item 4).
+  # Runs BEFORE any LLM invocation (router or direct-CLI) for every role --
+  # placed here, after stdin/prompt/chain are already captured to temp files
+  # so no LLM-CLI-specific state has been touched yet, and before the
+  # per-call timeout is even computed, so a preflight failure surfaces in
+  # milliseconds, never after a hung 180s+ call. ALL modes other than
+  # bedrock-sso (including UNDECLARED) are a no-op -- see
+  # _llm_auth_mode_preflight's own doc comment for the full contract.
+  if ! _llm_auth_mode_preflight; then
+    _amp_reason="$_LLM_AUTH_MODE_PREFLIGHT_REASON"
+    printf '[clagentic-lite/llm-client] AUTH-MODE PREFLIGHT FAILED for role=%s: %s\n' \
+      "$ROLE_L" "$_amp_reason" 1>&2
+    emit_degraded "$MODE" "$_amp_reason" "auth-mode-preflight"
+    log_attempt "$ROLE_L" "" "" "degraded" "cause=auth-mode-preflight: $_amp_reason"
+    rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
+    # Same polarity-flip contract as every other degraded exit below (INV-1):
+    # a distinct non-zero status, never 0, so a caller checking exit status
+    # alone cannot mistake this for a clean pass. Reuses exit 3 ("infra" —
+    # this IS an infra/credential-readiness problem, and the envelope's own
+    # "cause" field carries the more specific "auth-mode-preflight" label
+    # for a caller that wants to distinguish it from the generic infra case).
+    return 3
+  fi
 
   # Compute the combined input size for proportional timeout scaling.
   # Both files exist at this point; ds_file_size returns 0 on empty files.
