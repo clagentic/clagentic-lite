@@ -656,7 +656,7 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
         r1 = _run_review([], self._tmpdir, project2)
         self.assertEqual(r1.returncode, 0, r1.stderr)
-        self.assertIn("no prior anchored verdict", r1.stderr)
+        self.assertIn("no prior passing anchored verdict", r1.stderr)
 
     # ------------------------------------------------------------------ AC4
     def test_rebase_invalidates_prior_sha_falls_back_to_full_range_and_says_so(self):
