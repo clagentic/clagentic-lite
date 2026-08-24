@@ -159,6 +159,19 @@ CLAGENTIC_DISABLE_HANDOFF=0
 # long (lr-716012).
 # CLAGENTIC_SKIP_UPDATE_ALERT=0
 
+# `clagentic-lite update` non-tty safety (lr-55a27a). When CLAGENTIC_LITE_HOME
+# has uncommitted changes and update runs non-interactively (CI, a script, or
+# any agent invocation — every automated caller is non-tty), update now
+# REFUSES by default rather than silently discarding them via `git stash
+# push` + `git stash drop` (a sequence that destroys working-tree content
+# irrecoverably and leaves no reflog entry once dropped). Set =1 only if
+# CLAGENTIC_LITE_HOME is a genuinely disposable install directory you are
+# comfortable having discarded automatically on every unattended update.
+# Never set this in a config that CLAGENTIC_LITE_HOME might resolve to a
+# real development checkout (see the bootstrap block at the top of
+# bin/clagentic-lite for how CLAGENTIC_LITE_HOME can get repointed).
+# CLAGENTIC_UPDATE_ALLOW_DISCARD=0
+
 # Context-budget monitor (PostToolUse hook).
 # Estimates token cost of each tool result (4 bytes ≈ 1 token) and warns via
 # additionalContext when a single result or the cumulative session total crosses
