@@ -103,6 +103,8 @@ If you stop after `init` without running `enroll` in at least one project, the h
 
 After the first install, the steady-state upgrade is just `clagentic-lite update` — it does the `git pull --ff-only`, re-checks prereqs, and re-stamps hook shims, `.claude/settings.json`, and `CLAUDE.md` in every enrolled repo when their template versions change.
 
+**Upgrading and the secrets gate.** If any enrolled repo's `.gitleaks.toml` declares no `[[rules]]` table and has no `[extend]` / `useDefault = true`, the secrets gate previously reported a permanent, silent pass — `gitleaks --config` replaces the built-in ruleset rather than merging with it, so a rules-less config detects nothing. Since the fix for this, that same config now **blocks** the `secrets` gate outright, naming the cause, instead of passing. That is the correct behavior, but if your gate has been green for a while, it can look like the upgrade broke something. Run `clagentic-lite doctor` after updating — it now warns on exactly this condition for every enrolled repo, before you hit the block, and names the fix (`[extend]` / `useDefault = true`, or declare your own `[[rules]]`). See [`docs/GATES.md`, "4a. Secrets"](docs/GATES.md#4a-secrets-pre-commit) for the full mechanism.
+
 If `init` warns that `~/.local/bin` is not on `$PATH`, add this to your shell rc and reopen your shell:
 
 ```sh
