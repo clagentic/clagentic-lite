@@ -889,6 +889,113 @@ change-scoped pattern scan (internal-bleed):
 | **Augment** | `.gitleaks.toml` in repo root extends the default ruleset. Path-scoped allowlists only (see `.gitleaks.toml` comment for why regex allowlists on token literals are dangerous). |
 | **Timeout** | Every gitleaks invocation runs under `run_bounded` (default 300s, configurable via `CLAGENTIC_SECRETS_TIMEOUT_SEC`) — a full branch-history scan can legitimately take longer than a staged-only scan. A timeout counts as a block, same as a real finding. |
 
+**Config preflight — fail closed on a rules-less `.gitleaks.toml` (lr-170808).**
+gitleaks' `--config` REPLACES the embedded ruleset, it does not merge with
+it. A repo-supplied `.gitleaks.toml` consisting solely of an
+`[allowlist]`/`[[allowlists]]` block — the most natural file to write when
+the intent is "suppress these known false positives" — silently loads ZERO
+detection rules; an allowlist can only suppress what a rule first matched,
+so with no rules nothing is ever found and the gate reports a permanent,
+convincing "no leaks found" pass. Before every gitleaks invocation,
+`_gitleaks_config_declares_rules` (`scripts/gates.sh`) checks that
+`.gitleaks.toml` declares at least one `[[rules]]` table or an `[extend]`
+block with `useDefault = true` — gitleaks' own documented mechanism for
+re-including the built-in ruleset on top of a repo override. A config that
+declares neither BLOCKS outright, naming the exact cause: `.gitleaks.toml
+defines no rules and does not set [extend] useDefault = true. gitleaks
+--config replaces the built-in ruleset, so this configuration detects
+nothing. Add [extend] useDefault = true or declare rules.` No config file
+at all is unaffected (gitleaks runs with its full built-in ruleset, as
+before) — this check only fires when a `.gitleaks.toml` exists and fails to
+declare usable rules.
+
+**Positive control before trusting a pass (lr-170808).** A security tool
+reporting success proves nothing until it has been seen to fail on a
+known-bad input. Before the real scan's "no leaks found" is trusted,
+`_gitleaks_positive_control` (`scripts/gates.sh`) runs gitleaks (the same
+binary, the same effective `--config`) against a small scratch git repo
+seeded with several REALISTIC, NON-EXAMPLE synthetic credentials (an AWS
+key pair, a GitHub PAT, a Slack bot token, a generic API key — several
+distinct rule families so one upstream rule change cannot silently disable
+the whole canary) and requires a real, non-zero finding count with at least
+one attributed rule ID — asserted on the actual count and rule IDs, never
+merely a non-zero exit status. This catches the whole class, not just the
+config instance item above fixes directly: a rules-less config, a
+shimmed/broken gitleaks install, an allowlist that accidentally matches
+everything, or a future upstream change to `--config` semantics all produce
+the same "scanner ran but detected nothing" shape, and the canary fails
+identically on all of them. A canary failure BLOCKS with: `positive-control
+canary failed — gitleaks (this binary, this config) did not detect a
+planted, realistic credential in a scratch repo. The real scan's "no leaks
+found" cannot be trusted this run.` Opt out via
+`CLAGENTIC_SKIP_SECRETS_CANARY=1` for an air-gapped/offline environment
+where spinning up a throwaway git repo per run is undesirable; on by
+default, since the canary is cheap (one small local repo, one bounded
+scan under the same `CLAGENTIC_SECRETS_TIMEOUT_SEC` budget the real scan
+uses).
+
+**Do not build a canary from a documentation example.** gitleaks stopwords
+AWS's own published doc-example access key (deliberately not reproduced
+here — even a same-file prose mention of it is itself gitleaks-detectable,
+confirmed against the real binary rather than assumed) in most contexts, so
+a canary built from it reports "no leaks found" against a FULLY FUNCTIONAL
+scanner: the identical defect this section is about, one level up, and
+harder to notice because it would live in this harness rather than a
+repo's config. `_gitleaks_positive_control`'s fixture values are realistic,
+correctly-shaped, non-example synthetic secrets, never a published
+documentation/test-vector literal — and, since PR #188 review, assembled
+from run-time fragments rather than committed as complete literals, so the
+canary itself does not become the thing `gates.sh secrets` blocks on when
+scanning this repo's own history.
+
+**Proven sensitive in both directions.** `_gitleaks_positive_control` is
+exercised in `scripts/test_secrets_positive_control.py` against the REAL
+installed gitleaks binary (not a stub): it must report a real positive
+count with rules loaded (default ruleset, or a correctly-`[extend]`ed
+config), AND report exactly zero against the identical fixture when handed
+a deliberately rules-less config (the same `[[allowlists]]`-only shape the
+config-preflight check above blocks). A canary that cannot fail is not a
+control — this negative case is what proves it actually detects the class
+of defect this task closes, not merely that gitleaks is present and
+runnable.
+
+**The same principle generalizes to the deps and SAST gates.** A missing
+positive control is not unique to secrets — `cmd_deps` (osv-scanner) and
+`cmd_sast` (semgrep) have the identical structural exposure: a broken
+install, a misconfigured ignore list, or an upstream semantics change could
+each produce a convincing "no findings" from a scanner that is not actually
+scanning anything meaningful. Out of scope for this task (lr-170808) —
+noted here for a future task, not implemented.
+
+**Coverage visibility downstream (lr-170808).** A gitleaks run that produced
+no meaningful detection coverage — the config preflight block above, the
+positive-control canary block above, or the pre-existing older-gitleaks
+"no staged changes on a feature branch, history scan unavailable" warn path
+(see the version-floor note below) — is surfaced as an explicit
+`no_coverage: true` marker on the `secrets` entry of the `deterministic_gates`
+block `build_gate_summary` feeds to the merge-gate (`_read_deterministic_gates`,
+`scripts/gates.sh`; see "Gate attestation manifest" and
+`_read_deterministic_gates`'s own doc comment for the full field shape). A
+skip or a preflight/canary block previously logged `warn`/`block` with no
+way for the merge-gate payload to distinguish "the scanner ran and found
+nothing" from "the scanner did not meaningfully run at all" — this is the
+same downstream wire for all three causes, computed once from the fixed,
+greppable vocabulary each already writes to `gate_runs.details`, not three
+separate signals.
+
+**Version floor: `gitleaks git` requires 8.18+ (lr-170808).** `clagentic-lite
+doctor` reports the installed gitleaks version and warns below two floors
+independently: 8.18 (the `gitleaks git` subcommand cmd_secrets uses for
+feature-branch history scanning — below this floor, a feature branch with a
+clean index falls back to a staged-only scan that is a documented no-op,
+so committed-but-unstaged secrets go unscanned on EVERY such run, not just
+intermittently) and 8.25 (`[[allowlists]]`/`condition = "AND"` semantics —
+see `.gitleaks.toml`'s own header comment). Ubuntu 24.04's `apt install
+gitleaks` currently installs 8.16.0, below both floors — this affects most
+Linux installs following the obvious install path, and is a standing
+coverage gap the operator should know about once, not rediscover as an
+intermittent-looking gate behavior.
+
 ### 4b. Dependencies (pre-push)
 
 | | |

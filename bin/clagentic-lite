@@ -2282,6 +2282,76 @@ cmd_doctor() {
     fi
   done
 
+  # 5a. gitleaks version floor (lr-170808 scope item 4). `gitleaks git`
+  # (feature-branch history scanning — scripts/gates.sh cmd_secrets,
+  # docs/GATES.md "4a. Secrets") landed in gitleaks 8.18; below that floor,
+  # cmd_secrets falls back to a staged-only scan that is a documented no-op
+  # on a clean index (a Builder commit always leaves the index clean), so
+  # committed-but-not-staged secrets on a feature branch go unscanned on
+  # EVERY run, silently, until the operator happens to have unstaged work.
+  # This is a STANDING COVERAGE GAP, not a per-run surprise — report it once,
+  # here, rather than leaving it to be rediscovered as an intermittent-looking
+  # gate behavior. GITLEAKS_MIN_VERSION mirrors the .gitleaks.toml header
+  # comment's own floor (8.25, required for [[allowlists]] array-of-tables +
+  # condition = "AND" semantics) as a SEPARATE, higher bar from the 8.18
+  # history-scan floor — both are reported, since they gate different
+  # capabilities and a repo can be below one but not the other.
+  printf '\ngitleaks version:\n'
+  GITLEAKS_HISTORY_MIN_VERSION="8.18.0"
+  GITLEAKS_ALLOWLIST_MIN_VERSION="8.25.0"
+  if command -v gitleaks >/dev/null 2>&1; then
+    _gl_ver_raw=$(gitleaks version 2>/dev/null || true)
+    _gl_ver=$(printf '%s' "$_gl_ver_raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [ -z "$_gl_ver" ]; then
+      printf '  INFO gitleaks: on PATH but version unparseable (output: %s)\n' \
+        "$(printf '%s' "$_gl_ver_raw" | head -1 | cut -c1-80)"
+      printf '       Cannot confirm feature-branch history scanning (requires >= %s) or [[allowlists]]/condition="AND" support (requires >= %s).\n' \
+        "$GITLEAKS_HISTORY_MIN_VERSION" "$GITLEAKS_ALLOWLIST_MIN_VERSION"
+    else
+      _gl_history_ok=0
+      _gl_allowlist_ok=0
+      if sort -V /dev/null 2>/dev/null; then
+        _gl_lowest_h=$(printf '%s\n%s\n' "$_gl_ver" "$GITLEAKS_HISTORY_MIN_VERSION" | sort -V | head -1)
+        [ "$_gl_lowest_h" = "$GITLEAKS_HISTORY_MIN_VERSION" ] && _gl_history_ok=1
+        _gl_lowest_a=$(printf '%s\n%s\n' "$_gl_ver" "$GITLEAKS_ALLOWLIST_MIN_VERSION" | sort -V | head -1)
+        [ "$_gl_lowest_a" = "$GITLEAKS_ALLOWLIST_MIN_VERSION" ] && _gl_allowlist_ok=1
+      else
+        # Arithmetic fallback, same shape as the codex version check above.
+        _gvi_maj=$(printf '%s' "$_gl_ver" | cut -d. -f1 | tr -cd '0-9'); _gvi_maj="${_gvi_maj:-0}"
+        _gvi_min=$(printf '%s' "$_gl_ver" | cut -d. -f2 | tr -cd '0-9'); _gvi_min="${_gvi_min:-0}"
+        _gvi_pat=$(printf '%s' "$_gl_ver" | cut -d. -f3 | tr -cd '0-9'); _gvi_pat="${_gvi_pat:-0}"
+        for _gvm_pair in "$GITLEAKS_HISTORY_MIN_VERSION:_gl_history_ok" "$GITLEAKS_ALLOWLIST_MIN_VERSION:_gl_allowlist_ok"; do
+          _gvm_ver="${_gvm_pair%%:*}"
+          _gvm_maj=$(printf '%s' "$_gvm_ver" | cut -d. -f1 | tr -cd '0-9'); _gvm_maj="${_gvm_maj:-0}"
+          _gvm_min=$(printf '%s' "$_gvm_ver" | cut -d. -f2 | tr -cd '0-9'); _gvm_min="${_gvm_min:-0}"
+          _gvm_pat=$(printf '%s' "$_gvm_ver" | cut -d. -f3 | tr -cd '0-9'); _gvm_pat="${_gvm_pat:-0}"
+          _gvm_ok=0
+          if   [ "$_gvi_maj" -gt "$_gvm_maj" ]; then _gvm_ok=1
+          elif [ "$_gvi_maj" -lt "$_gvm_maj" ]; then _gvm_ok=0
+          elif [ "$_gvi_min" -gt "$_gvm_min" ]; then _gvm_ok=1
+          elif [ "$_gvi_min" -lt "$_gvm_min" ]; then _gvm_ok=0
+          elif [ "$_gvi_pat" -ge "$_gvm_pat" ]; then _gvm_ok=1
+          fi
+          case "$_gvm_pair" in *_gl_history_ok) _gl_history_ok=$_gvm_ok ;; *_gl_allowlist_ok) _gl_allowlist_ok=$_gvm_ok ;; esac
+        done
+      fi
+      if [ "$_gl_history_ok" -eq 1 ]; then
+        _ok "gitleaks $_gl_ver (>= $GITLEAKS_HISTORY_MIN_VERSION — feature-branch history scanning available)"
+      else
+        printf '  WARN gitleaks %s < %s — feature-branch history scanning is UNAVAILABLE.\n' "$_gl_ver" "$GITLEAKS_HISTORY_MIN_VERSION"
+        printf '       On a feature branch with a clean index (the normal state after a commit), the staged-only scan this version falls back to is a no-op — committed secrets go unscanned on every such run, not just intermittently. This is the version apt installs on Ubuntu 24.04 as of this writing.\n'
+        printf '       Upgrade: https://github.com/gitleaks/gitleaks#installing\n'
+      fi
+      if [ "$_gl_allowlist_ok" -ne 1 ]; then
+        printf '  WARN gitleaks %s < %s — [[allowlists]] (array-of-tables) and condition = "AND" are misread by older gitleaks (default OR semantics), which can let a real secret slip past a path-scoped allowlist meant only for known fixtures. See .gitleaks.toml'"'"'s own header comment.\n' \
+          "$_gl_ver" "$GITLEAKS_ALLOWLIST_MIN_VERSION"
+      fi
+    fi
+  else
+    printf '  INFO gitleaks: not on PATH (minimum for history scanning: %s; for AND-semantics allowlists: %s)\n' \
+      "$GITLEAKS_HISTORY_MIN_VERSION" "$GITLEAKS_ALLOWLIST_MIN_VERSION"
+  fi
+
   # 5b. sha256 soft dependency (used by review-merge.sh for finding dedup keys).
   # Warn-only: the identity fallback works but dedup keys become less robust.
   printf '\nsha256 (soft dep, chunked-review dedup):\n'

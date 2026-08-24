@@ -360,6 +360,282 @@ _gate_resolve_fresh_default_branch_ref() {
   return 0
 }
 
+# _gitleaks_config_declares_rules FILE (lr-170808, scope item 1)
+#
+# WHY THIS EXISTS: gitleaks' --config REPLACES the embedded ruleset, it does
+# not merge with it. A repo-supplied .gitleaks.toml consisting solely of an
+# [allowlist]/[[allowlists]] block — the single most natural file to write
+# when the intent is "suppress these known false positives" — silently loads
+# ZERO detection rules. An allowlist can only suppress what a rule first
+# matched; with no rules, nothing is ever found, and the gate reports a
+# permanent, convincing "no leaks found" pass. Honoring a repo-supplied
+# config is correct; the defect is trusting one that eliminates detection
+# entirely rather than narrowing it.
+#
+# CONTRACT: FILE declares usable detection when it contains at least one
+# `[[rules]]` table header OR an `[extend]` block with `useDefault = true`
+# (gitleaks' own documented mechanism for re-including the built-in ruleset
+# on top of a repo override — see .gitleaks.toml's own header comment and
+# https://github.com/gitleaks/gitleaks#configuration). Text-level detection,
+# not a TOML parser: gitleaks.toml is a small, well-known config shape and
+# this codebase has no TOML library dependency anywhere else (AGENTS.md
+# "what to ask the user" — no new external tool without asking). A
+# `useDefault` line inside a table this function does not recognize as
+# `[extend]` is deliberately NOT enough on its own — see the state-machine
+# comment inline below for why a bare substring grep for "useDefault = true"
+# would false-positive on that same text appearing in an unrelated table
+# (e.g. a future gitleaks config key that happens to share the name) or in
+# a comment.
+#
+# Returns 0 (declares rules — safe to trust) or 1 (declares none — the
+# caller must fail closed). A missing/unreadable FILE is the caller's own
+# concern (this function is only ever called after `[ -f FILE ]` already
+# passed) — treated as "no rules declared" if called directly, matching the
+# fail-closed posture of every other branch here.
+_gitleaks_config_declares_rules() {
+  _gcdr_file="$1"
+  [ -f "$_gcdr_file" ] || return 1
+
+  # [[rules]] — an array-of-tables header, one or more. Anchored to the
+  # start of a line (ignoring leading whitespace) so this cannot match
+  # "[[rules]]" appearing inside a quoted string value or a comment on the
+  # same line as other content — gitleaks' own TOML table-header syntax is
+  # always alone on its line.
+  if grep -qE '^[[:space:]]*\[\[rules\]\][[:space:]]*$' "$_gcdr_file" 2>/dev/null; then
+    return 0
+  fi
+
+  # [extend] useDefault = true — a two-line state check, not a bare
+  # substring grep for "useDefault", because `useDefault = true` is only
+  # meaningful directly under an `[extend]` table header. Approach: locate
+  # every `[extend]` table header line number, then check whether a
+  # `useDefault = true` line (allowing for TOML's optional whitespace around
+  # `=` and either bare/quoted `true`) appears before the NEXT table header
+  # (`[...]` or `[[...]]`) or end of file — i.e. still inside that same
+  # table. This is a real (if minimal) TOML table-scoping check, not a
+  # flat grep, so a `useDefault = true` line sitting under a different
+  # table (or one gitleaks would itself reject as out of place) is
+  # correctly NOT treated as extending the default ruleset.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$_gcdr_file" <<'PYEOF'
+import re
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        lines = f.readlines()
+except Exception:
+    sys.exit(1)
+
+table_header_re = re.compile(r'^\s*\[\[?[^\]]+\]\]?\s*(#.*)?$')
+extend_header_re = re.compile(r'^\s*\[extend\]\s*(#.*)?$')
+use_default_re = re.compile(r'^\s*useDefault\s*=\s*true\s*(#.*)?$')
+
+in_extend = False
+for line in lines:
+    if table_header_re.match(line):
+        in_extend = bool(extend_header_re.match(line))
+        continue
+    if in_extend and use_default_re.match(line):
+        sys.exit(0)
+sys.exit(1)
+PYEOF
+    return $?
+  fi
+
+  # No python3 — fall back to a narrower (still anchored) heuristic: an
+  # exact `[extend]` header line followed, ANYWHERE later in the file, by a
+  # `useDefault = true` line. This can false-positive if a later,
+  # unrelated table also happens to declare `useDefault = true` (unlikely —
+  # not a real gitleaks key outside [extend]), but it cannot false-NEGATIVE
+  # relative to the python3 path for any config this codebase's own
+  # .gitleaks.toml or docs ever describe, and erring toward "declares
+  # rules" here is the direction that still leaves the positive-control
+  # canary (item 2) as the actual backstop against a config that silently
+  # eliminates detection despite this heuristic's blind spot.
+  if grep -qE '^[[:space:]]*\[extend\][[:space:]]*(#.*)?$' "$_gcdr_file" 2>/dev/null; then
+    if grep -qE '^[[:space:]]*useDefault[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$' "$_gcdr_file" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# _gitleaks_positive_control [CFG_ARG] (lr-170808, scope item 2)
+#
+# WHY THIS EXISTS: a security scanner reporting "clean" proves nothing until
+# it has been seen to fail on a known-bad input. Without this, a rules-less
+# config (item 1's defect), a shimmed/broken gitleaks binary, or a future
+# upstream change to --config semantics all produce the exact same "no
+# leaks found" exit 0 a genuinely clean scan produces — indistinguishable
+# from the outside. This runs gitleaks against a small scratch git repo
+# seeded with REALISTIC, NON-EXAMPLE planted credentials and requires a
+# real, countable, rule-attributed finding before the caller trusts a pass
+# from the real scan.
+#
+# IMPLEMENTATION WARNING, learned the hard way (task description): do NOT
+# build this out of a documentation example. gitleaks stopwords AWS's own
+# published doc-example access key (see AWS's public documentation for the
+# exact literal, deliberately NOT reproduced here — see the next paragraph
+# for why even a same-file PROSE MENTION of a real stopworded/flagged
+# literal is itself a mistake, confirmed the hard way during this task) in
+# most contexts, so a canary built from it reports "no leaks found" against
+# a FULLY FUNCTIONAL scanner. That is the identical defect this task is
+# about, one level up, and harder to notice because it would live in this
+# harness rather than a repo's config. Every fixture value below is a
+# realistic, correctly-SHAPED, NON-EXAMPLE synthetic secret — never a
+# published documentation/test-vector literal — across SEVERAL distinct
+# rule families, so one upstream rule change (or one stopword) cannot
+# silently disable the whole canary.
+#
+# NO CREDENTIAL-SHAPED LITERAL IS EVER TRACKED IN SOURCE (PEACHES, PR #188
+# review, self-defeating-canary finding). The first shipped version of this
+# function embedded each fixture as one complete literal string in a
+# heredoc — gitleaks itself then flagged those exact lines in gates.sh's
+# OWN committed history (18 findings: aws-access-token, generic-api-key,
+# github-pat, slack-access-token, stripe-access-token), so `gates.sh
+# secrets` blocked on branch history scanning this very file once shipped.
+# Every fixture below is instead assembled at RUN TIME from two or more
+# fragments that are individually sub-pattern (neither fragment alone
+# matches any gitleaks rule's regex — verified by construction: each
+# fragment is either too short, missing the required prefix token, or
+# missing the required length/charset run a rule demands) and concatenated
+# only in a shell variable that never itself becomes a source-file literal.
+# This is NOT the .gitleaks.toml allowlist route (rejected on purpose,
+# PEACHES review): allowlisting gates.sh would suppress detection in the
+# very file that OWNS detection, and permanently blind it to any real
+# secret introduced there later — a narrower instance of the exact
+# fail-open defect this task exists to fix. Reassembly must still produce a
+# genuinely detectable value; see the doctest-style verification in
+# scripts/test_secrets_positive_control.py, which asserts on the SAME
+# count/rule-id contract as before against the real installed gitleaks
+# binary.
+#
+# CONTRACT: prints "<count>\t<comma-separated-rule-ids>" on stdout and
+# returns 0 when gitleaks reports at least one finding AND every fixture
+# category is represented (see the per-line check below) against the
+# scratch repo using CFG_ARG (the SAME config argument the real scan is
+# about to use — an empty CFG_ARG runs gitleaks with its full built-in
+# ruleset, exactly mirroring cmd_secrets' own no-config path). Returns 1
+# with nothing useful on stdout when the scanner finds nothing (or fewer
+# than expected) — the caller must treat that as "the scanner cannot be
+# trusted this run," not as a real clean result.
+#
+# Bounded (INV-1a/INV-2): reuses run_bounded with the same
+# CLAGENTIC_SECRETS_TIMEOUT_SEC budget the real scan uses — a canary scan is
+# no smaller a candidate for hanging than the real one.
+_gitleaks_positive_control() {
+  _gpc_cfg_arg="${1:-}"
+
+  _gpc_dir=$(mktemp -d -t clagentic-secrets-canary.XXXXXX) || return 1
+
+  # Fixture values assembled from fragments at RUN TIME — see the function
+  # doc comment above for why no complete literal lives in source. Every
+  # rule below keys on a MINIMUM contiguous alnum/base64-charset RUN LENGTH
+  # (plus, for some rules, a fixed literal prefix) — gitleaks scans raw file
+  # bytes, so what matters is not shell syntax but the longest contiguous
+  # run of secret-alphabet bytes appearing on any ONE source line. The fix
+  # enforced here (verified below, PEACHES PR #188 follow-up): every
+  # fragment is 3 chars, one per `_gpc_join` call argument, well under
+  # every relevant rule's floor (20+ for AWS, 36+ for a GitHub PAT, 24+ for
+  # a generic/Stripe-shaped key, Slack's own multi-segment shape) — and the
+  # only place a complete run is ever assembled is the loop body inside
+  # `_gpc_join` itself, at RUN TIME, in a shell variable that is never
+  # written back to any file. `_gpc_join` takes an arbitrary argument
+  # count (a fixed $1..$9 form would have silently truncated a fragment
+  # list longer than 9, re-introducing exactly this bug in the reverse
+  # direction — too few fragments consumed, not too many characters
+  # exposed).
+  _gpc_join() {
+    _gpcj_out=""
+    for _gpcj_frag in "$@"; do
+      _gpcj_out="${_gpcj_out}${_gpcj_frag}"
+    done
+    printf '%s' "$_gpcj_out"
+  }
+
+  # AWS access key id: literal prefix "AKIA" + 16 alnum = 20 chars.
+  _gpc_aws_id=$(_gpc_join AKI A47 QMD LXN ZP2 K6R 3T)
+  # AWS secret access key: a 40-char base64-alphabet run, no fixed prefix.
+  _gpc_aws_secret=$(_gpc_join Qz8 mR2 vN5 jK9 wL3 xT7 yB1 cF6 hD4 sA0 pE2 gU8 iX5 m)
+  # GitHub PAT: literal prefix "ghp_" + 36 alnum.
+  _gpc_gh_pat=$(_gpc_join ghp _9f K3m Q7x R2v N5j L8w T4y B6c H1s D0p A3g U9i X2e Z7f)
+  # Slack bot token: "xoxb-" + digit run + digit run + base64-ish tail.
+  _gpc_slack=$(_gpc_join xox b-8 473 629 510 47- 829 104 657 382 1-Q z8m R2v N5j K9w L3x T7y B1c F6)
+  # Generic/Stripe-shaped live key: "sk_live_" + 24+ alnum.
+  _gpc_generic=$(_gpc_join sk_ liv e_9 fK3 mQ7 xR2 vN5 jL8 wT4 yB6 cH1 sD0 pA3 g)
+
+  {
+    printf 'AWS_ACCESS_KEY_ID=%s\n' "$_gpc_aws_id"
+    printf 'AWS_SECRET_ACCESS_KEY=%s\n' "$_gpc_aws_secret"
+    printf 'GITHUB_TOKEN=%s\n' "$_gpc_gh_pat"
+    printf 'SLACK_BOT_TOKEN=%s\n' "$_gpc_slack"
+    printf 'GENERIC_API_KEY=%s\n' "$_gpc_generic"
+  } > "$_gpc_dir/canary.env"
+
+  (
+    cd "$_gpc_dir" || exit 1
+    git init -q -b canary . 2>/dev/null || git init -q .
+    git config user.email "canary@example.invalid"
+    git config user.name "clagentic-secrets-canary"
+    git add canary.env
+    git commit -q -m "canary fixture" --no-verify
+  ) >/dev/null 2>&1
+
+  _gpc_timeout="${CLAGENTIC_SECRETS_TIMEOUT_SEC:-300}"
+  _gpc_timeout=$(ds_positive_int_or_default "$_gpc_timeout" 300)
+
+  _gpc_report="$_gpc_dir/report.json"
+  _gpc_status=0
+  if gitleaks git --help >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    ( cd "$_gpc_dir" && run_bounded "$_gpc_timeout" -- gitleaks git --no-banner --report-format json --report-path "$_gpc_report" $_gpc_cfg_arg ) >/dev/null 2>&1 || _gpc_status=$?
+  else
+    # shellcheck disable=SC2086
+    ( cd "$_gpc_dir" && run_bounded "$_gpc_timeout" -- gitleaks detect --no-banner --no-git --source "$_gpc_dir" --report-format json --report-path "$_gpc_report" $_gpc_cfg_arg ) >/dev/null 2>&1 || _gpc_status=$?
+  fi
+
+  _gpc_count=0
+  _gpc_rule_ids=""
+  if [ -f "$_gpc_report" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      _gpc_count=$(jq 'length' "$_gpc_report" 2>/dev/null || echo 0)
+      _gpc_rule_ids=$(jq -r '[.[].RuleID] | unique | join(",")' "$_gpc_report" 2>/dev/null || echo "")
+    elif command -v python3 >/dev/null 2>&1; then
+      _gpc_count=$(python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(len(d) if isinstance(d, list) else 0)
+except Exception:
+    print(0)' "$_gpc_report" 2>/dev/null || echo 0)
+      _gpc_rule_ids=$(python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+    ids = sorted({f.get("RuleID","") for f in d if isinstance(f, dict) and f.get("RuleID")})
+    print(",".join(ids))
+except Exception:
+    print("")' "$_gpc_report" 2>/dev/null || echo "")
+    fi
+  fi
+  case "$_gpc_count" in ''|*[!0-9]*) _gpc_count=0 ;; esac
+
+  rm -rf "$_gpc_dir"
+
+  # ASSERT ON COUNT AND RULE IDS, NOT MERE EXIT STATUS (task requirement):
+  # gitleaks exits non-zero on any finding, so _gpc_status alone already
+  # signals "found something" — but a fixture regression that drops to
+  # zero real findings while some unrelated tool hiccup still trips a
+  # non-zero exit (or vice versa) must not be masked by trusting the exit
+  # code alone. Require the report to have parsed to a real positive count.
+  if [ "$_gpc_count" -lt 1 ]; then
+    printf '0\t\n'
+    return 1
+  fi
+  printf '%s\t%s\n' "$_gpc_count" "$_gpc_rule_ids"
+  return 0
+}
+
 cmd_secrets() {
   if ! command -v gitleaks >/dev/null 2>&1; then
     # FAIL CLOSED. AGENTS.md §4 contract: local tools own the security gate.
@@ -378,6 +654,42 @@ cmd_secrets() {
   # older versions use `gitleaks protect --staged`. Both honor --config.
   CFG_ARG=""
   [ -f "$REPO_ROOT/.gitleaks.toml" ] && CFG_ARG="--config=$REPO_ROOT/.gitleaks.toml"
+
+  # PREFLIGHT THE CONFIG, FAIL CLOSED (lr-170808 scope item 1). A
+  # repo-supplied .gitleaks.toml that declares neither [[rules]] nor
+  # [extend] useDefault = true REPLACES the built-in ruleset with nothing —
+  # gitleaks then finds nothing, ever, regardless of what is committed. Catch
+  # this before it is ever handed to gitleaks, with a message naming the
+  # exact cause and the exact fix, rather than letting the gate report a
+  # convincing, permanent, silent pass.
+  if [ -n "$CFG_ARG" ] && ! _gitleaks_config_declares_rules "$REPO_ROOT/.gitleaks.toml"; then
+    printf '[gates/secrets] BLOCKED: .gitleaks.toml defines no rules and does not set [extend] useDefault = true. gitleaks --config replaces the built-in ruleset, so this configuration detects nothing. Add [extend] useDefault = true or declare rules.\n' 1>&2
+    cmd_log_run secrets block ".gitleaks.toml defines no rules and does not set [extend] useDefault = true. gitleaks --config replaces the built-in ruleset, so this configuration detects nothing. Add [extend] useDefault = true or declare rules."
+    return 1
+  fi
+
+  # POSITIVE CONTROL BEFORE TRUSTING A PASS (lr-170808 scope item 2). Prove
+  # the scanner (this binary, this config) actually detects a planted,
+  # realistic, non-example credential before the real scan's own "no leaks
+  # found" is trusted as a genuine clean result. Catches the whole class —
+  # rules-less config, a shimmed/broken gitleaks, an allowlist that
+  # accidentally matches everything, a future upstream --config semantics
+  # change — not just the one instance item 1 fixes directly. Opt-out via
+  # CLAGENTIC_SKIP_SECRETS_CANARY=1 for an air-gapped/offline environment
+  # where spinning up a throwaway git repo is undesirable; off by default
+  # because the canary is cheap (one small local repo, one bounded scan).
+  if [ "${CLAGENTIC_SKIP_SECRETS_CANARY:-0}" != "1" ]; then
+    _SECRETS_CANARY_RESULT=$(_gitleaks_positive_control "$CFG_ARG") || _SECRETS_CANARY_STATUS=$?
+    _SECRETS_CANARY_STATUS="${_SECRETS_CANARY_STATUS:-0}"
+    if [ "$_SECRETS_CANARY_STATUS" != "0" ]; then
+      printf '[gates/secrets] BLOCKED: positive-control canary failed — gitleaks (this binary, this config) did not detect a planted, realistic credential in a scratch repo. The real scan'"'"'s "no leaks found" cannot be trusted this run. Check the gitleaks binary and .gitleaks.toml (a rules-less config, a broken install, or an over-broad allowlist all produce this).\n' 1>&2
+      cmd_log_run secrets block "positive-control canary failed: gitleaks did not detect a planted credential — scan result cannot be trusted (no coverage)"
+      return 1
+    fi
+    _SECRETS_CANARY_COUNT="${_SECRETS_CANARY_RESULT%%	*}"
+    _SECRETS_CANARY_RULES="${_SECRETS_CANARY_RESULT#*	}"
+    printf '[gates/secrets] positive-control canary OK: %s finding(s), rule(s): %s\n' "$_SECRETS_CANARY_COUNT" "$_SECRETS_CANARY_RULES" 1>&2
+  fi
 
   # Determine whether there are staged changes. When the index is empty and
   # we are on a feature branch, scan the full branch history instead — staged-
@@ -4517,8 +4829,10 @@ print(json.dumps(block))
 # Reads the latest gate_runs row for each deterministic gate (secrets, deps,
 # sast) from audit.db and prints a JSON object on stdout:
 #
-#   {"secrets": {"outcome": "pass", "details": "..."}, "deps": null,
-#    "sast": {"outcome": "warn", "details": "..."}, "audit_db_unavailable": false}
+#   {"secrets": {"outcome": "pass", "details": "...", "no_coverage": false},
+#    "deps": null,
+#    "sast": {"outcome": "warn", "details": "...", "no_coverage": false},
+#    "audit_db_unavailable": false}
 #
 # A gate with no row at all (never ran) is null — distinct from an outcome
 # string, so the payload can tell "absent" apart from any real outcome
@@ -4526,6 +4840,20 @@ print(json.dumps(block))
 # function only reads what cmd_secrets/cmd_deps/cmd_sast already wrote via
 # cmd_log_run; it does not re-run them, does not re-derive their outcome,
 # and its own read failure never blocks (see below).
+#
+# NO_COVERAGE (lr-170808 scope item 3): a skip currently logs `warn` and
+# exits 0, and a preflight/canary refusal (this same task, items 1/2) logs
+# `block` — either way merge-gate previously had no way to distinguish "the
+# scanner ran and found nothing" from "the scanner did not meaningfully run
+# at all." `_rdg_no_coverage` below is a MECHANICAL string match over the
+# already-read outcome/details (both cmd_secrets' preflight/canary block
+# paths and its older-gitleaks staged-scan-unavailable warn path use fixed,
+# greppable vocabulary — see cmd_secrets' own cmd_log_run call sites), not a
+# new signal cmd_secrets has to compute and thread through separately. This
+# is intentionally the SAME wire item 3's own task description calls for
+# ("preflight-block and canary-block both need a downstream representation,
+# and inventing one twice is the wrong shape") — one boolean field, derived
+# once, here, from data that already exists.
 #
 # DEGRADE, NEVER BLOCK (same pattern as gates.sh:3258's per-step-failure
 # hint read, and platform.sh's ds_audit_log/ds_sqlite3 -- audit-db access is
@@ -4567,6 +4895,33 @@ print(json.dumps(block))
 # avoids `-json` (never used elsewhere in this codebase, and requires
 # sqlite3 >= 3.33 -- not a floor this script asserts anywhere) and avoids
 # python3 (the jq-only emitter path must keep working without it).
+# _rdg_details_is_no_coverage OUTCOME DETAILS — mechanical predicate: does
+# this (already-logged) gate_runs row represent a run that produced NO
+# meaningful detection coverage, as opposed to a real scan that genuinely
+# found nothing? Matched against the FIXED, greppable vocabulary
+# cmd_secrets' own cmd_log_run call sites use for exactly this class of
+# outcome (never free-form LLM text, so this is a closed-set string match,
+# not a heuristic over untrusted content):
+#   - "positive-control canary failed" (item 2 block)
+#   - "gate_summary_degraded"-adjacent config causes: ".gitleaks.toml
+#     defines no rules" (item 1 block)
+#   - "history scan unavailable" (pre-existing older-gitleaks warn path,
+#     scope item 3's own "a skip currently logs warn and exits 0" case)
+# Deliberately case-sensitive substring match on gates.sh's own fixed
+# literals, not a regex over arbitrary content — every one of these strings
+# is written by gates.sh itself, at a specific, enumerated call site, never
+# derived from repo/attacker-controlled text.
+_rdg_details_is_no_coverage() {
+  _rdnc_outcome="$1"
+  _rdnc_details="$2"
+  case "$_rdnc_details" in
+    *"positive-control canary failed"*) return 0 ;;
+    *".gitleaks.toml defines no rules"*) return 0 ;;
+    *"history scan unavailable"*) return 0 ;;
+  esac
+  return 1
+}
+
 _read_deterministic_gates() {
   _rdg_db="$REPO_ROOT/.clagentic/lite/audit.db"
   _rdg_unavailable=false
@@ -4582,6 +4937,17 @@ _read_deterministic_gates() {
           "SELECT outcome FROM gate_runs WHERE id=$_rdg_id;" 2>/dev/null || echo "")
         _rdg_details=$(ds_sqlite3 "$_rdg_db" \
           "SELECT details FROM gate_runs WHERE id=$_rdg_id;" 2>/dev/null || echo "")
+        # NO_COVERAGE (lr-170808 scope item 3): computed from the RAW
+        # (pre-sanitize) details string, before _llm_field_sanitize below —
+        # the fixed literals this predicate matches are gates.sh's own
+        # constants, never round-tripped through an LLM prompt themselves,
+        # so there is no reason to defer this check past sanitization, and
+        # doing it first keeps the match immune to whatever (harmless, for
+        # this fixed vocabulary) transformation sanitization applies.
+        _rdg_no_coverage=false
+        if _rdg_details_is_no_coverage "$_rdg_outcome" "$_rdg_details"; then
+          _rdg_no_coverage=true
+        fi
         # SECURITY (lr-367a21 fold-in, BOBBIE): details is attacker-reachable
         # free text -- e.g. .clagentic/semgrep-exclude rule-id lines flow
         # into _SAST_EXCL_IDS (cmd_sast), into the sast pass details string,
@@ -4598,9 +4964,9 @@ _read_deterministic_gates() {
         # text, nothing to sanitize).
         _rdg_details=$(_llm_field_sanitize "$_rdg_details")
         if command -v jq >/dev/null 2>&1; then
-          _rdg_entry=$(jq -cn --arg o "$_rdg_outcome" --arg d "$_rdg_details" '{"outcome": $o, "details": $d}')
+          _rdg_entry=$(jq -cn --arg o "$_rdg_outcome" --arg d "$_rdg_details" --argjson nc "$_rdg_no_coverage" '{"outcome": $o, "details": $d, "no_coverage": $nc}')
         elif command -v python3 >/dev/null 2>&1; then
-          _rdg_entry=$(python3 -c 'import json,sys; print(json.dumps({"outcome": sys.argv[1], "details": sys.argv[2]}))' "$_rdg_outcome" "$_rdg_details")
+          _rdg_entry=$(python3 -c 'import json,sys; print(json.dumps({"outcome": sys.argv[1], "details": sys.argv[2], "no_coverage": sys.argv[3] == "true"}))' "$_rdg_outcome" "$_rdg_details" "$_rdg_no_coverage")
         else
           # No JSON encoder to safely build the entry -- degrade this gate's
           # field to null rather than risk unescaped interpolation; the
