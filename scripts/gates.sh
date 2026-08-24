@@ -1543,10 +1543,11 @@ _ledger_config_snapshot() {
 # only when the MOST RECENT ledger entry for BRANCH is anchored to HEAD_SHA
 # (its head_sha field equals HEAD_SHA) AND its verdict is "pass". This is
 # the one sanctioned "is there a currently-valid verdict" predicate — every
-# consumer (build_gate_summary) must route through this rather than
-# re-deriving the same check inline, mirroring this file's existing
-# "one shared helper, not a re-derivation per call site" discipline
-# (_git_repo_root_is_scoped, _gate_resolve_fresh_default_branch_ref).
+# consumer (build_gate_summary, get_review_diff via
+# _ledger_latest_passing_head_for_branch below) must route through this or
+# its sibling rather than re-deriving the same check inline, mirroring this
+# file's existing "one shared helper, not a re-derivation per call site"
+# discipline (_git_repo_root_is_scoped, _gate_resolve_fresh_default_branch_ref).
 #
 # An "unanchored" verdict (empty/unresolvable head_sha at record time) can
 # never satisfy this check even if HEAD_SHA is also empty — an empty
@@ -1586,6 +1587,70 @@ except Exception:
   [ -n "$_laph_entry_head" ] || return 1
   [ "$_laph_entry_head" = "$_laph_head" ] || return 1
   [ "$_laph_entry_verdict" = "pass" ]
+}
+
+# _ledger_latest_passing_head_for_branch LEDGER_FILE BRANCH — stdout: the
+# head_sha of the MOST RECENT anchored entry for BRANCH whose verdict is
+# "pass", or nothing if no such entry exists / LEDGER_FILE is absent / no
+# JSON tool available. Sibling of _ledger_anchored_pass_at_head, sharing its
+# "pass" doctrine: a "block"/"unanchored"/degraded entry is never returned,
+# even when it is the LATEST entry overall (lr-542a43 -- this is exactly
+# the gap _ledger_anchored_pass_at_head's own consumers were already closed
+# against: get_review_diff's delta-base lookup used to call
+# ledger_latest_for_branch directly and read ONLY head_sha with no verdict
+# filter, so a block verdict anchored the next round's delta base
+# identically to a pass. Two distinct exploit shapes followed: (a) HEAD
+# unchanged since the block -- git merge-base --is-ancestor treats a commit
+# as its own ancestor, so the "delta" is an empty diff, an empty diff
+# reviews clean, and a pass gets recorded at the SAME sha that just
+# blocked; (b) a cosmetic commit after the block -- the delta only covers
+# the cosmetic change, never the blocking content below it).
+#
+# WHY "latest pass", not "latest entry that happens to be a pass": scanning
+# all history (not just the single latest row) matters because the round
+# immediately after a block is very often itself a fix attempt that also
+# fails, or a cosmetic commit -- the correct re-review base is the last
+# point this branch was KNOWN CLEAN, however many blocked/degraded rounds
+# came after it, not "the most recent row regardless of what it says."
+#
+# Reuses ledger_entries_for_branch (oldest-first, same JSON-Lines source
+# _ledger_anchored_pass_at_head's own ledger_latest_for_branch reads) rather
+# than re-deriving a third ledger-scan primitive -- re-deriving is the exact
+# mistake that produced this bug (see lr-542a43 task description).
+_ledger_latest_passing_head_for_branch() {
+  _llphfb_file="$1"
+  _llphfb_branch="$2"
+
+  [ -f "$_llphfb_file" ] || return 0
+
+  if command -v jq >/dev/null 2>&1; then
+    ledger_entries_for_branch "$_llphfb_file" "$_llphfb_branch" \
+      | jq -rs '[.[] | select(.verdict == "pass" and (.head_sha // "") != "")] | last | .head_sha // empty' 2>/dev/null
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    ledger_entries_for_branch "$_llphfb_file" "$_llphfb_branch" | python3 -c '
+import json, sys
+best = ""
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        entry = json.loads(line)
+    except Exception:
+        continue
+    if entry.get("verdict") == "pass" and entry.get("head_sha"):
+        best = entry["head_sha"]
+if best:
+    print(best)
+' 2>/dev/null
+    return 0
+  fi
+  # No JSON tool: no output -- caller (get_review_diff) treats empty the
+  # same as "no prior passing verdict," which falls through to full-range
+  # review (fail toward MORE coverage, never a silent narrower diff).
+  return 0
 }
 
 # _ledger_mark_recurrence FINDINGS_JSON DIFF_FILE LEDGER_FILE BRANCH
@@ -2008,9 +2073,11 @@ except Exception:
 #   1. Staged diff (git diff --cached) — normal pre-commit path.
 #   2. Delta re-review (default-on, lr-01ae73; generalizes the former
 #      --since-last-review opt-in flag into the default mode): when the
-#      current branch has a prior ANCHORED ledger verdict (see "review
-#      ledger" above) whose head_sha resolves as an ancestor of HEAD in
-#      THIS repo, diff <that head_sha>..HEAD instead of the full
+#      current branch has a prior PASSING ANCHORED ledger verdict (see
+#      "review ledger" above; lr-542a43 — a block/degraded/unanchored
+#      entry, even if it is the LATEST entry for the branch, is never
+#      usable as a delta base) whose head_sha resolves as an ancestor of
+#      HEAD in THIS repo, diff <that head_sha>..HEAD instead of the full
 #      origin/<default>..HEAD branch diff. This is the structural fix for
 #      the death-spiral (many fix-commits accumulating into an unreviewed
 #      diff). --full-review forces full-range regardless of ledger state.
@@ -2018,7 +2085,10 @@ except Exception:
 #      (rebase, amend, force-push) is NOT usable as a delta base — falls
 #      through to full-range and says so on stderr (fail toward MORE
 #      coverage, matching cmd_sast/cmd_bleed doctrine — see REVIEW_FULL
-#      handling below).
+#      handling below). An empty computed range (HEAD unchanged since the
+#      passing verdict) is likewise never returned as-is — an empty diff
+#      reads as a clean re-review of nothing; it falls through to
+#      full-range too (lr-542a43).
 #   3. Branch diff against origin/<default_branch> — PR path when index is
 #      clean but we are on a feature branch with committed changes.
 #   4. Empty — on the default branch with no staged changes; review will see
@@ -2059,31 +2129,23 @@ get_review_diff() {
   # default behavior rather than a distinct one). REVIEW_FULL=1 (set by
   # cmd_review's --full-review flag parsing) opts back out to full-range.
   #
-  # SOURCE OF TRUTH: the review ledger's latest ANCHORED verdict for the
-  # current branch (_review_ledger_path / ledger_latest_for_branch,
-  # review-merge.sh) — not last-review.json's _clagentic_diff_sha stamp,
-  # which only ever remembers the SINGLE most recent run and is overwritten
-  # on every call regardless of outcome. The ledger is append-only and
-  # verdict-aware, so this reads the same value the "generalize, don't
-  # parallel" reuse-seam instruction points at, just from the durable
-  # record rather than the single mutable snapshot.
+  # SOURCE OF TRUTH: the review ledger's latest PASSING anchored verdict for
+  # the current branch (_review_ledger_path /
+  # _ledger_latest_passing_head_for_branch) — not last-review.json's
+  # _clagentic_diff_sha stamp, which only ever remembers the SINGLE most
+  # recent run and is overwritten on every call regardless of outcome, and
+  # NOT the raw latest ledger entry regardless of verdict (lr-542a43: a
+  # block/degraded/unanchored entry must never anchor the delta base — see
+  # _ledger_latest_passing_head_for_branch's own doc comment for the two
+  # exploit shapes that follow from anchoring on an unfiltered "latest
+  # entry"). The ledger is append-only and verdict-aware, so this reads the
+  # same value the "generalize, don't parallel" reuse-seam instruction
+  # points at, just from the durable record rather than the single mutable
+  # snapshot, and routed through the one sanctioned pass-filtering path
+  # rather than re-deriving a third inline verdict check.
   if [ "${REVIEW_FULL:-0}" != "1" ]; then
     _grd_ledger=$(_review_ledger_path)
-    _grd_prior_head=""
-    if [ -f "$_grd_ledger" ]; then
-      _grd_latest_entry=$(ledger_latest_for_branch "$_grd_ledger" "$CURRENT_BRANCH")
-      if [ -n "$_grd_latest_entry" ]; then
-        if command -v jq >/dev/null 2>&1; then
-          _grd_prior_head=$(printf '%s' "$_grd_latest_entry" | jq -r '.head_sha // ""' 2>/dev/null)
-        elif command -v python3 >/dev/null 2>&1; then
-          _grd_prior_head=$(printf '%s' "$_grd_latest_entry" | python3 -c 'import json,sys
-try:
-    print(json.load(sys.stdin).get("head_sha",""))
-except Exception:
-    print("")' 2>/dev/null)
-        fi
-      fi
-    fi
+    _grd_prior_head=$(_ledger_latest_passing_head_for_branch "$_grd_ledger" "$CURRENT_BRANCH")
 
     if [ -n "$_grd_prior_head" ]; then
       # UNRESOLVABLE PRIOR SHA (rebase/amend/force-push): a prior head_sha
@@ -2096,14 +2158,30 @@ except Exception:
       # "never silently narrow on a resolution failure" doctrine.
       if _git rev-parse --verify -q "${_grd_prior_head}^{commit}" >/dev/null 2>&1 \
          && _git merge-base --is-ancestor "$_grd_prior_head" HEAD 2>/dev/null; then
-        printf '[gates/review] delta re-review: diffing %s..HEAD (prior anchored verdict on this branch)\n' "$_grd_prior_head" 1>&2
-        _git diff "${_grd_prior_head}..HEAD" --unified=3 2>/dev/null
-        return 0
+        # EMPTY RANGE IS NOT CLEAN (lr-542a43, exploit path B): a commit is
+        # its own ancestor, so a passing verdict already anchored at
+        # current HEAD (nothing new committed since) produces `git diff
+        # X..X`, zero bytes. An empty diff must never be handed to the
+        # reviewer as "the delta" — it reads as a clean pass on content
+        # that was never re-examined. Compute the range into a temp file
+        # first and only return it when non-empty; an empty result falls
+        # through to full-range below, same fail-toward-MORE-coverage
+        # doctrine as the unresolvable-SHA branch above.
+        _grd_delta_tmp=$(mktemp -t clagentic-review-delta.XXXXXX)
+        _git diff "${_grd_prior_head}..HEAD" --unified=3 2>/dev/null > "$_grd_delta_tmp"
+        if [ -s "$_grd_delta_tmp" ]; then
+          printf '[gates/review] delta re-review: diffing %s..HEAD (prior passing anchored verdict on this branch)\n' "$_grd_prior_head" 1>&2
+          cat "$_grd_delta_tmp"
+          rm -f "$_grd_delta_tmp"
+          return 0
+        fi
+        rm -f "$_grd_delta_tmp"
+        printf '[gates/review] delta re-review: computed range %s..HEAD is empty (no new commits since the last passing verdict) — falling back to full-range review rather than reporting a silent pass\n' "$_grd_prior_head" 1>&2
       else
-        printf '[gates/review] delta re-review: prior verdict SHA %s is no longer an ancestor of HEAD (rebase/amend/force-push) — falling back to full-range review\n' "$_grd_prior_head" 1>&2
+        printf '[gates/review] delta re-review: prior passing verdict SHA %s is no longer an ancestor of HEAD (rebase/amend/force-push) — falling back to full-range review\n' "$_grd_prior_head" 1>&2
       fi
     else
-      printf '[gates/review] delta re-review: no prior anchored verdict for branch %s — full-range review\n' "${CURRENT_BRANCH:-<none>}" 1>&2
+      printf '[gates/review] delta re-review: no prior passing anchored verdict for branch %s — full-range review\n' "${CURRENT_BRANCH:-<none>}" 1>&2
     fi
   fi
 
