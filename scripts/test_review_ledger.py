@@ -705,6 +705,201 @@ class TestReviewLedgerViaCmdReview(unittest.TestCase):
         result = _run_review(["--since-last-review"], self._tmpdir, self._project)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    # ---------------------------------------------------------- lr-542a43
+    def test_rerun_after_block_at_same_head_does_not_flip_to_pass(self):
+        """EXPLOIT PATH B (lead case): a review blocks at SHA X and no new
+        commits follow. Re-running review at the SAME HEAD must NOT read
+        the block as an anchored delta base -- git merge-base --is-ancestor
+        treats a commit as its own ancestor, so an unfiltered "latest
+        entry" delta base would diff X..X (empty), which the reviewer would
+        then pass on nothing, silently flipping a block to a pass at the
+        exact SHA that just blocked. Uses a local-file-remote fixture (like
+        the pre-existing full-range tests) so round 1's blocking content
+        can be committed (not staged) and still reach the reviewer via the
+        pre-existing branch-diff-against-default path -- nothing is left
+        staged for round 2, so round 2 must fall through past
+        get_review_diff's staged-diff priority path and actually exercise
+        the ledger delta logic. One stub instance serves both rounds
+        (matches test_delta_review_is_default_second_round_scoped_to_new_
+        commit_only's pattern) so the diff-capture round counter lines up
+        with round-1.txt/round-2.txt as expected."""
+        project2 = os.path.join(self._tmpdir, "project-with-remote")
+        _init_git_repo_with_local_file_remote(self._tmpdir, project2)
+        head_x = _commit_file(project2, "feature.py", "print('hi')\nprint('again')\n",
+                               "add feature (contains the blocking content)")
+        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=project2)
+        _make_stub_llm_client(
+            self._tmpdir,
+            [_envelope([_finding(file="feature.py", line=2)]), _CLEAN_ENVELOPE],
+            capture_diffs=True,
+        )
+        r1 = _run_review([], self._tmpdir, project2)
+        self.assertEqual(r1.returncode, 1, r1.stderr)
+        entries = _read_ledger_entries(project2, "feat/example")
+        self.assertEqual(entries[-1]["verdict"], "block")
+        self.assertEqual(entries[-1]["head_sha"], head_x,
+                          "nothing was committed after round 1 -- HEAD must still equal "
+                          "the block's recorded head_sha for this test to exercise the "
+                          "same-HEAD-as-the-block re-run scenario")
+
+        # Re-run review at the SAME HEAD (nothing committed or staged since
+        # the block; default delta path, no --full-review). If the delta
+        # base were still anchored on the unfiltered latest entry (the
+        # block at head_x), the computed range would be head_x..HEAD ==
+        # empty, and the OLD code would hand the reviewer an empty diff
+        # (which trivially "passes"). With the fix, there is no PASSING
+        # entry at all yet (the only entry is the block), so
+        # _ledger_latest_passing_head_for_branch correctly reports no
+        # anchor and get_review_diff falls back to full-range on that
+        # basis -- assert on the round-2 diff content directly, not merely
+        # the returncode, so a regression that reintroduces the empty-diff
+        # path is caught even if the second stub envelope happens to also
+        # be a pass.
+        r2 = _run_review([], self._tmpdir, project2)
+        self.assertIn("no prior passing anchored verdict", r2.stderr,
+                       "a branch whose only ledger entry is a block must never anchor "
+                       "a delta base on it -- must read as if there were no prior "
+                       "verdict at all")
+        diff_round2 = os.path.join(self._tmpdir, "diffs", "round-2.txt")
+        self.assertTrue(os.path.exists(diff_round2) and os.path.getsize(diff_round2) > 0,
+                         "the re-run must feed the reviewer real (non-empty) content, "
+                         "never an empty range silently treated as clean")
+        with open(diff_round2) as f:
+            diff_text = f.read()
+        self.assertIn("feature.py", diff_text,
+                       "the full-range fallback must include the file the block was "
+                       "raised against")
+
+    def test_cosmetic_commit_after_block_still_includes_blocking_content(self):
+        """EXPLOIT PATH A: a review blocks at SHA X, then a cosmetic commit
+        Y follows. The delta base for the next review must NOT anchor on
+        the block at X (which would scope the diff to X..Y, the cosmetic
+        change only, hiding the still-unresolved blocking content beneath
+        it) -- with no prior PASSING verdict at all, this must fall back to
+        full-range and include everything, same as "no prior anchored
+        verdict for branch" (there IS a prior entry, just not a passing
+        one). Falling back to full-range requires proving origin/<default>
+        freshness (the pre-existing fallback path), so this uses the
+        local-file-remote fixture, same as test_no_prior_verdict_first_
+        round_is_full_range_and_says_so and its siblings."""
+        project2 = os.path.join(self._tmpdir, "project-with-remote")
+        _init_git_repo_with_local_file_remote(self._tmpdir, project2)
+        _stage_file(project2, "feature.py", "print('hi')\n")
+        _commit_staged(project2, "add feature")
+        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=project2)
+        _stage_file(project2, "feature.py", "print('hi')\nprint('bug')\n")
+        _make_stub_llm_client(
+            self._tmpdir,
+            [_envelope([_finding(file="feature.py", line=2)]), _CLEAN_ENVELOPE],
+            capture_diffs=True,
+        )
+        r1 = _run_review([], self._tmpdir, project2)
+        self.assertEqual(r1.returncode, 1, r1.stderr)
+        _commit_staged(project2, "round 1 (blocked) commit")
+
+        # Cosmetic follow-up commit -- does not touch feature.py.
+        _commit_file(project2, "cosmetic.py", "# cosmetic only\n", "cosmetic commit")
+
+        r2 = _run_review([], self._tmpdir, project2)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertIn("no prior passing anchored verdict", r2.stderr,
+                       "a branch whose only prior ledger entry is a block must be "
+                       "treated the same as having no prior anchored verdict at all")
+
+        diff_round2 = os.path.join(self._tmpdir, "diffs", "round-2.txt")
+        with open(diff_round2) as f:
+            diff_text = f.read()
+        self.assertIn("feature.py", diff_text,
+                       "the re-review must still cover the file the block was raised "
+                       "against, not just the cosmetic follow-up commit")
+        self.assertIn("cosmetic.py", diff_text)
+
+    def test_passing_verdict_after_a_block_anchors_the_next_delta_correctly(self):
+        """Once a genuine PASSING verdict is recorded (after an earlier
+        block on the same branch), the delta base must anchor on that
+        pass, not resurrect the older block -- proves
+        _ledger_latest_passing_head_for_branch finds the most RECENT pass,
+        not merely 'some' pass, when both a block and a pass exist in
+        history. Round 1 (blocked, full-range) needs a resolvable
+        origin/<default>, so this uses the local-file-remote fixture;
+        rounds 2/3 (delta path) never touch the remote again once the
+        first verdict exists."""
+        project2 = os.path.join(self._tmpdir, "project-with-remote")
+        _init_git_repo_with_local_file_remote(self._tmpdir, project2)
+        _stage_file(project2, "feature.py", "print('hi')\n")
+        _commit_staged(project2, "add feature")
+        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=project2)
+        _stage_file(project2, "feature.py", "print('hi')\nprint('bug')\n")
+        _make_stub_llm_client(
+            self._tmpdir,
+            [_envelope([_finding(file="feature.py", line=2)]), _CLEAN_ENVELOPE, _CLEAN_ENVELOPE],
+            capture_diffs=True,
+        )
+        r1 = _run_review([], self._tmpdir, project2)
+        self.assertEqual(r1.returncode, 1, r1.stderr)
+        _commit_staged(project2, "round 1 (blocked) commit")
+
+        # Fix the issue and COMMIT it (nothing staged for round 2), so
+        # round 2 falls to the delta/full-range branch rather than the
+        # staged-diff priority path -- with only a block in the ledger so
+        # far, this is still a full-range review (same as "no prior
+        # passing verdict"), and the resulting PASS anchors to HEAD AS OF
+        # round 2, i.e. this fix commit itself.
+        head_pass = _commit_file(project2, "feature.py", "print('hi')\nprint('bug')\n# fixed\n",
+                                  "round 2 (fix) commit")
+        r2 = _run_review([], self._tmpdir, project2)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        entries = _read_ledger_entries(project2, "feat/example")
+        self.assertEqual(entries[-1]["verdict"], "pass")
+        self.assertEqual(entries[-1]["head_sha"], head_pass)
+
+        # Round 3: a further cosmetic commit. Delta base must be the PASS
+        # at head_pass, not the earlier block.
+        _commit_file(project2, "cosmetic.py", "# cosmetic only\n", "cosmetic commit")
+        r3 = _run_review([], self._tmpdir, project2)
+        self.assertEqual(r3.returncode, 0, r3.stderr)
+        self.assertIn(f"diffing {head_pass}..HEAD", r3.stderr,
+                       "the delta base must be the most recent PASSING verdict, "
+                       "not the earlier block")
+
+        diff_round3 = os.path.join(self._tmpdir, "diffs", "round-3.txt")
+        with open(diff_round3) as f:
+            diff_text = f.read()
+        self.assertIn("cosmetic.py", diff_text)
+        self.assertNotIn("feature.py", diff_text,
+                          "the delta must be scoped to the pass, not re-include "
+                          "already-passed content")
+
+    def test_empty_computed_range_falls_back_to_full_range_and_says_so(self):
+        """A prior PASSING anchored verdict exists and HEAD has not moved
+        (no new commits, nothing staged) -- the computed range is empty.
+        This must never be silently treated as a clean re-review; it must
+        fall back to full-range and say so on stderr. The fallback needs a
+        resolvable origin/<default>, so this uses the local-file-remote
+        fixture, same as the other full-range-fallback tests in this class."""
+        project2 = os.path.join(self._tmpdir, "project-with-remote")
+        _init_git_repo_with_local_file_remote(self._tmpdir, project2)
+        _stage_file(project2, "feature.py", "print('hi')\n")
+        head = _commit_staged(project2, "add feature")
+        _git(["push", "-q", "-u", "origin", "feat/example"], cwd=project2)
+        _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE, _CLEAN_ENVELOPE], capture_diffs=True)
+        r1 = _run_review([], self._tmpdir, project2)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        entries = _read_ledger_entries(project2, "feat/example")
+        self.assertEqual(entries[-1]["head_sha"], head,
+                          "nothing was committed or staged after round 1 -- HEAD must "
+                          "still equal the round-1 commit for this test to exercise the "
+                          "empty-computed-range scenario")
+
+        r2 = _run_review([], self._tmpdir, project2)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertIn("computed range", r2.stderr)
+        self.assertIn("falling back to full-range", r2.stderr)
+        diff_round2 = os.path.join(self._tmpdir, "diffs", "round-2.txt")
+        self.assertTrue(os.path.exists(diff_round2) and os.path.getsize(diff_round2) > 0,
+                         "the fallback must feed the reviewer the real full-range diff, "
+                         "never an empty one")
+
 
 class TestMergeGateLedgerConsumption(unittest.TestCase):
     """AC3 (stale verdict refused), AC6 (no remote)."""
