@@ -1543,10 +1543,11 @@ _ledger_config_snapshot() {
 # only when the MOST RECENT ledger entry for BRANCH is anchored to HEAD_SHA
 # (its head_sha field equals HEAD_SHA) AND its verdict is "pass". This is
 # the one sanctioned "is there a currently-valid verdict" predicate — every
-# consumer (build_gate_summary) must route through this rather than
-# re-deriving the same check inline, mirroring this file's existing
-# "one shared helper, not a re-derivation per call site" discipline
-# (_git_repo_root_is_scoped, _gate_resolve_fresh_default_branch_ref).
+# consumer (build_gate_summary, get_review_diff via
+# _ledger_latest_passing_head_for_branch below) must route through this or
+# its sibling rather than re-deriving the same check inline, mirroring this
+# file's existing "one shared helper, not a re-derivation per call site"
+# discipline (_git_repo_root_is_scoped, _gate_resolve_fresh_default_branch_ref).
 #
 # An "unanchored" verdict (empty/unresolvable head_sha at record time) can
 # never satisfy this check even if HEAD_SHA is also empty — an empty
@@ -1586,6 +1587,70 @@ except Exception:
   [ -n "$_laph_entry_head" ] || return 1
   [ "$_laph_entry_head" = "$_laph_head" ] || return 1
   [ "$_laph_entry_verdict" = "pass" ]
+}
+
+# _ledger_latest_passing_head_for_branch LEDGER_FILE BRANCH — stdout: the
+# head_sha of the MOST RECENT anchored entry for BRANCH whose verdict is
+# "pass", or nothing if no such entry exists / LEDGER_FILE is absent / no
+# JSON tool available. Sibling of _ledger_anchored_pass_at_head, sharing its
+# "pass" doctrine: a "block"/"unanchored"/degraded entry is never returned,
+# even when it is the LATEST entry overall (lr-542a43 -- this is exactly
+# the gap _ledger_anchored_pass_at_head's own consumers were already closed
+# against: get_review_diff's delta-base lookup used to call
+# ledger_latest_for_branch directly and read ONLY head_sha with no verdict
+# filter, so a block verdict anchored the next round's delta base
+# identically to a pass. Two distinct exploit shapes followed: (a) HEAD
+# unchanged since the block -- git merge-base --is-ancestor treats a commit
+# as its own ancestor, so the "delta" is an empty diff, an empty diff
+# reviews clean, and a pass gets recorded at the SAME sha that just
+# blocked; (b) a cosmetic commit after the block -- the delta only covers
+# the cosmetic change, never the blocking content below it).
+#
+# WHY "latest pass", not "latest entry that happens to be a pass": scanning
+# all history (not just the single latest row) matters because the round
+# immediately after a block is very often itself a fix attempt that also
+# fails, or a cosmetic commit -- the correct re-review base is the last
+# point this branch was KNOWN CLEAN, however many blocked/degraded rounds
+# came after it, not "the most recent row regardless of what it says."
+#
+# Reuses ledger_entries_for_branch (oldest-first, same JSON-Lines source
+# _ledger_anchored_pass_at_head's own ledger_latest_for_branch reads) rather
+# than re-deriving a third ledger-scan primitive -- re-deriving is the exact
+# mistake that produced this bug (see lr-542a43 task description).
+_ledger_latest_passing_head_for_branch() {
+  _llphfb_file="$1"
+  _llphfb_branch="$2"
+
+  [ -f "$_llphfb_file" ] || return 0
+
+  if command -v jq >/dev/null 2>&1; then
+    ledger_entries_for_branch "$_llphfb_file" "$_llphfb_branch" \
+      | jq -rs '[.[] | select(.verdict == "pass" and (.head_sha // "") != "")] | last | .head_sha // empty' 2>/dev/null
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    ledger_entries_for_branch "$_llphfb_file" "$_llphfb_branch" | python3 -c '
+import json, sys
+best = ""
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        entry = json.loads(line)
+    except Exception:
+        continue
+    if entry.get("verdict") == "pass" and entry.get("head_sha"):
+        best = entry["head_sha"]
+if best:
+    print(best)
+' 2>/dev/null
+    return 0
+  fi
+  # No JSON tool: no output -- caller (get_review_diff) treats empty the
+  # same as "no prior passing verdict," which falls through to full-range
+  # review (fail toward MORE coverage, never a silent narrower diff).
+  return 0
 }
 
 # _ledger_mark_recurrence FINDINGS_JSON DIFF_FILE LEDGER_FILE BRANCH
