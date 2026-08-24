@@ -2458,6 +2458,35 @@ cmd_doctor() {
           _fail "$_rpath: stale command doc .claude/commands/$_stale_cmd found — run \`clagentic-lite update --restamp\`"
         fi
       done
+      # Check for a rules-less .gitleaks.toml (lr-170808 advisory item).
+      # gates.sh's own gate (_gitleaks_config_declares_rules, scripts/gates.sh)
+      # now BLOCKS this at scan time — that is the correct, already-shipped
+      # fix. This check exists so an operator sees the condition on a routine
+      # `doctor` run, BEFORE it surfaces as a scan-time block on their next
+      # push. Mirrors gates.sh's own detection contract (a `[[rules]]` table
+      # header, or an `[extend]` block containing `useDefault = true`) with
+      # the same anchored-regex heuristic gates.sh uses when python3 is
+      # unavailable — sufficient here since this is advisory (WARN), not a
+      # gate: a false WARN costs a re-read of a config file, not a wrongly
+      # granted pass. No config file at all is unaffected (gitleaks runs
+      # with its full built-in ruleset) and is intentionally not warned on.
+      _gl_cfg="$_rpath/.gitleaks.toml"
+      if [ -f "$_gl_cfg" ]; then
+        _gl_has_rules=0
+        if grep -qE '^[[:space:]]*\[\[rules\]\][[:space:]]*$' "$_gl_cfg" 2>/dev/null; then
+          _gl_has_rules=1
+        elif grep -qE '^[[:space:]]*\[extend\][[:space:]]*(#.*)?$' "$_gl_cfg" 2>/dev/null \
+             && grep -qE '^[[:space:]]*useDefault[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$' "$_gl_cfg" 2>/dev/null; then
+          _gl_has_rules=1
+        fi
+        if [ "$_gl_has_rules" -eq 1 ]; then
+          _ok "$_rpath: .gitleaks.toml declares rules or extends the default ruleset"
+        else
+          printf '  WARN  %s: .gitleaks.toml defines no [[rules]] and has no [extend] useDefault = true.\n' "$_rpath"
+          printf '        gitleaks --config REPLACES the built-in ruleset, so this configuration currently detects nothing — the secrets gate will now BLOCK on your next scan instead of silently passing.\n'
+          printf '        Fix: add [extend] / useDefault = true to keep the built-in rules, or declare your own [[rules]].\n'
+        fi
+      fi
     done < "$REGISTRY"
   fi
 
