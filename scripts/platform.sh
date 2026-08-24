@@ -938,6 +938,7 @@ for f in raw_fields:
         name = f[: -len(":number")]
         allowed[name] = (int, float)
     else:
+        name = f
         allowed[name] = (str,)
 
 try:
