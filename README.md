@@ -381,6 +381,14 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
                                                  (pre-lr-7939f8) is migrated here automatically by `update`,
                                                  with a one-time warning; still honored as a read fallback
                                                  until migrated.
+~/.config/clagentic/lite/osv-ignore              global osv CVE ignore list (gates.sh deps, one ID per line).
+                                                 An old list at the bare ~/.config/clagentic/osv-ignore path
+                                                 (pre-lr-8ee2df) is migrated here automatically on the next
+                                                 `deps` run, with a one-time warning; still honored as a read
+                                                 fallback until migrated.
+~/.config/clagentic/lite/semgrep-exclude         global semgrep rule-exclude ladder (gates.sh sast, one rule id
+                                                 per line). Same migrate-and-warn as osv-ignore above, from the
+                                                 bare ~/.config/clagentic/semgrep-exclude path (pre-lr-8ee2df).
 ~/.local/state/clagentic/registry               enrolled repos — one absolute path per line
 ~/.local/bin/clagentic-lite                     symlink to $CLAGENTIC_LITE_HOME/bin/clagentic-lite
 

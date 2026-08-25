@@ -1003,7 +1003,7 @@ intermittent-looking gate behavior.
 | **Tool** | `osv-scanner scan --recursive --format=json --config=<tmpfile> .` (newer releases) or `osv-scanner --recursive --severity=<S> .` (older releases). Version probed by subcommand availability, not version string. |
 | **Blocks?** | Yes, on vulnerabilities at or above the configured severity. Default is `CRITICAL`. |
 | **Severity** | Set `CLAGENTIC_OSV_SEVERITY` in `~/.config/clagentic/lite/config` or `.clagentic/config`. Values: `CRITICAL` (default), `HIGH`, `MEDIUM`, `LOW`. Set `LOW` to restore block-on-any-finding behavior. Newer releases no longer expose a scan-time severity filter, so clagentic-lite captures JSON and applies the threshold to osv-scanner's computed `max_severity` values. Missing or malformed severity data blocks fail-closed. |
-| **Ignore list** | Add CVE/GHSA IDs one-per-line to `~/.config/clagentic/osv-ignore` (global) or `.clagentic/osv-ignore` (repo). Lines starting with `#` and blank lines are ignored. For newer releases, these become `[[IgnoredVulns]]` blocks in the generated temp config; for older releases, they are passed as `--ignore-vulns=<id>`. |
+| **Ignore list** | Add CVE/GHSA IDs one-per-line to `~/.config/clagentic/lite/osv-ignore` (global) or `.clagentic/osv-ignore` (repo). Lines starting with `#` and blank lines are ignored. For newer releases, these become `[[IgnoredVulns]]` blocks in the generated temp config; for older releases, they are passed as `--ignore-vulns=<id>`. An old ignore list at the bare `~/.config/clagentic/osv-ignore` brand-root path (pre-lr-8ee2df) is migrated here automatically on the next `deps` run, with a one-time warning; still honored as a read fallback until migrated. |
 | **Missing tool** | Set `CLAGENTIC_ALLOW_MISSING_OSV=1` to skip if osv-scanner is not installed. |
 | **Timeout** | Every osv-scanner invocation runs under `run_bounded` (default 300s, configurable via `CLAGENTIC_OSV_TIMEOUT_SEC`) — the vulnerability-DB lookup is a network call. A timeout counts as a block. |
 
@@ -1024,7 +1024,10 @@ finding forced multi-round review churn with no sanctioned escape. Fixed by
 mirroring `cmd_deps`' osv-ignore mechanism (above) exactly (reuse-first): a
 two-level, one-rule-id-per-line exclude list, unioned across both levels —
 
-- `~/.config/clagentic/semgrep-exclude` (global)
+- `~/.config/clagentic/lite/semgrep-exclude` (global). An old exclude list at
+  the bare `~/.config/clagentic/semgrep-exclude` brand-root path
+  (pre-lr-8ee2df) is migrated here automatically on the next `sast` run, with
+  a one-time warning; still honored as a read fallback until migrated.
 - `.clagentic/semgrep-exclude` (repo, **committed** — unlike `.clagentic/`'s
   other contents, this one file is un-ignored in `.gitignore` the same way
   `.clagentic/adversarial-acks.json` is, because it is tracked policy, not
@@ -1103,7 +1106,7 @@ query = build_query(table, columns)  # nosemgrep: python.sqlalchemy.security.sql
 
 The rule id is mandatory and must name the exact finding being suppressed. A bare `# nosemgrep` with no rule id is **banned** — semgrep itself treats a bare directive as "suppress every rule on this line," which is strictly worse than a false negative on one known rule: it silently blinds every *future* rule the registry adds to that line too, with no record of which rule the suppression was ever meant to cover. The justification must state *why* the flagged pattern cannot trigger the vulnerability the rule targets at this specific site — "false positive" alone is not a justification; a reviewer must be able to check the claim without spelunking.
 
-**Sanctioned repo-wide form: the rule-exclude ladder** (`.clagentic/semgrep-exclude` / `~/.config/clagentic/semgrep-exclude`, see "Rule-exclude ladder (lr-321e18)" above). Use this when a rule is unsatisfiable **repo-wide**, not at one call site — e.g. a rule whose entire pattern class does not apply to this codebase's stack (no ORM, no shell-out, no template engine the rule targets). Each entry needs the same standard of evidence the inline form needs, just argued at repo scope instead of line scope: a justification citing concrete, verifiable code (or the concrete absence of a code shape) in *this* repo, not a general architectural claim.
+**Sanctioned repo-wide form: the rule-exclude ladder** (`.clagentic/semgrep-exclude` / `~/.config/clagentic/lite/semgrep-exclude`, see "Rule-exclude ladder (lr-321e18)" above). Use this when a rule is unsatisfiable **repo-wide**, not at one call site — e.g. a rule whose entire pattern class does not apply to this codebase's stack (no ORM, no shell-out, no template engine the rule targets). Each entry needs the same standard of evidence the inline form needs, just argued at repo scope instead of line scope: a justification citing concrete, verifiable code (or the concrete absence of a code shape) in *this* repo, not a general architectural claim.
 
 **Choosing between the two forms:**
 
@@ -1427,7 +1430,7 @@ Not wired into `gates ship`'s blocking sequence — it is diagnostic output, run
 | Gate | Situation | How to handle it |
 |---|---|---|
 | Gate 4a — secrets | False-positive token | Add a path-scoped allowlist entry to `.gitleaks.toml`. Do not use regex allowlists on token literals. |
-| Gate 4b — deps | Pre-existing CVE you accept | Add the ID to `.clagentic/osv-ignore` (repo) or `~/.config/clagentic/osv-ignore` (global). One ID per line. |
+| Gate 4b — deps | Pre-existing CVE you accept | Add the ID to `.clagentic/osv-ignore` (repo) or `~/.config/clagentic/lite/osv-ignore` (global). One ID per line. |
 | Gate 4b — deps | Want to ignore below CRITICAL | Set `CLAGENTIC_OSV_SEVERITY=HIGH` (or `MEDIUM`) in `.clagentic/config`. |
 | Gate 4c — SAST | False-positive semgrep rule | Add the file path to `.semgrepignore`, or add `# nosemgrep: <rule-id> — <reason>` inline (never a bare `# nosemgrep`); use the rule-exclude ladder instead when the rule is unsatisfiable repo-wide. See "Suppression policy" under Gate 4c above for the criteria. |
 | Gate 4c — SAST | Slow/unreliable network makes the baseline fetch time out, forcing full-tree scans | Set `CLAGENTIC_SAST_FETCH_TIMEOUT_SEC=<seconds>` (default 30) in `.clagentic/config`. A longer timeout only helps if the fetch would otherwise succeed — an unreachable remote still falls back to full-tree regardless of the timeout value, by design. |

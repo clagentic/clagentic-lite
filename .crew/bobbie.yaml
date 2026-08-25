@@ -40,7 +40,7 @@ security:
       description: >-
         Any NEW suppression introduced in a diff — an inline
         `# nosemgrep: <rule-id>` comment, or a new entry in
-        `.clagentic/semgrep-exclude` / `~/.config/clagentic/semgrep-exclude`
+        `.clagentic/semgrep-exclude` / `~/.config/clagentic/lite/semgrep-exclude`
         — is in-scope for security review, not a docs/config change to
         wave through. Verify the stated justification against the actual
         code it claims to describe: does the cited pattern (ORM usage,

@@ -768,6 +768,123 @@ cmd_secrets() {
   fi
 }
 
+# _gate_migrate_brand_root_file OLD NEW LABEL
+#
+# lr-8ee2df: migrate a global ignore-list file from the shared brand root
+# ($HOME/.config/clagentic/<name>) to this product's own namespace
+# ($HOME/.config/clagentic/lite/<name>), mirroring the brand/product split
+# lr-7939f8 shipped for the global config (bin/clagentic-lite,
+# _migrate_global_config_brand_path) and the rule AGENTS.md item 12 states.
+#
+# NOT the credentials case. osv-ignore/semgrep-exclude hold CVE IDs and
+# semgrep rule ids -- suppression policy, not secrets. This deliberately
+# does NOT reuse bin/clagentic-lite's _secret_tmp_create (umask-077
+# atomic-create, chmod 600 before/during/after, never-print-a-value): there
+# is no confidentiality window to protect and no value that would be
+# sensitive to log. A plain `mktemp` in the target directory plus `cat` +
+# `mv` is sufficient here -- the atomicity/idempotency/back-compat-read
+# properties below all still apply (a stale ignore entry silently going
+# unread is a real regression, wrong-direction: a suppressed finding starts
+# firing again on a BLOCKING security gate), but the chmod-600 and
+# never-leak-a-value apparatus that safety bar exists for a live
+# CLAGENTIC_ROUTER_TOKEN would be ceremony here.
+#
+# Args: OLD (brand-root path) NEW (product-namespace path) LABEL (used only
+# in messages, e.g. "osv-ignore" / "semgrep-exclude").
+#
+# Same contract as _migrate_global_config_brand_path minus the credential
+# apparatus:
+#   - Never overwrites an existing NEW from OLD. If both exist with
+#     different content, says so (byte-diff via cmp, not content) and
+#     leaves both untouched -- operator reconciles by hand. If both exist
+#     with IDENTICAL content, finishes a prior kill-window's cleanup by
+#     removing the now-redundant OLD copy (same idempotent-cleanup shape).
+#   - OLD absent: no-op, returns 0 (nothing to migrate).
+#   - OLD is a symlink: content is read through it (cat follows
+#     transparently) into NEW; only the symlink itself is removed after.
+#   - OLD is read-only: still migrates -- only ever READS old, then
+#     unlinks it (needs write on the parent dir, not the file).
+#   - NEW's parent directory created with plain `mkdir -p` (no chmod --
+#     these are not secrets, and no other non-secret state directory in
+#     gates.sh chmods its own parent either).
+#   - Atomic install: content lands in a temp file in NEW's directory
+#     first, then a single same-filesystem `mv` installs it at NEW; OLD is
+#     removed only AFTER that mv succeeds. A kill before the mv leaves OLD
+#     fully intact and NEW absent (temp file orphaned, harmless, cleaned up
+#     or overwritten by a re-run). A kill after the mv but before the OLD
+#     removal leaves the content fully intact at BOTH paths (NEW is
+#     authoritative; a re-run finishes the cleanup). No step holds content
+#     ONLY in a temp file with neither real path populated.
+#   - Idempotent: a second call with NEW already present (identical or
+#     divergent content) or OLD already gone is either a no-op or finishes
+#     cleanup, never double-migrates or corrupts.
+_gate_migrate_brand_root_file() {
+  _gmbrf_old="$1"
+  _gmbrf_new="$2"
+  _gmbrf_label="$3"
+
+  [ -f "$_gmbrf_old" ] || return 0
+
+  if [ -f "$_gmbrf_new" ]; then
+    if cmp -s "$_gmbrf_old" "$_gmbrf_new" 2>/dev/null; then
+      rm -f "$_gmbrf_old"
+      echo "[gates] removed redundant legacy $_gmbrf_label at $_gmbrf_old (already migrated to $_gmbrf_new)" 1>&2
+    else
+      echo "[gates] WARN both $_gmbrf_old and $_gmbrf_new exist with DIFFERENT content for $_gmbrf_label -- not migrating." 1>&2
+      echo "[gates]      $_gmbrf_new is authoritative (read by every gate, never the old path, once it exists)." 1>&2
+      echo "[gates]      Review $_gmbrf_old by hand and merge or remove it; this step will not touch either file until you do." 1>&2
+    fi
+    return 0
+  fi
+
+  _gmbrf_new_dir=$(dirname "$_gmbrf_new")
+  if [ ! -d "$_gmbrf_new_dir" ]; then
+    mkdir -p "$_gmbrf_new_dir" \
+      || { echo "[gates] WARN could not create $_gmbrf_new_dir -- skipping $_gmbrf_label migration (old path still honored)" 1>&2; return 1; }
+  fi
+
+  _gmbrf_tmp="$_gmbrf_new.migrate.$$"
+  if ! cat "$_gmbrf_old" > "$_gmbrf_tmp" 2>/dev/null; then
+    echo "[gates] WARN could not read $_gmbrf_old -- skipping $_gmbrf_label migration" 1>&2
+    rm -f "$_gmbrf_tmp"
+    return 1
+  fi
+
+  mv "$_gmbrf_tmp" "$_gmbrf_new" \
+    || { echo "[gates] WARN could not install migrated $_gmbrf_label at $_gmbrf_new -- skipping (old path still honored)" 1>&2; rm -f "$_gmbrf_tmp"; return 1; }
+
+  rm -f "$_gmbrf_old"
+  echo "[gates] migrated $_gmbrf_label: $_gmbrf_old -> $_gmbrf_new (brand/product namespace split)" 1>&2
+}
+
+# _gate_resolve_global_ignore_path NEW OLD LABEL
+#
+# Read-side resolution for a global ignore-list file, mirroring
+# ds_load_global_env's (scripts/platform.sh) new-path-wins-with-fallback
+# precedence: NEW wins unconditionally when it exists (regardless of
+# whether OLD is also still present -- never merges the two). When NEW is
+# absent and OLD exists, falls back to OLD with a one-time-per-process
+# warning, so an un-migrated install (or one where migration failed, e.g. a
+# read-only $HOME/.config/clagentic/) does not silently lose its ignore
+# list and start re-flagging suppressed findings on a blocking security
+# gate. Prints the resolved path (possibly empty, meaning neither exists)
+# on stdout.
+_gate_resolve_global_ignore_path() {
+  _grgi_new="$1"
+  _grgi_old="$2"
+  _grgi_label="$3"
+  if [ -f "$_grgi_new" ]; then
+    printf '%s' "$_grgi_new"
+    return 0
+  fi
+  if [ -f "$_grgi_old" ]; then
+    echo "[gates] reading global $_grgi_label from deprecated path $_grgi_old -- run \`clagentic-lite gates deps\`/\`sast\` after moving it to $_grgi_new (brand/product namespace split), or let migration retry on a writable \$HOME/.config/clagentic/lite/" 1>&2
+    printf '%s' "$_grgi_old"
+    return 0
+  fi
+  printf '%s' "$_grgi_new"
+}
+
 cmd_deps() {
   if ! command -v osv-scanner >/dev/null 2>&1; then
     if [ "${CLAGENTIC_ALLOW_MISSING_OSV:-0}" = "1" ]; then
@@ -781,7 +898,14 @@ cmd_deps() {
   fi
 
   SEVERITY="${CLAGENTIC_OSV_SEVERITY:-CRITICAL}"
-  GLOBAL_IGNORE="$HOME/.config/clagentic/osv-ignore"
+  OLD_GLOBAL_IGNORE="$HOME/.config/clagentic/osv-ignore"
+  NEW_GLOBAL_IGNORE="$HOME/.config/clagentic/lite/osv-ignore"
+  # `|| true`: a migration failure (unwritable target dir, unreadable old
+  # file, ...) must never abort this whole gate under `set -e` -- the
+  # resolve step right after falls back to reading the old path directly,
+  # same as any other un-migrated install during the deprecation window.
+  _gate_migrate_brand_root_file "$OLD_GLOBAL_IGNORE" "$NEW_GLOBAL_IGNORE" "osv-ignore" || true
+  GLOBAL_IGNORE=$(_gate_resolve_global_ignore_path "$NEW_GLOBAL_IGNORE" "$OLD_GLOBAL_IGNORE" "osv-ignore")
   REPO_IGNORE="$REPO_ROOT/.clagentic/osv-ignore"
 
   # Bound every osv-scanner invocation (INV-1a/INV-2, class-4 foundry fix):
@@ -1365,16 +1489,25 @@ cmd_sast() {
 $(_sast_config_flag)
 EOF_CFG
 
-  # Exclude ladder (lr-321e18): $HOME/.config/clagentic/semgrep-exclude
+  # Exclude ladder (lr-321e18): $HOME/.config/clagentic/lite/semgrep-exclude
   # (global) union $REPO_ROOT/.clagentic/semgrep-exclude (repo) — mirrors
   # cmd_deps' osv-ignore mechanism exactly (reuse-first). Each rule id
   # becomes an --exclude-rule flag on BOTH the baseline and full-tree
-  # invocations below.
+  # invocations below. Global half moved off the shared brand root to this
+  # product's own namespace (lr-8ee2df), same migrate-and-warn mechanism
+  # cmd_deps' GLOBAL_IGNORE uses (_gate_migrate_brand_root_file /
+  # _gate_resolve_global_ignore_path, defined above cmd_deps).
+  _OLD_GLOBAL_SEMGREP_EXCLUDE="$HOME/.config/clagentic/semgrep-exclude"
+  _NEW_GLOBAL_SEMGREP_EXCLUDE="$HOME/.config/clagentic/lite/semgrep-exclude"
+  # `|| true`: see the matching comment in cmd_deps above -- a migration
+  # failure must never abort this blocking gate under `set -e`.
+  _gate_migrate_brand_root_file "$_OLD_GLOBAL_SEMGREP_EXCLUDE" "$_NEW_GLOBAL_SEMGREP_EXCLUDE" "semgrep-exclude" || true
+  _GLOBAL_SEMGREP_EXCLUDE=$(_gate_resolve_global_ignore_path "$_NEW_GLOBAL_SEMGREP_EXCLUDE" "$_OLD_GLOBAL_SEMGREP_EXCLUDE" "semgrep-exclude")
   while IFS= read -r _SAST_EXCL_TOK; do
     [ -n "$_SAST_EXCL_TOK" ] || continue
     set -- "$@" "$_SAST_EXCL_TOK"
   done <<EOF_EXCL
-$(_sast_exclude_rule_flags "$HOME/.config/clagentic/semgrep-exclude" "$REPO_ROOT/.clagentic/semgrep-exclude")
+$(_sast_exclude_rule_flags "$_GLOBAL_SEMGREP_EXCLUDE" "$REPO_ROOT/.clagentic/semgrep-exclude")
 EOF_EXCL
 
   # A suppressed rule must never be silent (task requirement): when the
