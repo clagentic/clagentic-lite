@@ -3361,9 +3361,19 @@ cmd_review() {
   esac
 
   # Squash hint: warn the operator when the diff is large, before the chunking decision.
+  # lr-e33f73: name CLAGENTIC_REVIEW_CHUNKING explicitly, not just "chunking" --
+  # the incident behind this task was an operator on an install whose config
+  # predates this key, who saw only the diff-size symptom and spent hours on
+  # unrelated root causes before finding the variable by other means. Naming
+  # the exact variable here directly shortens that path.
   if [ "$_crv_diff_bytes" -gt "$_crv_chunk_bytes" ]; then
-    printf '[gates/review] diff is %d bytes (threshold %d) — delta re-review (default) or squashing commits reduces review scope\n' \
-      "$_crv_diff_bytes" "$_crv_chunk_bytes" 1>&2
+    if [ "${CLAGENTIC_REVIEW_CHUNKING:-0}" = "1" ]; then
+      printf '[gates/review] diff is %d bytes (threshold %d) — delta re-review (default) or squashing commits reduces review scope; chunked review will be used (CLAGENTIC_REVIEW_CHUNKING=1)\n' \
+        "$_crv_diff_bytes" "$_crv_chunk_bytes" 1>&2
+    else
+      printf '[gates/review] diff is %d bytes (threshold %d) — delta re-review (default) or squashing commits reduces review scope; set CLAGENTIC_REVIEW_CHUNKING=1 in your global config to review very large diffs in chunks instead of failing/timing out\n' \
+        "$_crv_diff_bytes" "$_crv_chunk_bytes" 1>&2
+    fi
   fi
 
   # Chunking path: CLAGENTIC_REVIEW_CHUNKING=1 AND diff > threshold.
