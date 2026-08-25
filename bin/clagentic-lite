@@ -1700,7 +1700,28 @@ cmd_init() {
   # re-run the full interactive front door, discarding the operator's
   # existing settings instead of recognizing them. No-op if already
   # migrated or if there is nothing at the old path.
-  _migrate_global_config_brand_path
+  #
+  # STATUS IS CHECKED EXPLICITLY, not inferred from `[ -f "$GLOBAL_CONFIG" ]`
+  # below (BOBBIE bobbie.uncat.1, folded in over its own non-blocking rating
+  # -- lore task lr-7939f8 comment #2). Calling this bare would still abort
+  # the whole `init` run on a `return 1` today, because `set -e` (top of
+  # file) propagates through an unwrapped simple-command failure -- but that
+  # protection is incidental to the call SHAPE, not a property of what this
+  # step actually needs, and is one `if _migrate...; then` refactor (which
+  # exempts its condition from `set -e` by construction) or one `set -e`
+  # removal away from silently regressing into exactly the state
+  # _migrate_global_config_brand_path itself refuses to create when it
+  # detects it directly: a fresh config written at $GLOBAL_CONFIG while the
+  # operator's real, un-migrated credentials sit untouched and unread at
+  # $OLD_GLOBAL_CONFIG. Wrapping the call in `if` here makes the check
+  # explicit and durable rather than borrowed from an unrelated top-of-file
+  # setting -- and, being an `if` condition, does NOT itself trigger `set -e`
+  # on failure, so this is not a behavior change for a genuine hard error
+  # elsewhere in `init`.
+  _migration_ok=1
+  if ! _migrate_global_config_brand_path; then
+    _migration_ok=0
+  fi
 
   # 3. Two-question front door. Skip entirely when global config already
   #    exists and --reconfigure was not passed — otherwise re-runs of init
@@ -1708,6 +1729,19 @@ cmd_init() {
   #    --reconfigure IS passed against an existing config, _write_global_config
   #    MERGES (preserves every user-set value, adds new keys) rather than
   #    clobbering (lr-25e73e item 4) — see its own header comment.
+  if [ "$_migration_ok" -eq 0 ] && [ -f "$OLD_GLOBAL_CONFIG" ] && [ ! -f "$GLOBAL_CONFIG" ]; then
+    # A genuinely FAILED migration (old file survives untouched -- migration
+    # never touches it on any failure path -- and no new file was ever
+    # installed) must never fall through to _write_global_config: that would
+    # write fresh DEFAULTS at $GLOBAL_CONFIG while the operator's real,
+    # un-migrated credentials sit unread at $OLD_GLOBAL_CONFIG -- new-path-
+    # wins precedence (ds_load_global_env) then makes every subsequent
+    # command silently run on defaults instead of the operator's actual
+    # config. Refuse loudly instead; the operator's config is untouched and
+    # still fully readable at the old path (back-compat fallback,
+    # ds_load_global_env) either way.
+    die "global config migration failed -- see the WARN above for the cause. Your config is untouched at $OLD_GLOBAL_CONFIG (still honored as a read fallback). Fix the cause and re-run \`clagentic-lite init\` or \`clagentic-lite update\`; refusing to write a fresh config at $GLOBAL_CONFIG alongside your real one at the old path."
+  fi
   if [ -f "$GLOBAL_CONFIG" ] && [ "$RECONFIGURE" -eq 0 ]; then
     say "global config already exists at $GLOBAL_CONFIG (use --reconfigure to re-prompt)"
   else

@@ -567,6 +567,75 @@ class TestEndToEndViaRealCli(unittest.TestCase):
                        msg="init on an un-migrated install must preserve the existing config, "
                            "not silently re-prompt and discard it")
 
+    def test_init_on_failed_migration_never_writes_divergent_new_config(self):
+        """lore task lr-7939f8 comment #2 fold-in (BOBBIE bobbie.uncat.1):
+        cmd_init's front-door gate used to check only `[ -f "$GLOBAL_CONFIG" ]`,
+        never whether the migration it just ran actually SUCCEEDED. On a
+        migration failure the old file is correctly left intact, but a plain
+        file-presence check can't tell "migration never ran/succeeded" apart
+        from "no config exists yet" -- falling through to _write_global_config
+        would write a FRESH config at the new path alongside the operator's
+        real, untouched credentials at the old path: exactly the
+        both-paths-diverged state _migrate_global_config_brand_path itself
+        refuses to create when it detects it directly, reached by a
+        different route.
+
+        Injection: the migration target's parent ("lite") pre-exists as a
+        regular FILE where a directory is needed, so `mkdir -p` fails with
+        ENOTDIR -- a type conflict, not a permission check, so this
+        reproduces identically whether or not the test runs as root (unlike
+        a chmod-based injection, which root bypasses -- see the read-only
+        skipIf elsewhere in this file)."""
+        body = "CLAGENTIC_ROUTER_TOKEN=REAL-SECRET-VALUE\n"
+        self._write_old_config(body)
+        lite_path = os.path.dirname(self.new_config)
+        with open(lite_path, "w") as f:
+            f.write("not a directory\n")
+
+        rc, out, err = self._run(["init"])
+
+        self.assertNotEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        self.assertFalse(
+            os.path.exists(self.new_config),
+            msg="a failed migration must never leave a divergent fresh config at the new path",
+        )
+        self.assertTrue(
+            os.path.isfile(self.old_config),
+            msg="the operator's real config must survive untouched at the old path",
+        )
+        with open(self.old_config) as f:
+            self.assertEqual(f.read(), body,
+                              msg="old-path content must be byte-identical, not partially written or clobbered")
+        combined = out + err
+        self.assertIn(self.old_config, combined,
+                       msg="the refusal must name the old path where the config actually is")
+        self.assertNotIn("REAL-SECRET-VALUE", combined,
+                          msg="no configured VALUE may appear in output, including this refusal path")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "running as root -- permission bits do not block root's "
+                      "own writes, so this scenario cannot be exercised here; "
+                      "test_init_on_failed_migration_never_writes_divergent_new_config "
+                      "above covers the same defect via a root-proof injection")
+    def test_init_on_migration_dir_creation_denied_never_writes_divergent_new_config(self):
+        """Companion to the test above using a permission-bit injection
+        (closer to a real-world unwritable-HOME scenario) rather than a
+        type conflict -- skipped under root, where chmod cannot block the
+        process's own writes."""
+        body = "CLAGENTIC_ROUTER_TOKEN=REAL-SECRET-VALUE\n"
+        self._write_old_config(body)
+        clagentic_dir = os.path.dirname(os.path.dirname(self.new_config))
+        os.chmod(clagentic_dir, 0o500)
+        self.addCleanup(os.chmod, clagentic_dir, 0o700)
+
+        rc, out, err = self._run(["init"])
+
+        self.assertNotEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        self.assertFalse(os.path.exists(self.new_config))
+        self.assertTrue(os.path.isfile(self.old_config))
+        with open(self.old_config) as f:
+            self.assertEqual(f.read(), body)
+
 
 if __name__ == "__main__":
     unittest.main()
