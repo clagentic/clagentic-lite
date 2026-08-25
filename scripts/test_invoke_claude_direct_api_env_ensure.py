@@ -19,12 +19,28 @@ surfaced.
 
 THE FIX: a new `enterprise|anthropic-oauth` arm sets CLAUDE_ROUTER_ENV_ENSURE
 to `env ANTHROPIC_BASE_URL= ANTHROPIC_AUTH_TOKEN= ANTHROPIC_BEDROCK_BASE_URL=
-AWS_BEARER_TOKEN_BEDROCK=`, blanking (not unsetting -- the var name must
-still be present for tooling that probes presence, matching the existing
-Bedrock arm's `env VAR=value` shape rather than NON_CLAUDE_ENV_STRIP's
-`env -u VAR` shape) all four router-scoped vars for this one spawn, so the
-`claude` CLI falls back to its own native OAuth/Enterprise auth resolution
-instead of whatever settings.json most recently stamped.
+AWS_BEARER_TOKEN_BEDROCK= CLAUDE_CODE_USE_BEDROCK=`, blanking (not unsetting
+-- the var name must still be present for tooling that probes presence,
+matching the existing Bedrock arm's `env VAR=value` shape rather than
+NON_CLAUDE_ENV_STRIP's `env -u VAR` shape) all five vars for this one spawn,
+so the `claude` CLI falls back to its own native OAuth/Enterprise auth
+resolution instead of whatever settings.json most recently stamped or
+whatever Bedrock flag the operator's own ambient shell happened to carry.
+
+FOLD-IN (PR #200 review round 2, PEACHES finding amos.path-choice.4):
+CLAUDE_CODE_USE_BEDROCK was originally left ungoverned by this arm -- an
+operator declaring enterprise/anthropic-oauth from a shell that ambiently
+carried CLAUDE_CODE_USE_BEDROCK=1 got a gate-path child that STILL SPOKE
+BEDROCK PROTOCOL, the exact ambient-session-dependence lr-0ac353 (PR #184)
+existed to eliminate, now reappearing inverted inside its own successor.
+Added as the fifth var in the same arm. A repo-wide sweep for every other
+Claude-Code auth-mode-selecting env var (see scripts/llm-client.sh's arm
+comment for the full enumeration) turned up exactly one further candidate,
+ANTHROPIC_API_KEY, which is DELIBERATELY EXCLUDED -- it is the operator's
+own legitimate direct-API credential, not an injection artifact, and
+blanking it would break real --bare/API-key auth instead of fixing
+anything. No Vertex-family var exists anywhere in this repo's
+CLAGENTIC_AUTH_MODE surface, so there is nothing further to govern.
 
 DESIGN CALL, stated here and in the PR body: anthropic-oauth is included in
 the SAME arm as enterprise, not split into its own no-op arm. Both are
@@ -87,6 +103,18 @@ arm and no enterprise|anthropic-oauth arm):
     bedrock-sso arm, untouched by this diff; included to prove the new arm's
     addition did not disturb the existing one (the "two predicates do not
     coexist" contract stays satisfied), not a fail-under-unfixed case.
+  - AC8 (enterprise/anthropic-oauth blank CLAUDE_CODE_USE_BEDROCK too, the
+    PEACHES fold-in): CODE PATH -- with the pre-fold-in arm (four router
+    vars only, no CLAUDE_CODE_USE_BEDROCK= term), CLAGENTIC_AUTH_MODE=
+    enterprise still matches the `enterprise|anthropic-oauth)` case, but
+    CLAUDE_ROUTER_ENV_ENSURE's value carries no CLAUDE_CODE_USE_BEDROCK=
+    term. The stub claude then inherits CLAUDE_CODE_USE_BEDROCK=1 from the
+    fixture's parent env UNCHANGED. The assertion that child_env.get(
+    "CLAUDE_CODE_USE_BEDROCK") == "" fails because it instead equals "1" --
+    this was reproduced against this exact test harness (arm's
+    CLAUDE_CODE_USE_BEDROCK= term temporarily removed, both vars set in the
+    fixture, child confirmed to still carry CLAUDE_CODE_USE_BEDROCK=1)
+    before the fifth term was restored and this test re-run green.
 
 Run with:
   python3 -m unittest scripts.test_invoke_claude_direct_api_env_ensure -v
@@ -400,6 +428,82 @@ class TestAcceptance6NonClaudeEnvStripUnaffected(unittest.TestCase):
                 f"arm -- the two constants must not interact. "
                 f"child_env keys={sorted(child_env)!r}",
             )
+
+
+class TestAcceptance8EnterpriseAndOauthBlankAmbientBedrockFlag(_DirectApiEnsureTestBase):
+    """AC8 (PEACHES fold-in, PR #200 finding amos.path-choice.4): an ambient
+    CLAUDE_CODE_USE_BEDROCK=1 in the operator's own shell must not survive
+    into the gate-path claude spawn when CLAGENTIC_AUTH_MODE=enterprise or
+    anthropic-oauth is declared -- verified to FAIL against the pre-fold-in
+    implementation (see module docstring's TEST-DISCIPLINE section, AC8)."""
+
+    def test_enterprise_blanks_ambient_claude_code_use_bedrock(self):
+        child_env, r = self._run_invoke_claude_and_capture_child_env(
+            extra_parent_env={
+                "CLAGENTIC_AUTH_MODE": "enterprise",
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+            },
+        )
+        self.assertIn(
+            "CLAUDE_CODE_USE_BEDROCK", child_env,
+            f"CLAUDE_CODE_USE_BEDROCK must still be PRESENT (blanked, not "
+            f"unset) in the spawned claude child's environ, same shape as "
+            f"the four router vars. child_env keys={sorted(child_env)!r}",
+        )
+        self.assertEqual(
+            child_env.get("CLAUDE_CODE_USE_BEDROCK"), "",
+            f"CLAGENTIC_AUTH_MODE=enterprise must BLANK an ambient "
+            f"CLAUDE_CODE_USE_BEDROCK=1 on the gate-path claude spawn -- "
+            f"otherwise the spawned child still speaks Bedrock protocol "
+            f"despite a declared direct-API mode, the exact "
+            f"ambient-session-dependence lr-0ac353 existed to eliminate, "
+            f"now inverted. Got {child_env.get('CLAUDE_CODE_USE_BEDROCK')!r} "
+            f"(the ambient value, un-blanked). stderr={r.stderr!r}",
+        )
+
+    def test_anthropic_oauth_blanks_ambient_claude_code_use_bedrock(self):
+        child_env, r = self._run_invoke_claude_and_capture_child_env(
+            extra_parent_env={
+                "CLAGENTIC_AUTH_MODE": "anthropic-oauth",
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+            },
+        )
+        self.assertEqual(
+            child_env.get("CLAUDE_CODE_USE_BEDROCK"), "",
+            f"CLAGENTIC_AUTH_MODE=anthropic-oauth must BLANK an ambient "
+            f"CLAUDE_CODE_USE_BEDROCK=1 too, same arm as enterprise. Got "
+            f"{child_env.get('CLAUDE_CODE_USE_BEDROCK')!r}. "
+            f"stderr={r.stderr!r}",
+        )
+
+
+class TestAcceptance9AnthropicApiKeyDeliberatelyUngoverned(_DirectApiEnsureTestBase):
+    """AC9 (the stated negative result from the sweep): ANTHROPIC_API_KEY is
+    NOT blanked by the enterprise|anthropic-oauth arm -- it is the
+    operator's own legitimate direct-API credential, not a router-injection
+    artifact, and blanking it would break real --bare/API-key auth. This is
+    a boundary check documenting the deliberate exclusion, NOT a
+    fail-under-unfixed case -- both the pre-fold-in and current
+    implementations leave this var untouched, by design."""
+
+    def test_anthropic_api_key_survives_enterprise_arm_unblanked(self):
+        child_env, r = self._run_invoke_claude_and_capture_child_env(
+            extra_parent_env={
+                "CLAGENTIC_AUTH_MODE": "enterprise",
+                "ANTHROPIC_API_KEY": "fixture-real-operator-api-key-not-real",
+            },
+        )
+        self.assertEqual(
+            child_env.get("ANTHROPIC_API_KEY"),
+            "fixture-real-operator-api-key-not-real",
+            f"ANTHROPIC_API_KEY must survive the enterprise|anthropic-oauth "
+            f"arm UNTOUCHED -- it is the operator's own legitimate "
+            f"direct-API credential (see scripts/llm-client.sh's arm "
+            f"comment and bin/clagentic-lite:585 for why), not a "
+            f"router-injection artifact like the five governed vars. "
+            f"child_env.get('ANTHROPIC_API_KEY')="
+            f"{child_env.get('ANTHROPIC_API_KEY')!r}",
+        )
 
 
 class TestAcceptance7BedrockArmsUnchanged(_DirectApiEnsureTestBase):
