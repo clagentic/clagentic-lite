@@ -19,6 +19,14 @@
 # Roles are independent. Codex does not implicitly fall back to Claude (or
 # vice versa) — every fallback step is something you wrote down on purpose.
 
+# ---------- config schema version ----------
+# Set automatically by `clagentic-lite init` (or `init --reconfigure`) to the
+# CONFIG_SCHEMA_VERSION constant in bin/clagentic-lite at write time. Records
+# which schema this file was materialized from — never rewritten by `update`
+# (lr-e33f73; see AGENTS.md/PR discussion for why a non-destructive refresh
+# of an EXISTING config is deferred). Do not hand-edit.
+CLAGENTIC_CONFIG_SCHEMA_VERSION=
+
 # ---------- tool home ----------
 # Set automatically by `clagentic-lite init`. Edit only if you move the install.
 # CLAGENTIC_HOME is the deprecated name — still honored with a one-time warning for

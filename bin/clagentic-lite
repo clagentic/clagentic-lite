@@ -259,6 +259,22 @@ CLAGENTIC_HOOK_SCRIPTS="session-start.sh prompt-inject.sh pre-bash-guard.sh pre-
 # Space-separated POSIX-sh string (no arrays).
 CLAGENTIC_SECURITY_TOOLS="gitleaks semgrep osv-scanner"
 
+# Global config schema version (lr-e33f73). Follows the same version-constant
+# pattern as SHIM_VERSION/CLAUDE_SETTINGS_VERSION/etc above, applied to the
+# one generated artifact that never had it: share/config.example. Stamped
+# into a fresh ~/.config/clagentic/config as CLAGENTIC_CONFIG_SCHEMA_VERSION
+# by _write_global_config (init/--reconfigure only — never rewritten into an
+# existing config outside that path, so this alone does not touch a live
+# customized config). `doctor`'s drift check (below) compares the KEY SET in
+# share/config.example against the installed config directly; it does not
+# depend on this constant. This constant exists so a future non-destructive
+# refresh mechanism (deferred — see AGENTS.md/PR discussion, lr-e33f73 items
+# 3-4) has a version to compare against, matching how every other stamped
+# artifact in this file already works. Bump on any structural change to
+# config.example's key set (add/remove/rename a key) — content-only comment
+# edits do not require a bump.
+CONFIG_SCHEMA_VERSION="v1"
+
 say()  { printf '[clagentic-lite] %s\n' "$*"; }
 warn() { printf '[clagentic-lite] WARN: %s\n' "$*" 1>&2; }
 die()  { printf '[clagentic-lite] ERROR: %s\n' "$*" 1>&2; exit 1; }
@@ -1050,6 +1066,80 @@ _doctor_check_orphaned_router_plugin() {
   fi
 }
 
+# _doctor_check_config_drift OK_FN
+# lr-e33f73: `clagentic-lite update` never refreshes an existing
+# ~/.config/clagentic/config (cmd_init short-circuits when the file already
+# exists — see the comment above CONFIG_SCHEMA_VERSION, top of file). A
+# fully up-to-date install can therefore be missing every config key shipped
+# after its own init, with zero indication anywhere that this happened —
+# the field incident behind this task was an operator who lost roughly four
+# hours misdiagnosing a missing CLAGENTIC_REVIEW_CHUNKING as an auth/router
+# problem. This check makes that gap visible on a routine `doctor` run: it
+# diffs the KEY SET (variable names only, never values — this is read-only
+# and reports names, not a user's configured values) in share/config.example
+# against $GLOBAL_CONFIG and names exactly which keys the installed config
+# is missing, whether the key is active or commented-out in the template.
+#
+# Deliberately advisory (WARN via a plain printf, not FAIL_FN) — an absent
+# key is not a broken install, it is a missing key the operator may or may
+# not want; forcing it to FAIL would make `doctor` red on every machine that
+# has ever customized a config by deleting an unwanted line. Only OK_FN is
+# taken as a parameter, matching _doctor_check_render_stamp_staleness's
+# WARN-only convention above.
+#
+# Key extraction: a line that matches ^CLAGENTIC_[A-Za-z0-9_]*= optionally
+# prefixed with a single '# ' comment marker (config.example's own
+# convention for an inert/commented-out key — see the file's "Opt-in
+# default: off" sections). Matches on VARIABLE NAME ONLY (up to and
+# including the first '='); values are never read or compared, so a
+# user-customized value can never be reported as "drift" by this check.
+_doctor_check_config_drift() {
+  _dccd_ok_fn="$1"
+  _dccd_example="$SHARE_DIR/config.example"
+  if [ ! -f "$_dccd_example" ]; then
+    printf '  (share/config.example not found at %s — skipping)\n' "$_dccd_example"
+    return 0
+  fi
+  if [ ! -f "$GLOBAL_CONFIG" ]; then
+    printf '  (no global config at %s yet — run `clagentic-lite init` — skipping)\n' "$GLOBAL_CONFIG"
+    return 0
+  fi
+
+  # Both sides use the SAME extraction (active OR commented-out key names) --
+  # a freshly-init'd config is a verbatim copy of config.example, so it
+  # carries the identical commented-out lines the template does. Extracting
+  # only active keys from one side and both from the other would falsely
+  # report every commented-out key as "missing" on a byte-identical install
+  # (caught by test_doctor_config_drift.py's no-drift-on-verbatim-copy case).
+  _dccd_key_sed='s/^#[[:space:]]*\(CLAGENTIC_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(CLAGENTIC_[A-Za-z0-9_]*\)=.*/\1/p'
+  _dccd_example_keys=$(sed -n "$_dccd_key_sed" "$_dccd_example" | sort -u)
+  _dccd_installed_keys=$(sed -n "$_dccd_key_sed" "$GLOBAL_CONFIG" | sort -u)
+
+  _dccd_missing=$(printf '%s\n' "$_dccd_example_keys" | while IFS= read -r _dccd_k; do
+    [ -z "$_dccd_k" ] && continue
+    if ! printf '%s\n' "$_dccd_installed_keys" | grep -qxF "$_dccd_k"; then
+      printf '%s\n' "$_dccd_k"
+    fi
+  done)
+
+  # wc -l, not grep -c: grep -c on zero matches exits 1, which would trip an
+  # `|| fallback` into printing a second "0" alongside its own zero count.
+  _dccd_missing_count=$(printf '%s\n' "$_dccd_missing" | sed '/^$/d' | wc -l | tr -d ' ')
+  _dccd_example_count=$(printf '%s\n' "$_dccd_example_keys" | sed '/^$/d' | wc -l | tr -d ' ')
+
+  if [ "$_dccd_missing_count" -eq 0 ]; then
+    "$_dccd_ok_fn" "global config has all $_dccd_example_count key(s) from share/config.example (no drift)"
+  else
+    printf '  WARN global config at %s is missing %s key(s) present in share/config.example (shipped after this config was written — see AGENTS.md "Template version-bump protocol" for why `update` does not add them automatically):\n' \
+      "$GLOBAL_CONFIG" "$_dccd_missing_count"
+    printf '%s\n' "$_dccd_missing" | while IFS= read -r _dccd_m; do
+      [ -z "$_dccd_m" ] && continue
+      printf '       %s\n' "$_dccd_m"
+    done
+    printf '       Review these in %s and add any you want to %s.\n' "$_dccd_example" "$GLOBAL_CONFIG"
+  fi
+}
+
 # _migrate_legacy_router_plugin
 # lr-1b5a31 migration, hardened by lr-35315f: detects a pre-lr-1b5a31
 # clagentic-lite-router install (the old overlay plugin) and removes it.
@@ -1559,9 +1649,10 @@ _write_global_config() {
   cp "$_CONFIG_SRC" "$GLOBAL_CONFIG"
   chmod 600 "$GLOBAL_CONFIG"
 
-  # Stamp CLAGENTIC_LITE_HOME.
-  awk -v home="$CLAGENTIC_LITE_HOME" '
+  # Stamp CLAGENTIC_LITE_HOME and CLAGENTIC_CONFIG_SCHEMA_VERSION (lr-e33f73).
+  awk -v home="$CLAGENTIC_LITE_HOME" -v schema="$CONFIG_SCHEMA_VERSION" '
     /^CLAGENTIC_LITE_HOME=/ { print "CLAGENTIC_LITE_HOME=" home; next }
+    /^CLAGENTIC_CONFIG_SCHEMA_VERSION=/ { print "CLAGENTIC_CONFIG_SCHEMA_VERSION=" schema; next }
     { print }
   ' "$GLOBAL_CONFIG" > "$GLOBAL_CONFIG.tmp"
   mv "$GLOBAL_CONFIG.tmp" "$GLOBAL_CONFIG"
@@ -2974,6 +3065,14 @@ cmd_doctor() {
   _ok "CLAGENTIC_RECALL_LIMIT=${CLAGENTIC_RECALL_LIMIT:-5 (default)}"
   _ok "CLAGENTIC_RECALL_MAX_CHARS=${CLAGENTIC_RECALL_MAX_CHARS:-1500 (default)}"
   _ok "CLAGENTIC_MEMORY_MAX_ROWS=${CLAGENTIC_MEMORY_MAX_ROWS:-5000 (default)}"
+
+  # 10b. Global config drift check (lr-e33f73): compares the key set in
+  # share/config.example against the installed global config. `update`
+  # never refreshes an existing config (see CONFIG_SCHEMA_VERSION comment,
+  # top of file) — this is the only place a missing-but-shipped key becomes
+  # visible short of manually diffing the two files.
+  printf '\nglobal config drift:\n'
+  _doctor_check_config_drift _ok
 
   # 11. Stale env/config var check: warn when CLAGENTIC_HOME is still set.
   printf '\nenv var migration:\n'
