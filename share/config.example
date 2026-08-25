@@ -22,9 +22,11 @@
 # ---------- config schema version ----------
 # Set automatically by `clagentic-lite init` (or `init --reconfigure`) to the
 # CONFIG_SCHEMA_VERSION constant in bin/clagentic-lite at write time. Records
-# which schema this file was materialized from — never rewritten by `update`
-# (lr-e33f73; see AGENTS.md/PR discussion for why a non-destructive refresh
-# of an EXISTING config is deferred). Do not hand-edit.
+# which schema this file was materialized from — a plain `update` never
+# touches this file's key set; run `update --refresh-config` to append any
+# missing keys (always commented out) without losing your customizations, or
+# `init --reconfigure` to merge in new keys while preserving every value you
+# have already set. Do not hand-edit this line.
 CLAGENTIC_CONFIG_SCHEMA_VERSION=
 
 # ---------- tool home ----------

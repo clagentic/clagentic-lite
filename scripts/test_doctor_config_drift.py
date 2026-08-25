@@ -136,6 +136,18 @@ class TestMissingKeysReported(_DoctorConfigDriftTestBase):
         rc, out, err = self._run_doctor()
         self.assertIn("key(s) present in share/config.example", out, msg=out)
 
+    def test_names_the_refresh_config_remedy_not_the_stale_protocol_citation(self):
+        """lr-25e73e item 5: the WARN used to cite AGENTS.md "Template
+        version-bump protocol" as the reason `update` does not add missing
+        keys automatically -- that section governs the four version-constant
+        template artifacts and does not actually cover share/config.example
+        (task thread comment #2). Now that a remedy command exists
+        (`update --refresh-config`), doctor must name it instead."""
+        self._write_global_config("CLAGENTIC_LITE_HOME=/fake/home\n")
+        rc, out, err = self._run_doctor()
+        self.assertIn("update --refresh-config", out, msg=out)
+        self.assertNotIn("Template version-bump protocol", out, msg=out)
+
 
 class TestNoDriftWhenAllKeysPresent(_DoctorConfigDriftTestBase):
     def test_full_config_example_copy_reports_no_drift(self):

@@ -8,7 +8,7 @@
 #   unenroll [--purge] [PATH]             remove clagentic hooks, deregister
 #   list                                  show enrolled repos + status
 #   doctor                                diagnostics punch list
-#   update [--restamp]                    git pull + re-prereq + re-stamp shims + plugin update
+#   update [--restamp] [--refresh-config] git pull + re-prereq + re-stamp shims + plugin update
 #   recall [keywords...]                  search session memory for matching summaries
 #   remember "<note>" [tags]              store a manual memory entry
 #   show memory|gates [N]         pretty-print last N rows from .clagentic/ DBs
@@ -262,17 +262,17 @@ CLAGENTIC_SECURITY_TOOLS="gitleaks semgrep osv-scanner"
 # Global config schema version (lr-e33f73). Follows the same version-constant
 # pattern as SHIM_VERSION/CLAUDE_SETTINGS_VERSION/etc above, applied to the
 # one generated artifact that never had it: share/config.example. Stamped
-# into a fresh ~/.config/clagentic/config as CLAGENTIC_CONFIG_SCHEMA_VERSION
-# by _write_global_config (init/--reconfigure only — never rewritten into an
-# existing config outside that path, so this alone does not touch a live
-# customized config). `doctor`'s drift check (below) compares the KEY SET in
-# share/config.example against the installed config directly; it does not
-# depend on this constant. This constant exists so a future non-destructive
-# refresh mechanism (deferred — see AGENTS.md/PR discussion, lr-e33f73 items
-# 3-4) has a version to compare against, matching how every other stamped
-# artifact in this file already works. Bump on any structural change to
-# config.example's key set (add/remove/rename a key) — content-only comment
-# edits do not require a bump.
+# into $GLOBAL_CONFIG as CLAGENTIC_CONFIG_SCHEMA_VERSION by
+# _write_global_config, always re-stamped to the current value on either a
+# fresh `init` or `init --reconfigure` (lr-25e73e: --reconfigure now MERGES
+# rather than clobbers an existing config, but this one key is exempt from
+# preservation — it is auto-managed bookkeeping, never a hand-set value).
+# `doctor`'s drift check and `update --refresh-config`'s append pass (below,
+# lr-25e73e item 3) both compare the KEY SET in share/config.example against
+# the installed config directly via the shared _config_key_set/
+# _config_missing_keys helpers; neither depends on this constant. Bump on any
+# structural change to config.example's key set (add/remove/rename a key) —
+# content-only comment edits do not require a bump.
 CONFIG_SCHEMA_VERSION="v1"
 
 say()  { printf '[clagentic-lite] %s\n' "$*"; }
@@ -1066,6 +1066,84 @@ _doctor_check_orphaned_router_plugin() {
   fi
 }
 
+# _secret_tmp_create PATH
+# lr-25e73e fold-in (BOBBIE bobbie.secret.7 + PEACHES amos.code-craft.12):
+# creates PATH truncated and chmod 600 BEFORE any content ever reaches it,
+# and is the ONLY sanctioned way to create a temp file anywhere in the
+# secrets-bearing config read/merge/append paths below (_write_global_config,
+# _append_missing_config_keys). A bare `cmd > newfile` redirection creates
+# newfile at whatever the process umask dictates the INSTANT the shell opens
+# it, before the command's own output ever exists — a subsequent `chmod 600`
+# is provably too late, since a hostile or merely-curious local reader can
+# open the file in the window between shell-open and chmod. This was the
+# root cause both PEACHES and BOBBIE independently found (four sites, two
+# different partial lists) in the PR #195 review round: _wgc_preserve.body,
+# _wgc_merged.body.tmp, _wgc_merged.notfound, and _amck_tmp.cmt were each a
+# `command > file` where `file` did not yet exist 600.
+#
+# THE RULE, enforced by construction from here on: a temp file that will
+# ever hold config content (which may include a live credential value, e.g.
+# CLAGENTIC_ROUTER_TOKEN) is NEVER the target of `cmd > newfile`. It is
+# ALWAYS created via this helper first, then written to with `cmd >> file`
+# (append onto an already-600 file) or `cmd > file` is replaced with
+# `_secret_tmp_create file && cmd > file` is STILL WRONG (same race) --
+# the correct pattern is always _secret_tmp_create, then >>-append, or
+# redirect into a file this helper already created and never re-truncate it.
+#
+# ATOMICITY, corrected in review (own test caught it live,
+# test_permissions_during_the_window_not_only_after): `: > file` FOLLOWED BY
+# `chmod 600 file` is NOT atomic -- the shell's own `>` redirection creates
+# `file` at whatever the process umask dictates the INSTANT it opens the
+# descriptor, and `chmod` is a SEPARATE syscall milliseconds later. A reader
+# racing between those two syscalls still sees the umask-derived mode (0644
+# under a typical 022 umask) -- the exact same class of window this helper
+# exists to close, just narrowed rather than closed. The genuinely atomic
+# fix: scope a `umask 077` to a subshell around the file's creation, so the
+# kernel creates it at mode 600 in ONE syscall and `chmod` is redundant
+# belt-and-braces afterward (kept for defense-in-depth against an inherited
+# umask that somehow bypassed the subshell, e.g. a shell without subshell
+# support for `( )` -- POSIX sh always has this, so this is theoretical, but
+# the chmod is one cheap statement and removing it buys nothing).
+_secret_tmp_create() {
+  ( umask 077 && : > "$1" ) || return 1
+  chmod 600 "$1" || return 1
+}
+
+# _config_key_set FILE
+# lr-25e73e: extraction shared by _doctor_check_config_drift AND cmd_update's
+# --refresh-config pass, so the two never carry divergent notions of "what is
+# a config key" (task requirement: "reuse the existing key-set extraction...
+# do NOT write a second, divergent extractor"). Prints one key name per line,
+# sorted+uniqued, for every line matching ^CLAGENTIC_[A-Za-z0-9_]*= optionally
+# prefixed with a single '# ' comment marker (config.example's own convention
+# for an inert/commented-out key — see the file's "Opt-in default: off"
+# sections). Matches on VARIABLE NAME ONLY (up to and including the first
+# '='); values are never read or emitted, so a caller can never leak a
+# user-configured value through this helper by construction.
+_config_key_set() {
+  _cks_key_sed='s/^#[[:space:]]*\(CLAGENTIC_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(CLAGENTIC_[A-Za-z0-9_]*\)=.*/\1/p'
+  sed -n "$_cks_key_sed" "$1" 2>/dev/null | sort -u
+}
+
+# _config_missing_keys EXAMPLE_KEYS INSTALLED_KEYS
+# lr-25e73e: given the two key-set listings (newline-separated, as produced by
+# _config_key_set), prints the EXAMPLE_KEYS lines absent from INSTALLED_KEYS,
+# excluding CLAGENTIC_CONFIG_SCHEMA_VERSION (auto-managed bookkeeping — see
+# the drift check below for why it is excluded). Shared by the drift check
+# and the --refresh-config append pass so "what counts as missing" cannot
+# drift between the two call sites either.
+_config_missing_keys() {
+  _cmk_example_keys="$1"
+  _cmk_installed_keys="$2"
+  printf '%s\n' "$_cmk_example_keys" | while IFS= read -r _cmk_k; do
+    [ -z "$_cmk_k" ] && continue
+    [ "$_cmk_k" = "CLAGENTIC_CONFIG_SCHEMA_VERSION" ] && continue
+    if ! printf '%s\n' "$_cmk_installed_keys" | grep -qxF "$_cmk_k"; then
+      printf '%s\n' "$_cmk_k"
+    fi
+  done
+}
+
 # _doctor_check_config_drift OK_FN
 # lr-e33f73: `clagentic-lite update` never refreshes an existing
 # ~/.config/clagentic/config (cmd_init short-circuits when the file already
@@ -1087,12 +1165,10 @@ _doctor_check_orphaned_router_plugin() {
 # taken as a parameter, matching _doctor_check_render_stamp_staleness's
 # WARN-only convention above.
 #
-# Key extraction: a line that matches ^CLAGENTIC_[A-Za-z0-9_]*= optionally
-# prefixed with a single '# ' comment marker (config.example's own
-# convention for an inert/commented-out key — see the file's "Opt-in
-# default: off" sections). Matches on VARIABLE NAME ONLY (up to and
-# including the first '='); values are never read or compared, so a
-# user-customized value can never be reported as "drift" by this check.
+# lr-25e73e: key extraction and the missing-set computation both moved to
+# shared helpers (_config_key_set, _config_missing_keys, above) so cmd_update's
+# --refresh-config append pass consumes the identical logic rather than a
+# second, divergent extractor.
 _doctor_check_config_drift() {
   _dccd_ok_fn="$1"
   _dccd_example="$SHARE_DIR/config.example"
@@ -1111,9 +1187,8 @@ _doctor_check_config_drift() {
   # only active keys from one side and both from the other would falsely
   # report every commented-out key as "missing" on a byte-identical install
   # (caught by test_doctor_config_drift.py's no-drift-on-verbatim-copy case).
-  _dccd_key_sed='s/^#[[:space:]]*\(CLAGENTIC_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(CLAGENTIC_[A-Za-z0-9_]*\)=.*/\1/p'
-  _dccd_example_keys=$(sed -n "$_dccd_key_sed" "$_dccd_example" | sort -u)
-  _dccd_installed_keys=$(sed -n "$_dccd_key_sed" "$GLOBAL_CONFIG" | sort -u)
+  _dccd_example_keys=$(_config_key_set "$_dccd_example")
+  _dccd_installed_keys=$(_config_key_set "$GLOBAL_CONFIG")
 
   # CLAGENTIC_CONFIG_SCHEMA_VERSION (PEACHES PR #193 review, finding 3):
   # auto-managed bookkeeping, not an operator-facing feature key -- config.
@@ -1123,13 +1198,8 @@ _doctor_check_config_drift() {
   # output entirely rather than special-cased with different wording: an
   # install missing this key (e.g. one written before lr-e33f73 introduced
   # it) has nothing useful for the operator to hand-add here regardless.
-  _dccd_missing=$(printf '%s\n' "$_dccd_example_keys" | while IFS= read -r _dccd_k; do
-    [ -z "$_dccd_k" ] && continue
-    [ "$_dccd_k" = "CLAGENTIC_CONFIG_SCHEMA_VERSION" ] && continue
-    if ! printf '%s\n' "$_dccd_installed_keys" | grep -qxF "$_dccd_k"; then
-      printf '%s\n' "$_dccd_k"
-    fi
-  done)
+  # (Exclusion now lives in the shared _config_missing_keys helper.)
+  _dccd_missing=$(_config_missing_keys "$_dccd_example_keys" "$_dccd_installed_keys")
 
   # wc -l, not grep -c: grep -c on zero matches exits 1, which would trip an
   # `|| fallback` into printing a second "0" alongside its own zero count.
@@ -1139,13 +1209,22 @@ _doctor_check_config_drift() {
   if [ "$_dccd_missing_count" -eq 0 ]; then
     "$_dccd_ok_fn" "global config has all $_dccd_example_count key(s) from share/config.example (no drift)"
   else
-    printf '  WARN global config at %s is missing %s key(s) present in share/config.example (shipped after this config was written — see AGENTS.md "Template version-bump protocol" for why `update` does not add them automatically):\n' \
+    # lr-25e73e item 5: name the actual remedy command instead of citing
+    # AGENTS.md's "Template version-bump protocol" — that section governs the
+    # four version-constant-stamped template artifacts (CLAUDE.md, builder-
+    # contract.md, settings.json, hook shims); share/config.example is not in
+    # that table and the protocol does not actually justify this behavior
+    # (see lr-25e73e task thread comment #2). The append pass itself remains
+    # opt-in (operator decision, lr-25e73e) — `update` reports loudly here,
+    # `update --refresh-config` is the one-command remedy.
+    printf '  WARN global config at %s is missing %s key(s) present in share/config.example (shipped after this config was written):\n' \
       "$GLOBAL_CONFIG" "$_dccd_missing_count"
     printf '%s\n' "$_dccd_missing" | while IFS= read -r _dccd_m; do
       [ -z "$_dccd_m" ] && continue
       printf '       %s\n' "$_dccd_m"
     done
-    printf '       Review these in %s and add any you want to %s.\n' "$_dccd_example" "$GLOBAL_CONFIG"
+    printf '       Run `clagentic-lite update --refresh-config` to append them as commented-out lines (never activated), or review them in %s and add any you want to %s by hand.\n' \
+      "$_dccd_example" "$GLOBAL_CONFIG"
   fi
 }
 
@@ -1597,7 +1676,10 @@ cmd_init() {
 
   # 3. Two-question front door. Skip entirely when global config already
   #    exists and --reconfigure was not passed — otherwise re-runs of init
-  #    pointlessly ask "Accept all defaults? [Y/n]" every time.
+  #    pointlessly ask "Accept all defaults? [Y/n]" every time. When
+  #    --reconfigure IS passed against an existing config, _write_global_config
+  #    MERGES (preserves every user-set value, adds new keys) rather than
+  #    clobbering (lr-25e73e item 4) — see its own header comment.
   if [ -f "$GLOBAL_CONFIG" ] && [ "$RECONFIGURE" -eq 0 ]; then
     say "global config already exists at $GLOBAL_CONFIG (use --reconfigure to re-prompt)"
   else
@@ -1626,6 +1708,39 @@ cmd_init() {
 }
 
 _write_global_config() {
+  # lr-25e73e item 4: `init --reconfigure` on an EXISTING config must MERGE,
+  # not clobber — preserve every user-set value, add new keys. Capture the
+  # existing file's active (non-comment) KEY=VALUE pairs, byte-for-byte,
+  # into a preservation side-file BEFORE anything below touches
+  # $GLOBAL_CONFIG. A fresh (no prior config) run captures nothing, so this
+  # is a strict no-op for first-time `init` — identical output to before.
+  #
+  # SECRETS: this side-file holds live credential VALUES (same class of data
+  # as $GLOBAL_CONFIG itself) — created 600 from the start via
+  # _secret_tmp_create (umask-independent, before any content is written),
+  # never printed, never logged, removed at the end of this function on
+  # every exit path.
+  _wgc_preserve=""
+  if [ -f "$GLOBAL_CONFIG" ]; then
+    _wgc_preserve="$GLOBAL_CONFIG.preserve.$$"
+    _secret_tmp_create "$_wgc_preserve" || { warn "could not chmod 600 preservation temp file — aborting to avoid a momentarily-exposed secrets file"; return 1; }
+    # KEY=VALUE lines only (active, not commented-out) — a commented-out line
+    # in the OLD config carries no user decision to preserve; the fresh
+    # template's own commented form (or the append pass, separately) is
+    # authoritative for those. Matches up to the FIRST '=' only, so a value
+    # containing '=' round-trips: everything after the first '=' is the value,
+    # untouched. CRLF: normalize to LF on read so a Windows-edited config's
+    # values still resolve to plain-content matches below; the file is
+    # rewritten LF-only regardless (matches config.example's own convention).
+    # Appended (>>) directly onto the already-600 file created above — never
+    # a bare `awk ... > newfile` (see _secret_tmp_create's own comment for
+    # why that pattern is unsafe on a secrets-bearing path).
+    awk -v OFS= '
+      { sub(/\r$/, "") }
+      /^CLAGENTIC_[A-Za-z0-9_]*=/ { print }
+    ' "$GLOBAL_CONFIG" >> "$_wgc_preserve"
+  fi
+
   # Q1: accept all defaults?
   ACCEPT_DEFAULTS="y"
   if [ -t 0 ]; then
@@ -1646,43 +1761,96 @@ _write_global_config() {
 
   # Start with the example as the base.
   _CONFIG_SRC="$SHARE_DIR/config.example"
-  [ -f "$_CONFIG_SRC" ] || die "share/config.example missing — is \$CLAGENTIC_LITE_HOME correct?"
+  if [ ! -f "$_CONFIG_SRC" ]; then
+    rm -f "$_wgc_preserve"
+    die "share/config.example missing — is \$CLAGENTIC_LITE_HOME correct?"
+  fi
 
   # Prepare destination directory.
   _config_dir="$(dirname "$GLOBAL_CONFIG")"
   if [ ! -d "$_config_dir" ]; then
     mkdir -p "$_config_dir" && chmod 700 "$_config_dir" \
-      || { warn "cannot create $_config_dir"; return 1; }
+      || { warn "cannot create $_config_dir"; rm -f "$_wgc_preserve"; return 1; }
   fi
 
-  cp "$_CONFIG_SRC" "$GLOBAL_CONFIG"
-  chmod 600 "$GLOBAL_CONFIG"
+  # Write the fresh template to a 600 temp file first (never briefly
+  # world-readable), then move it into place — matches the append-pass
+  # discipline in _append_missing_config_keys. Created via _secret_tmp_create
+  # (not a bare `cp`, which would create the destination at umask-derived
+  # permissions for the instant between creation and the following chmod)
+  # then populated with `cat >>` onto the already-600 file, for the same
+  # reason every other temp file in this function now does the same —
+  # config.example itself carries no secrets, but this keeps exactly one
+  # sanctioned creation pattern for every temp file in this function rather
+  # than two, so the safe pattern cannot silently regress at this one site.
+  _wgc_new="$GLOBAL_CONFIG.new.$$"
+  _secret_tmp_create "$_wgc_new" || { warn "could not chmod 600 template temp file"; rm -f "$_wgc_preserve"; return 1; }
+  cat "$_CONFIG_SRC" >> "$_wgc_new"
 
   # Stamp CLAGENTIC_LITE_HOME and CLAGENTIC_CONFIG_SCHEMA_VERSION (lr-e33f73).
+  # CLAGENTIC_CONFIG_SCHEMA_VERSION is auto-managed bookkeeping (config.example
+  # itself: "Do not hand-edit") — always re-stamped to the CURRENT constant on
+  # --reconfigure, never preserved from a stale prior value; CLAGENTIC_LITE_HOME
+  # is likewise always re-derived, never a hand-edited value worth preserving.
+  # Every awk pass below writes to a FRESH _secret_tmp_create'd file, then
+  # mv's it back onto $_wgc_new — never a bare `awk ... > $_wgc_new.tmp`
+  # (see _secret_tmp_create's own comment).
+  _wgc_new_tmp="$GLOBAL_CONFIG.new.stamp.$$"
+  _secret_tmp_create "$_wgc_new_tmp" || { warn "could not chmod 600 stamping temp file"; rm -f "$_wgc_preserve" "$_wgc_new"; return 1; }
   awk -v home="$CLAGENTIC_LITE_HOME" -v schema="$CONFIG_SCHEMA_VERSION" '
     /^CLAGENTIC_LITE_HOME=/ { print "CLAGENTIC_LITE_HOME=" home; next }
     /^CLAGENTIC_CONFIG_SCHEMA_VERSION=/ { print "CLAGENTIC_CONFIG_SCHEMA_VERSION=" schema; next }
     { print }
-  ' "$GLOBAL_CONFIG" > "$GLOBAL_CONFIG.tmp"
-  mv "$GLOBAL_CONFIG.tmp" "$GLOBAL_CONFIG"
-  chmod 600 "$GLOBAL_CONFIG"
+  ' "$_wgc_new" >> "$_wgc_new_tmp"
+  mv "$_wgc_new_tmp" "$_wgc_new"
 
   # Apply vendor mode: if mode=1 (Claude only), set all roles to claude.
   if [ "$VENDOR_MODE" = "1" ]; then
+    _wgc_new_tmp="$GLOBAL_CONFIG.new.vendor.$$"
+    _secret_tmp_create "$_wgc_new_tmp" || { warn "could not chmod 600 vendor-mode temp file"; rm -f "$_wgc_preserve" "$_wgc_new"; return 1; }
     awk '
       /^CLAGENTIC_(REVIEWER|AUDITOR)_CMD=/ { sub(/=.*/, "=claude"); }
       /^CLAGENTIC_(REVIEWER|AUDITOR)_CHAIN=/ { sub(/=.*/, "=claude:default"); }
       { print }
-    ' "$GLOBAL_CONFIG" > "$GLOBAL_CONFIG.tmp"
-    mv "$GLOBAL_CONFIG.tmp" "$GLOBAL_CONFIG"
-    chmod 600 "$GLOBAL_CONFIG"
+    ' "$_wgc_new" >> "$_wgc_new_tmp"
+    mv "$_wgc_new_tmp" "$_wgc_new"
     warn "Builder and Reviewer both set to 'claude'. Cross-vendor review surfaces blind spots that same-vendor review shares."
   fi
 
-  # Granular flow: max 6 prompts when user declined all-defaults.
+  # Granular flow: max 6 prompts when user declined all-defaults. Operates on
+  # $GLOBAL_CONFIG directly (pre-existing behavior/contract) — repoint it at
+  # the new-file-in-progress for the duration of the call, then move the
+  # result back, so a merge in progress isn't clobbered by a second direct
+  # $GLOBAL_CONFIG write while _wgc_new is still being assembled.
+  # GRANULAR_PROMPT_ANSWERS_FILE is set BY _granular_config_prompts (this-run
+  # interactive answers, see its own comment) and consumed by
+  # _merge_preserved_config_values below for precedence.
+  GRANULAR_PROMPT_ANSWERS_FILE=""
   if [ "$ACCEPT_DEFAULTS" = "n" ] && [ -t 0 ]; then
+    _wgc_real_global_config="$GLOBAL_CONFIG"
+    GLOBAL_CONFIG="$_wgc_new"
     _granular_config_prompts
+    GLOBAL_CONFIG="$_wgc_real_global_config"
   fi
+
+  # lr-25e73e item 4 + fold-in (PEACHES amos.code-craft.1, BOBBIE
+  # bobbie.secret.7): merge preserved OLD-config values and this-run
+  # interactive answers over the freshly-assembled template. Factored into
+  # _merge_preserved_config_values (below) — callable directly, without a
+  # TTY, so its precedence logic is unit-testable on its own rather than
+  # only through the interactive prompt path (PEACHES's preferred fix over
+  # PTY plumbing). Skipped entirely on a fresh `init` (no prior config, no
+  # interactive answers) — a strict no-op either way, but this avoids extra
+  # temp-file churn on the common first-install path.
+  if [ -n "$_wgc_preserve" ] || [ -n "$GRANULAR_PROMPT_ANSWERS_FILE" ]; then
+    _wgc_new=$(_merge_preserved_config_values "$_wgc_new" "$_wgc_preserve" "$GRANULAR_PROMPT_ANSWERS_FILE") \
+      || { warn "config merge failed"; rm -f "$_wgc_preserve" "$_wgc_new"; [ -n "$GRANULAR_PROMPT_ANSWERS_FILE" ] && rm -f "$GRANULAR_PROMPT_ANSWERS_FILE"; return 1; }
+  fi
+
+  mv "$_wgc_new" "$GLOBAL_CONFIG"
+  chmod 600 "$GLOBAL_CONFIG"
+  rm -f "$_wgc_preserve"
+  [ -n "$GRANULAR_PROMPT_ANSWERS_FILE" ] && rm -f "$GRANULAR_PROMPT_ANSWERS_FILE"
 
   # Stamp bleed-patterns template if not already present. This is a side-by-side
   # companion to config — it lives in the same directory but is not gitignored
@@ -1697,6 +1865,87 @@ _write_global_config() {
   fi
 
   say "wrote global config: $GLOBAL_CONFIG (chmod 600)"
+}
+
+# _merge_preserved_config_values TARGET_FILE PRESERVE_FILE [ANSWERS_FILE]
+# lr-25e73e item 4 + fold-in (PEACHES amos.code-craft.1, BOBBIE
+# bobbie.secret.7). Merges preserved OLD-config values and this-run
+# interactive answers over TARGET_FILE (the freshly-assembled template,
+# already stamped/vendor-adjusted). Echoes the path to a new 600 temp file
+# holding the merge result on success (caller mv's it into place); returns
+# nonzero on failure with no path echoed.
+#
+# PRECEDENCE, explicit and load-bearing (PEACHES finding 2 — the prompt
+# answers used to be silently discarded by the preservation merge that ran
+# after them):
+#     interactive answer (THIS run, ANSWERS_FILE) > preserved existing
+#     value (PRESERVE_FILE, from the OLD config) > template default
+#     (already baked into TARGET_FILE).
+# Mechanically: PRESERVE_FILE is applied FIRST, then ANSWERS_FILE is applied
+# SECOND, on top — so any key present in both wins on the ANSWERS_FILE side.
+# If this order is ever changed, update this comment at the same time; nothing
+# else in this file re-derives or re-states the precedence rule.
+#
+# Factored out of _write_global_config specifically so this logic is
+# unit-testable by calling it directly with a synthetic ANSWERS_FILE — no
+# TTY, no PTY plumbing, no `read` involved — while still being the exact
+# code path the interactive prompt flow exercises for real.
+#
+# SECRETS: every temp file this function creates is 600-from-creation via
+# _secret_tmp_create; content only ever reaches an already-600 file via `>>`
+# append, mirroring the discipline documented on _secret_tmp_create.
+# Skips CLAGENTIC_LITE_HOME/CLAGENTIC_CONFIG_SCHEMA_VERSION even if present
+# in either input file, so the caller's own fresh stamp is never overwritten.
+_merge_preserved_config_values() {
+  _mpcv_target="$1"
+  _mpcv_preserve="$2"
+  _mpcv_answers="${3:-}"
+
+  _mpcv_body="$_mpcv_target.merge-body.$$"
+  _secret_tmp_create "$_mpcv_body" || return 1
+  cat "$_mpcv_target" >> "$_mpcv_body"
+
+  # Apply PRESERVE_FILE first, then ANSWERS_FILE — see precedence comment
+  # above. Same substitution shape for both: one KEY=VALUE line at a time,
+  # awk substitutes only the matching `KEY=` or `# KEY=` line (activating
+  # it), leaving every other line — formatting, ordering, unrelated
+  # comments — byte-for-byte untouched. A key with no corresponding line
+  # anywhere in the target is appended verbatim at end of file rather than
+  # silently dropped (e.g. a preserved key retired from the template since
+  # this install's last init).
+  for _mpcv_src in "$_mpcv_preserve" "$_mpcv_answers"; do
+    [ -n "$_mpcv_src" ] || continue
+    [ -s "$_mpcv_src" ] || continue
+    while IFS= read -r _mpcv_line; do
+      [ -z "$_mpcv_line" ] && continue
+      _mpcv_key="${_mpcv_line%%=*}"
+      case "$_mpcv_key" in
+        CLAGENTIC_LITE_HOME|CLAGENTIC_CONFIG_SCHEMA_VERSION) continue ;;
+        ''|*[!A-Za-z0-9_]*) continue ;;  # malformed key name -- skip, do not error
+      esac
+
+      _mpcv_step="$_mpcv_target.merge-step.$$"
+      _mpcv_notfound="$_mpcv_target.merge-notfound.$$"
+      _secret_tmp_create "$_mpcv_step" || { rm -f "$_mpcv_body"; return 1; }
+      _secret_tmp_create "$_mpcv_notfound" || { rm -f "$_mpcv_body" "$_mpcv_step"; return 1; }
+
+      awk -v key="$_mpcv_key" -v line="$_mpcv_line" '
+        BEGIN { active_pat = "^" key "="; comment_pat = "^#[ \t]*" key "=" }
+        $0 ~ active_pat { print line; found=1; next }
+        $0 ~ comment_pat { print line; found=1; next }
+        { print }
+        END { if (!found) print line >> "/dev/stderr" }
+      ' "$_mpcv_body" 1>>"$_mpcv_step" 2>>"$_mpcv_notfound"
+      mv "$_mpcv_step" "$_mpcv_body"
+
+      if [ -s "$_mpcv_notfound" ]; then
+        printf '%s\n' "$_mpcv_line" >> "$_mpcv_body"
+      fi
+      rm -f "$_mpcv_notfound"
+    done < "$_mpcv_src"
+  done
+
+  printf '%s\n' "$_mpcv_body"
 }
 
 _granular_config_prompts() {
@@ -1724,6 +1973,31 @@ _granular_config_prompts() {
     _rc="$_bc"
   fi
 
+  # lr-25e73e fold-in (PEACHES amos.code-craft.1): record these answers as
+  # THIS-RUN interactive input, keyed by name, so _write_global_config's
+  # preservation merge (which runs AFTER this function returns) can give
+  # them precedence over a same-named preserved value from the OLD config.
+  # Precedence, explicit: interactive answer (this run) > preserved existing
+  # value > template default. Without this, an operator who changes e.g.
+  # default branch at the prompt had that answer silently discarded by the
+  # merge step -- the exact defect class item 4 exists to fix, inverted.
+  # One "KEY=VALUE" pair per line, matching PRESERVE_FILE's own shape so
+  # _merge_preserved_config_values can consume both identically. Values here
+  # are never secrets (no prompt above ever asks for CLAGENTIC_ROUTER_TOKEN
+  # or similar), but the file is still created via _secret_tmp_create for
+  # uniform discipline rather than carving out an exception.
+  GRANULAR_PROMPT_ANSWERS_FILE="$GLOBAL_CONFIG.granular-answers.$$"
+  _secret_tmp_create "$GRANULAR_PROMPT_ANSWERS_FILE" || { warn "could not chmod 600 granular-answers temp file"; return 1; }
+  {
+    printf 'CLAGENTIC_DEFAULT_BRANCH=%s\n' "$_db"
+    printf 'CLAGENTIC_REPO_HOST=%s\n' "$_rh"
+    printf 'CLAGENTIC_BLOCK_SEVERITY=%s\n' "$_bs"
+    printf 'CLAGENTIC_BUILDER_CMD=%s\n' "$_bc"
+    printf 'CLAGENTIC_REVIEWER_CMD=%s\n' "$_rc"
+  } >> "$GRANULAR_PROMPT_ANSWERS_FILE"
+
+  _gcp_tmp="$GLOBAL_CONFIG.tmp.$$"
+  _secret_tmp_create "$_gcp_tmp" || { warn "could not chmod 600 granular-prompts temp file"; return 1; }
   awk -v vm="$_vm" -v db="$_db" -v rh="$_rh" -v bs="$_bs" -v bc="$_bc" -v rc="$_rc" '
     /^CLAGENTIC_DEFAULT_BRANCH=/    { print "CLAGENTIC_DEFAULT_BRANCH=" db; next }
     /^CLAGENTIC_REPO_HOST=/         { print "CLAGENTIC_REPO_HOST=" rh; next }
@@ -1732,11 +2006,11 @@ _granular_config_prompts() {
     /^CLAGENTIC_REVIEWER_CMD=/      { print "CLAGENTIC_REVIEWER_CMD=" rc; next }
     /^CLAGENTIC_(AUDITOR|GATE)_CMD=/ { print $0; next }
     { print }
-  ' "$GLOBAL_CONFIG" > "$GLOBAL_CONFIG.tmp"
-  mv "$GLOBAL_CONFIG.tmp" "$GLOBAL_CONFIG"
+  ' "$GLOBAL_CONFIG" >> "$_gcp_tmp"
+  mv "$_gcp_tmp" "$GLOBAL_CONFIG"
   chmod 600 "$GLOBAL_CONFIG"
 
-  if [ "$vm" = "1" ] || [ "$_bc" = "$_rc" ]; then
+  if [ "$_vm" = "1" ] || [ "$_bc" = "$_rc" ]; then
     warn "Builder and Reviewer both set to '$_bc'. Cross-vendor review surfaces blind spots that same-vendor review shares."
   fi
 }
@@ -3293,8 +3567,12 @@ _restamp_repo_artifacts() {
 
 cmd_update() {
   RESTAMP=0
+  REFRESH_CONFIG=0
   for _arg in "$@"; do
-    case "$_arg" in --restamp) RESTAMP=1 ;; esac
+    case "$_arg" in
+      --restamp) RESTAMP=1 ;;
+      --refresh-config) REFRESH_CONFIG=1 ;;
+    esac
   done
 
   # Migration: ~/.clagentic-lite -> ~/.clagentic/lite
@@ -3491,6 +3769,17 @@ cmd_update() {
     say "Claude Code hook scripts up to date ($CLAUDE_HOOKS_VERSION)"
   fi
 
+  # Global config drift report / refresh (lr-25e73e, amending lr-e33f73 items
+  # 3-4). OPERATOR DECISION (task thread comment #2): NOT silent-automatic on
+  # every update, NOT warn-only-and-hand-edit either. `update` always LOUDLY
+  # reports missing keys and names the one-command remedy; the append itself
+  # only runs behind the explicit --refresh-config flag. Appended keys are
+  # ALWAYS commented out — the flag controls whether keys are appended, never
+  # whether they arrive active. Runs here, BEFORE the no-registry early
+  # return below, so a machine with zero enrolled repos still gets this
+  # (config refresh has nothing to do with repo enrollment).
+  _update_report_or_refresh_config
+
   # Re-stamp shims in registered repos if the template version changed.
   if [ ! -f "$REGISTRY" ]; then
     say "no enrolled repos to re-stamp"
@@ -3648,6 +3937,139 @@ cmd_update() {
   fi
 
   say "update complete (re-stamped $_restamped artifact(s))"
+}
+
+# _update_report_or_refresh_config
+# lr-25e73e: called from cmd_update BEFORE the no-registry early return
+# (config refresh has nothing to do with repo enrollment) — reuses
+# _config_key_set / _config_missing_keys (shared with
+# _doctor_check_config_drift, above) so this never carries a
+# second, divergent notion of "what is a config key" or "what counts as
+# missing". No-op paths (missing example, missing/absent config) mirror the
+# doctor check's own skip behavior.
+_update_report_or_refresh_config() {
+  _urrc_example="$SHARE_DIR/config.example"
+  [ -f "$_urrc_example" ] || return 0
+  [ -f "$GLOBAL_CONFIG" ] || return 0
+
+  _urrc_example_keys=$(_config_key_set "$_urrc_example")
+  _urrc_installed_keys=$(_config_key_set "$GLOBAL_CONFIG")
+  _urrc_missing=$(_config_missing_keys "$_urrc_example_keys" "$_urrc_installed_keys")
+  _urrc_missing_count=$(printf '%s\n' "$_urrc_missing" | sed '/^$/d' | wc -l | tr -d ' ')
+
+  if [ "$_urrc_missing_count" -eq 0 ]; then
+    say "global config: all keys from share/config.example present (no drift)"
+    return 0
+  fi
+
+  if [ "$REFRESH_CONFIG" -eq 1 ]; then
+    _append_missing_config_keys "$_urrc_missing" "$_urrc_missing_count"
+  else
+    printf '[clagentic-lite] WARN: global config at %s is missing %s key(s) present in share/config.example:\n' \
+      "$GLOBAL_CONFIG" "$_urrc_missing_count" 1>&2
+    printf '%s\n' "$_urrc_missing" | while IFS= read -r _urrc_m; do
+      [ -z "$_urrc_m" ] && continue
+      printf '  %s\n' "$_urrc_m" 1>&2
+    done
+    printf 'Run `clagentic-lite update --refresh-config` to append them as commented-out lines (never activated).\n' 1>&2
+  fi
+}
+
+# _append_missing_config_keys MISSING_KEYS MISSING_COUNT
+# lr-25e73e item 3: appends each key in MISSING_KEYS to $GLOBAL_CONFIG, always
+# COMMENTED OUT (non-negotiable — see the function this is called from). Only
+# ever ADDS lines; never rewrites, reorders, or touches an existing line, so
+# user comments/ordering/formatting survive untouched and a malformed or
+# unparseable existing line is never an error, just inert content the append
+# pass does not look at.
+#
+# SECRETS: reads $GLOBAL_CONFIG only to extract key NAMES (via _config_key_set,
+# which matches up to and including the first '=' and never captures a
+# value) and to append fixed template lines pulled from config.example that
+# are themselves comments (no value substitution) — no configured VALUE from
+# either file is ever read into a shell variable or printed here.
+#
+# chmod 600 discipline: the temp file is truncated-created (`: >`) then
+# chmod 600'd BEFORE any content is written to it, so it is never briefly
+# world-readable regardless of umask; content is only appended to
+# $GLOBAL_CONFIG itself (never rewritten wholesale here), and $GLOBAL_CONFIG
+# is explicitly chmod 600'd again immediately after, matching every other
+# write path in this file.
+_append_missing_config_keys() {
+  _amck_missing="$1"
+  _amck_count="$2"
+  _amck_example="$SHARE_DIR/config.example"
+
+  # Symlink handling: append to the RESOLVED target, not the link itself, so
+  # a config that is a symlink is refreshed the same way $GLOBAL_CONFIG is
+  # always read (every consumer here reads/writes through the $GLOBAL_CONFIG
+  # path, which the shell/kernel resolve transparently) — no special-casing
+  # needed for the append itself, only for the readability/writability probe
+  # below, which must check the resolved target, not just link presence.
+  if [ ! -w "$GLOBAL_CONFIG" ]; then
+    warn "global config at $GLOBAL_CONFIG is not writable — skipping --refresh-config append ($_amck_count key(s) still missing; see above)"
+    return 1
+  fi
+
+  # Build the append block in a 600 temp file first (never world-readable,
+  # even momentarily — via _secret_tmp_create), then append it to the live
+  # config in one write.
+  _amck_tmp="$GLOBAL_CONFIG.refresh.$$"
+  _secret_tmp_create "$_amck_tmp" || { warn "could not chmod 600 temp refresh file — skipping --refresh-config append"; rm -f "$_amck_tmp"; return 1; }
+
+  {
+    printf '\n# ---------- appended by `clagentic-lite update --refresh-config` ----------\n'
+    printf '# Keys shipped after this config was written, in share/config.example but\n'
+    printf '# missing here. COMMENTED OUT — nothing below is active. Uncomment and set\n'
+    printf '# a value to opt in to any of these.\n'
+  } >> "$_amck_tmp"
+
+  printf '%s\n' "$_amck_missing" | while IFS= read -r _amck_key; do
+    [ -z "$_amck_key" ] && continue
+    # Pull the key's own line(s) verbatim from config.example: its immediately
+    # preceding contiguous comment block (documentation) plus the key's own
+    # line (active or already commented), so the appended copy carries the
+    # same explanation a fresh `init` would have given the operator. Grep
+    # -qxF-style exact key match on the assignment/comment-assignment forms
+    # only — no shell eval of file content.
+    awk -v key="$_amck_key" '
+      BEGIN { active_pat = "^" key "="; comment_pat = "^# ?" key "=" }
+      $0 ~ active_pat || $0 ~ comment_pat { print buf $0; buf=""; found=1; next }
+      /^#/ { buf = buf $0 "\n"; next }
+      /^$/ { buf = ""; next }
+      { buf = "" }
+      END { if (!found) print "# " key "=" }
+    ' "$_amck_example" >> "$_amck_tmp"
+    printf '\n' >> "$_amck_tmp"
+  done
+
+  # Ensure every appended assignment line is actually commented out,
+  # regardless of whether it was active or already-commented in
+  # config.example — this is the non-negotiable half of the requirement.
+  # A line already starting with '#' is left as-is; an active
+  # CLAGENTIC_*=... line gets a leading '# ' inserted. Documentation
+  # comment lines (already '#'-prefixed) pass through untouched either way.
+  # _amck_tmp.cmt is _secret_tmp_create'd (600 from creation) before the awk
+  # output ever reaches it. Content here is pulled only from config.example
+  # (the checked-in template — never a live secret value; $_amck_missing
+  # carries KEY NAMES only), so this specific site was lower severity than
+  # the _write_global_config sites BOBBIE/PEACHES found — but it was still
+  # a `command > newfile` on the secrets-adjacent append path PEACHES named
+  # directly (amos.code-craft.12, site 3), so it goes through the same
+  # sanctioned pattern for consistency rather than being the one exception.
+  _amck_cmt="$_amck_tmp.cmt.$$"
+  _secret_tmp_create "$_amck_cmt" || { warn "could not chmod 600 comment-pass temp file — skipping --refresh-config append"; rm -f "$_amck_tmp" "$_amck_cmt"; return 1; }
+  awk '
+    /^CLAGENTIC_[A-Za-z0-9_]*=/ { print "# " $0; next }
+    { print }
+  ' "$_amck_tmp" >> "$_amck_cmt"
+  mv "$_amck_cmt" "$_amck_tmp"
+
+  cat "$_amck_tmp" >> "$GLOBAL_CONFIG"
+  chmod 600 "$GLOBAL_CONFIG"
+  rm -f "$_amck_tmp"
+
+  say "appended $_amck_count missing key(s) to $GLOBAL_CONFIG as commented-out lines (review and uncomment any you want)"
 }
 
 # ---------------------------------------------------------------- show
@@ -3985,13 +4407,13 @@ case "${1:-}" in
     ;;
   "")
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember, show, export, gates\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp] [--refresh-config], recall, remember, show, export, gates\n'
     exit 1
     ;;
   *)
     printf 'clagentic-lite: unknown subcommand: %s\n' "$1" 1>&2
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp], recall, remember, show, export, gates\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp] [--refresh-config], recall, remember, show, export, gates\n'
     exit 1
     ;;
 esac
