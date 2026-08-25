@@ -7,7 +7,7 @@
 # session_id, transcript_path, and stop_hook_active. We read it before
 # detaching so the payload is captured before the parent closes stdin.
 #
-# managed-by: clagentic · clagentic-hooks-version: v2
+# managed-by: clagentic · clagentic-hooks-version: v3
 # Source of truth: share/hook-shims/stop-summarize.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/stop-summarize.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -39,7 +39,7 @@ unset CLAGENTIC_LLM_CLIENT_SOURCE_ONLY CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE
 # found.
 _CLAGENTIC_PLATFORM_SH="$CLAGENTIC_LITE_HOME/scripts/platform.sh"
 if [ ! -f "$_CLAGENTIC_PLATFORM_SH" ]; then
-  printf '[clagentic-lite/stop-summarize] CLAGENTIC_LITE_HOME does not resolve to a real checkout: %s (missing scripts/platform.sh). Run `clagentic-lite doctor`, and check ~/.bashrc and ~/.config/clagentic/config for a stale CLAGENTIC_LITE_HOME.\n' "$CLAGENTIC_LITE_HOME" 1>&2
+  printf '[clagentic-lite/stop-summarize] CLAGENTIC_LITE_HOME does not resolve to a real checkout: %s (missing scripts/platform.sh). Run `clagentic-lite doctor`, and check ~/.bashrc and ~/.config/clagentic/lite/config for a stale CLAGENTIC_LITE_HOME.\n' "$CLAGENTIC_LITE_HOME" 1>&2
   exit 0
 fi
 # shellcheck disable=SC1090

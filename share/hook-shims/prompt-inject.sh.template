@@ -6,7 +6,7 @@
 # asking the user to recall them manually.
 # Non-blocking — any failure exits 0 silently.
 #
-# managed-by: clagentic · clagentic-hooks-version: v2
+# managed-by: clagentic · clagentic-hooks-version: v3
 # Source of truth: share/hook-shims/prompt-inject.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/prompt-inject.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -40,7 +40,7 @@ if [ -f "$_CLAGENTIC_PLATFORM_SH" ]; then
   # shellcheck disable=SC1090
   . "$_CLAGENTIC_PLATFORM_SH" 2>/dev/null || true
 else
-  printf '[clagentic-lite/prompt-inject] CLAGENTIC_LITE_HOME does not resolve to a real checkout: %s (missing scripts/platform.sh). Run `clagentic-lite doctor`, and check ~/.bashrc and ~/.config/clagentic/config for a stale CLAGENTIC_LITE_HOME.\n' "$CLAGENTIC_LITE_HOME" 1>&2
+  printf '[clagentic-lite/prompt-inject] CLAGENTIC_LITE_HOME does not resolve to a real checkout: %s (missing scripts/platform.sh). Run `clagentic-lite doctor`, and check ~/.bashrc and ~/.config/clagentic/lite/config for a stale CLAGENTIC_LITE_HOME.\n' "$CLAGENTIC_LITE_HOME" 1>&2
 fi
 
 # Read hook payload from stdin (Claude Code passes JSON).

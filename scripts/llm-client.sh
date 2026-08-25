@@ -1063,7 +1063,7 @@ role_env() {
 # model flag (it uses its own default).
 #
 # Resolution order for the codex CLI:
-#   1. CLAGENTIC_MODEL_CODEX_<TIER> env var (set in ~/.config/clagentic/config)
+#   1. CLAGENTIC_MODEL_CODEX_<TIER> env var (set in ~/.config/clagentic/lite/config)
 #   2. ~/.codex/models.json tiers.<tier>.model  (runtime tier map, never stale)
 #   3. Empty — codex uses its own default
 #

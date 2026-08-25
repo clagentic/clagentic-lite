@@ -1,5 +1,5 @@
 # clagentic-lite — global config template.
-# Written to ~/.config/clagentic/config by `clagentic-lite init`.
+# Written to ~/.config/clagentic/lite/config by `clagentic-lite init`.
 # Per-repo .clagentic/config is OPTIONAL and SPARSE — only override keys.
 # Load order at gate-run time: global config → per-repo .clagentic/config → env vars.
 #
