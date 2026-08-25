@@ -1574,19 +1574,131 @@ NON_CLAUDE_ENV_STRIP="env -u AWS_BEARER_TOKEN_BEDROCK -u ANTHROPIC_BEDROCK_BASE_
 # CLAUDE_CODE_USE_BEDROCK=1 on the spawned `claude` process regardless of
 # which Bedrock credential source backs it.
 #
+# lr-6276ea EXTENDS THIS TO THE OTHER TWO DECLARED VALUES (enterprise,
+# anthropic-oauth): CLAGENTIC_AUTH_MODE is a closed four-value enum and this
+# block originally handled only half of it -- see the `enterprise|
+# anthropic-oauth` arm below for why the other two values were silently a
+# no-op and what closes the gap. Same mirror relationship to
+# NON_CLAUDE_ENV_STRIP as the Bedrock arm, opposite direction: instead of
+# ensuring a var is present, it blanks four vars a settings.json passthrough
+# stamp may have injected, so this gate-path `claude --print` spawn falls
+# back to Claude Code's own native auth resolution rather than whatever the
+# most recently stamped settings.json env block names.
+#
 # ORDERING: same constraint NON_CLAUDE_ENV_STRIP documents above --
 # DS_TIMEOUT_CMD may resolve to ds_timeout_missing, a SHELL FUNCTION `env`
 # cannot exec. CLAUDE_ROUTER_ENV_ENSURE is therefore placed AFTER
 # $DS_TIMEOUT_CMD "$CALL_TIMEOUT" at both invoke_claude call sites, wrapping
 # only the `claude` invocation itself, exactly like NON_CLAUDE_ENV_STRIP.
+# This constraint applies identically to the enterprise|anthropic-oauth arm
+# added below -- it is the same CLAUDE_ROUTER_ENV_ENSURE variable, consumed
+# at the same two call sites, unconditionally after $DS_TIMEOUT_CMD.
 #
 # Empty by default (UNDECLARED CLAGENTIC_AUTH_MODE -> no env prefix ->
-# spawned command byte-identical to today's, AC1). Non-empty only when the
-# host has declared a bedrock-* auth mode.
+# spawned command byte-identical to today's, AC1). Non-empty for every
+# declared CLAGENTIC_AUTH_MODE value; the shape of the env prefix differs
+# per arm (ensure one var vs. blank four), never for UNDECLARED or an
+# unrecognized value, which both fall through to the empty default above.
 CLAUDE_ROUTER_ENV_ENSURE=""
 case "${CLAGENTIC_AUTH_MODE:-}" in
   bedrock-sso|bedrock-api-key)
     CLAUDE_ROUTER_ENV_ENSURE="env CLAUDE_CODE_USE_BEDROCK=1"
+    ;;
+  enterprise|anthropic-oauth)
+    # lr-6276ea, extending lr-0ac353/lr-6d4a1f's mechanism to the other two
+    # declared CLAGENTIC_AUTH_MODE values -- same block, same file, same
+    # `case`, only the two Bedrock arms existed until now.
+    #
+    # ROOT CAUSE THIS CLOSES: enterprise/anthropic-oauth are both
+    # "direct-API" modes with NO env-ensure arm at all, so a settings.json
+    # env block stamped by CLAGENTIC_ROUTER_URL (docs/ROUTER.md SS1) --
+    # ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN, or the Bedrock pair if
+    # CLAGENTIC_ROUTER_BEDROCK_MODE was also set -- is inherited verbatim by
+    # this gate-path `claude --print` subprocess with nothing to correct it.
+    # The spawned process sends the operator's real Anthropic/Bedrock
+    # credential to whatever the settings.json env block names (the local
+    # router, if passthrough/routed mode is configured), which is the wrong
+    # endpoint for a direct-CLI call and 401s -- silently falling through to
+    # the next chain entry with no auth-specific error surfaced.
+    #
+    # FIX: blank all four router-scoped vars for this spawn, restoring
+    # Claude Code's own native OAuth/Enterprise auth resolution instead of
+    # whatever settings.json most recently stamped. Same four vars
+    # NON_CLAUDE_ENV_STRIP already unsets unconditionally for non-Claude
+    # CLIs above -- this is that same corrective, applied here as `env
+    # VAR=` (blank, not unset) because NON_CLAUDE_ENV_STRIP's `env -u`
+    # form is for CLIs that must never see the var at all, whereas here the
+    # var name must still exist in the child's environ (some tooling probes
+    # for presence, not just value) but carry no value Claude Code would act
+    # on.
+    #
+    # anthropic-oauth INCLUDED IN THE SAME ARM AS enterprise (lr-6276ea
+    # design call, stated in the PR body): both are direct-API modes
+    # exposed to the identical settings.json-injection mechanism: nothing
+    # in docs/ROUTER.md SS1 or the settings-stamping code scopes the
+    # passthrough env block to `enterprise` hosts only. Blanking a var
+    # that is unset in a given operator's environment is a no-op --
+    # `env ANTHROPIC_BASE_URL= claude` with ANTHROPIC_BASE_URL already
+    # absent leaves the child's environ with the var present-but-empty
+    # instead of absent, which Claude Code's own SDK/CLI treats the same
+    # as unset (an empty base URL is not a usable override) -- so an
+    # anthropic-oauth host with no router configured pays zero behavior
+    # change from this arm firing. Splitting anthropic-oauth into its own
+    # non-ensuring arm would leave operators in that mode exposed to the
+    # exact same silent-misroute defect for no offsetting benefit.
+    #
+    # PEACHES FOLD-IN (lr-6276ea PR #200 review, finding amos.path-choice.4):
+    # the four router-scoped vars above are not the whole auth-relevant
+    # surface this spawn can inherit. CLAUDE_CODE_USE_BEDROCK is the exact
+    # var lr-0ac353 (PR #184) taught this file to ENSURE for the Bedrock
+    # arm precisely because Claude Code branches its wire protocol on it --
+    # "CLAUDE_CODE_USE_BEDROCK=1 sessions ignore ANTHROPIC_BASE_URL/
+    # ANTHROPIC_AUTH_TOKEN entirely" (docs/ROUTER.md SS "Bedrock-mode
+    # sessions"). Left ungoverned here, an operator declaring
+    # CLAGENTIC_AUTH_MODE=enterprise/anthropic-oauth from an ambient shell
+    # that happens to carry CLAUDE_CODE_USE_BEDROCK=1 (e.g. the operator's
+    # own interactive session is mid-Bedrock-experiment, or a prior export
+    # leaked into this shell) gets a gate-path child that STILL SPEAKS
+    # BEDROCK PROTOCOL regardless of the declared mode -- the exact
+    # ambient-session-dependence lr-0ac353's own close comment named as
+    # the bug ("reading a session-time value is the bug, not the fix"),
+    # now occurring in the opposite direction inside its own successor.
+    # Blanked (not unset) here for the same reason the four router vars
+    # are blanked rather than `env -u`'d: `env CLAUDE_CODE_USE_BEDROCK=`
+    # leaves the name present-but-empty, which Claude Code's own `= "1"`
+    # string-equality check (see bin/clagentic-lite:3286/3366's identical
+    # check) never matches -- functionally OFF, without removing the name
+    # from the child's environ.
+    #
+    # SWEEP FOR THE COMPLETE GOVERNED SET (PEACHES asked this be stated
+    # explicitly, not assumed): repo-wide search for every env var this
+    # codebase treats as Claude-Code auth-mode/endpoint-selecting turned up
+    # exactly six names -- ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN,
+    # ANTHROPIC_BEDROCK_BASE_URL, AWS_BEARER_TOKEN_BEDROCK,
+    # CLAUDE_CODE_USE_BEDROCK, and ANTHROPIC_API_KEY. No Google Vertex var
+    # (CLAUDE_CODE_USE_VERTEX or any Vertex-family name) appears anywhere
+    # in this repo's code, docs, or CLAGENTIC_AUTH_MODE's closed four-value
+    # enum -- Vertex is not a mode this repo supports today, so there is
+    # nothing to govern for it.
+    #
+    # Five of the six are now governed by this arm plus the bedrock arm
+    # above (the four router vars blanked here, CLAUDE_CODE_USE_BEDROCK
+    # blanked here too). ANTHROPIC_API_KEY is the sixth and is DELIBERATELY
+    # LEFT UNGOVERNED here, stated as a negative result rather than an
+    # oversight: unlike the other five, it is not a router-injection
+    # artifact -- it is the operator's own legitimate direct-Anthropic
+    # credential (bin/clagentic-lite:585's own comment: ANTHROPIC_AUTH_TOKEN
+    # is stamped instead of ANTHROPIC_API_KEY specifically so this var stays
+    # free for real API-key auth; scripts/llm-client.sh's --bare doc
+    # comment and share/config.example both document ANTHROPIC_API_KEY as
+    # what --bare mode REQUIRES). Blanking it would break a real
+    # enterprise/anthropic-oauth operator's working API-key credential on
+    # every gate-path call -- the over-correction in the opposite direction
+    # from this finding. doctor's own contradiction check (lr-6d4a1f)
+    # already treats ANTHROPIC_API_KEY as evidence of legitimate
+    # direct-API auth, not evidence of injection, which is the same
+    # classification this fix relies on.
+    CLAUDE_ROUTER_ENV_ENSURE="env ANTHROPIC_BASE_URL= ANTHROPIC_AUTH_TOKEN= ANTHROPIC_BEDROCK_BASE_URL= AWS_BEARER_TOKEN_BEDROCK= CLAUDE_CODE_USE_BEDROCK="
     ;;
 esac
 
