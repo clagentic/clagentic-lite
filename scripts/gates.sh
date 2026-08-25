@@ -1569,6 +1569,21 @@ _ledger_config_snapshot() {
 # match for GATE, mirroring _ledger_latest_passing_head_for_branch's own
 # filter-then-take-last pattern below rather than re-deriving a third scan
 # primitive.
+#
+# NO DEFAULT ON READ (PEACHES, PR #199 review, amos.code-craft.10): a
+# legacy ledger entry written before the `gate` field existed has NO gate
+# key at all. Defaulting a MISSING field to "review" here would make every
+# pre-schema entry a valid passing anchor for a "review" lookup forever,
+# and — worse, the actual failure shape reported — collapses the very
+# discriminator this predicate exists to enforce, since a reader that
+# silently assumes "review" is exactly the same fail-toward-LESS-coverage
+# shape as the defect this task fixes. Back-compat comes from the CALLER
+# always passing an explicit GATE (every call site in this file does), not
+# from the reader guessing one for an entry that never recorded it. An
+# entry whose `gate` is absent/null/an unexpected type simply does not
+# match ANY explicit GATE query — it falls out of consideration here, and
+# the caller (get_review_diff) falls through to full-range review exactly
+# as it already does for "no prior passing verdict."
 _ledger_anchored_pass_at_head() {
   _laph_file="$1"
   _laph_branch="$2"
@@ -1579,7 +1594,7 @@ _ledger_anchored_pass_at_head() {
   _laph_latest=""
   if command -v jq >/dev/null 2>&1; then
     _laph_latest=$(ledger_entries_for_branch "$_laph_file" "$_laph_branch" \
-      | jq -c --arg g "$_laph_gate" 'select((.gate // "review") == $g)' 2>/dev/null | tail -n 1)
+      | jq -c --arg g "$_laph_gate" 'select(.gate == $g)' 2>/dev/null | tail -n 1)
   elif command -v python3 >/dev/null 2>&1; then
     _laph_latest=$(ledger_entries_for_branch "$_laph_file" "$_laph_branch" | python3 -c '
 import json, sys
@@ -1593,7 +1608,7 @@ for line in sys.stdin:
         entry = json.loads(line)
     except Exception:
         continue
-    if entry.get("gate", "review") == gate:
+    if entry.get("gate") == gate:
         best = line
 if best:
     print(best)
@@ -1656,6 +1671,17 @@ except Exception:
 # each gate its own anchor namespace, so no gate's pass can ever anchor a
 # different gate's next delta.
 #
+# NO DEFAULT ON READ (PEACHES, PR #199 review, amos.code-craft.10): same
+# doctrine as _ledger_anchored_pass_at_head above -- a legacy entry with no
+# `gate` field must never satisfy an explicit GATE match by falling back to
+# an assumed "review". That is the exact fail-toward-LESS-coverage shape
+# this task exists to close: on a real installed base with a pre-existing
+# review-ledger.jsonl, defaulting would let a legacy entry anchor
+# cmd_adversarial's delta and narrow its resolved diff. An entry with a
+# missing/null/unexpected-type `gate` simply never matches any GATE query;
+# the caller falls through to full-range review, same as "no prior passing
+# verdict at all."
+#
 # WHY "latest pass", not "latest entry that happens to be a pass": scanning
 # all history (not just the single latest row) matters because the round
 # immediately after a block is very often itself a fix attempt that also
@@ -1676,7 +1702,7 @@ _ledger_latest_passing_head_for_branch() {
 
   if command -v jq >/dev/null 2>&1; then
     ledger_entries_for_branch "$_llphfb_file" "$_llphfb_branch" \
-      | jq -rs --arg g "$_llphfb_gate" '[.[] | select(.verdict == "pass" and (.head_sha // "") != "" and (.gate // "review") == $g)] | last | .head_sha // empty' 2>/dev/null
+      | jq -rs --arg g "$_llphfb_gate" '[.[] | select(.verdict == "pass" and (.head_sha // "") != "" and .gate == $g)] | last | .head_sha // empty' 2>/dev/null
     return 0
   fi
   if command -v python3 >/dev/null 2>&1; then
@@ -1692,7 +1718,7 @@ for line in sys.stdin:
         entry = json.loads(line)
     except Exception:
         continue
-    if entry.get("verdict") == "pass" and entry.get("head_sha") and entry.get("gate", "review") == gate:
+    if entry.get("verdict") == "pass" and entry.get("head_sha") and entry.get("gate") == gate:
         best = entry["head_sha"]
 if best:
     print(best)

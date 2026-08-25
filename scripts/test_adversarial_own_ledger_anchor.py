@@ -458,7 +458,12 @@ class TestAdversarialDispatcherForwardsFullReviewFlag(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp(prefix="clagentic-test-adv-fullreview-")
         self._project = _setup_project(os.path.join(self._tmpdir, "project"))
-        _init_git_repo_no_remote(self._project)
+        # LOCAL FILE-PATH remote (not _init_git_repo_no_remote): the
+        # rewritten test below needs get_review_diff's real
+        # branch-diff-against-default path (origin/main...HEAD), which
+        # requires a provably-fetchable origin -- see
+        # _init_git_repo_with_local_file_remote's own doc comment.
+        _init_git_repo_with_local_file_remote(self._tmpdir, self._project)
         self._fake_tool_home = os.path.join(self._tmpdir, "fake-tool-home")
         _setup_fake_tool_home(self._fake_tool_home)
         self._diffs_dir = os.path.join(self._tmpdir, "diffs")
@@ -468,42 +473,110 @@ class TestAdversarialDispatcherForwardsFullReviewFlag(unittest.TestCase):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def test_full_review_flag_forces_full_range_even_with_a_passing_anchor(self):
-        """Seed an adversarial pass anchored at the current HEAD (so the
-        DEFAULT delta-scoped path would resolve an EMPTY HEAD..HEAD diff --
-        exactly item 1's skip path), then advance HEAD with a new commit and
-        call `gates.sh adversarial --full-review`. Without --full-review
-        taking effect, the delta path would diff prior_head..HEAD (just the
-        new commit). WITH --full-review taking effect, REVIEW_FULL=1 skips
-        the ledger-anchored delta entirely and uses the full branch-diff
-        path instead -- observably different content (includes the ORIGINAL
-        seed file's full diff against empty tree via the branch-diff path,
-        not just the incremental commit). The simplest deterministic
-        observable available without a remote: the flag must be ACCEPTED
-        (no usage error, no silent no-op reflected in exit code) and the
-        LLM client must actually be invoked with non-empty content -- proving
-        the flag reached cmd_adversarial's own parsing rather than being
-        swallowed by the dispatcher's old bare case arm."""
-        _stage_file(self._project, "app.py", "def handle(x):\n    return x + 1\n")
+        """MECHANISM (not merely re-asserted -- see the coordinator's
+        instruction on this exact test): the ONLY way REVIEW_FULL=1 ever
+        reaches get_review_diff's branch-body is through cmd_adversarial's
+        own argv parsing, which reads it from "$@" the dispatcher forwards
+        (gates.sh's `adversarial) shift; cmd_adversarial "$@" ;;` case).
+        get_review_diff's `if [ "${REVIEW_FULL:-0}" != "1" ]` guard (see its
+        own source) is the SOLE branch point this flag controls: true, it
+        enters the ledger-anchored-delta block; false (REVIEW_FULL=1), it
+        skips that whole block and falls straight to the branch-diff-
+        against-default path below. This test must drive THAT branch point
+        specifically -- not merely reach cmd_adversarial with a nonzero
+        exit code, which any invocation does regardless of the flag.
+
+        PRIOR VERSION'S DEFECT (PEACHES, PR #199 review,
+        amos.code-craft.4): staged a file, then invoked `adversarial` twice
+        with the SAME file still staged both times. get_review_diff checks
+        `git diff --cached --name-only` FIRST, unconditionally, before it
+        ever reads REVIEW_FULL (see get_review_diff's own source: the
+        staged-diff branch and its `return 0` precede the
+        `if [ "${REVIEW_FULL:-0}" != "1" ]` block by several lines). A
+        staged diff never falls through to that guard at all -- REVIEW_FULL
+        is unread in that run. So an unfixed dispatcher that silently
+        discards --full-review, and a fixed dispatcher that forwards it,
+        produce BYTE-IDENTICAL captured diffs and BYTE-IDENTICAL exit codes
+        in that setup: both calls take the staged-diff branch every time.
+        The previous assertions (rc==0, "SKIP" absent from stderr) held for
+        that same reason regardless of whether the flag was forwarded --
+        they were never capable of failing on an unfixed dispatcher.
+
+        THIS VERSION drives the actual branch point: a CLEAN INDEX (no
+        staged file at all, ever) with a real ledger anchor already at
+        HEAD1, then a SECOND commit to HEAD2 with the index still clean.
+        With REVIEW_FULL unset (0), the delta path is the ONLY path
+        available (staged-diff is unavailable -- nothing is staged) and it
+        resolves prior_head(HEAD1)..HEAD2. Since app.py's line was edited
+        TWICE (seed "return x" -> round 1 "return x + 1" -> round 2
+        "return x + 2"), the delta diff's REMOVED line is the ROUND-1 TEXT
+        "return x + 1" (the state at HEAD1, the delta's own base).
+        With REVIEW_FULL=1 (only reachable if the dispatcher forwarded
+        --full-review AND cmd_adversarial parsed it), the delta block is
+        skipped entirely and get_review_diff falls to the
+        branch-diff-against-default path, which diffs origin/main...HEAD
+        (origin/main is still pinned at the SEED commit -- never advanced
+        past it) -- so THAT diff's removed line is the ORIGINAL SEED TEXT
+        "return x", not "return x + 1". This asymmetry -- verified directly
+        against this exact fixture below, not assumed -- is the load-
+        bearing, content-level observable: an unfixed dispatcher/
+        cmd_adversarial cannot ever set REVIEW_FULL=1 inside
+        cmd_adversarial's own process (pre-fix, cmd_adversarial has no
+        flag-parsing block at all -- see the fixed cmd_adversarial's own
+        `for _adv_arg in "$@"` loop, which did not exist before this task),
+        so it is STRUCTURALLY confined to the delta path and can only ever
+        produce a diff whose removed line is "return x + 1", never
+        "return x" -- the two are mutually exclusive by construction, not
+        merely different message text.
+
+        VERIFIED DIRECTLY (not asserted from theory): running this exact
+        fixture with `--full-review` OMITTED on round 2 (the delta path)
+        captures `-    return x + 1` / `+    return x + 2`; running it WITH
+        `--full-review` (below) captures `-    return x` / `+    return x
+        + 2` -- confirmed by direct measurement against this branch's own
+        gates.sh before writing this assertion."""
+        _commit_file(self._project, "app.py", "def handle(x):\n    return x + 1\n", "round 1 commit")
         r_adv1 = _run_gates("adversarial", [], self._fake_tool_home, self._project)
         self.assertEqual(r_adv1.returncode, 0, f"stderr={r_adv1.stderr}")
         entries = _read_ledger_entries(self._project, gate="adversarial")
         self.assertEqual(entries[-1]["verdict"], "pass")
 
-        # Nothing new staged/committed: the default (non-full-review) delta
-        # path would resolve prior_head..HEAD == HEAD..HEAD, i.e. empty --
-        # item 1's skip path (proven by TestAdversarialEmptyDiffNeverPasses,
-        # not re-asserted here). --full-review must instead force the full
-        # branch-diff-against-default path, which is non-empty (the whole
-        # feature branch's history against main).
+        # Second commit, clean index (nothing staged) -- get_review_diff's
+        # staged-diff branch is unavailable here, so this call is forced
+        # onto the delta-or-branch-diff decision REVIEW_FULL actually
+        # controls.
+        _commit_file(self._project, "app.py", "def handle(x):\n    return x + 2\n", "round 2 commit")
+
         r_adv2 = _run_gates("adversarial", ["--full-review"], self._fake_tool_home, self._project)
         self.assertEqual(r_adv2.returncode, 0, f"stderr={r_adv2.stderr}")
+
+        adv_call2 = os.path.join(self._diffs_dir, "adversarial-call2.txt")
+        self.assertTrue(
+            os.path.isfile(adv_call2),
+            "the LLM client must have been invoked a second time with a "
+            "non-empty resolved diff",
+        )
+        with open(adv_call2) as f:
+            captured_diff = f.read()
+        self.assertIn(
+            "-    return x\n", captured_diff,
+            f"--full-review must reach get_review_diff's branch-diff-"
+            f"against-default path (origin/main...HEAD, pinned at the seed "
+            f"commit) -- its removed line is the ORIGINAL seed text "
+            f"'return x'. The default ledger-anchored delta path "
+            f"(HEAD1..HEAD2) can ONLY ever remove 'return x + 1' (its own "
+            f"base, round 1's text) -- the two are mutually exclusive by "
+            f"construction. An unfixed dispatcher/cmd_adversarial has no "
+            f"way to set REVIEW_FULL=1 inside cmd_adversarial's own "
+            f"process and is structurally confined to the delta path. "
+            f"captured_diff={captured_diff!r}",
+        )
         self.assertNotIn(
-            "SKIP", r_adv2.stderr,
-            f"--full-review must force the full-range path even when the "
-            f"default delta path would resolve empty -- if the flag were "
-            f"silently discarded (pre-fix dispatcher behavior), this call "
-            f"would take the exact same empty-delta path as a bare "
-            f"`adversarial` call and report SKIP here. stderr={r_adv2.stderr!r}",
+            "-    return x + 1\n", captured_diff,
+            f"the delta path's removed line ('return x + 1') must be "
+            f"ABSENT from the full-range diff -- if present, --full-review "
+            f"did not actually reach the branch-diff-against-default path. "
+            f"captured_diff={captured_diff!r}",
         )
 
     def test_usage_string_advertises_full_review_for_adversarial(self):
@@ -585,6 +658,124 @@ class TestEmptyDiffCheckDoesNotSwallowFreshnessFailureDiagnostic(unittest.TestCa
             f"its own stderr must be surfaced, not silently swallowed by "
             f"the empty-diff check's stderr capture. "
             f"returncode={r.returncode} output={combined!r}",
+        )
+
+
+class TestLegacyLedgerEntryNeverAnchorsAnExplicitGateLookup(unittest.TestCase):
+    """PEACHES, PR #199 review, amos.code-craft.10: a ledger entry written
+    before the `gate` field existed (e.g. by lr-01ae73-era gates.sh, months
+    before this fix) has NO `gate` key at all. `_ledger_latest_passing_head_
+    for_branch` and `_ledger_anchored_pass_at_head`'s READ paths (gates.sh,
+    originally lines 1582/1596/1679/1695 in the fold-in report) defaulted a
+    MISSING gate field to "review" via `(.gate // "review")` -- so a
+    pre-schema entry silently became a valid anchor for a "review" lookup
+    forever, on every machine with a live pre-existing review-ledger.jsonl.
+    That is the exact fail-toward-LESS-coverage shape this task forbids:
+    an entry the CURRENT code never wrote (and whose provenance this fix's
+    own gate-namespacing was specifically designed to make explicit) still
+    got treated as authoritative because the READER assumed a default
+    identity for it, rather than the WRITER ever having stated one.
+
+    MECHANISM this test drives directly (not inferred): hand-writes a
+    review-ledger.jsonl entry with NO `gate` key at HEAD1 (exactly the
+    on-disk shape a real pre-existing installed ledger has -- verified
+    against this fixture's own JSON below, not assumed), commits a second
+    change to HEAD2 with a clean index, then runs `gates.sh review`
+    (nothing staged, forcing get_review_diff onto the ledger-anchored-delta
+    lookup this fix changed). Under the OLD `(.gate // "review") == $g`
+    read, the legacy entry defaults to "review", satisfies cmd_review's own
+    `gate="review"` lookup, and the delta is computed as HEAD1..HEAD2 (a
+    diff containing only the second commit). Under the FIXED strict
+    `.gate == $g` read, the legacy entry's `gate` key is absent entirely
+    (`null` on read), `null == "review"` is false, it can never anchor
+    ANY explicit gate lookup, and get_review_diff falls through to
+    full-range (origin/main...HEAD, both commits) instead -- MORE
+    coverage, never less, which is exactly what this task's own doctrine
+    requires ("fail toward MORE coverage or a hard error -- never a
+    silently narrower diff", get_review_diff's own comment).
+
+    Distinguishing observable: same construction as
+    TestAdversarialDispatcherForwardsFullReviewFlag's own rewritten test
+    above -- app.py's line is edited seed("return x") -> round1("return x
+    + 1") -> round2("return x + 2"). The delta path's removed line is
+    ALWAYS "return x + 1" (its own base); the full-range path's removed
+    line is ALWAYS "return x" (origin/main is pinned at the seed). These
+    are mutually exclusive by construction, not merely different text --
+    asserting on the correct one PROVES which code path actually ran."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp(prefix="clagentic-test-adv-legacy-ledger-")
+        self._project = _setup_project(os.path.join(self._tmpdir, "project"))
+        _init_git_repo_with_local_file_remote(self._tmpdir, self._project)
+        self._fake_tool_home = os.path.join(self._tmpdir, "fake-tool-home")
+        _setup_fake_tool_home(self._fake_tool_home)
+        self._diffs_dir = os.path.join(self._tmpdir, "diffs")
+        _make_stub_llm_client(self._fake_tool_home, self._diffs_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _write_legacy_ledger_entry(self, head_sha):
+        """Hand-write a review-ledger.jsonl entry in the PRE-SCHEMA shape
+        (lr-01ae73-era, before this fix's `gate` field existed): {ts,
+        branch, base_sha, head_sha, verdict, findings, config} -- NO `gate`
+        key at all. This is what a real operator's existing
+        .clagentic/lite/review-ledger.jsonl looks like on any machine that
+        ran `gates review` before this fix shipped."""
+        ledger_path = _ledger_path(self._project)
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        legacy_entry = {
+            "ts": "2026-01-01T00:00:00Z",
+            "branch": "feat/example",
+            "base_sha": "",
+            "head_sha": head_sha,
+            "verdict": "pass",
+            "findings": [],
+            "config": {"block_severity": "high", "cross_round_dedup": True, "recurrence_threshold": 2},
+        }
+        with open(ledger_path, "w") as f:
+            f.write(json.dumps(legacy_entry) + "\n")
+        # Confirm the fixture itself is genuinely gate-less before trusting
+        # the rest of the test on it.
+        with open(ledger_path) as f:
+            on_disk = json.loads(f.readline())
+        assert "gate" not in on_disk, "fixture setup bug: legacy entry must have no gate key"
+
+    def test_legacy_entry_falls_through_to_full_range_not_a_narrow_delta(self):
+        head1 = _commit_file(self._project, "app.py", "def handle(x):\n    return x + 1\n", "round 1 commit")
+        self._write_legacy_ledger_entry(head1)
+
+        # Second commit, clean index -- forces get_review_diff onto the
+        # ledger-anchored-delta-or-branch-diff decision the legacy entry's
+        # `gate` field (or lack of one) actually controls.
+        _commit_file(self._project, "app.py", "def handle(x):\n    return x + 2\n", "round 2 commit")
+
+        r_review = _run_gates("review", [], self._fake_tool_home, self._project)
+        self.assertEqual(r_review.returncode, 0, f"stderr={r_review.stderr}")
+
+        review_call1 = os.path.join(self._diffs_dir, "review-call1.txt")
+        self.assertTrue(os.path.isfile(review_call1), "the LLM client must have been invoked")
+        with open(review_call1) as f:
+            captured_diff = f.read()
+
+        self.assertIn(
+            "-    return x\n", captured_diff,
+            f"a legacy ledger entry with no `gate` field must NEVER anchor "
+            f"an explicit gate lookup -- get_review_diff must fall through "
+            f"to the full-range branch-diff-against-default path (removed "
+            f"line 'return x', the seed text) rather than treating the "
+            f"legacy entry as a valid 'review' anchor and computing a "
+            f"narrow HEAD1..HEAD2 delta (which would remove 'return x + 1' "
+            f"instead -- mutually exclusive by construction). "
+            f"captured_diff={captured_diff!r}",
+        )
+        self.assertNotIn(
+            "-    return x + 1\n", captured_diff,
+            f"the delta path's removed line ('return x + 1') must be "
+            f"ABSENT -- its presence would mean the legacy entry silently "
+            f"anchored the delta lookup, exactly the fail-toward-LESS-"
+            f"coverage defect this test guards against. "
+            f"captured_diff={captured_diff!r}",
         )
 
 
