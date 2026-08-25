@@ -68,10 +68,16 @@ class _DoctorConfigDriftTestBase(unittest.TestCase):
         env["CLAGENTIC_SKIP_UPDATE_ALERT"] = "1"
         env.pop("CLAGENTIC_HOME", None)
         env.pop("CLAGENTIC_ROUTER_URL", None)
+        # 60s, not 30 (test_doctor_gitleaks_config_advisory.py's own default):
+        # `doctor` runs several real subprocess probes (LLM CLI version/auth
+        # checks, `claude plugin list`, etc) whose wall-clock cost varies
+        # under load -- observed to occasionally exceed 30s specifically
+        # under a full concurrent test-suite run, not in isolation. This is
+        # resource contention, not a defect in the drift check itself.
         proc = subprocess.run(
             [os.path.join(self.fake_tool_home, "bin", "clagentic-lite"), "doctor"],
             cwd=self.tmpdir, env=env,
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=60,
         )
         return proc.returncode, proc.stdout, proc.stderr
 
