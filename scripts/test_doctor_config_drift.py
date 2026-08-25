@@ -109,6 +109,22 @@ class TestMissingKeysReported(_DoctorConfigDriftTestBase):
         # invisible to the operator as a genuinely-new key.
         self.assertIn("CLAGENTIC_ROUTER_URL", out, msg=out)
 
+    def test_schema_version_key_excluded_from_drift_output(self):
+        """PEACHES PR #193 review, finding 3: CLAGENTIC_CONFIG_SCHEMA_VERSION
+        is auto-managed bookkeeping (config.example itself says "Do not
+        hand-edit" for it) -- it must never appear in the drift list telling
+        an operator which keys to "review and add any you want", even when
+        a sparse config is genuinely missing it. Reporting it there directly
+        contradicted the template's own "do not hand-edit" instruction."""
+        self._write_global_config(
+            "CLAGENTIC_LITE_HOME=/fake/home\n"
+            "CLAGENTIC_BUILDER_CMD=claude\n"
+        )
+        rc, out, err = self._run_doctor()
+        section = out.split("global config drift:", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("WARN", section, msg=out)
+        self.assertNotIn("CLAGENTIC_CONFIG_SCHEMA_VERSION", section, msg=out)
+
     def test_missing_count_is_reported(self):
         self._write_global_config("CLAGENTIC_LITE_HOME=/fake/home\n")
         rc, out, err = self._run_doctor()

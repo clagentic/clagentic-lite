@@ -1115,8 +1115,17 @@ _doctor_check_config_drift() {
   _dccd_example_keys=$(sed -n "$_dccd_key_sed" "$_dccd_example" | sort -u)
   _dccd_installed_keys=$(sed -n "$_dccd_key_sed" "$GLOBAL_CONFIG" | sort -u)
 
+  # CLAGENTIC_CONFIG_SCHEMA_VERSION (PEACHES PR #193 review, finding 3):
+  # auto-managed bookkeeping, not an operator-facing feature key -- config.
+  # example itself says "Do not hand-edit" (top of file). Reporting it
+  # alongside real feature keys under "review these and add any you want"
+  # directly contradicted that instruction, so it is excluded from drift
+  # output entirely rather than special-cased with different wording: an
+  # install missing this key (e.g. one written before lr-e33f73 introduced
+  # it) has nothing useful for the operator to hand-add here regardless.
   _dccd_missing=$(printf '%s\n' "$_dccd_example_keys" | while IFS= read -r _dccd_k; do
     [ -z "$_dccd_k" ] && continue
+    [ "$_dccd_k" = "CLAGENTIC_CONFIG_SCHEMA_VERSION" ] && continue
     if ! printf '%s\n' "$_dccd_installed_keys" | grep -qxF "$_dccd_k"; then
       printf '%s\n' "$_dccd_k"
     fi
