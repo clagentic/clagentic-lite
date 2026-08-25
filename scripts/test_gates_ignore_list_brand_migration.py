@@ -265,6 +265,77 @@ class TestMigrateSymlinkOldPath(_HelperTestBase):
             self.assertEqual(f.read(), "CVE-2024-0009\n", "NEW must carry the symlink's content")
 
 
+class TestMigrateSymlinkNewPath(_HelperTestBase):
+    """NEW is a symlink -- the destructive counterpart to
+    TestMigrateSymlinkOldPath (HOLDEN/PEACHES/Codex finding, PR #203
+    review). A plausible operator setup: NEW symlinked to OLD to keep one
+    ignore list readable from both locations during the migration window.
+
+    Mechanism this proves against the pre-fix code: `[ -f "$_gmbrf_new" ]`
+    (scripts/gates.sh, the branch guarding the cmp-then-delete-OLD path)
+    FOLLOWS symlinks -- it is satisfied by a symlink pointing at a regular
+    file, indistinguishable from NEW being a real file. Once inside that
+    branch, `cmp -s "$_gmbrf_old" "$_gmbrf_new"` follows the symlink back
+    to OLD itself, so when NEW -> OLD the comparison is OLD-against-itself
+    and always reports identical -- unconditionally, regardless of content.
+    The pre-fix code then ran `rm -f "$_gmbrf_old"`, deleting the symlink's
+    TARGET (the only real copy of the ignore list) and leaving NEW a
+    dangling symlink. The fix adds an `[ -L "$_gmbrf_new" ]` check (tests
+    the path itself, not what it resolves to) before the cmp/rm sequence,
+    refusing to migrate at all when NEW is a symlink.
+
+    This test is shown to FAIL against the pre-fix implementation: with
+    the `-L` guard removed, `cmp -s` always matches (self-comparison
+    through the symlink), so `_gmbrf_old` is unconditionally deleted --
+    this assertion (`OLD must survive`) would fail, and the ignore list
+    would end up gone from BOTH paths (OLD deleted, NEW a dangling
+    symlink) -- exactly the data-loss mode the task's own contract
+    ("never overwrites... never a state where both locations exist with
+    different content") is meant to prevent, reached by a route neither
+    existing test (TestMigrateBothExistDivergent, which uses two REGULAR
+    files with different content) exercises."""
+
+    def test_new_as_symlink_to_old_does_not_delete_old(self):
+        old, new = self._old_new()
+        os.makedirs(os.path.dirname(new))
+        with open(old, "w") as f:
+            f.write("CVE-2024-0099\n")
+        os.symlink(old, new)
+
+        result = self._run(f"_gate_migrate_brand_root_file '{old}' '{new}' osv-ignore")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            os.path.isfile(old),
+            "OLD must survive -- deleting it here destroys the ignore list, since NEW is only a symlink to it",
+        )
+        with open(old) as f:
+            self.assertEqual(f.read(), "CVE-2024-0099\n", "OLD's content must be untouched")
+        self.assertTrue(os.path.lexists(new), "NEW's symlink must not be removed either -- refuse, don't clean up")
+        self.assertIn("symlink", result.stderr.lower())
+        self.assertIn("not migrating", result.stderr.lower())
+
+    def test_new_as_symlink_to_unrelated_file_does_not_delete_old(self):
+        """NEW symlinked to some THIRD file (not OLD) with identical
+        content -- still refused, not merely the OLD-self-comparison case.
+        The fix's -L check triggers on NEW being a symlink at all, not on
+        detecting the specific self-comparison mechanism, so this must
+        refuse the same way."""
+        old, new = self._old_new()
+        os.makedirs(os.path.dirname(new))
+        third_file = os.path.join(self._tmp, "third-file-same-content")
+        with open(old, "w") as f:
+            f.write("CVE-2024-0100\n")
+        with open(third_file, "w") as f:
+            f.write("CVE-2024-0100\n")
+        os.symlink(third_file, new)
+
+        result = self._run(f"_gate_migrate_brand_root_file '{old}' '{new}' osv-ignore")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.path.isfile(old), "OLD must survive when NEW is any symlink, not just one pointing at OLD")
+        self.assertTrue(os.path.isfile(third_file), "the symlink's actual target must also survive untouched")
+        self.assertIn("symlink", result.stderr.lower())
+
+
 class TestMigrateReadOnlyOldPath(_HelperTestBase):
     """OLD is read-only (no owner-write bit) -- still migrates: only ever
     READS old, then unlinks it (needs write on the parent dir, not the

@@ -826,6 +826,22 @@ _gate_migrate_brand_root_file() {
   [ -f "$_gmbrf_old" ] || return 0
 
   if [ -f "$_gmbrf_new" ]; then
+    # `-f` FOLLOWS SYMLINKS -- if NEW is a symlink (e.g. pointing at OLD, a
+    # plausible operator setup to keep one list readable from both
+    # locations during a transition), `cmp -s OLD NEW` compares OLD against
+    # itself through the symlink and always reports identical, and the old
+    # code below would then `rm -f OLD` -- deleting the symlink's TARGET
+    # and leaving NEW a dangling symlink with the ignore list gone
+    # entirely (HOLDEN/PEACHES/Codex finding, PR #203 review). `-L` tests
+    # the path itself, not what it resolves to, so this is safe against
+    # any symlink chain without needing to reason about what NEW points
+    # at. Falls through to the DIFFERENT-content warn-and-leave-both-alone
+    # branch, which never deletes anything -- the conservative outcome.
+    if [ -L "$_gmbrf_new" ]; then
+      echo "[gates] WARN $_gmbrf_new is a symlink -- not migrating $_gmbrf_label (refusing to risk deleting whatever it points at, including possibly $_gmbrf_old itself)." 1>&2
+      echo "[gates]      Replace the symlink with a real file, or remove $_gmbrf_old by hand once you've confirmed its content is preserved." 1>&2
+      return 0
+    fi
     if cmp -s "$_gmbrf_old" "$_gmbrf_new" 2>/dev/null; then
       rm -f "$_gmbrf_old"
       echo "[gates] removed redundant legacy $_gmbrf_label at $_gmbrf_old (already migrated to $_gmbrf_new)" 1>&2
