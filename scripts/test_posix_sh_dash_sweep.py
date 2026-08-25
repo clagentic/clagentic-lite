@@ -74,6 +74,70 @@ this task exists to remove:
      check 1 is a cheap grammar floor underneath it, not the primary
      detector.
 
+CONTROL-FLOW MODEL, enumerated explicitly (PEACHES PR #202 round-3 review,
+item (a) -- "extend the honest-limits register to the control-flow
+model"): three rounds of review each found a real false-suppression bug in
+the dominance checker (round 2: any-earlier-line instead of dominance,
+same-line `if...fi` compound misread as Pattern B; round 3: an `elif`
+branch's exit wrongly counted as the negative guard's own unconditional
+exit, `exit`/`return`/`continue` matched inside a comment, `then` search
+checking only the literal next line despite its own comment's claim). Every
+one of those was a FALSE NEGATIVE -- the direction that defeats this
+detector's purpose. The policy going forward, applied everywhere below:
+WHEN THE LINE-ORIENTED SCAN CANNOT PROVE DOMINANCE, IT MUST NOT SUPPRESS --
+an unrecognized or ambiguous shape is treated as NOT dominated (flag it),
+never as dominated (suppress it). Concretely, what the checker DOES model:
+
+  - `if [ ! -f "$OP" ]; then ... <exit|return|continue> ...; fi` (Pattern
+    A) -- exit must be the FIRST TOKEN of a non-comment, non-blank line,
+    at the guard's own branch depth, BEFORE any depth-0 `elif`/`else`
+    (round-3 findings 1 and 2).
+  - `if [ -f "$OP" ]; then <source line>; ... fi` / `... else ...; fi`
+    (Pattern B) -- source line must be the NEAREST meaningful (non-blank,
+    non-comment) line after the guard `if`, with no intervening `elif`
+    (an intervening `elif`/`else` line is never matched by the Pattern-B
+    check at all, since `_IF_OPEN_RE` does not match `elif`/`else` --
+    falls through to "not dominated" automatically, not by special-case
+    logic).
+  - `[ -f "$OP" ] && <source line>` (Pattern C), same line only.
+  - `if ! . "$OP" ...; then ...; fi` with `then` on the SAME line, the
+    NEXT line, or the next line after up to `_THEN_SEARCH_MAX_LINES`
+    CONSECUTIVE comment lines (round-3 finding 3) -- a blank line in that
+    gap, or exceeding the bound, means the construct is simply NOT
+    recognized as the dead-guard shape at all (neither flagged nor
+    suppressed as dominated -- see
+    TestElifAndCommentDominanceEdgeCases.test_then_search_bounded_does_
+    not_match_arbitrarily_far). This is itself a stated gap: a
+    then-across-a-blank-line or then-beyond-the-bound file is invisible
+    to this specific check, not merely unguarded.
+
+What the checker explicitly DOES NOT model, stated plainly rather than
+approximated (item (c)): `case` statement branches (a source line inside
+a `case ... esac` arm is never recognized as dominated by anything,
+including a genuinely dominating case pattern -- this is fail-OPEN by
+construction: an unrecognized construct is never treated as dominated,
+so a false positive here is possible but a false negative is not);
+`&&`/`||` chains split across a backslash line continuation; heredocs whose
+body text happens to contain literal `then`/`fi`/`exit` (a heredoc body
+is not distinguished from real code by this line-oriented scan -- a
+`then`/`fi` INSIDE a heredoc could be miscounted by the nesting tracker);
+nested `elif` chains beyond the first `elif`/`else` boundary (only the
+FIRST depth-0 elif/else is checked for -- a second, third, etc. `elif` is
+never separately analyzed, though this cannot itself cause a false
+suppression, since the scan already stops at the first one); a guard
+idiom other than `[ -f ... ]`/`[ ! -f ... ]` on the exact same operand
+string (`test -f`, a `case`-based existence check, a differently-spelled
+but equivalent path). NONE of these constructs occur in this repo's
+tracked files today (confirmed by the currently-clean sweep below); if
+one is introduced, the checker's behavior on it is UNVERIFIED by this
+docstring's claims, not silently assumed safe -- a case/heredoc/
+line-continuation shape reaching a flagged line falls through this
+scan's pattern matches and is reported as a violation (fail open), while
+the reverse -- treating an unrecognized shape as dominated -- never
+happens by construction (every dominance path requires a positive regex
+match on a known shape; the default return value throughout
+_find_dominating_block is False, "not dominated").
+
 TOOL DEPENDENCY, per task constraint: `checkbashisms` is not installed on
 this host (confirmed absent from PATH at authoring time). `shellcheck` IS
 present at /usr/bin/shellcheck on this host, but AGENTS.md's ask-before
@@ -118,7 +182,12 @@ dead-guard reintroduction, correctly discovers a deliberately planted
 `#!/usr/bin/env sh`/`#!/bin/sh -e` file, and correctly distinguishes a
 same-operand guard that DOMINATES the source line from one that merely
 appears earlier without gating it, respectively, before this docstring's
-claims are trusted.
+claims are trusted. TestElifAndCommentDominanceEdgeCases additionally
+proves the three round-3 false-suppression bugs (elif-branch exit,
+exit-word-in-comment, then-across-comment) are fixed, each with a
+same-fixture proof that the OLD code would have missed it.
+TestUnmodeledConstructsFailOpen proves the fail-open claim above for
+`case` branches mechanically rather than asserting it.
 
 Run with: python3 -m unittest scripts.test_posix_sh_dash_sweep -v
 """
@@ -260,14 +329,61 @@ _NEGATIVE_EXISTENCE_GUARD_RE = re.compile(r'\[\s*!\s*-f\s')
 _POSITIVE_EXISTENCE_GUARD_RE = re.compile(r'\[\s*-f\s')
 _IF_OPEN_RE = re.compile(r'^\s*if\s+(?:\[|!)')
 _FI_RE = re.compile(r'^\s*fi\b')
-_UNCONDITIONAL_EXIT_RE = re.compile(r'\b(?:exit\b|return\b|continue\b)')
+_ELIF_OR_ELSE_RE = re.compile(r'^\s*(?:elif\b|else\b)')
+# PEACHES PR #202 round-3 review, finding 2 (HOLDEN-verified real): a bare
+# word-boundary search for exit/return/continue matched INSIDE comment
+# lines (`# exit 0` read as a real exit) and would equally match inside an
+# echoed string (`echo "call exit to leave"`) -- the enclosing scan never
+# excluded comments, and a substring search can never distinguish "this
+# IS the exit statement" from "this line merely CONTAINS the word". Fixed
+# by requiring the word to be the FIRST TOKEN of the (already
+# comment-filtered, see the caller) line -- the actual invocation shape,
+# not a mention anywhere in it. This does not fully solve the general
+# problem (`echo exit 0` as the first two tokens of an echo call still
+# matches) -- stated as a known residual ambiguity, not solved away; see
+# the module-level "what this checker models" enumeration below for the
+# full list of what remains unhandled by design.
+_UNCONDITIONAL_EXIT_STMT_RE = re.compile(r'^(?:exit|return|continue)\b')
+
+
+# PEACHES PR #202 round-3 review, finding 3 (HOLDEN-verified real, and the
+# code contradicted its own comment): the multi-line `then` search checked
+# ONLY the literal next line, while the comment above it claimed a
+# non-comment skip. Bounded forward scan: skips COMMENT lines only (never
+# blank lines -- a blank line between `if ! . "$X"` and `then` is not a
+# shape seen anywhere in this repo and treating it as skippable would
+# widen the search indefinitely for no observed benefit) up to
+# _THEN_SEARCH_MAX_LINES lines ahead, looking for a bare `then`. If
+# anything else (real code, blank line) is hit first, or the bound is
+# exceeded, the multi-line form is NOT recognized here -- see
+# _dead_guard_operand's own fail-open handling of that case.
+_THEN_SEARCH_MAX_LINES = 5
+
+
+def _find_then_within_comment_gap(lines, idx):
+    """Starting at lines[idx+1], skips COMMENT-only lines (not blank, not
+    code) looking for a bare `then`, bounded to _THEN_SEARCH_MAX_LINES.
+    Returns True if found, False otherwise (including: blank line or real
+    code encountered first, or bound exceeded)."""
+    j = idx + 1
+    steps = 0
+    while j < len(lines) and steps < _THEN_SEARCH_MAX_LINES:
+        stripped = lines[j].strip()
+        if _BARE_THEN_RE.match(stripped):
+            return True
+        if stripped.startswith("#"):
+            j += 1
+            steps += 1
+            continue
+        return False
+    return False
 
 
 def _dead_guard_operand(lines, idx):
     """Returns the sourced operand string if `lines[idx]` is GH #174's
     dead-guard shape (either the bare-`.`-with-fallback form, or the
-    `if ! . "$X"` form -- same-line OR next-line `then`, see
-    _IF_DEAD_GUARD_OPEN_RE's docstring), else None."""
+    `if ! . "$X"` form -- same-line, next-line, or next-line-past-comments
+    `then`, see _IF_DEAD_GUARD_OPEN_RE's docstring), else None."""
     stripped = lines[idx].strip()
     dot_match = _DOT_DEAD_GUARD_RE.match(stripped)
     if dot_match:
@@ -277,10 +393,9 @@ def _dead_guard_operand(lines, idx):
         return None
     if stripped.rstrip().endswith("then"):
         return if_match.group("operand")
-    # No `then` on this line -- the immediately-following non-comment
-    # line must be a bare `then` for this to be the multi-line if-form.
-    nxt = idx + 1
-    if nxt < len(lines) and _BARE_THEN_RE.match(lines[nxt].strip()):
+    # No `then` on this line -- search forward past any comment lines
+    # (bounded) for a bare `then`.
+    if _find_then_within_comment_gap(lines, idx):
         return if_match.group("operand")
     return None
 
@@ -359,18 +474,47 @@ def _matching_if_index(lines, fi_idx):
 
 def _block_between_has_unconditional_exit(lines, if_idx, fi_idx):
     """True if the body between `if_idx` and `fi_idx` (exclusive of both)
-    contains an exit/return/continue at the body's OWN nesting depth
-    (depth 0 relative to this block) -- an exit inside a further-nested
-    if is conditional on THAT inner test too, so it does not make the
-    outer block's negative branch unconditional and is not counted.
-    Self-closing single-line `if...fi` compounds are treated as
-    depth-neutral (see _is_self_closing_if_line) and their own content is
-    not inspected for an exit -- an exit inside a self-closing
+    contains an exit/return/continue STATEMENT (first token of the line,
+    not merely the word appearing anywhere -- see
+    _UNCONDITIONAL_EXIT_STMT_RE) STRICTLY WITHIN THE NEGATIVE GUARD'S OWN
+    POSITIVE BRANCH -- i.e. before any depth-0 `elif`/`else` -- at the
+    body's own nesting depth (depth 0 relative to this block; an exit
+    inside a further-nested if is conditional on THAT inner test too and
+    is not counted).
+
+    PEACHES PR #202 round-3 review, finding 1 (HOLDEN-verified real): an
+    earlier version scanned the ENTIRE if..fi span at depth 0 with no
+    branch awareness, so an exit inside an `elif`/`else` branch -- which
+    is conditional on a DIFFERENT test than the negative-guard `if`
+    itself -- was wrongly counted as making the if's OWN negative branch
+    unconditional:
+
+        if [ ! -f "$X" ]; then
+          echo missing        # <- does NOT exit
+        elif [ -n "$Y" ]; then
+          exit 0               # <- exits, but only when $Y is set,
+        fi                     #    unrelated to whether $X is missing
+        . "$X" || true          # WAS wrongly suppressed; must be flagged
+
+    Fixed: the scan now STOPS (returns False, not "keep looking") at the
+    first depth-0 `elif`/`else` -- an exit found only in a later branch
+    never counts, because that branch's own condition is what gates it,
+    not the negative guard being evaluated.
+
+    COMMENT lines are skipped entirely (round-3 finding 2, HOLDEN-verified
+    real: an earlier version had no comment filter here, so `# exit 0`
+    inside a guard block was read as a real exit, making a
+    non-dominating guard read as dominating -- also the false-suppression
+    direction). Self-closing single-line `if...fi` compounds are treated
+    as depth-neutral (see _is_self_closing_if_line) and their own content
+    is not inspected for an exit -- an exit inside a self-closing
     conditional is conditional on THAT test, same reasoning as a
     multi-line nested if."""
     depth = 0
     for k in range(if_idx + 1, fi_idx):
         stripped = lines[k].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
         if _is_self_closing_if_line(stripped):
             continue
         if _IF_OPEN_RE.match(stripped):
@@ -379,7 +523,9 @@ def _block_between_has_unconditional_exit(lines, if_idx, fi_idx):
         if _FI_RE.match(stripped):
             depth -= 1
             continue
-        if depth == 0 and _UNCONDITIONAL_EXIT_RE.search(stripped):
+        if depth == 0 and _ELIF_OR_ELSE_RE.match(stripped):
+            return False
+        if depth == 0 and _UNCONDITIONAL_EXIT_STMT_RE.match(stripped):
             return True
     return False
 
@@ -945,6 +1091,274 @@ class TestDominatingVsNonDominatingGuard(unittest.TestCase):
             "fi\n",
         )
         self.assertEqual(_dead_guard_violations(planted), [])
+
+
+class TestElifAndCommentDominanceEdgeCases(unittest.TestCase):
+    """PEACHES PR #202 round-3 review: three real false-suppression
+    defects found in the dominance checker itself, all discovered by
+    HOLDEN reading the code directly against fixtures shaped like these.
+    Each test here demonstrates the exact shape named, including one
+    (test_elif_branch_own_exit_still_dominates) that reproduces the
+    non-elif Pattern A shape with an elif tacked on afterward, to prove
+    the elif-boundary fix does not over-correct into a new false
+    positive on the case that SHOULD still dominate."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="clagentic-test-posix-elif-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _write(self, name, content):
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def test_finding_1_exit_only_in_elif_branch_does_not_dominate(self):
+        """Finding 1: a negative guard's own positive branch does NOT
+        exit; only an elif branch (conditional on a DIFFERENT test) does.
+        The elif's exit is not unconditional relative to the negative
+        guard -- must still flag."""
+        planted = self._write(
+            "elif-exit-only.sh",
+            "#!/bin/sh\n"
+            'if [ ! -f "$X" ]; then\n'
+            "  echo missing\n"
+            'elif [ -n "$SOMETHING" ]; then\n'
+            "  exit 0\n"
+            "fi\n"
+            '. "$X" || true\n',
+        )
+        violations = _dead_guard_violations(planted)
+        self.assertEqual(
+            len(violations), 1,
+            f"an exit only in an elif branch (conditional on a different "
+            f"test) must not dominate the negative guard's own branch -- "
+            f"got {violations}",
+        )
+
+    def test_finding_1_old_scan_would_have_missed_this(self):
+        """Direct proof the OLD whole-span, elif-unaware exit scan would
+        have wrongly suppressed the finding above."""
+        lines = [
+            "#!/bin/sh\n",
+            'if [ ! -f "$X" ]; then\n',
+            "  echo missing\n",
+            'elif [ -n "$SOMETHING" ]; then\n',
+            "  exit 0\n",
+            "fi\n",
+            '. "$X" || true\n',
+        ]
+        exit_re = re.compile(r'\b(?:exit\b|return\b|continue\b)')
+        depth = 0
+        old_found_exit = False
+        # Mirrors the OLD _block_between_has_unconditional_exit signature:
+        # scans strictly BETWEEN if_idx and fi_idx (both exclusive) -- the
+        # guard `if` line itself (index 1) is not part of the scanned
+        # range, matching the real function's own `range(if_idx + 1,
+        # fi_idx)`.
+        if_idx, fi_idx = 1, 5
+        for k in range(if_idx + 1, fi_idx):
+            stripped = lines[k].strip()
+            if _is_self_closing_if_line(stripped):
+                continue
+            if _IF_OPEN_RE.match(stripped):
+                depth += 1
+                continue
+            if _FI_RE.match(stripped):
+                depth -= 1
+                continue
+            if depth == 0 and exit_re.search(stripped):
+                old_found_exit = True
+        self.assertTrue(
+            old_found_exit,
+            "sanity check on the OLD behavior itself: the elif-unaware "
+            "scan must find the elif branch's exit -- if this assertion "
+            "fails, the regression this test guards against no longer "
+            "describes the old code",
+        )
+
+    def test_elif_branch_own_exit_still_dominates(self):
+        """Non-regression: exit IS in the negative guard's own positive
+        branch, before an unrelated later elif -- must still dominate.
+        Proves the elif-boundary fix stops at the FIRST depth-0
+        elif/else, not before it."""
+        planted = self._write(
+            "elif-after-own-exit.sh",
+            "#!/bin/sh\n"
+            'if [ ! -f "$X" ]; then\n'
+            "  exit 0\n"
+            'elif [ -n "$Y" ]; then\n'
+            "  echo something\n"
+            "fi\n"
+            '. "$X" || true\n',
+        )
+        self.assertEqual(_dead_guard_violations(planted), [])
+
+    def test_finding_2_exit_word_inside_comment_does_not_dominate(self):
+        """Finding 2: a comment containing the word 'exit' inside a
+        negative guard's body must not be read as a real exit statement
+        -- the guard's actual body has no real exit, so it must not
+        dominate."""
+        planted = self._write(
+            "comment-exit-word.sh",
+            "#!/bin/sh\n"
+            'if [ ! -f "$X" ]; then\n'
+            "  # exit 0\n"
+            "  echo missing\n"
+            "fi\n"
+            '. "$X" || true\n',
+        )
+        violations = _dead_guard_violations(planted)
+        self.assertEqual(
+            len(violations), 1,
+            f"a comment containing 'exit' must not be read as a real "
+            f"exit statement -- got {violations}",
+        )
+
+    def test_finding_2_old_scan_would_have_missed_this(self):
+        """Direct proof the OLD comment-blind, substring-search exit scan
+        would have wrongly matched the comment above as a real exit."""
+        line = "  # exit 0"
+        old_exit_re = re.compile(r'\b(?:exit\b|return\b|continue\b)')
+        self.assertTrue(
+            bool(old_exit_re.search(line.strip())),
+            "sanity check on the OLD behavior itself: the substring "
+            "search must match 'exit' inside this comment -- if this "
+            "assertion fails, the regression this test guards against "
+            "no longer describes the old code",
+        )
+
+    def test_finding_3_undominated_then_across_comment_is_flagged(self):
+        """Finding 3, positive detection proof: the multi-line if-form
+        with an intervening comment before `then`, when NOT dominated by
+        anything else, must be flagged."""
+        planted = self._write(
+            "then-across-comment-undominated.sh",
+            "#!/bin/sh\n"
+            'if ! . "$X"\n'
+            "# some comment\n"
+            "then\n"
+            "  echo not_a_real_exit\n"
+            "fi\n",
+        )
+        violations = _dead_guard_violations(planted)
+        self.assertEqual(
+            len(violations), 1,
+            f"the multi-line if-form with a comment before `then` must "
+            f"be recognized as the dead-guard shape when undominated -- "
+            f"got {violations}",
+        )
+
+    def test_finding_3_old_next_line_only_check_would_have_missed_this(self):
+        """Direct proof the OLD idx+1-only `then` check would have
+        missed the comment-gap form above."""
+        lines = [
+            "#!/bin/sh\n",
+            'if ! . "$X"\n',
+            "# some comment\n",
+            "then\n",
+        ]
+        old_bare_then_re = re.compile(r'^\s*then\s*$')
+        nxt = 1 + 1  # idx of the if-line is 1; old code checked idx+1 only
+        old_found_then = nxt < len(lines) and bool(
+            old_bare_then_re.match(lines[nxt].strip())
+        )
+        self.assertFalse(
+            old_found_then,
+            "sanity check on the OLD behavior itself: idx+1 is the "
+            "comment line, not `then` -- if this assertion fails, the "
+            "regression this test guards against no longer describes "
+            "the old code",
+        )
+
+    def test_then_search_bounded_does_not_match_arbitrarily_far(self):
+        """The comment-skip is bounded (_THEN_SEARCH_MAX_LINES) -- a
+        `then` beyond the bound, even past only comments, is not
+        matched. Documents the stated limit rather than silently
+        extending it."""
+        far_comments = "\n".join(f"# comment {i}" for i in range(10))
+        planted = self._write(
+            "then-too-far.sh",
+            f'#!/bin/sh\nif ! . "$X"\n{far_comments}\nthen\n  exit 0\nfi\n',
+        )
+        # Not recognized as the dead-guard shape at all (operand is None)
+        # -- the `if ! . "$X"` line without a same/near-line `then` falls
+        # through, silently. This is exactly the shape (b)/(c) below
+        # require to be named plainly: this specific line-oriented
+        # limitation neither flags nor suppresses, it simply doesn't
+        # recognize the construct. Documented in the module docstring's
+        # "what this checker models" section.
+        violations = _dead_guard_violations(planted)
+        self.assertEqual(violations, [])
+
+
+class TestUnmodeledConstructsFailOpen(unittest.TestCase):
+    """PEACHES PR #202 round-3 review, items (b)/(c): where the checker
+    cannot model a construct, it must FAIL OPEN (flag a possible
+    violation) rather than fail closed (silently suppress). This class
+    mechanically verifies that claim for the constructs the module
+    docstring names as unmodeled, rather than asserting it without
+    evidence -- the same discipline this file applies everywhere else."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="clagentic-test-posix-unmodeled-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _write(self, name, content):
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def test_case_branch_dead_guard_is_flagged_not_silently_missed(self):
+        """A dead-guard line inside a `case ... esac` arm is not
+        recognized by any dominance pattern -- must be flagged (fail
+        open), never silently suppressed."""
+        planted = self._write(
+            "case-branch.sh",
+            "#!/bin/sh\n"
+            'case "$MODE" in\n'
+            "  a)\n"
+            '    . "$X" || true\n'
+            "    ;;\n"
+            "  *)\n"
+            "    echo default\n"
+            "    ;;\n"
+            "esac\n",
+        )
+        violations = _dead_guard_violations(planted)
+        self.assertEqual(
+            len(violations), 1,
+            f"a dead-guard line inside a case arm must be flagged -- got "
+            f"{violations}",
+        )
+
+    def test_case_branch_with_genuinely_dominating_pattern_still_flagged(self):
+        """Even when a case PATTERN would, in real shell semantics,
+        genuinely gate reachability of the dead-guard line (e.g. a
+        preceding `[ -f "$X" ]` check elsewhere doesn't help here at
+        all -- case dispatch is not `if`/`fi`), the checker does not
+        attempt to model it -- must still flag, matching the fail-open
+        policy exactly."""
+        planted = self._write(
+            "case-branch-with-guard-nearby.sh",
+            "#!/bin/sh\n"
+            'if [ -f "$X" ]; then\n'
+            "  echo found\n"
+            "fi\n"
+            'case "$MODE" in\n'
+            "  a)\n"
+            '    . "$X" || true\n'
+            "    ;;\n"
+            "esac\n",
+        )
+        violations = _dead_guard_violations(planted)
+        self.assertEqual(
+            len(violations), 1,
+            f"a nearby if/fi guard does not dominate a case-arm dead "
+            f"guard (case dispatch, not if/fi control flow) -- must "
+            f"still flag. Got {violations}",
+        )
 
 
 if __name__ == "__main__":
