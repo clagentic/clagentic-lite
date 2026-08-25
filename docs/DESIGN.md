@@ -99,7 +99,7 @@ The goal is to let the user recognize repeated summaries without hiding any row.
 
 Non-integer values for either variable fall back silently to the documented default.
 
-Three env vars govern the recall and retention budget (code defaults; override in `~/.config/clagentic/config` or `.clagentic/config`):
+Three env vars govern the recall and retention budget (code defaults; override in `~/.config/clagentic/lite/config` or `.clagentic/config`):
 
 | Var | Default | Effect |
 |---|---|---|
@@ -249,7 +249,7 @@ Project root isolation: `gates.sh`, `memory.sh`, and `llm-client.sh` resolve the
 
 ### Trust boundary: global config vs. per-repo config
 
-Two config files feed into every clagentic-lite process: `~/.config/clagentic/config` (global, written by `init`, lives outside any repo) and `<repo>/.clagentic/config` (optional, sparse, lives inside the repo). Both are loaded the same way — sourced into the shell, each assignment auto-exported — which means loading either one *executes* it: it is a shell file, not a passive key-value format.
+Two config files feed into every clagentic-lite process: `~/.config/clagentic/lite/config` (global, written by `init`, lives outside any repo) and `<repo>/.clagentic/config` (optional, sparse, lives inside the repo). Both are loaded the same way — sourced into the shell, each assignment auto-exported — which means loading either one *executes* it: it is a shell file, not a passive key-value format.
 
 That distinction matters because the two files have very different provenance. The global config is something the operator wrote, on their own machine, before any of this runs. The per-repo config is *repo content* — it travels with `git clone` like everything else in the tree. A repo you have merely cloned, never enrolled, never reviewed, can carry a `.clagentic/config` an attacker planted. If the CLI sourced that file the moment it noticed cwd was inside a git repo, running something as innocuous as `clagentic-lite doctor` right after cloning an unfamiliar repo — out of curiosity, before deciding whether to trust it at all — would execute arbitrary shell on your machine.
 

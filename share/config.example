@@ -1,5 +1,5 @@
 # clagentic-lite — global config template.
-# Written to ~/.config/clagentic/config by `clagentic-lite init`.
+# Written to ~/.config/clagentic/lite/config by `clagentic-lite init`.
 # Per-repo .clagentic/config is OPTIONAL and SPARSE — only override keys.
 # Load order at gate-run time: global config → per-repo .clagentic/config → env vars.
 #
@@ -641,7 +641,7 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # WHAT THIS DOES NOT DO: this key is deliberately NOT a value you should
 # copy from documentation or another machine. It describes what auth THIS
 # HOST actually uses. Set it once, on the machine where it is true, in
-# ~/.config/clagentic/config or the enrolled repo's .clagentic/config --
+# ~/.config/clagentic/lite/config or the enrolled repo's .clagentic/config --
 # never hardcode a value here in a committed file, and never propagate one
 # host's value to another host's config by copy-paste without checking it
 # is still true there (AGENTS.md invariant 6: nothing host-specific

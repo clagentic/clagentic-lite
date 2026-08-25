@@ -3,7 +3,7 @@
 # Blocks writes to the default branch, outside the repo, or to sensitive paths.
 # Exit 2 = block.
 #
-# managed-by: clagentic · clagentic-hooks-version: v2
+# managed-by: clagentic · clagentic-hooks-version: v3
 # Source of truth: share/hook-shims/pre-write-guard.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/pre-write-guard.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -31,7 +31,7 @@
 # every site it was found.
 _CLAGENTIC_PLATFORM_SH="$CLAGENTIC_LITE_HOME/scripts/platform.sh"
 if [ ! -f "$_CLAGENTIC_PLATFORM_SH" ]; then
-  printf '[clagentic-lite/pre-write-guard] CLAGENTIC_LITE_HOME does not resolve to a real checkout: %s (missing scripts/platform.sh) -- failing OPEN (call allowed, unaudited). Run `clagentic-lite doctor`, and check ~/.bashrc and ~/.config/clagentic/config for a stale CLAGENTIC_LITE_HOME.\n' "$CLAGENTIC_LITE_HOME" 1>&2
+  printf '[clagentic-lite/pre-write-guard] CLAGENTIC_LITE_HOME does not resolve to a real checkout: %s (missing scripts/platform.sh) -- failing OPEN (call allowed, unaudited). Run `clagentic-lite doctor`, and check ~/.bashrc and ~/.config/clagentic/lite/config for a stale CLAGENTIC_LITE_HOME.\n' "$CLAGENTIC_LITE_HOME" 1>&2
   exit 0
 fi
 # shellcheck disable=SC1090

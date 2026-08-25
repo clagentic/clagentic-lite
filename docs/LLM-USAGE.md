@@ -103,7 +103,7 @@ already has it → pulls and re-runs `init` (this is exactly what
    `$CLAGENTIC_LITE_HOME/.claude/hooks/` — this is the ONE shared copy every
    later-enrolled repo's hooks call back into.
 4. Runs a two-question front door (accept defaults? which vendor mode?) and
-   writes `~/.config/clagentic/config` (global config, `chmod 600`).
+   writes `~/.config/clagentic/lite/config` (global config, `chmod 600`).
 5. Symlinks `~/.local/bin/clagentic-lite` → `$CLAGENTIC_LITE_HOME/bin/clagentic-lite`
    and warns (with the exact shell-rc line to add) if `~/.local/bin` is not on
    `$PATH`.
@@ -130,7 +130,7 @@ on the machine. It does not gate any project. That is Step 3.
 ## Step 2 — Confirm config exists
 
 ```sh
-test -f ~/.config/clagentic/config && echo "global config present" || echo "MISSING — re-run: clagentic-lite init"
+test -f ~/.config/clagentic/lite/config && echo "global config present" || echo "MISSING — re-run: clagentic-lite init"
 ```
 
 If `init` completed successfully this file exists already (it's written in
@@ -150,7 +150,7 @@ The settings a user is most likely to need to change, and where they live:
 | `CLAGENTIC_ALLOW_MISSING_GITLEAKS` / `_OSV` / `_SEMGREP` | `0` (i.e. required) | Set to `1` to run without that specific security scanner installed — see "Minimal install" in README.md. |
 | `CLAGENTIC_REPO_HOST` / `CLAGENTIC_DEFAULT_BRANCH` | `github` / `main` | Where `gates ship` opens PRs and what branch write-guard protects. |
 
-Config is layered: `~/.config/clagentic/config` (global, applies everywhere)
+Config is layered: `~/.config/clagentic/lite/config` (global, applies everywhere)
 then `<repo>/.clagentic/config` (per-repo override, optional, committed —
 **note:** not read on the very first `enroll` call for a given repo, only
 from the next command onward; see README.md "What init and enroll do").
@@ -315,7 +315,7 @@ at that repo's own README for build/run instructions. Once it's running
 locally, wiring clagentic-lite to it is two config keys plus a re-enroll:
 
 ```sh
-# In ~/.config/clagentic/config or <repo>/.clagentic/config:
+# In ~/.config/clagentic/lite/config or <repo>/.clagentic/config:
 CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765
 CLAGENTIC_ROUTER_TOKEN=<the router's own proxy token>
 
