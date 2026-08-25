@@ -208,6 +208,25 @@ class _DirectApiEnsureTestBase(unittest.TestCase):
             for var in _ROUTER_SCOPED_VARS:
                 env.pop(var, None)
             env.pop("CLAGENTIC_AUTH_MODE", None)
+            # PEACHES nit, promoted (PR #200 review round 2): mirrors
+            # test_invoke_claude_auth_mode_ensure.py's identical pop at
+            # its own base-class setup (line ~219). Without this, a shell
+            # with ambient CLAUDE_CODE_USE_BEDROCK=1 makes AC3/AC4 fail --
+            # the exact class of leak this whole task exists to fix,
+            # reproduced inside the fix's own test harness. SWEEP (stated
+            # as required rather than adding this one var and stopping):
+            # every var this file's assertions check for absence/blankness
+            # without the individual test itself supplying it via
+            # extra_parent_env is: the four _ROUTER_SCOPED_VARS (cleared
+            # above), CLAGENTIC_AUTH_MODE (cleared above), and this one.
+            # ANTHROPIC_API_KEY (AC9) and CLAUDE_CODE_USE_BEDROCK when
+            # explicitly asserted-blanked (AC8) are both always supplied by
+            # their own test via extra_parent_env, which overwrites
+            # whatever the fixture inherited ambiently -- so neither is a
+            # leak risk for any assertion in this file. Negative result:
+            # CLAUDE_CODE_USE_BEDROCK is the only additional var the sweep
+            # found; nothing else needs clearing here.
+            env.pop("CLAUDE_CODE_USE_BEDROCK", None)
             if extra_parent_env:
                 env.update(extra_parent_env)
             env.update(source_env(llm_client=True))

@@ -658,10 +658,22 @@ class TestAcceptance9NonBedrockValuesNeverEnsure(_InvokeClaudeEnsureTestBase):
     unchanged and is what the updated assertion checks directly. This is
     not a weakening: an empty-string CLAUDE_CODE_USE_BEDROCK is exactly as
     inert to the claude CLI's own `= "1"` check as an absent one (see
-    bin/clagentic-lite:3286/3366's identical string-equality check), and
-    the updated assertion is STRICTER in one respect -- it would also catch
-    a hypothetical future regression that set CLAUDE_CODE_USE_BEDROCK to
-    any other truthy-looking non-"1" string, which assertNotIn could not.
+    bin/clagentic-lite:3286/3366's identical string-equality check).
+
+    CORRECTION (PEACHES, PR #200 review round 2): an earlier version of
+    this comment claimed the updated assertion was "stricter" because it
+    would also catch a hypothetical future regression setting
+    CLAUDE_CODE_USE_BEDROCK to some other truthy-looking non-"1" string
+    (e.g. "true"). That claim is FALSE and is withdrawn -- `assertNotEqual(
+    x, "1")` only fails when x is exactly "1"; it would silently PASS for
+    x == "true", whereas the original `assertNotIn` would have failed on
+    ANY presence of the key at all, catching that same hypothetical.
+    Neither form strictly dominates the other. What the updated assertion
+    actually guarantees, no more and no less: these modes never force
+    CLAUDE_CODE_USE_BEDROCK to the one value ("1") the claude CLI's own
+    string-equality check treats as Bedrock-mode-on. It is the correct
+    proxy for THIS arm's known blank-vs-unset behavior, not a strictly
+    stronger check in general.
     The unrecognized-value case is untouched -- that arm still leaves
     CLAUDE_CODE_USE_BEDROCK entirely absent, no blanking, so its original
     assertNotIn remains the precise assertion there."""
