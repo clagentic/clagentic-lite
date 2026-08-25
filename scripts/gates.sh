@@ -376,7 +376,8 @@ _gate_resolve_fresh_default_branch_ref() {
 # `[[rules]]` table header OR an `[extend]` block with `useDefault = true`
 # (gitleaks' own documented mechanism for re-including the built-in ruleset
 # on top of a repo override — see .gitleaks.toml's own header comment and
-# https://github.com/gitleaks/gitleaks#configuration). Text-level detection,
+# the gitleaks project's own README "Configuration" section for the
+# upstream spec this mirrors). Text-level detection,
 # not a TOML parser: gitleaks.toml is a small, well-known config shape and
 # this codebase has no TOML library dependency anywhere else (AGENTS.md
 # "what to ask the user" — no new external tool without asking). A
@@ -493,9 +494,11 @@ PYEOF
 # review, self-defeating-canary finding). The first shipped version of this
 # function embedded each fixture as one complete literal string in a
 # heredoc — gitleaks itself then flagged those exact lines in gates.sh's
-# OWN committed history (18 findings: aws-access-token, generic-api-key,
-# github-pat, slack-access-token, stripe-access-token), so `gates.sh
-# secrets` blocked on branch history scanning this very file once shipped.
+# OWN committed history (18 findings across five distinct rule families,
+# including a generic API-key shape, a GitHub personal-access-token shape,
+# a Slack access-token shape, a Stripe access-token shape, and an AWS
+# access-token shape), so `gates.sh secrets` blocked on branch history
+# scanning this very file once shipped.
 # Every fixture below is instead assembled at RUN TIME from two or more
 # fragments that are individually sub-pattern (neither fragment alone
 # matches any gitleaks rule's regex — verified by construction: each
