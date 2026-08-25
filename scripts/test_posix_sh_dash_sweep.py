@@ -42,31 +42,37 @@ this task exists to remove:
      `-n` flag makes it read and parse the script without executing it, so
      it rejects constructs its grammar cannot parse at all (bash arrays,
      process substitution, here-strings, `((...))` arithmetic command
-     forms, etc). It does GENUINELY NOT catch most real-world bashisms,
-     which are grammatically valid POSIX sh tokens that only diverge in
-     BEHAVIOR at runtime -- `[[ ... ]]` is the concrete case this sweep's
-     own test discovered: dash's parser accepts `[[` as an ordinary,
-     unrecognized command WORD (not a keyword, since dash doesn't reserve
-     it), so `dash -n` reports success on a script containing `[[ ]]`; the
-     failure only appears at execution as "not found". `local` inside a
-     function, `echo -e` interpretation, `read` without `-r`, `function
-     name() { }` -- all likewise parse cleanly and diverge only at
-     runtime. This check's real, honest scope is: catches gross
-     dash-incompatible GRAMMAR, not general bashism behavior.
-  2. A source-level regex (`_dead_guard_operand` / `_dead_guard_violations`)
-     catches the exact GH #174 shape (a bare `.` special-builtin source
-     guarded only by `|| true`/`|| exit 0`/`if ! . ...`, with no `[ -f
-     ... ]` existence guard for the SAME operand anywhere earlier in the
-     file -- see `_EXISTENCE_GUARD_RE`'s docstring for the unbounded-
-     lookback rationale and its own honest idiom-coverage limits) --
+     forms, AND `function name() { }` -- dash has no `function` keyword at
+     all, so this is a genuine PARSE-time rejection, unlike the items
+     below). It does GENUINELY NOT catch most real-world bashisms, which
+     ARE grammatically valid POSIX sh tokens that only diverge in BEHAVIOR
+     at runtime -- `[[ ... ]]` is the concrete case this sweep's own test
+     discovered: dash's parser accepts `[[` as an ordinary, unrecognized
+     command WORD (not a keyword, since dash doesn't reserve it), so
+     `dash -n` reports success on a script containing `[[ ]]`; the failure
+     only appears at execution as "not found". `local` inside a function,
+     `echo -e` interpretation, `read` without `-r` -- all likewise parse
+     cleanly and diverge only at runtime. This check's real, honest scope
+     is: catches gross dash-incompatible GRAMMAR, not general bashism
+     behavior.
+  2. A source-level regex/block-scan (`_dead_guard_operand` /
+     `_existence_guard_dominates` / `_dead_guard_violations`) catches the
+     exact GH #174 shape (a bare `.` special-builtin source, or an
+     `if ! . ...` wrapper with same-line OR next-line `then`, guarded only
+     by `|| true`/`|| exit 0`/`if !`, with no existence guard that
+     DOMINATES the source line for the SAME operand -- see the
+     module-level comment above `_NEGATIVE_EXISTENCE_GUARD_RE` for the
+     three recognized dominating patterns and this check's own honest
+     limits) --
      `dash -n` alone does NOT catch this: the line is syntactically valid
      POSIX sh, it only misbehaves at RUNTIME when the sourced path is
-     missing. This regex is the static-analysis equivalent of what
-     test_hook_shim_stale_home_no_abort.py proves dynamically for the six
-     hooks; here it sweeps every POSIX-declared file, not just those six.
-     BECAUSE check 1 is parse-time-only (see above), this regex sweep is
-     the load-bearing check for the actual GH #174 defect class -- check 1
-     is a cheap grammar floor underneath it, not the primary detector.
+     missing. This regex/block-scan is the static-analysis equivalent of
+     what test_hook_shim_stale_home_no_abort.py proves dynamically for the
+     six hooks; here it sweeps every POSIX-declared file, not just those
+     six. BECAUSE check 1 is parse-time-only (see above), this check is
+     the load-bearing detector for the actual GH #174 defect class --
+     check 1 is a cheap grammar floor underneath it, not the primary
+     detector.
 
 TOOL DEPENDENCY, per task constraint: `checkbashisms` is not installed on
 this host (confirmed absent from PATH at authoring time). `shellcheck` IS
@@ -92,22 +98,27 @@ check. setUp() hard-fails (not skips) when dash is missing, exactly
 mirroring test_hook_shim_stale_home_no_abort.py's own posture.
 
 FINDINGS (informational; NON-GOAL per task spec to fix these here):
-running `dash -n` and the source-guard regex against every currently
+running `dash -n` and the source-guard/block-scan against every currently
 tracked file matching the WIDENED shebang family finds ZERO bashisms and
 ZERO instances of the GH #174 dead-guard shape outside the six
-already-fixed hook shims (which correctly guard with a preceding
-`[ ! -f ... ]` check, per lr-24f649). The widened filter does not discover
-any file the exact-match version missed -- confirmed directly
+already-fixed hook shims (which correctly DOMINATE the source line with a
+preceding `[ ! -f ... ]` check per lr-24f649, re-verified against the
+dominance logic specifically -- see PEACHES PR #202 round-2 findings 1/2
+below). The widened filter does not discover any file the exact-match
+version missed -- confirmed directly
 (TestPosixShFileDiscovery.test_no_env_sh_or_flagged_shebang_file_in_current_tree):
 this repo currently has zero `#!/usr/bin/env sh` or `#!/bin/sh <flags>`
 tracked files, so there is no newly-discovered file to check for a bashism
 in. Net: this sweep lands GREEN with no exclusion list needed. If a future
 run of this test DOES fail, the failure is real detection, not
-miscalibration -- see TestSweepMechanismActuallyDetects and
-TestWidenedShebangFamilyDiscovery below, which prove the sweep trips on a
-deliberately planted bashism/dead-guard reintroduction and correctly
-discovers a deliberately planted `#!/usr/bin/env sh`/`#!/bin/sh -e` file,
-respectively, before this docstring's claims are trusted.
+miscalibration -- see TestSweepMechanismActuallyDetects,
+TestWidenedShebangFamilyDiscovery, and TestDominatingVsNonDominatingGuard
+below, which prove the sweep trips on a deliberately planted bashism/
+dead-guard reintroduction, correctly discovers a deliberately planted
+`#!/usr/bin/env sh`/`#!/bin/sh -e` file, and correctly distinguishes a
+same-operand guard that DOMINATES the source line from one that merely
+appears earlier without gating it, respectively, before this docstring's
+claims are trusted.
 
 Run with: python3 -m unittest scripts.test_posix_sh_dash_sweep -v
 """
@@ -152,56 +163,280 @@ _SHEBANG_RE = re.compile(
 # the line to match -- an unconditional `. "$X"` with no fallback at all is
 # a different (intentional, `set -e`-consistent hard-fail) shape, not this
 # defect, and must not be flagged.
-_IF_DEAD_GUARD_RE = re.compile(
-    r'^\s*if\s+!\s+\.\s+(?P<quote>["\'])(?P<operand>[^"\']+)(?P=quote)[^;]*;?\s*then\s*$'
+#
+# PEACHES PR #202 round-2 review, finding 2 (HOLDEN-verified real): an
+# EARLIER version of _IF_DEAD_GUARD_RE anchored on `then` appearing on the
+# SAME line, missing the POSIX-valid multi-line form:
+#     if ! . "$X"
+#     then
+# `_IF_DEAD_GUARD_OPEN_RE` now matches the `if ! . "$X"` line WITHOUT
+# requiring `then` on it, and `_dead_guard_operand` (below) additionally
+# checks the immediately-following non-comment line for a bare `then` when
+# the current line doesn't carry it -- covering both the same-line and
+# next-line forms. A `then` more than one line further down (e.g. a blank
+# line or a comment between `if ! . "$X"` and `then`) is NOT covered; this
+# repo's own tracked files use only same-line or immediately-next-line
+# `then`, and covering arbitrary whitespace/comment gaps would need a real
+# tokenizer rather than a two-line regex check -- stated as a limit, not
+# silently assumed away.
+_IF_DEAD_GUARD_OPEN_RE = re.compile(
+    r'^\s*if\s+!\s+\.\s+(?P<quote>["\'])(?P<operand>[^"\']+)(?P=quote)[^;]*'
+    r'(?:;\s*then\s*)?$'
 )
+_BARE_THEN_RE = re.compile(r'^\s*then\s*$')
 _DOT_DEAD_GUARD_RE = re.compile(
     r'^\s*\.\s+(?P<quote>["\'])(?P<operand>[^"\']+)(?P=quote)\s*(?:2>/dev/null)?\s*'
     r'\|\|\s*(?:true|exit\s+0)\s*$'
 )
 
-# An existence guard for the SAME sourced operand on THIS line, or ANY
-# preceding line in the file, neutralizes the defect -- the fix pattern this
-# repo already uses (post-lr-24f649) is `if [ ! -f "$X" ]; then <handle>; fi`
-# on one or more lines before the `.`/`if !` line, not necessarily adjacent
-# to it (e.g. bin/clagentic-lite's bootstrap guard is ~30 lines above its
-# `.` line). PEACHES PR #202 review, item (b) (HOLDEN-verified real): an
-# earlier version of this check used a fixed 6-line lookback window, added
-# to kill a same-line-only false positive on the six already-fixed hook
-# shims -- but a FIXED window trades that false positive for a false
-# NEGATIVE risk in the other direction: a real GH #174-shaped defect whose
-# existence guard sits 7+ lines away (exactly bin/clagentic-lite's real
-# shape) would have passed silently. The lookback is now UNBOUNDED --
-# scans every line from the top of the file down to (and including) the
-# flagged line for an existence guard matching the same operand -- which
-# removes the distance-based false-negative risk entirely rather than
-# tuning a magic number. This is deliberately still narrower than "any
-# guard shape": it requires `[ -f ... ]` or `[ ! -f ... ]` testing the
-# SAME sourced path string (see `_existence_guard_matches_operand`), the
-# one idiom this repo's own post-lr-24f649 fix and the six hook shims all
-# use. A different but equally-valid guard idiom (e.g. `test -f`, a
-# `case`-based check, or a guard against a differently-spelled but
-# equivalent path expression) is NOT covered by this pattern match and
-# would still be flagged as a violation even if functionally safe -- that
-# is a possible FALSE POSITIVE the regex approach cannot fully rule out
-# without a real shell parser, stated plainly rather than implied away.
-# No attempt is made to enumerate a complete guard-idiom set; `[ -f ... ]`/
-# `[ ! -f ... ]` is what this repo actually uses everywhere today.
-_EXISTENCE_GUARD_RE = re.compile(r'\[\s*!?\s*-f\s')
+# PEACHES PR #202 round-2 review, finding 1 (HOLDEN-verified real): an
+# EARLIER version of this check treated ANY earlier line testing the same
+# operand as neutralizing, regardless of control flow --
+#
+#     if [ -f "$X" ]; then echo found; fi   # guard exists, guards nothing
+#     . "$X" || true                        # still aborts under dash
+#
+# -- a guard that merely APPEARS earlier does not protect the source line
+# unless it DOMINATES it: either the source is textually inside the
+# guard's own positive branch, or the guard's negative branch
+# unconditionally terminates before the source line is ever reached. That
+# is the actual GH #174-preventing property; "some earlier line mentions
+# the same path" is not.
+#
+# This repo's own fixed instances (post-lr-24f649) use exactly two
+# dominating shapes, both handled below by a real (bounded) block scan
+# rather than a flat lookback:
+#
+#   Pattern A -- negative guard, unconditional early exit:
+#       if [ ! -f "$OPERAND" ]; then
+#         ...
+#         exit 0        # or: exit 1, return, continue
+#       fi
+#       . "$OPERAND" ... || true     <- dominated: negative branch always
+#                                        terminates before this line, so
+#                                        reaching it means the file exists
+#     (bin/clagentic-lite, post-tool-nudge/stop-summarize/pre-write-guard/
+#     pre-bash-guard.sh.template -- the latter two apply this pattern to
+#     the `if ! . "$OPERAND"; then exit 0; fi` if-form itself)
+#
+#   Pattern B -- positive guard, source inside the branch:
+#       if [ -f "$OPERAND" ]; then
+#         . "$OPERAND" ... || true  <- dominated: only reached when the
+#                                        positive branch's condition held
+#       else
+#         ...
+#       fi
+#     (session-start.sh.template, prompt-inject.sh.template)
+#
+#   Pattern C -- same-line AND-chain:
+#       [ -f "$OPERAND" ] && . "$OPERAND"   <- dominated: `.` is the RHS
+#                                                of `&&`, only reached if
+#                                                the test passed
+#     (not currently used in this repo's tracked files, but a valid
+#     dominating idiom worth recognizing on its own merits)
+#
+# HONEST LIMIT, stated plainly rather than implied complete: this is a
+# bounded `if`/`fi` NESTING SCAN over TEXTUAL LINES, not a real shell
+# parser. It assumes this repo's own one-keyword-per-line style (`if
+# COND; then` opens, `fi` alone or `; fi`-suffixed closes, one per line).
+# A single-line `if ...; then ...; fi` compound is explicitly detected
+# (_is_self_closing_if_line) and treated as depth-neutral -- it is
+# neither a Pattern-A/B guard candidate itself nor counted toward nesting
+# depth, closing the false-suppression gap this exact shape produced
+# during development (see TestDominatingVsNonDominatingGuard's
+# test_non_dominating_same_operand_guard_still_flagged, whose fixture is
+# precisely this shape). What remains genuinely unhandled: a `fi` sharing
+# a line with OTHER unrelated trailing content after a `;` that is not
+# itself a self-closing `if`, or multiple `if`/`fi` pairs packed onto one
+# physical line -- neither occurs in this repo's tracked files today. A
+# guard idiom other than `[ -f ... ]`/`[ ! -f ... ]` on the SAME operand
+# string (e.g. `test -f`, a `case` check, or a differently-spelled but
+# equivalent path expression) is also not recognized and would still be
+# flagged as a violation even if functionally safe. No attempt is made to
+# enumerate a complete guard-idiom or control-flow set; the three
+# patterns above are what this repo's own post-lr-24f649 fixes and hook
+# shims actually use today.
+_NEGATIVE_EXISTENCE_GUARD_RE = re.compile(r'\[\s*!\s*-f\s')
+_POSITIVE_EXISTENCE_GUARD_RE = re.compile(r'\[\s*-f\s')
+_IF_OPEN_RE = re.compile(r'^\s*if\s+(?:\[|!)')
+_FI_RE = re.compile(r'^\s*fi\b')
+_UNCONDITIONAL_EXIT_RE = re.compile(r'\b(?:exit\b|return\b|continue\b)')
 
 
-def _dead_guard_operand(stripped_line):
-    for pattern in (_IF_DEAD_GUARD_RE, _DOT_DEAD_GUARD_RE):
-        match = pattern.match(stripped_line)
-        if match:
-            return match.group("operand")
+def _dead_guard_operand(lines, idx):
+    """Returns the sourced operand string if `lines[idx]` is GH #174's
+    dead-guard shape (either the bare-`.`-with-fallback form, or the
+    `if ! . "$X"` form -- same-line OR next-line `then`, see
+    _IF_DEAD_GUARD_OPEN_RE's docstring), else None."""
+    stripped = lines[idx].strip()
+    dot_match = _DOT_DEAD_GUARD_RE.match(stripped)
+    if dot_match:
+        return dot_match.group("operand")
+    if_match = _IF_DEAD_GUARD_OPEN_RE.match(stripped)
+    if not if_match:
+        return None
+    if stripped.rstrip().endswith("then"):
+        return if_match.group("operand")
+    # No `then` on this line -- the immediately-following non-comment
+    # line must be a bare `then` for this to be the multi-line if-form.
+    nxt = idx + 1
+    if nxt < len(lines) and _BARE_THEN_RE.match(lines[nxt].strip()):
+        return if_match.group("operand")
     return None
 
 
-def _existence_guard_matches_operand(line, operand):
-    if not _EXISTENCE_GUARD_RE.search(line):
+def _line_tests_operand(line, guard_re, operand):
+    if not guard_re.search(line):
         return False
     return f'"{operand}"' in line or f"'{operand}'" in line
+
+
+def _same_line_and_chain_dominates(line, operand):
+    """Pattern C: `[ -f "$OPERAND" ] && . "$OPERAND"` on one line -- the
+    dead-guard line IS the guard-test line, with the source as the `&&`
+    right-hand side."""
+    if not _line_tests_operand(line, _POSITIVE_EXISTENCE_GUARD_RE, operand):
+        return False
+    return "&&" in line
+
+
+def _nearest_meaningful_preceding_line(lines, idx):
+    """Walks backward from `idx` (exclusive) skipping comment and blank
+    lines, returning the index of the nearest line that is neither --
+    or None if the top of the file is reached first."""
+    j = idx - 1
+    while j >= 0:
+        stripped = lines[j].strip()
+        if stripped and not stripped.startswith("#"):
+            return j
+        j -= 1
+    return None
+
+
+_TRAILING_FI_RE = re.compile(r';\s*fi\s*$')
+
+
+def _is_self_closing_if_line(stripped):
+    """True for a single-line `if ...; then ...; fi` compound -- opens
+    and closes its own block on one line, so it must never be counted by
+    a nesting-depth walk that tracks `if`-opens-a-line /
+    `fi`-closes-a-line as separate events (that shape is this repo's
+    style everywhere else, but a self-closing line breaks the one-line
+    assumption and would otherwise desynchronize the depth counter).
+    `_FI_RE` is `^`-anchored (matches a `fi` that OPENS a line) and is
+    the wrong tool here -- this checks for a `; fi` CLOSING the same
+    line the `if` opened."""
+    return bool(_IF_OPEN_RE.match(stripped)) and bool(_TRAILING_FI_RE.search(stripped))
+
+
+def _matching_if_index(lines, fi_idx):
+    """Given the index of a `fi` line, walks backward tracking nested
+    if/fi depth to find the index of the `if` that opens the SAME block
+    (depth returns to 0). Returns None if unbalanced (no match found by
+    index 0) -- a real possibility this bounded scan cannot rule out for
+    arbitrarily malformed input, but never true for any file that itself
+    parses cleanly under `dash -n`, which every file this is called on
+    already does by the time this check runs. Self-closing single-line
+    `if...fi` compounds are skipped entirely (see
+    _is_self_closing_if_line) -- they never straddle the block being
+    searched for, so counting them would desynchronize depth."""
+    depth = 1
+    j = fi_idx - 1
+    while j >= 0:
+        stripped = lines[j].strip()
+        if _is_self_closing_if_line(stripped):
+            j -= 1
+            continue
+        if _FI_RE.match(stripped):
+            depth += 1
+        elif _IF_OPEN_RE.match(stripped):
+            depth -= 1
+            if depth == 0:
+                return j
+        j -= 1
+    return None
+
+
+def _block_between_has_unconditional_exit(lines, if_idx, fi_idx):
+    """True if the body between `if_idx` and `fi_idx` (exclusive of both)
+    contains an exit/return/continue at the body's OWN nesting depth
+    (depth 0 relative to this block) -- an exit inside a further-nested
+    if is conditional on THAT inner test too, so it does not make the
+    outer block's negative branch unconditional and is not counted.
+    Self-closing single-line `if...fi` compounds are treated as
+    depth-neutral (see _is_self_closing_if_line) and their own content is
+    not inspected for an exit -- an exit inside a self-closing
+    conditional is conditional on THAT test, same reasoning as a
+    multi-line nested if."""
+    depth = 0
+    for k in range(if_idx + 1, fi_idx):
+        stripped = lines[k].strip()
+        if _is_self_closing_if_line(stripped):
+            continue
+        if _IF_OPEN_RE.match(stripped):
+            depth += 1
+            continue
+        if _FI_RE.match(stripped):
+            depth -= 1
+            continue
+        if depth == 0 and _UNCONDITIONAL_EXIT_RE.search(stripped):
+            return True
+    return False
+
+
+def _find_dominating_block(lines, flagged_idx, operand):
+    """Looks at the nearest meaningful (non-comment, non-blank) line
+    preceding the flagged line for Pattern A or Pattern B (see the
+    module-level comment above _EXISTENCE_GUARD_RE). Bounded, not a real
+    parser -- see that comment for the exact assumptions and honest
+    limits.
+
+      - If that nearest line is `fi`: candidate Pattern A. Find its
+        matching `if` (nesting-depth-tracked backward walk); it must
+        test `[ ! -f "$OPERAND" ]`, and its body must unconditionally
+        exit/return/continue at the block's own depth.
+      - If that nearest line is `if [ -f "$OPERAND" ]; then` (or
+        `if [ -f "$OPERAND" ] && ...`-shaped opens are not matched here,
+        only the block form): candidate Pattern B -- the flagged line is
+        directly inside this if's positive branch, with nothing closing
+        it first.
+    """
+    nearest = _nearest_meaningful_preceding_line(lines, flagged_idx)
+    if nearest is None:
+        return False
+    nearest_stripped = lines[nearest].strip()
+
+    if _FI_RE.match(nearest_stripped):
+        if_idx = _matching_if_index(lines, nearest)
+        if if_idx is None:
+            return False
+        if_stripped = lines[if_idx].strip()
+        if not _line_tests_operand(if_stripped, _NEGATIVE_EXISTENCE_GUARD_RE, operand):
+            return False
+        return _block_between_has_unconditional_exit(lines, if_idx, nearest)
+
+    if _IF_OPEN_RE.match(nearest_stripped):
+        if _is_self_closing_if_line(nearest_stripped):
+            # Single-line `if ...; then ...; fi` compound -- the `fi`
+            # closes the block on the SAME line, so the flagged line is
+            # NOT inside this if's branch at all; it merely follows a
+            # closed, unrelated (from the flagged line's position) if/fi
+            # statement. Must NOT be treated as Pattern B -- this is
+            # exactly the single-line-compound gap named in the
+            # module-level honest-limits comment above
+            # _NEGATIVE_EXISTENCE_GUARD_RE, and getting it wrong here
+            # would be a false SUPPRESSION (the dangerous direction).
+            return False
+        return _line_tests_operand(nearest_stripped, _POSITIVE_EXISTENCE_GUARD_RE, operand)
+
+    return False
+
+
+def _existence_guard_dominates(lines, flagged_idx, operand):
+    flagged_line = lines[flagged_idx]
+    if _same_line_and_chain_dominates(flagged_line, operand):
+        return True
+    return _find_dominating_block(lines, flagged_idx, operand)
 
 
 def _list_tracked_files():
@@ -235,14 +470,14 @@ def _discover_posix_sh_files():
 
 def _dead_guard_violations(abs_path):
     """Lines matching GH #174's dead-guard shape (bare `.` source relying
-    only on `|| true`/`|| exit 0`/`if !`) that are NOT already preceded,
-    ANYWHERE earlier in the file (unbounded lookback -- see
-    _EXISTENCE_GUARD_RE's docstring for why this is not windowed), by an
-    explicit `[ -f ... ]`/`[ ! -f ... ]` existence guard testing the SAME
-    sourced operand -- the fix shape this repo already uses checks
-    existence on a prior line (not necessarily adjacent), then sources
-    unconditionally (or with a fallback that's now unreachable-but-
-    harmless) on a later line."""
+    only on `|| true`/`|| exit 0`/`if !`) that are NOT DOMINATED by a real
+    existence guard for the SAME sourced operand -- see
+    `_existence_guard_dominates` and the module-level comment above
+    `_EXISTENCE_GUARD_RE` for the three recognized dominating patterns and
+    this check's own honest limits. A guard that merely appears somewhere
+    earlier in the file, without actually gating reachability of the
+    source line, does NOT suppress a finding (PEACHES PR #202 round-2,
+    finding 1)."""
     violations = []
     with open(abs_path, encoding="utf-8") as f:
         lines = f.readlines()
@@ -251,14 +486,10 @@ def _dead_guard_violations(abs_path):
         stripped = line.strip()
         if stripped.startswith("#"):
             continue
-        operand = _dead_guard_operand(stripped)
+        operand = _dead_guard_operand(lines, idx)
         if operand is None:
             continue
-        preceding_and_self = lines[:idx + 1]
-        if any(
-            _existence_guard_matches_operand(w, operand)
-            for w in preceding_and_self
-        ):
+        if _existence_guard_dominates(lines, idx, operand):
             continue
         violations.append((lineno, stripped))
     return violations
@@ -546,6 +777,174 @@ class TestSweepMechanismActuallyDetects(unittest.TestCase):
                 '. "$CLAGENTIC_LITE_HOME/scripts/platform.sh"\n'
             )
         self.assertEqual(_dead_guard_violations(fixed), [])
+
+
+class TestDominatingVsNonDominatingGuard(unittest.TestCase):
+    """PEACHES PR #202 round-2 review, finding 1 (HOLDEN-verified real):
+    an earlier version of _dead_guard_violations treated ANY earlier line
+    testing the same operand as neutralizing, regardless of control flow.
+    PEACHES's own diagnosis of WHY this was missed: the prior regression
+    test (TestSweepMechanismActuallyDetects, above) only checked that an
+    UNRELATED-operand guard fails to suppress -- it never checked the
+    SAME-operand-NON-DOMINATING case, which is the actual GH #174 shape.
+    This class closes that gap directly, and proves the CURRENT
+    implementation is right where the OLD one was wrong (reproducing the
+    old any-earlier-line check inline, since the buggy code itself is
+    gone -- see test_old_lookback_logic_would_have_missed_this for the
+    literal old predicate re-run against the same fixture)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="clagentic-test-posix-dominance-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _write(self, name, content):
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def test_non_dominating_same_operand_guard_still_flagged(self):
+        """The exact shape PEACHES named: a guard that TESTS the same
+        operand but does not GATE the source line (its branch merely
+        echoes, doesn't exit) must NOT suppress the finding."""
+        planted = self._write(
+            "non-dominating.sh",
+            "#!/bin/sh\n"
+            'if [ -f "$X" ]; then echo found; fi\n'
+            '. "$X" || true\n',
+        )
+        violations = _dead_guard_violations(planted)
+        self.assertEqual(
+            len(violations), 1,
+            f"a same-operand guard whose branch does not exit/return must "
+            f"not suppress the dead-guard finding -- it provides zero "
+            f"protection at the source line. Got {violations}",
+        )
+
+    def test_old_lookback_logic_would_have_missed_this(self):
+        """Direct proof the OLD implementation (any earlier line
+        mentioning the operand, regardless of control flow) would have
+        wrongly suppressed the finding above -- reproduces that exact
+        predicate inline against the same fixture, since the buggy code
+        itself no longer exists to call."""
+        lines = [
+            "#!/bin/sh\n",
+            'if [ -f "$X" ]; then echo found; fi\n',
+            '. "$X" || true\n',
+        ]
+        operand = "$X"
+        old_existence_guard_re = re.compile(r'\[\s*!?\s*-f\s')
+
+        def old_predicate(line, op):
+            if not old_existence_guard_re.search(line):
+                return False
+            return f'"{op}"' in line or f"'{op}'" in line
+
+        flagged_idx = 2
+        old_would_suppress = any(
+            old_predicate(w, operand) for w in lines[:flagged_idx + 1]
+        )
+        self.assertTrue(
+            old_would_suppress,
+            "sanity check on the OLD behavior itself: the any-earlier-"
+            "line predicate must match this fixture's non-dominating "
+            "guard -- if this assertion fails, the regression this test "
+            "guards against no longer describes the old code",
+        )
+
+    def test_pattern_a_negative_guard_unconditional_exit_dominates(self):
+        """Pattern A (this repo's own real shape, e.g. bin/clagentic-lite,
+        post-tool-nudge.sh.template): negative guard whose body
+        unconditionally exits before the source line -- must suppress."""
+        planted = self._write(
+            "pattern-a.sh",
+            "#!/bin/sh\n"
+            'if [ ! -f "$X" ]; then\n'
+            "  echo missing\n"
+            "  exit 0\n"
+            "fi\n"
+            '. "$X" || true\n',
+        )
+        self.assertEqual(_dead_guard_violations(planted), [])
+
+    def test_pattern_a_negative_guard_without_exit_does_not_dominate(self):
+        """Negative-guard variant of the non-dominating shape: the
+        negative branch does NOT exit, so reaching the source line is NOT
+        proof the file exists -- must still flag."""
+        planted = self._write(
+            "pattern-a-no-exit.sh",
+            "#!/bin/sh\n"
+            'if [ ! -f "$X" ]; then\n'
+            "  echo missing\n"
+            "fi\n"
+            '. "$X" || true\n',
+        )
+        violations = _dead_guard_violations(planted)
+        self.assertEqual(
+            len(violations), 1,
+            f"a negative guard whose branch does not exit/return/continue "
+            f"does not dominate the source line -- must still flag. Got "
+            f"{violations}",
+        )
+
+    def test_pattern_b_positive_guard_source_inside_branch_dominates(self):
+        """Pattern B (session-start.sh.template's real shape): source
+        line directly inside the positive branch of `if [ -f "$X" ]`."""
+        planted = self._write(
+            "pattern-b.sh",
+            "#!/bin/sh\n"
+            'if [ -f "$X" ]; then\n'
+            '  . "$X" || true\n'
+            "else\n"
+            "  echo missing\n"
+            "fi\n",
+        )
+        self.assertEqual(_dead_guard_violations(planted), [])
+
+    def test_pattern_c_same_line_and_chain_dominates(self):
+        """Pattern C: `[ -f "$X" ] && . "$X"` on one line."""
+        planted = self._write(
+            "pattern-c.sh",
+            '#!/bin/sh\n[ -f "$X" ] && . "$X"\n',
+        )
+        self.assertEqual(_dead_guard_violations(planted), [])
+
+    def test_multiline_if_bang_dot_source_form_is_detected(self):
+        """PEACHES PR #202 round-2 review, finding 2 (HOLDEN-verified
+        real): the POSIX-valid multi-line `if ! . "$X"` / `then` form
+        (then on the FOLLOWING line, not the same line) must be detected
+        as the dead-guard shape when undominated."""
+        planted = self._write(
+            "multiline-if.sh",
+            "#!/bin/sh\n"
+            'if ! . "$X"\n'
+            "then\n"
+            "  exit 0\n"
+            "fi\n",
+        )
+        violations = _dead_guard_violations(planted)
+        self.assertEqual(
+            len(violations), 1,
+            f"the multi-line `if ! . \"$X\"` / `then` form must be "
+            f"detected -- got {violations}",
+        )
+
+    def test_multiline_if_bang_dot_source_form_dominated_by_pattern_a(self):
+        """Non-regression: the multi-line if-form, when itself dominated
+        by an enclosing Pattern-A guard (pre-bash-guard.sh.template's real
+        shape), must NOT be flagged."""
+        planted = self._write(
+            "multiline-if-dominated.sh",
+            "#!/bin/sh\n"
+            'if [ ! -f "$X" ]; then\n'
+            "  exit 0\n"
+            "fi\n"
+            'if ! . "$X"\n'
+            "then\n"
+            "  exit 0\n"
+            "fi\n",
+        )
+        self.assertEqual(_dead_guard_violations(planted), [])
 
 
 if __name__ == "__main__":
