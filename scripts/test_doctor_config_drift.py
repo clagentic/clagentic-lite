@@ -1,8 +1,8 @@
 """
 Regression tests for lr-e33f73: `clagentic-lite update` never refreshes an
-existing ~/.config/clagentic/config, so a config key shipped after a given
-install's `init` run is invisible to that install forever, with nothing
-anywhere telling the operator it exists. `_doctor_check_config_drift`
+existing ~/.config/clagentic/lite/config, so a config key shipped after a
+given install's `init` run is invisible to that install forever, with
+nothing anywhere telling the operator it exists. `_doctor_check_config_drift`
 (bin/clagentic-lite) closes the visibility gap by diffing the KEY SET (never
 values) in share/config.example against the installed global config on every
 `clagentic-lite doctor` run.
@@ -10,7 +10,8 @@ values) in share/config.example against the installed global config on every
 Uses a constructed global config (never the real share/config.example
 verbatim) so drift is exercised deterministically regardless of how many
 real keys config.example currently has -- these tests point GLOBAL_CONFIG at
-a throwaway file under a temp HOME, never at a real ~/.config/clagentic/config.
+a throwaway file under a temp HOME, never at a real
+~/.config/clagentic/lite/config.
 
 HAZARD (PEACHES PR #193 review, finding 1 -- class re-audit): `cmd_doctor`
 itself never runs a mutating `git` subcommand and every `_doctor_check_*`
@@ -51,7 +52,7 @@ class _DoctorConfigDriftTestBase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
         self.home = os.path.join(self.tmpdir, "home")
         os.makedirs(self.home)
-        self.config_dir = os.path.join(self.home, ".config", "clagentic")
+        self.config_dir = os.path.join(self.home, ".config", "clagentic", "lite")
         os.makedirs(self.config_dir)
         self.config_path = os.path.join(self.config_dir, "config")
         self.fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")

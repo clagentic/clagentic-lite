@@ -136,11 +136,12 @@ def _init_git_repo(path):
 
 
 def _write_global_config(home, body):
-    """Write ~/.config/clagentic/config with the given body (a shell-sourceable
-    KEY=VALUE block), as a real operator following share/config.example's
-    instructions would -- NOT via `clagentic-lite init`, which is exactly the
-    "shell that never ran init, config file present" shape the task describes."""
-    cfg_dir = os.path.join(home, ".config", "clagentic")
+    """Write ~/.config/clagentic/lite/config with the given body (a
+    shell-sourceable KEY=VALUE block), as a real operator following
+    share/config.example's instructions would -- NOT via `clagentic-lite
+    init`, which is exactly the "shell that never ran init, config file
+    present" shape the task describes."""
+    cfg_dir = os.path.join(home, ".config", "clagentic", "lite")
     os.makedirs(cfg_dir, exist_ok=True)
     cfg_path = os.path.join(cfg_dir, "config")
     with open(cfg_path, "w") as f:
@@ -163,6 +164,25 @@ def _run_cli(argv, cwd, home, env_extra=None, clagentic_lite_home=None,
         env.pop("CLAGENTIC_ROUTER_TOKEN", None)
         env.pop("CLAGENTIC_ROUTER_BEDROCK_MODE", None)
         env.pop("CLAGENTIC_ROUTER_INJECT_AGENT_MODEL", None)
+    # ds_load_global_env/ds_load_repo_env/ds_load_env (scripts/platform.sh)
+    # are each idempotent for exactly one reason: they early-return when
+    # CLAGENTIC_ENV_LOADED/CLAGENTIC_GLOBAL_ENV_LOADED/CLAGENTIC_REPO_ENV_LOADED
+    # is already "1" in the process environment. `env = dict(os.environ)`
+    # above means this test's subprocess silently inherits those flags
+    # whenever the CALLING shell already has them set -- e.g. this test
+    # suite running inside a clagentic-lite-enrolled session/agent
+    # environment (its own hooks/gates.sh source platform.sh and set these).
+    # Left unscrubbed, EVERY assertion in this file that the config FILE was
+    # actually read (the entire point of this module -- see the file
+    # docstring) silently no-ops: the guard fires before a single line of
+    # $GLOBAL_CONFIG is ever sourced, and the test would still pass on
+    # accident-free happy paths that don't need the loaded value, while
+    # falsely reporting real regressions in the load-and-honor path as
+    # passing. Scrub unconditionally -- these are pure internal
+    # once-per-process bookkeeping flags, never a value an operator sets.
+    env.pop("CLAGENTIC_ENV_LOADED", None)
+    env.pop("CLAGENTIC_GLOBAL_ENV_LOADED", None)
+    env.pop("CLAGENTIC_REPO_ENV_LOADED", None)
     if env_extra:
         env.update(env_extra)
     proc = subprocess.run(
@@ -332,8 +352,12 @@ class TestConfigFileInertWhenAbsent(unittest.TestCase):
 
     def test_no_config_file_no_env_settings_json_byte_identical(self):
         self.assertFalse(
-            os.path.exists(os.path.join(self.home, ".config", "clagentic", "config")),
+            os.path.exists(os.path.join(self.home, ".config", "clagentic", "lite", "config")),
             "test setup error: a config file exists when the test requires none",
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(self.home, ".config", "clagentic", "config")),
+            "test setup error: a legacy-path config file exists when the test requires none",
         )
         rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
         self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
