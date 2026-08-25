@@ -1555,13 +1555,52 @@ _ledger_config_snapshot() {
 # from a resolved _git_repo_scoped_head_sha call, which is non-empty
 # whenever this function is worth calling at all; callers with no resolvable
 # HEAD_SHA should not call this function (there is nothing to anchor to).
+#
+# GATE (4th arg, defaults "review" for backward compatibility with the
+# one pre-existing caller in cmd_merge_gate): each gate (review,
+# adversarial) now has its own anchor namespace in the ledger, so this
+# must find the most recent entry FOR THIS GATE, not merely
+# the most recent entry overall for BRANCH — ledger_latest_for_branch reads
+# across every gate that writes to the shared review-ledger.jsonl file, so
+# taking its result unfiltered would let a later-written adversarial entry
+# shadow an earlier, still-valid review pass (or vice versa) purely because
+# of write order, not because either gate's own anchor actually changed.
+# Filters via ledger_entries_for_branch (oldest-first) and keeps the LAST
+# match for GATE, mirroring _ledger_latest_passing_head_for_branch's own
+# filter-then-take-last pattern below rather than re-deriving a third scan
+# primitive.
 _ledger_anchored_pass_at_head() {
   _laph_file="$1"
   _laph_branch="$2"
   _laph_head="$3"
+  _laph_gate="${4:-review}"
   [ -n "$_laph_head" ] || return 1
 
-  _laph_latest=$(ledger_latest_for_branch "$_laph_file" "$_laph_branch")
+  _laph_latest=""
+  if command -v jq >/dev/null 2>&1; then
+    _laph_latest=$(ledger_entries_for_branch "$_laph_file" "$_laph_branch" \
+      | jq -c --arg g "$_laph_gate" 'select((.gate // "review") == $g)' 2>/dev/null | tail -n 1)
+  elif command -v python3 >/dev/null 2>&1; then
+    _laph_latest=$(ledger_entries_for_branch "$_laph_file" "$_laph_branch" | python3 -c '
+import json, sys
+gate = sys.argv[1]
+best = ""
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        entry = json.loads(line)
+    except Exception:
+        continue
+    if entry.get("gate", "review") == gate:
+        best = line
+if best:
+    print(best)
+' "$_laph_gate" 2>/dev/null)
+  else
+    return 1
+  fi
   [ -n "$_laph_latest" ] || return 1
 
   _laph_entry_head=""
@@ -1589,14 +1628,14 @@ except Exception:
   [ "$_laph_entry_verdict" = "pass" ]
 }
 
-# _ledger_latest_passing_head_for_branch LEDGER_FILE BRANCH — stdout: the
-# head_sha of the MOST RECENT anchored entry for BRANCH whose verdict is
-# "pass", or nothing if no such entry exists / LEDGER_FILE is absent / no
-# JSON tool available. Sibling of _ledger_anchored_pass_at_head, sharing its
-# "pass" doctrine: a "block"/"unanchored"/degraded entry is never returned,
-# even when it is the LATEST entry overall (lr-542a43 -- this is exactly
-# the gap _ledger_anchored_pass_at_head's own consumers were already closed
-# against: get_review_diff's delta-base lookup used to call
+# _ledger_latest_passing_head_for_branch LEDGER_FILE BRANCH GATE — stdout: the
+# head_sha of the MOST RECENT anchored entry for BRANCH AND GATE whose
+# verdict is "pass", or nothing if no such entry exists / LEDGER_FILE is
+# absent / no JSON tool available. Sibling of _ledger_anchored_pass_at_head,
+# sharing its "pass" doctrine: a "block"/"unanchored"/"skip"/degraded entry
+# is never returned, even when it is the LATEST entry overall (lr-542a43 --
+# this is exactly the gap _ledger_anchored_pass_at_head's own consumers were
+# already closed against: get_review_diff's delta-base lookup used to call
 # ledger_latest_for_branch directly and read ONLY head_sha with no verdict
 # filter, so a block verdict anchored the next round's delta base
 # identically to a pass. Two distinct exploit shapes followed: (a) HEAD
@@ -1606,6 +1645,17 @@ except Exception:
 # blocked; (b) a cosmetic commit after the block -- the delta only covers
 # the cosmetic change, never the blocking content below it).
 #
+# GATE (3rd arg, defaults "review" for backward compatibility):
+# review-ledger.jsonl is now shared by BOTH cmd_review and cmd_adversarial,
+# each writing its own `gate` field. Without this filter, a review pass
+# entry at HEAD anchors the very next cmd_adversarial call's delta lookup
+# too -- the adversarial diff resolves to HEAD..HEAD (a hollow-audit
+# defect: the auditor examines nothing and reports a clean pass) purely
+# because cmd_review ran
+# moments earlier in the same `ship` invocation. Filtering on GATE gives
+# each gate its own anchor namespace, so no gate's pass can ever anchor a
+# different gate's next delta.
+#
 # WHY "latest pass", not "latest entry that happens to be a pass": scanning
 # all history (not just the single latest row) matters because the round
 # immediately after a block is very often itself a fix attempt that also
@@ -1614,23 +1664,25 @@ except Exception:
 # came after it, not "the most recent row regardless of what it says."
 #
 # Reuses ledger_entries_for_branch (oldest-first, same JSON-Lines source
-# _ledger_anchored_pass_at_head's own ledger_latest_for_branch reads) rather
-# than re-deriving a third ledger-scan primitive -- re-deriving is the exact
-# mistake that produced this bug (see lr-542a43 task description).
+# _ledger_anchored_pass_at_head's own scan reads) rather than re-deriving a
+# third ledger-scan primitive -- re-deriving is the exact mistake that
+# produced this bug (see lr-542a43 task description).
 _ledger_latest_passing_head_for_branch() {
   _llphfb_file="$1"
   _llphfb_branch="$2"
+  _llphfb_gate="${3:-review}"
 
   [ -f "$_llphfb_file" ] || return 0
 
   if command -v jq >/dev/null 2>&1; then
     ledger_entries_for_branch "$_llphfb_file" "$_llphfb_branch" \
-      | jq -rs '[.[] | select(.verdict == "pass" and (.head_sha // "") != "")] | last | .head_sha // empty' 2>/dev/null
+      | jq -rs --arg g "$_llphfb_gate" '[.[] | select(.verdict == "pass" and (.head_sha // "") != "" and (.gate // "review") == $g)] | last | .head_sha // empty' 2>/dev/null
     return 0
   fi
   if command -v python3 >/dev/null 2>&1; then
     ledger_entries_for_branch "$_llphfb_file" "$_llphfb_branch" | python3 -c '
 import json, sys
+gate = sys.argv[1]
 best = ""
 for line in sys.stdin:
     line = line.strip()
@@ -1640,11 +1692,11 @@ for line in sys.stdin:
         entry = json.loads(line)
     except Exception:
         continue
-    if entry.get("verdict") == "pass" and entry.get("head_sha"):
+    if entry.get("verdict") == "pass" and entry.get("head_sha") and entry.get("gate", "review") == gate:
         best = entry["head_sha"]
 if best:
     print(best)
-' 2>/dev/null
+' "$_llphfb_gate" 2>/dev/null
     return 0
   fi
   # No JSON tool: no output -- caller (get_review_diff) treats empty the
@@ -1747,14 +1799,20 @@ PYEOF
   return 0
 }
 
-# _ledger_record_review_verdict OUT_FILE DIFF_FILE OUTCOME BASE_SHA HEAD_SHA
+# _ledger_record_review_verdict GATE OUT_FILE DIFF_FILE OUTCOME BASE_SHA HEAD_SHA
 #
 # Item 1/2/5: builds and appends one ledger entry for this review run.
-# OUTCOME is "pass" or "block" (the caller's own severity_blockers/degraded
-# determination — this function does not re-derive it). HEAD_SHA empty means
-# the verdict is UNANCHORED (see "review ledger" above) regardless of
-# OUTCOME — recorded for audit-trail completeness but never readable as a
-# passing verdict by _ledger_anchored_pass_at_head.
+# GATE is "review" or "adversarial" — written into the entry's own `gate`
+# field so each gate's anchor lookups (_ledger_latest_passing_head_for_branch,
+# _ledger_anchored_pass_at_head) can filter to entries THIS gate wrote,
+# never a sibling gate's. OUTCOME is "pass", "block", or "skip" (an empty
+# resolved diff; see cmd_review/cmd_adversarial's own empty-diff check) —
+# the caller's own severity_blockers/degraded/empty-diff determination,
+# this function does not re-derive it. HEAD_SHA empty means the verdict is
+# UNANCHORED (see
+# "review ledger" above) regardless of OUTCOME — recorded for audit-trail
+# completeness but never readable as a passing verdict by
+# _ledger_anchored_pass_at_head.
 #
 # Fail-open: a ledger write failure (no python3/jq, malformed OUT_FILE) must
 # never abort or alter the review gate's own pass/block decision — the
@@ -1762,11 +1820,12 @@ PYEOF
 # precondition for it. Matches every other on-disk gate-state writer's
 # posture in this file.
 _ledger_record_review_verdict() {
-  _lrrv_out="$1"
-  _lrrv_diff="$2"
-  _lrrv_outcome="$3"
-  _lrrv_base_sha="$4"
-  _lrrv_head_sha="$5"
+  _lrrv_gate="$1"
+  _lrrv_out="$2"
+  _lrrv_diff="$3"
+  _lrrv_outcome="$4"
+  _lrrv_base_sha="$5"
+  _lrrv_head_sha="$6"
 
   _lrrv_verdict="$_lrrv_outcome"
   [ -n "$_lrrv_head_sha" ] || _lrrv_verdict="unanchored"
@@ -1792,16 +1851,17 @@ _ledger_record_review_verdict() {
     _lrrv_line=$(jq -nc \
       --arg ts "$_lrrv_ts" \
       --arg branch "$_lrrv_branch" \
+      --arg gate "$_lrrv_gate" \
       --arg base "$_lrrv_base_sha" \
       --arg head "$_lrrv_head_sha" \
       --arg verdict "$_lrrv_verdict" \
       --argjson findings "$_lrrv_findings" \
       --argjson config "$_lrrv_config" \
-      '{ts: $ts, branch: $branch, base_sha: $base, head_sha: $head, verdict: $verdict, findings: $findings, config: $config}' 2>/dev/null)
+      '{ts: $ts, branch: $branch, gate: $gate, base_sha: $base, head_sha: $head, verdict: $verdict, findings: $findings, config: $config}' 2>/dev/null)
   elif command -v python3 >/dev/null 2>&1; then
-    _lrrv_line=$(python3 - "$_lrrv_ts" "$_lrrv_branch" "$_lrrv_base_sha" "$_lrrv_head_sha" "$_lrrv_verdict" "$_lrrv_findings" "$_lrrv_config" <<'PYEOF'
+    _lrrv_line=$(python3 - "$_lrrv_ts" "$_lrrv_branch" "$_lrrv_gate" "$_lrrv_base_sha" "$_lrrv_head_sha" "$_lrrv_verdict" "$_lrrv_findings" "$_lrrv_config" <<'PYEOF'
 import json, sys
-ts, branch, base, head, verdict, findings_json, config_json = sys.argv[1:8]
+ts, branch, gate, base, head, verdict, findings_json, config_json = sys.argv[1:9]
 try:
     findings = json.loads(findings_json)
     if not isinstance(findings, list):
@@ -1813,7 +1873,7 @@ try:
 except Exception:
     config = {}
 print(json.dumps({
-    "ts": ts, "branch": branch, "base_sha": base, "head_sha": head,
+    "ts": ts, "branch": branch, "gate": gate, "base_sha": base, "head_sha": head,
     "verdict": verdict, "findings": findings, "config": config,
 }))
 PYEOF
@@ -1825,11 +1885,20 @@ PYEOF
   _lrrv_max="${CLAGENTIC_LEDGER_MAX_PER_BRANCH:-0}"
   case "$_lrrv_max" in ''|*[!0-9]*) _lrrv_max=0 ;; esac
   ledger_append "$_lrrv_ledger" "$_lrrv_line" "$_lrrv_max"
-  ds_audit_log "review-ledger" "pass" "branch=${_lrrv_branch:-<none>} verdict=${_lrrv_verdict} head=${_lrrv_head_sha:-<unresolved>}"
+  ds_audit_log "review-ledger" "pass" "gate=${_lrrv_gate} branch=${_lrrv_branch:-<none>} verdict=${_lrrv_verdict} head=${_lrrv_head_sha:-<unresolved>}"
 
   # Publish (lr-2b07a8): observability only, never gating -- see
   # _publish_review_verdict's own doc comment for the fallback contract.
-  _publish_review_verdict "$_lrrv_branch" "$_lrrv_verdict" "$_lrrv_head_sha" "$_lrrv_findings"
+  # GATE-SCOPED: _publish_review_verdict's one-comment-per-run contract was
+  # designed for cmd_review only (its doc comment says "once per cmd_review
+  # run"); this function is now also called from cmd_adversarial to give
+  # that gate its own ledger anchor, but adding a second PR-comment stream
+  # for adversarial verdicts is a distinct, unscoped feature -- publish
+  # only when this
+  # entry came from the review gate.
+  if [ "$_lrrv_gate" = "review" ]; then
+    _publish_review_verdict "$_lrrv_branch" "$_lrrv_verdict" "$_lrrv_head_sha" "$_lrrv_findings"
+  fi
 
   return 0
 }
@@ -2107,7 +2176,16 @@ except Exception:
 # mis-stamping a SHA. Guard the whole function the same way: skip straight
 # to the documented "no staged changes" empty-diff fallback when REPO_ROOT
 # is not the git repo `_git` would actually resolve to.
+#
+# GATE_NAME: which gate is asking for a diff — "review" or "adversarial".
+# Required for the ledger-anchored delta lookup below: each gate now has
+# its OWN anchor namespace in the ledger
+# (_ledger_latest_passing_head_for_branch's GATE argument), so cmd_adversarial
+# can never consume cmd_review's just-written HEAD anchor and diff
+# HEAD..HEAD against it. Defaults to "review" when omitted, matching this
+# function's original behavior for any caller that hasn't been updated.
 get_review_diff() {
+  _grd_gate="${1:-review}"
   DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
 
   if ! _git_repo_root_is_scoped; then
@@ -2145,7 +2223,7 @@ get_review_diff() {
   # rather than re-deriving a third inline verdict check.
   if [ "${REVIEW_FULL:-0}" != "1" ]; then
     _grd_ledger=$(_review_ledger_path)
-    _grd_prior_head=$(_ledger_latest_passing_head_for_branch "$_grd_ledger" "$CURRENT_BRANCH")
+    _grd_prior_head=$(_ledger_latest_passing_head_for_branch "$_grd_ledger" "$CURRENT_BRANCH" "$_grd_gate")
 
     if [ -n "$_grd_prior_head" ]; then
       # UNRESOLVABLE PRIOR SHA (rebase/amend/force-push): a prior head_sha
@@ -2170,18 +2248,18 @@ get_review_diff() {
         _grd_delta_tmp=$(mktemp -t clagentic-review-delta.XXXXXX)
         _git diff "${_grd_prior_head}..HEAD" --unified=3 2>/dev/null > "$_grd_delta_tmp"
         if [ -s "$_grd_delta_tmp" ]; then
-          printf '[gates/review] delta re-review: diffing %s..HEAD (prior passing anchored verdict on this branch)\n' "$_grd_prior_head" 1>&2
+          printf '[gates/%s] delta re-review: diffing %s..HEAD (prior passing anchored verdict on this branch, gate=%s)\n' "$_grd_gate" "$_grd_prior_head" "$_grd_gate" 1>&2
           cat "$_grd_delta_tmp"
           rm -f "$_grd_delta_tmp"
           return 0
         fi
         rm -f "$_grd_delta_tmp"
-        printf '[gates/review] delta re-review: computed range %s..HEAD is empty (no new commits since the last passing verdict) — falling back to full-range review rather than reporting a silent pass\n' "$_grd_prior_head" 1>&2
+        printf '[gates/%s] delta re-review: computed range %s..HEAD is empty (no new commits since the last passing verdict) — falling back to full-range review rather than reporting a silent pass\n' "$_grd_gate" "$_grd_prior_head" 1>&2
       else
-        printf '[gates/review] delta re-review: prior passing verdict SHA %s is no longer an ancestor of HEAD (rebase/amend/force-push) — falling back to full-range review\n' "$_grd_prior_head" 1>&2
+        printf '[gates/%s] delta re-review: prior passing verdict SHA %s is no longer an ancestor of HEAD (rebase/amend/force-push) — falling back to full-range review\n' "$_grd_gate" "$_grd_prior_head" 1>&2
       fi
     else
-      printf '[gates/review] delta re-review: no prior passing anchored verdict for branch %s — full-range review\n' "${CURRENT_BRANCH:-<none>}" 1>&2
+      printf '[gates/%s] delta re-review: no prior passing anchored verdict for branch %s (gate=%s) — full-range review\n' "$_grd_gate" "${CURRENT_BRANCH:-<none>}" "$_grd_gate" 1>&2
     fi
   fi
 
@@ -2214,16 +2292,27 @@ get_review_diff() {
     rm -f "$_grd_fresh_err_tmp"
 
     if [ -z "$_grd_fresh_tip" ]; then
-      printf '[gates/review] branch baseline not provably current (%s) — refusing to produce a possibly-narrowed diff\n' "$_grd_fresh_err" 1>&2
+      printf '[gates/%s] branch baseline not provably current (%s) — refusing to produce a possibly-narrowed diff\n' "$_grd_gate" "$_grd_fresh_err" 1>&2
       return 1
     fi
 
-    printf '[gates/review] no staged changes — using branch diff vs verified origin/%s\n' "$DEFAULT_BRANCH" 1>&2
+    printf '[gates/%s] no staged changes — using branch diff vs verified origin/%s\n' "$_grd_gate" "$DEFAULT_BRANCH" 1>&2
     _git diff "${_grd_fresh_tip}...HEAD" --unified=3 2>/dev/null
     return 0
   fi
 
-  printf '[gates/review] no staged changes and on default branch — empty diff\n' 1>&2
+  printf '[gates/%s] no staged changes and on default branch — empty diff\n' "$_grd_gate" 1>&2
+}
+
+# _gate_resolved_diff_is_empty DIFF_FILE — true (exit 0) when DIFF_FILE has
+# zero bytes, i.e. get_review_diff resolved a range with nothing in it.
+# Thin, named predicate rather than an inline `[ ! -s FILE ]` at each of
+# cmd_review/cmd_adversarial's call sites -- both gates must apply the
+# identical test, and a shared name makes the intent ("did this gate
+# actually have anything to examine") greppable independent of either
+# caller's own variable-naming convention.
+_gate_resolved_diff_is_empty() {
+  [ ! -s "$1" ]
 }
 
 # _cross_round_dedup ENVELOPE_FILE DIFF_FILE SEEN_FILE
@@ -3327,13 +3416,21 @@ cmd_review() {
   _crv_seen_file="$REPO_ROOT/.clagentic/lite/review-seen-keys"
   _crv_recurrence_file="$REPO_ROOT/.clagentic/lite/review-recurrence.json"
   if [ "$_crv_reset_dedup" = "1" ]; then
+    # OUTCOME "skip", not "pass": --reset-dedup reviews nothing -- it
+    # deletes local dedup state and returns immediately, never touching the
+    # ledger. Logging it as "pass" was a third way (alongside the
+    # empty-diff case below) to record a passing review verdict for a run
+    # that examined zero diff content. "skip" is the same audit-vocabulary
+    # cmd_sast's pre-existing semgrep-not-installed skip and the empty-diff
+    # skip below already establish, not a new outcome invented for this
+    # call site alone.
     if [ -f "$_crv_seen_file" ] || [ -f "$_crv_recurrence_file" ]; then
       rm -f "$_crv_seen_file" "$_crv_recurrence_file"
       echo "[gates/review] cross-round dedup state reset (review-seen-keys and review-recurrence.json deleted)"
-      cmd_log_run review pass "cross-round dedup reset by --reset-dedup (recurrence counts cleared)"
+      cmd_log_run review skip "cross-round dedup reset by --reset-dedup (recurrence counts cleared) -- no review performed"
     else
       echo "[gates/review] cross-round dedup state already empty (review-seen-keys and review-recurrence.json not found)"
-      cmd_log_run review pass "cross-round dedup reset by --reset-dedup (files were absent)"
+      cmd_log_run review skip "cross-round dedup reset by --reset-dedup (files were absent) -- no review performed"
     fi
     return 0
   fi
@@ -3342,9 +3439,66 @@ cmd_review() {
 
   # Collect the diff into a temp file so we can measure its size for the
   # chunking threshold check and pass it to split_diff without re-running git.
+  # Capture get_review_diff's own stderr diagnostic alongside the diff so the
+  # empty-diff check below can name the resolved range in its skip reason
+  # without re-deriving it (get_review_diff already prints exactly which
+  # range/mode it resolved on every path -- see its own printf lines).
+  #
+  # STATUS EXPLICITLY GUARDED (regression fix): get_review_diff returns
+  # NONZERO on an unresolvable freshness precondition (branch baseline not
+  # provably current -- see its own doc comment) and this call site must
+  # still hard-fail on that per get_review_diff's own contract ("a caller
+  # that does not explicitly guard the call aborts the gate"). Redirecting
+  # its stderr to a file for the empty-diff reason below, without guarding
+  # the exit status here, would let `set -e` abort the WHOLE SCRIPT at this
+  # line before the `cat ... 1>&2` a few lines down ever ran -- silently
+  # swallowing the exact diagnostic get_review_diff wrote, the opposite of
+  # its own fail-loud contract. Capture the status explicitly and print the
+  # captured stderr (then re-raise via `return 1`) rather than letting an
+  # unguarded call's implicit `set -e` abort hide it.
   _crv_diff_tmp=$(mktemp -t clagentic-review-diff.XXXXXX)
-  get_review_diff > "$_crv_diff_tmp"
+  _crv_diff_reason_tmp=$(mktemp -t clagentic-review-diff-reason.XXXXXX)
+  _crv_diff_status=0
+  get_review_diff review > "$_crv_diff_tmp" 2>"$_crv_diff_reason_tmp" || _crv_diff_status=$?
+  cat "$_crv_diff_reason_tmp" 1>&2
+  if [ "$_crv_diff_status" -ne 0 ]; then
+    rm -f "$_crv_diff_tmp" "$_crv_diff_reason_tmp"
+    return 1
+  fi
   _crv_diff_bytes=$(ds_file_size "$_crv_diff_tmp")
+
+  # NO GATE MAY REPORT A VERDICT ON AN EMPTY INPUT -- the input-side half
+  # of INV-1b/lr-7047bf that fix never implemented: that fix hardened only
+  # "did the LLM run," never "was it given anything to examine". A zero-byte
+  # resolved diff must never reach the LLM at all -- it is neither a clean
+  # pass (nothing was examined) nor a block (nothing failed); it is SKIP,
+  # named with the resolved-range diagnostic get_review_diff already wrote
+  # to stderr above. Still records a ledger entry (gate=review, verdict
+  # "skip") so a later branch state can be told apart from "review never
+  # ran here at all," but a "skip" verdict can never satisfy
+  # _ledger_anchored_pass_at_head/_ledger_latest_passing_head_for_branch's
+  # "pass" filter -- an empty-diff round can never anchor a future delta or
+  # satisfy the merge-gate's ledger check.
+  if _gate_resolved_diff_is_empty "$_crv_diff_tmp"; then
+    _crv_empty_reason=$(tail -n 1 "$_crv_diff_reason_tmp" 2>/dev/null)
+    [ -n "$_crv_empty_reason" ] || _crv_empty_reason="resolved diff is empty"
+    rm -f "$_crv_diff_reason_tmp"
+    printf '{"degraded": false, "summary": "[clagentic-lite skip] no resolved diff to review: %s", "checked": [], "findings": []}\n' \
+      "$(printf '%s' "$_crv_empty_reason" | tr -d '"\\')" > "$OUT"
+    _review_sha=$(_git_repo_scoped_head_sha)
+    if [ -n "$_review_sha" ]; then
+      _stamp_envelope "$OUT" "$_review_sha"
+    fi
+    _crv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
+    _crv_fetch_timeout=$(ds_positive_int_or_default "$_crv_fetch_timeout" 30)
+    _crv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_crv_fetch_timeout")
+    cmd_log_run review skip "empty-resolved-diff: $_crv_empty_reason"
+    printf '[gates/review] SKIP: %s — no findings can be reported on an empty input, this is not a pass\n' "$_crv_empty_reason" 1>&2
+    _ledger_record_review_verdict review "$OUT" "$_crv_diff_tmp" "skip" "$_crv_base_sha" "$_review_sha"
+    rm -f "$_crv_diff_tmp"
+    return 0
+  fi
+  rm -f "$_crv_diff_reason_tmp"
 
   # Chunking threshold: CLAGENTIC_REVIEWER_MAX_DIFF_KB (operator-facing alias,
   # in KB) takes precedence; CLAGENTIC_REVIEW_CHUNK_BYTES (in bytes) is the
@@ -3542,7 +3696,7 @@ cmd_review() {
         # show a degraded round happened, and an unresolved head_sha
         # (or a resolved one paired with outcome "block" below) can never
         # be read as a passing verdict either way.
-        _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
+        _ledger_record_review_verdict review "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
         rm -f "$_crv_diff_tmp"
         rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
         return 2
@@ -3554,14 +3708,14 @@ cmd_review() {
         cmd_log_run review block "review-blocked: $BLOCKERS finding(s) at >= $THRESHOLD"
         echo "[gates/review] REVIEW_BLOCKED: $BLOCKERS finding(s) at or above severity '$THRESHOLD'." 1>&2
         cmd_render_review "$OUT" 1>&2
-        _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
+        _ledger_record_review_verdict review "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
         rm -f "$_crv_diff_tmp"
         rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
         return 1
       fi
       _cmd_log_run_checked_pass review "0 findings at >= $THRESHOLD (chunked)"
       cmd_render_review "$OUT"
-      _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "pass" "$_crv_base_sha" "$_review_sha"
+      _ledger_record_review_verdict review "$OUT" "$_crv_diff_tmp" "pass" "$_crv_base_sha" "$_review_sha"
       rm -f "$_crv_diff_tmp"
       rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
       return 0
@@ -3680,7 +3834,7 @@ cmd_review() {
     echo "[gates/review] full details: $OUT  |  scripts/gates.sh digest" 1>&2
     # Degraded: no real verdict was reached — see the chunked-path comment
     # at its own degraded exit for why this is still recorded.
-    _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
+    _ledger_record_review_verdict review "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
     rm -f "$_crv_diff_tmp"
     return 2
   fi
@@ -3691,13 +3845,13 @@ cmd_review() {
     cmd_log_run review block "review-blocked: $BLOCKERS finding(s) at >= $THRESHOLD"
     echo "[gates/review] REVIEW_BLOCKED: $BLOCKERS finding(s) at or above severity '$THRESHOLD'." 1>&2
     cmd_render_review "$OUT" 1>&2
-    _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
+    _ledger_record_review_verdict review "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
     rm -f "$_crv_diff_tmp"
     return 1
   fi
   _cmd_log_run_checked_pass review "0 findings at >= $THRESHOLD"
   cmd_render_review "$OUT"
-  _ledger_record_review_verdict "$OUT" "$_crv_diff_tmp" "pass" "$_crv_base_sha" "$_review_sha"
+  _ledger_record_review_verdict review "$OUT" "$_crv_diff_tmp" "pass" "$_crv_base_sha" "$_review_sha"
   rm -f "$_crv_diff_tmp"
 }
 
@@ -4284,10 +4438,85 @@ _sanitize_adversarial_findings_json() {
 }
 
 cmd_adversarial() {
+  # --full-review: gates.sh's dispatcher now forwards argv
+  # to this function (previously a bare `cmd_adversarial ;;` with no shift/
+  # "$@" -- a documented, accepted flag was silently discarded, producing a
+  # confident "I forced a full audit" that was false). Parsed the same way
+  # cmd_review parses it: sets/exports REVIEW_FULL=1, which get_review_diff
+  # reads to skip the ledger-anchored delta and use the full branch-diff-
+  # against-default (or staged-diff) path instead.
+  REVIEW_FULL=0
+  for _adv_arg in "$@"; do
+    case "$_adv_arg" in
+      --full-review) REVIEW_FULL=1 ;;
+    esac
+  done
+  export REVIEW_FULL
+
   OUT="$REPO_ROOT/.clagentic/lite/last-adversarial.md"
   FINDINGS_OUT="$REPO_ROOT/.clagentic/lite/last-adversarial-findings.json"
   _adv_diff_tmp=$(mktemp -t clagentic-adv-diff.XXXXXX)
-  get_review_diff > "$_adv_diff_tmp"
+  # GATE-SCOPED ANCHOR: "adversarial" gives this call its
+  # own ledger anchor namespace -- get_review_diff's delta-base lookup now
+  # filters on gate, so a review pass recorded moments earlier at HEAD (the
+  # normal cmd_ship order: review, then adversarial, in the same process)
+  # can never anchor THIS call's delta and collapse it to HEAD..HEAD.
+  #
+  # STATUS EXPLICITLY GUARDED (same regression fix as cmd_review's own
+  # get_review_diff call site -- see its comment for the full rationale):
+  # get_review_diff returns nonzero on an unresolvable freshness
+  # precondition and must still hard-fail here; redirecting its stderr to a
+  # file without guarding the exit status would let `set -e` abort before
+  # the `cat ... 1>&2` below ever ran, silently swallowing the diagnostic.
+  _adv_diff_reason_tmp=$(mktemp -t clagentic-adv-diff-reason.XXXXXX)
+  _adv_diff_status=0
+  get_review_diff adversarial > "$_adv_diff_tmp" 2>"$_adv_diff_reason_tmp" || _adv_diff_status=$?
+  cat "$_adv_diff_reason_tmp" 1>&2
+  if [ "$_adv_diff_status" -ne 0 ]; then
+    rm -f "$_adv_diff_tmp" "$_adv_diff_reason_tmp"
+    return 1
+  fi
+  # NO GATE MAY REPORT A VERDICT ON AN EMPTY INPUT -- the input-side half
+  # of INV-1b/lr-7047bf that fix never implemented; see that fix's own
+  # comment two lines below, which guards only whether the auditor RAN,
+  # never whether it was GIVEN ANYTHING. Before this check, cmd_adversarial
+  # handed an empty diff straight to the auditor exactly like a non-empty
+  # one -- the auditor "examined" zero bytes, wrote zero [FINDING] headers,
+  # and this function reported it identically to a genuine clean pass
+  # ("warn", exit 0). A zero-byte resolved diff must short-circuit BEFORE
+  # the LLM call: it is neither a clean pass (nothing was examined) nor a
+  # degraded run (the auditor never got the chance to fail) -- it is SKIP,
+  # named with get_review_diff's own resolved-range diagnostic (captured
+  # to stderr above). Still records a ledger entry (gate=adversarial,
+  # verdict "skip") so a later branch state can be told apart from
+  # "adversarial never ran here at all," but a "skip" verdict can never
+  # satisfy _ledger_latest_passing_head_for_branch's "pass" filter -- an
+  # empty-diff round can never anchor a future adversarial delta either.
+  if _gate_resolved_diff_is_empty "$_adv_diff_tmp"; then
+    _adv_empty_reason=$(tail -n 1 "$_adv_diff_reason_tmp" 2>/dev/null)
+    [ -n "$_adv_empty_reason" ] || _adv_empty_reason="resolved diff is empty"
+    rm -f "$_adv_diff_reason_tmp"
+    printf '[clagentic-lite skip] no resolved diff to audit: %s\n' "$_adv_empty_reason" > "$OUT"
+    _adv_sha=$(_git_repo_scoped_head_sha)
+    if [ -n "$_adv_sha" ]; then
+      _adv_tmp=$(mktemp -t clagentic-adv-stamp.XXXXXX)
+      printf '<!-- clagentic-diff-sha: %s -->\n' "$_adv_sha" > "$_adv_tmp"
+      cat "$OUT" >> "$_adv_tmp"
+      mv "$_adv_tmp" "$OUT"
+    fi
+    printf '[]' > "$FINDINGS_OUT"
+    printf '{"dropped_count": 0, "total_before_cap": 0}\n' > "$REPO_ROOT/.clagentic/lite/last-adversarial-findings-meta.json"
+    cmd_log_run adversarial skip "empty-resolved-diff: $_adv_empty_reason"
+    printf '[gates/adversarial] SKIP: %s — no findings can be reported on an empty input, this is not a clean pass\n' "$_adv_empty_reason" 1>&2
+    _adv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
+    _adv_fetch_timeout=$(ds_positive_int_or_default "$_adv_fetch_timeout" 30)
+    _adv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_adv_fetch_timeout")
+    _ledger_record_review_verdict adversarial "$OUT" "$_adv_diff_tmp" "skip" "$_adv_base_sha" "$_adv_sha"
+    rm -f "$_adv_diff_tmp"
+    cat "$OUT"
+    return 0
+  fi
+  rm -f "$_adv_diff_reason_tmp"
   # STATUS-CHECKED + DEGRADED-CHECKED (lr-7047bf, INV-1b): this used to be
   # THE WORST site in the class -- no check of any kind. A fully-dead
   # auditor wrote a degraded markdown envelope, _parse_adversarial_findings
@@ -4451,7 +4680,13 @@ EOF3
     _invariant_feed_write adversarial "$_adv_findings_json" "$_adv_diff_tmp" "$_adv_prior_seen_snap" "$_adv_seen_file"
     rm -f "$_adv_prior_seen_snap"
   fi
-  rm -f "$_adv_diff_tmp"
+
+  # base_sha for the ledger entry -- same provably-current resolution
+  # cmd_review's own ledger write uses (see _resolve_base_sha's own doc
+  # comment).
+  _adv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
+  _adv_fetch_timeout=$(ds_positive_int_or_default "$_adv_fetch_timeout" 30)
+  _adv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_adv_fetch_timeout")
 
   # cmd_adversarial can no longer report a clean audit when the auditor was
   # dead. A degraded emission is a distinct, mechanically-detectable outcome
@@ -4482,10 +4717,17 @@ EOF3
     fi
     _llm_degraded_remediation_lines "$_adv_cause" 1>&2
     echo "[gates/adversarial] full details: $OUT  |  scripts/gates.sh digest" 1>&2
+    # Degraded: no real audit was reached -- recorded as "block" (never
+    # readable as a passing anchor), same doctrine cmd_review's own
+    # degraded exits already use for the review ledger.
+    _ledger_record_review_verdict adversarial "$OUT" "$_adv_diff_tmp" "block" "$_adv_base_sha" "$_adv_sha"
+    rm -f "$_adv_diff_tmp"
     cat "$OUT"
     return 2
   fi
   cmd_log_run adversarial warn "wrote $OUT (non-blocking)"
+  _ledger_record_review_verdict adversarial "$OUT" "$_adv_diff_tmp" "pass" "$_adv_base_sha" "$_adv_sha"
+  rm -f "$_adv_diff_tmp"
   cat "$OUT"
 }
 
@@ -6548,6 +6790,19 @@ cmd_ship() {
   # records the same distinction under its own outcome vocabulary
   # (degraded, not a bare "ran") so a degraded-but-non-blocking auditor is
   # still visible as a LOUD, greppable state, per this task's policy.
+  #
+  # cmd_review runs immediately above and writes a "review" ledger pass
+  # entry at HEAD before returning -- previously, cmd_adversarial's OWN
+  # delta-base lookup had no gate discriminator of its own, so it consumed
+  # that same-run review anchor and resolved HEAD..HEAD (an empty diff),
+  # which get_review_diff then handed straight to the auditor with no
+  # check, reporting a silent clean audit on `gates ship`'s first run on
+  # EVERY branch. Fixed at the source: cmd_adversarial now calls
+  # get_review_diff with its own "adversarial" gate name, so it only ever
+  # anchors on its OWN prior passing verdicts, never review's -- no
+  # ordering change or `cmd_ship`-local workaround is needed here,
+  # cmd_adversarial gets the same non-empty range it would get standalone
+  # regardless of what cmd_review just wrote.
   if gate_enabled adversarial; then
     _adv_watermark=$(_manifest_audit_watermark)
     _adv_rc=0
@@ -6916,7 +7171,7 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
     deps)           cmd_deps ;;
     sast)           cmd_sast ;;
     review)         shift; cmd_review "$@" ;;
-    adversarial)    cmd_adversarial ;;
+    adversarial)    shift; cmd_adversarial "$@" ;;
     merge-gate)     shift; cmd_merge_gate "$@" ;;
     render-review)  shift; cmd_render_review "$@" ;;
     render-manifest) shift; cmd_render_manifest "$@" ;;
@@ -6928,7 +7183,7 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
     digest)         cmd_digest ;;
     status)         shift; cmd_status "$@" ;;
     tail)           shift; cmd_tail "$@" ;;
-    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial|merge-gate [--recheck]|render-review|render-manifest [FILE]|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial [--full-review]|merge-gate [--recheck]|render-review|render-manifest [FILE]|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
   esac
 elif [ -z "${CLAGENTIC_GATES_DELIBERATE_SOURCE:-}" ]; then
   echo "gates.sh: CLAGENTIC_GATES_SOURCE_ONLY is set but CLAGENTIC_GATES_DELIBERATE_SOURCE is not -- dispatch suppressed with no provenance asserting deliberate sourcing, refusing to report a false pass. If dot-sourcing this file on purpose, set both variables. If you did not mean to set CLAGENTIC_GATES_SOURCE_ONLY, unset it." 1>&2
