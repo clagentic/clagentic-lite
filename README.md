@@ -415,7 +415,7 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
 | **Builder** | claude | Write code on a feature branch. Never merges. | Read, Write, Edit, Bash (allowlisted) |
 | **Reviewer** | codex | Read staged diff, return JSON findings. | Read, Bash (read-only) |
 | **Auditor** | codex | LLM narration on top of deterministic security scans. Adversarial mode plays attacker. | Read, Bash (security tools) |
-| **Merge Gate** | claude | Final approve/refuse decision over every prior gate's output. Never opens PRs. | Read |
+| **Merge Gate** | claude | Final approve/refuse decision over every prior gate's output. Never opens PRs. | Read, Bash (unrestricted) |
 
 Each role is a markdown file under `.claude/agents/` with the role contract in the body. Model selection for non-interactive invocations (via `llm-client.sh`) is controlled by `CLAGENTIC_<ROLE>_CMD` and `CLAGENTIC_<ROLE>_TIER` in config. The Reviewer file is the longest — it carries the Pre-Report Gate and the Common False Positives list, both load-bearing for output quality.
 

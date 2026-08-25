@@ -1286,5 +1286,244 @@ class TestNoTrackedLiveHookScriptUnderClaudeDir(unittest.TestCase):
         )
 
 
+
+
+# ---------------------------------------------------------------------- #
+# lr-507c4a: README's and docs/DESIGN.md's Merge Gate role-table entry
+# must agree with ds_llm_role_is_bash_unrestricted (scripts/platform.sh).
+# ---------------------------------------------------------------------- #
+#
+# THE DEFECT THIS CLOSES: README's Merge Gate row previously read "Read"
+# only, while ds_llm_role_is_bash_unrestricted has granted gate|builder|
+# summarizer full unrestricted Bash since lr-49df97. The two facts drifted
+# because they were two independently hand-maintained descriptions of the
+# same behavior with nothing keeping them in sync -- correcting the prose
+# once (holden, lr-507c4a: the doc was wrong, not the code -- the gate
+# needs Bash to inspect the tree, and narrowing it would be a real
+# behavioral change to the last check before main, made on a guess rather
+# than evidence) fixes this instance; only a mechanical check against the
+# actual predicate closes the CLASS, per AGENTS.md rule 8 and the
+# Sweeping-test discovery convention above.
+#
+# WHY A TEST OVER THE TABLE, NOT A GENERATED TABLE: the role tables in
+# README.md and docs/DESIGN.md are prose-embedded -- each row also carries
+# a free-text Job description and (in DESIGN.md) a paragraph of mechanism
+# explanation that doesn't correspond to anything ds_llm_role_is_bash_
+# unrestricted could regenerate. Generating the whole table would mean
+# generating prose from a boolean, which is a worse fit than asserting the
+# one machine-checkable fact (does this row's Tools cell claim Bash is
+# unrestricted?) agrees with the function that actually decides it. A
+# verification test is the cheaper, more precise choice here.
+#
+# SWEEP: covers Merge Gate, Builder, and Summarizer -- the acceptance
+# criteria named builder and summarizer as needing the same check gate
+# got. Builder and Merge Gate both have a real doc row in both tables;
+# Summarizer has no Tools-column row in either table (it is called out as
+# a "non-role" in prose, docs/DESIGN.md line 40) so there is no cell to
+# check it against -- this is not a gap, there is nothing to sweep.
+# Reviewer and Auditor are intentionally NOT covered here even though they
+# also key off the same predicate: this sweep only asserts the
+# UNRESTRICTED side of the predicate against the docs' claim of
+# unrestricted Bash, mirroring the specific contradiction that motivated
+# lr-507c4a (a doc claiming LESS access than the code grants). Reviewer/
+# Auditor's docs already correctly describe restriction in prose
+# (test_reviewer_tool_restriction.py covers that side of the predicate
+# directly against the real invoke_claude/invoke_codex call).
+
+
+def _ds_llm_role_is_bash_unrestricted(role):
+    """Direct probe of the real predicate (scripts/platform.sh) -- never a
+    re-derived Python copy of the gate|builder|summarizer enumeration, so
+    this test can't drift from the function it's meant to verify against."""
+    script = f'. "{PLATFORM_SH}"\nds_llm_role_is_bash_unrestricted {role}\necho "RC=$?"\n'
+    r = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
+    return "RC=0" in r.stdout.splitlines()
+
+
+# Role name -> the exact bold-markdown row label used in both README.md's
+# and docs/DESIGN.md's role tables (`| **Merge Gate** | ... |`). Table row
+# discovery below is driven by these labels, not a hardcoded expected-text
+# snapshot of the Tools cell -- only the PRESENCE of an unrestricted-Bash
+# claim in that cell is asserted, so a future rewording of the surrounding
+# prose does not spuriously trip this sweep.
+_ROLE_TABLE_LABELS = {
+    "gate": "Merge Gate",
+    "builder": "Builder",
+}
+
+README_MD = os.path.join(TOOL_HOME, "README.md")
+DESIGN_MD = os.path.join(TOOL_HOME, "docs", "DESIGN.md")
+
+# A doc cell claims "Bash is unrestricted for this role" when it contains
+# the word Bash without being immediately qualified by a restriction marker
+# on the same row (no-Bash / read-only / allowlisted / security tools).
+# allowlisted is treated as a RESTRICTION marker here even though Builder's
+# actual code path is unrestricted per the predicate -- see
+# _extract_role_row_tools_cell's caller for how Builder's row is actually
+# read; this constant only supplies the marker vocabulary.
+_RESTRICTION_MARKERS = ("no bash", "read-only", "security tools")
+
+
+# Both README.md and docs/DESIGN.md also have a GATES table with its own
+# unrelated "Merge Gate" row (the gate's blocking/trigger behavior, not its
+# tool grants) -- a bare label search across the whole file would match
+# that row too. Anchor to the specific ROLE table by its own header row
+# text (the one column-header phrase every role table in this repo uses
+# for the tools column) and only search rows between that header and the
+# next blank-line-preceded non-table content.
+_ROLE_TABLE_HEADER_MARKERS = ("Tools allowed", "State-changing tools")
+
+
+def _extract_role_row(md_lines, label):
+    """Find the ROLE table's header row first (never the Gates table, which
+    also has Merge Gate/Builder-adjacent rows), then the row `| **<label>**
+    | ... |` within that table, and return its LAST pipe-delimited cell
+    (the Tools/Tools-allowed/State-changing-tools column) -- discovery is
+    by label text within the correct live markdown table, not a fixed line
+    number, so a table reflow doesn't break this sweep the way a
+    hardcoded line number would."""
+    in_role_table = False
+    needle = f"**{label}**"
+    for line in md_lines:
+        stripped = line.strip()
+        if not in_role_table:
+            if stripped.startswith("|") and any(m in line for m in _ROLE_TABLE_HEADER_MARKERS):
+                in_role_table = True
+            continue
+        if not stripped.startswith("|"):
+            # First non-table line after the header ends this table.
+            break
+        if needle not in line:
+            continue
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        return cells[-1]
+    return None
+
+
+def _doc_cell_claims_bash_unrestricted(cell):
+    """True iff the Tools cell's own text asserts Bash without a
+    restriction qualifier on the same row. Builder's cell reads
+    'Bash (allowlisted)' in both tables -- allowlisted describes a
+    workflow-level scoping (pre-bash-guard's rule list), not the
+    ds_llm_role_is_bash_unrestricted restriction this sweep governs
+    (Builder is not routed through invoke_claude/invoke_codex's
+    --allowedTools/--disallowedTools path at all, see scripts/llm-client.sh
+    cmd_build), so 'allowlisted' is NOT treated as a restriction marker for
+    Builder's row -- only Reviewer/Auditor's genuine no-Bash/read-only/
+    security-tools phrasing would trip that path, and this sweep does not
+    check those roles (see module-level comment above)."""
+    if cell is None:
+        return None
+    lower = cell.lower()
+    if "bash" not in lower:
+        return False
+    for marker in ("no bash",):
+        if marker in lower:
+            return False
+    return True
+
+
+class TestRoleTableAgreesWithBashUnrestrictedPredicate(unittest.TestCase):
+    """lr-507c4a: for every role this repo documents as Bash-unrestricted
+    in README.md's and docs/DESIGN.md's role tables, the doc's claim must
+    agree with ds_llm_role_is_bash_unrestricted's real return value -- and
+    vice versa. Fails if either file's Merge Gate or Builder row disagrees
+    with the predicate, the exact shape that let README drift to 'Read'
+    only while the code granted full Bash."""
+
+    def setUp(self):
+        with open(README_MD, encoding="utf-8") as f:
+            self.readme_lines = f.readlines()
+        with open(DESIGN_MD, encoding="utf-8") as f:
+            self.design_lines = f.readlines()
+
+    def test_sweep_anchor_finds_both_known_rows_in_both_files(self):
+        """Fail loudly, not vacuously, if a role table is ever restructured
+        so the label-based row lookup below stops finding anything."""
+        for md_name, lines in (("README.md", self.readme_lines), ("docs/DESIGN.md", self.design_lines)):
+            for role, label in _ROLE_TABLE_LABELS.items():
+                cell = _extract_role_row(lines, label)
+                self.assertIsNotNone(
+                    cell,
+                    f"{md_name}: could not find a role-table row for "
+                    f"'{label}' -- sweep anchor lost, the agreement check "
+                    f"below would pass vacuously with nothing to compare",
+                )
+
+    def test_readme_and_design_role_tables_agree_with_predicate(self):
+        mismatches = []
+        for md_name, lines in (("README.md", self.readme_lines), ("docs/DESIGN.md", self.design_lines)):
+            for role, label in _ROLE_TABLE_LABELS.items():
+                cell = _extract_role_row(lines, label)
+                if cell is None:
+                    continue
+                doc_says_unrestricted = _doc_cell_claims_bash_unrestricted(cell)
+                code_is_unrestricted = _ds_llm_role_is_bash_unrestricted(role)
+                if doc_says_unrestricted != code_is_unrestricted:
+                    mismatches.append(
+                        f"{md_name} role '{label}': doc cell {cell!r} implies "
+                        f"unrestricted={doc_says_unrestricted}, but "
+                        f"ds_llm_role_is_bash_unrestricted {role} returned "
+                        f"unrestricted={code_is_unrestricted}"
+                    )
+        self.assertEqual(
+            mismatches, [],
+            "README.md/docs/DESIGN.md role table disagrees with "
+            "ds_llm_role_is_bash_unrestricted (scripts/platform.sh) -- the "
+            "doc must describe what the code does (lr-507c4a):\n" +
+            "\n".join(f"  {m}" for m in mismatches),
+        )
+
+
+class TestRoleTableSweepCatchesADeliberateDisagreement(unittest.TestCase):
+    """Proves the sweep above actually trips on disagreement, using a
+    synthetic README-shaped fixture where the Merge Gate row is reverted
+    to the exact pre-fix text ('Read' only, no Bash) while the real
+    predicate still returns unrestricted for gate -- the precise defect
+    shape lr-507c4a fixed. Mirrors TestSweepCatchesAnUnboundSiblingInvocation's
+    self-test discipline for the INV-4 sweep above."""
+
+    _STALE_DOC_FIXTURE = (
+        "| Role | Default CLI | Job | State-changing tools |\n"
+        "|---|---|---|---|\n"
+        "| **Builder** | claude | Write code on a feature branch. Never merges. | Read, Write, Edit, Bash (allowlisted) |\n"
+        "| **Merge Gate** | claude | Final approve/refuse decision over every prior gate's output. Never opens PRs. | Read |\n"
+    )
+
+    _FIXED_DOC_FIXTURE = (
+        "| Role | Default CLI | Job | State-changing tools |\n"
+        "|---|---|---|---|\n"
+        "| **Builder** | claude | Write code on a feature branch. Never merges. | Read, Write, Edit, Bash (allowlisted) |\n"
+        "| **Merge Gate** | claude | Final approve/refuse decision over every prior gate's output. Never opens PRs. | Read, Bash (unrestricted) |\n"
+    )
+
+    def test_stale_gate_row_trips_the_sweep(self):
+        lines = self._STALE_DOC_FIXTURE.splitlines(keepends=True)
+        cell = _extract_role_row(lines, "Merge Gate")
+        self.assertEqual(cell, "Read")
+        doc_says_unrestricted = _doc_cell_claims_bash_unrestricted(cell)
+        code_is_unrestricted = _ds_llm_role_is_bash_unrestricted("gate")
+        self.assertTrue(code_is_unrestricted, "sanity: predicate must be true for gate")
+        self.assertNotEqual(
+            doc_says_unrestricted, code_is_unrestricted,
+            "the stale pre-fix fixture ('Read' only) must disagree with "
+            "the real predicate -- if this assertion fails, the sweep's "
+            "own comparison logic would not have caught the real defect "
+            "this task fixed",
+        )
+
+    def test_fixed_gate_row_does_not_trip_the_sweep(self):
+        lines = self._FIXED_DOC_FIXTURE.splitlines(keepends=True)
+        cell = _extract_role_row(lines, "Merge Gate")
+        doc_says_unrestricted = _doc_cell_claims_bash_unrestricted(cell)
+        code_is_unrestricted = _ds_llm_role_is_bash_unrestricted("gate")
+        self.assertEqual(
+            doc_says_unrestricted, code_is_unrestricted,
+            "the corrected fixture must agree with the real predicate",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
