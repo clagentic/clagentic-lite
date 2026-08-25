@@ -101,7 +101,7 @@ cd /path/to/your/project && clagentic-lite enroll
 
 If you stop after `init` without running `enroll` in at least one project, the harness is installed but dormant — no gates are active anywhere.
 
-After the first install, the steady-state upgrade is just `clagentic-lite update` — it does the `git pull --ff-only`, re-checks prereqs, and re-stamps hook shims, `.claude/settings.json`, and `CLAUDE.md` in every enrolled repo when their template versions change.
+After the first install, the steady-state upgrade is just `clagentic-lite update` — it does the `git pull --ff-only`, re-checks prereqs, and re-stamps hook shims, `.claude/settings.json`, and `CLAUDE.md` in every enrolled repo when their template versions change. **It does NOT touch `~/.config/clagentic/config`** — your global config is written once by `init` and never rewritten by `update`, so a config key added after your install predates it silently. Run `clagentic-lite doctor` after updating to see which keys in `share/config.example` your installed config is missing, then add any you want by hand.
 
 **Upgrading and the secrets gate.** If any enrolled repo's `.gitleaks.toml` declares no `[[rules]]` table and has no `[extend]` / `useDefault = true`, the secrets gate previously reported a permanent, silent pass — `gitleaks --config` replaces the built-in ruleset rather than merging with it, so a rules-less config detects nothing. Since the fix for this, that same config now **blocks** the `secrets` gate outright, naming the cause, instead of passing. That is the correct behavior, but if your gate has been green for a while, it can look like the upgrade broke something. Run `clagentic-lite doctor` after updating — it now warns on exactly this condition for every enrolled repo, before you hit the block, and names the fix (`[extend]` / `useDefault = true`, or declare your own `[[rules]]`). See [`docs/GATES.md`, "4a. Secrets"](docs/GATES.md#4a-secrets-pre-commit) for the full mechanism.
 
@@ -111,7 +111,7 @@ If `init` warns that `~/.local/bin` is not on `$PATH`, add this to your shell rc
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic-lite update` — pulls `--ff-only`, re-checks prereqs, re-stamps all versioned artifacts in enrolled repos when their template versions change.
+There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic-lite update` — pulls `--ff-only`, re-checks prereqs, re-stamps all versioned artifacts in enrolled repos when their template versions change. Your global config (`~/.config/clagentic/config`) is not one of those artifacts — see above.
 
 The tool is cloned once to `~/.clagentic/lite` (or `$CLAGENTIC_LITE_HOME` if set). Your projects never contain a copy of the scripts or agent files — they hold only `.clagentic/lite/{audit.db,memory.db}`, thin hook shims, and a `CLAUDE.md` that call back to `$CLAGENTIC_LITE_HOME`. Update the tool once and every enrolled repo picks it up.
 
