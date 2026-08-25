@@ -3863,11 +3863,12 @@ _update_report_or_refresh_config() {
 # are themselves comments (no value substitution) — no configured VALUE from
 # either file is ever read into a shell variable or printed here.
 #
-# chmod 600 discipline: the temp file used for the atomic append is created
-# with `install -m 600` (or mkfile+chmod fallback) BEFORE any content is
-# written to it, so it is never briefly world-readable; the final `mv` onto
-# $GLOBAL_CONFIG preserves the destination's own mode bit changes are then
-# reasserted with an explicit chmod 600 pass regardless of umask.
+# chmod 600 discipline: the temp file is truncated-created (`: >`) then
+# chmod 600'd BEFORE any content is written to it, so it is never briefly
+# world-readable regardless of umask; content is only appended to
+# $GLOBAL_CONFIG itself (never rewritten wholesale here), and $GLOBAL_CONFIG
+# is explicitly chmod 600'd again immediately after, matching every other
+# write path in this file.
 _append_missing_config_keys() {
   _amck_missing="$1"
   _amck_count="$2"
@@ -3897,7 +3898,6 @@ _append_missing_config_keys() {
     printf '# a value to opt in to any of these.\n'
   } >> "$_amck_tmp"
 
-  _amck_appended=0
   printf '%s\n' "$_amck_missing" | while IFS= read -r _amck_key; do
     [ -z "$_amck_key" ] && continue
     # Pull the key's own line(s) verbatim from config.example: its immediately
