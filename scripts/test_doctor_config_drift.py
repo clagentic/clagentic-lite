@@ -12,10 +12,19 @@ verbatim) so drift is exercised deterministically regardless of how many
 real keys config.example currently has -- these tests point GLOBAL_CONFIG at
 a throwaway file under a temp HOME, never at a real ~/.config/clagentic/config.
 
-`doctor` never runs `git -C "$CLAGENTIC_LITE_HOME" stash` (only `update`
-does -- see test_update_nontty_discard_guard.py's HAZARD discipline), so
-CLAGENTIC_LITE_HOME can point straight at the live checkout here, matching
-test_doctor_gitleaks_config_advisory.py's own precedent.
+HAZARD (PEACHES PR #193 review, finding 1 -- class re-audit): `cmd_doctor`
+itself never runs a mutating `git` subcommand and every `_doctor_check_*`
+helper it calls (including `_doctor_check_config_drift`) is read-only
+against $CLAGENTIC_LITE_HOME. There IS one conditional write path inside
+`cmd_doctor` -- an auto-restamp of .clagentic/lite/builder-contract.md for
+any repo listed in $HOME/.local/state/clagentic/registry -- but it is keyed
+off $HOME's registry, not $CLAGENTIC_LITE_HOME directly, and every test
+below uses a fresh tempdir HOME with no registry file, so that path can
+never fire here. Even so, CLAGENTIC_LITE_HOME below points at a throwaway
+`git clone` of the real checkout (never the live tree itself), matching
+test_update_nontty_discard_guard.py's `_clone_tool_home` helper exactly --
+the stronger, doubt-free guarantee, rather than relying on the doctor-is-
+read-only argument alone.
 
 Run with: python3 -m unittest scripts.test_doctor_config_drift -v
 """
@@ -26,7 +35,14 @@ import tempfile
 import unittest
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
+
+
+def _clone_tool_home(dest):
+    subprocess.run(["git", "clone", "-q", TOOL_HOME, dest], check=True, capture_output=True)
+    subprocess.run(["git", "-C", dest, "config", "user.email", "test@example.com"],
+                    check=True, capture_output=True)
+    subprocess.run(["git", "-C", dest, "config", "user.name", "Test"],
+                    check=True, capture_output=True)
 
 
 class _DoctorConfigDriftTestBase(unittest.TestCase):
@@ -38,6 +54,8 @@ class _DoctorConfigDriftTestBase(unittest.TestCase):
         self.config_dir = os.path.join(self.home, ".config", "clagentic")
         os.makedirs(self.config_dir)
         self.config_path = os.path.join(self.config_dir, "config")
+        self.fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")
+        _clone_tool_home(self.fake_tool_home)
 
     def _write_global_config(self, body):
         with open(self.config_path, "w") as f:
@@ -46,12 +64,13 @@ class _DoctorConfigDriftTestBase(unittest.TestCase):
     def _run_doctor(self):
         env = dict(os.environ)
         env["HOME"] = self.home
-        env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
+        env["CLAGENTIC_LITE_HOME"] = self.fake_tool_home
         env["CLAGENTIC_SKIP_UPDATE_ALERT"] = "1"
         env.pop("CLAGENTIC_HOME", None)
         env.pop("CLAGENTIC_ROUTER_URL", None)
         proc = subprocess.run(
-            [CLI, "doctor"], cwd=self.tmpdir, env=env,
+            [os.path.join(self.fake_tool_home, "bin", "clagentic-lite"), "doctor"],
+            cwd=self.tmpdir, env=env,
             capture_output=True, text=True, timeout=30,
         )
         return proc.returncode, proc.stdout, proc.stderr
@@ -104,7 +123,7 @@ class TestNoDriftWhenAllKeysPresent(_DoctorConfigDriftTestBase):
         false positive on config.example's own commented-out keys, since
         both the installed file and the source template carry the same
         commented lines here."""
-        example_path = os.path.join(TOOL_HOME, "share", "config.example")
+        example_path = os.path.join(self.fake_tool_home, "share", "config.example")
         with open(example_path) as f:
             example_body = f.read()
         self._write_global_config(example_body)
@@ -121,7 +140,7 @@ class TestNoDriftWhenAllKeysPresent(_DoctorConfigDriftTestBase):
         customization. Uses CLAGENTIC_DEFAULT_BRANCH, a key no OTHER doctor
         check consumes, so a leaked value elsewhere in doctor's unrelated
         output can't produce a false failure here."""
-        example_path = os.path.join(TOOL_HOME, "share", "config.example")
+        example_path = os.path.join(self.fake_tool_home, "share", "config.example")
         with open(example_path) as f:
             lines = f.readlines()
         customized = []
