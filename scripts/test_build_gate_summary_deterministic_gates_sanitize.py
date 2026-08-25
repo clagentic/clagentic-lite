@@ -285,6 +285,28 @@ class TestDeterministicGatesFencedJqBranch(unittest.TestCase):
         self.assertIn("semgrep clean", fenced)
         self.assertIn("pass", fenced)
 
+    def test_fenced_json_body_round_trips_to_the_same_object(self):
+        """End-to-end structure check (PEACHES, PR #205 review): substring
+        assertions on the fenced TEXT (above) don't prove the JSON embedded
+        between the markers is actually well-formed and equal to the
+        unfenced `deterministic_gates` object -- extract exactly the text
+        between the two fence markers and json.loads it directly, then
+        compare against `deterministic_gates` field-by-field."""
+        _seed_audit_db(self._tmpdir, [
+            ("secrets", "pass", "clean"),
+            ("deps", "warn", "2 advisories"),
+            ("sast", "block", "1 finding"),
+        ])
+        payload = _run_build_gate_summary(self._tmpdir)
+        fenced = payload["deterministic_gates_fenced"]
+        begin = "===BEGIN DETERMINISTIC GATES DATA==="
+        end = "===END DETERMINISTIC GATES DATA==="
+        start_idx = fenced.index(begin) + len(begin)
+        end_idx = fenced.index(end)
+        embedded_json_text = fenced[start_idx:end_idx].strip()
+        embedded = json.loads(embedded_json_text)
+        self.assertEqual(embedded, payload["deterministic_gates"])
+
     def test_hostile_details_neutralized_in_fenced_rendering_too(self):
         """The fenced text is a rendering of the ALREADY-sanitized object
         (_read_deterministic_gates sanitizes before _fence_deterministic_gates
@@ -337,6 +359,23 @@ class TestDeterministicGatesFencedPythonBranch(unittest.TestCase):
         self.assertIn("===BEGIN DETERMINISTIC GATES DATA===", fenced)
         self.assertIn("===END DETERMINISTIC GATES DATA===", fenced)
         self.assertIn("deps", fenced)
+
+    def test_fenced_json_body_round_trips_to_the_same_object_python_branch(self):
+        """Same end-to-end structure check as the jq branch's
+        test_fenced_json_body_round_trips_to_the_same_object, forced onto
+        the python3 emitter branch."""
+        _seed_audit_db(self._tmpdir, [
+            ("secrets", "block", "leaked token"),
+            ("sast", "pass", "clean"),
+        ])
+        payload = _run_build_gate_summary(self._tmpdir, path_override=self._nojq_bin)
+        fenced = payload["deterministic_gates_fenced"]
+        begin = "===BEGIN DETERMINISTIC GATES DATA==="
+        end = "===END DETERMINISTIC GATES DATA==="
+        start_idx = fenced.index(begin) + len(begin)
+        end_idx = fenced.index(end)
+        embedded = json.loads(fenced[start_idx:end_idx].strip())
+        self.assertEqual(embedded, payload["deterministic_gates"])
 
     def test_jq_and_python3_branches_agree_on_fenced_rendering(self):
         """Both emitter branches must not diverge -- mirrors
