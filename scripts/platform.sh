@@ -712,20 +712,38 @@ _invariant_feed_max_field_chars() {
 #     reader. Newline (0x0A) and tab (0x09) are preserved — legitimate
 #     structure in a multi-line finding message, not a control sequence.
 #   - Collapses the delimiter label a hostile finding could forge to fake a
-#     new data-block boundary once re-injected into a future prompt — both
-#     the invariant-feed fence (===BEGIN/END INVARIANTS DATA===,
-#     ds_adversarial_prompt in llm-client.sh) and the adversarial-findings
+#     new data-block boundary once re-injected into a future prompt — the
+#     invariant-feed fence (===BEGIN/END INVARIANTS DATA===,
+#     ds_adversarial_prompt in llm-client.sh), the adversarial-findings
 #     fence the merge-gate prompt uses (===BEGIN/END ADVERSARIAL FINDINGS
-#     DATA===) are defanged unconditionally, regardless of which pipeline a
-#     given finding is travelling through — a payload could be planted once
-#     and land in either round-trip. Case-insensitively replaces each
-#     literal label string with a defanged spaced-out form. This does not
-#     make the text nonsensical to a human reviewer (the words are still
-#     legible) but prevents it from being byte-identical to the real
-#     delimiter the model was told to trust. Without this, a finding
-#     containing a literal fence string survives verbatim into the written
-#     artifact and can forge a fake end-of-data marker inside the block,
-#     escaping the fence entirely (BOBBIE, lr-cda4b9 follow-up).
+#     DATA===), and the deterministic-gates fence the merge-gate prompt uses
+#     (===BEGIN/END DETERMINISTIC GATES DATA===, lr-92d931) are all defanged
+#     unconditionally, regardless of which pipeline a given finding is
+#     travelling through — a payload could be planted once and land in any
+#     round-trip. Case-insensitively replaces each literal label string with
+#     a defanged spaced-out form. This does not make the text nonsensical to
+#     a human reviewer (the words are still legible) but prevents it from
+#     being byte-identical to the real delimiter the model was told to
+#     trust. Without this, a finding containing a literal fence string
+#     survives verbatim into the written artifact and can forge a fake
+#     end-of-data marker inside the block, escaping the fence entirely
+#     (BOBBIE, lr-cda4b9 follow-up).
+#
+#   CONVENTION (lr-92d931, PINNED decision): every external-text payload
+#   field that reaches an LLM prompt is BOTH sanitized (this function) AND
+#   fenced (wrapped in its own ===BEGIN/END ... DATA=== block by the
+#   payload-building caller, with the label added to the defang list above).
+#   This is the broad rule, deliberately — the narrower "only fence fields
+#   the model reasons over" alternative requires every future author to
+#   correctly classify their new field under time pressure, which is exactly
+#   the judgment call that failed for deterministic_gates.details (marked
+#   informational-only, sanitized here, but left unfenced until this fix).
+#   A field costs a few bytes of prompt to fence even when the model never
+#   reasons over it; NOT fencing a field the model turns out to reason over
+#   is a prompt-injection surface. When you add a new external-text field to
+#   any prompt built in llm-client.sh, sanitize it through this function AND
+#   add its own fence label above AND wrap it in that fence at the payload
+#   site — do not ship one without the other.
 #   - Caps length at MAX_CHARS, truncating rather than rejecting — a
 #     merely-too-long finding is not attacker behavior, and rejecting it
 #     would silently drop a real finding (fail-open posture matches the
@@ -763,20 +781,22 @@ text = ''.join(ch for ch in text if ch in ('\t', '\n') or 0x20 <= ord(ch) != 0x7
 
 # Defang forged delimiter labels: a hostile finding message (or, as of
 # lr-4f8316, a hostile commit-message change-class trailer, or a hostile
-# deferrals.json entry) could contain the literal string "INVARIANTS:" or
+# deferrals.json entry, or as of lr-92d931 a hostile deterministic-gate
+# details string) could contain the literal string "INVARIANTS:" or
 # "DEFERRED FINDINGS:" -- or any of the fenced data-block marker sets this
 # codebase uses (===BEGIN/END INVARIANTS DATA===, the invariant-feed fence
 # in ds_adversarial_prompt; ===BEGIN/END ADVERSARIAL FINDINGS DATA===, the
 # merge-gate fence in ds_merge_gate_prompt; ===BEGIN/END CHANGE-CLASS HINT
 # DATA===, the change-class hint fence in both ds_review_prompt and
 # ds_adversarial_prompt; ===BEGIN/END DEFERRED FINDINGS DATA===, the
-# deferrals fence in ds_review_prompt -- all llm-client.sh) -- to try to
-# spoof a fresh data-block boundary once re-injected into a future prompt.
-# Insert a zero-width-safe space so the string is still legible to a human
-# but no longer byte-identical to the real delimiter. All fence sets are
-# defanged unconditionally here (not gated by which caller invoked this
-# function) since a single planted payload could round-trip through any
-# path.
+# deferrals fence in ds_review_prompt; ===BEGIN/END DETERMINISTIC GATES
+# DATA===, the deterministic-gates fence in ds_merge_gate_prompt (lr-92d931)
+# -- all llm-client.sh) -- to try to spoof a fresh data-block boundary once
+# re-injected into a future prompt. Insert a zero-width-safe space so the
+# string is still legible to a human but no longer byte-identical to the
+# real delimiter. All fence sets are defanged unconditionally here (not
+# gated by which caller invoked this function) since a single planted
+# payload could round-trip through any path.
 for label in ("INVARIANTS:", "DEFERRED FINDINGS:", "END INVARIANTS",
               "END DEFERRED FINDINGS",
               "===BEGIN INVARIANTS DATA===", "===END INVARIANTS DATA===",
@@ -785,7 +805,9 @@ for label in ("INVARIANTS:", "DEFERRED FINDINGS:", "END INVARIANTS",
               "===BEGIN CHANGE-CLASS HINT DATA===",
               "===END CHANGE-CLASS HINT DATA===",
               "===BEGIN DEFERRED FINDINGS DATA===",
-              "===END DEFERRED FINDINGS DATA==="):
+              "===END DEFERRED FINDINGS DATA===",
+              "===BEGIN DETERMINISTIC GATES DATA===",
+              "===END DETERMINISTIC GATES DATA==="):
     pattern = re.compile(re.escape(label), re.IGNORECASE)
     text = pattern.sub(lambda m: ' '.join(m.group(0)), text)
 
@@ -820,7 +842,7 @@ PYEOF
   # closes that specific gap even though it cannot close the general one.
   printf '%s' "$_lfs_text" \
     | tr -d '\001-\010\013-\037\177' \
-    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g; s|===BEGIN ADVERSARIAL FINDINGS DATA===|= = =BEGIN ADVERSARIAL FINDINGS DATA= = =|g; s|===END ADVERSARIAL FINDINGS DATA===|= = =END ADVERSARIAL FINDINGS DATA= = =|g; s|===BEGIN CHANGE-CLASS HINT DATA===|= = =BEGIN CHANGE-CLASS HINT DATA= = =|g; s|===END CHANGE-CLASS HINT DATA===|= = =END CHANGE-CLASS HINT DATA= = =|g; s|===BEGIN DEFERRED FINDINGS DATA===|= = =BEGIN DEFERRED FINDINGS DATA= = =|g; s|===END DEFERRED FINDINGS DATA===|= = =END DEFERRED FINDINGS DATA= = =|g' \
+    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g; s|===BEGIN ADVERSARIAL FINDINGS DATA===|= = =BEGIN ADVERSARIAL FINDINGS DATA= = =|g; s|===END ADVERSARIAL FINDINGS DATA===|= = =END ADVERSARIAL FINDINGS DATA= = =|g; s|===BEGIN CHANGE-CLASS HINT DATA===|= = =BEGIN CHANGE-CLASS HINT DATA= = =|g; s|===END CHANGE-CLASS HINT DATA===|= = =END CHANGE-CLASS HINT DATA= = =|g; s|===BEGIN DEFERRED FINDINGS DATA===|= = =BEGIN DEFERRED FINDINGS DATA= = =|g; s|===END DEFERRED FINDINGS DATA===|= = =END DEFERRED FINDINGS DATA= = =|g; s|===BEGIN DETERMINISTIC GATES DATA===|= = =BEGIN DETERMINISTIC GATES DATA= = =|g; s|===END DETERMINISTIC GATES DATA===|= = =END DETERMINISTIC GATES DATA= = =|g' \
     | cut -c "1-${_lfs_max}"
 }
 
