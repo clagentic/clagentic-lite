@@ -654,7 +654,13 @@ CLAGENTIC_DEFAULT_BRANCH=main
 #     own ambient value -- this REPLACES the earlier, narrower predicate
 #     (keying off ANTHROPIC_BEDROCK_BASE_URL being non-empty), which is
 #     inert under an Enterprise/OAuth session-blanking payload that sets
-#     the sentinel var to an EMPTY (but present) string.
+#     the sentinel var to an EMPTY (but present) string. When
+#     CLAGENTIC_AUTH_MODE is enterprise or anthropic-oauth (lr-6276ea),
+#     the same gate-path call instead BLANKS ANTHROPIC_BASE_URL,
+#     ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BEDROCK_BASE_URL, and
+#     AWS_BEARER_TOKEN_BEDROCK, so a CLAGENTIC_ROUTER_URL settings.json
+#     passthrough stamp (docs/ROUTER.md SS1) cannot silently redirect this
+#     direct-CLI spawn's real credential to the router endpoint.
 #   - scripts/llm-client.sh's walk_chain: a mode-implied readiness preflight
 #     runs before any review/gate LLM call. bedrock-sso reads the AWS SSO
 #     token cache's expiresAt and fails fast (a degraded envelope, not a
