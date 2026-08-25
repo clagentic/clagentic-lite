@@ -1,5 +1,5 @@
 """
-Regression tests for bin/clagentic-lite loading ~/.config/clagentic/config
+Regression tests for bin/clagentic-lite loading ~/.config/clagentic/lite/config
 and per-repo .clagentic/config via ds_load_env (lr-33fb89).
 
 Root cause: bin/clagentic-lite read CLAGENTIC_* variables directly (chiefly
@@ -8,7 +8,7 @@ _stamp_claude_settings / the doctor router probe) but never called
 ds_load_env (scripts/platform.sh) -- the single source of truth for reading
 the global/per-repo config files every other entry point (hooks, gates.sh,
 llm-client.sh, memory.sh, smoke.sh) already calls immediately after sourcing
-platform.sh. A CLAGENTIC_ROUTER_URL written into ~/.config/clagentic/config
+platform.sh. A CLAGENTIC_ROUTER_URL written into ~/.config/clagentic/lite/config
 exactly as share/config.example and the README instruct had NO EFFECT on
 enroll/update/doctor: no error, no warning, silent no-op -- indistinguishable
 from "unset" to the pre-existing inert-when-unset test suite
@@ -18,7 +18,7 @@ config FILE on disk.
 
 This file is structurally blind-spot-closing, not a duplicate of
 test_router_settings_stamp.py: every test here writes a REAL
-~/.config/clagentic/config (or repo-local .clagentic/config) file on disk
+~/.config/clagentic/lite/config (or repo-local .clagentic/config) file on disk
 and asserts the CLI, invoked in a shell that never exported the var, honors
 it -- the exact gap the task's acceptance criteria calls out.
 
@@ -197,7 +197,7 @@ def _run_cli(argv, cwd, home, env_extra=None, clagentic_lite_home=None,
 
 
 class TestConfigFileRouterUrlHonored(unittest.TestCase):
-    """CLAGENTIC_ROUTER_URL set ONLY in ~/.config/clagentic/config -- the
+    """CLAGENTIC_ROUTER_URL set ONLY in ~/.config/clagentic/lite/config -- the
     exact acceptance-criteria repro from the task. The calling shell never
     exports it; only a config FILE on disk carries it."""
 
