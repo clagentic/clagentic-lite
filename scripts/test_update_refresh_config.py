@@ -47,7 +47,7 @@ class _UpdateRefreshConfigTestBase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
         self.home = os.path.join(self.tmpdir, "home")
         os.makedirs(self.home)
-        self.config_dir = os.path.join(self.home, ".config", "clagentic")
+        self.config_dir = os.path.join(self.home, ".config", "clagentic", "lite")
         os.makedirs(self.config_dir)
         self.config_path = os.path.join(self.config_dir, "config")
         self.fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")
