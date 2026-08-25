@@ -47,7 +47,7 @@ class _InitReconfigureMergeTestBase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
         self.home = os.path.join(self.tmpdir, "home")
         os.makedirs(self.home)
-        self.config_path = os.path.join(self.home, ".config", "clagentic", "config")
+        self.config_path = os.path.join(self.home, ".config", "clagentic", "lite", "config")
         self.fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")
         _clone_tool_home(self.fake_tool_home)
 

@@ -136,9 +136,28 @@ fi
 
 SHARE_DIR="$CLAGENTIC_LITE_HOME/share"
 REGISTRY="$HOME/.local/state/clagentic/registry"
-GLOBAL_CONFIG="$HOME/.config/clagentic/config"
 
-# Load ~/.config/clagentic/config (ds_load_global_env, scripts/platform.sh)
+# GLOBAL_CONFIG (lr-7939f8): lives under the PRODUCT namespace
+# ~/.config/clagentic/lite/, not the brand root ~/.config/clagentic/ --
+# clagentic is the brand shared by multiple tools (clagentic-loadout uses
+# ~/.config/clagentic/loadout/, 34 occurrences, zero exceptions -- the
+# reference implementation), clagentic-lite is one product under it. This
+# mirrors the two brand/product splits this codebase already performs for
+# CLAGENTIC_LITE_HOME (~/.clagentic-lite -> ~/.clagentic/lite, cmd_update)
+# and per-repo ephemeral state (.clagentic/<f> -> .clagentic/lite/<f>,
+# cmd_update) -- the global config was the one holdout.
+#
+# OLD_GLOBAL_CONFIG is the pre-lr-7939f8 brand-root path. It is READ as a
+# back-compat fallback (ds_load_global_env, scripts/platform.sh) during a
+# deprecation window so an un-updated install does not silently lose its
+# config and revert to defaults, and it is the source path for the
+# migrate-and-warn step in cmd_update (_migrate_global_config_brand_path,
+# below). Nothing in this file WRITES to OLD_GLOBAL_CONFIG going forward.
+GLOBAL_CONFIG="$HOME/.config/clagentic/lite/config"
+OLD_GLOBAL_CONFIG="$HOME/.config/clagentic/config"
+
+# Load ~/.config/clagentic/lite/config, with a back-compat read of the old
+# ~/.config/clagentic/config path (ds_load_global_env, scripts/platform.sh)
 # — the same operator-owned global config every other runtime entry point
 # (hooks, gates.sh, llm-client.sh, memory.sh, smoke.sh) reads via ds_load_env.
 # Before lr-33fb89, bin/clagentic-lite was not on that list: every
@@ -1674,12 +1693,55 @@ cmd_init() {
   say "checking prerequisites..."
   _run_prereq_checks init
 
+  # 2.5. Global config migration (lr-7939f8): an install with a config still
+  # at the pre-lr-7939f8 brand-root path gets it moved to the product path
+  # here too, not only on `update` -- otherwise a first `init` run on an
+  # un-migrated machine would see no $GLOBAL_CONFIG at the new path and
+  # re-run the full interactive front door, discarding the operator's
+  # existing settings instead of recognizing them. No-op if already
+  # migrated or if there is nothing at the old path.
+  #
+  # STATUS IS CHECKED EXPLICITLY, not inferred from `[ -f "$GLOBAL_CONFIG" ]`
+  # below (BOBBIE bobbie.uncat.1, folded in over its own non-blocking rating
+  # -- lore task lr-7939f8 comment #2). Calling this bare would still abort
+  # the whole `init` run on a `return 1` today, because `set -e` (top of
+  # file) propagates through an unwrapped simple-command failure -- but that
+  # protection is incidental to the call SHAPE, not a property of what this
+  # step actually needs, and is one `if _migrate...; then` refactor (which
+  # exempts its condition from `set -e` by construction) or one `set -e`
+  # removal away from silently regressing into exactly the state
+  # _migrate_global_config_brand_path itself refuses to create when it
+  # detects it directly: a fresh config written at $GLOBAL_CONFIG while the
+  # operator's real, un-migrated credentials sit untouched and unread at
+  # $OLD_GLOBAL_CONFIG. Wrapping the call in `if` here makes the check
+  # explicit and durable rather than borrowed from an unrelated top-of-file
+  # setting -- and, being an `if` condition, does NOT itself trigger `set -e`
+  # on failure, so this is not a behavior change for a genuine hard error
+  # elsewhere in `init`.
+  _migration_ok=1
+  if ! _migrate_global_config_brand_path; then
+    _migration_ok=0
+  fi
+
   # 3. Two-question front door. Skip entirely when global config already
   #    exists and --reconfigure was not passed — otherwise re-runs of init
   #    pointlessly ask "Accept all defaults? [Y/n]" every time. When
   #    --reconfigure IS passed against an existing config, _write_global_config
   #    MERGES (preserves every user-set value, adds new keys) rather than
   #    clobbering (lr-25e73e item 4) — see its own header comment.
+  if [ "$_migration_ok" -eq 0 ] && [ -f "$OLD_GLOBAL_CONFIG" ] && [ ! -f "$GLOBAL_CONFIG" ]; then
+    # A genuinely FAILED migration (old file survives untouched -- migration
+    # never touches it on any failure path -- and no new file was ever
+    # installed) must never fall through to _write_global_config: that would
+    # write fresh DEFAULTS at $GLOBAL_CONFIG while the operator's real,
+    # un-migrated credentials sit unread at $OLD_GLOBAL_CONFIG -- new-path-
+    # wins precedence (ds_load_global_env) then makes every subsequent
+    # command silently run on defaults instead of the operator's actual
+    # config. Refuse loudly instead; the operator's config is untouched and
+    # still fully readable at the old path (back-compat fallback,
+    # ds_load_global_env) either way.
+    die "global config migration failed -- see the WARN above for the cause. Your config is untouched at $OLD_GLOBAL_CONFIG (still honored as a read fallback). Fix the cause and re-run \`clagentic-lite init\` or \`clagentic-lite update\`; refusing to write a fresh config at $GLOBAL_CONFIG alongside your real one at the old path."
+  fi
   if [ -f "$GLOBAL_CONFIG" ] && [ "$RECONFIGURE" -eq 0 ]; then
     say "global config already exists at $GLOBAL_CONFIG (use --reconfigure to re-prompt)"
   else
@@ -3379,6 +3441,20 @@ cmd_doctor() {
         ;;
     esac
   fi
+  # lr-7939f8: warn if the global config still lives at the pre-migration
+  # brand-root path. Names paths only, never a value from either file.
+  if [ -f "$OLD_GLOBAL_CONFIG" ]; then
+    if [ -f "$GLOBAL_CONFIG" ]; then
+      printf '  WARN legacy global config still present at %s alongside the current one at %s.\n' "$OLD_GLOBAL_CONFIG" "$GLOBAL_CONFIG"
+      printf '       %s is authoritative (read by every command); run `clagentic-lite update` to clean up the legacy copy if it is identical, or reconcile by hand if it differs.\n' "$GLOBAL_CONFIG"
+    else
+      printf '  WARN global config is still at the deprecated brand-root path: %s\n' "$OLD_GLOBAL_CONFIG"
+      printf '       Run `clagentic-lite update` to migrate it to %s (brand/product namespace split).\n' "$GLOBAL_CONFIG"
+      printf '       The old path is still honored as a read fallback during the deprecation window.\n'
+    fi
+  else
+    _ok "global config at product path (no legacy brand-root config found)"
+  fi
 
   printf '\n== doctor summary: %s OK, %s FAIL ==\n\n' "$_ok" "$_fail"
   [ "$_fail" -eq 0 ]
@@ -3565,6 +3641,118 @@ _restamp_repo_artifacts() {
   printf '%d\n' "$_ra_count"
 }
 
+# _mgcb_checkpoint STEP_NAME
+# Test-only instrumentation point, called at each step boundary inside
+# _migrate_global_config_brand_path below. In production this is exactly a
+# no-op (defined once, here, as a plain `:`) -- zero behavior/perf change on
+# every real invocation. A test that needs to prove atomicity across a
+# process kill at a specific step boundary (lore task lr-7939f8 comment #1
+# requirement: "test process-kill mid-migration at every step boundary")
+# defines its OWN _mgcb_checkpoint before sourcing the extracted function
+# (same extraction technique as scripts/test_unified_plugin_render.py) that
+# writes a readiness marker and then sends itself SIGKILL at the named step
+# -- deterministic, no sleep-and-race timing. This function is intentionally
+# defined unconditionally (not `command -v` guarded) so a stale/missing
+# override in a future test still calls a real, harmless no-op rather than
+# an undefined-function shell error.
+_mgcb_checkpoint() { :; }
+
+# _migrate_global_config_brand_path
+# lr-7939f8: migrate the global config from the brand root
+# $OLD_GLOBAL_CONFIG (~/.config/clagentic/config) to the product path
+# $GLOBAL_CONFIG (~/.config/clagentic/lite/config) -- see the header
+# comment above the two constant definitions (top of file) for why.
+#
+# SAFETY BAR (this file holds live credentials -- CLAGENTIC_ROUTER_TOKEN,
+# CLAGENTIC_ROUTER_BEDROCK_TOKEN):
+#   - chmod 600 before/during/after, no window -- every temp file this
+#     function creates goes through _secret_tmp_create (umask 077 subshell,
+#     mode 600 from the single creating syscall), never `cmd > file` then
+#     chmod after the fact. Reusing that existing helper rather than a
+#     second primitive is a binding requirement (lore task lr-7939f8
+#     comment #1) -- see _secret_tmp_create's own doc comment for why a
+#     truncate-then-chmod pattern is a real, previously-caught race.
+#   - No configured VALUE is ever printed/logged/echoed on any path,
+#     including error paths -- every message below names paths only.
+#   - Never a state where both locations exist with different content:
+#     if $GLOBAL_CONFIG already exists, this function never overwrites it
+#     from $OLD_GLOBAL_CONFIG. If the two differ, it says so explicitly
+#     (byte-diff, not content) and leaves both in place -- the operator
+#     reconciles by hand. Precedence when both exist (matches
+#     ds_load_global_env, scripts/platform.sh): the NEW path always wins
+#     at read time; the OLD path is never consulted once the new one
+#     exists, migrated or not.
+#   - Old path is a symlink: content is read through the symlink (cat
+#     follows it transparently) into the new location; only the symlink
+#     itself is removed afterward, never whatever it pointed at.
+#   - Old path is read-only (mode without owner-write): still migrates --
+#     migrating only ever READS the old file and later unlinks it (which
+#     needs write permission on the parent directory, not the file itself).
+#   - New path's parent directory ($HOME/.config/clagentic/lite) is
+#     created at mode 700 if missing, mirroring _write_global_config's own
+#     directory-creation discipline for the same class of file.
+#   - Idempotent: a second call with the new path already present and
+#     identical content, or with the old path already gone, is a silent
+#     no-op (nothing left to migrate).
+#   - ATOMICITY ACROSS A KILL: content lands in a 600 temp file in the
+#     NEW directory first, then a single `mv` (same-filesystem rename,
+#     since both live under $HOME/.config/clagentic/) installs it at
+#     $GLOBAL_CONFIG. The old file is removed only AFTER that mv succeeds.
+#     A process kill before the mv leaves the config fully intact and
+#     unchanged at the OLD path only (temp file is orphaned, never
+#     world-readable, harmless to leave or clean up on a re-run). A kill
+#     AFTER the mv but before the old-file removal leaves the config fully
+#     intact at BOTH paths (new is authoritative per the precedence rule
+#     above; a re-run sees the new path already populated and simply
+#     finishes the cleanup by removing the now-redundant old copy). There
+#     is no step where the config is held ONLY in a temp file with the
+#     real path holding nothing, and no step where neither path has the
+#     full content.
+_migrate_global_config_brand_path() {
+  [ -f "$OLD_GLOBAL_CONFIG" ] || return 0
+
+  if [ -f "$GLOBAL_CONFIG" ]; then
+    if cmp -s "$OLD_GLOBAL_CONFIG" "$GLOBAL_CONFIG" 2>/dev/null; then
+      # Already migrated, identical content -- finish the cleanup (a prior
+      # run's kill window between mv and old-file removal, or a config
+      # manually copied into place) by removing the now-redundant old copy.
+      _mgcb_checkpoint before-cleanup-rm
+      rm -f "$OLD_GLOBAL_CONFIG"
+      say "removed redundant legacy config at $OLD_GLOBAL_CONFIG (already migrated to $GLOBAL_CONFIG)"
+    else
+      warn "both $OLD_GLOBAL_CONFIG and $GLOBAL_CONFIG exist with DIFFERENT content -- not migrating."
+      warn "  $GLOBAL_CONFIG is authoritative (every command reads it, never the old path, once it exists)."
+      warn "  Review $OLD_GLOBAL_CONFIG by hand and merge or remove it; this step will not touch either file until you do."
+    fi
+    return 0
+  fi
+
+  _mgcb_new_dir="$(dirname "$GLOBAL_CONFIG")"
+  if [ ! -d "$_mgcb_new_dir" ]; then
+    mkdir -p "$_mgcb_new_dir" && chmod 700 "$_mgcb_new_dir" \
+      || { warn "could not create $_mgcb_new_dir -- skipping global config migration (old path still honored)"; return 1; }
+  fi
+  _mgcb_checkpoint after-mkdir
+
+  _mgcb_tmp="$GLOBAL_CONFIG.migrate.$$"
+  _secret_tmp_create "$_mgcb_tmp" || { warn "could not chmod 600 migration temp file -- skipping global config migration (old path still honored)"; return 1; }
+  _mgcb_checkpoint after-tmp-create
+  if ! cat "$OLD_GLOBAL_CONFIG" >> "$_mgcb_tmp" 2>/dev/null; then
+    warn "could not read $OLD_GLOBAL_CONFIG -- skipping global config migration"
+    rm -f "$_mgcb_tmp"
+    return 1
+  fi
+  _mgcb_checkpoint after-content-copied
+
+  mv "$_mgcb_tmp" "$GLOBAL_CONFIG" \
+    || { warn "could not install migrated config at $GLOBAL_CONFIG -- skipping (old path still honored)"; rm -f "$_mgcb_tmp"; return 1; }
+  chmod 600 "$GLOBAL_CONFIG"
+  _mgcb_checkpoint after-mv-before-old-rm
+
+  rm -f "$OLD_GLOBAL_CONFIG"
+  say "migrated global config: $OLD_GLOBAL_CONFIG -> $GLOBAL_CONFIG (brand/product namespace split, chmod 600)"
+}
+
 cmd_update() {
   RESTAMP=0
   REFRESH_CONFIG=0
@@ -3611,6 +3799,16 @@ cmd_update() {
         ;;
     esac
   fi
+
+  # Global config migration: ~/.config/clagentic/config -> ~/.config/clagentic/lite/config
+  # (lr-7939f8, brand/product namespace split -- see _migrate_global_config_brand_path's
+  # own doc comment for the full safety contract). Unlike the two migrations above,
+  # this one holds live credentials and runs with no interactive prompt -- it is
+  # additive/non-destructive by construction (never overwrites an existing
+  # $GLOBAL_CONFIG, never deletes the old file until the new one is confirmed on
+  # disk), so it does not need the tty confirmation gate the home-directory move above
+  # uses for a plain directory rename.
+  _migrate_global_config_brand_path
 
   # Per-repo migration: .clagentic/<ephemeral> -> .clagentic/lite/<ephemeral>
   _EPHEMERAL_FILES="audit.db memory.db builder-contract.md last-review.json last-adversarial.md last-merge-gate.json gate-summary.json stop-summarize.lock report.html"

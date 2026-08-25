@@ -72,7 +72,7 @@ ds_repo_root() {
 }
 
 # ds_load_global_env — load ONLY the operator-owned global config
-# (~/.config/clagentic/config, written by `clagentic-lite init`). Trust
+# (~/.config/clagentic/lite/config, written by `clagentic-lite init`). Trust
 # boundary: this file lives outside any repo, so no amount of cloning or
 # `cd`-ing into an untrusted repo can plant or influence it — safe to
 # dot-source unconditionally, at any point, for any subcommand.
@@ -83,6 +83,21 @@ ds_repo_root() {
 # below — see ds_load_repo_env's docstring for why that second load is not
 # safe to run unconditionally the way this one is.
 #
+# BRAND/PRODUCT PATH (lr-7939f8): the config moved from the brand root
+# ~/.config/clagentic/config to the product path
+# ~/.config/clagentic/lite/config — clagentic is a brand shared by multiple
+# tools (clagentic-loadout correctly uses ~/.config/clagentic/loadout/;
+# clagentic-lite's own config was the one holdout still claiming the brand
+# root). PRECEDENCE, matching the CLAGENTIC_HOME -> CLAGENTIC_LITE_HOME
+# back-compat contract elsewhere in this codebase: the NEW path wins
+# unconditionally when it exists, regardless of whether the OLD path is
+# also still present — this function never merges the two or reads both.
+# `clagentic-lite update` is the sole place that migrates old -> new
+# (_migrate_global_config_brand_path, bin/clagentic-lite); this loader only
+# ever READS, and falls back to the old path, with a one-time warning, so
+# an un-updated install does not silently lose its config and revert to
+# defaults during the deprecation window.
+#
 # Idempotent — honors CLAGENTIC_ENV_LOADED same as the combined
 # ds_load_env (below), which calls this function internally: a prior
 # ds_load_global_env call is enough to skip the global-config re-read
@@ -92,7 +107,15 @@ ds_load_global_env() {
   [ "${CLAGENTIC_ENV_LOADED:-0}" = "1" ] && return 0
   [ "${CLAGENTIC_GLOBAL_ENV_LOADED:-0}" = "1" ] && return 0
 
-  _GLOBAL_CFG="$HOME/.config/clagentic/config"
+  _GLOBAL_CFG="$HOME/.config/clagentic/lite/config"
+  _GLOBAL_CFG_OLD="$HOME/.config/clagentic/config"
+  if [ ! -f "$_GLOBAL_CFG" ] && [ -f "$_GLOBAL_CFG_OLD" ]; then
+    _GLOBAL_CFG="$_GLOBAL_CFG_OLD"
+    if [ -z "${CLAGENTIC_GLOBAL_CONFIG_OLD_PATH_WARNED:-}" ]; then
+      printf 'clagentic-lite: reading global config from deprecated path %s -- run `clagentic-lite update` to migrate to ~/.config/clagentic/lite/config\n' "$_GLOBAL_CFG_OLD" >&2
+      export CLAGENTIC_GLOBAL_CONFIG_OLD_PATH_WARNED=1
+    fi
+  fi
   if [ -f "$_GLOBAL_CFG" ]; then
     set -a
     # shellcheck disable=SC1090
