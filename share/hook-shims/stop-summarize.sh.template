@@ -117,10 +117,17 @@ PY
 
   # Run the summarizer via the role-call wrapper.
   #
-  # NOTE: REPO_ROOT-scoped, not CLAGENTIC_LITE_HOME-scoped — this is
-  # deliberate and preserved as-is by this relocation (share/hook-shims/,
-  # lr-57db23), not something the relocation changes. See
-  # post-tool-nudge.sh.template's identical comment.
+  # CLAGENTIC_LITE_HOME-scoped, NOT REPO_ROOT-scoped (lr-778f43): an
+  # enrolled repo never receives its own copy of scripts/ (see the
+  # __CLAGENTIC_LITE_HOME__ header comment at the top of this file) — only
+  # the ONE materialized copy under CLAGENTIC_LITE_HOME/scripts/ exists.
+  # The prior REPO_ROOT-scoped form resolved to a path that is never
+  # present in an enrolled repo, so this call silently failed (stderr
+  # discarded) on every enrolled repo that is not itself this checkout —
+  # session memory never populated from the Stop hook. CLAGENTIC_LITE_HOME
+  # is already resolved and validated to a real checkout at the top of
+  # this file (see the platform.sh existence guard above, line ~40) —
+  # reuse that same variable here rather than inventing a new resolution.
   #
   # STATUS-CHECKED + DEGRADED-CHECKED (lr-7047bf, INV-1b, fold-in, BOBBIE +
   # HOLDEN, PR #141 review #2): this hook was one of two unwired consumers
@@ -141,7 +148,7 @@ PY
   # wording, not because this status check recognized them) -- see
   # memory.sh cmd_summarize_turn's identical comment for the full rationale.
   _sts_status=0
-  _sts_raw=$(printf '%s' "$LAST_TURN" | "$REPO_ROOT/scripts/llm-client.sh" summarize 2>/dev/null) || _sts_status=$?
+  _sts_raw=$(printf '%s' "$LAST_TURN" | "$CLAGENTIC_LITE_HOME/scripts/llm-client.sh" summarize 2>/dev/null) || _sts_status=$?
   if [ "$_sts_status" -eq 3 ] || [ "$_sts_status" -eq 4 ] || [ "$_sts_status" -eq 5 ] || printf '%s' "$_sts_raw" | grep -qF '[clagentic-lite degraded]'; then
     # A genuinely degraded summarizer chain: do not write a fabricated
     # digest to memory, and do not claim an audit "pass" for it. Mirrors
@@ -159,7 +166,19 @@ PY
     sort -u | head -3 | tr '\n' ' ')
 
   # Insert via memory.sh (it handles SQL escaping and schema init).
-  "$REPO_ROOT/scripts/memory.sh" log-turn "$SUMMARY" "$TAGS" "stop-hook" >/dev/null 2>&1 || true
+  # CLAGENTIC_LITE_HOME-scoped (lr-778f43): see the identical fix and
+  # rationale on the llm-client.sh call above.
+  #
+  # Failure is no longer silently swallowed (lr-778f43): the prior
+  # `|| true` made a genuine write failure indistinguishable from success —
+  # exactly the always-true guard that let the REPO_ROOT-vs-CLAGENTIC_LITE_HOME
+  # defect above ship unnoticed. A failed log-turn is now surfaced to
+  # stderr and to the audit trail (skip, not pass) instead of being invisible.
+  if ! _lt_err=$("$CLAGENTIC_LITE_HOME/scripts/memory.sh" log-turn "$SUMMARY" "$TAGS" "stop-hook" 2>&1 >/dev/null); then
+    echo "stop-summarize: memory.sh log-turn failed, session memory not recorded for this turn: $_lt_err" 1>&2
+    ds_audit_log summarize skip "stop-summarize: log-turn failed, session=$SESSION_ID" "$SESSION_ID"
+    exit 0
+  fi
 
   # Log to audit trail. ds_audit_log escapes both details and session_id.
   ds_audit_log summarize pass "stop-summarize: session=$SESSION_ID" "$SESSION_ID"

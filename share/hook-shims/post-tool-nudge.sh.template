@@ -2,8 +2,8 @@
 # clagentic-lite :: PostToolUse hook
 # Three responsibilities (all non-blocking — always exits 0):
 #
-# 1. Git-workflow nudge: reminds the session to run /review after git commit
-#    or git add (advisory only).
+# 1. Git-workflow nudge: reminds the session to run `clagentic-lite gates
+#    review`/`gates ship` after git commit or git add (advisory only).
 #
 # 2. Context-budget monitor: estimates token cost of each tool result (byte
 #    proxy: 4 bytes ≈ 1 token), accumulates per-session totals in audit.db,
@@ -173,13 +173,13 @@ CMD=$(printf '%s' "$PAYLOAD" | ds_json_field command 2>/dev/null) || CMD=""
 if [ -n "$CMD" ]; then
   case "$CMD" in
     *"git commit"*)
-      GIT_MSG="clagentic-lite: changes committed. Run /review to get a cross-vendor review of the staged diff before /ship, or run /ship to execute all gates in sequence."
+      GIT_MSG="clagentic-lite: changes committed. Run 'clagentic-lite gates review' to get a cross-vendor review of the staged diff before shipping, or 'clagentic-lite gates ship' to execute all gates in sequence."
       ;;
     *"git add"*)
       case "$CMD" in
         *"-p"*|*"--patch"*) : ;;
         *)
-          GIT_MSG="clagentic-lite: changes staged. When ready, run /review for cross-vendor review before committing, or /ship to run all gates."
+          GIT_MSG="clagentic-lite: changes staged. When ready, run 'clagentic-lite gates review' for cross-vendor review before committing, or 'clagentic-lite gates ship' to run all gates."
           ;;
       esac
       ;;
@@ -210,11 +210,15 @@ if [ "${CLAGENTIC_DISABLE_AUTOSUMMARIZE:-0}" != "1" ] && [ -n "$REPO_ROOT" ]; th
       if [ "$RESULT_BYTES" -gt "$AUTOSUMMARIZE_BYTES" ] 2>/dev/null; then
         # Summarize: pipe result through Summarizer; best-effort, 10s timeout.
         # Use $DS_TIMEOUT_CMD if available (from platform.sh), fall back to plain exec.
-        # NOTE: deliberately REPO_ROOT-scoped, not CLAGENTIC_LITE_HOME-scoped —
-        # matches memory.sh's own resolution and stop-summarize.sh's identical
-        # choice (see that hook's comment). Preserved as-is by this relocation;
-        # not something this migration changes.
-        _summarize_cmd="$REPO_ROOT/scripts/llm-client.sh"
+        # CLAGENTIC_LITE_HOME-scoped, NOT REPO_ROOT-scoped (lr-778f43): an
+        # enrolled repo never receives its own copy of scripts/ (see this
+        # file's own __CLAGENTIC_LITE_HOME__ header comment) — only the ONE
+        # materialized copy under CLAGENTIC_LITE_HOME/scripts/ exists. The
+        # prior REPO_ROOT-scoped form resolved to a path absent from every
+        # enrolled repo that is not itself this checkout, so the `[ -x ]`
+        # guard below silently no-op'd and autosummarize never ran. See the
+        # identical fix and rationale in stop-summarize.sh.template.
+        _summarize_cmd="$CLAGENTIC_LITE_HOME/scripts/llm-client.sh"
         if [ -x "$_summarize_cmd" ]; then
           # STATUS-CHECKED + DEGRADED-CHECKED (lr-7047bf, INV-1b, fold-in,
           # BOBBIE + HOLDEN, PR #141 review #2): this was the other unwired
@@ -247,8 +251,21 @@ if [ "${CLAGENTIC_DISABLE_AUTOSUMMARIZE:-0}" != "1" ] && [ -n "$REPO_ROOT" ]; th
             DIGEST=$(printf '%s' "$_ptn_raw" | head -c 300)
           fi
           if [ -n "$DIGEST" ]; then
-            # Store digest in memory.db — best-effort, failures are silent.
-            "$REPO_ROOT/scripts/memory.sh" log-turn "$DIGEST" "autosummarize tool-result" "autosummarize" >/dev/null 2>&1 || true
+            # Store digest in memory.db. CLAGENTIC_LITE_HOME-scoped
+            # (lr-778f43): see this section's llm-client.sh fix above for
+            # the full rationale.
+            #
+            # Failure is no longer silently swallowed (lr-778f43): the
+            # prior `|| true` made a genuine write failure indistinguishable
+            # from success — the same always-true-guard defect class as
+            # stop-summarize.sh's identical fix. Surface it to stderr (this
+            # hook is non-blocking regardless) rather than hiding it; still
+            # do not block the additionalContext hint below on the write's
+            # success — the hint describes the digest that was computed,
+            # not a promise that it was persisted.
+            if ! _ptn_lt_err=$("$CLAGENTIC_LITE_HOME/scripts/memory.sh" log-turn "$DIGEST" "autosummarize tool-result" "autosummarize" 2>&1 >/dev/null); then
+              echo "post-tool-nudge: memory.sh log-turn failed, digest not recorded: $_ptn_lt_err" 1>&2
+            fi
             # Build the additionalContext hint: first 100 chars of the digest.
             _digest_hint=$(printf '%s' "$DIGEST" | head -c 100)
             _approx_tokens=$(( RESULT_BYTES / 4 ))
