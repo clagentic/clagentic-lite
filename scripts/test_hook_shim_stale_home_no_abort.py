@@ -9,7 +9,7 @@ source with a pattern that does not survive dash/POSIX sh:
 Two independent defects, both fixed here:
 
   1. `:=` only fires when the var is UNSET. A stale/wrong CLAGENTIC_LITE_HOME
-     left in ~/.bashrc or ~/.config/clagentic/config (e.g. after the
+     left in ~/.bashrc or ~/.config/clagentic/lite/config (e.g. after the
      CLAGENTIC_HOME -> CLAGENTIC_LITE_HOME rename) is never validated.
   2. `.` is a POSIX special builtin. Under dash (and any POSIX-conformant
      shell -- NOT bash, which does not reproduce this), a file-not-found
@@ -24,7 +24,7 @@ The fix replaces every occurrence with an explicit existence guard
 (`[ -f "$X" ] && . "$X"`, never a bare `.` relying on `||`), plus a
 CLAGENTIC_LITE_HOME validation that emits an actionable message to stderr
 naming the bad value and pointing at `clagentic-lite doctor` plus the two
-usual drift sites (~/.bashrc, ~/.config/clagentic/config) on failure.
+usual drift sites (~/.bashrc, ~/.config/clagentic/lite/config) on failure.
 
 Scope note: the upstream issue reported only session-start.sh and
 prompt-inject.sh, but the same fatal pattern (in three shape variants: bare
@@ -212,8 +212,8 @@ class TestHookShimSurvivesStaleHomeUnderDash(unittest.TestCase):
                     f"site. stderr={err!r}",
                 )
                 self.assertIn(
-                    "~/.config/clagentic/config", err,
-                    f"{name}: stderr should name ~/.config/clagentic/config "
+                    "~/.config/clagentic/lite/config", err,
+                    f"{name}: stderr should name ~/.config/clagentic/lite/config "
                     f"as a usual drift site. stderr={err!r}",
                 )
 

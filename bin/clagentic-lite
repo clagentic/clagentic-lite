@@ -246,7 +246,7 @@ PLUGIN_RENDER_VERSION="v1"
 # path (enrolled repos never receive their own copy of these scripts).
 # Bump on any content change to any hook template so `clagentic-lite update`
 # re-stamps existing installs.
-CLAUDE_HOOKS_VERSION="v2"
+CLAUDE_HOOKS_VERSION="v3"
 
 # Single source of truth for which hook scripts are stamped into
 # $CLAGENTIC_LITE_HOME/.claude/hooks/. Space-separated POSIX-sh string (no
@@ -3161,7 +3161,7 @@ cmd_doctor() {
     if [ "$DS_ROUTER_URL_CLASS" = "malformed" ]; then
       _fail "CLAGENTIC_ROUTER_URL is not a well-formed http:// or https:// URL: ${CLAGENTIC_ROUTER_URL}"
       printf '       enroll/update will refuse to stamp this into settings.json until it is fixed.\n'
-      printf '       Fix CLAGENTIC_ROUTER_URL in ~/.config/clagentic/config, then re-run '"'"'clagentic-lite update'"'"' and '"'"'clagentic-lite doctor'"'"'.\n'
+      printf '       Fix CLAGENTIC_ROUTER_URL in ~/.config/clagentic/lite/config, then re-run '"'"'clagentic-lite update'"'"' and '"'"'clagentic-lite doctor'"'"'.\n'
     else
       if [ "$DS_ROUTER_URL_CLASS" = "nonlocal" ]; then
         printf '  WARN CLAGENTIC_ROUTER_URL points at a NON-LOCAL host: %s (host: %s)\n' "$CLAGENTIC_ROUTER_URL" "$DS_ROUTER_URL_HOST"
@@ -3211,7 +3211,7 @@ cmd_doctor() {
           _fail "clagentic-router unreachable at $_router_url (GET /version — connection failed or timed out)"
           printf '       Check that clagentic-router is running and listening at %s.\n' "$_router_url"
           printf '       Start it from the clagentic-router checkout (see that repo'"'"'s README), then re-run '"'"'clagentic-lite doctor'"'"'.\n'
-          printf '       If CLAGENTIC_ROUTER_URL points at the wrong host/port, fix it in ~/.config/clagentic/config and re-run '"'"'clagentic-lite update'"'"'.\n'
+          printf '       If CLAGENTIC_ROUTER_URL points at the wrong host/port, fix it in ~/.config/clagentic/lite/config and re-run '"'"'clagentic-lite update'"'"'.\n'
         fi
         rm -f "$_router_probe_body"
       fi

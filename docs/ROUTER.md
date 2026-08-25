@@ -89,7 +89,7 @@ see §3 for the gate path's stricter application of the same check.
 # 1. Run clagentic-router (see that repo's README for build/run instructions).
 #    It listens on 127.0.0.1:8765 by default.
 
-# 2. Set the two config keys (~/.config/clagentic/config or .clagentic/config):
+# 2. Set the two config keys (~/.config/clagentic/lite/config or .clagentic/config):
 CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765
 CLAGENTIC_ROUTER_TOKEN=<your router's proxy.token / CLAGENTIC_ROUTER_TOKEN>
 

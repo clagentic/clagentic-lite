@@ -4,12 +4,12 @@
 #    additionalContext so the session opens with recent decisions visible.
 # 2. Checks whether the clagentic-lite tool itself is behind its upstream and,
 #    if so, appends a terse one-line update notice.  Rate-limited to one
-#    git fetch per 24 h via ~/.config/clagentic/update-check.  Non-blocking —
+#    git fetch per 24 h via ~/.config/clagentic/lite/update-check.  Non-blocking —
 #    any failure exits 0 silently.  Suppress with CLAGENTIC_SKIP_UPDATE_ALERT=1.
 #
 # Non-blocking — any failure exits 0 silently.
 #
-# managed-by: clagentic · clagentic-hooks-version: v2
+# managed-by: clagentic · clagentic-hooks-version: v3
 # Source of truth: share/hook-shims/session-start.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/session-start.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -31,7 +31,7 @@ if [ -f "$_CLAGENTIC_PLATFORM_SH" ]; then
   # shellcheck disable=SC1090
   . "$_CLAGENTIC_PLATFORM_SH" 2>/dev/null || true
 else
-  printf '[clagentic-lite/session-start] CLAGENTIC_LITE_HOME does not resolve to a real checkout: %s (missing scripts/platform.sh). Run `clagentic-lite doctor`, and check ~/.bashrc and ~/.config/clagentic/config for a stale CLAGENTIC_LITE_HOME.\n' "$CLAGENTIC_LITE_HOME" 1>&2
+  printf '[clagentic-lite/session-start] CLAGENTIC_LITE_HOME does not resolve to a real checkout: %s (missing scripts/platform.sh). Run `clagentic-lite doctor`, and check ~/.bashrc and ~/.config/clagentic/lite/config for a stale CLAGENTIC_LITE_HOME.\n' "$CLAGENTIC_LITE_HOME" 1>&2
 fi
 
 MEMORY_DB="${PWD}/.clagentic/lite/memory.db"
@@ -103,8 +103,13 @@ _sst_home_canon=$(cd "$CLAGENTIC_LITE_HOME" 2>/dev/null && pwd -P || printf '%s'
 if [ "${CLAGENTIC_SKIP_UPDATE_ALERT:-0}" != "1" ] \
     && [ -n "$_sst_git_toplevel" ] && [ "$_sst_git_toplevel" = "$_sst_home_canon" ]; then
 
-  # State file: track the last time we did a network fetch.
-  _STATE_DIR="$HOME/.config/clagentic"
+  # State file: track the last time we did a network fetch. lr-7939f8:
+  # product namespace (~/.config/clagentic/lite/), not the shared brand
+  # root (~/.config/clagentic/) -- same rule as $GLOBAL_CONFIG, see
+  # bin/clagentic-lite's own header comment on that constant. This is a
+  # rate-limit timestamp only, never a credential -- no _secret_tmp_create
+  # requirement, but the path convention still applies.
+  _STATE_DIR="$HOME/.config/clagentic/lite"
   _STATE_FILE="$_STATE_DIR/update-check"
   _FETCH_INTERVAL=86400   # 24 h in seconds
   _NOW=$(date +%s 2>/dev/null || echo 0)

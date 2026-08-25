@@ -101,7 +101,7 @@ cd /path/to/your/project && clagentic-lite enroll
 
 If you stop after `init` without running `enroll` in at least one project, the harness is installed but dormant — no gates are active anywhere.
 
-After the first install, the steady-state upgrade is just `clagentic-lite update` — it does the `git pull --ff-only`, re-checks prereqs, and re-stamps hook shims, `.claude/settings.json`, and `CLAUDE.md` in every enrolled repo when their template versions change. **It does NOT touch `~/.config/clagentic/config`** — your global config is written once by `init` and never rewritten by `update`, so a config key added after your install predates it silently. Run `clagentic-lite doctor` after updating to see which keys in `share/config.example` your installed config is missing, then add any you want by hand.
+After the first install, the steady-state upgrade is just `clagentic-lite update` — it does the `git pull --ff-only`, re-checks prereqs, and re-stamps hook shims, `.claude/settings.json`, and `CLAUDE.md` in every enrolled repo when their template versions change. **It does NOT rewrite `~/.config/clagentic/lite/config`'s key set** — your global config is written once by `init` and never rewritten by `update`, so a config key added after your install predates it silently. (The one exception is a one-time, additive migration off the pre-lr-7939f8 `~/.config/clagentic/config` brand-root path — see "Config file location" below.) Run `clagentic-lite doctor` after updating to see which keys in `share/config.example` your installed config is missing, then add any you want by hand.
 
 **Upgrading and the secrets gate.** If any enrolled repo's `.gitleaks.toml` declares no `[[rules]]` table and has no `[extend]` / `useDefault = true`, the secrets gate previously reported a permanent, silent pass — `gitleaks --config` replaces the built-in ruleset rather than merging with it, so a rules-less config detects nothing. Since the fix for this, that same config now **blocks** the `secrets` gate outright, naming the cause, instead of passing. That is the correct behavior, but if your gate has been green for a while, it can look like the upgrade broke something. Run `clagentic-lite doctor` after updating — it now warns on exactly this condition for every enrolled repo, before you hit the block, and names the fix (`[extend]` / `useDefault = true`, or declare your own `[[rules]]`). See [`docs/GATES.md`, "4a. Secrets"](docs/GATES.md#4a-secrets-pre-commit) for the full mechanism.
 
@@ -111,7 +111,7 @@ If `init` warns that `~/.local/bin` is not on `$PATH`, add this to your shell rc
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic-lite update` — pulls `--ff-only`, re-checks prereqs, re-stamps all versioned artifacts in enrolled repos when their template versions change. Your global config (`~/.config/clagentic/config`) is not one of those artifacts — see above.
+There is no package manager. Distribution is the git repo itself at <https://github.com/clagentic/clagentic-lite>. Updates are `clagentic-lite update` — pulls `--ff-only`, re-checks prereqs, re-stamps all versioned artifacts in enrolled repos when their template versions change. Your global config (`~/.config/clagentic/lite/config`) is not one of those artifacts — see above.
 
 The tool is cloned once to `~/.clagentic/lite` (or `$CLAGENTIC_LITE_HOME` if set). Your projects never contain a copy of the scripts or agent files — they hold only `.clagentic/lite/{audit.db,memory.db}`, thin hook shims, and a `CLAUDE.md` that call back to `$CLAGENTIC_LITE_HOME`. Update the tool once and every enrolled repo picks it up.
 
@@ -147,7 +147,7 @@ Nice-to-have:
 
 ### Minimal install (just the harness, no security gates)
 
-Want to try the role/review/memory layer without installing gitleaks/semgrep/osv-scanner? Set the three `ALLOW_MISSING` opt-ins to `1` in `~/.config/clagentic/config` after `clagentic-lite init`:
+Want to try the role/review/memory layer without installing gitleaks/semgrep/osv-scanner? Set the three `ALLOW_MISSING` opt-ins to `1` in `~/.config/clagentic/lite/config` after `clagentic-lite init`:
 
 ```sh
 CLAGENTIC_ALLOW_MISSING_GITLEAKS=1
@@ -165,7 +165,7 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 2. Detects WSL vs macOS, picks portable tool variants (`scripts/platform.sh`).
 3. For each REQUIRED missing tool: prints `MISSING: X — install with: <cmd>` and prompts `Run it now? [y/N]:`. On y, runs the install command. On N, exits non-zero with the manual command.
 4. Two-question front door: accept all defaults (Y/n) + vendor mode ([1] Claude only / [2] Claude+Codex). On Y+mode-2: writes global config and done. On n: up to 6 granular prompts.
-5. Writes `~/.config/clagentic/config` (chmod 600).
+5. Writes `~/.config/clagentic/lite/config` (chmod 600). If a config still exists at the pre-lr-7939f8 brand-root path `~/.config/clagentic/config`, it is migrated in place first (see "Config file location" below) rather than re-prompted from scratch.
 6. Ensures `~/.local/bin/` exists; warns with the exact shell-profile line if not on `$PATH`.
 7. Symlinks `~/.local/bin/clagentic-lite` to `$CLAGENTIC_LITE_HOME/bin/clagentic-lite`.
 
@@ -180,7 +180,13 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 7. Stamps `CLAUDE.md` at the repo root — activates the Builder contract and exposes agents for Claude Code auto-dispatch. Refuses to overwrite a non-clagentic `CLAUDE.md` unless `--force`.
 8. Registers the repo path in `~/.local/state/clagentic/registry`.
 
-**A repo-local `.clagentic/config` does not apply on this very first `enroll` call** — the CLI will not execute a repo's own config before that repo is registered as enrolled. It takes effect starting with the next command you run against the repo (`doctor`, `update`, a re-`enroll`, or any hook that fires from your next commit). The global config (`~/.config/clagentic/config`) is unaffected and applies at enroll time as normal.
+**A repo-local `.clagentic/config` does not apply on this very first `enroll` call** — the CLI will not execute a repo's own config before that repo is registered as enrolled. It takes effect starting with the next command you run against the repo (`doctor`, `update`, a re-`enroll`, or any hook that fires from your next commit). The global config (`~/.config/clagentic/lite/config`) is unaffected and applies at enroll time as normal.
+
+#### Config file location
+
+The global config lives at `~/.config/clagentic/lite/config` — `~/.config/clagentic/` is a brand root shared with other tools (`clagentic-loadout` uses `~/.config/clagentic/loadout/` alongside it), so clagentic-lite's own config lives one segment deeper, under `lite/`, never at the bare brand root.
+
+If you installed before this change (pre-lr-7939f8), your config may still be at `~/.config/clagentic/config`. `clagentic-lite update` (and a fresh `init` on an un-migrated machine) moves it automatically: byte-identical content, `chmod 600` preserved throughout, with a one-time warning. Until you run `update`, the old path is still read as a fallback — nothing is silently lost. If both paths somehow end up populated with different content, neither is touched automatically; `doctor` names both paths and tells you to reconcile by hand.
 
 ### Solo vs. shared repos
 
@@ -271,7 +277,7 @@ The recommended approach is `~/.codex/models.json` — a runtime tier map that c
 }
 ```
 
-Fill in the model IDs that are available on your account. clagentic-lite reads this file at runtime — update it when OpenAI releases new models or renames existing ones, with no `clagentic-lite init` re-run required. Model strings in `~/.config/clagentic/config` (`CLAGENTIC_MODEL_CODEX_*`) are intentionally left blank by default so this file is the sole source of truth.
+Fill in the model IDs that are available on your account. clagentic-lite reads this file at runtime — update it when OpenAI releases new models or renames existing ones, with no `clagentic-lite init` re-run required. Model strings in `~/.config/clagentic/lite/config` (`CLAGENTIC_MODEL_CODEX_*`) are intentionally left blank by default so this file is the sole source of truth.
 
 Tier names map to clagentic-lite's chain vocabulary: `flagship`, `mini`, `spark`. The `default` tier alias resolves to `default_tier` in the file. Explicit env vars always win over models.json if both are set.
 
@@ -336,7 +342,7 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
 ├── CLAUDE.md                                   pointer to AGENTS.md
 ├── README.md                                   this file
 ├── share/
-│   ├── config.example                          global config template (written to ~/.config/clagentic/config)
+│   ├── config.example                          global config template (written to ~/.config/clagentic/lite/config)
 │   └── hook-shims/
 │       ├── pre-commit.template                 stamped into enrolled repos at enroll time
 │       └── pre-push.template
@@ -367,7 +373,14 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
 │   └── smoke.sh                                non-interactive end-to-end
 └── examples/{python,node,go}/                  demo projects with planted bugs + secrets
 
-~/.config/clagentic/config                      global config (chmod 600; written by init)
+~/.config/clagentic/lite/config                 global config (chmod 600; written by init). ~/.config/clagentic/
+                                                 is the shared brand root (clagentic-loadout uses
+                                                 ~/.config/clagentic/loadout/ alongside this) -- lite's own state
+                                                 always lives one segment deeper, under lite/.
+                                                 An old config at the bare ~/.config/clagentic/config path
+                                                 (pre-lr-7939f8) is migrated here automatically by `update`,
+                                                 with a one-time warning; still honored as a read fallback
+                                                 until migrated.
 ~/.local/state/clagentic/registry               enrolled repos — one absolute path per line
 ~/.local/bin/clagentic-lite                     symlink to $CLAGENTIC_LITE_HOME/bin/clagentic-lite
 

@@ -25,7 +25,7 @@ Keyword extraction is the simplest thing that works: strip stopwords from the pr
 | **Blocks?** | Yes (exit 2). Also blocks if neither `jq` nor `python3` is on PATH — hooks need a JSON validator to parse tool input safely, and a hook that can't parse fails closed. |
 | **JSON parsing** | `ds_json_field` (in `scripts/platform.sh`) routes through `jq` if present, `python3` as fallback. The previous `sed`-based parser truncated on escaped quotes and was a known R-005 bypass surface. |
 | **Path normalization** | `pre-write-guard.sh` resolves relative paths against the repo root via `python3 os.path.realpath` before the W-002 "inside repo" check, so `../outside.txt` traversal blocks. |
-| **Override** | `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` (comma-separated) in `.clagentic/config` or `~/.config/clagentic/config`. Document the reason in your commit or PR body. Never edit `pre-bash-guard.sh` to remove a rule. |
+| **Override** | `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` (comma-separated) in `.clagentic/config` or `~/.config/clagentic/lite/config`. Document the reason in your commit or PR body. Never edit `pre-bash-guard.sh` to remove a rule. |
 
 Bash rules (R-001 through R-020) implemented inline in `pre-bash-guard.sh`:
 
@@ -463,7 +463,7 @@ audited architectural decisions that persist in the repo history.
 | **Conservative bias** | Bias is toward showing. A finding on changed lines will always re-show (the diff window changes → different hash → not suppressed). A finding where the key cannot be computed (parse error, no diff file, no sha256) is retained. |
 | **First run** | Seen-keys file absent → no-op: all findings pass through; keys for this run's findings are appended for use by the next round. |
 
-Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/config` (global). See `share/config.example` for the full entry.
+Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/lite/config` (global). See `share/config.example` for the full entry.
 
 ### Cross-round finding recurrence demotion (lr-66e598)
 
@@ -502,7 +502,7 @@ notion of sameness.
 | **Conservative bias** | Identical posture to cross-round dedup, applied to demotion instead of suppression: empty key → retained, un-demoted. Splice failure → original findings retained untouched. No JSON tool at all → full passthrough, `last-review.json` unmodified. A finding is annotated only when its key was actually computable this round; an uncomputable key never accrues a count and can never be demoted. |
 | **Scope** | Review findings only (Gate 3). Adversarial findings (Gate 5) already have their own two-tier `reachable`/`tier` mechanism (see "Blocking vs advisory" above) with its own mechanical security-floor clamp; recurrence demotion does not read or write adversarial findings and has no interaction with that clamp — a finding held `tier: blocking` by the security floor is a Gate 5 concept entirely outside this function's reach. |
 
-Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/config` (global). See `share/config.example` for the full entry.
+Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/lite/config` (global). See `share/config.example` for the full entry.
 
 ### Review ledger and anchored verdicts (lr-01ae73)
 
@@ -1002,7 +1002,7 @@ intermittent-looking gate behavior.
 |---|---|
 | **Tool** | `osv-scanner scan --recursive --format=json --config=<tmpfile> .` (newer releases) or `osv-scanner --recursive --severity=<S> .` (older releases). Version probed by subcommand availability, not version string. |
 | **Blocks?** | Yes, on vulnerabilities at or above the configured severity. Default is `CRITICAL`. |
-| **Severity** | Set `CLAGENTIC_OSV_SEVERITY` in `~/.config/clagentic/config` or `.clagentic/config`. Values: `CRITICAL` (default), `HIGH`, `MEDIUM`, `LOW`. Set `LOW` to restore block-on-any-finding behavior. Newer releases no longer expose a scan-time severity filter, so clagentic-lite captures JSON and applies the threshold to osv-scanner's computed `max_severity` values. Missing or malformed severity data blocks fail-closed. |
+| **Severity** | Set `CLAGENTIC_OSV_SEVERITY` in `~/.config/clagentic/lite/config` or `.clagentic/config`. Values: `CRITICAL` (default), `HIGH`, `MEDIUM`, `LOW`. Set `LOW` to restore block-on-any-finding behavior. Newer releases no longer expose a scan-time severity filter, so clagentic-lite captures JSON and applies the threshold to osv-scanner's computed `max_severity` values. Missing or malformed severity data blocks fail-closed. |
 | **Ignore list** | Add CVE/GHSA IDs one-per-line to `~/.config/clagentic/osv-ignore` (global) or `.clagentic/osv-ignore` (repo). Lines starting with `#` and blank lines are ignored. For newer releases, these become `[[IgnoredVulns]]` blocks in the generated temp config; for older releases, they are passed as `--ignore-vulns=<id>`. |
 | **Missing tool** | Set `CLAGENTIC_ALLOW_MISSING_OSV=1` to skip if osv-scanner is not installed. |
 | **Timeout** | Every osv-scanner invocation runs under `run_bounded` (default 300s, configurable via `CLAGENTIC_OSV_TIMEOUT_SEC`) — the vulnerability-DB lookup is a network call. A timeout counts as a block. |
