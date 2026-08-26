@@ -50,6 +50,13 @@ live tree, under every path including setup-failure and cleanup -- follows
 test_update_nontty_discard_guard.py exactly. HOME is always a fresh tempdir,
 never the operator's real HOME, which holds live credentials.
 
+`_clone_tool_home` (scripts/test_support.py) also overlays the checkout's
+CURRENT on-disk content over the clone -- `git clone` alone only picks up
+COMMITTED history, so an uncommitted edit to bin/clagentic-lite would
+otherwise be invisible to TestEndToEndViaRealCli below (PEACHES finding,
+PR #207; this file previously claimed the HAZARD discipline above without
+actually carrying the overlay -- lr-bca2ee).
+
 Run with: python3 -m unittest scripts.test_global_config_brand_migration -v
 """
 import os
@@ -59,6 +66,8 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+
+from scripts.test_support import clone_this_tool_home_with_overlay
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
@@ -93,16 +102,12 @@ def _extract_migration_functions():
     return extracted
 
 
-def _clone_tool_home(dest):
-    """Throwaway git clone of the real checkout, per the HAZARD discipline
-    in test_update_nontty_discard_guard.py. Used only by the end-to-end
-    (real CLI) tests below -- the extracted-function tests never invoke
-    bin/clagentic-lite as a subprocess at all."""
-    subprocess.run(["git", "clone", "-q", TOOL_HOME, dest], check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.email", "test@example.com"],
-                    check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.name", "Test"],
-                    check=True, capture_output=True)
+_clone_tool_home = clone_this_tool_home_with_overlay
+"""Throwaway git clone of the real checkout, overlaid with its current
+on-disk content (scripts/test_support.py), per the HAZARD discipline in
+test_update_nontty_discard_guard.py. Used only by the end-to-end (real CLI)
+tests below -- the extracted-function tests never invoke bin/clagentic-lite
+as a subprocess at all."""
 
 
 def _all_file_modes_under(root):
@@ -499,7 +504,14 @@ class TestEndToEndViaRealCli(unittest.TestCase):
         env["CLAGENTIC_LITE_HOME"] = self.fake_tool_home
         env["CLAGENTIC_SKIP_UPDATE_ALERT"] = "1"
         env.pop("CLAGENTIC_HOME", None)
-        env.pop("CLAGENTIC_UPDATE_ALLOW_DISCARD", None)
+        # The overlaid clone (_clone_tool_home, scripts/test_support.py) is
+        # unstaged-dirty against its own HEAD whenever this checkout has
+        # uncommitted changes, tripping cmd_update's non-tty discard guard
+        # (lr-55a27a) even though self.fake_tool_home is disposable
+        # (shutil.rmtree'd in cleanup) -- no test in this class exercises
+        # the discard-refusal behavior itself (test_update_nontty_discard_
+        # guard.py owns that), so always allow it here rather than scrub it.
+        env["CLAGENTIC_UPDATE_ALLOW_DISCARD"] = "1"
         env.pop("CLAGENTIC_ENV_LOADED", None)
         env.pop("CLAGENTIC_GLOBAL_ENV_LOADED", None)
         env.pop("CLAGENTIC_REPO_ENV_LOADED", None)
