@@ -1181,7 +1181,7 @@ See lr-3b06b1 (open, tracked separately) for whether `issue_class`/`class_fix` o
 | **Fires** | `scripts/gates.sh bleed`; part of `gates ship`'s blocking sequence |
 | **Tool** | `grep -lIf` against a change-scoped file set, using a repo- or user-supplied pattern file |
 | **Blocks?** | Yes, on any pattern match. Opt-in: skips non-blocking when no pattern file is configured. |
-| **Pattern file** | `.clagentic/bleed-patterns` (repo-level, checked first) or `~/.config/clagentic/bleed-patterns` (global). BRE, one pattern per line; `#` comments and blank lines ignored. |
+| **Pattern file** | `.clagentic/bleed-patterns` (repo-level, checked first) or `~/.config/clagentic/lite/bleed-patterns` (global; migrated off the shared brand root `~/.config/clagentic/bleed-patterns` by the same migrate-and-warn mechanism as the osv-ignore and semgrep-exclude ladders, lr-73fa40). BRE, one pattern per line; `#` comments and blank lines ignored. |
 | **Exclusions** | `.clagentic-bleed-ignore` (repo root, one path-substring per line); `.git/` and `.clagentic/` are always excluded. |
 | **Full-scan escape hatch** | `scripts/gates.sh bleed --full-scan`, or automatic whenever a change-scoped resolution can't be established (see below). |
 | **Branch-diff fetch timeout** | `CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC` (default 30). Bounds both the `git fetch` and the `git ls-remote` freshness check used to verify the branch-diff baseline (see "Branch-diff freshness" below) — expiry falls back to full-tree, same as any other unverifiable-baseline outcome. |

@@ -1095,8 +1095,19 @@ cmd_bleed() {
   # lines starting with # and blank lines are ignored.
   #
   # Pattern file resolution (first found wins):
-  #   1. ${CLAGENTIC_PROJECT_ROOT:-$PWD}/.clagentic/bleed-patterns  (repo-level)
-  #   2. $HOME/.config/clagentic/bleed-patterns                     (global user config)
+  #   1. ${CLAGENTIC_PROJECT_ROOT:-$PWD}/.clagentic/bleed-patterns        (repo-level)
+  #   2. $HOME/.config/clagentic/lite/bleed-patterns                     (global user config)
+  #
+  # Global half moved off the shared brand root ($HOME/.config/clagentic/
+  # bleed-patterns) to this product's own namespace (lr-73fa40), same
+  # migrate-and-warn mechanism cmd_deps' GLOBAL_IGNORE and cmd_sast's
+  # semgrep-exclude use (_gate_migrate_brand_root_file /
+  # _gate_resolve_global_ignore_path, defined above cmd_deps) -- third and
+  # final known instance of the brand/product split (lr-7939f8,
+  # lr-8ee2df). bleed-patterns is a single pattern file, not credentials,
+  # same non-credential posture as the ignore lists -- see
+  # _gate_migrate_brand_root_file's own doc comment for why it deliberately
+  # skips the chmod-600/never-leak apparatus.
   #
   # If neither exists, the gate skips non-blocking with a warning — the gate
   # is opt-in via pattern config, not fail-closed on missing config.
@@ -1131,15 +1142,24 @@ cmd_bleed() {
     esac
   done
 
+  _BLEED_OLD_GLOBAL_PAT_FILE="$HOME/.config/clagentic/bleed-patterns"
+  _BLEED_NEW_GLOBAL_PAT_FILE="$HOME/.config/clagentic/lite/bleed-patterns"
+  # `|| true`: see the matching comment in cmd_deps -- a migration failure
+  # must never abort this gate under `set -e`; the resolve step right after
+  # falls back to reading the old path directly, same as any other
+  # un-migrated install during the deprecation window.
+  _gate_migrate_brand_root_file "$_BLEED_OLD_GLOBAL_PAT_FILE" "$_BLEED_NEW_GLOBAL_PAT_FILE" "bleed-patterns" || true
+  _BLEED_GLOBAL_PAT_FILE=$(_gate_resolve_global_ignore_path "$_BLEED_NEW_GLOBAL_PAT_FILE" "$_BLEED_OLD_GLOBAL_PAT_FILE" "bleed-patterns")
+
   _BLEED_PAT_FILE=""
   if [ -f "${CLAGENTIC_PROJECT_ROOT:-$PWD}/.clagentic/bleed-patterns" ]; then
     _BLEED_PAT_FILE="${CLAGENTIC_PROJECT_ROOT:-$PWD}/.clagentic/bleed-patterns"
-  elif [ -f "$HOME/.config/clagentic/bleed-patterns" ]; then
-    _BLEED_PAT_FILE="$HOME/.config/clagentic/bleed-patterns"
+  elif [ -n "$_BLEED_GLOBAL_PAT_FILE" ] && [ -f "$_BLEED_GLOBAL_PAT_FILE" ]; then
+    _BLEED_PAT_FILE="$_BLEED_GLOBAL_PAT_FILE"
   fi
 
   if [ -z "$_BLEED_PAT_FILE" ]; then
-    echo "[gates/bleed] no pattern file found — skipping (configure ~/.config/clagentic/bleed-patterns to enable)"
+    echo "[gates/bleed] no pattern file found — skipping (configure ${_BLEED_NEW_GLOBAL_PAT_FILE} to enable)"
     cmd_log_run bleed pass "no pattern file"
     return 0
   fi

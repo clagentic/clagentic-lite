@@ -1,5 +1,5 @@
 # clagentic-lite internal-bleed pattern config
-# Copy to ~/.config/clagentic/bleed-patterns and add your own patterns.
+# Copy to ~/.config/clagentic/lite/bleed-patterns and add your own patterns.
 # One grep BRE pattern per line. Lines starting with # and blank lines are ignored.
 #
 # The bleed gate scans all committed tracked files for these patterns and blocks
