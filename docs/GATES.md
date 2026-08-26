@@ -65,7 +65,7 @@ Write rules:
 
 | | |
 |---|---|
-| **Fires** | `/review` slash command (which routes through `scripts/gates.sh review` — never bypassed); optional pre-push hook (`CLAGENTIC_REVIEW_ON_PUSH=1`) |
+| **Fires** | `clagentic-lite gates review` (or the subagent, which routes through `scripts/gates.sh review` — never bypassed); optional pre-push hook (`CLAGENTIC_REVIEW_ON_PUSH=1`) |
 | **Tool** | `scripts/gates.sh review` → `scripts/llm-client.sh review` |
 | **Blocks?** | (a) Findings ≥ `${CLAGENTIC_BLOCK_SEVERITY}` block `/ship`; (b) degraded envelopes (every Reviewer chain step failed) block; (c) unparseable JSON blocks (sentinel value 99). |
 | **Default severity** | `high` |
@@ -537,6 +537,7 @@ remote` configured at all.
   "base_sha": "a1b2c3d...",
   "head_sha": "e4f5a6b...",
   "verdict": "pass",
+  "gate": "review",
   "findings": [
     {"severity": "medium", "file": "app.py", "line": 12, "category": "style",
      "message": "...", "issue_class": "...", "class_fix": "...",
@@ -552,8 +553,9 @@ remote` configured at all.
 | `branch` | Branch name the review ran on (`_review_current_branch`, `scripts/gates.sh`); empty on a detached HEAD or a non-git `REPO_ROOT` |
 | `base_sha` | `merge-base(origin/<default-branch>, HEAD)`, resolved via the SAME provably-current freshness precondition `cmd_sast`'s `--baseline-commit` scoping uses (`_gate_resolve_fresh_default_branch_ref`) — reuse, not a parallel freshness check. Empty when unresolvable (detached HEAD, on the default branch itself, unreachable remote, shallow clone) — provenance, not the anchor itself; a ledger entry with an empty `base_sha` is still a valid, anchored entry as long as `head_sha` resolved. |
 | `head_sha` | The commit SHA this verdict evaluated, via `_git_repo_scoped_head_sha` (same repo-scoping discipline as every other SHA read in this file). **This is the anchor** — see "Anchored verdicts" below. |
-| `verdict` | `"pass"`, `"block"`, or `"unanchored"` (see below) |
-| `findings` | The exact structured findings array from this round's `last-review.json`, each annotated with `_ledger_recurring` (see "Stable finding identity" below) |
+| `verdict` | `"pass"`, `"block"`, `"unanchored"`, or `"skip"` (see below) |
+| `gate` | Which gate wrote this entry — `"review"` (`cmd_review`) or `"adversarial"` (`cmd_adversarial`). Both gates share this one ledger file; `gate` is what keeps their delta-re-review anchors from colliding — see "Delta re-review is shared, and gate-scoped" below. A legacy entry written before this field existed has no `gate` key at all, and is never treated as `"review"` by default — see that section. |
+| `findings` | For `gate: "review"`, the exact structured findings array from this round's `last-review.json`, each annotated with `_ledger_recurring` (see "Stable finding identity" below). For `gate: "adversarial"`, always `[]` — `_ledger_record_review_verdict` (`scripts/gates.sh`) reads `.findings` from the markdown file `cmd_adversarial` writes (`last-adversarial.md`), which has no such key, so extraction falls through to empty; the adversarial findings themselves live in `last-adversarial-findings.json`, not in this ledger entry. |
 | `config` | The gate config in effect for this run: `block_severity` (`CLAGENTIC_BLOCK_SEVERITY`), `cross_round_dedup` (`CLAGENTIC_CROSS_ROUND_DEDUP`), `recurrence_threshold` (`CLAGENTIC_RECURRENCE_THRESHOLD`) |
 
 **Append-only; prior entries retained.** `ledger_append` never rewrites or
@@ -563,8 +565,8 @@ removes an entry except for the optional per-branch cap
 rounds visible after the fact: every prior round's findings for a branch
 stay on disk, not just the latest one.
 
-**Anchored verdicts (item 2).** `cmd_review` always records the
-`(base_sha, head_sha)` pair it evaluated — every call to
+**Anchored verdicts (item 2).** Both `cmd_review` and `cmd_adversarial`
+always record the `(base_sha, head_sha)` pair they evaluated — every call to
 `_ledger_record_review_verdict` (`scripts/gates.sh`) passes both, resolved
 fresh for that run, regardless of outcome. A verdict with NO resolvable
 `head_sha` (`_git_repo_scoped_head_sha` came back empty — `REPO_ROOT` is not
@@ -578,16 +580,54 @@ this SHA," requires both a non-empty stored `head_sha` matching the
 queried SHA AND `verdict == "pass"` — an `"unanchored"` entry can never
 satisfy either half.
 
-**Delta re-review is now the default (item 3).** `get_review_diff`
-(`scripts/gates.sh`) generalizes the former `--since-last-review` opt-in
-flag: when the current branch has a prior ANCHORED ledger verdict (i.e.
-`ledger_latest_for_branch` returns an entry with a non-empty `head_sha`),
-review diffs `<that head_sha>..HEAD` by default instead of the full
+**Delta re-review is shared, and gate-scoped (item 3).** `get_review_diff`
+(`scripts/gates.sh`) is the ONE resolver both `cmd_review` and
+`cmd_adversarial` call to get their diff — it generalizes the former
+`--since-last-review` opt-in flag: when the current branch has a prior
+PASSING ANCHORED ledger verdict for the calling gate, that gate diffs
+`<that head_sha>..HEAD` by default instead of the full
 `origin/<default>..HEAD` branch diff. `--since-last-review` is still
 accepted (as a backward-compatible no-op — it names the same behavior that
-is now the default). `gates.sh review --full-review` forces the full-range
-branch diff regardless of ledger state — the explicit opt-out this task
-requires stays available.
+is now the default). `gates.sh review --full-review` / `gates.sh adversarial
+--full-review` force the full-range branch diff for that gate regardless of
+ledger state — the explicit opt-out stays available on both gates.
+
+**Each gate has its own anchor namespace — one shared resolver, two
+independent deltas.** `get_review_diff` takes a `GATE` argument
+(`"review"` or `"adversarial"`) and passes it to
+`_ledger_latest_passing_head_for_branch`, which filters
+`review-ledger.jsonl` to entries whose `gate` field matches the caller —
+see the entry-schema table above. **This is not cosmetic**: before this
+filter existed, both gates wrote to the same file with no `gate`
+discriminator, so a `cmd_review` pass recorded at HEAD (the normal
+`gates ship` order: review, then adversarial, in the same process) anchored
+the very next `cmd_adversarial` call's delta too. That collapsed the
+adversarial diff to `HEAD..HEAD` — empty — purely because review had just
+run, with no code change of its own. An operator watching `gates ship`
+succeed had no way to know the auditor had examined nothing; a clean
+adversarial pass and a hollow one were indistinguishable. `gate`-scoping the
+anchor lookup means a review pass can never anchor adversarial's delta, or
+vice versa — each gate's "prior passing verdict" is only ever a prior
+verdict from that same gate.
+
+A ledger entry written before the `gate` field existed has no `gate` key at
+all. It is never treated as `gate: "review"` by default: an explicit-GATE
+query only ever matches entries carrying that exact `gate` value, so a
+legacy entry simply matches nothing and the caller falls through to
+full-range review — the same fail-toward-MORE-coverage direction as every
+other resolution failure in this section, never a silent narrower diff.
+
+**An empty resolved diff is `skip`, never a silent `pass` (lr-1a04cf).** If
+delta re-review (or any other path through `get_review_diff`) resolves to
+zero bytes — nothing changed since the gate's last passing verdict, or
+there is genuinely nothing to review — that gate does not report a clean
+pass on content it never examined. `cmd_review` and `cmd_adversarial` both
+check the resolved diff with `_gate_resolved_diff_is_empty` before calling
+the LLM at all; on an empty diff, the gate short-circuits, records a ledger
+entry with `verdict: "skip"`, and reports SKIP rather than a pass. A `skip`
+verdict can never satisfy `_ledger_latest_passing_head_for_branch`'s `pass`
+filter, so an empty-diff round can never anchor a future delta either, for
+either gate.
 
 **Unresolvable prior SHA falls back to full-range (fail toward MORE
 coverage).** A prior `head_sha` this repo can no longer resolve as a real
@@ -597,11 +637,13 @@ produces — cannot anchor a delta diff: `git diff A..B` between two
 unrelated or missing points is not "the delta since the prior verdict," it
 is either a hard error or a misleading unrelated-history diff. `get_review_diff`
 detects this and falls back to the full branch-diff path, **and says so on
-stderr** (`delta re-review: prior verdict SHA ... is no longer an ancestor
-of HEAD (rebase/amend/force-push) — falling back to full-range review`) —
-the same "never silently narrow on a resolution failure, always widen and
-announce it" doctrine `cmd_sast`'s baseline scoping and `cmd_bleed`'s branch
-scoping already established for their own freshness-resolution failures.
+stderr**, naming the calling gate (`[gates/review] delta re-review: prior
+passing verdict SHA ... is no longer an ancestor of HEAD (rebase/amend/
+force-push) — falling back to full-range review`, or the same message under
+`[gates/adversarial]` when `cmd_adversarial` is the caller) — the same
+"never silently narrow on a resolution failure, always widen and announce
+it" doctrine `cmd_sast`'s baseline scoping and `cmd_bleed`'s branch scoping
+already established for their own freshness-resolution failures.
 
 **Merge-gate consumption (item 4) — stale or missing verdict-at-HEAD means
 re-review, never proceed.** `build_gate_summary` (`scripts/gates.sh`)
@@ -1160,7 +1202,7 @@ A pattern-file change is also detected and forces a full scan regardless of the 
 
 | | |
 |---|---|
-| **Fires** | `/review --adversarial`; `scripts/gates.sh adversarial` |
+| **Fires** | `clagentic-lite gates adversarial` (or the subagent); `scripts/gates.sh adversarial` |
 | **Tool** | Auditor role via `scripts/llm-client.sh adversarial` |
 | **Blocks?** | No — Gate 5 itself is commentary only. A finding's `tier` field can make Gate 6 (Merge Gate) refuse — see "Reachability requirement" and "Blocking vs advisory" below. `gates.sh ship` runs it as `cmd_adversarial \|\| true` (an explicit, deliberate opt-out, not an accidental default — see "Exit codes" below). |
 | **Output** | Markdown attack scenarios saved to `.clagentic/lite/last-adversarial.md`; structured findings (same data, machine-readable) saved to `.clagentic/lite/last-adversarial-findings.json`; attach to PR if interesting |
@@ -1338,7 +1380,7 @@ As a second, independent layer, `ds_adversarial_prompt` (`scripts/llm-client.sh`
 
 | | |
 |---|---|
-| **Fires** | `scripts/gates.sh ship` (the `/ship` slash command), after all other gates have passed |
+| **Fires** | `clagentic-lite gates ship` (or the subagent), which runs `scripts/gates.sh ship`, after all other gates have passed |
 | **Tool** | LLM "gate" role via `scripts/llm-client.sh merge-gate` |
 | **Input** | A JSON gate-summary payload (`.clagentic/lite/gate-summary.json`) built from `last-review.json` + `last-adversarial.md` + `last-adversarial-findings.json` + threshold + an informational `deterministic_gates` block read from `audit.db` (lr-367a21; see Gate 5 "Deterministic-gates payload block") |
 | **Output** | `{decision: "approve" | "refuse", reason: "<one sentence>"}` JSON at `.clagentic/lite/last-merge-gate.json` |
