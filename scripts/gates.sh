@@ -5332,6 +5332,68 @@ print(json.dumps(block))
   printf '""'
 }
 
+# _fence_deterministic_gates JSON_OBJECT — render an (already sanitized)
+# deterministic_gates JSON object as a JSON string value, human-readable and
+# wrapped in the ===BEGIN/END DETERMINISTIC GATES DATA=== fence
+# ds_merge_gate_prompt (llm-client.sh) instructs the Merge Gate to treat as
+# data, not instructions (lr-92d931, settling the convention question
+# lr-367a21 left open: every external-text payload field reaching an LLM
+# prompt is BOTH sanitized AND fenced — deterministic_gates.details was
+# sanitized via _llm_field_sanitize at lr-367a21 but never fenced; this
+# closes that divergence). Mirrors _fence_adversarial_findings's own
+# ===BEGIN/END ADVERSARIAL FINDINGS DATA=== fence and
+# ds_adversarial_prompt's ===BEGIN/END INVARIANTS DATA=== fence for the
+# equivalent round-trip shape. Assumes the input is already sanitized
+# (_read_deterministic_gates below calls _llm_field_sanitize on each gate's
+# "details" field before this is ever called) — this function only renders
+# and fences, it does not sanitize a second time. "outcome" is never
+# sanitized upstream (closed 4-value set, not free text) and is fenced here
+# unchanged along with everything else in the object — fencing applies to
+# the payload field as a whole, not per-subfield, matching how
+# adversarial_findings_fenced fences its whole array rather than
+# re-selecting only the free-text subfields within each entry.
+#
+# TRAILING-NEWLINE PARITY (lr-92d931): unlike _fence_adversarial_findings
+# (which is only ever exercised from the emitter branch matching its own
+# jq/python3 availability, so its two internal paths never have to agree
+# byte-for-byte with each other), build_gate_summary's python3 branch below
+# calls THIS function directly to compute deterministic_gates_fenced even
+# though the caller itself is in the jq-absent branch -- both of this
+# function's own jq and python3 paths must therefore produce byte-identical
+# output for the same input, or the two build_gate_summary emitter branches
+# could disagree on nothing more than a trailing newline. Both paths below
+# are written to end the rendered block with the same "\n===END ...===\n"
+# shape (the jq path's heredoc blank line before EOF is intentional and
+# mirrored explicitly in the python3 path's block string, rather than left
+# to a possible divergence).
+_fence_deterministic_gates() {
+  _fdg_json="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -Rs '.' <<EOF
+===BEGIN DETERMINISTIC GATES DATA===
+$(printf '%s' "$_fdg_json" | jq '.' 2>/dev/null || printf '%s' "$_fdg_json")
+===END DETERMINISTIC GATES DATA===
+EOF
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, sys
+raw = sys.argv[1]
+try:
+    pretty = json.dumps(json.loads(raw), indent=2)
+except Exception:
+    pretty = raw
+# Trailing "\n" before the closing marker matches the jq path above (heredoc
+# blank line before EOF) -- see this function doc comment.
+block = "===BEGIN DETERMINISTIC GATES DATA===\n" + pretty + "\n===END DETERMINISTIC GATES DATA===\n"
+print(json.dumps(block))
+' "$_fdg_json"
+    return 0
+  fi
+  printf '""'
+}
+
 # _read_deterministic_gates (lr-367a21) — INFORMATIONAL ONLY.
 #
 # Reads the latest gate_runs row for each deterministic gate (secrets, deps,
@@ -6280,6 +6342,13 @@ build_gate_summary() {
     # comment. Never gates a decision -- read failure degrades to nulls +
     # audit_db_unavailable, never a block.
     DETERMINISTIC_GATES_PAYLOAD=$(_read_deterministic_gates)
+    # Fenced, explicit-data-block rendering (lr-92d931), mirroring
+    # adversarial_findings_fenced immediately above. deterministic_gates.
+    # details is already sanitized (_read_deterministic_gates ->
+    # _llm_field_sanitize); this only renders and fences the whole object,
+    # same convention, same reasoning: every external-text payload field
+    # reaching the Merge Gate prompt is both sanitized and fenced.
+    DETERMINISTIC_GATES_FENCED_PAYLOAD=$(_fence_deterministic_gates "$DETERMINISTIC_GATES_PAYLOAD")
     cat <<EOF
 {
   "review": $RV_PAYLOAD,
@@ -6297,7 +6366,8 @@ build_gate_summary() {
   "accepted_risks": $AR_PAYLOAD,
   "introduces_ack_file": $INTRODUCES_ACK_FILE,
   "threshold": "$THRESHOLD",
-  "deterministic_gates": $DETERMINISTIC_GATES_PAYLOAD
+  "deterministic_gates": $DETERMINISTIC_GATES_PAYLOAD,
+  "deterministic_gates_fenced": $DETERMINISTIC_GATES_FENCED_PAYLOAD
 }
 EOF
     return 0
@@ -6322,7 +6392,13 @@ EOF
     # posture, for both emitter branches. See _read_deterministic_gates's
     # doc comment.
     DETERMINISTIC_GATES_PAYLOAD=$(_read_deterministic_gates)
-    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" "$DETERMINISTIC_GATES_PAYLOAD" <<'PY'
+    # Fenced, explicit-data-block rendering (lr-92d931) -- same sh helper
+    # (_fence_deterministic_gates) the jq branch above calls, handed in
+    # pre-built for the identical reason DETERMINISTIC_GATES_PAYLOAD is:
+    # one render site, one fence text, for both emitter branches -- they
+    # cannot diverge on the fence wording either.
+    DETERMINISTIC_GATES_FENCED_PAYLOAD=$(_fence_deterministic_gates "$DETERMINISTIC_GATES_PAYLOAD")
+    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" "$DETERMINISTIC_GATES_PAYLOAD" "$DETERMINISTIC_GATES_FENCED_PAYLOAD" <<'PY'
 import json, sys
 threshold           = sys.argv[1]
 introduces_ack      = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
@@ -6334,15 +6410,42 @@ ar_path             = sys.argv[7] if len(sys.argv) > 7 else ""
 adf_path            = sys.argv[8] if len(sys.argv) > 8 else ""
 adversarial_degraded = sys.argv[9].lower() == "true" if len(sys.argv) > 9 else False
 adf_meta_path       = sys.argv[10] if len(sys.argv) > 10 else ""
+deterministic_gates_fenced_arg = sys.argv[12] if len(sys.argv) > 12 else ""
 # Pre-built by _read_deterministic_gates (sh) -- fail-open to an
 # audit-db-unavailable envelope if this somehow arrives empty/unparseable
 # (defense in depth; the sh helper always emits valid JSON on this path).
+# deterministic_gates_fenced (lr-92d931) tracks the SAME fallback: if the
+# raw object couldn't be parsed, the fenced text handed in from sh (rendered
+# from that same unparseable/empty argv[11]) cannot be trusted to describe
+# the fallback dict either, so it is re-derived from the fallback dict
+# itself rather than trusting the pre-rendered argv[12] in this one branch
+# -- the two emitter branches must not diverge on what "deterministic_gates
+# was unreadable" looks like.
+# Trailing "\n" before the closing marker matches _fence_deterministic_gates'
+# own jq heredoc shape (jq -Rs slurps the heredoc verbatim, blank line before
+# EOF included) -- kept identical here so this fallback-only construction
+# cannot diverge from the sh helper's real output by a stray/missing newline.
+_DETGATES_FENCE_BEGIN = "===BEGIN DETERMINISTIC GATES DATA===\n"
+_DETGATES_FENCE_END = "\n===END DETERMINISTIC GATES DATA===\n"
 try:
-    deterministic_gates = json.loads(sys.argv[11]) if len(sys.argv) > 11 and sys.argv[11] else {
-        "secrets": None, "deps": None, "sast": None, "audit_db_unavailable": True,
-    }
+    if len(sys.argv) > 11 and sys.argv[11]:
+        deterministic_gates = json.loads(sys.argv[11])
+        # _fence_deterministic_gates (sh) emits a JSON STRING LITERAL
+        # (quoted) on stdout -- the same contract _fence_adversarial_findings
+        # uses, which the jq branch above splices directly into a JSON
+        # template as-is. This python branch assigns the value into a
+        # Python dict that json.dumps() will re-encode below, so the
+        # argument must be DECODED to a plain string here first -- passing
+        # the still-JSON-encoded argv value through unchanged would nest an
+        # extra layer of quoting/escaping around the fence text.
+        deterministic_gates_fenced = json.loads(deterministic_gates_fenced_arg)
+    else:
+        raise ValueError("empty deterministic_gates payload")
 except Exception:
     deterministic_gates = {"secrets": None, "deps": None, "sast": None, "audit_db_unavailable": True}
+    deterministic_gates_fenced = (
+        _DETGATES_FENCE_BEGIN + json.dumps(deterministic_gates, indent=2) + _DETGATES_FENCE_END
+    )
 review = None
 if rv_path:
     try:
@@ -6447,6 +6550,7 @@ print(json.dumps({
     "adversarial_acks": acks,
     "accepted_risks": ar,
     "deterministic_gates": deterministic_gates,
+    "deterministic_gates_fenced": deterministic_gates_fenced,
     "introduces_ack_file": introduces_ack,
     "threshold": threshold,
 }))
@@ -6468,12 +6572,28 @@ PY
   # inferring it from an envelope that looks identical to a genuinely empty
   # one. introduces_ack_file is included as false (conservative — no
   # bootstrap exemption in degraded mode).
+  # deterministic_gates/deterministic_gates_fenced (lr-92d931): this branch
+  # has no jq and no python3, so deterministic_gates was never populated
+  # here even before this fix -- _read_deterministic_gates/
+  # _fence_deterministic_gates both themselves prefer jq then python3 for
+  # their own JSON handling and would degrade to the same audit-db-
+  # unavailable shape if called, so there is nothing gained by attempting
+  # the call in an environment already known to lack both JSON tools.
+  # Emitting the literal audit-db-unavailable envelope directly here (same
+  # values _read_deterministic_gates itself falls back to) keeps this
+  # degraded branch schema-complete with the other two emitter branches
+  # rather than omitting the field entirely, and keeps it fenced per this
+  # codebase's now-settled convention (every external-text payload field is
+  # both sanitized and fenced) -- there is no free text in this fixed
+  # fallback shape to sanitize, only the fence itself to add.
+  DETGATES_UNAVAILABLE_JSON='{"secrets": null, "deps": null, "sast": null, "audit_db_unavailable": true}'
+  DETGATES_UNAVAILABLE_FENCED='"===BEGIN DETERMINISTIC GATES DATA===\n{\n  \"secrets\": null,\n  \"deps\": null,\n  \"sast\": null,\n  \"audit_db_unavailable\": true\n}\n===END DETERMINISTIC GATES DATA==="'
   if [ -f "$RV" ]; then
     cat <<EOF
-{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_degraded": $ADVERSARIAL_DEGRADED, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "resolved_change_class": null, "adversarial_downgraded_by_class_count": 0, "adversarial_findings_dropped_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD", "gate_summary_degraded": true}
+{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_degraded": $ADVERSARIAL_DEGRADED, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "resolved_change_class": null, "adversarial_downgraded_by_class_count": 0, "adversarial_findings_dropped_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD", "deterministic_gates": $DETGATES_UNAVAILABLE_JSON, "deterministic_gates_fenced": $DETGATES_UNAVAILABLE_FENCED, "gate_summary_degraded": true}
 EOF
   else
-    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_degraded\": $ADVERSARIAL_DEGRADED, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_findings_dropped_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\", \"gate_summary_degraded\": true}"
+    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_degraded\": $ADVERSARIAL_DEGRADED, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_findings_dropped_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\", \"deterministic_gates\": $DETGATES_UNAVAILABLE_JSON, \"deterministic_gates_fenced\": $DETGATES_UNAVAILABLE_FENCED, \"gate_summary_degraded\": true}"
   fi
 }
 
