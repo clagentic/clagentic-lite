@@ -32,11 +32,22 @@ matches on it, not just that a file exists at some path afterward.
 Same reason as the sibling suite for testing via a real gates.sh subprocess
 for the wiring class (TestEndToEndViaRealCli there): clagentic-lite is
 developed on this host, never run here (CLAUDE.local.md fact 6). Runs only
-against a throwaway clone (_clone_tool_home, matching
+against a throwaway copy (_clone_tool_home, matching
 test_gates_ignore_list_brand_migration.py and
 test_update_nontty_discard_guard.py) with both CLAGENTIC_LITE_HOME and HOME
 pointed at fresh tempdirs -- never this checkout, never the operator's real
 HOME (TEST HAZARD in this task's dispatch).
+
+PEACHES review finding (PR #207): `git clone` of a local path clones
+COMMITTED history only -- it does not see uncommitted working-tree edits.
+A change to scripts/gates.sh made but not yet committed on the feature
+branch would be invisible to a test that only clones, so the test would
+validate the wrong revision (the last commit, not the diff under review)
+right up until the moment the change is committed. _clone_tool_home clones
+first (to get a real git repo shape other subprocess calls in this suite
+may rely on), then overlays every currently-tracked file's on-disk content
+from TOOL_HOME on top -- so a test run always exercises what is actually on
+disk in this checkout, committed or not.
 
 Run with: python3 -m unittest scripts.test_gates_bleed_patterns_brand_migration -v
 """
@@ -44,16 +55,39 @@ import os
 import shutil
 import subprocess
 import tempfile
-import textwrap
 import unittest
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _clone_tool_home(dest):
-    """Throwaway clone of this checkout -- never run the real CLI/gates.sh
-    against the live checkout (test hazard, see module docstring)."""
+    """Throwaway copy of this checkout -- never run the real CLI/gates.sh
+    against the live checkout (test hazard, see module docstring).
+
+    Clones committed history first (git rev-parse/log-dependent code paths
+    elsewhere in this suite need a real repo), then overlays the CURRENT
+    on-disk content of every tracked file over the clone. Without the
+    overlay, an uncommitted edit to e.g. scripts/gates.sh is invisible to
+    every test in this file -- they would silently validate the last
+    commit instead of the change under review (PEACHES finding, PR #207).
+    """
     subprocess.run(["git", "clone", "-q", TOOL_HOME, dest], check=True, capture_output=True)
+    tracked = subprocess.run(
+        ["git", "-C", TOOL_HOME, "ls-files", "-z"],
+        check=True, capture_output=True,
+    ).stdout
+    for rel_raw in tracked.split(b"\0"):
+        if not rel_raw:
+            continue
+        rel = rel_raw.decode()
+        src = os.path.join(TOOL_HOME, rel)
+        dst = os.path.join(dest, rel)
+        # A tracked file can be deleted-but-uncommitted on disk; skip it
+        # rather than fail the overlay -- ls-files still lists it (index
+        # entry unchanged), but there is nothing to copy.
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
     subprocess.run(["git", "-C", dest, "config", "user.email", "test@example.com"],
                     check=True, capture_output=True)
     subprocess.run(["git", "-C", dest, "config", "user.name", "Test"],
@@ -176,6 +210,14 @@ class TestBleedGlobalPatternFileMigration(unittest.TestCase):
         )
         self.assertIn("could not create", result.stderr)
         self.assertIn("deprecated path", result.stderr, "must still fall back to reading the old path")
+        # PEACHES finding (PR #207): the fallback warning used to say "run
+        # `clagentic-lite gates deps`/`sast`" -- accurate when cmd_deps and
+        # cmd_sast were the only two callers of this shared helper, but
+        # cmd_bleed becoming a third caller makes that text prescribe two
+        # unrelated gates to a bleed user. The message must name no
+        # specific gate command.
+        self.assertNotIn("gates deps", result.stderr, "bleed fallback warning must not tell the operator to run an unrelated gate")
+        self.assertNotIn("sast", result.stderr, "bleed fallback warning must not tell the operator to run an unrelated gate")
         # Falls back to reading OLD directly, so the pattern is still active
         # and the gate still finds it -- proving the fallback path is really
         # read, not just that the gate merely survives.

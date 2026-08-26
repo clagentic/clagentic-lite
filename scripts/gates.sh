@@ -885,6 +885,15 @@ _gate_migrate_brand_root_file() {
 # list and start re-flagging suppressed findings on a blocking security
 # gate. Prints the resolved path (possibly empty, meaning neither exists)
 # on stdout.
+#
+# The fallback warning below deliberately names no specific gate command.
+# It was originally written when cmd_deps/cmd_sast were the only two
+# callers and said "run `gates deps`/`sast`" -- accurate at the time, but
+# cmd_bleed becoming a third caller (lr-73fa40) made it prescribe two
+# unrelated gates to a bleed user. Same shape as the stale docs/GATES.md
+# waiver lr-92d931 found: a caller-specific message silently going stale
+# as the caller set grows. Generalized instead of re-specialized so a
+# fourth caller does not reopen the same defect.
 _gate_resolve_global_ignore_path() {
   _grgi_new="$1"
   _grgi_old="$2"
@@ -894,7 +903,7 @@ _gate_resolve_global_ignore_path() {
     return 0
   fi
   if [ -f "$_grgi_old" ]; then
-    echo "[gates] reading global $_grgi_label from deprecated path $_grgi_old -- run \`clagentic-lite gates deps\`/\`sast\` after moving it to $_grgi_new (brand/product namespace split), or let migration retry on a writable \$HOME/.config/clagentic/lite/" 1>&2
+    echo "[gates] reading global $_grgi_label from deprecated path $_grgi_old -- move it to $_grgi_new (brand/product namespace split), or let migration retry on a writable \$HOME/.config/clagentic/lite/" 1>&2
     printf '%s' "$_grgi_old"
     return 0
   fi
