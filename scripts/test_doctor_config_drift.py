@@ -22,10 +22,11 @@ any repo listed in $HOME/.local/state/clagentic/registry -- but it is keyed
 off $HOME's registry, not $CLAGENTIC_LITE_HOME directly, and every test
 below uses a fresh tempdir HOME with no registry file, so that path can
 never fire here. Even so, CLAGENTIC_LITE_HOME below points at a throwaway
-`git clone` of the real checkout (never the live tree itself), matching
-test_update_nontty_discard_guard.py's `_clone_tool_home` helper exactly --
-the stronger, doubt-free guarantee, rather than relying on the doctor-is-
-read-only argument alone.
+`git clone` of the real checkout (never the live tree itself), overlaid with
+the checkout's current on-disk content (scripts/test_support.py) so an
+uncommitted change to the file under test is never invisible to this
+suite -- the stronger, doubt-free guarantee, rather than relying on the
+doctor-is-read-only argument alone.
 
 Run with: python3 -m unittest scripts.test_doctor_config_drift -v
 """
@@ -35,15 +36,10 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.test_support import clone_this_tool_home_with_overlay
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-
-def _clone_tool_home(dest):
-    subprocess.run(["git", "clone", "-q", TOOL_HOME, dest], check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.email", "test@example.com"],
-                    check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.name", "Test"],
-                    check=True, capture_output=True)
+_clone_tool_home = clone_this_tool_home_with_overlay
 
 
 class _DoctorConfigDriftTestBase(unittest.TestCase):

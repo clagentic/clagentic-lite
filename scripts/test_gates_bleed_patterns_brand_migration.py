@@ -57,41 +57,10 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.test_support import clone_this_tool_home_with_overlay
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-
-def _clone_tool_home(dest):
-    """Throwaway copy of this checkout -- never run the real CLI/gates.sh
-    against the live checkout (test hazard, see module docstring).
-
-    Clones committed history first (git rev-parse/log-dependent code paths
-    elsewhere in this suite need a real repo), then overlays the CURRENT
-    on-disk content of every tracked file over the clone. Without the
-    overlay, an uncommitted edit to e.g. scripts/gates.sh is invisible to
-    every test in this file -- they would silently validate the last
-    commit instead of the change under review (PEACHES finding, PR #207).
-    """
-    subprocess.run(["git", "clone", "-q", TOOL_HOME, dest], check=True, capture_output=True)
-    tracked = subprocess.run(
-        ["git", "-C", TOOL_HOME, "ls-files", "-z"],
-        check=True, capture_output=True,
-    ).stdout
-    for rel_raw in tracked.split(b"\0"):
-        if not rel_raw:
-            continue
-        rel = rel_raw.decode()
-        src = os.path.join(TOOL_HOME, rel)
-        dst = os.path.join(dest, rel)
-        # A tracked file can be deleted-but-uncommitted on disk; skip it
-        # rather than fail the overlay -- ls-files still lists it (index
-        # entry unchanged), but there is nothing to copy.
-        if os.path.isfile(src):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
-    subprocess.run(["git", "-C", dest, "config", "user.email", "test@example.com"],
-                    check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.name", "Test"],
-                    check=True, capture_output=True)
+_clone_tool_home = clone_this_tool_home_with_overlay
 
 
 class TestBleedGlobalPatternFileMigration(unittest.TestCase):

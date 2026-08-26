@@ -11,10 +11,14 @@ appended, never whether they arrive active.
 HAZARD, read before editing this file: every test here points
 CLAGENTIC_LITE_HOME at a throwaway `git clone` of the real checkout, never
 at the live dev checkout itself -- follows _clone_tool_home from
-test_update_nontty_discard_guard.py / test_doctor_config_drift.py exactly.
-`cmd_update` is emphatically NOT read-only (git pull, hook re-stamp, plugin
-render/install) -- pointing CLAGENTIC_LITE_HOME at the live tree here is
-exactly the class of defect PEACHES blocked lr-e33f73's first SHA for.
+test_update_nontty_discard_guard.py / test_doctor_config_drift.py
+(scripts/test_support.py) exactly. `cmd_update` is emphatically NOT
+read-only (git pull, hook re-stamp, plugin render/install) -- pointing
+CLAGENTIC_LITE_HOME at the live tree here is exactly the class of defect
+PEACHES blocked lr-e33f73's first SHA for. The shared clone helper also
+overlays the checkout's current on-disk content over the clone, so an
+uncommitted edit to the --refresh-config logic under test is never
+invisible to this suite.
 
 Run with: python3 -m unittest scripts.test_update_refresh_config -v
 """
@@ -25,15 +29,10 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.test_support import clone_this_tool_home_with_overlay
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-
-def _clone_tool_home(dest):
-    subprocess.run(["git", "clone", "-q", TOOL_HOME, dest], check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.email", "test@example.com"],
-                    check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.name", "Test"],
-                    check=True, capture_output=True)
+_clone_tool_home = clone_this_tool_home_with_overlay
 
 
 def _read(path):
@@ -64,7 +63,17 @@ class _UpdateRefreshConfigTestBase(unittest.TestCase):
         env["CLAGENTIC_LITE_HOME"] = self.fake_tool_home
         env["CLAGENTIC_SKIP_UPDATE_ALERT"] = "1"
         env.pop("CLAGENTIC_HOME", None)
-        env.pop("CLAGENTIC_UPDATE_ALLOW_DISCARD", None)
+        # The overlaid clone (_clone_tool_home, scripts/test_support.py)
+        # copies the checkout's current on-disk content over committed
+        # HEAD, so it is unstaged-dirty against its own HEAD whenever the
+        # checkout itself has uncommitted changes -- exactly the state a
+        # PR under review is normally in. That trips cmd_update's non-tty
+        # discard guard (lr-55a27a, bin/clagentic-lite ~3872-3898) even
+        # though self.fake_tool_home is a genuinely disposable tempdir
+        # (shutil.rmtree'd in cleanup) -- the guard's own opt-in mechanism
+        # exists for exactly this shape. Never set for the real dev
+        # checkout, which this fake_tool_home is not.
+        env["CLAGENTIC_UPDATE_ALLOW_DISCARD"] = "1"
         if extra_env:
             env.update(extra_env)
         proc = subprocess.run(

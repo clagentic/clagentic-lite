@@ -29,6 +29,8 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.test_support import clone_this_tool_home_with_overlay
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
 TEMPLATE = os.path.join(TOOL_HOME, "share", "hook-shims", "claude-settings.template")
@@ -207,14 +209,12 @@ class TestRouterSettingsStampRestamp(unittest.TestCase):
         _init_git_repo(self.repo)
 
         # Throwaway clone of the real checkout -- cmd_update's git pull/stash
-        # logic runs against THIS, never against TOOL_HOME.
+        # logic runs against THIS, never against TOOL_HOME. Overlaid with
+        # the checkout's current on-disk content (scripts/test_support.py)
+        # so an uncommitted edit to the restamp logic under test is never
+        # invisible to this class.
         self.fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")
-        subprocess.run(["git", "clone", "-q", TOOL_HOME, self.fake_tool_home],
-                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", self.fake_tool_home, "config", "user.email", "test@example.com"],
-                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", self.fake_tool_home, "config", "user.name", "Test"],
-                        check=True, capture_output=True)
+        clone_this_tool_home_with_overlay(self.fake_tool_home)
 
     def _run_cli_fake_home(self, argv, cwd, env_extra=None):
         env = dict(os.environ)
@@ -223,6 +223,12 @@ class TestRouterSettingsStampRestamp(unittest.TestCase):
         env.pop("CLAGENTIC_HOME", None)
         env.pop("CLAGENTIC_ROUTER_URL", None)
         env.pop("CLAGENTIC_ROUTER_TOKEN", None)
+        # The overlaid clone (scripts/test_support.py) is unstaged-dirty
+        # against its own HEAD whenever this checkout has uncommitted
+        # changes, tripping cmd_update's non-tty discard guard (lr-55a27a)
+        # even though self.fake_tool_home is disposable (shutil.rmtree'd in
+        # cleanup) -- harmless for the enroll calls this method also makes.
+        env["CLAGENTIC_UPDATE_ALLOW_DISCARD"] = "1"
         if env_extra:
             env.update(env_extra)
         proc = subprocess.run(
@@ -635,22 +641,15 @@ class TestRouterSettingsStampPreservesExistingFileOnRefusal(unittest.TestCase):
         clone of the checkout, never the real dev tree (see
         TestRouterSettingsStampRestamp's own docstring for why).
 
-        NOTE: `git clone` reflects committed HEAD only, not uncommitted
-        working-tree edits -- this test (and TestRouterSettingsStampRestamp
-        above, which established the pattern) must be run against a
-        checkout where the change under test is already committed, or it
-        silently exercises stale pre-fix code. cmd_update's own `git pull
-        --ff-only` requires a real clone with an upstream, which is why a
-        plain `git init` + working-tree copy (no clone) is not a viable
-        substitute here the way it would be for a plain `cmd_init` test
-        (init never pulls)."""
+        NOTE (lr-bca2ee): the clone is overlaid with the checkout's current
+        on-disk content (scripts/test_support.py), so this test exercises
+        an uncommitted change under review, not only a committed one.
+        cmd_update's own `git pull --ff-only` requires a real clone with an
+        upstream, which is why a plain `git init` + working-tree copy (no
+        clone) is not a viable substitute here the way it would be for a
+        plain `cmd_init` test (init never pulls)."""
         fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")
-        subprocess.run(["git", "clone", "-q", TOOL_HOME, fake_tool_home],
-                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", fake_tool_home, "config", "user.email", "test@example.com"],
-                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", fake_tool_home, "config", "user.name", "Test"],
-                        check=True, capture_output=True)
+        clone_this_tool_home_with_overlay(fake_tool_home)
 
         def run_fake_home(argv, env_extra=None):
             env = dict(os.environ)
@@ -659,6 +658,11 @@ class TestRouterSettingsStampPreservesExistingFileOnRefusal(unittest.TestCase):
             env.pop("CLAGENTIC_HOME", None)
             env.pop("CLAGENTIC_ROUTER_URL", None)
             env.pop("CLAGENTIC_ROUTER_TOKEN", None)
+            # See clone_this_tool_home_with_overlay's own doc comment: the
+            # overlay makes this disposable clone unstaged-dirty against its
+            # own HEAD whenever this checkout has uncommitted changes,
+            # tripping cmd_update's non-tty discard guard (lr-55a27a).
+            env["CLAGENTIC_UPDATE_ALLOW_DISCARD"] = "1"
             if env_extra:
                 env.update(env_extra)
             proc = subprocess.run(

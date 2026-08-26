@@ -47,6 +47,8 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.test_support import clone_this_tool_home_with_overlay
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
 
@@ -381,17 +383,15 @@ class TestBedrockSettingsStampPreservesExistingFileOnRefusal(unittest.TestCase):
         docstring for why: cmd_update's git stash push/drop path would
         otherwise operate on a developer's real uncommitted edits.
 
-        NOTE: `git clone` reflects committed HEAD only -- this test must
-        run against a checkout where this change is already committed, or
-        it silently exercises stale pre-fix code (same caveat documented
-        in test_router_settings_stamp.py's restamp tests)."""
+        NOTE (lr-bca2ee): the clone is overlaid with the checkout's current
+        on-disk content (scripts/test_support.py), so this test exercises
+        an uncommitted change under review, not only a committed one --
+        this previously documented caveat described a real gap in this
+        file's own pre-fix inline clone, now closed by routing through the
+        shared helper (same fix applied in test_router_settings_stamp.py's
+        restamp tests)."""
         fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")
-        subprocess.run(["git", "clone", "-q", TOOL_HOME, fake_tool_home],
-                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", fake_tool_home, "config", "user.email", "test@example.com"],
-                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", fake_tool_home, "config", "user.name", "Test"],
-                        check=True, capture_output=True)
+        clone_this_tool_home_with_overlay(fake_tool_home)
 
         def run_fake_home(argv, env_extra=None):
             env = dict(os.environ)
@@ -401,6 +401,11 @@ class TestBedrockSettingsStampPreservesExistingFileOnRefusal(unittest.TestCase):
             env.pop("CLAGENTIC_ROUTER_URL", None)
             env.pop("CLAGENTIC_ROUTER_TOKEN", None)
             env.pop("CLAGENTIC_ROUTER_BEDROCK_MODE", None)
+            # See clone_this_tool_home_with_overlay's own doc comment: the
+            # overlay makes this disposable clone unstaged-dirty against its
+            # own HEAD whenever this checkout has uncommitted changes,
+            # tripping cmd_update's non-tty discard guard (lr-55a27a).
+            env["CLAGENTIC_UPDATE_ALLOW_DISCARD"] = "1"
             if env_extra:
                 env.update(env_extra)
             proc = subprocess.run(
@@ -454,14 +459,16 @@ class TestBedrockSettingsStampPreservesExistingFileOnRefusal(unittest.TestCase):
         """A pre-existing v6 settings.json (pre-lr-4af4c4, no Bedrock
         support) with CLAGENTIC_ROUTER_BEDROCK_MODE newly turned on must be
         upgraded to v7 with the Bedrock pair added -- proves the version
-        bump is a real migration path, not just a string change."""
+        bump is a real migration path, not just a string change.
+
+        Overlaid clone (scripts/test_support.py, lr-bca2ee fold-in -- same
+        gap as the two sites this file's module docstring already named,
+        found in the same pass since it is the identical inline-clone
+        shape in the same file): without the overlay this test would
+        exercise the last-committed migration logic, not an uncommitted
+        change under review."""
         fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")
-        subprocess.run(["git", "clone", "-q", TOOL_HOME, fake_tool_home],
-                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", fake_tool_home, "config", "user.email", "test@example.com"],
-                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", fake_tool_home, "config", "user.name", "Test"],
-                        check=True, capture_output=True)
+        clone_this_tool_home_with_overlay(fake_tool_home)
 
         def run_fake_home(argv, env_extra=None):
             env = dict(os.environ)
@@ -471,6 +478,11 @@ class TestBedrockSettingsStampPreservesExistingFileOnRefusal(unittest.TestCase):
             env.pop("CLAGENTIC_ROUTER_URL", None)
             env.pop("CLAGENTIC_ROUTER_TOKEN", None)
             env.pop("CLAGENTIC_ROUTER_BEDROCK_MODE", None)
+            # See clone_this_tool_home_with_overlay's own doc comment: the
+            # overlay makes this disposable clone unstaged-dirty against its
+            # own HEAD whenever this checkout has uncommitted changes,
+            # tripping cmd_update's non-tty discard guard (lr-55a27a).
+            env["CLAGENTIC_UPDATE_ALLOW_DISCARD"] = "1"
             if env_extra:
                 env.update(env_extra)
             proc = subprocess.run(

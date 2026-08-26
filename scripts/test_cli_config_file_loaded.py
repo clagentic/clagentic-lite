@@ -116,6 +116,8 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.test_support import clone_this_tool_home_with_overlay
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
 TEMPLATE = os.path.join(TOOL_HOME, "share", "hook-shims", "claude-settings.template")
@@ -230,12 +232,11 @@ class TestConfigFileRouterUrlHonored(unittest.TestCase):
         --restamp` against an enrolled repo, in a shell that never exported
         the router vars, with CLAGENTIC_ROUTER_URL only in the config file."""
         fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")
-        subprocess.run(["git", "clone", "-q", TOOL_HOME, fake_tool_home],
-                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", fake_tool_home, "config", "user.email", "test@example.com"],
-                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", fake_tool_home, "config", "user.name", "Test"],
-                        check=True, capture_output=True)
+        # Overlaid clone (scripts/test_support.py): `git clone` alone only
+        # picks up committed HEAD, which would make this test silently
+        # validate the last commit's update/restamp logic rather than an
+        # uncommitted change under review (PEACHES finding, PR #207).
+        clone_this_tool_home_with_overlay(fake_tool_home)
 
         rc, out, err = _run_cli(
             ["enroll", self.repo], cwd=self.repo, home=self.home,
@@ -264,7 +265,13 @@ class TestConfigFileRouterUrlHonored(unittest.TestCase):
         rc, out, err = _run_cli(
             ["update", "--restamp"], cwd=self.repo, home=self.home,
             clagentic_lite_home=fake_tool_home,
-            env_extra={"CLAGENTIC_SKIP_FETCH": "1"},
+            # The overlaid clone (scripts/test_support.py) is unstaged-dirty
+            # against its own HEAD whenever this checkout has uncommitted
+            # changes, tripping cmd_update's non-tty discard guard
+            # (lr-55a27a) even though fake_tool_home is disposable
+            # (shutil.rmtree'd in cleanup) -- exactly what the guard's
+            # opt-in exists for.
+            env_extra={"CLAGENTIC_SKIP_FETCH": "1", "CLAGENTIC_UPDATE_ALLOW_DISCARD": "1"},
         )
         self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
 

@@ -40,7 +40,14 @@ HAZARD, read before editing this file: every test here points
 CLAGENTIC_LITE_HOME at a throwaway `git clone` of the real checkout, never
 the live dev checkout -- follows _clone_tool_home from
 test_init_reconfigure_merge.py / test_update_nontty_discard_guard.py
-exactly, with check=True and no fallback to the live tree.
+(scripts/test_support.py) exactly, with check=True and no fallback to the
+live tree. The clone is overlaid with the checkout's current on-disk
+content, which matters here specifically: _extract_shell_function below
+reads the function bodies under test straight out of the CLONED
+bin/clagentic-lite, so without the overlay an uncommitted edit to either
+_secret_tmp_create or _merge_preserved_config_values would be invisible --
+this suite would extract and test the last-committed function body, not
+the one under review.
 
 Run with: python3 -m unittest scripts.test_merge_preserved_config_values -v
 """
@@ -54,16 +61,11 @@ import threading
 import time
 import unittest
 
+from scripts.test_support import clone_this_tool_home_with_overlay
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BIN_PATH = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
-
-
-def _clone_tool_home(dest):
-    subprocess.run(["git", "clone", "-q", TOOL_HOME, dest], check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.email", "test@example.com"],
-                    check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.name", "Test"],
-                    check=True, capture_output=True)
+_clone_tool_home = clone_this_tool_home_with_overlay
 
 
 def _extract_shell_function(source_path, name):
