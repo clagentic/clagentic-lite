@@ -41,7 +41,9 @@ against a throwaway clone (_clone_tool_home, matching
 scripts/test_update_nontty_discard_guard.py and
 scripts/test_global_config_brand_migration.py) with both
 CLAGENTIC_LITE_HOME and HOME pointed at fresh tempdirs -- never this
-checkout, never the operator's real HOME.
+checkout, never the operator's real HOME. The clone is overlaid with the
+checkout's current on-disk content (scripts/test_support.py) so an
+uncommitted edit to scripts/gates.sh under test is never invisible.
 
 Run with: python3 -m unittest scripts.test_gates_ignore_list_brand_migration -v
 """
@@ -52,6 +54,8 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+
+from scripts.test_support import clone_this_tool_home_with_overlay
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
@@ -84,15 +88,9 @@ def _extract_helpers():
     return extracted
 
 
-def _clone_tool_home(dest):
-    """Throwaway clone of this checkout for TestEndToEndViaRealCli -- never
-    run the real CLI against the live checkout (test hazard, see module
-    docstring)."""
-    subprocess.run(["git", "clone", "-q", TOOL_HOME, dest], check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.email", "test@example.com"],
-                    check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.name", "Test"],
-                    check=True, capture_output=True)
+_clone_tool_home = clone_this_tool_home_with_overlay
+"""Throwaway clone of this checkout for TestEndToEndViaRealCli -- never run
+the real CLI against the live checkout (test hazard, see module docstring)."""
 
 
 class _HelperTestBase(unittest.TestCase):

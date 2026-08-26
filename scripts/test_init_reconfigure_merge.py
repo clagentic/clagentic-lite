@@ -8,7 +8,10 @@ HAZARD, read before editing this file: every test here points
 CLAGENTIC_LITE_HOME at a throwaway `git clone` of the real checkout, never
 the live dev checkout -- `cmd_init` materializes .claude/hooks/ and may run
 `git fetch` against CLAGENTIC_LITE_HOME, so it is not read-only. Follows
-_clone_tool_home from test_init_config_schema_version_stamp.py exactly.
+_clone_tool_home from test_init_config_schema_version_stamp.py exactly
+(scripts/test_support.py) -- the clone is overlaid with the checkout's
+current on-disk content so an uncommitted edit under test is never
+invisible to this suite.
 
 Run with: python3 -m unittest scripts.test_init_reconfigure_merge -v
 """
@@ -20,15 +23,10 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.test_support import clone_this_tool_home_with_overlay
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-
-def _clone_tool_home(dest):
-    subprocess.run(["git", "clone", "-q", TOOL_HOME, dest], check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.email", "test@example.com"],
-                    check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "config", "user.name", "Test"],
-                    check=True, capture_output=True)
+_clone_tool_home = clone_this_tool_home_with_overlay
 
 
 def _current_schema_version(fake_tool_home):
