@@ -49,7 +49,7 @@ If macOS users have Homebrew GNU tools on PATH ahead of system tools, clagentic-
 ## What we deliberately don't do
 
 - Shell out to anything Node-only on the harness side (examples are fine; the harness itself is POSIX sh + sqlite + a small `python3 -c` for JSON parsing where shell isn't safe).
-- Assume `gh` (GitHub CLI). `/ship` uses `gh` if present and falls back to printing the PR URL template.
+- Assume `gh` (GitHub CLI). `gates ship` uses `gh` if present and falls back to printing the PR URL template.
 
 ## What we DO require
 

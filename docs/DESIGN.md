@@ -21,10 +21,10 @@ clagentic-lite is the smallest credible expression of that thesis. It is built t
 |---|------|---------|-----------|----------|
 | 1 | **Memory recall** | `UserPromptSubmit` | `scripts/memory.sh recall <keywords>` → top `CLAGENTIC_RECALL_LIMIT` (default 5) summaries injected, capped at `CLAGENTIC_RECALL_MAX_CHARS` (default 1500) chars | no |
 | 2 | **Safe Bash + writes** | `PreToolUse` (Bash, Write, Edit) | regex deny-list on dangerous commands; path-scope check; default-branch protection; hooks fail closed when no JSON validator (jq/python3) available | yes |
-| 3 | **Cross-CLI review** | `/review` slash command, optional pre-push | Builder's staged diff piped to Reviewer; schema-validated JSON findings | findings ≥ `BLOCK_SEVERITY` block `/ship`; degraded envelopes also block |
+| 3 | **Cross-CLI review** | `clagentic-lite gates review` (or subagent), optional pre-push | Builder's staged diff piped to Reviewer; schema-validated JSON findings | findings ≥ `BLOCK_SEVERITY` block `gates ship`; degraded envelopes also block |
 | 4 | **Local security scan** | git `pre-commit` (secrets) and `pre-push` (deps, SAST) | gitleaks; osv-scanner; semgrep --error --severity=ERROR. Missing tool fails closed unless `CLAGENTIC_ALLOW_MISSING_*=1` | yes |
-| 5 | **Adversarial pass** | `/review --adversarial` | Auditor role plays attacker on the diff; each finding is tagged `reachable: yes/no`, `tier: blocking/advisory`, and `class: durable/ephemeral` | no on its own (commentary); `tier: blocking` findings are what Gate 6 can refuse on |
-| 6 | **Merge Gate** | `/ship` | LLM reads every prior gate's structured output and returns `{decision, reason}` JSON | yes by default (`CLAGENTIC_MERGE_GATE_BLOCKING=1`); only `tier: blocking` adversarial findings are refusal-eligible, `tier: advisory` findings are never gating |
+| 5 | **Adversarial pass** | `clagentic-lite gates adversarial` (or subagent) | Auditor role plays attacker on the diff; each finding is tagged `reachable: yes/no`, `tier: blocking/advisory`, and `class: durable/ephemeral` | no on its own (commentary); `tier: blocking` findings are what Gate 6 can refuse on |
+| 6 | **Merge Gate** | `clagentic-lite gates ship` (or subagent) | LLM reads every prior gate's structured output and returns `{decision, reason}` JSON | yes by default (`CLAGENTIC_MERGE_GATE_BLOCKING=1`); only `tier: blocking` adversarial findings are refusal-eligible, `tier: advisory` findings are never gating |
 | 7 | **Session summarize** | `Stop` | async, debounced: Summarizer reads transcript → one-line summary → SQLite | no (best-effort) |
 
 ## The five roles
@@ -109,7 +109,7 @@ Three env vars govern the recall and retention budget (code defaults; override i
 
 ## Cross-CLI review — concrete flow
 
-`/review` slash command routes through `scripts/gates.sh review`:
+`clagentic-lite gates review` (or the subagent) routes through `scripts/gates.sh review`:
 
 1. `git diff --cached --unified=3` → stdin to `scripts/llm-client.sh review`.
 2. The wrapper walks the Reviewer's model_chain — primary, then each fallback `(cmd, tier)` — and validates output against the reviewer schema (`.findings` must be an array). Schema-invalid output advances the chain; if every step fails, it returns a degraded envelope marked `"degraded": true`.
@@ -119,11 +119,11 @@ Three env vars govern the recall and retention budget (code defaults; override i
 6. `cmd_render_review` pretty-prints the JSON to the session.
 7. Builder may revise in the same session. Each revision restarts the loop. Max 3 rounds (operator discipline; not enforced in code).
 
-The Reviewer never edits files. The Builder never gates its own work. `/review` never calls `llm-client.sh` directly — always through `gates.sh` so the audit row, severity check, render, and persistence stay in one path.
+The Reviewer never edits files. The Builder never gates its own work. `gates review` never calls `llm-client.sh` directly — always through `gates.sh` so the audit row, severity check, render, and persistence stay in one path.
 
 ## Adversarial layer — non-blocking, opt-in
 
-`/review --adversarial` adds a second pass:
+`clagentic-lite gates adversarial` (or the subagent) adds a second pass:
 
 1. Reviewer is reprompted: "you are an attacker. What would you exploit in this diff?"
 2. Builder is reprompted: "the reviewer suggests these attacks. Which are plausible? Which are overstated?"
@@ -166,7 +166,7 @@ Implementation is **one-shot per call**. Each subcommand resolves the configured
 
 Per-call timeout is `$CLAGENTIC_LLM_TIMEOUT_SEC` (default 180s) via `timeout` or `gtimeout` — exposed as `$DS_TIMEOUT_CMD` from `scripts/platform.sh`. If neither is available, `$DS_TIMEOUT_CMD` resolves to `ds_timeout_missing`, which fails closed at the point of use: it refuses to run the wrapped command at all and returns a distinct exit status (99) rather than running it unbounded. `clagentic-lite doctor` should be run to install a real timeout binary before any gate or LLM call is attempted on such a host.
 
-Persistent codex sessions and persistent claude sessions were both considered and deferred. The wall-clock difference between repeated one-shots and one persistent session is small on the cadence clagentic-lite is built for (a few `/review` calls per coding session, not hundreds), and the persistent path would require either codex's experimental `app-server` or a long-running daemon — both of which violate the no-server constraint.
+Persistent codex sessions and persistent claude sessions were both considered and deferred. The wall-clock difference between repeated one-shots and one persistent session is small on the cadence clagentic-lite is built for (a few `gates review` calls per coding session, not hundreds), and the persistent path would require either codex's experimental `app-server` or a long-running daemon — both of which violate the no-server constraint.
 
 ### The interactive-path gap, and how clagentic-router closes it
 
