@@ -48,6 +48,21 @@ else
 fi
 [ -n "$REPO_ROOT" ] || { echo "gates.sh: not in a git repo" 1>&2; exit 1; }
 
+# lr-dfd45f: scrub git's own hook-exported env (GIT_DIR et al) ONLY AFTER
+# REPO_ROOT is resolved above. ds_repo_root (platform.sh), used in the
+# non-CLAGENTIC_PROJECT_ROOT branch, calls bare `git rev-parse
+# --show-toplevel` with no `-C` -- when gates.sh runs as a git hook it
+# depends on git's own inherited GIT_DIR to correctly resolve the enrolled
+# repo's root; scrubbing before that call would break repo-root resolution
+# itself. Once REPO_ROOT is fixed, though, every `_git`/`-C "$REPO_ROOT"`
+# call below must be the ONLY thing that decides which repo an operation
+# touches -- verified empirically (this task) that an inherited GIT_DIR
+# silently overrides an explicit `-C`, so leaving it set here would let it
+# keep overriding every `_git` call for the rest of this script's run, not
+# just the canary. Scrubbing here pins `-C "$REPO_ROOT"` from "usually
+# right" to authoritative for the remainder of this invocation.
+ds_git_env_scrub
+
 # _git — run git against REPO_ROOT, not $PWD. In wrapper/repo layouts $PWD may
 # be the (non-git) wrapper directory or an unrelated outer repo whose HEAD has
 # nothing to do with REPO_ROOT. All git operations that inspect history, staged
@@ -69,6 +84,25 @@ _git() { git -C "$REPO_ROOT" "$@"; }
 # baseline, a staged/branch diff fed to the review gates, a SHA staleness
 # comparison, a push-target branch name) must gate on this helper first, not
 # assume `_git`/`-C` alone is safe (lr-da1f28 sweep).
+#
+# STRUCTURALLY BLIND to an inherited GIT_DIR (lr-dfd45f): both sides of the
+# comparison below derive from the same poisoned resolution when GIT_DIR is
+# exported (as git does for a hook invocation) -- `_grs_git_toplevel` comes
+# from `_git rev-parse --show-toplevel`, which an inherited GIT_DIR silently
+# overrides regardless of `-C "$REPO_ROOT"` (verified empirically), so it
+# reports the SAME foreign repo GIT_DIR points at, not REPO_ROOT's own repo.
+# The predicate then compares that foreign toplevel against REPO_ROOT and
+# can spuriously report "scoped" even though every `_git` call it is meant
+# to gate is actually operating on the wrong repo. This is why gates.sh
+# calls ds_git_env_scrub (scripts/platform.sh) once, at top level, right
+# after REPO_ROOT is resolved -- once GIT_DIR and friends are cleared,
+# `-C "$REPO_ROOT"` is authoritative and this predicate's comparison is
+# meaningful again. The identical predicate is triplicated in
+# scripts/memory.sh (_mem_repo_root_is_scoped) and
+# scripts/host-adapter.sh (_host_adapter_repo_root_is_scoped) -- same class,
+# same blind spot, each file's own copy; not swept into a shared scrub call
+# in this task (see lr-dfd45f PR body for why that follow-up is scoped
+# separately).
 #
 # `git rev-parse --show-toplevel` always prints an absolute, canonical
 # (symlink-resolved) path. REPO_ROOT is not guaranteed to be either: it can
@@ -579,29 +613,16 @@ _gitleaks_positive_control() {
 
   (
     cd "$_gpc_dir" || exit 1
-    # lr-dfd45f: when gates.sh runs as a git hook, git exports several
-    # GIT_* vars that redirect repo/index/object-store discovery for every
-    # git invocation in this subshell -- they override `cd` entirely, so
-    # without this the canary's `git init`/`add`/`commit` below silently
-    # operate on the CALLER's real repo instead of this scratch dir,
-    # staging fake-but-detectable credentials into real history and
-    # replacing the caller's commit message. Clear every var that can
-    # redirect where a fresh `git init`/`add`/`commit` here actually reads
-    # or writes:
-    #   GIT_DIR / GIT_WORK_TREE   - override repo/worktree location outright
-    #   GIT_INDEX_FILE            - overrides which index add/commit use
-    #   GIT_COMMON_DIR            - overrides shared refs/config (worktrees)
-    #   GIT_OBJECT_DIRECTORY      - overrides where new objects are written
-    # GIT_ALTERNATE_OBJECT_DIRECTORIES only widens object *lookup*, it does
-    # not redirect writes, but it can let this scratch repo silently resolve
-    # objects it has no business seeing -- cleared for the same reason.
-    # GIT_NAMESPACE (ref-namespace prefix) does not redirect to a different
-    # repo but is cleared for symmetry within the same var family.
-    # GIT_PREFIX is a cosmetic relative-path prefix for message/porcelain
-    # output only -- it never changes what repo/index/objects an operation
-    # touches, so it is deliberately left alone (not cargo-culted in).
-    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR \
-      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
+    # lr-dfd45f: when gates.sh runs as a git hook, git exports GIT_DIR (and
+    # sometimes GIT_WORK_TREE/GIT_INDEX_FILE) pointing at the CALLER's real
+    # repo -- verified empirically to override an explicit `-C`/`cd` for
+    # every git invocation in this subshell. Without this scrub, the
+    # canary's `git init`/`add`/`commit` below silently operate on the
+    # caller's real repo instead of this scratch dir, staging
+    # fake-but-detectable credentials into real history and replacing the
+    # caller's commit message. See ds_git_env_scrub's own doc comment
+    # (scripts/platform.sh) for exactly what it clears and why.
+    ds_git_env_scrub
     git init -q -b canary . 2>/dev/null || git init -q .
     git config user.email "canary@example.invalid"
     git config user.name "clagentic-secrets-canary"
@@ -615,8 +636,16 @@ _gitleaks_positive_control() {
   _gpc_report="$_gpc_dir/report.json"
   _gpc_status=0
   if gitleaks git --help >/dev/null 2>&1; then
+    # Same inherited-GIT_DIR exposure as the canary-build subshell above:
+    # `gitleaks git` is a history scanner that performs its own git repo
+    # discovery, which honors an inherited GIT_DIR exactly as plain git
+    # does -- without this scrub it would silently scan the CALLER's real
+    # repo history instead of this scratch repo's, defeating the whole
+    # positive-control (the canary would "pass" by finding real-looking
+    # leaks in real history, proving nothing about the scanner -- the
+    # exact fail-open this function's own doc comment above warns against).
     # shellcheck disable=SC2086
-    ( cd "$_gpc_dir" && run_bounded "$_gpc_timeout" -- gitleaks git --no-banner --report-format json --report-path "$_gpc_report" $_gpc_cfg_arg ) >/dev/null 2>&1 || _gpc_status=$?
+    ( cd "$_gpc_dir" && ds_git_env_scrub && run_bounded "$_gpc_timeout" -- gitleaks git --no-banner --report-format json --report-path "$_gpc_report" $_gpc_cfg_arg ) >/dev/null 2>&1 || _gpc_status=$?
   else
     # shellcheck disable=SC2086
     ( cd "$_gpc_dir" && run_bounded "$_gpc_timeout" -- gitleaks detect --no-banner --no-git --source "$_gpc_dir" --report-format json --report-path "$_gpc_report" $_gpc_cfg_arg ) >/dev/null 2>&1 || _gpc_status=$?
