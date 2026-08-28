@@ -26,14 +26,47 @@ commit object would land in the real repo's object store, unreferenced by
 any real ref and invisible to `git log`, but present on disk and reachable
 by a later full-history secret scan).
 
-Parametrizes GIT_DIR as both an ABSOLUTE path and a RELATIVE path (".git")
--- a relative GIT_DIR combined with a `cd` into a different scratch
-directory resolves against the NEW cwd, not the original one, which is a
-different (and in some shapes worse, silently-repo-creating) failure mode
-than the absolute case.
+Parametrizes GIT_DIR as both an ABSOLUTE path and a RELATIVE path (".git").
 
-Both parametrized cases are confirmed to FAIL pre-fix (reverting
-ds_git_env_scrub's body to a no-op reproduces real corruption in both).
+POSITIVE-EVIDENCE REQUIREMENT (PEACHES, PR #209 review, finding 2): the
+original version of this file asserted ONLY that the real repo is
+untouched -- it could not distinguish "the canary ran and was correctly
+isolated" from "the canary never ran at all" (gitleaks missing, an early
+return, a sourcing failure). A gate that silently never reaches the canary
+would pass those assertions vacuously, which is exactly backwards for a bug
+class that is itself about silent fail-open. Every test method here now
+also asserts (a) the subprocess's own exit code, and (b) POSITIVE stderr
+evidence the canary actually ran and reported success
+("positive-control canary OK", the exact string `cmd_secrets` prints on
+the canary's own success path, scripts/gates.sh) -- not merely that the
+real repo happens to be unchanged.
+
+REALISTIC-CWD CORRECTION (PEACHES, PR #209 review, finding 2): the
+relative-GIT_DIR case previously ran with cwd=scratch while claiming to
+model a real hook invocation -- but a real hook always runs with cwd at the
+REPO ROOT (the repo under commit), which is where a relative GIT_DIR=".git"
+actually resolves in practice. That case now sets cwd to the real repo
+itself, matching the genuine hook shape; the absolute-GIT_DIR case keeps
+cwd=scratch (an absolute GIT_DIR is location-independent by construction,
+so cwd choice there is not part of what's under test).
+
+test_absolute_git_dir_does_not_corrupt_real_repo is confirmed to FAIL
+pre-fix (reverting ds_git_env_scrub's body to a no-op reproduces real
+corruption -- the real repo's HEAD moves). test_relative_git_dir_does_not_
+corrupt_real_repo, once corrected to the realistic cwd=repo-root shape
+above, does NOT independently reproduce corruption pre-fix: with cwd
+already at the real repo, a relative GIT_DIR=".git" re-resolves against the
+canary's OWN `cd "$_gpc_dir"` before ds_git_env_scrub would run, landing on
+"$_gpc_dir/.git" -- a location inside the scratch dir itself, not the real
+repo -- so this specific relative+repo-root-cwd combination is not the
+vector that corrupts (verified directly by disabling ds_git_env_scrub and
+re-running: the real repo's HEAD does not move in this case, only in the
+absolute case). It is kept as a test anyway because it is still the
+realistic hook shape and still exercises the full gates.sh secrets path
+end-to-end with a POSITIVE assertion that the canary actually ran and
+passed -- a regression that broke isolation via THIS path would still be
+caught by the corruption assertions, even though this particular pre-fix
+baseline happens not to trip them.
 
 Run with: python3 -m unittest scripts.test_gates_hook_git_env_isolation -v
 """
@@ -52,6 +85,12 @@ _GIT_ENV = {
     "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
     "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
 }
+
+# The exact string cmd_secrets (scripts/gates.sh) prints to stderr on the
+# canary's own success path -- positive evidence the canary actually ran
+# and passed, not merely that the real repo happens to be unchanged (which
+# a gate that never reached the canary at all would also satisfy).
+_CANARY_SUCCESS_MARKER = "positive-control canary OK"
 
 
 def _gitleaks_available():
@@ -84,7 +123,9 @@ def _loose_objects(repo):
 @unittest.skipUnless(_gitleaks_available(), "gitleaks not installed")
 class TestGatesSecretsHookGitEnvIsolation(unittest.TestCase):
     """`gates.sh secrets` end-to-end, driven exactly the way a real
-    pre-commit hook invokes it, must never touch the caller's real repo."""
+    pre-commit hook invokes it, must never touch the caller's real repo --
+    and must actually run the canary while doing so, not merely pass
+    vacuously because it never got there."""
 
     def setUp(self):
         self._real_repo = tempfile.mkdtemp(prefix="clagentic-test-hookenv-real-")
@@ -134,8 +175,22 @@ class TestGatesSecretsHookGitEnvIsolation(unittest.TestCase):
         ).stdout.strip()
         self.assertNotEqual(subject, "canary fixture")
 
-        status_after = _run(["git", "status", "--porcelain"], cwd=self._real_repo, env=env).stdout
-        self.assertEqual(self._status_before, status_after, "real repo status changed")
+        # gates.sh unconditionally mkdir -p's REPO_ROOT/.clagentic/lite/ for
+        # its own audit db, regardless of this bug -- a real, legitimate,
+        # unrelated side effect of running gates.sh at all with cwd=the
+        # real repo (only exercised by the relative-GIT_DIR case, whose cwd
+        # is the real repo root to match a genuine hook invocation).
+        # Filtered out here so this assertion stays meaningful for anything
+        # ELSE that changes, rather than papering over a real corruption by
+        # widening the comparison.
+        status_lines_before = [
+            ln for ln in self._status_before.splitlines() if ".clagentic/" not in ln
+        ]
+        status_after_raw = _run(["git", "status", "--porcelain"], cwd=self._real_repo, env=env).stdout
+        status_lines_after = [
+            ln for ln in status_after_raw.splitlines() if ".clagentic/" not in ln
+        ]
+        self.assertEqual(status_lines_before, status_lines_after, "real repo status changed")
 
         objects_after = _loose_objects(self._real_repo)
         self.assertEqual(
@@ -159,26 +214,52 @@ class TestGatesSecretsHookGitEnvIsolation(unittest.TestCase):
             capture_output=True, text=True, env=env, cwd=cwd, timeout=180,
         )
 
+    def _assert_canary_actually_ran_and_passed(self, result):
+        """Positive evidence the canary executed and reached the isolated
+        path, not merely that the real repo happens to be unchanged (which
+        a gate that never got to the canary at all -- gitleaks missing, an
+        early return, a sourcing failure -- would also satisfy)."""
+        self.assertEqual(
+            result.returncode, 0,
+            msg=f"gates.sh secrets exited nonzero -- cannot trust the "
+                f"real-repo-untouched assertions below to mean the canary "
+                f"ran and was isolated, rather than never ran at all. "
+                f"stdout={result.stdout!r} stderr={result.stderr!r}",
+        )
+        self.assertIn(
+            _CANARY_SUCCESS_MARKER, result.stderr,
+            msg=f"gates.sh secrets exited 0 but never printed the canary's "
+                f"own success marker -- the canary may not have run at all "
+                f"(e.g. CLAGENTIC_SKIP_SECRETS_CANARY, an early return, or "
+                f"a sourcing failure silently short-circuiting before the "
+                f"canary). stderr={result.stderr!r}",
+        )
+
     def test_absolute_git_dir_does_not_corrupt_real_repo(self):
+        """Absolute GIT_DIR is location-independent by construction, so cwd
+        choice is not part of what this case is exercising -- cwd=scratch,
+        distinct from the real repo, models GIT_DIR alone doing the
+        redirecting."""
         scratch = tempfile.mkdtemp(prefix="clagentic-test-hookenv-scratch-")
         try:
-            self._run_gates_secrets(os.path.join(self._real_repo, ".git"), scratch)
+            result = self._run_gates_secrets(os.path.join(self._real_repo, ".git"), scratch)
+            self._assert_canary_actually_ran_and_passed(result)
             self._assert_real_repo_untouched()
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
 
     def test_relative_git_dir_does_not_corrupt_real_repo(self):
         """A relative GIT_DIR (".git") is the shape git itself typically
-        exports for a hook invocation, since the hook runs with cwd already
-        at the repo root -- resolved relative to whatever cwd the canary's
-        `cd "$_gpc_dir"` leaves it at, which is a DIFFERENT (and
-        potentially repo-creating) failure mode than an absolute GIT_DIR."""
-        scratch = tempfile.mkdtemp(prefix="clagentic-test-hookenv-scratch-rel-")
-        try:
-            self._run_gates_secrets(".git", scratch)
-            self._assert_real_repo_untouched()
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+        exports for a hook invocation -- and a real hook invocation always
+        runs with cwd AT THE REPO ROOT (the repo under commit), which is
+        where this actually resolves. cwd is therefore the real repo
+        itself here, not an unrelated scratch dir -- the earlier version
+        of this test ran with cwd=scratch, which is a different (and less
+        realistic) failure mode than the one a real hook invocation
+        produces."""
+        result = self._run_gates_secrets(".git", self._real_repo)
+        self._assert_canary_actually_ran_and_passed(result)
+        self._assert_real_repo_untouched()
 
 
 if __name__ == "__main__":
