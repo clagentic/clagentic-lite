@@ -579,6 +579,29 @@ _gitleaks_positive_control() {
 
   (
     cd "$_gpc_dir" || exit 1
+    # lr-dfd45f: when gates.sh runs as a git hook, git exports several
+    # GIT_* vars that redirect repo/index/object-store discovery for every
+    # git invocation in this subshell -- they override `cd` entirely, so
+    # without this the canary's `git init`/`add`/`commit` below silently
+    # operate on the CALLER's real repo instead of this scratch dir,
+    # staging fake-but-detectable credentials into real history and
+    # replacing the caller's commit message. Clear every var that can
+    # redirect where a fresh `git init`/`add`/`commit` here actually reads
+    # or writes:
+    #   GIT_DIR / GIT_WORK_TREE   - override repo/worktree location outright
+    #   GIT_INDEX_FILE            - overrides which index add/commit use
+    #   GIT_COMMON_DIR            - overrides shared refs/config (worktrees)
+    #   GIT_OBJECT_DIRECTORY      - overrides where new objects are written
+    # GIT_ALTERNATE_OBJECT_DIRECTORIES only widens object *lookup*, it does
+    # not redirect writes, but it can let this scratch repo silently resolve
+    # objects it has no business seeing -- cleared for the same reason.
+    # GIT_NAMESPACE (ref-namespace prefix) does not redirect to a different
+    # repo but is cleared for symmetry within the same var family.
+    # GIT_PREFIX is a cosmetic relative-path prefix for message/porcelain
+    # output only -- it never changes what repo/index/objects an operation
+    # touches, so it is deliberately left alone (not cargo-culted in).
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
     git init -q -b canary . 2>/dev/null || git init -q .
     git config user.email "canary@example.invalid"
     git config user.name "clagentic-secrets-canary"
