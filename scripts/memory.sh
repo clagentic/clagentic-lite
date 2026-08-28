@@ -36,6 +36,14 @@ mkdir -p "$REPO_ROOT/.clagentic/lite"
 # comment for the ancestor-walk-up rationale. Not extracted to a shared
 # location: this file does not source gates.sh, and this is the only call
 # site here that reads repo state rather than merely resolving REPO_ROOT.
+#
+# STRUCTURALLY BLIND to an inherited GIT_DIR (lr-dfd45f) — see gates.sh's
+# own copy of this predicate for the full explanation: an exported GIT_DIR
+# silently overrides `-C "$REPO_ROOT"`, so both sides of the comparison
+# below can derive from the same foreign repo and spuriously report
+# "scoped." This file does not currently call ds_git_env_scrub
+# (scripts/platform.sh) at its own top level — a known follow-up, not fixed
+# in lr-dfd45f's PR (scoped to gates.sh's own canary defect there).
 _mem_repo_root_is_scoped() {
   _mrs_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
   _mrs_git_toplevel=$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || echo "")

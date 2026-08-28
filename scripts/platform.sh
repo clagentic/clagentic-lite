@@ -1532,3 +1532,230 @@ ds_router_url_classify() {
     DS_ROUTER_URL_CLASS="nonlocal"
   fi
 }
+
+# ds_git_env_scrub — unset every git-exported env var that can redirect a
+# git invocation away from the caller's own explicit `-C DIR`/`cd DIR`
+# choice, and pin the scratch repo to its own identity/config rather than
+# inheriting the invoking process's.
+#
+# WHY THIS EXISTS (lr-dfd45f): git hooks (pre-commit, pre-push, ...) run
+# with GIT_DIR (and sometimes GIT_WORK_TREE/GIT_INDEX_FILE) exported by git
+# itself, pointing at the repo under commit. VERIFIED EMPIRICALLY (this
+# task): an inherited GIT_DIR silently overrides an explicit `git -C <dir>
+# ...` -- `git -C repo_a log` with GIT_DIR=repo_b/.git in the environment
+# reports repo_b's history, not repo_a's, with no error. `cd` into a
+# directory offers no more protection than `-C` does -- git's own repo
+# discovery consults these env vars before it looks at cwd. Any script that
+# builds or inspects a SCRATCH repo (a throwaway git repo meant to be
+# self-contained, e.g. a positive-control canary) must scrub these before
+# its first git call, or every git operation in that scratch repo silently
+# operates on the CALLER's real repo instead.
+#
+# ENUMERATION SOURCE (PEACHES, PR #209 review, finding 1): the fixed
+# name-by-name list below is cross-checked against `git rev-parse
+# --local-env-vars` -- git's OWN authoritative list of env vars that affect
+# local repo resolution -- rather than hand-curated from first principles
+# alone. That command additionally names GIT_IMPLICIT_WORK_TREE,
+# GIT_GRAFT_FILE, GIT_NO_REPLACE_OBJECTS, GIT_REPLACE_REF_BASE, and
+# GIT_SHALLOW_FILE, folded in below; it does NOT enumerate
+# GIT_CONFIG_KEY_*/GIT_CONFIG_VALUE_* (git itself does not list these --
+# they are INDEXED and unbounded, driven by GIT_CONFIG_COUNT, so no static
+# name list can cover them; handled separately below, not by this fixed
+# list) or GIT_CONFIG/GIT_CONFIG_PARAMETERS (also real config-redirection
+# channels `--local-env-vars` DOES name, added here for the same
+# demonstrated reason as the indexed pair -- see PEACHES' reproduction).
+#
+# What each var can redirect, for a fresh `git init`/`add`/`commit`/`log` in
+# a scratch dir:
+#   GIT_DIR / GIT_WORK_TREE        - override repo/worktree location outright
+#   GIT_IMPLICIT_WORK_TREE          - suppresses the "no work tree" implication
+#                                     GIT_DIR-without-GIT_WORK_TREE would
+#                                     otherwise carry -- part of the same
+#                                     location-override family as the two above
+#   GIT_INDEX_FILE                 - overrides which index add/commit use
+#   GIT_COMMON_DIR                 - overrides shared refs/config (worktrees)
+#   GIT_OBJECT_DIRECTORY           - overrides where NEW objects are written
+#                                     (a scratch commit's blobs/trees/commit
+#                                     object land in the caller's real
+#                                     .git/objects, unreferenced by any real
+#                                     ref -- invisible to `git log` but
+#                                     present on disk and reachable by a
+#                                     full-history scan)
+#   GIT_ALTERNATE_OBJECT_DIRECTORIES - widens object *lookup* (not writes);
+#                                     can let the scratch repo silently
+#                                     resolve/see objects it has no business
+#                                     seeing, e.g. during a history scan
+#   GIT_GRAFT_FILE / GIT_SHALLOW_FILE - override which grafts/shallow-bound
+#                                     file git consults, letting an inherited
+#                                     file rewrite the scratch repo's own
+#                                     apparent history shape
+#   GIT_NO_REPLACE_OBJECTS / GIT_REPLACE_REF_BASE - control whether/where
+#                                     git substitutes replacement objects;
+#                                     an inherited replace-ref base could
+#                                     make the scratch repo transparently
+#                                     resolve objects from elsewhere
+#   GIT_NAMESPACE                  - ref-namespace prefix; cleared for
+#                                     symmetry within the same var family
+#   GIT_CEILING_DIRECTORIES         - bounds the upward directory walk repo
+#                                     discovery performs; cleared so a
+#                                     scratch repo's own boundary is decided
+#                                     by its own tree, not an inherited limit
+#   GIT_AUTHOR_NAME/EMAIL,
+#   GIT_COMMITTER_NAME/EMAIL       - override `user.name`/`user.email`
+#                                     config for the ACTUAL commit identity
+#                                     used, regardless of `git config` calls
+#                                     made after this scrub -- a caller that
+#                                     deliberately sets a synthetic identity
+#                                     (e.g. "clagentic-secrets-canary") via
+#                                     `git config` needs these cleared first
+#                                     or the inherited identity wins
+#   GIT_CONFIG_GLOBAL/SYSTEM        - override which global/system config
+#                                     file git reads; cleared together with
+#                                     GIT_CONFIG_NOSYSTEM=1 (set, not
+#                                     unset)
+#   GIT_CONFIG / GIT_CONFIG_PARAMETERS - inject arbitrary config key/value
+#                                     pairs directly via the environment,
+#                                     bypassing any file at all
+#   GIT_CONFIG_COUNT + GIT_CONFIG_KEY_N/GIT_CONFIG_VALUE_N (N = 0..COUNT-1)
+#                                   - the INDEXED, unbounded config-injection
+#                                     channel PEACHES demonstrated directly:
+#                                     an inherited `GIT_CONFIG_COUNT=1
+#                                     GIT_CONFIG_KEY_0=commit.gpgsign
+#                                     GIT_CONFIG_VALUE_0=true` forces the
+#                                     canary's commit to require a GPG
+#                                     signature it cannot produce -- and
+#                                     because every canary call site
+#                                     redirects to /dev/null, that failure
+#                                     is silent, degrading the whole
+#                                     positive-control to a no-op that still
+#                                     "passes" by construction (the caller
+#                                     sees a nonzero exit only if it checks
+#                                     for one -- see the companion test-gap
+#                                     fix in test_gates_hook_git_env_isolation.py
+#                                     for why silently swallowing that is
+#                                     itself part of this defect class).
+#                                     GIT_CONFIG_COUNT/KEY_N/VALUE_N cannot
+#                                     be cleared by a fixed name list -- N is
+#                                     unbounded and caller-controlled.
+#                                     Handled by reading GIT_CONFIG_COUNT
+#                                     FIRST (before unsetting it), then
+#                                     iterating i=0..count-1 unsetting
+#                                     GIT_CONFIG_KEY_$i/GIT_CONFIG_VALUE_$i
+#                                     for each, THEN unsetting
+#                                     GIT_CONFIG_COUNT itself. A
+#                                     non-numeric or unset GIT_CONFIG_COUNT
+#                                     is treated as 0 iterations (nothing
+#                                     indexed to clear) rather than falling
+#                                     back to some default count -- unlike
+#                                     ds_positive_int_or_default, a bogus
+#                                     count here must never be treated as
+#                                     "some" pairs are present when it
+#                                     cannot be trusted to say how many.
+#                                     UPPER-CLAMPED at
+#                                     _DGES_MAX_CONFIG_COUNT (256) --
+#                                     BOBBIE, PR #209 audit, bobbie.uncat.1:
+#                                     the loop trip count was previously
+#                                     unbounded above, so a large all-digit
+#                                     GIT_CONFIG_COUNT (verified: even
+#                                     5,000,000 hangs well past a 5s budget)
+#                                     passed the digits-only check and hung
+#                                     indefinitely. BOTH call sites of this
+#                                     function (scripts/gates.sh) run
+#                                     entirely OUTSIDE run_bounded's timeout
+#                                     wrapper, and moving the scrub itself
+#                                     inside run_bounded would reorder it
+#                                     relative to the git calls it exists to
+#                                     protect (the scrub must complete
+#                                     before the FIRST git call in the
+#                                     subshell, not be wrapped around a
+#                                     single external command the way
+#                                     run_bounded wraps one) -- so a fixed
+#                                     upper clamp on the loop's own trip
+#                                     count is the fix, not a timeout
+#                                     wrapper. 256 is chosen because git's
+#                                     own practical use of GIT_CONFIG_COUNT
+#                                     is a handful of `-c key=value`
+#                                     overrides or scripted CLI injections --
+#                                     realistically single digits to low
+#                                     tens -- so 256 has wide headroom above
+#                                     any legitimate value while keeping the
+#                                     loop's worst case sub-millisecond. A
+#                                     count above the clamp is treated the
+#                                     same as a non-numeric one: 0
+#                                     iterations, not the clamp value itself
+#                                     (clamping the ITERATION COUNT to 256
+#                                     rather than silently processing the
+#                                     first 256 entries would still "do
+#                                     something" with a value this function
+#                                     has already decided not to trust).
+#
+# GIT_PREFIX and GIT_INDEX_VERSION are deliberately NOT cleared here: both
+# are cosmetic/format-only (relative-path prefix for porcelain output;
+# on-disk index format version) and never redirect what repo, index, or
+# object store an operation reads or writes -- not cargo-culted in, even
+# though `git rev-parse --local-env-vars` lists GIT_PREFIX alongside the
+# vars above (its own list is "affects local resolution", broader than
+# "can redirect to a different repo/index/object-store/identity", which is
+# the narrower contract this function actually promises).
+#
+# Under set -e, `unset` of an already-unset POSIX shell variable is not an
+# error (confirmed under dash, this host's /bin/sh) -- no `|| true` needed.
+# _DGES_MAX_CONFIG_COUNT -- see ds_git_env_scrub's own doc comment above
+# for the DoS this bounds (BOBBIE, PR #209 audit, bobbie.uncat.1) and why
+# 256 is the chosen ceiling. A separate named constant (not an inline
+# literal in the loop guard below) so the one number that matters here is
+# stated once, in one place, self-documenting at its own definition site.
+_DGES_MAX_CONFIG_COUNT=256
+
+ds_git_env_scrub() {
+  # Indexed config-injection channel FIRST, before GIT_CONFIG_COUNT itself
+  # is unset below -- reading it after would always see "unset" and clear
+  # nothing.
+  _dges_count="${GIT_CONFIG_COUNT:-}"
+  case "$_dges_count" in
+    ''|*[!0-9]*) _dges_count=0 ;;
+    *) [ "$_dges_count" -gt "$_DGES_MAX_CONFIG_COUNT" ] && _dges_count=0 ;;
+  esac
+  _dges_i=0
+  while [ "$_dges_i" -lt "$_dges_count" ]; do
+    eval "unset GIT_CONFIG_KEY_${_dges_i} GIT_CONFIG_VALUE_${_dges_i}"
+    _dges_i=$((_dges_i + 1))
+  done
+  unset _dges_count _dges_i
+
+  unset GIT_DIR GIT_WORK_TREE GIT_IMPLICIT_WORK_TREE GIT_INDEX_FILE \
+    GIT_COMMON_DIR \
+    GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    GIT_GRAFT_FILE GIT_SHALLOW_FILE \
+    GIT_NO_REPLACE_OBJECTS GIT_REPLACE_REF_BASE \
+    GIT_NAMESPACE GIT_CEILING_DIRECTORIES \
+    GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL \
+    GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+
+  # GIT_CONFIG_SYSTEM is unset (not pointed at /dev/null) because
+  # GIT_CONFIG_NOSYSTEM=1 below already fully disables system-config
+  # reading outright -- pointing GIT_CONFIG_SYSTEM at /dev/null too would
+  # be redundant with, not additive to, that.
+  unset GIT_CONFIG_SYSTEM
+  GIT_CONFIG_NOSYSTEM=1
+  export GIT_CONFIG_NOSYSTEM
+
+  # GIT_CONFIG_GLOBAL is explicitly POINTED AT /dev/null, not merely
+  # unset (BOBBIE, PR #209 audit nit, folded in here rather than deferred:
+  # same channel as finding 1). Unsetting it alone leaves git's OWN
+  # default global-config resolution in force -- $HOME/.gitconfig or
+  # $XDG_CONFIG_HOME/git/config, neither of which this function touches
+  # (HOME/XDG_CONFIG_HOME are deliberately NOT scrubbed: their blast
+  # radius is everything else in this process, not just git, so touching
+  # them here would be far wider than this function's stated contract).
+  # An inherited real global config with e.g. `core.hooksPath` set could
+  # otherwise fire a NON-BLOCKING hook (post-commit; --no-verify already
+  # covers pre-commit/commit-msg) during the canary's own commit -- narrow,
+  # but verified reproducible directly: a `[core] hooksPath = ...`
+  # global config's post-commit script fires during the canary commit
+  # without this line, and does not fire with it. /dev/null is git's own
+  # documented idiom for "no file here" (an existing path git reads as an
+  # empty, valid config), not an arbitrary sentinel choice.
+  GIT_CONFIG_GLOBAL=/dev/null
+  export GIT_CONFIG_GLOBAL
+}

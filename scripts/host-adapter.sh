@@ -109,6 +109,14 @@
 # elsewhere in this file's individual git calls is exactly the unscoped
 # shape this predicate exists to refuse; it deliberately does NOT default
 # REPO_ROOT to "." itself.
+#
+# STRUCTURALLY BLIND to an inherited GIT_DIR (lr-dfd45f) — see gates.sh's
+# own copy of this predicate for the full explanation: an exported GIT_DIR
+# silently overrides `-C "$REPO_ROOT"`, so both sides of the comparison
+# below can derive from the same foreign repo and spuriously report
+# "scoped." This file does not currently call ds_git_env_scrub
+# (scripts/platform.sh) at its own top level — a known follow-up, not fixed
+# in lr-dfd45f's PR (scoped to gates.sh's own canary defect there).
 _host_adapter_repo_root_is_scoped() {
   [ -n "${REPO_ROOT:-}" ] || return 1
   _harris_repo_root_canon=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P || printf '%s' "$REPO_ROOT")
