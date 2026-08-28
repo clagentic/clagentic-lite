@@ -1532,3 +1532,83 @@ ds_router_url_classify() {
     DS_ROUTER_URL_CLASS="nonlocal"
   fi
 }
+
+# ds_git_env_scrub — unset every git-exported env var that can redirect a
+# git invocation away from the caller's own explicit `-C DIR`/`cd DIR`
+# choice, and pin the scratch repo to its own identity/config rather than
+# inheriting the invoking process's.
+#
+# WHY THIS EXISTS (lr-dfd45f): git hooks (pre-commit, pre-push, ...) run
+# with GIT_DIR (and sometimes GIT_WORK_TREE/GIT_INDEX_FILE) exported by git
+# itself, pointing at the repo under commit. VERIFIED EMPIRICALLY (this
+# task): an inherited GIT_DIR silently overrides an explicit `git -C <dir>
+# ...` -- `git -C repo_a log` with GIT_DIR=repo_b/.git in the environment
+# reports repo_b's history, not repo_a's, with no error. `cd` into a
+# directory offers no more protection than `-C` does -- git's own repo
+# discovery consults these env vars before it looks at cwd. Any script that
+# builds or inspects a SCRATCH repo (a throwaway git repo meant to be
+# self-contained, e.g. a positive-control canary) must scrub these before
+# its first git call, or every git operation in that scratch repo silently
+# operates on the CALLER's real repo instead.
+#
+# What each var can redirect, for a fresh `git init`/`add`/`commit`/`log` in
+# a scratch dir:
+#   GIT_DIR / GIT_WORK_TREE        - override repo/worktree location outright
+#   GIT_INDEX_FILE                 - overrides which index add/commit use
+#   GIT_COMMON_DIR                 - overrides shared refs/config (worktrees)
+#   GIT_OBJECT_DIRECTORY           - overrides where NEW objects are written
+#                                     (a scratch commit's blobs/trees/commit
+#                                     object land in the caller's real
+#                                     .git/objects, unreferenced by any real
+#                                     ref -- invisible to `git log` but
+#                                     present on disk and reachable by a
+#                                     full-history scan)
+#   GIT_ALTERNATE_OBJECT_DIRECTORIES - widens object *lookup* (not writes);
+#                                     can let the scratch repo silently
+#                                     resolve/see objects it has no business
+#                                     seeing, e.g. during a history scan
+#   GIT_NAMESPACE                  - ref-namespace prefix; cleared for
+#                                     symmetry within the same var family
+#   GIT_CEILING_DIRECTORIES         - bounds the upward directory walk repo
+#                                     discovery performs; cleared so a
+#                                     scratch repo's own boundary is decided
+#                                     by its own tree, not an inherited limit
+#   GIT_AUTHOR_NAME/EMAIL,
+#   GIT_COMMITTER_NAME/EMAIL       - override `user.name`/`user.email`
+#                                     config for the ACTUAL commit identity
+#                                     used, regardless of `git config` calls
+#                                     made after this scrub -- a caller that
+#                                     deliberately sets a synthetic identity
+#                                     (e.g. "clagentic-secrets-canary") via
+#                                     `git config` needs these cleared first
+#                                     or the inherited identity wins
+#   GIT_CONFIG_GLOBAL/SYSTEM        - override which global/system config
+#                                     file git reads; cleared together with
+#                                     GIT_CONFIG_NOSYSTEM=1 (set, not
+#                                     unset) so the scratch repo's commit
+#                                     cannot be silently defeated by an
+#                                     inherited core.hooksPath or
+#                                     commit.gpgsign requirement -- a
+#                                     canary/scratch operation that
+#                                     silently fails is a fail-open, not a
+#                                     fail-closed, and several call sites
+#                                     redirect this scrub's git calls to
+#                                     /dev/null, which would hide exactly
+#                                     that failure
+#
+# GIT_PREFIX and GIT_INDEX_VERSION are deliberately NOT cleared here: both
+# are cosmetic/format-only (relative-path prefix for porcelain output;
+# on-disk index format version) and never redirect what repo, index, or
+# object store an operation reads or writes -- not cargo-culted in.
+#
+# Under set -e, `unset` of an already-unset POSIX shell variable is not an
+# error (confirmed under dash, this host's /bin/sh) -- no `|| true` needed.
+ds_git_env_scrub() {
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR \
+    GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE \
+    GIT_CEILING_DIRECTORIES \
+    GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL \
+    GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
+  GIT_CONFIG_NOSYSTEM=1
+  export GIT_CONFIG_NOSYSTEM
+}
