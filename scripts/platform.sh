@@ -1651,6 +1651,43 @@ ds_router_url_classify() {
 #                                     count here must never be treated as
 #                                     "some" pairs are present when it
 #                                     cannot be trusted to say how many.
+#                                     UPPER-CLAMPED at
+#                                     _DGES_MAX_CONFIG_COUNT (256) --
+#                                     BOBBIE, PR #209 audit, bobbie.uncat.1:
+#                                     the loop trip count was previously
+#                                     unbounded above, so a large all-digit
+#                                     GIT_CONFIG_COUNT (verified: even
+#                                     5,000,000 hangs well past a 5s budget)
+#                                     passed the digits-only check and hung
+#                                     indefinitely. BOTH call sites of this
+#                                     function (scripts/gates.sh) run
+#                                     entirely OUTSIDE run_bounded's timeout
+#                                     wrapper, and moving the scrub itself
+#                                     inside run_bounded would reorder it
+#                                     relative to the git calls it exists to
+#                                     protect (the scrub must complete
+#                                     before the FIRST git call in the
+#                                     subshell, not be wrapped around a
+#                                     single external command the way
+#                                     run_bounded wraps one) -- so a fixed
+#                                     upper clamp on the loop's own trip
+#                                     count is the fix, not a timeout
+#                                     wrapper. 256 is chosen because git's
+#                                     own practical use of GIT_CONFIG_COUNT
+#                                     is a handful of `-c key=value`
+#                                     overrides or scripted CLI injections --
+#                                     realistically single digits to low
+#                                     tens -- so 256 has wide headroom above
+#                                     any legitimate value while keeping the
+#                                     loop's worst case sub-millisecond. A
+#                                     count above the clamp is treated the
+#                                     same as a non-numeric one: 0
+#                                     iterations, not the clamp value itself
+#                                     (clamping the ITERATION COUNT to 256
+#                                     rather than silently processing the
+#                                     first 256 entries would still "do
+#                                     something" with a value this function
+#                                     has already decided not to trust).
 #
 # GIT_PREFIX and GIT_INDEX_VERSION are deliberately NOT cleared here: both
 # are cosmetic/format-only (relative-path prefix for porcelain output;
@@ -1663,12 +1700,22 @@ ds_router_url_classify() {
 #
 # Under set -e, `unset` of an already-unset POSIX shell variable is not an
 # error (confirmed under dash, this host's /bin/sh) -- no `|| true` needed.
+# _DGES_MAX_CONFIG_COUNT -- see ds_git_env_scrub's own doc comment above
+# for the DoS this bounds (BOBBIE, PR #209 audit, bobbie.uncat.1) and why
+# 256 is the chosen ceiling. A separate named constant (not an inline
+# literal in the loop guard below) so the one number that matters here is
+# stated once, in one place, self-documenting at its own definition site.
+_DGES_MAX_CONFIG_COUNT=256
+
 ds_git_env_scrub() {
   # Indexed config-injection channel FIRST, before GIT_CONFIG_COUNT itself
   # is unset below -- reading it after would always see "unset" and clear
   # nothing.
   _dges_count="${GIT_CONFIG_COUNT:-}"
-  case "$_dges_count" in ''|*[!0-9]*) _dges_count=0 ;; esac
+  case "$_dges_count" in
+    ''|*[!0-9]*) _dges_count=0 ;;
+    *) [ "$_dges_count" -gt "$_DGES_MAX_CONFIG_COUNT" ] && _dges_count=0 ;;
+  esac
   _dges_i=0
   while [ "$_dges_i" -lt "$_dges_count" ]; do
     eval "unset GIT_CONFIG_KEY_${_dges_i} GIT_CONFIG_VALUE_${_dges_i}"
