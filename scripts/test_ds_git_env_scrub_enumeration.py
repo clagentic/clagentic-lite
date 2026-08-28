@@ -304,6 +304,60 @@ class TestDsGitEnvScrubIndexedConfigChannel(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, "done")
 
+    def test_large_all_digit_count_is_clamped_not_hung(self):
+        """BOBBIE, PR #209 audit (bobbie.uncat.1) -- blocking: the digits-
+        only validation alone has no UPPER bound, so a large all-digit
+        GIT_CONFIG_COUNT (e.g. an inherited or attacker-influenced value)
+        passed the pre-clamp check and drove the unset loop through
+        millions of iterations. Both call sites of ds_git_env_scrub
+        (scripts/gates.sh) run entirely OUTSIDE run_bounded's timeout
+        wrapper, so nothing else catches this -- it directly violates the
+        function's own documented "no smaller a candidate for hanging than
+        the real [gitleaks] scan" invariant.
+
+        Uses a REAL, TIGHT subprocess timeout (5s -- generous for a
+        256-iteration loop, far short of what an unbounded multi-million
+        iteration loop needs) so a regression here fails FAST with a clear
+        TimeoutExpired, rather than hanging this test (and the suite/CI
+        run it's part of) indefinitely -- the exact fail-open shape this
+        finding is about, reproduced at the test-harness level too if this
+        assertion were naively an unbounded subprocess.run call.
+
+        Confirmed to hang past this same 5s budget pre-fix (verified
+        directly during this task by disabling the upper-clamp branch and
+        re-running with a comparable large count)."""
+        env = os.environ.copy()
+        env["GIT_CONFIG_COUNT"] = "5000000"
+        script = f". '{PLATFORM_SH}'\nds_git_env_scrub\nprintf done\n"
+        try:
+            r = subprocess.run(["sh", "-c", script, PLATFORM_SH],
+                                capture_output=True, text=True, env=env, timeout=5)
+        except subprocess.TimeoutExpired:
+            self.fail(
+                "ds_git_env_scrub hung past a 5s budget on GIT_CONFIG_COUNT="
+                "5000000 -- the upper clamp did not engage (unbounded loop "
+                "DoS, bobbie.uncat.1)"
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "done")
+
+    def test_count_just_above_the_clamp_is_also_rejected(self):
+        """The clamp boundary itself: one past _DGES_MAX_CONFIG_COUNT (256)
+        must be treated as zero iterations (same as non-numeric), not
+        silently truncated to processing the first 256 entries -- this
+        function has already decided a count that large cannot be
+        trusted, so it should do nothing indexed, not "do something"."""
+        result = self._probe_indexed(257, [("commit.gpgsign", "true")])
+        # KEY_0/VALUE_0 must survive (never touched) because the whole
+        # indexed pass is skipped -- if the clamp instead silently
+        # truncated to 256 iterations, index 0 would still be cleared and
+        # this assertion would not catch the truncation-vs-reject
+        # distinction. Only GIT_CONFIG_COUNT itself is unconditionally
+        # unset by the second, unrelated unset block later in the
+        # function.
+        self.assertEqual(result["GIT_CONFIG_KEY_0"], "commit.gpgsign")
+        self.assertEqual(result["GIT_CONFIG_VALUE_0"], "true")
+
 
 if __name__ == "__main__":
     unittest.main()
