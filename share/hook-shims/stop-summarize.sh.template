@@ -7,7 +7,7 @@
 # session_id, transcript_path, and stop_hook_active. We read it before
 # detaching so the payload is captured before the parent closes stdin.
 #
-# managed-by: clagentic · clagentic-hooks-version: v3
+# managed-by: clagentic · clagentic-hooks-version: v4
 # Source of truth: share/hook-shims/stop-summarize.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/stop-summarize.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite

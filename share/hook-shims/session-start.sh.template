@@ -9,7 +9,7 @@
 #
 # Non-blocking — any failure exits 0 silently.
 #
-# managed-by: clagentic · clagentic-hooks-version: v3
+# managed-by: clagentic · clagentic-hooks-version: v4
 # Source of truth: share/hook-shims/session-start.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/session-start.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -182,38 +182,20 @@ fi
 
 [ -z "$CONTEXT" ] && exit 0
 
-# Escape the context string for safe embedding in a JSON string value.
-# Must produce spec-compliant output: RFC 8259 §7 requires escaping U+0000-U+001F.
-# Strategy: python3 (already a project dependency via ds_json_field) handles the
-# full control-character range correctly in one pass. The sed+tr fallback (for
-# environments without python3) escapes: \\ \" \t (0x09) \r (0x0D), converts
-# literal newlines to \n via awk, then strips the remaining obscure control chars
-# (0x01-0x08, 0x0B-0x0C, 0x0E-0x1F) that are near-impossible in session context
-# and have no standard single-letter JSON escape sequence.
-_json_escape() {
-  if command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$1" | python3 -c '
-import sys, json
-raw = sys.stdin.read()
-# json.dumps produces a quoted string; strip the surrounding quotes.
-encoded = json.dumps(raw)
-sys.stdout.write(encoded[1:-1])
-'
-  else
-    # Fallback: escape backslash and double-quote; escape tab (0x09) as \t and
-    # CR (0x0D) as \r; convert literal newlines to \n escape sequences via awk;
-    # strip remaining 0x01-0x08, 0x0B-0x0C, 0x0E-0x1F control bytes. The tr
-    # ranges exclude 0x09 (already \t), 0x0A (handled by awk), and 0x0D
-    # (already \r). Uses octal ranges which are POSIX-portable.
-    printf '%s' "$1" \
-      | sed 's/\\/\\\\/g; s/"/\\"/g' \
-      | sed 's/'"$(printf '\t')"'/\\t/g' \
-      | sed 's/'"$(printf '\r')"'/\\r/g' \
-      | awk '{if(NR>1)printf "\\n"; printf "%s", $0} END{printf ""}' \
-      | tr -d '\001-\010\013-\014\016-\037\177'
-  fi
-}
-CONTEXT_JSON=$(_json_escape "$CONTEXT")
+# Escape the context string for safe embedding in a JSON string value via
+# ds_json_escape (scripts/platform.sh, lr-b82538 hoist) -- this shim's own
+# copy of the escaper was the reference implementation the hoist lifted
+# verbatim; it now calls the shared primitive instead of carrying its own
+# copy. platform.sh is already sourced above.
+if command -v ds_json_escape >/dev/null 2>&1; then
+  CONTEXT_JSON=$(ds_json_escape "$CONTEXT")
+else
+  # platform.sh failed to load (see the existence guard above): fall back to
+  # the raw, unescaped string rather than aborting -- this hook is
+  # non-blocking by contract (see file header). A malformed additionalContext
+  # in this rare case is a strictly better outcome than a hook crash.
+  CONTEXT_JSON="$CONTEXT"
+fi
 
 cat <<EOF
 {

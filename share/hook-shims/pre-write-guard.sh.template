@@ -3,7 +3,7 @@
 # Blocks writes to the default branch, outside the repo, or to sensitive paths.
 # Exit 2 = block.
 #
-# managed-by: clagentic · clagentic-hooks-version: v3
+# managed-by: clagentic · clagentic-hooks-version: v4
 # Source of truth: share/hook-shims/pre-write-guard.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/pre-write-guard.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
