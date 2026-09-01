@@ -402,7 +402,16 @@ class TestPostToolNudgeEscaperFailureFailsClosed(unittest.TestCase):
     and records the `-c` invocation shape ds_json_escape's python3 branch
     uses, proving the escaper's python3 call was actually attempted (and
     therefore that GIT_MSG was assembled and handed to a genuinely failing
-    escaper) rather than the branch being skipped entirely."""
+    escaper) rather than the branch being skipped entirely.
+
+    TWO TEST METHODS below share the same assertion body
+    (`_run_and_assert_fails_closed`) against two different PATH
+    configurations -- jq-present (the common case) and jq-absent
+    (`_no_jq_path`, a genuine simulated jq-less host, not merely "remove
+    jq's whole directory and also break sed/awk/wc"). Both are required:
+    this exact test was proven vacuous in the jq-absent case before this
+    fold-in and the isolation fix must be shown to hold in BOTH, not just
+    whichever jq happens to exist on the machine that authored the test."""
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="clagentic-test-json-emit-ptn-")
@@ -418,9 +427,40 @@ class TestPostToolNudgeEscaperFailureFailsClosed(unittest.TestCase):
         shutil.rmtree(self._tmp, ignore_errors=True)
         shutil.rmtree(self._stub_dir, ignore_errors=True)
 
-    def test_git_nudge_escaper_failure_drops_message_not_raw(self):
+    def _no_jq_path(self, base_path):
+        """Build a PATH with every real `jq` unreachable but every OTHER
+        tool (sed, awk, wc, sqlite3, ...) from the same directory still
+        available -- via symlinks into a shadow dir -- genuinely simulating
+        a jq-absent host rather than a host missing sed/awk/wc too, which
+        is not what "jq absent" means and would make the shim fail for
+        unrelated reasons. See task lr-b82538 comment seq 9 requirement 3:
+        this isolation must be proven to work in BOTH jq-present and
+        jq-absent host configurations, not just whichever jq happens to be
+        on the machine that authored the test."""
+        import shutil
+        shadow = tempfile.mkdtemp(prefix="clagentic-test-no-jq-shadow-")
+        self.addCleanup(shutil.rmtree, shadow, ignore_errors=True)
+        new_dirs = []
+        for d in base_path.split(os.pathsep):
+            if os.path.exists(os.path.join(d, "jq")):
+                try:
+                    for name in os.listdir(d):
+                        if name == "jq":
+                            continue
+                        src = os.path.join(d, name)
+                        dst = os.path.join(shadow, name)
+                        if not os.path.exists(dst) and os.path.isfile(src):
+                            os.symlink(src, dst)
+                except OSError:
+                    pass
+                new_dirs.append(shadow)
+            else:
+                new_dirs.append(d)
+        return os.pathsep.join(new_dirs)
+
+    def _run_and_assert_fails_closed(self, base_path):
         env_overrides = {
-            "PATH": self._stub_dir + os.pathsep + os.environ.get("PATH", ""),
+            "PATH": self._stub_dir + os.pathsep + base_path,
             "CLAGENTIC_ENV_LOADED": "1",
         }
         result = _run_shim(
@@ -467,6 +507,25 @@ class TestPostToolNudgeEscaperFailureFailsClosed(unittest.TestCase):
             f"`-c` call shape -- escaper branch not genuinely reached: "
             f"{invocations!r}",
         )
+
+    def test_git_nudge_escaper_failure_drops_message_not_raw(self):
+        """jq-present host configuration (the working jq stub installed in
+        setUp always wins the PATH race regardless of real host jq, but
+        this exercises the ordinary/common case where a real jq also
+        exists further down PATH)."""
+        self._run_and_assert_fails_closed(os.environ.get("PATH", ""))
+
+    def test_git_nudge_escaper_failure_drops_message_not_raw_jq_absent_host(self):
+        """jq-ABSENT host configuration (PEACHES PR #210 comment
+        5501308317): the exact configuration under which the pre-fix
+        version of this test was vacuous, because ds_json_field's own
+        python3 fallback (triggered only when jq is absent) was ALSO
+        broken by the same global failing-python3 stub, so post-tool-nudge
+        exited at the payload-parse failure before GIT_MSG was ever
+        assembled and the escaper-failure branch never ran. Proves the
+        working-jq-stub isolation holds even when the host genuinely has
+        no jq at all, not merely when a real jq happens to be present."""
+        self._run_and_assert_fails_closed(self._no_jq_path(os.environ.get("PATH", "")))
 
 
 class TestAcceptance6RegressionGuardSweep(unittest.TestCase):
