@@ -1219,12 +1219,14 @@ fi
 # Previously only \\ and \" were handled; tab, CR, and the broader 0x00-0x1F
 # range were passed through raw, producing invalid JSON string values.
 #
-# The function is inlined from session-start.sh so the test runs against the
-# actual implementation without sourcing the full hook (which has side effects).
+# The function is inlined from ds_json_escape (scripts/platform.sh, hoisted
+# there from session-start.sh.template by lr-b82538 -- every JSON-emitting
+# shim now calls the shared primitive) so the test runs against the actual
+# implementation without sourcing the full hook (which has side effects).
 
 step "21a. _json_escape fallback: control chars escaped (lr-d8f1)"
 
-# Inline the fallback pipeline from session-start.sh (sed+awk+tr path only --
+# Inline the fallback pipeline from ds_json_escape (sed+awk+tr path only --
 # does NOT call python3 regardless of availability, so this always exercises
 # the fallback code path).
 _json_escape_fallback() {
@@ -1303,7 +1305,7 @@ fi
 step "21b. _json_escape python3: control chars escaped (lr-d8f1)"
 
 if command -v python3 >/dev/null 2>&1; then
-  # Inline the full _json_escape function (python3 branch wins when available).
+  # Inline the full ds_json_escape function (python3 branch wins when available).
   _json_escape() {
     if command -v python3 >/dev/null 2>&1; then
       printf '%s' "$1" | python3 -c '
