@@ -266,7 +266,7 @@ class TestSessionStartEscaperUnavailableFailsClosed(_RepoFixture):
         )
 
 
-def _write_failing_python3_stub(bin_dir):
+def _write_failing_python3_stub(bin_dir, invoked_marker):
     """A `python3` stub that always exits nonzero with no stdout, placed
     ahead of the real python3 on PATH. Exercises ds_json_escape's OWN
     runtime failure (`command -v python3` succeeds, the python3 -c call
@@ -274,10 +274,92 @@ def _write_failing_python3_stub(bin_dir):
     ds_json_escape is undefined entirely). This is the branch
     post-tool-nudge.sh.template's `_json_escape` wrapper previously papered
     over with `|| printf '%s' "$1"`, falling back to the raw, unescaped
-    value on ANY failure (BOBBIE finding 2, PR #210, lr-b82538 fold-in)."""
+    value on ANY failure (BOBBIE finding 2, PR #210, lr-b82538 fold-in).
+
+    `invoked_marker`: an absolute path (inside the test's own scratch dir,
+    never /tmp directly) the stub touches on every invocation, appending
+    the args it was called with. PEACHES re-review item 2 (PR #210
+    lr-b82538 fold-in round 3): a guard that fails-safe on an unreached
+    branch is indistinguishable from one that correctly guards a reached
+    branch unless something proves the branch was actually hit -- this
+    marker is that proof. Note this stub is invoked for EVERY python3 call
+    post-tool-nudge's whole process tree makes (ds_json_field's python3
+    fallback too, when jq is genuinely absent and the jq stub isn't in
+    play) -- the test asserts only that ds_json_escape's specific
+    `-c` invocation shape appears at least once, not that the marker file
+    is otherwise empty."""
     path = os.path.join(bin_dir, "python3")
     with open(path, "w") as f:
-        f.write("#!/bin/sh\ncat >/dev/null 2>&1\nexit 1\n")
+        f.write(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> " + invoked_marker + "\n"
+            "cat >/dev/null 2>&1\n"
+            "exit 1\n"
+        )
+    os.chmod(path, 0o755)
+    return path
+
+
+def _write_working_jq_stub(bin_dir):
+    """A minimal `jq` stub that correctly answers the ONE call shape
+    platform.sh's ds_json_field ever issues (`jq -r --arg f "$FIELD"
+    '.[$f] // empty'` against a flat, single-level JSON object) -- placed
+    ahead of any real jq on PATH.
+
+    PEACHES re-review, PR #210 lr-b82538 fold-in round 3 (comment
+    5501308317): ds_json_field (scripts/platform.sh line 466) tries jq
+    FIRST, falling back to python3 only in the elif; ds_json_escape (line
+    511) is python3-ONLY, no jq path. A global failing-python3 stub
+    (TestPostToolNudgeEscaperFailureFailsClosed, above) therefore breaks
+    ds_json_field too -- but ONLY on a host without jq, where the elif is
+    what's failing. On a host WITH jq the test was real; on a host without
+    jq it was vacuous, because ds_json_field's own parse failure exits
+    post-tool-nudge before GIT_MSG is ever assembled, so the escaper-failure
+    branch this test exists to guard never runs and the assertNotIn passes
+    on empty stdout regardless of whether the fix is present. A guard whose
+    correctness depends on undeclared host jq availability is exactly the
+    defect class this task exists to close, one layer up, in the guard
+    itself. Codex confirmed empirically (jq removed from PATH, test still
+    passed).
+
+    Supplying a WORKING jq stub -- not skipping ds_json_field, not mocking
+    it away -- makes ds_json_field succeed deterministically regardless of
+    host jq presence, isolating the failure to ds_json_escape alone (the
+    python3-only branch) on every host. Implemented in pure POSIX text
+    tools (sed/grep), not python3, since python3 is independently stubbed
+    to fail in the same test -- a jq stub that shelled out to python3 would
+    make this test load-bearing on the same failing stub it exists to
+    isolate from.
+
+    Deliberately narrow: extracts a single flat top-level string field by
+    name via a line-oriented `"field": "value"` match. Sufficient for and
+    scoped to the flat single-level JSON payloads this test suite ever
+    constructs (session_id, tool_name, command, output) -- NOT a general
+    jq replacement, and must never be reused outside this isolation
+    purpose."""
+    path = os.path.join(bin_dir, "jq")
+    with open(path, "w") as f:
+        f.write(
+            "#!/bin/sh\n"
+            "# Minimal jq stub: answers exactly `jq -r --arg f NAME "
+            "'.[$f] // empty'` against a flat JSON object on stdin.\n"
+            "# Scoped to this test suite's isolation use only -- see\n"
+            "# _write_working_jq_stub's docstring in\n"
+            "# test_hook_json_emission_acceptance.py. Reads stdin via a\n"
+            "# single sed pipeline -- no temp file, no python3 (the sibling\n"
+            "# stub in this same test independently fails python3).\n"
+            "FIELD=\"\"\n"
+            "prev=\"\"\n"
+            "for arg in \"$@\"; do\n"
+            "  if [ \"$prev\" = \"f\" ]; then\n"
+            "    FIELD=\"$arg\"\n"
+            "  fi\n"
+            "  prev=\"$arg\"\n"
+            "done\n"
+            "sed -n 's/.*\"'\"$FIELD\"'\"[[:space:]]*:[[:space:]]*\"\\(\\([^\"\\\\]\\|\\\\.\\)*\\)\".*/\\1/p' "
+            "| sed '1q' | sed 's/\\\\\\\\/\\\\/g; s/\\\\\"/\"/g'\n"
+            "exit 0\n"
+        )
     os.chmod(path, 0o755)
     return path
 
@@ -293,14 +375,43 @@ class TestPostToolNudgeEscaperFailureFailsClosed(unittest.TestCase):
     ds_json_escape takes the python3 branch, which then fails. Must now
     fail closed: that message segment is dropped (empty), not emitted raw
     -- proven here by asserting the raw GIT_MSG text never reaches stdout,
-    and that whatever ships still parses as JSON."""
+    and that whatever ships still parses as JSON.
+
+    ISOLATION (PEACHES re-review, PR #210 lr-b82538 fold-in round 3,
+    comment 5501308317, FALSE-POSITIVE finding): platform.sh's
+    ds_json_field (line 466) tries jq FIRST, falling back to python3 only
+    in the elif; ds_json_escape (line 511) is python3-ONLY. A global
+    failing-python3 stub therefore ALSO breaks ds_json_field, but only on
+    a host without jq -- there, post-tool-nudge exits at the payload-parse
+    failure before GIT_MSG is ever assembled, and the escaper-failure
+    branch this test exists to guard never runs; the assertNotIn then
+    passes vacuously on empty stdout regardless of whether the fix is
+    present. HOLDEN ruled for PEACHES against BOBBIE's contrary read (task
+    lr-b82538 comment seq 9) after reading platform.sh directly. Fixed by
+    ALSO placing a WORKING jq stub on PATH (`_write_working_jq_stub`), so
+    ds_json_field succeeds deterministically on every host regardless of
+    real jq presence, isolating the forced failure to ds_json_escape's
+    python3-only branch alone.
+
+    POSITIVE REACHED-BRANCH ASSERTION (required regardless of isolation
+    approach, same PEACHES comment): a guard that cannot demonstrate it
+    reached its target branch is the general shape of the defect this
+    whole task exists to correct one layer up, in the test itself. The
+    failing python3 stub appends its invocation args to a marker file in
+    this test's own scratch dir; the test asserts that marker file exists
+    and records the `-c` invocation shape ds_json_escape's python3 branch
+    uses, proving the escaper's python3 call was actually attempted (and
+    therefore that GIT_MSG was assembled and handed to a genuinely failing
+    escaper) rather than the branch being skipped entirely."""
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="clagentic-test-json-emit-ptn-")
         _init_repo(self._tmp)
         os.makedirs(os.path.join(self._tmp, ".clagentic", "lite"), exist_ok=True)
         self._stub_dir = tempfile.mkdtemp(prefix="clagentic-test-stub-bin-")
-        _write_failing_python3_stub(self._stub_dir)
+        self._marker = os.path.join(self._stub_dir, "python3-invoked.log")
+        _write_failing_python3_stub(self._stub_dir, self._marker)
+        _write_working_jq_stub(self._stub_dir)
 
     def tearDown(self):
         import shutil
@@ -333,6 +444,29 @@ class TestPostToolNudgeEscaperFailureFailsClosed(unittest.TestCase):
                 json.loads(stdout)
             except json.JSONDecodeError as exc:
                 self.fail(f"stdout did not parse as JSON: {exc}\nstdout={stdout!r}")
+
+        # Positive branch-reached evidence: ds_json_escape's python3 branch
+        # (scripts/platform.sh line ~513) invokes `python3 -c '...'` --
+        # confirm the stubbed python3 was actually called with that shape,
+        # not merely that stdout came back empty. An empty stdout is
+        # consistent with EITHER a correctly-reached-and-failed escaper OR
+        # the escaper branch never running at all (ds_json_field failing
+        # first) -- this assertion is what tells the two apart.
+        self.assertTrue(
+            os.path.exists(self._marker),
+            "python3 stub was never invoked -- ds_json_escape's failure "
+            "branch was not reached, so this test proves nothing (this is "
+            "the exact false-positive-guard defect the marker exists to "
+            "catch, PEACHES PR #210 comment 5501308317)",
+        )
+        with open(self._marker) as f:
+            invocations = f.read()
+        self.assertIn(
+            "-c", invocations,
+            f"python3 stub was invoked but never with ds_json_escape's "
+            f"`-c` call shape -- escaper branch not genuinely reached: "
+            f"{invocations!r}",
+        )
 
 
 class TestAcceptance6RegressionGuardSweep(unittest.TestCase):
