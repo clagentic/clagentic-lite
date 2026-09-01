@@ -127,10 +127,10 @@ class TestDeclaredModeUsesDistinctToken(_StampTestBase):
         # Direct-API pair is unaffected -- still the router token.
         self.assertEqual(parsed["env"]["ANTHROPIC_AUTH_TOKEN"], "router-admin-token")
 
-    def test_declared_mode_with_bedrock_token_unset_and_router_token_unset_stamps_empty(self):
-        """Neither token set at all: stamps an empty AWS_BEARER_TOKEN_BEDROCK,
-        same not-omitted convention the pre-existing UNDECLARED path uses --
-        no refusal, because there is no old-overload ATTEMPT (nothing to
+    def test_declared_mode_with_bedrock_token_unset_and_router_token_unset_omits_key(self):
+        """lr-684947 (empty-token regression): neither token set at all --
+        AWS_BEARER_TOKEN_BEDROCK is OMITTED ENTIRELY, never stamped empty.
+        No refusal either way: there is no old-overload ATTEMPT (nothing to
         reuse) when CLAGENTIC_ROUTER_TOKEN itself is also unset."""
         rc, out, err = _run_cli(
             ["enroll", self.repo],
@@ -146,8 +146,7 @@ class TestDeclaredModeUsesDistinctToken(_StampTestBase):
         settings_path = os.path.join(self.repo, ".claude", "settings.json")
         with open(settings_path) as f:
             parsed = json.load(f)
-        self.assertIn("AWS_BEARER_TOKEN_BEDROCK", parsed["env"])
-        self.assertEqual(parsed["env"]["AWS_BEARER_TOKEN_BEDROCK"], "")
+        self.assertNotIn("AWS_BEARER_TOKEN_BEDROCK", parsed["env"], msg=parsed)
 
 
 class TestDeclaredModeRefusesOldOverload(_StampTestBase):
