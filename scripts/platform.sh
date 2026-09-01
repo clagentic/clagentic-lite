@@ -486,6 +486,52 @@ except Exception:
   fi
 }
 
+# Escape a string for safe embedding in a JSON string value (i.e. between the
+# surrounding double quotes -- callers supply those). Hoisted from
+# session-start.sh.template's _json_escape (lr-b82538): that shim's copy was
+# already correct and already portable -- this hoist is a move, not a
+# rewrite. Prior to this hoist, this function was duplicated per-shim
+# (present in session-start and post-tool-nudge, absent from prompt-inject),
+# the same per-shim-duplication shape the GH #174 header comment on every
+# hook template already documents for a different helper. Every JSON-emitting
+# shim must call this and delete its own local copy.
+#
+# Args: RAW_STRING (the unescaped text to embed)
+# Stdout: the escaped text, WITHOUT surrounding quotes -- callers wrap it
+#   themselves, e.g. printf '"%s"' "$(ds_json_escape "$RAW")".
+#
+# Must produce spec-compliant output: RFC 8259 §7 requires escaping
+# U+0000-U+001F. Strategy: python3 (already a project dependency via
+# ds_json_field) handles the full control-character range correctly in one
+# pass. The sed+tr fallback (for environments without python3) escapes: \\ \"
+# \t (0x09) \r (0x0D), converts literal newlines to \n via awk, then strips
+# the remaining obscure control chars (0x01-0x08, 0x0B-0x0C, 0x0E-0x1F) that
+# are near-impossible in session context and have no standard single-letter
+# JSON escape sequence.
+ds_json_escape() {
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 -c '
+import sys, json
+raw = sys.stdin.read()
+# json.dumps produces a quoted string; strip the surrounding quotes.
+encoded = json.dumps(raw)
+sys.stdout.write(encoded[1:-1])
+'
+  else
+    # Fallback: escape backslash and double-quote; escape tab (0x09) as \t and
+    # CR (0x0D) as \r; convert literal newlines to \n escape sequences via awk;
+    # strip remaining 0x01-0x08, 0x0B-0x0C, 0x0E-0x1F control bytes. The tr
+    # ranges exclude 0x09 (already \t), 0x0A (handled by awk), and 0x0D
+    # (already \r). Uses octal ranges which are POSIX-portable.
+    printf '%s' "$1" \
+      | sed 's/\\/\\\\/g; s/"/\\"/g' \
+      | sed 's/'"$(printf '\t')"'/\\t/g' \
+      | sed 's/'"$(printf '\r')"'/\\r/g' \
+      | awk '{if(NR>1)printf "\\n"; printf "%s", $0} END{printf ""}' \
+      | tr -d '\001-\010\013-\014\016-\037\177'
+  fi
+}
+
 # ---------------------------------------------------------------- tool detection
 #
 # ds_check_tool NAME HINT_LINUX HINT_DARWIN
