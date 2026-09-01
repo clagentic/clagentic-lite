@@ -74,10 +74,21 @@ AUDIT_DB=""
 # JSON-escape a plain-text string for safe embedding in a JSON string value,
 # via ds_json_escape (scripts/platform.sh, lr-b82538 hoist -- replaces this
 # shim's own former local copy). platform.sh load is unconditional above
-# (`|| exit 0` on source failure), so ds_json_escape is always available here
-# when this line is reached.
+# (`|| exit 0` on source failure), so ds_json_escape is defined here, but a
+# call to it can still fail at runtime (e.g. python3 present but its stdin
+# pipe breaks) -- fail CLOSED on that failure by emitting nothing rather than
+# the raw, unescaped value. The prior `|| printf '%s' "$1"` fallback fired on
+# ANY ds_json_escape failure, not merely unavailability, and could leak
+# attacker-influenceable summarized tool-result content (the auto-summarize
+# digest hint, section 3 below) into the JSON payload unescaped -- BOBBIE
+# review of PR #210, lr-b82538 fold-in. Every call site below only appends
+# its message when non-empty, so an empty return here silently drops that
+# one message segment rather than corrupting the whole payload; mirrors the
+# fail-closed posture prompt-inject.sh.template and session-start.sh
+# .template (this same fold-in) both use at their own escaper-unavailable
+# branches.
 _json_escape() {
-  ds_json_escape "$1" 2>/dev/null || printf '%s' "$1"
+  ds_json_escape "$1" 2>/dev/null
 }
 
 # ---- section 1: context-budget monitor ----

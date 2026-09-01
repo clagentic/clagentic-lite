@@ -190,11 +190,16 @@ fi
 if command -v ds_json_escape >/dev/null 2>&1; then
   CONTEXT_JSON=$(ds_json_escape "$CONTEXT")
 else
-  # platform.sh failed to load (see the existence guard above): fall back to
-  # the raw, unescaped string rather than aborting -- this hook is
-  # non-blocking by contract (see file header). A malformed additionalContext
-  # in this rare case is a strictly better outcome than a hook crash.
-  CONTEXT_JSON="$CONTEXT"
+  # platform.sh failed to load (see the existence guard above): fail CLOSED
+  # by skipping injection rather than emitting CONTEXT raw and unescaped.
+  # CONTEXT can carry untrusted sqlite3 summary text (RECENT) and raw
+  # handoff.md content (HANDOFF_CONTENT); a quote/backslash/control byte in
+  # either produces broken JSON the host rejects -- BOBBIE/PEACHES review of
+  # PR #210, lr-b82538 fold-in. This mirrors the posture prompt-inject.sh
+  # .template already established at its own escaper-unavailable branch
+  # (fail closed, not fail open) -- non-blocking overall, the user simply
+  # sees no recall/handoff context for this turn.
+  exit 0
 fi
 
 cat <<EOF
