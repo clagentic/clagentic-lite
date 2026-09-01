@@ -27,7 +27,8 @@ as-is (task lr-b82538, comment #1):
   5. platform.sh unavailable: exit 0, no stdout (existing behavior).
   6. Regression guard: every shim template containing "additionalContext"
      must also contain "_json_escape" or "ds_json_escape" -- a real test,
-     not a comment, using git-ls-files-driven discovery (never a
+     not a comment, discovered via `git ls-files` against the TRACKED,
+     SHIPPED set (never glob.glob() against the filesystem, and never a
      hardcoded site list), per AGENTS.md's "Sweeping-test discovery
      convention".
 
@@ -40,7 +41,6 @@ PASS for the sweep, not a gap -- see test 6's own assertion shape).
 
 Run with: python3 -m unittest scripts/test_hook_json_emission_acceptance.py -v
 """
-import glob
 import json
 import os
 import subprocess
@@ -235,16 +235,133 @@ class TestAcceptance5PlatformShUnavailable(_RepoFixture):
         self.assertEqual(result.stdout, b"", f"expected no stdout, got {result.stdout!r}")
 
 
+class TestSessionStartEscaperUnavailableFailsClosed(_RepoFixture):
+    """PR #210 fold-in (lr-b82538, BOBBIE finding 1 / PEACHES finding 1,
+    two independent confirmations plus a PEACHES repro): session-start.sh
+    .template's escaper-unavailable branch previously set CONTEXT_JSON to
+    the raw, unescaped CONTEXT and emitted it -- CONTEXT can carry
+    untrusted sqlite3 summary text. Same technique as
+    TestAcceptance5PlatformShUnavailable (bogus CLAGENTIC_LITE_HOME so
+    platform.sh never sources and ds_json_escape is undefined), but with a
+    seeded memory row so CONTEXT is non-empty and the branch under test is
+    actually reached -- must now fail CLOSED (exit 0, no stdout), not emit
+    broken JSON."""
+
+    def test_missing_platform_sh_with_nonempty_context_emits_nothing(self):
+        _seed_memory_db(self._tmp, HOSTILE_SUMMARY, tags="findme")
+        bogus_home = os.path.join(self._tmp, "nonexistent-clagentic-home")
+        result = _run_shim(
+            SESSION_START, self._tmp,
+            env_overrides={
+                "CLAGENTIC_LITE_HOME": bogus_home,
+                "CLAGENTIC_SKIP_UPDATE_ALERT": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(
+            result.stdout, b"",
+            f"expected fail-closed (no stdout) when ds_json_escape is "
+            f"unavailable, got {result.stdout!r} -- this must never be the "
+            f"raw, unescaped CONTEXT string",
+        )
+
+
+def _write_failing_python3_stub(bin_dir):
+    """A `python3` stub that always exits nonzero with no stdout, placed
+    ahead of the real python3 on PATH. Exercises ds_json_escape's OWN
+    runtime failure (`command -v python3` succeeds, the python3 -c call
+    itself fails) -- distinct from platform.sh-unavailable (where
+    ds_json_escape is undefined entirely). This is the branch
+    post-tool-nudge.sh.template's `_json_escape` wrapper previously papered
+    over with `|| printf '%s' "$1"`, falling back to the raw, unescaped
+    value on ANY failure (BOBBIE finding 2, PR #210, lr-b82538 fold-in)."""
+    path = os.path.join(bin_dir, "python3")
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\ncat >/dev/null 2>&1\nexit 1\n")
+    os.chmod(path, 0o755)
+    return path
+
+
+class TestPostToolNudgeEscaperFailureFailsClosed(unittest.TestCase):
+    """PR #210 fold-in (lr-b82538, BOBBIE finding 2): post-tool-nudge.sh
+    .template's local _json_escape wrapper fell back to the RAW unescaped
+    value on ANY ds_json_escape failure (stderr swallowed, OR-fallback
+    fires), not merely unavailability -- reachable via the git-workflow
+    nudge message (section 2, GIT_MSG) whenever ds_json_escape itself
+    errors at runtime. A failing `python3` stub ahead of the real one on
+    PATH forces exactly that: `command -v python3` succeeds so
+    ds_json_escape takes the python3 branch, which then fails. Must now
+    fail closed: that message segment is dropped (empty), not emitted raw
+    -- proven here by asserting the raw GIT_MSG text never reaches stdout,
+    and that whatever ships still parses as JSON."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-json-emit-ptn-")
+        _init_repo(self._tmp)
+        os.makedirs(os.path.join(self._tmp, ".clagentic", "lite"), exist_ok=True)
+        self._stub_dir = tempfile.mkdtemp(prefix="clagentic-test-stub-bin-")
+        _write_failing_python3_stub(self._stub_dir)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        shutil.rmtree(self._stub_dir, ignore_errors=True)
+
+    def test_git_nudge_escaper_failure_drops_message_not_raw(self):
+        env_overrides = {
+            "PATH": self._stub_dir + os.pathsep + os.environ.get("PATH", ""),
+            "CLAGENTIC_ENV_LOADED": "1",
+        }
+        result = _run_shim(
+            POST_TOOL_NUDGE, self._tmp,
+            payload={"session_id": "s1", "tool_name": "Bash",
+                     "command": "git commit -m 'test'", "output": ""},
+            env_overrides=env_overrides,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        stdout = result.stdout.decode()
+        # The raw GIT_MSG text must never appear verbatim -- either it was
+        # escaped correctly (impossible here, the stub always fails) or it
+        # was dropped. Fail-open would emit this exact substring unescaped.
+        self.assertNotIn(
+            "clagentic-lite: changes committed", stdout,
+            f"raw, unescaped GIT_MSG leaked into stdout despite a failing "
+            f"escaper -- fail-open regression: {stdout!r}",
+        )
+        if stdout.strip():
+            try:
+                json.loads(stdout)
+            except json.JSONDecodeError as exc:
+                self.fail(f"stdout did not parse as JSON: {exc}\nstdout={stdout!r}")
+
+
 class TestAcceptance6RegressionGuardSweep(unittest.TestCase):
     """Every shim template containing "additionalContext" must also
-    contain "_json_escape" or "ds_json_escape". Discovery via
-    share/hook-shims/*.sh.template glob (git-ls-files-equivalent for a
-    small, fully-tracked directory), never a hardcoded site list -- per
-    AGENTS.md's "Sweeping-test discovery convention" and this task's own
-    "the grep that finds violations must return nothing" spec."""
+    contain "_json_escape" or "ds_json_escape". Discovery via `git
+    ls-files` against the TRACKED, SHIPPED set -- never glob.glob() against
+    the filesystem (a glob proves what's on disk, not what ships; an
+    untracked stray template would silently pass), and never a hardcoded
+    site list -- per AGENTS.md's "Sweeping-test discovery convention"
+    (see scripts/test_posix_sh_dash_sweep.py's `_list_tracked_files`,
+    the same convention this sweep now matches) and this task's own "the
+    grep that finds violations must return nothing" spec. PEACHES PR #210
+    review, lr-b82538 fold-in: the prior glob.glob() version, and the two
+    stale comments claiming git-ls-files-equivalence, both corrected here
+    -- this is the regression guard for the entire defect class, so
+    proving the wrong set substantially weakens it."""
 
     def test_every_json_emitting_shim_calls_an_escaper(self):
-        templates = sorted(glob.glob(os.path.join(HOOK_SHIMS_DIR, "*.sh.template")))
+        proc = subprocess.run(
+            ["git", "-C", TOOL_HOME, "ls-files", "-z", "share/hook-shims"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        tracked = [p for p in proc.stdout.split("\0") if p]
+        templates = sorted(
+            os.path.join(TOOL_HOME, p) for p in tracked if p.endswith(".sh.template")
+        )
         self.assertGreaterEqual(
             len(templates), 6,
             f"expected at least the six known hook shim templates, found {templates}",
