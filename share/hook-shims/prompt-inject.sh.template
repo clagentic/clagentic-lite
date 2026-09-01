@@ -6,7 +6,7 @@
 # asking the user to recall them manually.
 # Non-blocking — any failure exits 0 silently.
 #
-# managed-by: clagentic · clagentic-hooks-version: v3
+# managed-by: clagentic · clagentic-hooks-version: v4
 # Source of truth: share/hook-shims/prompt-inject.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/prompt-inject.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -139,8 +139,34 @@ fi
 
 [ -z "$MATCHES" ] && exit 0
 
+# Join KEYWORDS on comma-space rather than injecting the newline-separated
+# list as-is -- KEYWORDS is newline-separated by construction (see the
+# tr/awk/sort/head pipeline above), so a raw interpolation reads as a broken
+# list even once escaped correctly, and previously corrupted the JSON payload
+# outright (lr-b82538: every keyword after the first inserted a raw newline
+# into an unescaped JSON string value).
+KEYWORDS_JOINED=$(printf '%s\n' "$KEYWORDS" | tr '\n' ',' | sed 's/,/, /g; s/, $//')
+
+# Escape both interpolated variables via ds_json_escape (scripts/platform.sh,
+# lr-b82538 hoist). KEYWORDS_JOINED is user-derived (extracted from the
+# prompt) and MATCHES is untrusted stored summary text (sqlite3 output, can
+# contain quotes/backslashes/control bytes/embedded newlines across its up-
+# to-3 rows) -- both previously reached this heredoc unescaped, which is the
+# reported defect: any successful recall emitted invalid JSON.
+if command -v ds_json_escape >/dev/null 2>&1; then
+  KEYWORDS_JSON=$(ds_json_escape "$KEYWORDS_JOINED")
+  MATCHES_JSON=$(ds_json_escape "$MATCHES")
+else
+  # platform.sh loaded (ds_json_field succeeded above, or this hook would
+  # already have exited at the "unavailable" branch) but ds_json_escape
+  # specifically is missing -- an unexpected partial-load state. Fail closed
+  # by skipping injection rather than emitting unescaped JSON; non-blocking,
+  # the user simply sees no recall context for this turn.
+  exit 0
+fi
+
 cat <<EOF
 {
-  "additionalContext": "CLAGENTIC RECALL · prior matches for [$KEYWORDS]:\n${MATCHES}"
+  "additionalContext": "CLAGENTIC RECALL · prior matches for [${KEYWORDS_JSON}]:\n${MATCHES_JSON}"
 }
 EOF

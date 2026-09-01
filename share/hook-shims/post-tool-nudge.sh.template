@@ -20,7 +20,7 @@
 #    Opt-out: CLAGENTIC_DISABLE_AUTOSUMMARIZE=1
 #    Threshold: CLAGENTIC_AUTOSUMMARIZE_BYTES (default 32768)
 #
-# managed-by: clagentic · clagentic-hooks-version: v3
+# managed-by: clagentic · clagentic-hooks-version: v4
 # Source of truth: share/hook-shims/post-tool-nudge.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/post-tool-nudge.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -71,21 +71,24 @@ REPO_ROOT=$(ds_repo_root 2>/dev/null || true)
 AUDIT_DB=""
 [ -n "$REPO_ROOT" ] && AUDIT_DB="$REPO_ROOT/.clagentic/lite/audit.db"
 
-# JSON-escape a plain-text string for safe embedding in a JSON string value.
-# Uses python3 (already a project dependency). Falls back to the raw value on
-# failure — the worst outcome is a slightly malformed additionalContext, not a
-# session block (hook is non-blocking).
+# JSON-escape a plain-text string for safe embedding in a JSON string value,
+# via ds_json_escape (scripts/platform.sh, lr-b82538 hoist -- replaces this
+# shim's own former local copy). platform.sh load is unconditional above
+# (`|| exit 0` on source failure), so ds_json_escape is defined here, but a
+# call to it can still fail at runtime (e.g. python3 present but its stdin
+# pipe breaks) -- fail CLOSED on that failure by emitting nothing rather than
+# the raw, unescaped value. The prior `|| printf '%s' "$1"` fallback fired on
+# ANY ds_json_escape failure, not merely unavailability, and could leak
+# attacker-influenceable summarized tool-result content (the auto-summarize
+# digest hint, section 3 below) into the JSON payload unescaped -- BOBBIE
+# review of PR #210, lr-b82538 fold-in. Every call site below only appends
+# its message when non-empty, so an empty return here silently drops that
+# one message segment rather than corrupting the whole payload; mirrors the
+# fail-closed posture prompt-inject.sh.template and session-start.sh
+# .template (this same fold-in) both use at their own escaper-unavailable
+# branches.
 _json_escape() {
-  if command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$1" | python3 -c '
-import sys, json
-raw = sys.stdin.read()
-encoded = json.dumps(raw)
-sys.stdout.write(encoded[1:-1])
-' 2>/dev/null || printf '%s' "$1"
-  else
-    printf '%s' "$1"
-  fi
+  ds_json_escape "$1" 2>/dev/null
 }
 
 # ---- section 1: context-budget monitor ----
