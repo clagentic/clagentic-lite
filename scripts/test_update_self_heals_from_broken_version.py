@@ -168,8 +168,15 @@ class _UpdateSelfHealPtyTestBase(unittest.TestCase):
                 ["git", "-C", upstream, "add", "-A"],
                 check=True, capture_output=True,
             )
+            # --allow-empty: the overlay is a no-op commit whenever
+            # TOOL_HOME's working tree is fully committed (no diff for the
+            # overlay to introduce) -- a real, expected state, not an
+            # error. Without --allow-empty, `git commit` exits 1 with
+            # "nothing to commit" in exactly that case, which is not a
+            # test setup failure.
             subprocess.run(
-                ["git", "-C", upstream, "commit", "-q", "-m", "overlay current on-disk state"],
+                ["git", "-C", upstream, "commit", "-q", "--allow-empty",
+                 "-m", "overlay current on-disk state"],
                 check=True, capture_output=True,
             )
             # The overlay clone's default branch is whatever branch is
@@ -262,13 +269,29 @@ class _UpdateSelfHealPtyTestBase(unittest.TestCase):
         # (lr-55a27a) is never even reached.
         return env
 
-    def _run_bare_update_under_pty(self, budget_sec):
+    def _run_bare_update_under_pty(self, budget_sec, feed_input=True):
         """Runs `clagentic-lite update`, bare, no flags, no stdin
         redirection, under a real pty as the operator's exact scenario
         requires. Returns 'gone' if the process completed within
         `budget_sec`, or the last observed state otherwise (still running
         -- the hang this whole task exists to catch/reproduce, depending
-        on which subclass is calling)."""
+        on which subclass is calling).
+
+        `feed_input`: whether to continuously write newlines into the pty
+        master. Required for the self-heal case (the stub's `read -r _line
+        < /dev/tty` must actually unblock once the process is correctly
+        running in the foreground group, or update would appear to hang
+        for an unrelated reason). Deliberately OMITTED for the harness
+        self-check negative control (`upstream_has_fix=False`): the
+        self-check does not need the stub to ever proceed -- it only needs
+        to prove `update` does not COMPLETE without a fix available -- and
+        feeding input into the pty actively races against demonstrating a
+        SIGTTIN stop (input that arrives in the terminal driver's buffer
+        before a stopped process is later resumed can still be delivered
+        the instant it un-stops, for reasons unrelated to whether the
+        underlying group-mismatch defect is real), so the negative control
+        is strictly more conservative -- and more reliable -- with no feed
+        at all."""
         cli = os.path.join(self.broken_install, "bin", "clagentic-lite")
         master_fd, slave_fd = pty.openpty()
         env = self._env()
@@ -290,20 +313,14 @@ class _UpdateSelfHealPtyTestBase(unittest.TestCase):
         os.close(slave_fd)
 
         try:
-            # Continuously feed newlines into the pty master so the stub's
-            # `read -r _line < /dev/tty` unblocks immediately whenever the
-            # stub process is NOT SIGTTIN-stopped. If the stub IS stopped
-            # (the defect reproducing), no amount of input on the master
-            # side reaches a stopped process -- this feed does not mask
-            # the defect, it only removes an unrelated reason a
-            # correctly-running stub might block.
             deadline = time.time() + budget_sec
             state = "R"
             while time.time() < deadline:
-                try:
-                    os.write(master_fd, b"\n")
-                except OSError:
-                    pass
+                if feed_input:
+                    try:
+                        os.write(master_fd, b"\n")
+                    except OSError:
+                        pass
                 try:
                     os.waitpid(pid, os.WNOHANG)
                 except ChildProcessError:
@@ -402,7 +419,9 @@ class TestUpdateSelfHealHarnessSelfCheck(_UpdateSelfHealPtyTestBase):
         # Shorter budget than the self-heal test: this run is EXPECTED to
         # still be running (SIGTTIN-stopped) at the deadline, so there is
         # no reason to wait as long as the success-path test does.
-        state = self._run_bare_update_under_pty(_NO_FIX_BUDGET_SEC)
+        state = self._run_bare_update_under_pty(_NO_FIX_BUDGET_SEC, feed_input=False)
+        with open(self.invocation_log) as f:
+            invocations = f.read()
         self.assertNotEqual(
             state, "gone",
             "expected `clagentic-lite update` to still be hanging "
@@ -410,7 +429,11 @@ class TestUpdateSelfHealHarnessSelfCheck(_UpdateSelfHealPtyTestBase):
             "completed anyway, this harness cannot distinguish a real "
             "self-heal from a false pass, and "
             "TestUpdateSelfHealsFromBrokenVersion's own passing result "
-            "cannot be trusted until this negative control is fixed.",
+            "cannot be trusted until this negative control is fixed. "
+            f"claude invocation log (empty means update exited/returned "
+            f"before ever calling the stub, a DIFFERENT failure mode than "
+            f"the stub proceeding past a SIGTTIN it should not have "
+            f"survived): {invocations!r}",
         )
         # `git pull --ff-only` against an origin with nothing new is a
         # real no-op -- HEAD must NOT have moved, confirming this run
