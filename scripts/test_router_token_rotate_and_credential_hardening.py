@@ -192,6 +192,47 @@ class TestApiKeyHelper(unittest.TestCase):
         self.assertIn("CLAGENTIC_ROUTER_TOKEN", helper_cmd)
         self.assertIn(os.path.join(self.home, ".config", "clagentic", "lite", "config"), helper_cmd)
 
+    def test_helper_command_survives_a_space_in_global_config_path(self):
+        """bobbie.sast.1 (lr-684947 fold-in): GLOBAL_CONFIG is substituted
+        into the generated apiKeyHelper command string. A $HOME containing a
+        space (unremarkable on macOS) must not split into two grep argv
+        tokens -- the helper must still execute and return the token."""
+        space_home = os.path.join(self.tmpdir, "home with space")
+        os.makedirs(space_home)
+        rc, out, err = _run_cli(
+            ["enroll", self.repo],
+            cwd=self.repo,
+            home=space_home,
+            env_extra={
+                "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+                "CLAGENTIC_ROUTER_TOKEN": "space-path-token",
+                "CLAGENTIC_ROUTER_USE_API_KEY_HELPER": "1",
+            },
+        )
+        self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
+        settings_path = os.path.join(self.repo, ".claude", "settings.json")
+        with open(settings_path) as f:
+            raw = f.read()
+        parsed = json.loads(raw)  # must remain valid JSON despite the embedded quoting
+        helper_cmd = parsed["apiKeyHelper"]
+        self.assertNotIn('"', helper_cmd, msg=helper_cmd)  # no double quotes to JSON-escape
+
+        # Global config is written by `init`, not `enroll` -- write it by
+        # hand here to exercise the helper command as Claude Code would run
+        # it (a fresh sh -c invocation, independent of this process's env).
+        global_config_dir = os.path.join(space_home, ".config", "clagentic", "lite")
+        os.makedirs(global_config_dir, exist_ok=True)
+        global_config_path = os.path.join(global_config_dir, "config")
+        with open(global_config_path, "w") as f:
+            f.write("CLAGENTIC_ROUTER_TOKEN=space-path-token\n")
+
+        proc = subprocess.run(
+            ["sh", "-c", helper_cmd],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, msg=f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        self.assertEqual(proc.stdout.strip(), "space-path-token", msg=proc.stdout)
+
 
 class TestRotate(unittest.TestCase):
     """`clagentic-lite rotate` (concern 1): walks the registry, re-stamps
@@ -362,6 +403,22 @@ class TestDoctorTokenCount(unittest.TestCase):
             env_extra={"CLAGENTIC_SKIP_UPDATE_ALERT": "1"},
         )
         self.assertIn("0 enrolled repo(s) hold a stamped literal credential", out, msg=out)
+
+    def test_doctor_prints_no_fan_out_summary_when_no_registry_exists(self):
+        """amos.path-choice.3 (lr-684947 fold-in): on a host with no
+        registry at all, doctor must print only '(no registry at ...)' and
+        must NOT also print a 0-literal/0-helper fan-out summary -- that
+        would announce a fan-out statistic to a user who never enrolled
+        anything. No enroll call in this test -- self.home has no registry
+        by construction."""
+        rc, out, err = _run_cli(
+            ["doctor"],
+            cwd=self.home,
+            home=self.home,
+            env_extra={"CLAGENTIC_SKIP_UPDATE_ALERT": "1"},
+        )
+        self.assertIn("(no registry at", out, msg=out)
+        self.assertNotIn("router token/credential fan-out", out, msg=out)
 
     def test_doctor_distinguishes_helper_from_literal_count(self):
         repo = os.path.join(self.tmpdir, "repo-helper")
