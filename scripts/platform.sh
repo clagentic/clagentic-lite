@@ -359,6 +359,65 @@ else
 fi
 export DS_TIMEOUT_FOREGROUND_CMD
 
+# DS_TIMEOUT_CMD-FAMILY CALL-SITE CLASSIFICATION (lr-b8e7fb audit, folded
+# into lr-c65d8a per operator directive -- "do the audit, because it does
+# not exist and its absence is why your own not-applicable call was
+# wrong"). Every one of the 58 DS_TIMEOUT_CMD/DS_TIMEOUT_FOREGROUND_CMD
+# references across scripts/platform.sh, scripts/gates.sh,
+# scripts/llm-client.sh, and bin/clagentic-lite was read and classified by
+# which property that call site actually REQUIRES:
+#
+#   WHOLE-GROUP  -- a hung DESCENDANT process must be reachable at expiry
+#                   (the point of bounding at all for a network/subprocess
+#                   call with no controlling-terminal interaction).
+#   FOREGROUND   -- the wrapped command touches the CONTROLLING TERMINAL
+#                   (GitHub issue #213's mechanism: SIGTTIN/SIGTTOU stops a
+#                   non-foreground process group, and a stopped process
+#                   cannot receive the SIGTERM a plain `timeout` sends at
+#                   expiry) -- requires DS_TIMEOUT_FOREGROUND_CMD.
+#
+# RESULT: every real call site classifies as ONE of these two properties,
+# never both, never neither, and no third combination was found anywhere
+# in this codebase. THAT IS THE FINDING -- not an assumption going in. The
+# two buckets this fix already introduced (DS_TIMEOUT_CMD,
+# DS_TIMEOUT_FOREGROUND_CMD) are SUFFICIENT for the current call-site
+# population; ds_timeout_supports_flag exists specifically so a future
+# third property, if one is ever found, extends this same primitive rather
+# than requiring a redesign.
+#
+#   WHOLE-GROUP (DS_TIMEOUT_CMD, unchanged) -- every site not listed below:
+#     - scripts/gates.sh's run_bounded (the sole entry point for every
+#       gitleaks/osv-scanner/semgrep/`git push` call in that file, plus
+#       scripts/host-adapter.sh's `gh pr view/create/comment` calls) and
+#       the two `git fetch`/`git ls-remote` sites in
+#       _gate_resolve_fresh_default_branch_ref -- all non-interactive CLI
+#       subcommands with piped/redirected I/O, none touch a tty.
+#     - scripts/llm-client.sh's `claude --print` (1463/1469, stdin PIPED
+#       from a file via `cat`, never inherited), `codex exec` (1810/1814/
+#       1823, non-interactive `exec` form), the generic non-claude/codex
+#       carrier (1861, mirrors the same piped/redirected shape), and the
+#       router `curl` probe (2046) -- none touch a controlling terminal.
+#     - bin/clagentic-lite's `codex exec`/generic-CLI doctor auth probes
+#       and its router-version `curl` probe -- same reasoning as their
+#       llm-client.sh counterparts; see the classification comment at that
+#       case statement in bin/clagentic-lite for detail.
+#
+#   FOREGROUND (DS_TIMEOUT_FOREGROUND_CMD) -- every real `claude` call site
+#   whose stdin is INHERITED from the caller rather than piped/redirected,
+#   i.e. every site reachable from a real interactive terminal:
+#     - bin/clagentic-lite's 14 `claude plugin ...`/`claude --version`
+#       sites (this task's own P1 fix, GitHub issue #213's own repro).
+#     - bin/clagentic-lite's doctor LLM-CLI-auth-probe `claude --print
+#       "ping"` call -- FOUND BY THIS AUDIT, not previously classified.
+#       `doctor` is run interactively exactly like `update`/`init`, and
+#       this probe's stdin was inherited (only stdout/stderr redirected),
+#       unlike llm-client.sh's own `claude --print` sites which pipe stdin
+#       from a file. Fixed in the same commit that added this table.
+#
+# See bin/clagentic-lite's own per-site comments (near
+# _claude_plugin_list_or_unknown and the doctor auth-probe case statement)
+# for the detailed per-site reasoning this table summarizes.
+
 # ---------------------------------------------------------------- shared helpers
 
 # Escape a string for safe single-quoted SQL interpolation.

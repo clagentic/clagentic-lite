@@ -363,5 +363,47 @@ class TestDetectedFlagActuallyThreadsThroughDurationAndCommand(_PlatformShDetect
         self.assertIn("5 touch", argv, f"recorded argv={argv!r}")
 
 
+class TestClaudeCallSitesWithInheritedStdinUseForegroundVariant(unittest.TestCase):
+    """lr-b8e7fb classification audit finding (folded into lr-c65d8a): a
+    `claude` call site whose STDIN IS INHERITED from the caller (as opposed
+    to piped from a file, e.g. scripts/llm-client.sh's `cat file | timeout
+    ... claude --print`) is reachable from the same GitHub-issue-#213
+    tty-probe mechanism as the `claude plugin`/`claude --version` sites
+    this task already fixed -- regardless of which subcommand is invoked.
+    bin/clagentic-lite's doctor LLM-CLI-auth-probe section's `claude`
+    branch (`claude --print "ping"`, run from cmd_doctor -- an interactive
+    command, same as update/init) had inherited stdin and was still on the
+    plain DS_TIMEOUT_CMD before this audit found it.
+
+    This sweeps bin/clagentic-lite source text directly (not a full pty
+    reproduction -- proportionate to a secondary finding surfaced by the
+    audit itself, not a re-run of finding 2's original P1 investigation)
+    to lock in the fix as a regression guard: every literal `claude ` call
+    (a real invocation, not a comment/string) whose surrounding lines don't
+    pipe/redirect INTO it via `cat ... |` must be DS_TIMEOUT_FOREGROUND_CMD
+    -bound, not DS_TIMEOUT_CMD."""
+
+    def test_doctor_claude_print_probe_uses_foreground_variant(self):
+        with open(os.path.join(TOOL_HOME, "bin", "clagentic-lite")) as f:
+            content = f.read()
+        self.assertIn(
+            '$DS_TIMEOUT_FOREGROUND_CMD "$_llm_probe_timeout" claude --print "ping"',
+            content,
+            "doctor's LLM CLI auth probe's `claude --print \"ping\"` call "
+            "(inherited stdin, run from an interactive command) must use "
+            "DS_TIMEOUT_FOREGROUND_CMD, not the plain DS_TIMEOUT_CMD -- "
+            "lr-b8e7fb classification audit finding",
+        )
+        # Negative control: the OLD (unfixed) shape must not still be
+        # present anywhere in the file -- proves this is a real fix, not
+        # merely an additional correct line coexisting with a stale one.
+        self.assertNotIn(
+            '$DS_TIMEOUT_CMD "$_llm_probe_timeout" claude --print "ping"',
+            content,
+            "the pre-audit DS_TIMEOUT_CMD-bound form of this call is still "
+            "present -- the fix did not fully replace it",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
