@@ -52,6 +52,7 @@ import unittest
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
 AGENTS_SRC = os.path.join(TOOL_HOME, "plugins", "clagentic-lite", "agents")
+PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 
 # Extraction markers: stable anchors bracketing the whole "clagentic-lite
 # plugin render" block in bin/clagentic-lite, from its section-header
@@ -205,12 +206,20 @@ class _RenderTestBase(unittest.TestCase):
             env.update(extra_env)
         # say()/warn() are used by the extracted functions but defined
         # elsewhere in bin/clagentic-lite -- provide minimal stand-ins so
-        # the sourced block is self-contained.
+        # the sourced block is self-contained. $DS_TIMEOUT_CMD and
+        # ds_positive_int_or_default (lr-da3b7e: _CLAUDE_PLUGIN_TIMEOUT's
+        # claude-plugin-call timeout wrap) are real platform.sh primitives,
+        # not stubbed -- sourced from the REAL scripts/platform.sh (a pure
+        # function/export library, no subcommand dispatch tail, so no
+        # source-guard sentinel is needed) BEFORE the extracted block, since
+        # _CLAUDE_PLUGIN_TIMEOUT's assignment runs at source time and needs
+        # both already defined.
         preamble = (
+            f". '{PLATFORM_SH}'\n"
             "say()  { printf '[clagentic-lite] %s\\n' \"$*\"; }\n"
             "warn() { printf '[clagentic-lite] WARN: %s\\n' \"$*\" 1>&2; }\n"
         )
-        script = f". '{self.helpers_sh}'\n{preamble}\n{textwrap.dedent(script_body)}\n"
+        script = f"{preamble}. '{self.helpers_sh}'\n{textwrap.dedent(script_body)}\n"
         return subprocess.run(
             ["sh", "-c", script, "unified-plugin-render-test"],
             capture_output=True, text=True, env=env, cwd=self.tmp,

@@ -329,7 +329,14 @@ class TestCanaryFixturesAreNotSourceLiterals(unittest.TestCase):
             capture_output=True, text=True, cwd=TOOL_HOME, timeout=30,
         )
         commits = [c for c in rev_list.stdout.splitlines() if c]
-        self.assertGreater(len(commits), 0, "expected at least one commit in range")
+        if not commits:
+            # merge-base resolved but equals HEAD -- a LEGITIMATELY empty
+            # range (e.g. this checkout's branch tip has already merged
+            # into origin/main), not the unresolvable-merge-base case the
+            # skipTest above guards. Distinct from that case: skip rather
+            # than assert, since there is genuinely no branch history left
+            # to check (lr-da3b7e item 3, MILLER/holden comment #1).
+            self.skipTest("merge-base equals HEAD -- no commits in range to check")
 
         # The exact literal substrings BOBBIE's independent gitleaks/
         # trufflehog runs attributed to commit 89be47b, scripts/gates.sh
@@ -399,7 +406,13 @@ class TestCanaryFixturesAreNotSourceLiterals(unittest.TestCase):
             capture_output=True, text=True, cwd=TOOL_HOME, timeout=30,
         )
         commits = [c for c in rev_list.stdout.splitlines() if c]
-        self.assertGreater(len(commits), 0, "expected at least one commit in range")
+        if not commits:
+            # See the sibling test above (test_no_reachable_commit_in_this_
+            # branchs_history_carries_the_literals) for why this is a skip,
+            # not an assert -- a legitimately empty base..head range (branch
+            # tip already merged into origin/main) is distinct from an
+            # unresolvable merge-base (lr-da3b7e item 3).
+            self.skipTest("merge-base equals HEAD -- no commits in range to check")
 
         touched_files = {
             "bin/clagentic-lite", "docs/GATES.md", "scripts/gates.sh",
