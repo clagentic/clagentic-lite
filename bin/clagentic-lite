@@ -931,7 +931,44 @@ _LEGACY_ROUTER_PLUGIN_CACHE_DIR="$HOME/.claude/plugins/cache/$_LEGACY_ROUTER_PLU
 # convention (see share/config.example) rather than a bare literal, so it is
 # user-configurable the same way every other bounded external call in this
 # tool is.
+#
+# STDIN, PER-SITE DECISION (lr-c65d8a seq 1, constraint 2): none of the 14
+# `claude plugin ...`/`claude --version` call sites bound by this timeout
+# are ever expected to prompt for input -- every one is a non-interactive,
+# scriptable CLI subcommand (`plugin list/install/uninstall/update`,
+# `plugin marketplace add/remove/update`, `--version`), none of which reads
+# stdin as part of its normal contract. The SIGTTIN/SIGTTOU stop this task
+# fixes (see the --foreground detection in scripts/platform.sh) comes from
+# `claude` PROBING the controlling terminal on startup, not from any of
+# these subcommands actually waiting on stdin input -- so silently
+# detaching stdin here would not be "converting a legitimate prompt into a
+# hang" (the constraint's own condition for when detaching is wrong), it
+# would just be redundant with the --foreground fix. --foreground is kept
+# as the single fix at the platform.sh capability-detection site rather
+# than ALSO redirecting stdin at 14 call sites, per the same fix-the-pattern-
+# once discipline as the timeout constant itself.
 _CLAUDE_PLUGIN_TIMEOUT=$(ds_positive_int_or_default "${CLAGENTIC_PLUGIN_TIMEOUT_SEC:-}" 30)
+
+# EMPTY-OUTPUT-EQUALS-ABSENCE SWEEP (lr-c65d8a absorbing lr-f8117f,
+# fnd-bc204a): every $DS_TIMEOUT_CMD-bound `claude plugin ...`/`claude
+# --version` call site above and below was audited for the same inference
+# a timed-out probe's empty output silently read as "answer: no/none".
+# _doctor_check_plugin_collision (below) and cmd_doctor's `claude --version`
+# probe are diagnostic REPORTS -- a timeout there must not read as a
+# passing/known answer, so both now check $DS_TIMEOUT_CMD's exit status and
+# report UNKNOWN rather than falling through to the empty-output branch.
+# _migrate_legacy_router_plugin and _install_clagentic_lite_plugin are
+# NOT APPLICABLE to that same fix: both are MUTATING install/migration
+# steps, not status reports. Their `grep -qE` guards over `claude plugin
+# list` output already fail safe on empty/timed-out input (no match ->
+# no destructive action attempted), and every actual mutation they DO
+# attempt (install/update/uninstall) already carries its own explicit
+# say/warn success-or-failure line from the `claude` subcommand's own real
+# exit status -- there is no silent-pass branch to fix here the way the two
+# diagnostic checks had. A timeout during `_install_clagentic_lite_plugin`'s
+# list check can fall through to attempting `claude plugin install` on an
+# already-installed plugin; that call's own warn/say output still reports
+# what actually happened, so no additional discrimination was added.
 
 # _plugin_agent_needs_injection ROLE_ENV_PREFIX
 # Returns 0 (needs model: injected) when router injection is active
@@ -1122,6 +1159,23 @@ _installed_plugin_render_stamp() {
 # shape. OK_FN/FAIL_FN are the names of the caller's reporting functions
 # (cmd_doctor's _ok/_fail closures) so doctor's running tally stays
 # accurate; a test harness can pass its own stand-ins.
+#
+# THREE-OUTCOME DISCRIMINATION (lr-c65d8a, absorbing lr-f8117f/fnd-bc204a):
+# EMPTY OUTPUT is not evidence of "no plugins installed" — it is also
+# exactly what a TIMED-OUT or otherwise-failed probe produces. Before this
+# fix, both cases printed the same "skipping" line and returned 0, so a
+# probe that never completed was indistinguishable from a probe that
+# genuinely found nothing — in a check whose entire purpose is to warn
+# about a collision. This became MORE reachable, not less, once PR #212
+# bounded the previously-unbounded call: a slow/unreachable network used to
+# hang doctor outright (loud); now it quietly times out and this check
+# reads that as "no plugins" (silent false negative). Checking $? (the
+# EXIT STATUS of $DS_TIMEOUT_CMD, not just whether output is empty) lets
+# this distinguish PROBE-DID-NOT-COMPLETE from GENUINELY-NO-PLUGINS: exit
+# 124 is $DS_TIMEOUT_CMD's own timeout-fired signal (GNU/BSD `timeout`
+# convention), matching the ds_timeout_missing exit-99 precedent this
+# codebase already established for "could not run" rather than silently
+# proceeding as if the answer were known.
 _doctor_check_plugin_collision() {
   _dcpc_ok_fn="$1"
   _dcpc_fail_fn="$2"
@@ -1129,9 +1183,24 @@ _doctor_check_plugin_collision() {
     printf '  (claude not on PATH — skipping)\n'
     return 0
   fi
-  _dcpc_list=$($DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin list 2>/dev/null || true)
+  # `|| _dcpc_status=$?`, not a bare assignment -- under this file's
+  # `set -e`, an unguarded `_v=$(cmd)` whose substitution exits non-zero
+  # (124 on timeout) would abort the WHOLE SCRIPT here rather than
+  # reaching the discrimination logic below (lr-c65d8a: same class of bug
+  # as cmd_doctor's claude --version probe a few hundred lines down --
+  # both caught by this task's own new pty/timeout test suite).
+  _dcpc_status=0
+  _dcpc_list=$($DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin list 2>/dev/null) || _dcpc_status=$?
+  if [ "$_dcpc_status" -eq 124 ] || [ "$_dcpc_status" -eq 137 ]; then
+    printf '  UNKNOWN `claude plugin list` timed out after %ss — collision status could not be determined (slow/unreachable network?). Re-run doctor once the network recovers, or raise CLAGENTIC_PLUGIN_TIMEOUT_SEC.\n' "$_CLAUDE_PLUGIN_TIMEOUT"
+    return 0
+  fi
   if [ -z "$_dcpc_list" ]; then
-    printf '  (no plugins installed, or `claude plugin list` produced no output — skipping)\n'
+    if [ "$_dcpc_status" -ne 0 ]; then
+      printf '  UNKNOWN `claude plugin list` exited %s with no output — collision status could not be determined.\n' "$_dcpc_status"
+    else
+      printf '  (no plugins installed, or `claude plugin list` produced no output — skipping)\n'
+    fi
     return 0
   fi
   _dcpc_collisions=$(printf '%s\n' "$_dcpc_list" \
@@ -3172,13 +3241,32 @@ cmd_doctor() {
     printf '  INFO codex: not on PATH (minimum required: %s)\n' "$_codex_min"
   fi
   if command -v claude >/dev/null 2>&1; then
-    _claude_ver_raw=$($DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude --version 2>/dev/null || true)
-    _claude_ver=$(printf '%s' "$_claude_ver_raw" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
-    if [ -n "$_claude_ver" ]; then
-      printf '  INFO claude %s (on PATH)\n' "$_claude_ver"
+    # `|| _claude_ver_status=$?` (not a bare assignment) -- under this
+    # file's `set -e`, an unguarded `_v=$(cmd)` assignment whose command
+    # substitution exits non-zero (124 on timeout) aborts the WHOLE
+    # SCRIPT right here, never reaching the discrimination logic below at
+    # all (lr-c65d8a: caught by this task's own new pty/timeout test suite
+    # hanging at exactly this probe once --foreground made the timeout
+    # class newly reachable in a plain `doctor` run). `_claude_ver_status`
+    # defaults to 0 (`|| true`-equivalent) only when the trailing `||`
+    # itself doesn't run, i.e. when the substitution succeeded.
+    _claude_ver_status=0
+    _claude_ver_raw=$($DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude --version 2>/dev/null) || _claude_ver_status=$?
+    # THREE-OUTCOME DISCRIMINATION (lr-c65d8a/lr-f8117f, same pattern as
+    # _doctor_check_plugin_collision above): a timed-out probe must not be
+    # reported as if it were a real (if unparseable) version string — empty
+    # output here is ambiguous between "claude printed nothing" and "the
+    # probe never completed", so the timeout exit status is checked first.
+    if [ "$_claude_ver_status" -eq 124 ] || [ "$_claude_ver_status" -eq 137 ]; then
+      printf '  UNKNOWN claude: on PATH, but `claude --version` timed out after %ss — version could not be determined (slow/unreachable network?).\n' "$_CLAUDE_PLUGIN_TIMEOUT"
     else
-      printf '  INFO claude: on PATH (version: %s)\n' \
-        "$(printf '%s' "$_claude_ver_raw" | head -1 | cut -c1-60)"
+      _claude_ver=$(printf '%s' "$_claude_ver_raw" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+      if [ -n "$_claude_ver" ]; then
+        printf '  INFO claude %s (on PATH)\n' "$_claude_ver"
+      else
+        printf '  INFO claude: on PATH (version: %s)\n' \
+          "$(printf '%s' "$_claude_ver_raw" | head -1 | cut -c1-60)"
+      fi
     fi
   else
     printf '  INFO claude: not on PATH\n'
