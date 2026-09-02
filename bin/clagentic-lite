@@ -3450,8 +3450,24 @@ cmd_doctor() {
       claude)
         # claude --print "ping" — succeeds on any auth path (OAuth or API key).
         # CLAGENTIC_DISABLE_RECALL=1 avoids triggering session-start hooks.
+        #
+        # PROPERTY THIS SITE NEEDS (lr-b8e7fb classification audit,
+        # lr-c65d8a fold-in): FOREGROUND. Found DURING the audit, not
+        # previously classified -- `doctor` is run interactively from a
+        # real terminal exactly like `update`/`init`, and this probe's
+        # stdin is INHERITED from the caller (only stdout/stderr are
+        # redirected), unlike every DS_TIMEOUT_CMD-bound `claude --print`
+        # call in scripts/llm-client.sh (1463/1469), which pipes stdin from
+        # a file via `cat`. A real `claude` binary that probes the
+        # controlling terminal on startup (GitHub issue #213's mechanism)
+        # is reachable from an inherited-tty stdin the same way the
+        # `claude plugin`/`claude --version` sites this task fixed are.
+        # Switched to DS_TIMEOUT_FOREGROUND_CMD as a precaution matching
+        # every other `claude`-with-inherited-stdin site in this file,
+        # since the flag is a no-op if `claude --print` in fact never
+        # touches the terminal.
         CLAGENTIC_DISABLE_RECALL=1 \
-          $DS_TIMEOUT_CMD "$_llm_probe_timeout" claude --print "ping" \
+          $DS_TIMEOUT_FOREGROUND_CMD "$_llm_probe_timeout" claude --print "ping" \
           > "$_probe_out" 2> "$_probe_err" && _probe_ok=1 || true
         ;;
       codex)
@@ -3459,6 +3475,14 @@ cmd_doctor() {
         # response (stdout is spinner/progress noise). The prior approach
         # captured stdout, which exercises a different output channel than
         # every real gate call — causing false PASS or false FAIL.
+        #
+        # PROPERTY THIS SITE NEEDS (lr-b8e7fb classification audit):
+        # WHOLE-GROUP BOUNDING only. `codex exec` is a different binary,
+        # not implicated in GitHub issue #213's `claude`-specific tty-probe
+        # mechanism, and scripts/llm-client.sh's own `codex exec` sites
+        # (1810/1814/1823) use the identical non-interactive `exec` form
+        # with no reported tty issue -- DS_TIMEOUT_CMD (unchanged) is
+        # correct here.
         _probe_o=$(mktemp -t clagentic-doctor-codex-o.XXXXXX)
         $DS_TIMEOUT_CMD "$_llm_probe_timeout" codex exec --skip-git-repo-check \
           --color never -o "$_probe_o" "ping" \
@@ -3472,6 +3496,14 @@ cmd_doctor() {
         ;;
       *)
         # Generic: try `-p ping`.
+        #
+        # PROPERTY THIS SITE NEEDS (lr-b8e7fb classification audit):
+        # WHOLE-GROUP BOUNDING only. Covers whatever CLI a role's
+        # CLAGENTIC_<ROLE>_CMD names beyond claude/codex -- no evidence any
+        # such CLI shares `claude`'s specific startup tty-probe behavior,
+        # and this is the same generic shape scripts/llm-client.sh's own
+        # non-claude/non-codex carrier (1861) already uses successfully
+        # with DS_TIMEOUT_CMD.
         $DS_TIMEOUT_CMD "$_llm_probe_timeout" "$_pcmd" -p "ping" \
           > "$_probe_out" 2> "$_probe_err" && _probe_ok=1 || true
         ;;
@@ -4411,6 +4443,27 @@ cmd_update() {
   # check runs. Without re-exec the variables are baked in at script startup and
   # the restamp comparison uses the pre-pull values — meaning a version bump in the
   # pull is invisible to the running process and enrolled repos are never restamped.
+  #
+  # ALSO LOAD-BEARING FOR UPDATE SELF-HEALING (lr-c65d8a / lr-3bf7a4, GitHub
+  # issue #213) — NOT JUST VERSION CONSTANTS. This re-exec is the ONLY reason
+  # a user running plain `clagentic-lite update` from a pre-lr-c65d8a
+  # (SIGTTIN-hanging) install self-heals with no flag, env var, or
+  # workaround. Everything below this line — including
+  # _install_clagentic_lite_plugin's `claude plugin ...` calls, the exact
+  # site issue #213 reported hanging — runs from the FRESHLY PULLED code
+  # (DS_TIMEOUT_FOREGROUND_CMD-bound as of lr-c65d8a), never from the
+  # in-memory pre-pull process. If `_pre_pull_sha != _post_pull_sha` (true
+  # for any user actually pulling a fix) and this `exec` did not fire, the
+  # hanging `claude plugin` calls below would still run from the OLD,
+  # already-loaded shell functions — the update would hang using the very
+  # code it was meant to replace, making the fix permanently unreachable by
+  # the only delivery path a real user has. AGENTS.md's no-required-flags
+  # invariant (lr-3bf7a4) depends on this line unconditionally re-execing on
+  # any SHA change; do not gate this `exec` behind a flag, condition it on
+  # anything beyond the SHA comparison already here, or remove it, without
+  # re-verifying self-heal end-to-end (see
+  # scripts/test_update_self_heals_from_broken_version.py, the real-pty
+  # regression test proving this property holds).
   if [ "$_pre_pull_sha" != "$_post_pull_sha" ]; then
     say "re-executing updated binary to pick up new version constants..."
     exec "$CLAGENTIC_LITE_HOME/bin/clagentic-lite" update "$@"
