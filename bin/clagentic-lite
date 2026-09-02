@@ -1189,6 +1189,17 @@ _installed_plugin_render_stamp() {
 # an answer the probe never returned — worse, not merely inconsistent, so
 # this is fixed once, here, rather than re-deriving the same discrimination
 # a fourth and fifth time at each mutating call site.
+#
+# WHAT PROPERTY THIS SITE ACTUALLY NEEDS (raw material for lr-b8e7fb, filed
+# alongside this fix -- the DS_TIMEOUT_CMD-family call site classification
+# that does not exist anywhere in this codebase yet, whose absence is
+# exactly why the earlier not-applicable audit above was wrong): FOREGROUND
+# (this is a real `claude` invocation that touches the controlling
+# terminal, per GitHub issue #213 -- needs DS_TIMEOUT_FOREGROUND_CMD, not
+# DS_TIMEOUT_CMD) AND THREE-OUTCOME DISCRIMINATION (a timed-out/failed probe
+# must never be read as a genuine "no match" answer -- this helper's whole
+# purpose). Does NOT need group-kill (no descendant process tree to
+# reap on expiry; `claude` is a single process here).
 _claude_plugin_list_or_unknown() {
   # `|| _cplu_status=$?`, not a bare assignment -- under this file's
   # `set -e`, an unguarded `_v=$(cmd)` whose substitution exits non-zero
@@ -3378,6 +3389,12 @@ cmd_doctor() {
     # class newly reachable in a plain `doctor` run). `_claude_ver_status`
     # defaults to 0 (`|| true`-equivalent) only when the trailing `||`
     # itself doesn't run, i.e. when the substitution succeeded.
+    #
+    # PROPERTY THIS SITE NEEDS (lr-b8e7fb classification, see
+    # _claude_plugin_list_or_unknown's own comment above): FOREGROUND (real
+    # `claude` invocation, touches the controlling terminal) AND
+    # THREE-OUTCOME DISCRIMINATION (below) -- same pair as every other
+    # `claude` site in this file. No group-kill need (single process).
     _claude_ver_status=0
     _claude_ver_raw=$($DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude --version 2>/dev/null) || _claude_ver_status=$?
     # THREE-OUTCOME DISCRIMINATION (lr-c65d8a/lr-f8117f, same pattern as

@@ -23,6 +23,19 @@ SEPARATE variable, DS_TIMEOUT_FOREGROUND_CMD, carries the capability-detected
 (bin/clagentic-lite's `claude plugin ...`/`claude --version` probes) that
 actually touch a controlling terminal.
 
+DS_TIMEOUT_FOREGROUND_CMD is built by a NAMED, reusable detection primitive,
+`ds_timeout_supports_flag TIMEOUT_BINARY FLAG` -- not a one-off inline
+`--help | grep`. A future third bounding property extends this same probe
+with a new flag argument rather than hand-rolling a fourth ad hoc
+`--help | grep` and a third exported global. TestDsTimeoutSupportsFlagPrimitive
+below tests that primitive directly, independent of the DS_TIMEOUT_FOREGROUND_CMD
+assembly built on top of it. (The exported artifact stays a plain string,
+not a function-per-call-site design, because every DS_TIMEOUT_CMD-family
+call site in this codebase invokes it as a bare word-splittable command
+prefix -- see platform.sh's own comment at the detection site, and
+lr-b8e7fb for the larger, deliberately out-of-scope question of whether
+that call-site idiom itself should change repo-wide.)
+
 WHY --foreground MATTERS AT ALL (see platform.sh's own comment at the
 detection site for the full mechanism): GNU/BSD `timeout` without
 --foreground puts the wrapped command in a NEW PROCESS GROUP, so a command
@@ -111,6 +124,59 @@ class _PlatformShDetectionTestBase(unittest.TestCase):
             capture_output=True, text=True, env=env,
         )
         return result
+
+
+class TestDsTimeoutSupportsFlagPrimitive(_PlatformShDetectionTestBase):
+    """Tests ds_timeout_supports_flag directly -- the named, reusable
+    capability probe DS_TIMEOUT_FOREGROUND_CMD's assembly is built on top
+    of, rather than only exercising it indirectly through the assembled
+    variable's final value. Proves the primitive generalizes to an
+    arbitrary flag argument, not just '--foreground' hardcoded inline."""
+
+    def _run_probe(self, binary_path, flag):
+        env = os.environ.copy()
+        script = (
+            f". '{PLATFORM_SH}'\n"
+            f"if ds_timeout_supports_flag '{binary_path}' '{flag}'; then "
+            f"printf yes; else printf no; fi\n"
+        )
+        return subprocess.run(
+            ["sh", "-c", script, PLATFORM_SH],
+            capture_output=True, text=True, env=env,
+        )
+
+    def test_returns_true_when_binary_advertises_flag(self):
+        binary_path = _write_fake_timeout(self.bin_dir, "timeout", supports_foreground=True)
+        result = self._run_probe(binary_path, "--foreground")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "yes", result.stderr)
+
+    def test_returns_false_when_binary_does_not_advertise_flag(self):
+        binary_path = _write_fake_timeout(self.bin_dir, "timeout", supports_foreground=False)
+        result = self._run_probe(binary_path, "--foreground")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "no", result.stderr)
+
+    def test_generalizes_to_an_arbitrary_flag_not_just_foreground(self):
+        """Proves the primitive is not secretly hardcoded to the literal
+        string '--foreground' -- a future third bounding property can reuse
+        this same function with a different flag argument."""
+        path = os.path.join(self.bin_dir, "timeout")
+        with open(path, "w") as f:
+            f.write(textwrap.dedent("""\
+                #!/bin/sh
+                if [ "$1" = "--help" ]; then
+                  printf -- '--some-other-flag   an unrelated capability\\n'
+                  exit 0
+                fi
+                shift; shift; "$@"
+            """))
+        os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        result = self._run_probe(path, "--some-other-flag")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "yes", result.stderr)
+        result_absent = self._run_probe(path, "--foreground")
+        self.assertEqual(result_absent.stdout, "no", result_absent.stderr)
 
 
 class TestDsTimeoutCmdNeverGainsForeground(_PlatformShDetectionTestBase):
