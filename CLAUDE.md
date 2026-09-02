@@ -26,6 +26,7 @@ the highest-cost rules so they aren't buried at line 94+ of a 295-line file.
 8. Fix the pattern, not the line — a defect that could recur elsewhere gets a shared primitive, a sweep, and a guard, not a point-patch.
 9. No emojis, no fluff, in commits/PRs/comments/code.
 10. Ask before: new external tool dependency, changing default severity/CLI roles, editing bash/write-guard rule lists, widening the non-goals list, or loosening the gitleaks allowlist.
+11. No fix may require a flag, env var, redirect, or documented user action to be received — `update`/`doctor`/`init`/`enroll` must work bare, for a user who knows nothing (INV-8).
 
 When this repo is opened by Claude Code:
 
