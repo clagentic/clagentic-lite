@@ -7,6 +7,16 @@ condition, the way scripts/test_doctor_init_claude_plugin_timeout.py's
 stdin=DEVNULL test measures a DIFFERENT axis entirely (see that file's own
 updated HAZARD note, added by this task, for why it cannot see this class).
 
+NARROWED (PEACHES PR #214 review finding 2, verified by HOLDEN): the fix
+under test is DS_TIMEOUT_FOREGROUND_CMD, a SEPARATE variable from
+DS_TIMEOUT_CMD -- the first version of this fix mutated DS_TIMEOUT_CMD
+itself, which would have silently narrowed every OTHER consumer of that
+generic bounding primitive (scripts/gates.sh's run_bounded,
+scripts/llm-client.sh) from whole-process-group to direct-child-only
+bounding. DS_TIMEOUT_CMD is untouched by this fix and stays bare; only
+DS_TIMEOUT_FOREGROUND_CMD carries the capability-detected --foreground
+augmentation, and only bin/clagentic-lite's `claude` call sites use it.
+
 MECHANISM UNDER TEST. `timeout DURATION cmd` (GNU/BSD, no --foreground) puts
 `cmd` in a NEW PROCESS GROUP distinct from the shell's foreground process
 group. A command that then touches the controlling terminal (reads from it,
@@ -227,11 +237,58 @@ class _PtySessionTestBase(unittest.TestCase):
 
 
 class TestForegroundFlagPreventsSigttinStopUnderPty(_PtySessionTestBase):
-    """THE FIX: the real, capability-detected DS_TIMEOUT_CMD from
+    """THE FIX: the real, capability-detected DS_TIMEOUT_FOREGROUND_CMD from
     platform.sh (this task) must NOT allow the wrapped command's process
-    group to stop under SIGTTIN when driven from a real pty."""
+    group to stop under SIGTTIN when driven from a real pty. This is the
+    variable bin/clagentic-lite's `claude plugin`/`claude --version` sites
+    actually use -- DS_TIMEOUT_CMD itself is untouched (see
+    TestPlainDsTimeoutCmdStillStopsUnderSigttin below: proves the narrowing
+    is real, not just documented)."""
 
-    def test_ds_timeout_cmd_wrapped_call_does_not_stop(self):
+    def test_ds_timeout_foreground_cmd_wrapped_call_does_not_stop(self):
+        pid_file = os.path.join(self.tmp, "claude.pid")
+        _write_tty_reading_stub(self.bin_dir, pid_file, "claude")
+        script = textwrap.dedent(f"""\
+            . '{PLATFORM_SH}'
+            $DS_TIMEOUT_FOREGROUND_CMD {_TEST_TIMEOUT_SEC} claude
+        """)
+        shell_pid, master_fd = self._spawn_in_pty(script)
+        try:
+            claude_pid = self._wait_for_pid_file(pid_file)
+            state = self._wait_for_state(claude_pid)
+            self.assertNotEqual(
+                state, "T",
+                "wrapped `claude` stub STOPPED under SIGTTIN despite the "
+                "--foreground-augmented DS_TIMEOUT_FOREGROUND_CMD -- the "
+                "fix did not prevent the process-group mismatch from "
+                "GitHub issue #213",
+            )
+            self.assertIn(
+                state, ("Z", "gone"),
+                f"expected the wrapped command to terminate (bounded by "
+                f"the {_TEST_TIMEOUT_SEC}s guard, since the stub blocks on "
+                f"/dev/tty forever otherwise) rather than run indefinitely; "
+                f"observed state={state!r}",
+            )
+        finally:
+            os.close(master_fd)
+            self._cleanup_pid(shell_pid)
+
+
+class TestPlainDsTimeoutCmdStillStopsUnderSigttin(_PtySessionTestBase):
+    """THE NARROWING, PROVEN NOT JUST DOCUMENTED (PEACHES PR #214 review
+    finding 2): DS_TIMEOUT_CMD itself -- the variable scripts/gates.sh's
+    run_bounded and scripts/llm-client.sh actually consume -- must still
+    exhibit the pre-fix SIGTTIN-stop behavior when driven against a
+    tty-touching command, proving this task did NOT quietly re-widen
+    DS_TIMEOUT_CMD's own scope back to include --foreground. (No real
+    consumer of DS_TIMEOUT_CMD actually touches a controlling terminal --
+    this test's stub is synthetic, standing in for "some tty-touching
+    command wrapped by the generic primitive", to prove the primitive's
+    OWN behavior is unchanged, not to claim a real regression exists at
+    gates.sh/llm-client.sh's actual call sites.)"""
+
+    def test_ds_timeout_cmd_wrapped_call_still_stops(self):
         pid_file = os.path.join(self.tmp, "claude.pid")
         _write_tty_reading_stub(self.bin_dir, pid_file, "claude")
         script = textwrap.dedent(f"""\
@@ -242,18 +299,14 @@ class TestForegroundFlagPreventsSigttinStopUnderPty(_PtySessionTestBase):
         try:
             claude_pid = self._wait_for_pid_file(pid_file)
             state = self._wait_for_state(claude_pid)
-            self.assertNotEqual(
+            self.assertEqual(
                 state, "T",
-                "wrapped `claude` stub STOPPED under SIGTTIN despite the "
-                "--foreground-augmented DS_TIMEOUT_CMD -- the fix did not "
-                "prevent the process-group mismatch from GitHub issue #213",
-            )
-            self.assertIn(
-                state, ("Z", "gone"),
-                f"expected the wrapped command to terminate (bounded by "
-                f"the {_TEST_TIMEOUT_SEC}s guard, since the stub blocks on "
-                f"/dev/tty forever otherwise) rather than run indefinitely; "
-                f"observed state={state!r}",
+                f"DS_TIMEOUT_CMD must still exhibit the pre-fix SIGTTIN-"
+                f"stop behavior against a tty-touching command -- if this "
+                f"assertion fails, DS_TIMEOUT_CMD itself gained "
+                f"--foreground somewhere, re-widening its scope to every "
+                f"consumer (run_bounded, llm-client.sh) contrary to "
+                f"PEACHES PR #214 finding 2; observed state={state!r}",
             )
         finally:
             os.close(master_fd)
@@ -268,7 +321,29 @@ class TestBareTimeoutStopsUnderSigttinPreFix(_PtySessionTestBase):
     landed. This is what "verified to FAIL against current HEAD before the
     fix lands" means in practice: the reproduction mechanism itself is
     exercised here, on demand, rather than only inferred from having once
-    failed during development."""
+    failed during development.
+
+    PEACHES PR #214 REVIEW FINDING 1: this exact assertion was observed to
+    return state='gone' (the wrapped stub exited/reaped before the poll
+    loop ever caught it stopped) rather than 'T' in the reviewer's
+    execution environment, meaning the guard could not demonstrate it
+    detects the defect there. INVESTIGATED (this task): re-run repeatedly
+    in this environment -- both this test alone and the whole file, via
+    `python3 -m unittest` (module, class, and `unittest discover` forms) --
+    and it passed every single time, consistently observing state='T'.
+    TestPlainDsTimeoutCmdStillStopsUnderSigttin above exercises the same
+    stop mechanism through the real (non-synthetic) DS_TIMEOUT_CMD and also
+    passes reliably here. No host-specific difference (missing real
+    `timeout` binary, no pty/session/job-control support, container
+    restriction on SIGTTIN delivery) was found in this environment that
+    would explain a 'gone' result -- the reproduction is genuine and
+    reliable HERE. Per this task's own instruction not to weaken a guard
+    that failed loudly rather than passing silently: this assertion is left
+    UNCHANGED. If a future run in a DIFFERENT environment reproduces
+    'gone' again, that points at an environment-specific race or
+    restriction (e.g. a sandbox that reaps a stopped grandchild before
+    /proc is readable, or restricts SIGTTIN delivery) that needs
+    diagnosing in THAT environment, not a widening of this assertion."""
 
     def test_bare_timeout_without_foreground_stops_the_group(self):
         real_timeout = _real_system_timeout()

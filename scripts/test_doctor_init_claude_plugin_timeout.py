@@ -59,10 +59,13 @@ and is the only place in this suite that can observe SIGTTIN at all.
 Also lr-c65d8a: `_write_hanging_claude`'s stub was changed from a plain
 child `sleep 300` to `exec sleep 300` -- see that function's own docstring
 for why the non-exec'd form silently broke this module's own coverage the
-moment `--foreground` was added to DS_TIMEOUT_CMD (a `--foreground`-bound
-timeout signals only its direct child, not a whole process group the way
-bare `timeout` does, so a non-exec'd grandchild survived and kept the
-wrapping pipe open).
+moment bin/clagentic-lite's `claude` call sites switched to
+DS_TIMEOUT_FOREGROUND_CMD (a `--foreground`-bound timeout signals only its
+direct child, not a whole process group the way bare `timeout` does, so a
+non-exec'd grandchild survived and kept the wrapping pipe open). NARROWED
+further by PEACHES PR #214 review finding 2: --foreground now lives on the
+separate DS_TIMEOUT_FOREGROUND_CMD variable, never on DS_TIMEOUT_CMD itself
+-- see scripts/test_platform_timeout_foreground_detection.py.
 
 Run with: python3 -m unittest scripts.test_doctor_init_claude_plugin_timeout -v
 """
@@ -97,17 +100,18 @@ def _write_hanging_claude(bin_dir):
     `exec sleep 300`, NOT a plain `sleep 300` child call (lr-c65d8a
     discovery): the real `claude` CLI is a single process (a Node.js
     binary invoked directly, never itself forking a shell-visible child
-    the way this stub used to) -- DS_TIMEOUT_CMD's real-world child IS the
-    process that must receive the timeout signal. `timeout --foreground`
-    (added by lr-c65d8a to fix the SIGTTIN class this file also guards)
-    sends its expiry signal ONLY to its direct child, not to a whole
-    process-group the way bare `timeout` does -- correct and sufficient
-    for a single-process real `claude`, but a plain (non-exec'd) `sleep`
-    child of a shell-script stub would survive its parent's SIGTERM and
-    keep the wrapping pipe open, silently reintroducing the exact
-    unbounded-hang class this test exists to catch, in the test fixture
-    itself rather than the product. `exec` replaces the stub shell's own
-    process image with `sleep`, matching the real single-process shape.
+    the way this stub used to) -- DS_TIMEOUT_FOREGROUND_CMD's real-world
+    child IS the process that must receive the timeout signal.
+    `timeout --foreground` (used by DS_TIMEOUT_FOREGROUND_CMD, the variable
+    bin/clagentic-lite's `claude` call sites use as of lr-c65d8a) sends its
+    expiry signal ONLY to its direct child, not to a whole process-group
+    the way bare `timeout` does -- correct and sufficient for a
+    single-process real `claude`, but a plain (non-exec'd) `sleep` child of
+    a shell-script stub would survive its parent's SIGTERM and keep the
+    wrapping pipe open, silently reintroducing the exact unbounded-hang
+    class this test exists to catch, in the test fixture itself rather than
+    the product. `exec` replaces the stub shell's own process image with
+    `sleep`, matching the real single-process shape.
     """
     path = os.path.join(bin_dir, "claude")
     with open(path, "w") as f:
