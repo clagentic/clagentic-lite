@@ -327,9 +327,32 @@ export DS_TIMEOUT_CMD
 # DS_TIMEOUT_CMD is ds_timeout_missing (no timeout binary at all),
 # DS_TIMEOUT_FOREGROUND_CMD is set to the SAME ds_timeout_missing function:
 # FAIL CLOSED per INV-1a continues to apply regardless of this flag.
+#
+# ds_timeout_supports_flag: a NAMED, extensible capability probe rather than
+# a one-off inline `--help | grep`, so a future third bounding property
+# (e.g. a platform quirk needing both --foreground AND group-kill, or a BSD
+# `timeout`-specific flag) extends this same probe with a new flag argument
+# instead of hand-rolling a fourth ad hoc `--help | grep` and a third
+# exported global whose name encodes one hardcoded flag. This is the
+# smallest version of that generalization that still fits this codebase's
+# existing idiom: every DS_TIMEOUT_CMD-family call site invokes the result
+# as a bare word-splittable command prefix ($DS_TIMEOUT_CMD "$DURATION"
+# cmd...), so the exported artifact must stay a STRING, not a function --
+# but the DETECTION that builds that string is now a reusable named
+# primitive rather than inlined once per property. See lr-b8e7fb (filed
+# alongside this fix, not addressed here) for the larger, deliberately
+# out-of-scope question of whether the 58 existing DS_TIMEOUT_CMD-family
+# call sites across this codebase should route through a per-site
+# behavior-as-argument function instead of a raw exported string at all --
+# that is a repo-wide idiom change, not a fold-in-sized one.
+ds_timeout_supports_flag() {
+  # Args: TIMEOUT_BINARY_NAME  FLAG (e.g. "timeout" "--foreground")
+  "$1" --help 2>/dev/null | grep -qe "$2"
+}
+
 if [ "$DS_TIMEOUT_CMD" = "ds_timeout_missing" ]; then
   DS_TIMEOUT_FOREGROUND_CMD="$DS_TIMEOUT_CMD"
-elif "$DS_TIMEOUT_CMD" --help 2>/dev/null | grep -qe '--foreground'; then
+elif ds_timeout_supports_flag "$DS_TIMEOUT_CMD" '--foreground'; then
   DS_TIMEOUT_FOREGROUND_CMD="$DS_TIMEOUT_CMD --foreground"
 else
   DS_TIMEOUT_FOREGROUND_CMD="$DS_TIMEOUT_CMD"
