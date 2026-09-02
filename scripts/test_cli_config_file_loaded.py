@@ -247,7 +247,7 @@ class TestConfigFileRouterUrlHonored(unittest.TestCase):
         settings_path = os.path.join(self.repo, ".claude", "settings.json")
         with open(settings_path) as f:
             raw = f.read()
-        raw = raw.replace("clagentic-settings-version: v7", "clagentic-settings-version: v6")
+        raw = raw.replace("clagentic-settings-version: v8", "clagentic-settings-version: v7")
         with open(settings_path, "w") as f:
             f.write(raw)
 

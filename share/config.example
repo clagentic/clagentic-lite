@@ -550,7 +550,41 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # router's own passthrough mode does not check this token, but clagentic-lite
 # always stamps it when present so routed roles (reviewer/auditor by default)
 # work without a second manual step.
+#
+# EMPTY-TOKEN BEHAVIOR (lr-684947): leaving this unset/empty no longer
+# stamps an empty ANTHROPIC_AUTH_TOKEN into settings.json — the key is
+# omitted entirely in that case. Claude Code's settings.json `env` block
+# takes precedence over the process environment, and an empty-string value
+# there still shadows (does not fall back to) an ambient credential or
+# stored login — so a genuinely empty token is never written as a literal.
 # CLAGENTIC_ROUTER_TOKEN=
+
+# CLAGENTIC_ROUTER_USE_API_KEY_HELPER: separate opt-in, OFF by default even
+# when CLAGENTIC_ROUTER_TOKEN is set. When =1, clagentic-lite stamps a
+# top-level `apiKeyHelper` command into settings.json instead of the literal
+# token in ANTHROPIC_AUTH_TOKEN. The helper command reads
+# CLAGENTIC_ROUTER_TOKEN out of THIS FILE at Claude Code's own call time (a
+# small `grep`/`cut` one-liner, no new dependency) — the token itself is
+# never written into any enrolled repo's settings.json. Rotating the token
+# then means editing this ONE file; every enrolled repo picks up the new
+# value on the helper's next TTL-driven invocation, with no re-stamp of any
+# repo required (`clagentic-lite rotate` still exists for the literal-token
+# path below, or for CLAGENTIC_ROUTER_BEDROCK_TOKEN, which apiKeyHelper does
+# not cover — see AWS_BEARER_TOKEN_BEDROCK below).
+#
+# PRECEDENCE, why the literal token is REMOVED, not merely supplemented:
+# apiKeyHelper ranks BELOW ANTHROPIC_AUTH_TOKEN in Claude Code's own
+# credential chain (cloud-provider creds > ANTHROPIC_AUTH_TOKEN >
+# ANTHROPIC_API_KEY > apiKeyHelper > ...). A non-empty ANTHROPIC_AUTH_TOKEN
+# stamped alongside apiKeyHelper would silently WIN over the helper, making
+# this key a no-op — clagentic-lite omits ANTHROPIC_AUTH_TOKEN entirely
+# whenever this key is on, never stamps both.
+#
+# Does not affect the Bedrock pair (AWS_BEARER_TOKEN_BEDROCK) — Claude
+# Code's apiKeyHelper contract feeds direct-API auth only, not the Bedrock
+# bearer-token variable, so that pair keeps stamping a literal (or omitting
+# it, per the empty-token rule above) regardless of this key.
+# CLAGENTIC_ROUTER_USE_API_KEY_HELPER=0
 
 # CLAGENTIC_ROUTER_INJECT_AGENT_MODEL: separate opt-in, OFF by default even
 # when CLAGENTIC_ROUTER_URL is set. Setting CLAGENTIC_ROUTER_URL alone gets
@@ -611,10 +645,11 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # verbatim for both variable names -- nothing could distinguish a router
 # admin token from a real AWS Bedrock bearer token by value alone (this was
 # the root cause of an incident where the router's own local token was sent
-# straight to a real Bedrock endpoint and 401'd). Leave unset to stamp an
-# empty AWS_BEARER_TOKEN_BEDROCK (matching the pre-existing behavior for an
-# unset CLAGENTIC_ROUTER_TOKEN) -- clagentic-lite never falls back to
-# CLAGENTIC_ROUTER_TOKEN's value for this key.
+# straight to a real Bedrock endpoint and 401'd). Leave unset/empty to OMIT
+# AWS_BEARER_TOKEN_BEDROCK entirely (lr-684947: an empty literal is never
+# stamped, matching the same fix applied to ANTHROPIC_AUTH_TOKEN above) --
+# clagentic-lite never falls back to CLAGENTIC_ROUTER_TOKEN's value for this
+# key.
 # CLAGENTIC_ROUTER_BEDROCK_TOKEN=
 
 # ---------- host auth-mode declaration (CLAGENTIC_AUTH_MODE) ----------

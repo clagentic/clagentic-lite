@@ -8,6 +8,7 @@
 #   unenroll [--purge] [PATH]             remove clagentic hooks, deregister
 #   list                                  show enrolled repos + status
 #   doctor                                diagnostics punch list
+#   rotate                                re-stamp every enrolled repo's settings.json with the current router token
 #   update [--restamp] [--refresh-config] git pull + re-prereq + re-stamp shims + plugin update
 #   recall [keywords...]                  search session memory for matching summaries
 #   remember "<note>" [tags]              store a manual memory entry
@@ -226,7 +227,14 @@ SHIM_VERSION="v3"
 
 # Claude Code artifact version markers. Bump when the corresponding template
 # changes so `clagentic-lite update` re-stamps enrolled repos automatically.
-CLAUDE_SETTINGS_VERSION="v7"
+# v7 -> v8 (lr-684947): MIGRATION, not a content-only change. Closes the
+# empty-token regression (an enrolled repo with no router configured used
+# to get an empty ANTHROPIC_AUTH_TOKEN stamped, silently shadowing ambient
+# auth) and adds the apiKeyHelper single-copy path. Without this bump,
+# `update` sees a matching version on an already-stamped v7 file and skips
+# the restamp, leaving every existing enrolled repo on the broken behavior
+# forever — see AGENTS.md "Template version-bump protocol".
+CLAUDE_SETTINGS_VERSION="v8"
 # CLAUDE_MD_VERSION is retired — replaced by three narrower constants below.
 # The variable is kept as a tombstone so doctor/update version-compare calls
 # against old installed files continue to work during the transition period.
@@ -567,6 +575,57 @@ _validate_router_url() {
   esac
 }
 
+# _render_api_key_helper_command
+# Builds the shell command string stamped into settings.json's top-level
+# "apiKeyHelper" key (lr-684947, concern 2 — "the literal need not be on
+# disk at all"). Claude Code invokes this command and uses its stdout
+# (trimmed) as the credential, re-invoking on a TTL — see
+# code.claude.com/docs/en/settings-reference's apiKeyHelper contract.
+#
+# ONE HOME, not a second copy: the command reads CLAGENTIC_ROUTER_TOKEN
+# straight out of $GLOBAL_CONFIG (~/.config/clagentic/lite/config, already
+# chmod 600, already the sole place an operator sets this value) at RUN
+# TIME, every invocation — it never embeds the token value itself into the
+# command string or into settings.json. This is the mechanism that actually
+# closes the N-repo fan-out: rotating the token means editing ONE file
+# (GLOBAL_CONFIG), and every enrolled repo's apiKeyHelper re-reads the new
+# value on its next TTL-driven invocation with no re-stamp required at all
+# — a stronger property than the `rotate` subcommand below, which still has
+# to visit N repos for the literal-token path.
+#
+# Portable POSIX sh one-liner, no external dependency beyond a shell (the
+# same trust surface Claude Code's own hook `command` entries already
+# require): grep the last matching KEY=VALUE line (last-wins, matching
+# `set -a; . file` sourcing semantics) and print VALUE with the trailing
+# newline stripped via command substitution. Absolute path to GLOBAL_CONFIG
+# is used directly — $HOME is stable at settings.json read time (this is a
+# per-user file, not a per-repo one), so no __CLAGENTIC_LITE_HOME__-style
+# substitution is needed here.
+#
+# NO DOUBLE QUOTES in the generated command string, deliberately: the
+# command is embedded into a JSON string value by the caller, and every
+# double quote inside it would need JSON-escaping to stay valid. The whole
+# command is wrapped in single quotes for the outer `sh -c '...'`, and
+# GLOBAL_CONFIG is ALSO individually single-quoted inside that string via
+# the standard POSIX close-escape-reopen trick ('\''), so a $HOME containing
+# a space (unremarkable on macOS) still produces a single grep argv token
+# instead of splitting on the space and either erroring or silently
+# searching the wrong (or a nonexistent) path. GLOBAL_CONFIG is a fixed
+# HOME-derived path (never operator-typed at this call site), so it never
+# itself contains a single quote that would need its own escaping here —
+# only whitespace-safety is in scope.
+#
+# FAIL-QUIET BY THE PLATFORM'S OWN CONTRACT: if GLOBAL_CONFIG is missing or
+# the key is absent, this prints nothing — Claude Code's own apiKeyHelper
+# contract treats empty/failing helper output as an auth failure surfaced
+# to the user (not a silent fallback), which is the correct failure mode
+# here: better a loud auth error than a session that silently authenticates
+# with a stale or wrong credential.
+_render_api_key_helper_command() {
+  _raihc_q_config=$(printf '%s' "$GLOBAL_CONFIG" | sed "s/'/'\\\\''/g")
+  printf "sh -c 'grep ^CLAGENTIC_ROUTER_TOKEN= '\\''%s'\\'' 2>/dev/null | tail -1 | cut -d= -f2-'" "$_raihc_q_config"
+}
+
 # _render_claude_settings_body TEMPLATE_FILE > stdout
 # Pure renderer for .claude/settings.json content — NO validation, NO file
 # I/O beyond reading TEMPLATE_FILE, safe to call only after the caller has
@@ -586,11 +645,38 @@ _validate_router_url() {
 # sends that variable as `Authorization: Bearer <token>`, which is one of the
 # two header forms clagentic-router's routed-mode auth accepts (the other is
 # x-api-key) — see share/config.example's router section for the full
-# citation trail. CLAGENTIC_ROUTER_TOKEN may be empty (e.g. a passthrough-only
-# setup); the env block still stamps ANTHROPIC_AUTH_TOKEN with an empty value
-# in that case rather than omitting the key, so `clagentic-lite doctor` and a
-# human reading settings.json see explicitly that no token is configured
-# instead of silently missing the key.
+# citation trail.
+#
+# EMPTY-TOKEN REGRESSION, FIXED (lr-684947). PRECEDENCE FACT, durable —
+# do not re-derive this, and do not reintroduce an empty stamp: per
+# code.claude.com/docs/en/env-vars and code.claude.com/docs/en/authentication
+# (retrieved 2026-09-01), a `settings.json` `env` block TAKES PRECEDENCE over
+# the ambient process environment — Claude Code writes each `env` entry into
+# the session's process environment, replacing whatever the shell already
+# exported for that key. An EMPTY-STRING value does NOT behave like "unset":
+# Claude Code treats an empty value as unset for its OWN provider-selection
+# logic (this is the documented mechanism for overriding a variable you
+# cannot remove from a settings file), but the empty string still REPLACES
+# the shell's inherited value in the process environment, and spawned
+# subprocesses inherit the empty string, not the original. Concretely: a
+# user who enrolls a repo WITHOUT ever configuring CLAGENTIC_ROUTER_TOKEN
+# used to get an empty ANTHROPIC_AUTH_TOKEN stamped, which silently shadowed
+# any ambient ANTHROPIC_AUTH_TOKEN or stored OAuth login the session would
+# otherwise have used — Claude Code does not fall back to the shell value.
+# This is the DEFAULT new-user path for a released tool (enroll without
+# router configured), so the fix is unconditional: ANTHROPIC_AUTH_TOKEN and
+# AWS_BEARER_TOKEN_BEDROCK are OMITTED ENTIRELY (key absent, not present-
+# with-empty-value) whenever their source token is empty. ANTHROPIC_BASE_URL/
+# ANTHROPIC_BEDROCK_BASE_URL are not secrets and are unaffected — they keep
+# stamping whenever CLAGENTIC_ROUTER_URL is set, same as before.
+#
+# apiKeyHelper, SINGLE-COPY ALTERNATIVE (lr-684947, concern 2). When
+# CLAGENTIC_ROUTER_TOKEN is non-empty, this function ALSO stamps a top-level
+# `apiKeyHelper` command instead of the literal token in ANTHROPIC_AUTH_TOKEN
+# — see _render_api_key_helper_command below for the mechanism and the
+# CRITICAL PRECEDENCE INTERACTION (apiKeyHelper ranks BELOW ANTHROPIC_AUTH_TOKEN
+# in Claude Code's own credential chain, so the literal key MUST be removed,
+# not merely supplemented, or the helper is silently inert).
 #
 # BEDROCK PAIR (lr-4af4c4): ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN are
 # INERT for any session running CLAUDE_CODE_USE_BEDROCK=1 — that mode
@@ -656,24 +742,54 @@ _render_claude_settings_body() {
       ;;
   esac
 
+  # Resolve the Bedrock bearer token source value up front (mirrors the
+  # existing DE-OVERLOAD selection above) so the empty-vs-non-empty decision
+  # below and the actual printed value never diverge.
+  if [ "$_rcs_bedrock_token_source" = "declared-distinct" ]; then
+    _rcs_bedrock_token="${CLAGENTIC_ROUTER_BEDROCK_TOKEN:-}"
+  else
+    _rcs_bedrock_token="${CLAGENTIC_ROUTER_TOKEN:-}"
+  fi
+
+  # apiKeyHelper, single-copy alternative to the literal ANTHROPIC_AUTH_TOKEN
+  # (lr-684947, concern 2). Only applies to the direct-API token — the
+  # Bedrock pair keeps stamping AWS_BEARER_TOKEN_BEDROCK as a literal (or
+  # omitting it, per the empty-token fix below); Claude Code's apiKeyHelper
+  # contract feeds ANTHROPIC_API_KEY-equivalent auth only, not the Bedrock
+  # bearer-token variable, so there is no equivalent single-copy mechanism
+  # for that pair to move behind.
+  _rcs_use_api_key_helper=0
+  if [ -n "${CLAGENTIC_ROUTER_TOKEN:-}" ] && [ "${CLAGENTIC_ROUTER_USE_API_KEY_HELPER:-0}" = "1" ]; then
+    _rcs_use_api_key_helper=1
+  fi
+
   while IFS= read -r _rcs_line || [ -n "$_rcs_line" ]; do
     case "$_rcs_line" in
       *__CLAGENTIC_ROUTER_ENV_BLOCK__*)
         if [ -n "$_rcs_router_url" ]; then
-          printf '  "env": {\n'
-          printf '    "ANTHROPIC_BASE_URL": "%s",\n' "$_rcs_router_url"
-          if [ "$_rcs_bedrock_mode" = "1" ]; then
-            printf '    "ANTHROPIC_AUTH_TOKEN": "%s",\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
-            printf '    "ANTHROPIC_BEDROCK_BASE_URL": "%s",\n' "$_rcs_router_url"
-            if [ "$_rcs_bedrock_token_source" = "declared-distinct" ]; then
-              printf '    "AWS_BEARER_TOKEN_BEDROCK": "%s"\n' "${CLAGENTIC_ROUTER_BEDROCK_TOKEN:-}"
-            else
-              printf '    "AWS_BEARER_TOKEN_BEDROCK": "%s"\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
-            fi
-          else
-            printf '    "ANTHROPIC_AUTH_TOKEN": "%s"\n' "${CLAGENTIC_ROUTER_TOKEN:-}"
+          if [ "$_rcs_use_api_key_helper" = "1" ]; then
+            printf '  "apiKeyHelper": "%s",\n' "$(ds_json_escape "$(_render_api_key_helper_command)")"
           fi
-          printf '  },\n'
+          printf '  "env": {\n'
+          printf '    "ANTHROPIC_BASE_URL": "%s"' "$_rcs_router_url"
+          # ANTHROPIC_AUTH_TOKEN: OMITTED ENTIRELY when the router token is
+          # empty (never stamped empty — see this function's doc comment,
+          # "EMPTY-TOKEN REGRESSION, FIXED") and OMITTED ENTIRELY when
+          # apiKeyHelper is stamped instead (apiKeyHelper ranks BELOW
+          # ANTHROPIC_AUTH_TOKEN in Claude Code's credential precedence, so a
+          # non-empty literal here would silently win over the helper).
+          if [ "$_rcs_use_api_key_helper" != "1" ] && [ -n "${CLAGENTIC_ROUTER_TOKEN:-}" ]; then
+            printf ',\n    "ANTHROPIC_AUTH_TOKEN": "%s"' "${CLAGENTIC_ROUTER_TOKEN:-}"
+          fi
+          if [ "$_rcs_bedrock_mode" = "1" ]; then
+            printf ',\n    "ANTHROPIC_BEDROCK_BASE_URL": "%s"' "$_rcs_router_url"
+            # AWS_BEARER_TOKEN_BEDROCK: same empty-omission rule as
+            # ANTHROPIC_AUTH_TOKEN above — never stamp an empty bearer token.
+            if [ -n "$_rcs_bedrock_token" ]; then
+              printf ',\n    "AWS_BEARER_TOKEN_BEDROCK": "%s"' "$_rcs_bedrock_token"
+            fi
+          fi
+          printf '\n  },\n'
         fi
         # Router URL unset: emit nothing — the sentinel line is dropped
         # entirely, restoring byte-identical output to the pre-router template.
@@ -713,6 +829,21 @@ _render_claude_settings_body() {
 # the atomic write (the wrapper flavor's own settings-version comment
 # rewrite) — kept as a rendering-time step, not a second file write, so
 # there is still only one point where TARGET_FILE itself is touched.
+#
+# MODE 0600, not 0644 (lr-684947, agnostic-tool hardening). This file can
+# carry a live credential (ANTHROPIC_AUTH_TOKEN / AWS_BEARER_TOKEN_BEDROCK)
+# whenever a router is configured — a released tool cannot know whether it
+# is installed on a single-user workstation or a shared/multi-user host, so
+# a world-readable file holding a live credential is wrong by default,
+# matching the treatment $GLOBAL_CONFIG already gets (chmod 600,
+# _secret_tmp_create). Reuses _secret_tmp_create rather than a second
+# primitive — same genuinely-atomic `umask 077` subshell creation that
+# closes the create-then-chmod race window (_secret_tmp_create's own doc
+# comment explains why a bare `chmod 600` after the fact is not equivalent).
+# Applies unconditionally, even when no router is configured and the file
+# carries no secret today — the router can be configured later via
+# `update`/`enroll --force` without this file's mode ever having been
+# tightened retroactively otherwise.
 _stamp_claude_settings() {
   _scs_template="$1"
   _scs_target="$2"
@@ -726,10 +857,11 @@ _stamp_claude_settings() {
   [ -n "$_scs_router_url" ] && _validate_router_url "$_scs_router_url"
 
   _scs_tmp="${_scs_target}.tmp.$$"
+  _secret_tmp_create "$_scs_tmp" || { warn "could not chmod 600 settings-stamp temp file — aborting to avoid a momentarily-exposed settings.json"; return 1; }
   if [ -n "$_scs_comment_sed" ]; then
-    _render_claude_settings_body "$_scs_template" | sed "$_scs_comment_sed" > "$_scs_tmp"
+    _render_claude_settings_body "$_scs_template" | sed "$_scs_comment_sed" >> "$_scs_tmp"
   else
-    _render_claude_settings_body "$_scs_template" > "$_scs_tmp"
+    _render_claude_settings_body "$_scs_template" >> "$_scs_tmp"
   fi
   mv -f "$_scs_tmp" "$_scs_target"
 }
@@ -2803,6 +2935,15 @@ cmd_doctor() {
 
   # 6. Registry + enrolled repos.
   printf '\nenrolled repos:\n'
+  # lr-684947, concern 4 -- fan-out visibility: count how many enrolled
+  # repos hold a stamped credential (ANTHROPIC_AUTH_TOKEN or
+  # AWS_BEARER_TOKEN_BEDROCK present and non-empty in .claude/settings.json),
+  # separately from apiKeyHelper (a stamped helper command is NOT a
+  # credential copy -- see _render_api_key_helper_command's doc comment).
+  # Unbounded N by design (agnostic-tool hardening) -- no assumption this
+  # host has few enrolled repos.
+  _dc_token_count=0
+  _dc_helper_count=0
   if [ ! -f "$REGISTRY" ]; then
     printf '  (no registry at %s)\n' "$REGISTRY"
   else
@@ -2816,6 +2957,14 @@ cmd_doctor() {
       if [ -z "$_git_dir" ]; then
         _fail "$_rpath: not a git repo"
         continue
+      fi
+      _dc_cs="$_rpath/.claude/settings.json"
+      if [ -f "$_dc_cs" ]; then
+        if grep -q '"apiKeyHelper"' "$_dc_cs" 2>/dev/null; then
+          _dc_helper_count=$((_dc_helper_count+1))
+        elif grep -qE '"(ANTHROPIC_AUTH_TOKEN|AWS_BEARER_TOKEN_BEDROCK)": "[^"]' "$_dc_cs" 2>/dev/null; then
+          _dc_token_count=$((_dc_token_count+1))
+        fi
       fi
       case "$_git_dir" in
         /*) _hd="$_git_dir/hooks" ;;
@@ -2924,6 +3073,8 @@ cmd_doctor() {
         fi
       fi
     done < "$REGISTRY"
+    printf '  router token/credential fan-out: %s enrolled repo(s) hold a stamped literal credential, %s hold an apiKeyHelper (no literal copy)\n' \
+      "$_dc_token_count" "$_dc_helper_count"
   fi
 
 
@@ -3458,6 +3609,110 @@ cmd_doctor() {
 
   printf '\n== doctor summary: %s OK, %s FAIL ==\n\n' "$_ok" "$_fail"
   [ "$_fail" -eq 0 ]
+}
+
+# ---------------------------------------------------------------- rotate
+
+# cmd_rotate
+# lr-684947, concern 1: no rotate subcommand existed. Rotating
+# CLAGENTIC_ROUTER_TOKEN/CLAGENTIC_ROUTER_BEDROCK_TOKEN meant re-stamping
+# every enrolled repo by hand, per repo, with nothing enumerating the
+# copies or detecting a stale one. Builds on the registry machinery `list`/
+# `doctor` already walk — see REGISTRY (top of file).
+#
+# SCOPE: re-stamps ONLY .claude/settings.json (the one artifact that can
+# carry the credential), never CLAUDE.md/builder-contract.md — a narrower
+# operation than _restamp_repo_artifacts (used by `update --restamp`),
+# deliberately, so `rotate` does exactly one thing and its exit code means
+# exactly one thing: every reachable enrolled repo's settings.json now
+# reflects the CURRENT CLAGENTIC_ROUTER_TOKEN/CLAGENTIC_ROUTER_BEDROCK_TOKEN
+# (or apiKeyHelper — see CLAGENTIC_ROUTER_USE_API_KEY_HELPER, which makes
+# rotation a single-file GLOBAL_CONFIG edit that needs no restamp at all,
+# the stronger property _render_api_key_helper_command's doc comment names).
+#
+# UNBOUNDED N, NOT THE REPORTING HOST'S ELEVEN (lr-684947, agnostic-tool
+# hardening): no assumption about registry size, and every member is
+# checked independently — one unreachable/deleted repo never stops the
+# sweep over the rest (mirrors cmd_doctor's own per-repo continue-on-
+# failure loop, not a fail-fast one).
+#
+# EXIT STATUS: non-zero if ANY registry member could not be re-stamped
+# (missing directory, not a git repo, or not clagentic-managed) — the
+# member's path is always named on stderr, never silently skipped. Zero
+# only when every reachable, clagentic-managed member was re-stamped
+# successfully (an empty registry is zero — nothing to rotate is not a
+# failure).
+cmd_rotate() {
+  _rot_ok=0
+  _rot_stale=0
+  _rot_total=0
+
+  if [ ! -f "$REGISTRY" ]; then
+    say "no enrolled repos (registry not found at $REGISTRY) — nothing to rotate"
+    return 0
+  fi
+
+  while IFS= read -r _rot_path; do
+    [ -z "$_rot_path" ] && continue
+    _rot_total=$((_rot_total+1))
+
+    if [ ! -d "$_rot_path" ]; then
+      printf '  STALE %s: registered path no longer exists\n' "$_rot_path" 1>&2
+      _rot_stale=$((_rot_stale+1))
+      continue
+    fi
+    if ! git -C "$_rot_path" rev-parse --git-dir >/dev/null 2>&1; then
+      printf '  STALE %s: not a git repo\n' "$_rot_path" 1>&2
+      _rot_stale=$((_rot_stale+1))
+      continue
+    fi
+
+    _rot_cs="$_rot_path/.claude/settings.json"
+    if [ ! -f "$_rot_cs" ]; then
+      printf '  STALE %s: .claude/settings.json missing (run `clagentic-lite enroll --force`)\n' "$_rot_path" 1>&2
+      _rot_stale=$((_rot_stale+1))
+      continue
+    fi
+    if ! grep -q 'managed-by: clagentic' "$_rot_cs" 2>/dev/null; then
+      printf '  STALE %s: .claude/settings.json is not clagentic-managed\n' "$_rot_path" 1>&2
+      _rot_stale=$((_rot_stale+1))
+      continue
+    fi
+
+    _rot_cs_template="$SHARE_DIR/hook-shims/claude-settings.template"
+    if [ ! -f "$_rot_cs_template" ]; then
+      printf '  STALE %s: claude-settings.template missing from this install\n' "$_rot_path" 1>&2
+      _rot_stale=$((_rot_stale+1))
+      continue
+    fi
+
+    if _stamp_claude_settings "$_rot_cs_template" "$_rot_cs"; then
+      say "rotated: $_rot_cs"
+      _rot_ok=$((_rot_ok+1))
+    else
+      printf '  STALE %s: settings.json re-stamp failed\n' "$_rot_path" 1>&2
+      _rot_stale=$((_rot_stale+1))
+    fi
+
+    # Wrapper .claude/settings.json, if this repo has a .clagentic-project
+    # parent — same credential, same rotation obligation, not counted as a
+    # SECOND registry member (it is derived from this one's parent dir, the
+    # same relationship cmd_doctor's own wrapper-pointer check (§7) uses).
+    _rot_wrapper_dir=$(dirname "$_rot_path")
+    _rot_wrapper_ptr="$_rot_wrapper_dir/.clagentic-project"
+    if [ -f "$_rot_wrapper_ptr" ] && [ -f "$_rot_wrapper_dir/.claude/settings.json" ]; then
+      if ENROLL_FORCE=1 _stamp_wrapper_settings "$_rot_wrapper_dir"; then
+        say "rotated wrapper: $_rot_wrapper_dir/.claude/settings.json"
+      else
+        printf '  STALE %s: wrapper settings.json re-stamp failed\n' "$_rot_wrapper_dir" 1>&2
+        _rot_stale=$((_rot_stale+1))
+      fi
+    fi
+  done < "$REGISTRY"
+
+  printf '[clagentic-lite] rotate complete: %s rotated, %s stale, %s total enrolled repo(s)\n' \
+    "$_rot_ok" "$_rot_stale" "$_rot_total"
+  [ "$_rot_stale" -eq 0 ]
 }
 
 # ---------------------------------------------------------------- update
@@ -4566,6 +4821,7 @@ case "${1:-}" in
   unenroll) shift; cmd_unenroll "$@" ;;
   list)     cmd_list ;;
   doctor)   cmd_doctor ;;
+  rotate)   cmd_rotate ;;
   update)   shift; cmd_update "$@" ;;
   recall)
     # recall <keywords...>  — search session memory for matching summaries.
@@ -4605,13 +4861,13 @@ case "${1:-}" in
     ;;
   "")
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp] [--refresh-config], recall, remember, show, export, gates\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, rotate, update [--restamp] [--refresh-config], recall, remember, show, export, gates\n'
     exit 1
     ;;
   *)
     printf 'clagentic-lite: unknown subcommand: %s\n' "$1" 1>&2
     printf 'usage: clagentic-lite <subcommand> [args]\n'
-    printf 'subcommands: init, enroll, unenroll, list, doctor, update [--restamp] [--refresh-config], recall, remember, show, export, gates\n'
+    printf 'subcommands: init, enroll, unenroll, list, doctor, rotate, update [--restamp] [--refresh-config], recall, remember, show, export, gates\n'
     exit 1
     ;;
 esac

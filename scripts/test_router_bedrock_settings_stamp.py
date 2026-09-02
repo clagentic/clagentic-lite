@@ -204,7 +204,12 @@ class TestBedrockModeStampsBothPairs(unittest.TestCase):
         self.assertEqual(parsed["env"]["AWS_BEARER_TOKEN_BEDROCK"], "test-token-value")
         self.assertNotIn("__CLAGENTIC_ROUTER_ENV_BLOCK__", raw)
 
-    def test_empty_router_token_stamps_empty_bedrock_token_not_omitted(self):
+    def test_empty_router_token_omits_both_auth_token_keys(self):
+        """lr-684947 (empty-token regression): an unset CLAGENTIC_ROUTER_TOKEN
+        with Bedrock mode on OMITS both ANTHROPIC_AUTH_TOKEN and
+        AWS_BEARER_TOKEN_BEDROCK entirely -- neither is ever stamped as an
+        empty literal (inverts the pre-fix behavior this test used to
+        assert)."""
         rc, out, err = _run_cli(
             ["enroll", self.repo],
             cwd=self.repo,
@@ -218,12 +223,13 @@ class TestBedrockModeStampsBothPairs(unittest.TestCase):
         settings_path = os.path.join(self.repo, ".claude", "settings.json")
         with open(settings_path) as f:
             parsed = json.load(f)
-        self.assertIn("AWS_BEARER_TOKEN_BEDROCK", parsed["env"])
-        self.assertEqual(parsed["env"]["AWS_BEARER_TOKEN_BEDROCK"], "")
-        self.assertIn("ANTHROPIC_AUTH_TOKEN", parsed["env"])
-        self.assertEqual(parsed["env"]["ANTHROPIC_AUTH_TOKEN"], "")
+        self.assertNotIn("AWS_BEARER_TOKEN_BEDROCK", parsed["env"], msg=parsed)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", parsed["env"], msg=parsed)
+        # Base URLs are not secrets and are unaffected.
+        self.assertEqual(parsed["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8765")
+        self.assertEqual(parsed["env"]["ANTHROPIC_BEDROCK_BASE_URL"], "http://127.0.0.1:8765")
 
-    def test_settings_version_marker_is_v7(self):
+    def test_settings_version_marker_is_v8(self):
         rc, out, err = _run_cli(
             ["enroll", self.repo],
             cwd=self.repo,
@@ -237,7 +243,7 @@ class TestBedrockModeStampsBothPairs(unittest.TestCase):
         settings_path = os.path.join(self.repo, ".claude", "settings.json")
         with open(settings_path) as f:
             raw = f.read()
-        self.assertIn("clagentic-settings-version: v7", raw, msg=raw)
+        self.assertIn("clagentic-settings-version: v8", raw, msg=raw)
 
 
 class TestBedrockModeSharesRouterUrlValidation(unittest.TestCase):
@@ -498,11 +504,11 @@ class TestBedrockSettingsStampPreservesExistingFileOnRefusal(unittest.TestCase):
         rc, out, err = run_fake_home(["enroll", self.repo])
         self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
 
-        # Simulate a stale pre-lr-4af4c4 install at v6.
+        # Simulate a stale pre-lr-684947 install at v7.
         settings_path = os.path.join(self.repo, ".claude", "settings.json")
         with open(settings_path) as f:
             raw = f.read()
-        raw = raw.replace("clagentic-settings-version: v7", "clagentic-settings-version: v6")
+        raw = raw.replace("clagentic-settings-version: v8", "clagentic-settings-version: v7")
         with open(settings_path, "w") as f:
             f.write(raw)
 
@@ -525,7 +531,7 @@ class TestBedrockSettingsStampPreservesExistingFileOnRefusal(unittest.TestCase):
         with open(settings_path) as f:
             raw = f.read()
         parsed = json.loads(raw)
-        self.assertIn("clagentic-settings-version: v7", raw, msg=raw)
+        self.assertIn("clagentic-settings-version: v8", raw, msg=raw)
         self.assertEqual(parsed["env"]["ANTHROPIC_BEDROCK_BASE_URL"], "http://127.0.0.1:8765")
         self.assertEqual(parsed["env"]["AWS_BEARER_TOKEN_BEDROCK"], "upgraded-token")
 

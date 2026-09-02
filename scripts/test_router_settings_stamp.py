@@ -157,10 +157,19 @@ class TestRouterSettingsStampWhenSet(unittest.TestCase):
         self.assertEqual(parsed["env"]["ANTHROPIC_AUTH_TOKEN"], "test-token-value")
         self.assertNotIn("__CLAGENTIC_ROUTER_ENV_BLOCK__", raw)
 
-    def test_enroll_stamps_empty_token_when_url_set_but_token_unset(self):
-        """Router URL set without a token (e.g. passthrough-only use) still
-        stamps the ANTHROPIC_AUTH_TOKEN key, explicitly empty -- never
-        silently omitted."""
+    def test_enroll_omits_auth_token_when_url_set_but_token_unset(self):
+        """lr-684947 (empty-token regression, release-blocking): router URL
+        set without a token (e.g. passthrough-only use) OMITS the
+        ANTHROPIC_AUTH_TOKEN key entirely -- never stamps it empty. Per
+        Anthropic's documented settings.json env-var precedence, an
+        empty-string env value still REPLACES an ambient/inherited
+        credential in the process environment (Claude Code treats it as
+        unset only for its own provider-selection logic, not for what
+        subprocesses inherit) -- so a genuinely-empty token must never be
+        written as a literal, or every non-router user who enrolls gets
+        their real credential silently shadowed. See this key's replacement
+        test below (acceptance test 1, lr-684947 comment #1) for the
+        no-router-at-all case, which is the actual default new-user path."""
         rc, out, err = _run_cli(
             ["enroll", self.repo],
             cwd=self.repo,
@@ -171,19 +180,22 @@ class TestRouterSettingsStampWhenSet(unittest.TestCase):
         settings_path = os.path.join(self.repo, ".claude", "settings.json")
         with open(settings_path) as f:
             parsed = json.load(f)
-        self.assertIn("ANTHROPIC_AUTH_TOKEN", parsed["env"])
-        self.assertEqual(parsed["env"]["ANTHROPIC_AUTH_TOKEN"], "")
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", parsed["env"], msg=parsed)
+        # Base URL is not a secret and is unaffected.
+        self.assertEqual(parsed["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8765")
 
-    def test_settings_version_marker_is_v7(self):
-        # v6 -> v7 bumped by lr-4af4c4 (ANTHROPIC_BEDROCK_BASE_URL /
-        # AWS_BEARER_TOKEN_BEDROCK support) -- a migration, not a
-        # content-only change.
+    def test_settings_version_marker_is_v8(self):
+        # v7 -> v8 bumped by lr-684947 (empty-token omission fix +
+        # apiKeyHelper support) -- a migration, not a content-only change:
+        # without the bump, `update` would see a matching v7 file and never
+        # re-stamp an already-enrolled repo still carrying the empty-stamp
+        # bug.
         rc, out, err = _run_cli(["enroll", self.repo], cwd=self.repo, home=self.home)
         self.assertEqual(rc, 0, msg=f"stdout={out!r} stderr={err!r}")
         settings_path = os.path.join(self.repo, ".claude", "settings.json")
         with open(settings_path) as f:
             raw = f.read()
-        self.assertIn("clagentic-settings-version: v7", raw, msg=raw)
+        self.assertIn("clagentic-settings-version: v8", raw, msg=raw)
 
 
 class TestRouterSettingsStampRestamp(unittest.TestCase):
@@ -250,7 +262,7 @@ class TestRouterSettingsStampRestamp(unittest.TestCase):
         settings_path = os.path.join(self.repo, ".claude", "settings.json")
         with open(settings_path) as f:
             raw = f.read()
-        raw = raw.replace("clagentic-settings-version: v7", "clagentic-settings-version: v6")
+        raw = raw.replace("clagentic-settings-version: v8", "clagentic-settings-version: v7")
         with open(settings_path, "w") as f:
             f.write(raw)
 
