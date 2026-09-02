@@ -263,6 +263,49 @@ elif command -v gtimeout >/dev/null 2>&1; then
 else
   DS_TIMEOUT_CMD="ds_timeout_missing"
 fi
+
+# --foreground CAPABILITY DETECTION (lr-c65d8a, successor to lr-da3b7e).
+#
+# THE DEFECT lr-da3b7e SHIPPED: GNU/BSD `timeout` WITHOUT --foreground puts
+# the wrapped command in a NEW PROCESS GROUP so it can signal the whole
+# group at expiry. A wrapped command that touches the controlling terminal
+# from that non-foreground group (e.g. `claude` probing tty state) gets
+# SIGTTIN/SIGTTOU from the kernel and the whole group STOPS. A stopped
+# process cannot act on ordinary signals, including the SIGTERM timeout
+# sends at expiry -- so the guard never fires and the wrapped call hangs
+# forever, in ANY interactive terminal, regardless of network reachability.
+# lr-da3b7e fixed the network axis (bounded a previously-unbounded call) and
+# broke the tty axis in the process (bin/clagentic-lite's `claude plugin`/
+# `claude --version` call sites, GitHub issue #213).
+#
+# --foreground keeps the wrapped command in timeout's OWN (the caller's)
+# foreground process group, so it never triggers SIGTTIN/SIGTTOU against the
+# controlling terminal, and remains normally signalable at expiry.
+#
+# WHY DETECTED HERE, NOT ASSUMED, PER OPERATOR DIRECTIVE (lr-c65d8a seq 1):
+# --foreground is a GNU coreutils / BSD `timeout`/`gtimeout` flag, not
+# POSIX. Blanket-adding it without checking would trade the tty assumption
+# lr-da3b7e shipped for a coreutils-flavor assumption -- an equally
+# non-agnostic mistake in the opposite direction. This is the single site
+# AGENTS.md non-negotiable 5 designates for routing GNU/BSD differences, so
+# the detection lives here once, and every one of DS_TIMEOUT_CMD's callers
+# (bin/clagentic-lite, scripts/gates.sh, scripts/llm-client.sh) picks it up
+# for free with no call-site change -- callers already invoke
+# `$DS_TIMEOUT_CMD "$DURATION" cmd...` unquoted, so a second space-separated
+# token in DS_TIMEOUT_CMD's value word-splits correctly at every site.
+#
+# `timeout --foreground` has accepted this flag before DURATION since GNU
+# coreutils 8.13 (2011); a `timeout`/`gtimeout` old enough to lack it prints
+# an unrecognized-option error on `--help`, which the probe below treats as
+# "not supported" and falls back to the bare (pre-lr-c65d8a-detection)
+# command -- no worse than before this fix, never a new failure mode.
+# ds_timeout_missing (no timeout binary at all) is untouched: FAIL CLOSED
+# per INV-1a continues to apply regardless of this flag.
+if [ "$DS_TIMEOUT_CMD" != "ds_timeout_missing" ]; then
+  if "$DS_TIMEOUT_CMD" --help 2>/dev/null | grep -qe '--foreground'; then
+    DS_TIMEOUT_CMD="$DS_TIMEOUT_CMD --foreground"
+  fi
+fi
 export DS_TIMEOUT_CMD
 
 # ---------------------------------------------------------------- shared helpers
