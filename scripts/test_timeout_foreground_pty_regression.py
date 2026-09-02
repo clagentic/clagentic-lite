@@ -194,30 +194,109 @@ class _PtySessionTestBase(unittest.TestCase):
         )
 
     def _wait_for_state(self, pid, budget=_WAIT_BUDGET_SEC):
-        """Polls /proc/<pid>/stat for the process state char. Returns the
-        final observed state ('T' = stopped, 'Z' = zombie/exited, etc) once
-        the process either stops or exits, or None if it is still running
-        (state 'S'/'R') when the budget expires -- that "still running,
-        never stopped, never exited" outcome is itself the hang this whole
-        task exists to fix, so callers assert against it explicitly rather
-        than treating a timeout here as an error."""
-        deadline = time.time() + budget
+        """Polls /proc/<pid>/stat for the process state char across the
+        FULL budget, not a single read. Returns the final observed state
+        ('T' = stopped, 'Z' = zombie/exited, etc), 'gone' if the process
+        disappeared AFTER having been observed alive at least once, or
+        'unreadable' if /proc/<pid>/stat could never be read at all within
+        the budget -- e.g. no /proc (macOS/BSD), or a hardened container
+        restricting it. 'still running' (state 'S'/'R' persisting to the
+        deadline) is itself the hang this whole task exists to fix, so
+        callers assert against that explicitly rather than treating a
+        timeout here as an error.
+
+        MILLER'S DIAGNOSIS (lr-c65d8a fold-in, PR #214 round 2): the prior
+        version of this method returned 'gone' on the FIRST failed read
+        (FileNotFoundError/ProcessLookupError/IndexError), collapsing two
+        genuinely different outcomes into one string:
+          - a real "process disappeared after being observed alive" event
+          - a read that simply failed, e.g. because /proc does not exist on
+            this platform at all (every read fails, always, on macOS/BSD),
+            or because IndexError fired from a stat line that didn't parse
+            the way this method expects (a PARSE failure, not an absence
+            signal) -- folded into the same verdict, also wrong.
+        Because the guard normally observes 'T' well within the first poll
+        (~0.1s per MILLER's measurement; the non-reproduction arm takes
+        ~2.1s to reach the kernel deadline), this method's own failure path
+        had never executed in this environment -- so the collapse went
+        unnoticed until a platform without /proc hit it and got a
+        confident, specific, WRONG verdict blaming the pty reproduction
+        technique instead of the missing prerequisite.
+
+        Fix: retry unreadable/unparseable reads within the budget (a
+        transient race -- pid file written, /proc entry not yet populated
+        -- is expected and should not end the poll early); only report
+        'unreadable' if EVERY read attempt across the whole budget failed
+        (no /proc, or persistently unreadable), and only report 'gone' once
+        the process has been read successfully at least once and then a
+        later read finds it missing (ProcessLookupError, or ESRCH-shaped
+        FileNotFoundError after a prior success) -- genuine disappearance,
+        not a first-attempt read failure. IndexError (parse failure on a
+        line that WAS read) is tracked separately and never folded into
+        either sentinel.
+
+        Records elapsed wall-clock time to self.last_wait_elapsed_sec --
+        MILLER's decisive measurement showed the two real outcomes are
+        separated by ~2s (a genuine 'T' stop resolves in ~0.1s, one poll
+        interval; a genuine non-reproduction rides out the full ~2.1s
+        kernel deadline), so a caller that wants to self-describe which
+        arm it observed can assert against this directly rather than
+        trusting the state string alone."""
+        start = time.time()
+
+        def _finish(result):
+            self.last_wait_elapsed_sec = time.time() - start
+            return result
+
+        deadline = start + budget
         last_state = None
+        observed_alive = False
+        ever_read_succeeded = False
+        parse_errors = 0
         while time.time() < deadline:
             try:
                 with open(f"/proc/{pid}/stat") as f:
                     raw = f.read()
+            except (FileNotFoundError, ProcessLookupError):
+                if observed_alive:
+                    return _finish("gone")
+                # Not yet observed alive: could be a startup race (pid file
+                # written, /proc entry not yet populated) OR a platform
+                # with no /proc at all. Retry within budget rather than
+                # deciding on the first sample.
+                time.sleep(_POLL_INTERVAL_SEC)
+                continue
+            try:
                 # Field 3 (state) follows the )-terminated comm field,
                 # which can itself contain spaces/parens -- split on the
                 # LAST ')' to stay correct regardless of comm content.
                 after = raw.rsplit(")", 1)[1]
                 last_state = after.split()[0]
-                if last_state in ("T", "t", "Z"):
-                    return last_state
-            except (FileNotFoundError, ProcessLookupError, IndexError):
-                return "gone"
+            except IndexError:
+                # The read succeeded but the line didn't parse as expected
+                # -- a distinct failure mode from absence. Do not fold into
+                # 'gone': retry, since a torn read mid-write is plausible.
+                parse_errors += 1
+                time.sleep(_POLL_INTERVAL_SEC)
+                continue
+            ever_read_succeeded = True
+            observed_alive = True
+            if last_state in ("T", "t", "Z"):
+                return _finish(last_state)
             time.sleep(_POLL_INTERVAL_SEC)
-        return last_state
+        if not ever_read_succeeded:
+            self.last_wait_elapsed_sec = time.time() - start
+            raise unittest.SkipTest(
+                f"/proc/{pid}/stat was never successfully read within "
+                f"{budget}s ({parse_errors} parse failure(s) observed) -- "
+                f"this platform likely has no /proc (e.g. macOS/BSD) or "
+                f"restricts reading it (e.g. a hardened container); this "
+                f"guard cannot observe process state here, so it must skip "
+                f"loudly rather than report a state it never actually saw, "
+                f"exactly as _real_system_timeout already does for its own "
+                f"missing prerequisite"
+            )
+        return _finish(last_state)
 
     def _cleanup_pid(self, pid):
         """`pid` is the pty-attached shell -- also its own process group
@@ -330,20 +409,39 @@ class TestBareTimeoutStopsUnderSigttinPreFix(_PtySessionTestBase):
     detects the defect there. INVESTIGATED (this task): re-run repeatedly
     in this environment -- both this test alone and the whole file, via
     `python3 -m unittest` (module, class, and `unittest discover` forms) --
-    and it passed every single time, consistently observing state='T'.
-    TestPlainDsTimeoutCmdStillStopsUnderSigttin above exercises the same
-    stop mechanism through the real (non-synthetic) DS_TIMEOUT_CMD and also
-    passes reliably here. No host-specific difference (missing real
-    `timeout` binary, no pty/session/job-control support, container
-    restriction on SIGTTIN delivery) was found in this environment that
-    would explain a 'gone' result -- the reproduction is genuine and
-    reliable HERE. Per this task's own instruction not to weaken a guard
-    that failed loudly rather than passing silently: this assertion is left
-    UNCHANGED. If a future run in a DIFFERENT environment reproduces
-    'gone' again, that points at an environment-specific race or
-    restriction (e.g. a sandbox that reaps a stopped grandchild before
-    /proc is readable, or restricts SIGTTIN delivery) that needs
-    diagnosing in THAT environment, not a widening of this assertion."""
+    and it passed every single time, consistently observing state='T'
+    (MILLER's independent re-run: 34/34). TestPlainDsTimeoutCmdStillStops
+    UnderSigttin above exercises the same stop mechanism through the real
+    (non-synthetic) DS_TIMEOUT_CMD and also passes reliably here. The
+    assertion itself was correct and stays unchanged; the earlier
+    investigation stopped one layer too shallow.
+
+    CORRECTED (MILLER, fold-in round 2): the ORIGINAL hypotheses this note
+    once offered for a possible 'gone' elsewhere -- restricted SIGTTIN
+    delivery in some sandbox, or a sandbox reaping a stopped grandchild
+    early -- are REFUTED by MILLER's timing measurement and do not need
+    re-investigating if 'gone' recurs. Restricted SIGTTIN delivery would
+    make the stub never stop at all, so the poll would ride out the full
+    ~2.1s non-reproduction arm (nothing writes to master_fd, the stub
+    blocks in 'S' until timeout's kill) before disappearing -- not an
+    instant 'gone'. A sandbox does not reap a STOPPED ('T') process without
+    an explicit SIGCONT/SIGKILL first, which nothing in this harness sends
+    mid-poll. The simpler, and now confirmed, explanation for an instant
+    'gone' was a /proc READ FAILURE on the very first poll attempt, not a
+    process lifecycle event -- `_wait_for_state`'s own error path folded
+    "never successfully read /proc at all" (e.g. no /proc on macOS/BSD)
+    into the identical 'gone' string used for genuine post-observation
+    disappearance, discarding the ~7.9s of remaining budget that would
+    have let a real transient race resolve itself. See `_wait_for_state`'s
+    docstring for the fix: retry within budget, split the sentinels, and
+    skip loudly (SkipTest) when /proc is provably unreadable rather than
+    guess. If a future run reports 'gone' again, it is now a REAL
+    post-observation disappearance (the two are no longer conflated); an
+    'unreadable'-driven SkipTest is the platform-prerequisite signal
+    instead, distinguishable by the elapsed time TestBareTimeoutStops
+    UnderSigttinPreFix's own run records (~0.1s for a genuine 'T' stop
+    vs. the ~2.1s non-reproduction deadline -- see that measurement's
+    origin in this fold-in's PR body / lr-c65d8a task thread)."""
 
     def test_bare_timeout_without_foreground_stops_the_group(self):
         real_timeout = _real_system_timeout()
@@ -364,6 +462,24 @@ class TestBareTimeoutStopsUnderSigttinPreFix(_PtySessionTestBase):
                 f"If this assertion fails, the pty/process-group "
                 f"reproduction technique itself is broken, independent of "
                 f"the product fix.",
+            )
+            # MILLER'S DISCRIMINATOR (optional per this task, included
+            # because it directly encodes the measurement that resolved
+            # the AMoS/PEACHES 'T' vs 'gone' dispute): a genuine SIGTTIN
+            # stop resolves within roughly one poll interval (~0.1s),
+            # sharply distinct from the ~2.1s a real non-reproduction rides
+            # out to the kernel deadline. Asserting the elapsed time here
+            # makes this test self-describing about WHICH arm it actually
+            # observed, not just that the string happened to read 'T'.
+            self.assertLess(
+                self.last_wait_elapsed_sec, 1.0,
+                f"observed state=='T' but took "
+                f"{self.last_wait_elapsed_sec:.3f}s to resolve -- a genuine "
+                f"SIGTTIN stop resolves in ~1 poll interval "
+                f"({_POLL_INTERVAL_SEC}s); this elapsed time is inconsistent "
+                f"with MILLER's ~0.1s measurement for a real stop and "
+                f"warrants re-diagnosing this environment's timing rather "
+                f"than trusting the state string alone",
             )
         finally:
             os.close(master_fd)
