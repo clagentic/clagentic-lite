@@ -263,7 +263,160 @@ elif command -v gtimeout >/dev/null 2>&1; then
 else
   DS_TIMEOUT_CMD="ds_timeout_missing"
 fi
+
 export DS_TIMEOUT_CMD
+
+# --foreground CAPABILITY DETECTION, SEPARATE PRIMITIVE (lr-c65d8a, successor
+# to lr-da3b7e; NARROWED from lr-c65d8a's first attempt per PEACHES PR #214
+# review finding 2, verified independently by HOLDEN).
+#
+# THE DEFECT lr-da3b7e SHIPPED: GNU/BSD `timeout` WITHOUT --foreground puts
+# the wrapped command in a NEW PROCESS GROUP so it can signal the whole
+# group at expiry. A wrapped command that touches the controlling terminal
+# from that non-foreground group (e.g. `claude` probing tty state) gets
+# SIGTTIN/SIGTTOU from the kernel and the whole group STOPS. A stopped
+# process cannot act on ordinary signals, including the SIGTERM timeout
+# sends at expiry -- so the guard never fires and the wrapped call hangs
+# forever, in ANY interactive terminal, regardless of network reachability.
+# lr-da3b7e fixed the network axis (bounded a previously-unbounded call) and
+# broke the tty axis in the process (bin/clagentic-lite's `claude plugin`/
+# `claude --version` call sites, GitHub issue #213).
+#
+# --foreground keeps the wrapped command in timeout's OWN (the caller's)
+# foreground process group, so it never triggers SIGTTIN/SIGTTOU against the
+# controlling terminal, and remains normally signalable at expiry.
+#
+# WHY THIS IS A SEPARATE VARIABLE, NOT A DS_TIMEOUT_CMD MUTATION: the first
+# version of this fix set --foreground into DS_TIMEOUT_CMD itself so "every
+# caller picks it up for free" -- that is exactly the defect. --foreground
+# CHANGES WHAT `timeout` BOUNDS: GNU's own --help states "children of
+# COMMAND will not be timed out" in foreground mode, i.e. only the DIRECT
+# CHILD is signalable at expiry, not the whole process group. DS_TIMEOUT_CMD
+# is the GENERIC bounding primitive consumed repo-wide -- scripts/gates.sh's
+# run_bounded (itself wrapping git fetch/ls-remote and every gate's external
+# tool call) and scripts/llm-client.sh's claude/codex/curl invocations all
+# rely on WHOLE-PROCESS-GROUP bounding to catch a hung DESCENDANT, which is
+# the entire point of a timeout at those sites. None of them touch a
+# controlling terminal the way `claude`'s own tty probe does, so none of
+# them need --foreground, and applying it there would silently convert
+# "bound the whole subtree" into "bound only the immediate child" --
+# trading lr-da3b7e's tty assumption for a timeout-SEMANTICS assumption
+# across the whole repo, the same shape of error on a different axis.
+# DS_TIMEOUT_CMD is therefore left UNCHANGED (whole-process-group bounding,
+# as before lr-c65d8a) and a second, foreground-scoped variable is
+# introduced for the small set of call sites that actually need it --
+# currently only the `claude plugin ...`/`claude --version` probes in
+# bin/clagentic-lite (GitHub issue #213's own repro).
+#
+# WHY DETECTED HERE, NOT ASSUMED, PER OPERATOR DIRECTIVE (lr-c65d8a seq 1):
+# --foreground is a GNU coreutils / BSD `timeout`/`gtimeout` flag, not
+# POSIX. Blanket-adding it without checking would trade the tty assumption
+# lr-da3b7e shipped for a coreutils-flavor assumption -- an equally
+# non-agnostic mistake in the opposite direction. This is the single site
+# AGENTS.md non-negotiable 5 designates for routing GNU/BSD differences, so
+# the detection lives here once. Callers that need foreground-scoped
+# bounding invoke `$DS_TIMEOUT_FOREGROUND_CMD "$DURATION" cmd...` (same
+# unquoted word-splitting convention as DS_TIMEOUT_CMD).
+#
+# `timeout --foreground` has accepted this flag before DURATION since GNU
+# coreutils 8.13 (2011); a `timeout`/`gtimeout` old enough to lack it prints
+# an unrecognized-option error on `--help`, which the probe below treats as
+# "not supported" and DS_TIMEOUT_FOREGROUND_CMD degrades to the bare
+# (non-foreground) $DS_TIMEOUT_CMD -- no worse than before lr-c65d8a for a
+# caller on an old timeout binary, never a new failure mode. When
+# DS_TIMEOUT_CMD is ds_timeout_missing (no timeout binary at all),
+# DS_TIMEOUT_FOREGROUND_CMD is set to the SAME ds_timeout_missing function:
+# FAIL CLOSED per INV-1a continues to apply regardless of this flag.
+#
+# ds_timeout_supports_flag: a NAMED, extensible capability probe rather than
+# a one-off inline `--help | grep`, so a future third bounding property
+# (e.g. a platform quirk needing both --foreground AND group-kill, or a BSD
+# `timeout`-specific flag) extends this same probe with a new flag argument
+# instead of hand-rolling a fourth ad hoc `--help | grep` and a third
+# exported global whose name encodes one hardcoded flag. This is the
+# smallest version of that generalization that still fits this codebase's
+# existing idiom: every DS_TIMEOUT_CMD-family call site invokes the result
+# as a bare word-splittable command prefix ($DS_TIMEOUT_CMD "$DURATION"
+# cmd...), so the exported artifact must stay a STRING, not a function --
+# but the DETECTION that builds that string is now a reusable named
+# primitive rather than inlined once per property. See lr-b8e7fb (filed
+# alongside this fix, not addressed here) for the larger, deliberately
+# out-of-scope question of whether the 58 existing DS_TIMEOUT_CMD-family
+# call sites across this codebase should route through a per-site
+# behavior-as-argument function instead of a raw exported string at all --
+# that is a repo-wide idiom change, not a fold-in-sized one.
+ds_timeout_supports_flag() {
+  # Args: TIMEOUT_BINARY_NAME  FLAG (e.g. "timeout" "--foreground")
+  "$1" --help 2>/dev/null | grep -qe "$2"
+}
+
+if [ "$DS_TIMEOUT_CMD" = "ds_timeout_missing" ]; then
+  DS_TIMEOUT_FOREGROUND_CMD="$DS_TIMEOUT_CMD"
+elif ds_timeout_supports_flag "$DS_TIMEOUT_CMD" '--foreground'; then
+  DS_TIMEOUT_FOREGROUND_CMD="$DS_TIMEOUT_CMD --foreground"
+else
+  DS_TIMEOUT_FOREGROUND_CMD="$DS_TIMEOUT_CMD"
+fi
+export DS_TIMEOUT_FOREGROUND_CMD
+
+# DS_TIMEOUT_CMD-FAMILY CALL-SITE CLASSIFICATION (lr-b8e7fb audit, folded
+# into lr-c65d8a per operator directive -- "do the audit, because it does
+# not exist and its absence is why your own not-applicable call was
+# wrong"). Every one of the 58 DS_TIMEOUT_CMD/DS_TIMEOUT_FOREGROUND_CMD
+# references across scripts/platform.sh, scripts/gates.sh,
+# scripts/llm-client.sh, and bin/clagentic-lite was read and classified by
+# which property that call site actually REQUIRES:
+#
+#   WHOLE-GROUP  -- a hung DESCENDANT process must be reachable at expiry
+#                   (the point of bounding at all for a network/subprocess
+#                   call with no controlling-terminal interaction).
+#   FOREGROUND   -- the wrapped command touches the CONTROLLING TERMINAL
+#                   (GitHub issue #213's mechanism: SIGTTIN/SIGTTOU stops a
+#                   non-foreground process group, and a stopped process
+#                   cannot receive the SIGTERM a plain `timeout` sends at
+#                   expiry) -- requires DS_TIMEOUT_FOREGROUND_CMD.
+#
+# RESULT: every real call site classifies as ONE of these two properties,
+# never both, never neither, and no third combination was found anywhere
+# in this codebase. THAT IS THE FINDING -- not an assumption going in. The
+# two buckets this fix already introduced (DS_TIMEOUT_CMD,
+# DS_TIMEOUT_FOREGROUND_CMD) are SUFFICIENT for the current call-site
+# population; ds_timeout_supports_flag exists specifically so a future
+# third property, if one is ever found, extends this same primitive rather
+# than requiring a redesign.
+#
+#   WHOLE-GROUP (DS_TIMEOUT_CMD, unchanged) -- every site not listed below:
+#     - scripts/gates.sh's run_bounded (the sole entry point for every
+#       gitleaks/osv-scanner/semgrep/`git push` call in that file, plus
+#       scripts/host-adapter.sh's `gh pr view/create/comment` calls) and
+#       the two `git fetch`/`git ls-remote` sites in
+#       _gate_resolve_fresh_default_branch_ref -- all non-interactive CLI
+#       subcommands with piped/redirected I/O, none touch a tty.
+#     - scripts/llm-client.sh's `claude --print` (1463/1469, stdin PIPED
+#       from a file via `cat`, never inherited), `codex exec` (1810/1814/
+#       1823, non-interactive `exec` form), the generic non-claude/codex
+#       carrier (1861, mirrors the same piped/redirected shape), and the
+#       router `curl` probe (2046) -- none touch a controlling terminal.
+#     - bin/clagentic-lite's `codex exec`/generic-CLI doctor auth probes
+#       and its router-version `curl` probe -- same reasoning as their
+#       llm-client.sh counterparts; see the classification comment at that
+#       case statement in bin/clagentic-lite for detail.
+#
+#   FOREGROUND (DS_TIMEOUT_FOREGROUND_CMD) -- every real `claude` call site
+#   whose stdin is INHERITED from the caller rather than piped/redirected,
+#   i.e. every site reachable from a real interactive terminal:
+#     - bin/clagentic-lite's 14 `claude plugin ...`/`claude --version`
+#       sites (this task's own P1 fix, GitHub issue #213's own repro).
+#     - bin/clagentic-lite's doctor LLM-CLI-auth-probe `claude --print
+#       "ping"` call -- FOUND BY THIS AUDIT, not previously classified.
+#       `doctor` is run interactively exactly like `update`/`init`, and
+#       this probe's stdin was inherited (only stdout/stderr redirected),
+#       unlike llm-client.sh's own `claude --print` sites which pipe stdin
+#       from a file. Fixed in the same commit that added this table.
+#
+# See bin/clagentic-lite's own per-site comments (near
+# _claude_plugin_list_or_unknown and the doctor auth-probe case statement)
+# for the detailed per-site reasoning this table summarizes.
 
 # ---------------------------------------------------------------- shared helpers
 

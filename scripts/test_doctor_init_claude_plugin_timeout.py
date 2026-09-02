@@ -33,6 +33,40 @@ CLAGENTIC_LITE_HOME (per test_doctor_config_drift.py's own HAZARD note) but
 uses the same clone helper anyway for consistency and because the stub
 `claude` on PATH needs its own throwaway bin dir regardless.
 
+SCOPE HAZARD, ADDED lr-c65d8a (GitHub issue #213, DO NOT MISTAKE THIS FILE
+FOR COMPLETE COVERAGE OF THE TIMEOUT GUARD): every test in this module runs
+with stdin=subprocess.DEVNULL (TestInitTerminatesOnUnreachableClaude) or a
+non-tty inherited stdin (TestDoctorTerminatesOnUnreachableClaude, via
+subprocess.run's default). That is deliberately the CI/non-interactive
+shape and is retained here as real, load-bearing coverage of the network-
+timeout axis lr-da3b7e fixed -- do not delete it.
+
+But it is STRUCTURALLY INCAPABLE of reproducing the SIGTTIN/SIGTTOU
+process-group stop GitHub issue #213 reported: that defect only manifests
+when the wrapped command has a REAL CONTROLLING TERMINAL to touch. A
+detached-stdin subprocess has no controlling terminal to raise SIGTTIN
+against in the first place, so this module's stub-sleeps-past-the-timeout
+technique proves the guard fires when there is nothing for SIGTTIN to
+interact with -- it says nothing about the interactive-terminal case. THIS
+IS EXACTLY THE GAP lr-da3b7e's own regression test had that let the SIGTTIN
+regression ship undetected (see lr-c65d8a's task description for the full
+diagnosis) -- recorded explicitly here per that task's own directive so
+this file's scope is never again mistaken for full timeout-guard coverage.
+The interactive/pty shape is covered separately by
+scripts/test_timeout_foreground_pty_regression.py, which drives a real pty
+and is the only place in this suite that can observe SIGTTIN at all.
+
+Also lr-c65d8a: `_write_hanging_claude`'s stub was changed from a plain
+child `sleep 300` to `exec sleep 300` -- see that function's own docstring
+for why the non-exec'd form silently broke this module's own coverage the
+moment bin/clagentic-lite's `claude` call sites switched to
+DS_TIMEOUT_FOREGROUND_CMD (a `--foreground`-bound timeout signals only its
+direct child, not a whole process group the way bare `timeout` does, so a
+non-exec'd grandchild survived and kept the wrapping pipe open). NARROWED
+further by PEACHES PR #214 review finding 2: --foreground now lives on the
+separate DS_TIMEOUT_FOREGROUND_CMD variable, never on DS_TIMEOUT_CMD itself
+-- see scripts/test_platform_timeout_foreground_detection.py.
+
 Run with: python3 -m unittest scripts.test_doctor_init_claude_plugin_timeout -v
 """
 import os
@@ -61,14 +95,30 @@ def _write_hanging_claude(bin_dir):
     """Stub `claude` that never returns for `plugin ...`/`--version`
     invocations -- simulates an unreachable/slow network. Sleeps far longer
     than _TEST_PLUGIN_TIMEOUT_SEC so a passing test proves the timeout
-    wrapper actually fired, not that the stub happened to finish first."""
+    wrapper actually fired, not that the stub happened to finish first.
+
+    `exec sleep 300`, NOT a plain `sleep 300` child call (lr-c65d8a
+    discovery): the real `claude` CLI is a single process (a Node.js
+    binary invoked directly, never itself forking a shell-visible child
+    the way this stub used to) -- DS_TIMEOUT_FOREGROUND_CMD's real-world
+    child IS the process that must receive the timeout signal.
+    `timeout --foreground` (used by DS_TIMEOUT_FOREGROUND_CMD, the variable
+    bin/clagentic-lite's `claude` call sites use as of lr-c65d8a) sends its
+    expiry signal ONLY to its direct child, not to a whole process-group
+    the way bare `timeout` does -- correct and sufficient for a
+    single-process real `claude`, but a plain (non-exec'd) `sleep` child of
+    a shell-script stub would survive its parent's SIGTERM and keep the
+    wrapping pipe open, silently reintroducing the exact unbounded-hang
+    class this test exists to catch, in the test fixture itself rather than
+    the product. `exec` replaces the stub shell's own process image with
+    `sleep`, matching the real single-process shape.
+    """
     path = os.path.join(bin_dir, "claude")
     with open(path, "w") as f:
         f.write(textwrap.dedent("""\
             #!/bin/sh
             # Simulates an unreachable/slow network: never returns on its own.
-            sleep 300
-            exit 0
+            exec sleep 300
         """))
     os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
     return path
