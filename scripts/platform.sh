@@ -264,7 +264,11 @@ else
   DS_TIMEOUT_CMD="ds_timeout_missing"
 fi
 
-# --foreground CAPABILITY DETECTION (lr-c65d8a, successor to lr-da3b7e).
+export DS_TIMEOUT_CMD
+
+# --foreground CAPABILITY DETECTION, SEPARATE PRIMITIVE (lr-c65d8a, successor
+# to lr-da3b7e; NARROWED from lr-c65d8a's first attempt per PEACHES PR #214
+# review finding 2, verified independently by HOLDEN).
 #
 # THE DEFECT lr-da3b7e SHIPPED: GNU/BSD `timeout` WITHOUT --foreground puts
 # the wrapped command in a NEW PROCESS GROUP so it can signal the whole
@@ -282,31 +286,55 @@ fi
 # foreground process group, so it never triggers SIGTTIN/SIGTTOU against the
 # controlling terminal, and remains normally signalable at expiry.
 #
+# WHY THIS IS A SEPARATE VARIABLE, NOT A DS_TIMEOUT_CMD MUTATION: the first
+# version of this fix set --foreground into DS_TIMEOUT_CMD itself so "every
+# caller picks it up for free" -- that is exactly the defect. --foreground
+# CHANGES WHAT `timeout` BOUNDS: GNU's own --help states "children of
+# COMMAND will not be timed out" in foreground mode, i.e. only the DIRECT
+# CHILD is signalable at expiry, not the whole process group. DS_TIMEOUT_CMD
+# is the GENERIC bounding primitive consumed repo-wide -- scripts/gates.sh's
+# run_bounded (itself wrapping git fetch/ls-remote and every gate's external
+# tool call) and scripts/llm-client.sh's claude/codex/curl invocations all
+# rely on WHOLE-PROCESS-GROUP bounding to catch a hung DESCENDANT, which is
+# the entire point of a timeout at those sites. None of them touch a
+# controlling terminal the way `claude`'s own tty probe does, so none of
+# them need --foreground, and applying it there would silently convert
+# "bound the whole subtree" into "bound only the immediate child" --
+# trading lr-da3b7e's tty assumption for a timeout-SEMANTICS assumption
+# across the whole repo, the same shape of error on a different axis.
+# DS_TIMEOUT_CMD is therefore left UNCHANGED (whole-process-group bounding,
+# as before lr-c65d8a) and a second, foreground-scoped variable is
+# introduced for the small set of call sites that actually need it --
+# currently only the `claude plugin ...`/`claude --version` probes in
+# bin/clagentic-lite (GitHub issue #213's own repro).
+#
 # WHY DETECTED HERE, NOT ASSUMED, PER OPERATOR DIRECTIVE (lr-c65d8a seq 1):
 # --foreground is a GNU coreutils / BSD `timeout`/`gtimeout` flag, not
 # POSIX. Blanket-adding it without checking would trade the tty assumption
 # lr-da3b7e shipped for a coreutils-flavor assumption -- an equally
 # non-agnostic mistake in the opposite direction. This is the single site
 # AGENTS.md non-negotiable 5 designates for routing GNU/BSD differences, so
-# the detection lives here once, and every one of DS_TIMEOUT_CMD's callers
-# (bin/clagentic-lite, scripts/gates.sh, scripts/llm-client.sh) picks it up
-# for free with no call-site change -- callers already invoke
-# `$DS_TIMEOUT_CMD "$DURATION" cmd...` unquoted, so a second space-separated
-# token in DS_TIMEOUT_CMD's value word-splits correctly at every site.
+# the detection lives here once. Callers that need foreground-scoped
+# bounding invoke `$DS_TIMEOUT_FOREGROUND_CMD "$DURATION" cmd...` (same
+# unquoted word-splitting convention as DS_TIMEOUT_CMD).
 #
 # `timeout --foreground` has accepted this flag before DURATION since GNU
 # coreutils 8.13 (2011); a `timeout`/`gtimeout` old enough to lack it prints
 # an unrecognized-option error on `--help`, which the probe below treats as
-# "not supported" and falls back to the bare (pre-lr-c65d8a-detection)
-# command -- no worse than before this fix, never a new failure mode.
-# ds_timeout_missing (no timeout binary at all) is untouched: FAIL CLOSED
-# per INV-1a continues to apply regardless of this flag.
-if [ "$DS_TIMEOUT_CMD" != "ds_timeout_missing" ]; then
-  if "$DS_TIMEOUT_CMD" --help 2>/dev/null | grep -qe '--foreground'; then
-    DS_TIMEOUT_CMD="$DS_TIMEOUT_CMD --foreground"
-  fi
+# "not supported" and DS_TIMEOUT_FOREGROUND_CMD degrades to the bare
+# (non-foreground) $DS_TIMEOUT_CMD -- no worse than before lr-c65d8a for a
+# caller on an old timeout binary, never a new failure mode. When
+# DS_TIMEOUT_CMD is ds_timeout_missing (no timeout binary at all),
+# DS_TIMEOUT_FOREGROUND_CMD is set to the SAME ds_timeout_missing function:
+# FAIL CLOSED per INV-1a continues to apply regardless of this flag.
+if [ "$DS_TIMEOUT_CMD" = "ds_timeout_missing" ]; then
+  DS_TIMEOUT_FOREGROUND_CMD="$DS_TIMEOUT_CMD"
+elif "$DS_TIMEOUT_CMD" --help 2>/dev/null | grep -qe '--foreground'; then
+  DS_TIMEOUT_FOREGROUND_CMD="$DS_TIMEOUT_CMD --foreground"
+else
+  DS_TIMEOUT_FOREGROUND_CMD="$DS_TIMEOUT_CMD"
 fi
-export DS_TIMEOUT_CMD
+export DS_TIMEOUT_FOREGROUND_CMD
 
 # ---------------------------------------------------------------- shared helpers
 

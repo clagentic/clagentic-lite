@@ -104,7 +104,7 @@ This checkout does not ship a tracked, live `.claude/hooks/*.sh` + `.claude/sett
 | `.codex/config.toml` | Codex sandbox + role config — operator-facing documentation only; not auto-loaded by the codex binary and never read by `invoke_codex` |
 | `.gitleaks.toml` | gitleaks config — extends defaults, narrow path+token allowlist |
 | `.github/pull_request_template.md` | governs this repo's own PRs opened through the GitHub web UI (four required sections: what changed/why, review provenance, trade-offs, out of scope). `_build_ship_pr_body` (`scripts/gates.sh`, lr-429b32) renders the equivalent structure — plus a fifth, gate-attestation section (lr-37a9c8, `.clagentic/lite/last-gate-manifest.json`) — automatically for a `gates ship`-opened PR — see `docs/GATES.md` "Ship-time PR body" and "Gate attestation manifest" |
-| `scripts/platform.sh` | GNU/BSD shims + shared helpers (`ds_load_env`, `ds_sql_escape`, `ds_audit_log`, `ds_json_field`, `ds_check_tool`, `ds_offer_install`, `$DS_TIMEOUT_CMD`) |
+| `scripts/platform.sh` | GNU/BSD shims + shared helpers (`ds_load_env`, `ds_sql_escape`, `ds_audit_log`, `ds_json_field`, `ds_check_tool`, `ds_offer_install`, `$DS_TIMEOUT_CMD`, `$DS_TIMEOUT_FOREGROUND_CMD` — same fail-closed detection, plus capability-detected `--foreground`; use only at a tty-touching call site, e.g. `claude` probes in `bin/clagentic-lite` — never as a drop-in for `$DS_TIMEOUT_CMD`'s whole-process-group bounding, see lr-c65d8a) |
 | `scripts/memory.sh` | SQLite session memory CRUD |
 | `scripts/llm-client.sh` | role-aware LLM wrapper with model_chain fallback |
 | `scripts/gates.sh` | gate orchestrator + digest + ship + merge-gate |
