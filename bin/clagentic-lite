@@ -932,6 +932,17 @@ _LEGACY_ROUTER_PLUGIN_CACHE_DIR="$HOME/.claude/plugins/cache/$_LEGACY_ROUTER_PLU
 # user-configurable the same way every other bounded external call in this
 # tool is.
 #
+# ALL 14 SITES USE DS_TIMEOUT_FOREGROUND_CMD, NOT DS_TIMEOUT_CMD (lr-c65d8a,
+# PEACHES PR #214 review finding 2 -- see scripts/platform.sh for the full
+# rationale). `claude` touches the controlling terminal on startup; a bare
+# `timeout`/`gtimeout` (no --foreground) puts it in a non-foreground process
+# group, so the kernel SIGTTIN-stops it and the wrapped call hangs forever
+# in any interactive terminal (GitHub issue #213). DS_TIMEOUT_FOREGROUND_CMD
+# is capability-detected --foreground bounding, scoped to exactly the call
+# sites that touch a tty; DS_TIMEOUT_CMD itself is untouched everywhere else
+# in the repo (scripts/gates.sh's run_bounded, scripts/llm-client.sh) so
+# their whole-process-group bounding of a hung descendant keeps working.
+#
 # STDIN, PER-SITE DECISION (lr-c65d8a seq 1, constraint 2): none of the 14
 # `claude plugin ...`/`claude --version` call sites bound by this timeout
 # are ever expected to prompt for input -- every one is a non-interactive,
@@ -950,25 +961,34 @@ _LEGACY_ROUTER_PLUGIN_CACHE_DIR="$HOME/.claude/plugins/cache/$_LEGACY_ROUTER_PLU
 _CLAUDE_PLUGIN_TIMEOUT=$(ds_positive_int_or_default "${CLAGENTIC_PLUGIN_TIMEOUT_SEC:-}" 30)
 
 # EMPTY-OUTPUT-EQUALS-ABSENCE SWEEP (lr-c65d8a absorbing lr-f8117f,
-# fnd-bc204a): every $DS_TIMEOUT_CMD-bound `claude plugin ...`/`claude
-# --version` call site above and below was audited for the same inference
-# a timed-out probe's empty output silently read as "answer: no/none".
+# fnd-bc204a): every $DS_TIMEOUT_FOREGROUND_CMD-bound `claude plugin ...`/
+# `claude --version` call site above and below was audited for the same
+# inference -- a timed-out probe's empty output silently read as "answer:
+# no/none".
 # _doctor_check_plugin_collision (below) and cmd_doctor's `claude --version`
 # probe are diagnostic REPORTS -- a timeout there must not read as a
-# passing/known answer, so both now check $DS_TIMEOUT_CMD's exit status and
-# report UNKNOWN rather than falling through to the empty-output branch.
-# _migrate_legacy_router_plugin and _install_clagentic_lite_plugin are
-# NOT APPLICABLE to that same fix: both are MUTATING install/migration
-# steps, not status reports. Their `grep -qE` guards over `claude plugin
-# list` output already fail safe on empty/timed-out input (no match ->
-# no destructive action attempted), and every actual mutation they DO
-# attempt (install/update/uninstall) already carries its own explicit
-# say/warn success-or-failure line from the `claude` subcommand's own real
-# exit status -- there is no silent-pass branch to fix here the way the two
-# diagnostic checks had. A timeout during `_install_clagentic_lite_plugin`'s
-# list check can fall through to attempting `claude plugin install` on an
-# already-installed plugin; that call's own warn/say output still reports
-# what actually happened, so no additional discrimination was added.
+# passing/known answer, so both check the probe's exit status and report
+# UNKNOWN rather than falling through to the empty-output branch.
+#
+# _migrate_legacy_router_plugin and _install_clagentic_lite_plugin: an
+# earlier version of this comment audited both as NOT APPLICABLE to this
+# sweep, reasoning that a `grep -qE` guard over `claude plugin list` output
+# already "fails safe" on empty/timed-out input (no match -> no destructive
+# action attempted). PEACHES PR #214 review finding 3 (verified by HOLDEN)
+# found that audit WRONG: "no match" is exactly what BOTH a timed-out probe
+# AND a genuinely-absent plugin produce, and the three `claude plugin list`
+# probes inside these two functions (removing the legacy router plugin;
+# migrating the pre-v1.2.0 plugin name; the exact-match install-vs-update
+# check) each fall through, on "no match", to a DESTRUCTIVE mutating call
+# (`claude plugin uninstall`/`install`/`update`) chosen ON THE BASIS OF an
+# answer the probe never actually returned. That is worse than the
+# diagnostic-only case fnd-bc204a described: a false negative here doesn't
+# just misreport, it mutates plugin state on unproven grounds. All three
+# `claude plugin list` probes in this pair of functions now apply the same
+# three-outcome discrimination as the two diagnostic checks (see
+# _claude_plugin_list_or_unknown below) -- PROBE-DID-NOT-COMPLETE is
+# reported and the mutating step is skipped, rather than silently treated
+# as GENUINELY-NO-MATCH.
 
 # _plugin_agent_needs_injection ROLE_ENV_PREFIX
 # Returns 0 (needs model: injected) when router injection is active
@@ -1141,6 +1161,55 @@ _installed_plugin_render_stamp() {
   grep -o '"clagenticStamp": *"[^"]*"' "$_iprs_file" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
 }
 
+# _claude_plugin_list_or_unknown
+# Runs `claude plugin list` under $DS_TIMEOUT_FOREGROUND_CMD and prints
+# THREE-OUTCOME discrimination on stdout as the first line, one of:
+#   OK <list output, possibly multi-line, everything after "OK ">
+#   EMPTY
+#   UNKNOWN <status>
+# Callers must read the first line to branch, then treat any remaining
+# lines (only present for OK) as the list body.
+#
+# WHY A SHARED HELPER (lr-c65d8a, PEACHES PR #214 review finding 3, fixing
+# the WRONG not-applicable audit an earlier version of this file's
+# EMPTY-OUTPUT-EQUALS-ABSENCE SWEEP comment recorded): a `claude plugin
+# list` probe that TIMES OUT or otherwise fails produces the exact same
+# empty stdout as a probe that genuinely found no matching plugin. Every
+# call site in this file that branches on `claude plugin list | grep -q`
+# was, before this fix, treating "no match" as proof of absence — correct
+# when the probe actually ran, silently wrong when it didn't. The two
+# diagnostic call sites (_doctor_check_plugin_collision, cmd_doctor's
+# `claude --version` probe) already had their own hand-written version of
+# this discrimination; _migrate_legacy_router_plugin and
+# _install_clagentic_lite_plugin's three `claude plugin list` probes did
+# not, and were wrongly audited as not needing it (see the sweep comment
+# near _CLAUDE_PLUGIN_TIMEOUT's definition). A false negative in a
+# diagnostic check misreports; a false negative here PROCEEDS TO A
+# DESTRUCTIVE `claude plugin install/update/uninstall` CALL on the basis of
+# an answer the probe never returned — worse, not merely inconsistent, so
+# this is fixed once, here, rather than re-deriving the same discrimination
+# a fourth and fifth time at each mutating call site.
+_claude_plugin_list_or_unknown() {
+  # `|| _cplu_status=$?`, not a bare assignment -- under this file's
+  # `set -e`, an unguarded `_v=$(cmd)` whose substitution exits non-zero
+  # (124 on timeout) would abort the WHOLE SCRIPT here (lr-c65d8a).
+  _cplu_status=0
+  _cplu_list=$($DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin list 2>/dev/null) || _cplu_status=$?
+  if [ "$_cplu_status" -eq 124 ] || [ "$_cplu_status" -eq 137 ]; then
+    printf 'UNKNOWN %s\n' "$_cplu_status"
+    return 0
+  fi
+  if [ -z "$_cplu_list" ]; then
+    if [ "$_cplu_status" -ne 0 ]; then
+      printf 'UNKNOWN %s\n' "$_cplu_status"
+    else
+      printf 'EMPTY\n'
+    fi
+    return 0
+  fi
+  printf 'OK %s\n' "$_cplu_list"
+}
+
 # _doctor_check_plugin_collision OK_FN FAIL_FN
 # Generic backstop (lr-1b5a31): the single-plugin render makes the
 # clagentic-lite-vs-clagentic-lite-router collision structurally impossible
@@ -1183,26 +1252,22 @@ _doctor_check_plugin_collision() {
     printf '  (claude not on PATH — skipping)\n'
     return 0
   fi
-  # `|| _dcpc_status=$?`, not a bare assignment -- under this file's
-  # `set -e`, an unguarded `_v=$(cmd)` whose substitution exits non-zero
-  # (124 on timeout) would abort the WHOLE SCRIPT here rather than
-  # reaching the discrimination logic below (lr-c65d8a: same class of bug
-  # as cmd_doctor's claude --version probe a few hundred lines down --
-  # both caught by this task's own new pty/timeout test suite).
-  _dcpc_status=0
-  _dcpc_list=$($DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin list 2>/dev/null) || _dcpc_status=$?
-  if [ "$_dcpc_status" -eq 124 ] || [ "$_dcpc_status" -eq 137 ]; then
-    printf '  UNKNOWN `claude plugin list` timed out after %ss — collision status could not be determined (slow/unreachable network?). Re-run doctor once the network recovers, or raise CLAGENTIC_PLUGIN_TIMEOUT_SEC.\n' "$_CLAUDE_PLUGIN_TIMEOUT"
-    return 0
-  fi
-  if [ -z "$_dcpc_list" ]; then
-    if [ "$_dcpc_status" -ne 0 ]; then
-      printf '  UNKNOWN `claude plugin list` exited %s with no output — collision status could not be determined.\n' "$_dcpc_status"
-    else
+  # Three-outcome discrimination via the shared _claude_plugin_list_or_unknown
+  # helper (lr-c65d8a) -- see that function's own comment for why a timed-out
+  # probe must not be read as "no plugins".
+  _dcpc_probe="$(_claude_plugin_list_or_unknown)"
+  case "$_dcpc_probe" in
+    "UNKNOWN "*)
+      printf '  UNKNOWN `claude plugin list` timed out or failed after %ss (%s) — collision status could not be determined (slow/unreachable network?). Re-run doctor once the network recovers, or raise CLAGENTIC_PLUGIN_TIMEOUT_SEC.\n' \
+        "$_CLAUDE_PLUGIN_TIMEOUT" "${_dcpc_probe#UNKNOWN }"
+      return 0
+      ;;
+    "EMPTY")
       printf '  (no plugins installed, or `claude plugin list` produced no output — skipping)\n'
-    fi
-    return 0
-  fi
+      return 0
+      ;;
+  esac
+  _dcpc_list="${_dcpc_probe#OK }"
   _dcpc_collisions=$(printf '%s\n' "$_dcpc_list" \
     | grep -oE '[A-Za-z0-9_-]+@[A-Za-z0-9_-]+' 2>/dev/null \
     | awk -F'@' '{print $1}' | sort | uniq -d || true)
@@ -1493,13 +1558,31 @@ _doctor_check_config_drift() {
 #      single-plugin model regardless of prior drift direction or whatever
 #      state Claude Code's own plugin manager left the cache in.
 _migrate_legacy_router_plugin() {
-  if command -v claude >/dev/null 2>&1 && \
-     $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_LEGACY_ROUTER_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
-    say "migrating: removing legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME (superseded by config-aware single-plugin render, lr-1b5a31)..."
-    $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "${_LEGACY_ROUTER_PLUGIN_NAME}@${_LEGACY_ROUTER_PLUGIN_NAME}" 2>/dev/null || \
-      $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || \
-      warn "could not uninstall legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME via the plugin manager — cache directory will still be removed directly below"
-    $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin marketplace remove "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || true
+  if command -v claude >/dev/null 2>&1; then
+    # Three-outcome discrimination (lr-c65d8a, PEACHES PR #214 review
+    # finding 3): a probe that TIMED OUT must not be read as "legacy plugin
+    # not present" -- that would silently skip the uninstall this function
+    # exists to run. Only an OK probe that actually matches the legacy name
+    # proceeds to the mutating uninstall calls below; UNKNOWN is reported
+    # and this block is skipped (the unconditional cache-directory removal
+    # further down still runs regardless, per lr-35315f gap 1).
+    _mlrp_probe="$(_claude_plugin_list_or_unknown)"
+    case "$_mlrp_probe" in
+      "UNKNOWN "*)
+        warn "\`claude plugin list\` timed out or failed (${_mlrp_probe#UNKNOWN }) — could not determine whether legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME is still registered; skipping plugin-manager uninstall this run (cache-directory removal below still applies)"
+        ;;
+      "OK "*)
+        _mlrp_list="${_mlrp_probe#OK }"
+        if printf '%s\n' "$_mlrp_list" | grep -qE "(^|[[:space:]])${_LEGACY_ROUTER_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
+          say "migrating: removing legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME (superseded by config-aware single-plugin render, lr-1b5a31)..."
+          $DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "${_LEGACY_ROUTER_PLUGIN_NAME}@${_LEGACY_ROUTER_PLUGIN_NAME}" 2>/dev/null || \
+            $DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || \
+            warn "could not uninstall legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME via the plugin manager — cache directory will still be removed directly below"
+          $DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin marketplace remove "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || true
+        fi
+        ;;
+      # EMPTY: genuinely no plugins installed -- nothing to migrate.
+    esac
   fi
 
   # Cache-directory removal runs regardless of whether `claude` is on PATH
@@ -1511,6 +1594,21 @@ _migrate_legacy_router_plugin() {
     say "migrating: removing orphaned legacy plugin cache directory $_LEGACY_ROUTER_PLUGIN_CACHE_DIR..."
     rm -rf "$_LEGACY_ROUTER_PLUGIN_CACHE_DIR" 2>/dev/null || \
       warn "could not remove legacy plugin cache directory $_LEGACY_ROUTER_PLUGIN_CACHE_DIR — remove manually"
+  fi
+}
+
+# _install_clagentic_lite_plugin_fresh
+# Shared "not currently installed" branch of _install_clagentic_lite_plugin
+# (lr-c65d8a) -- reached both when a real probe confirms the plugin is
+# genuinely absent (EMPTY) and when a probe confirms it does not carry the
+# current name (OK, no match). Kept as one function rather than duplicated
+# inline so the actual `claude plugin install` call and its warn message
+# exist in exactly one place.
+_install_clagentic_lite_plugin_fresh() {
+  if $DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin install "${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"; then
+    say "installed plugin: $_RENDERED_PLUGIN_NAME (agents and skills available globally)"
+  else
+    warn "claude plugin install failed — run manually: claude plugin marketplace add $_RENDERED_PLUGIN_DIR && claude plugin install ${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"
   fi
 }
 
@@ -1544,38 +1642,68 @@ _install_clagentic_lite_plugin() {
 
   _render_clagentic_lite_plugin_dir || { warn "plugin render failed — skipping plugin install"; return 1; }
 
-  $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin marketplace add "$_RENDERED_PLUGIN_DIR" --scope user 2>/dev/null || true
+  $DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin marketplace add "$_RENDERED_PLUGIN_DIR" --scope user 2>/dev/null || true
 
   # Migration: uninstall the pre-v1.2.0 plugin name (clagentic-lite-agents)
   # before the exact-match check below. Without this, its presence causes
   # the check to fall through to 'plugin update', which fails because the
   # current name was never installed under the old label.
-  if $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite-agents(@|[[:space:]]|$)'; then
-    say "migrating: removing old plugin name clagentic-lite-agents..."
-    $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "clagentic-lite-agents@clagentic-lite" 2>/dev/null || \
-      $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "clagentic-lite-agents" 2>/dev/null || \
-      warn "could not uninstall old plugin clagentic-lite-agents — remove manually: claude plugin uninstall clagentic-lite-agents"
-  fi
+  #
+  # Three-outcome discrimination (lr-c65d8a, PEACHES PR #214 review finding
+  # 3): a probe that TIMED OUT must not be read as "old plugin name absent"
+  # -- proceed to the migration uninstall only on a confirmed OK match;
+  # report and skip on UNKNOWN rather than silently assuming absence.
+  _icp_probe="$(_claude_plugin_list_or_unknown)"
+  case "$_icp_probe" in
+    "UNKNOWN "*)
+      warn "\`claude plugin list\` timed out or failed (${_icp_probe#UNKNOWN }) — could not determine whether old plugin name clagentic-lite-agents is still installed; skipping that migration step this run"
+      ;;
+    "OK "*)
+      if printf '%s\n' "${_icp_probe#OK }" | grep -qE '(^|[[:space:]])clagentic-lite-agents(@|[[:space:]]|$)'; then
+        say "migrating: removing old plugin name clagentic-lite-agents..."
+        $DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "clagentic-lite-agents@clagentic-lite" 2>/dev/null || \
+          $DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "clagentic-lite-agents" 2>/dev/null || \
+          warn "could not uninstall old plugin clagentic-lite-agents — remove manually: claude plugin uninstall clagentic-lite-agents"
+      fi
+      ;;
+    # EMPTY: genuinely no plugins installed -- nothing to migrate.
+  esac
 
   # Exact-match check: grep for the current plugin name as a whole token, not
   # a substring. "clagentic-lite-agents" contains "clagentic-lite" as a
   # prefix; substring grep would falsely match it and skip the install of
   # the renamed plugin.
-  if $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_RENDERED_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
-    $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin marketplace update "$_RENDERED_PLUGIN_NAME" 2>/dev/null || \
-      warn "claude plugin marketplace update failed — plugin may be stale"
-    if $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin update "${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"; then
-      say "updated plugin: $_RENDERED_PLUGIN_NAME"
-    else
-      warn "claude plugin update failed for $_RENDERED_PLUGIN_NAME; run manually: claude plugin update ${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"
-    fi
-  else
-    if $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin install "${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"; then
-      say "installed plugin: $_RENDERED_PLUGIN_NAME (agents and skills available globally)"
-    else
-      warn "claude plugin install failed — run manually: claude plugin marketplace add $_RENDERED_PLUGIN_DIR && claude plugin install ${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"
-    fi
-  fi
+  #
+  # Three-outcome discrimination (same finding as above): a re-probe here
+  # (rather than reusing the one above) because `claude plugin uninstall`
+  # may have just run and changed the answer. UNKNOWN must not be read as
+  # "not installed" -- that would incorrectly route to `claude plugin
+  # install` on an already-installed plugin instead of `update`, and would
+  # do so on the basis of an answer the probe never returned. Report and
+  # skip this run rather than guess. EMPTY and a confirmed non-match both
+  # mean "genuinely not installed" and share the install branch below.
+  _icp_probe2="$(_claude_plugin_list_or_unknown)"
+  case "$_icp_probe2" in
+    "UNKNOWN "*)
+      warn "\`claude plugin list\` timed out or failed (${_icp_probe2#UNKNOWN }) — could not determine whether $_RENDERED_PLUGIN_NAME is already installed; skipping install/update this run. Re-run \`clagentic-lite update\` once the network recovers, or raise CLAGENTIC_PLUGIN_TIMEOUT_SEC."
+      ;;
+    "OK "*)
+      if printf '%s\n' "${_icp_probe2#OK }" | grep -qE "(^|[[:space:]])${_RENDERED_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
+        $DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin marketplace update "$_RENDERED_PLUGIN_NAME" 2>/dev/null || \
+          warn "claude plugin marketplace update failed — plugin may be stale"
+        if $DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin update "${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"; then
+          say "updated plugin: $_RENDERED_PLUGIN_NAME"
+        else
+          warn "claude plugin update failed for $_RENDERED_PLUGIN_NAME; run manually: claude plugin update ${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"
+        fi
+      else
+        _install_clagentic_lite_plugin_fresh
+      fi
+      ;;
+    "EMPTY")
+      _install_clagentic_lite_plugin_fresh
+      ;;
+  esac
 
   if [ -n "${CLAGENTIC_ROUTER_URL:-}" ] && [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" = "1" ]; then
     say "router agent-model injection active (model: role:<role>-chain on reviewer/auditor/merge-gate where CLAGENTIC_<ROLE>_CMD is non-claude)"
@@ -3251,7 +3379,7 @@ cmd_doctor() {
     # defaults to 0 (`|| true`-equivalent) only when the trailing `||`
     # itself doesn't run, i.e. when the substitution succeeded.
     _claude_ver_status=0
-    _claude_ver_raw=$($DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude --version 2>/dev/null) || _claude_ver_status=$?
+    _claude_ver_raw=$($DS_TIMEOUT_FOREGROUND_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude --version 2>/dev/null) || _claude_ver_status=$?
     # THREE-OUTCOME DISCRIMINATION (lr-c65d8a/lr-f8117f, same pattern as
     # _doctor_check_plugin_collision above): a timed-out probe must not be
     # reported as if it were a real (if unparseable) version string — empty
