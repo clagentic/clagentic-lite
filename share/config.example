@@ -267,6 +267,15 @@ CLAGENTIC_SQLITE_BUSY_TIMEOUT_MS=5000
 # tool is missing. Off by default so scripted init runs don't fail spuriously.
 CLAGENTIC_STRICT_PREFLIGHT=0
 
+# `claude plugin ...`/`claude --version` timeout (seconds), used by doctor's
+# plugin-collision check and init/update's plugin install/migration path
+# (bin/clagentic-lite, lr-da3b7e). These are network calls (marketplace
+# add/update/list/install hit Claude Code's plugin registry) that previously
+# had no timeout wrapper at all -- a slow or unreachable network could hang
+# `doctor` or `init` indefinitely with no diagnostic. Non-numeric, empty, or
+# zero falls back to the default.
+CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
+
 # ---------- repo host ----------
 # github | gitlab | gitea | none
 CLAGENTIC_REPO_HOST=github

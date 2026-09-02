@@ -920,6 +920,18 @@ _LEGACY_ROUTER_PLUGIN_NAME="clagentic-lite-router"
 # literal name, never an interpolated/config-derived path — this satisfies
 # that by construction, not by convention.
 _LEGACY_ROUTER_PLUGIN_CACHE_DIR="$HOME/.claude/plugins/cache/$_LEGACY_ROUTER_PLUGIN_NAME"
+# Wall-clock bound for every `claude plugin ...`/`claude --version` subprocess
+# call below (lr-da3b7e, fnd-fdb04d): these are network calls (marketplace
+# add/update/list/install hit Claude Code's plugin registry) with no timeout
+# wrapper previously at all, distinct from and in addition to doctor's
+# existing 10s LLM auth probe / router curl probe timeouts (both already
+# $DS_TIMEOUT_CMD-bound). A user on a slow or unreachable network could hang
+# `doctor` or `init` indefinitely with no diagnostic. Follows this codebase's
+# established CLAGENTIC_<SCOPE>_TIMEOUT_SEC + ds_positive_int_or_default
+# convention (see share/config.example) rather than a bare literal, so it is
+# user-configurable the same way every other bounded external call in this
+# tool is.
+_CLAUDE_PLUGIN_TIMEOUT=$(ds_positive_int_or_default "${CLAGENTIC_PLUGIN_TIMEOUT_SEC:-}" 30)
 
 # _plugin_agent_needs_injection ROLE_ENV_PREFIX
 # Returns 0 (needs model: injected) when router injection is active
@@ -1117,7 +1129,7 @@ _doctor_check_plugin_collision() {
     printf '  (claude not on PATH — skipping)\n'
     return 0
   fi
-  _dcpc_list=$(claude plugin list 2>/dev/null || true)
+  _dcpc_list=$($DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin list 2>/dev/null || true)
   if [ -z "$_dcpc_list" ]; then
     printf '  (no plugins installed, or `claude plugin list` produced no output — skipping)\n'
     return 0
@@ -1413,12 +1425,12 @@ _doctor_check_config_drift() {
 #      state Claude Code's own plugin manager left the cache in.
 _migrate_legacy_router_plugin() {
   if command -v claude >/dev/null 2>&1 && \
-     claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_LEGACY_ROUTER_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
+     $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_LEGACY_ROUTER_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
     say "migrating: removing legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME (superseded by config-aware single-plugin render, lr-1b5a31)..."
-    claude plugin uninstall "${_LEGACY_ROUTER_PLUGIN_NAME}@${_LEGACY_ROUTER_PLUGIN_NAME}" 2>/dev/null || \
-      claude plugin uninstall "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || \
+    $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "${_LEGACY_ROUTER_PLUGIN_NAME}@${_LEGACY_ROUTER_PLUGIN_NAME}" 2>/dev/null || \
+      $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || \
       warn "could not uninstall legacy plugin $_LEGACY_ROUTER_PLUGIN_NAME via the plugin manager — cache directory will still be removed directly below"
-    claude plugin marketplace remove "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || true
+    $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin marketplace remove "$_LEGACY_ROUTER_PLUGIN_NAME" 2>/dev/null || true
   fi
 
   # Cache-directory removal runs regardless of whether `claude` is on PATH
@@ -1463,16 +1475,16 @@ _install_clagentic_lite_plugin() {
 
   _render_clagentic_lite_plugin_dir || { warn "plugin render failed — skipping plugin install"; return 1; }
 
-  claude plugin marketplace add "$_RENDERED_PLUGIN_DIR" --scope user 2>/dev/null || true
+  $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin marketplace add "$_RENDERED_PLUGIN_DIR" --scope user 2>/dev/null || true
 
   # Migration: uninstall the pre-v1.2.0 plugin name (clagentic-lite-agents)
   # before the exact-match check below. Without this, its presence causes
   # the check to fall through to 'plugin update', which fails because the
   # current name was never installed under the old label.
-  if claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite-agents(@|[[:space:]]|$)'; then
+  if $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin list 2>/dev/null | grep -qE '(^|[[:space:]])clagentic-lite-agents(@|[[:space:]]|$)'; then
     say "migrating: removing old plugin name clagentic-lite-agents..."
-    claude plugin uninstall "clagentic-lite-agents@clagentic-lite" 2>/dev/null || \
-      claude plugin uninstall "clagentic-lite-agents" 2>/dev/null || \
+    $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "clagentic-lite-agents@clagentic-lite" 2>/dev/null || \
+      $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin uninstall "clagentic-lite-agents" 2>/dev/null || \
       warn "could not uninstall old plugin clagentic-lite-agents — remove manually: claude plugin uninstall clagentic-lite-agents"
   fi
 
@@ -1480,16 +1492,16 @@ _install_clagentic_lite_plugin() {
   # a substring. "clagentic-lite-agents" contains "clagentic-lite" as a
   # prefix; substring grep would falsely match it and skip the install of
   # the renamed plugin.
-  if claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_RENDERED_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
-    claude plugin marketplace update "$_RENDERED_PLUGIN_NAME" 2>/dev/null || \
+  if $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin list 2>/dev/null | grep -qE "(^|[[:space:]])${_RENDERED_PLUGIN_NAME}(@|[[:space:]]|\$)"; then
+    $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin marketplace update "$_RENDERED_PLUGIN_NAME" 2>/dev/null || \
       warn "claude plugin marketplace update failed — plugin may be stale"
-    if claude plugin update "${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"; then
+    if $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin update "${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"; then
       say "updated plugin: $_RENDERED_PLUGIN_NAME"
     else
       warn "claude plugin update failed for $_RENDERED_PLUGIN_NAME; run manually: claude plugin update ${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"
     fi
   else
-    if claude plugin install "${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"; then
+    if $DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude plugin install "${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"; then
       say "installed plugin: $_RENDERED_PLUGIN_NAME (agents and skills available globally)"
     else
       warn "claude plugin install failed — run manually: claude plugin marketplace add $_RENDERED_PLUGIN_DIR && claude plugin install ${_RENDERED_PLUGIN_NAME}@${_RENDERED_PLUGIN_NAME}"
@@ -3160,7 +3172,7 @@ cmd_doctor() {
     printf '  INFO codex: not on PATH (minimum required: %s)\n' "$_codex_min"
   fi
   if command -v claude >/dev/null 2>&1; then
-    _claude_ver_raw=$(claude --version 2>/dev/null || true)
+    _claude_ver_raw=$($DS_TIMEOUT_CMD "$_CLAUDE_PLUGIN_TIMEOUT" claude --version 2>/dev/null || true)
     _claude_ver=$(printf '%s' "$_claude_ver_raw" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
     if [ -n "$_claude_ver" ]; then
       printf '  INFO claude %s (on PATH)\n' "$_claude_ver"
