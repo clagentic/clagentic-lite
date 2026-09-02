@@ -604,12 +604,16 @@ _validate_router_url() {
 #
 # NO DOUBLE QUOTES in the generated command string, deliberately: the
 # command is embedded into a JSON string value by the caller, and every
-# double quote inside it would need JSON-escaping to stay valid. Using only
-# single quotes around GLOBAL_CONFIG inside the inner `sh -c '...'` avoids
-# that class of bug entirely rather than depending on the caller to escape
-# correctly — GLOBAL_CONFIG is a fixed HOME-derived path (never
-# operator-typed at this call site), so it never itself contains a single
-# quote that would need its own escaping here.
+# double quote inside it would need JSON-escaping to stay valid. The whole
+# command is wrapped in single quotes for the outer `sh -c '...'`, and
+# GLOBAL_CONFIG is ALSO individually single-quoted inside that string via
+# the standard POSIX close-escape-reopen trick ('\''), so a $HOME containing
+# a space (unremarkable on macOS) still produces a single grep argv token
+# instead of splitting on the space and either erroring or silently
+# searching the wrong (or a nonexistent) path. GLOBAL_CONFIG is a fixed
+# HOME-derived path (never operator-typed at this call site), so it never
+# itself contains a single quote that would need its own escaping here —
+# only whitespace-safety is in scope.
 #
 # FAIL-QUIET BY THE PLATFORM'S OWN CONTRACT: if GLOBAL_CONFIG is missing or
 # the key is absent, this prints nothing — Claude Code's own apiKeyHelper
@@ -618,7 +622,8 @@ _validate_router_url() {
 # here: better a loud auth error than a session that silently authenticates
 # with a stale or wrong credential.
 _render_api_key_helper_command() {
-  printf "sh -c 'grep ^CLAGENTIC_ROUTER_TOKEN= %s 2>/dev/null | tail -1 | cut -d= -f2-'" "$GLOBAL_CONFIG"
+  _raihc_q_config=$(printf '%s' "$GLOBAL_CONFIG" | sed "s/'/'\\\\''/g")
+  printf "sh -c 'grep ^CLAGENTIC_ROUTER_TOKEN= '\\''%s'\\'' 2>/dev/null | tail -1 | cut -d= -f2-'" "$_raihc_q_config"
 }
 
 # _render_claude_settings_body TEMPLATE_FILE > stdout
