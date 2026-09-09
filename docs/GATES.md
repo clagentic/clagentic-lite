@@ -1279,6 +1279,31 @@ the shipped snapshot extends it without waiting for a release:
 either snapshot only ever widens what's treated as in-domain (the allowlist
 default), never narrows it — see "Fail-closed enumeration" above.
 
+**Re-sync trigger — when to bump `CLAGENTIC_DEPS_DOMAIN_VERSION` /
+`CLAGENTIC_SAST_DOMAIN_VERSION`.** These version strings exist so a
+snapshot's staleness is visible in the audit trail (every `not_applicable`
+row's `details` records which version it was tested against) rather than
+silently rotting — but nothing re-checks them automatically. Re-derive the
+glob list and bump the version string (`vN-YYYY-MM` format) when any of:
+
+- **osv-scanner** ships a new major/minor release that adds support for a
+  new package ecosystem or manifest/lockfile filename (check
+  <https://google.github.io/osv-scanner/supported-languages-and-lockfiles/>
+  against `_gate_deps_domain_globs`, `scripts/gates.sh`).
+- **semgrep** ships a new major/minor release that changes what
+  `--config=auto`'s registry-selected ruleset covers by default — a new
+  language, or a new build/config filename a registry rule commonly reads
+  (check semgrep's own release notes against `_gate_sast_domain_globs`).
+- **`CLAGENTIC_DEPS_DOMAIN_EXTRA_GLOBS` / `CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS`
+  usage recurs** across multiple unrelated repos for the same glob pattern
+  — a repeated per-repo override is a signal the built-in snapshot itself
+  should absorb that pattern rather than leaving every repo to widen it
+  independently.
+
+A version bump with no glob-list change (e.g. confirming a scanner release
+changed nothing relevant) is still worth recording — it moves the "last
+checked against upstream" evidence forward even when the diff is empty.
+
 ### Suppression policy — inline `# nosemgrep` vs the repo-level exclude ladder (lr-cfc360)
 
 Two mechanisms exist for a registry SAST rule that no correct code can satisfy. Both are legitimate; neither is a default reach-for-first. **A suppression is a claim that a specific finding is a false positive or genuinely unsatisfiable, not a shortcut around review** — see "The suppression-review loop" below for what happens when that claim doesn't hold.

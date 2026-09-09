@@ -518,5 +518,614 @@ class TestDirectInvocationUnaffected(unittest.TestCase):
         self.assertNotEqual(outcome, "not_applicable")
 
 
+class TestShallowCloneRunsEveryGate(unittest.TestCase):
+    """A shallow clone (--depth 1) makes any merge-base/diff computed
+    against a commit outside the fetched depth unreliable --
+    `--is-shallow-repository` must make the whole push inconclusive (STRONG
+    form: the scanner is actually invoked), even for an otherwise
+    docs-only-looking diff."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-domain-shallow-")
+        self._bin = os.path.join(self._tmp, "bin")
+        self._osv_argv = os.path.join(self._tmp, "osv_argv.log")
+        open(self._osv_argv, "w").close()
+        self._sast_argv = os.path.join(self._tmp, "sast_argv.log")
+        open(self._sast_argv, "w").close()
+        _write_fake_osv_scanner(self._bin, self._osv_argv, exit_code=0)
+        _write_fake_semgrep(self._bin, self._sast_argv, exit_code=0)
+
+        env = {**os.environ, **_GIT_ENV}
+        self._origin = os.path.join(self._tmp, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", self._origin], check=True)
+        seed = os.path.join(self._tmp, "seed")
+        subprocess.run(["git", "clone", "-q", self._origin, seed], check=True)
+        for i in range(3):
+            _commit(seed, "README.md", f"hello {i}\n", f"c{i}", env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=seed, env=env)
+        self._base_sha = _sha(seed, "HEAD")
+
+        # --depth is ignored for a local filesystem-path clone; a file://
+        # URL forces git to honor it and produce a genuinely shallow clone.
+        self._work = os.path.join(self._tmp, "work")
+        subprocess.run(
+            ["git", "clone", "-q", "--depth", "1", "--branch", "main", "file://" + self._origin, self._work],
+            check=True,
+        )
+        is_shallow = subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"], cwd=self._work,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert is_shallow == "true", "fixture setup did not produce a real shallow clone"
+
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=self._work, env=env)
+        _commit(self._work, "README.md", "hello docs-only change\n", "docs-only", env)
+        self._new_sha = _sha(self._work, "HEAD")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_shallow_clone_runs_deps(self):
+        stdin = f"refs/heads/feature {self._new_sha} refs/heads/feature {self._base_sha}\n"
+        result = _run_pre_push(
+            self._work, self._bin, stdin,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        with open(self._osv_argv) as f:
+            self.assertNotEqual(f.read(), "", "a shallow clone must run deps, never skip")
+        outcome, _ = _last_audit_row(self._work, "deps")
+        self.assertNotEqual(outcome, "not_applicable")
+
+
+class TestGraftedHistoryRunsEveryGate(unittest.TestCase):
+    """Grafted history (.git/info/grafts) is NOT caught by
+    --is-shallow-repository (a separate mechanism) and can make the
+    ancestor check give a false positive by forging one commit as
+    another's parent. A non-empty info/grafts must make the whole push
+    inconclusive."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-domain-graft-")
+        self._bin = os.path.join(self._tmp, "bin")
+        self._osv_argv = os.path.join(self._tmp, "osv_argv.log")
+        open(self._osv_argv, "w").close()
+        self._sast_argv = os.path.join(self._tmp, "sast_argv.log")
+        open(self._sast_argv, "w").close()
+        _write_fake_osv_scanner(self._bin, self._osv_argv, exit_code=0)
+        _write_fake_semgrep(self._bin, self._sast_argv, exit_code=0)
+
+        env = {**os.environ, **_GIT_ENV}
+        self._origin, self._work = _init_origin_and_work(self._tmp)
+        _commit(self._work, "README.md", "hello\n", "initial", env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=self._work, env=env)
+        self._base_sha = _sha(self._work, "HEAD")
+
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=self._work, env=env)
+        _commit(self._work, "README.md", "hello docs-only change\n", "docs-only", env)
+        self._new_sha = _sha(self._work, "HEAD")
+
+        # A minimal, harmless graft: give base_sha a (nonexistent, but
+        # syntactically valid 40-hex) fake parent. The exact content only
+        # needs to make info/grafts non-empty -- the guard checked here is
+        # presence, not semantic validity of the graft.
+        grafts_path = os.path.join(self._work, ".git", "info", "grafts")
+        os.makedirs(os.path.dirname(grafts_path), exist_ok=True)
+        with open(grafts_path, "w") as f:
+            f.write(self._base_sha + "\n")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_grafted_history_runs_deps(self):
+        stdin = f"refs/heads/feature {self._new_sha} refs/heads/feature {self._base_sha}\n"
+        result = _run_pre_push(
+            self._work, self._bin, stdin,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        with open(self._osv_argv) as f:
+            self.assertNotEqual(f.read(), "", "grafted history must run deps, never skip")
+        outcome, _ = _last_audit_row(self._work, "deps")
+        self.assertNotEqual(outcome, "not_applicable")
+
+
+class TestMergeCommitCapturesFullDiff(unittest.TestCase):
+    """A merge commit introducing a manifest via a non-first-parent branch
+    must still run deps -- `git diff old..new --raw` reports the full
+    diff, not first-parent-only, so a merge's actual file introductions
+    are captured regardless of which parent introduced them."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-domain-merge-")
+        self._bin = os.path.join(self._tmp, "bin")
+        self._osv_argv = os.path.join(self._tmp, "osv_argv.log")
+        open(self._osv_argv, "w").close()
+        self._sast_argv = os.path.join(self._tmp, "sast_argv.log")
+        open(self._sast_argv, "w").close()
+        _write_fake_osv_scanner(self._bin, self._osv_argv, exit_code=0)
+        _write_fake_semgrep(self._bin, self._sast_argv, exit_code=0)
+
+        env = {**os.environ, **_GIT_ENV}
+        self._origin, self._work = _init_origin_and_work(self._tmp)
+        _commit(self._work, "README.md", "hello\n", "initial", env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=self._work, env=env)
+        self._base_sha = _sha(self._work, "HEAD")
+
+        # feature: docs-only change.
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=self._work, env=env)
+        _commit(self._work, "README.md", "hello docs\n", "docs change", env)
+
+        # side: introduces a manifest, branched from base_sha (not
+        # feature) -- base_sha rather than a local branch literally named
+        # "main", since this fixture's local default branch name (whatever
+        # init.defaultBranch resolves to on the host) need not be "main"
+        # even though the bare origin's ref is pushed to refs/heads/main.
+        subprocess.run(["git", "checkout", "-q", "-b", "side", self._base_sha], check=True, cwd=self._work, env=env)
+        _commit(self._work, "package.json", '{"name": "x"}\n', "add manifest", env)
+
+        # Merge side into feature -- package.json enters via the SECOND
+        # parent, not feature's own first-parent history.
+        subprocess.run(["git", "checkout", "-q", "feature"], check=True, cwd=self._work, env=env)
+        subprocess.run(
+            ["git", "merge", "-q", "--no-ff", "-m", "merge side", "side"],
+            check=True, cwd=self._work, env=env,
+        )
+        self._new_sha = _sha(self._work, "HEAD")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_merge_commit_introducing_manifest_runs_deps(self):
+        stdin = f"refs/heads/feature {self._new_sha} refs/heads/feature {self._base_sha}\n"
+        result = _run_pre_push(
+            self._work, self._bin, stdin,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        with open(self._osv_argv) as f:
+            self.assertNotEqual(
+                f.read(), "",
+                "a merge commit introducing a manifest via a non-first-parent "
+                "branch must still run deps",
+            )
+        outcome, _ = _last_audit_row(self._work, "deps")
+        self.assertNotEqual(outcome, "not_applicable")
+
+
+class TestSubmodulePointerChangeRunsEveryGate(unittest.TestCase):
+    """A submodule pointer (gitlink, raw diff mode 160000) bump, with no
+    other changed path, must run every gate -- a gitlink path essentially
+    never matches a source/manifest domain glob on its own, which would
+    otherwise satisfy the 'every changed path proven out of domain' skip
+    condition despite the bump being able to introduce arbitrary new
+    dependency/source content this push's own diff cannot see."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-domain-submod-")
+        env = {**os.environ, **_GIT_ENV}
+
+        sub_origin = os.path.join(self._tmp, "sub.git")
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", sub_origin], check=True)
+        sub_work = os.path.join(self._tmp, "sub_work")
+        subprocess.run(["git", "clone", "-q", sub_origin, sub_work], check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "main"], check=True, cwd=sub_work, env=env)
+        _commit(sub_work, "f.txt", "a\n", "sub1", env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=sub_work, env=env)
+        _commit(sub_work, "f.txt", "b\n", "sub2", env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=sub_work, env=env)
+
+        self._origin, self._work = _init_origin_and_work(self._tmp)
+        _commit(self._work, "README.md", "hello\n", "initial", env)
+        subprocess.run(
+            ["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_origin, "subm"],
+            check=True, cwd=self._work, env=env,
+        )
+        subprocess.run(["git", "commit", "-q", "-m", "add submodule"], check=True, cwd=self._work, env=env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=self._work, env=env)
+        self._base_sha = _sha(self._work, "HEAD")
+
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=self._work, env=env)
+        # A genuine, further bump of the submodule tip (a THIRD sub commit,
+        # made after the submodule was already added at sub2) -- not merely
+        # re-pointing at the commit already staged by `submodule add`.
+        _commit(sub_work, "f.txt", "c\n", "sub3", env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=sub_work, env=env)
+        sub_new_sha = _sha(sub_origin, "main")
+        subprocess.run(
+            ["git", "update-index", "--cacheinfo", f"160000,{sub_new_sha},subm"],
+            check=True, cwd=self._work, env=env,
+        )
+        subprocess.run(["git", "commit", "-q", "-m", "bump submodule"], check=True, cwd=self._work, env=env)
+        self._new_sha = _sha(self._work, "HEAD")
+
+        self._bin = os.path.join(self._tmp, "bin")
+        self._osv_argv = os.path.join(self._tmp, "osv_argv.log")
+        open(self._osv_argv, "w").close()
+        self._sast_argv = os.path.join(self._tmp, "sast_argv.log")
+        open(self._sast_argv, "w").close()
+        _write_fake_osv_scanner(self._bin, self._osv_argv, exit_code=0)
+        _write_fake_semgrep(self._bin, self._sast_argv, exit_code=0)
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_submodule_bump_runs_deps_and_sast(self):
+        stdin = f"refs/heads/feature {self._new_sha} refs/heads/feature {self._base_sha}\n"
+        result = _run_pre_push(
+            self._work, self._bin, stdin,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        with open(self._osv_argv) as f:
+            self.assertNotEqual(f.read(), "", "a submodule pointer bump must run deps, never skip")
+        with open(self._sast_argv) as f:
+            self.assertNotEqual(f.read(), "", "a submodule pointer bump must run sast, never skip")
+        outcome, _ = _last_audit_row(self._work, "deps")
+        self.assertNotEqual(outcome, "not_applicable")
+
+
+class TestModeAndSymlinkChangesWithQuotableFilenames(unittest.TestCase):
+    """A content-identical mode flip, or a new symlink, on a path
+    containing a space (git C-quotes such a path as `"file with
+    space.py"` INCLUDING the quote characters unless the diff is read
+    NUL-delimited) must still be caught -- this is the direct fail-open
+    proof for the quoting defect BOBBIE and PEACHES both found on
+    PR #215 (_gate_resolve_changed_paths now reads `git diff -z
+    --no-renames --raw`, never quoted)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-domain-modesym-")
+        self._bin = os.path.join(self._tmp, "bin")
+        self._osv_argv = os.path.join(self._tmp, "osv_argv.log")
+        open(self._osv_argv, "w").close()
+        self._sast_argv = os.path.join(self._tmp, "sast_argv.log")
+        open(self._sast_argv, "w").close()
+        _write_fake_osv_scanner(self._bin, self._osv_argv, exit_code=0)
+        _write_fake_semgrep(self._bin, self._sast_argv, exit_code=0)
+        self._env = {**os.environ, **_GIT_ENV}
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_mode_flip_on_space_named_py_file_runs_sast(self):
+        origin, work = _init_origin_and_work(self._tmp)
+        fname = "quoted name.py"
+        _commit(work, fname, "print('hi')\n", "initial", self._env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=work, env=self._env)
+        base_sha = _sha(work, "HEAD")
+
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=work, env=self._env)
+        full = os.path.join(work, fname)
+        os.chmod(full, os.stat(full).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        subprocess.run(["git", "add", fname], check=True, cwd=work, env=self._env)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "mode flip only, byte-identical content"],
+            check=True, cwd=work, env=self._env,
+        )
+        new_sha = _sha(work, "HEAD")
+
+        stdin = f"refs/heads/feature {new_sha} refs/heads/feature {base_sha}\n"
+        result = _run_pre_push(
+            work, self._bin, stdin,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        with open(self._sast_argv) as f:
+            self.assertNotEqual(
+                f.read(), "",
+                "a content-identical mode flip on a space-containing .py "
+                "path must still run sast",
+            )
+        outcome, _ = _last_audit_row(work, "sast")
+        self.assertNotEqual(outcome, "not_applicable")
+
+    def test_symlink_creation_with_space_in_path_runs_sast(self):
+        origin, work = _init_origin_and_work(self._tmp)
+        _commit(work, "README.md", "hello\n", "initial", self._env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=work, env=self._env)
+        base_sha = _sha(work, "HEAD")
+
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=work, env=self._env)
+        link_name = "linked script with space.py"
+        os.symlink("target.py", os.path.join(work, link_name))
+        subprocess.run(["git", "add", link_name], check=True, cwd=work, env=self._env)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "add symlink with space in name"],
+            check=True, cwd=work, env=self._env,
+        )
+        new_sha = _sha(work, "HEAD")
+
+        stdin = f"refs/heads/feature {new_sha} refs/heads/feature {base_sha}\n"
+        result = _run_pre_push(
+            work, self._bin, stdin,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        with open(self._sast_argv) as f:
+            self.assertNotEqual(
+                f.read(), "",
+                "a new symlink at a space-containing .py path must still run sast",
+            )
+        outcome, _ = _last_audit_row(work, "sast")
+        self.assertNotEqual(outcome, "not_applicable")
+
+
+class TestVendoredAndLiterateDocsHaveNoDirectoryCarveOut(unittest.TestCase):
+    """Domain matching is by file NAME/EXTENSION shape only -- there is no
+    directory-based carve-out anywhere in this mechanism. A manifest
+    vendored under docs/ still matches the deps domain; a literate/
+    compiled document with a source extension under docs/ still matches
+    the sast domain."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-domain-vendored-")
+        self._bin = os.path.join(self._tmp, "bin")
+        self._osv_argv = os.path.join(self._tmp, "osv_argv.log")
+        open(self._osv_argv, "w").close()
+        self._sast_argv = os.path.join(self._tmp, "sast_argv.log")
+        open(self._sast_argv, "w").close()
+        _write_fake_osv_scanner(self._bin, self._osv_argv, exit_code=0)
+        _write_fake_semgrep(self._bin, self._sast_argv, exit_code=0)
+        self._env = {**os.environ, **_GIT_ENV}
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_manifest_vendored_under_docs_runs_deps(self):
+        origin, work = _init_origin_and_work(self._tmp)
+        _commit(work, "README.md", "hello\n", "initial", self._env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=work, env=self._env)
+        base_sha = _sha(work, "HEAD")
+
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=work, env=self._env)
+        _commit(work, "docs/vendor/package.json", '{"name": "x"}\n', "vendored manifest under docs", self._env)
+        new_sha = _sha(work, "HEAD")
+
+        stdin = f"refs/heads/feature {new_sha} refs/heads/feature {base_sha}\n"
+        result = _run_pre_push(
+            work, self._bin, stdin,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        with open(self._osv_argv) as f:
+            self.assertNotEqual(
+                f.read(), "",
+                "a manifest file vendored under docs/ must still run deps",
+            )
+        outcome, _ = _last_audit_row(work, "deps")
+        self.assertNotEqual(outcome, "not_applicable")
+
+    def test_literate_doc_with_source_extension_under_docs_runs_sast(self):
+        origin, work = _init_origin_and_work(self._tmp)
+        _commit(work, "README.md", "hello\n", "initial", self._env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=work, env=self._env)
+        base_sha = _sha(work, "HEAD")
+
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=work, env=self._env)
+        _commit(
+            work, "docs/tutorial.py", "# literate doc executed as a tutorial\nprint('hi')\n",
+            "literate doc under docs", self._env,
+        )
+        new_sha = _sha(work, "HEAD")
+
+        stdin = f"refs/heads/feature {new_sha} refs/heads/feature {base_sha}\n"
+        result = _run_pre_push(
+            work, self._bin, stdin,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        with open(self._sast_argv) as f:
+            self.assertNotEqual(
+                f.read(), "",
+                "a literate/compiled document with a source extension under "
+                "docs/ must still run sast",
+            )
+        outcome, _ = _last_audit_row(work, "sast")
+        self.assertNotEqual(outcome, "not_applicable")
+
+
+class TestGateConfigPathSweep(unittest.TestCase):
+    """Finding 3 (PEACHES, PR #215): the config-in-every-domain rule was
+    tested with only 1 of _gate_config_paths' entries. Table-driven sweep
+    of every declared config path -- each, alone, with no manifest/source
+    file in the diff, must still force deps to run (the mechanical
+    closure of the privilege-escalation shape: weaken a gate's config and
+    skip the gate that would have noticed, in the same push)."""
+
+    # Mirrors _gate_config_paths (scripts/gates.sh) exactly. Kept as a
+    # literal list, not parsed from the shell source, so a change to
+    # either side is a visible diff in code review rather than a silent
+    # desync -- this is a regression test asserting a specific declared
+    # set, not a generic "whatever the function currently returns" check.
+    _CONFIG_PATHS = [
+        ".gitleaks.toml",
+        ".clagentic/osv-ignore",
+        ".clagentic/semgrep-exclude",
+        ".semgrepignore",
+        ".clagentic/config",
+        ".clagentic-bleed-ignore",
+        ".clagentic/bleed-patterns",
+        ".clagentic/deferrals.json",
+        ".clagentic/adversarial-acks.json",
+        ".clagentic/accepted-risks.md",
+    ]
+
+    def test_every_declared_config_path_forces_deps_to_run(self):
+        for cfg_path in self._CONFIG_PATHS:
+            with self.subTest(cfg_path=cfg_path):
+                tmp = tempfile.mkdtemp(prefix="clagentic-test-domain-cfgsweep-")
+                try:
+                    bin_dir = os.path.join(tmp, "bin")
+                    osv_argv = os.path.join(tmp, "osv_argv.log")
+                    open(osv_argv, "w").close()
+                    sast_argv = os.path.join(tmp, "sast_argv.log")
+                    open(sast_argv, "w").close()
+                    _write_fake_osv_scanner(bin_dir, osv_argv, exit_code=0)
+                    _write_fake_semgrep(bin_dir, sast_argv, exit_code=0)
+
+                    env = {**os.environ, **_GIT_ENV}
+                    origin, work = _init_origin_and_work(tmp)
+                    _commit(work, "README.md", "hello\n", "initial", env)
+                    subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=work, env=env)
+                    base_sha = _sha(work, "HEAD")
+
+                    subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=work, env=env)
+                    # .clagentic/config is sourced as shell by gates.sh
+                    # itself -- arbitrary content there is a syntax-error
+                    # risk. Every other config path is inert data (TOML/
+                    # JSON/list/markdown), never executed.
+                    content = "# test\n" if cfg_path == ".clagentic/config" else "x\n"
+                    _commit(work, cfg_path, content, f"touch {cfg_path}", env)
+                    new_sha = _sha(work, "HEAD")
+
+                    stdin = f"refs/heads/feature {new_sha} refs/heads/feature {base_sha}\n"
+                    result = _run_pre_push(
+                        work, bin_dir, stdin,
+                        extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+                    )
+                    with open(osv_argv) as f:
+                        osv_out = f.read()
+                    self.assertNotEqual(
+                        osv_out, "",
+                        f"deps must run when {cfg_path} changed alone "
+                        f"(rc={result.returncode}, stderr={result.stderr})",
+                    )
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestDomainExtraGlobsWidenOnly(unittest.TestCase):
+    """CLAGENTIC_DEPS_DOMAIN_EXTRA_GLOBS / CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS
+    are documented in share/config.example as widen-only. Enforce that by
+    test, not just by reading the append-only implementation (Finding 4,
+    PEACHES PR #215): the override must (a) genuinely widen a novel
+    manifest/source shape into domain, and (b) be unable to narrow an
+    already-in-domain path out of domain no matter what pattern is set."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-domain-extraglobs-")
+        self._bin = os.path.join(self._tmp, "bin")
+        self._osv_argv = os.path.join(self._tmp, "osv_argv.log")
+        open(self._osv_argv, "w").close()
+        self._sast_argv = os.path.join(self._tmp, "sast_argv.log")
+        open(self._sast_argv, "w").close()
+        _write_fake_osv_scanner(self._bin, self._osv_argv, exit_code=0)
+        _write_fake_semgrep(self._bin, self._sast_argv, exit_code=0)
+        self._env = {**os.environ, **_GIT_ENV}
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _push_with_new_file(self, fname, content):
+        origin, work = _init_origin_and_work(self._tmp)
+        _commit(work, "README.md", "hello\n", "initial", self._env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=work, env=self._env)
+        base_sha = _sha(work, "HEAD")
+
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=work, env=self._env)
+        _commit(work, fname, content, f"add {fname}", self._env)
+        new_sha = _sha(work, "HEAD")
+        return work, base_sha, new_sha
+
+    def test_deps_extra_glob_widens_a_novel_manifest_shape(self):
+        work, base_sha, new_sha = self._push_with_new_file("custom.lockfile", "novel-ecosystem-lock\n")
+        stdin = f"refs/heads/feature {new_sha} refs/heads/feature {base_sha}\n"
+
+        # Without the override: not a recognized manifest shape -- skips.
+        result_before = _run_pre_push(
+            work, self._bin, stdin, extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+        )
+        self.assertEqual(result_before.returncode, 0, f"stdout={result_before.stdout}\nstderr={result_before.stderr}")
+        with open(self._osv_argv) as f:
+            self.assertEqual(f.read(), "", "an unrecognized manifest shape must skip deps without the override")
+        outcome, _ = _last_audit_row(work, "deps")
+        self.assertEqual(outcome, "not_applicable")
+
+        # With the override: the novel shape is now in-domain -- runs.
+        result_after = _run_pre_push(
+            work, self._bin, stdin,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main", "CLAGENTIC_DEPS_DOMAIN_EXTRA_GLOBS": "*.lockfile"},
+        )
+        self.assertEqual(result_after.returncode, 0, f"stdout={result_after.stdout}\nstderr={result_after.stderr}")
+        with open(self._osv_argv) as f:
+            self.assertNotEqual(
+                f.read(), "",
+                "CLAGENTIC_DEPS_DOMAIN_EXTRA_GLOBS must widen domain to catch a novel manifest shape",
+            )
+        outcome, _ = _last_audit_row(work, "deps")
+        self.assertNotEqual(outcome, "not_applicable")
+
+    def test_deps_extra_glob_cannot_narrow_an_existing_manifest_match(self):
+        work, base_sha, new_sha = self._push_with_new_file("package.json", '{"name": "x"}\n')
+        stdin = f"refs/heads/feature {new_sha} refs/heads/feature {base_sha}\n"
+
+        # package.json is ALREADY in the built-in domain. An EXTRA_GLOBS
+        # value that matches nothing relevant must not be able to narrow
+        # that -- append-only semantics mean this can only ever add
+        # patterns, never remove or override the built-in list.
+        result = _run_pre_push(
+            work, self._bin, stdin,
+            extra_env={
+                "CLAGENTIC_DEFAULT_BRANCH": "main",
+                "CLAGENTIC_DEPS_DOMAIN_EXTRA_GLOBS": "*.nonsense-unrelated-ext",
+            },
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        with open(self._osv_argv) as f:
+            self.assertNotEqual(
+                f.read(), "",
+                "an unrelated CLAGENTIC_DEPS_DOMAIN_EXTRA_GLOBS value must "
+                "never narrow an already-in-domain manifest out of domain",
+            )
+        outcome, _ = _last_audit_row(work, "deps")
+        self.assertNotEqual(outcome, "not_applicable")
+
+    def test_sast_extra_glob_widens_a_novel_source_shape(self):
+        work, base_sha, new_sha = self._push_with_new_file("script.novelext", "print('hi')\n")
+        stdin = f"refs/heads/feature {new_sha} refs/heads/feature {base_sha}\n"
+
+        result_before = _run_pre_push(
+            work, self._bin, stdin, extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+        )
+        self.assertEqual(result_before.returncode, 0, f"stdout={result_before.stdout}\nstderr={result_before.stderr}")
+        with open(self._sast_argv) as f:
+            self.assertEqual(f.read(), "", "an unrecognized source shape must skip sast without the override")
+
+        result_after = _run_pre_push(
+            work, self._bin, stdin,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main", "CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS": "*.novelext"},
+        )
+        self.assertEqual(result_after.returncode, 0, f"stdout={result_after.stdout}\nstderr={result_after.stderr}")
+        with open(self._sast_argv) as f:
+            self.assertNotEqual(
+                f.read(), "",
+                "CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS must widen domain to catch a novel source shape",
+            )
+        outcome, _ = _last_audit_row(work, "sast")
+        self.assertNotEqual(outcome, "not_applicable")
+
+    def test_sast_extra_glob_cannot_narrow_an_existing_source_match(self):
+        work, base_sha, new_sha = self._push_with_new_file("app.py", "print('hi')\n")
+        stdin = f"refs/heads/feature {new_sha} refs/heads/feature {base_sha}\n"
+
+        result = _run_pre_push(
+            work, self._bin, stdin,
+            extra_env={
+                "CLAGENTIC_DEFAULT_BRANCH": "main",
+                "CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS": "*.nonsense-unrelated-ext",
+            },
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        with open(self._sast_argv) as f:
+            self.assertNotEqual(
+                f.read(), "",
+                "an unrelated CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS value must "
+                "never narrow an already-in-domain source file out of domain",
+            )
+        outcome, _ = _last_audit_row(work, "sast")
+        self.assertNotEqual(outcome, "not_applicable")
+
+
 if __name__ == "__main__":
     unittest.main()
