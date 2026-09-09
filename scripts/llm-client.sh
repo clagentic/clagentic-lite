@@ -2485,13 +2485,27 @@ def _resolve_profile():
         reason = f"profile {profile!r} has no section in {config_path} or {creds_path}"
         return "unresolved", None, config_path, creds_path, profile, reason
 
+    # STRIP-THEN-CHECK (PR #216 third fold-in, BOBBIE non-blocking finding):
+    # normalize whitespace BEFORE the truthy check, matching session_name's
+    # own strip-then-check ordering directly below -- a whitespace-only
+    # sso_start_url (" ") is truthy as a raw string but empty after
+    # stripping; checking truthiness on the raw value would return kind
+    # "legacy" with an effectively-empty key. That already fails closed
+    # today (the SHA1-of-whitespace direct lookup misses, and the
+    # startUrl-filtered scan's `data.get("startUrl") != target_start_url`
+    # comparison stays active because "" is not None), so this was not a
+    # reproduction of the bug -- but the asymmetry with session_name invited
+    # a real gap later and costs nothing to close here.
     direct_url = parser.get(section, "sso_start_url", fallback=None)
+    if direct_url is not None:
+        direct_url = direct_url.strip()
     if direct_url:
-        return "legacy", direct_url.strip(), config_path, creds_path, profile, None
+        return "legacy", direct_url, config_path, creds_path, profile, None
 
     session_name = parser.get(section, "sso_session", fallback=None)
-    if session_name:
+    if session_name is not None:
         session_name = session_name.strip()
+    if session_name:
         session_section = f"sso-session {session_name}"
         if not parser.has_section(session_section):
             reason = (
@@ -2515,6 +2529,32 @@ def _resolve_profile():
 
 resolve_kind, resolve_key, config_path, creds_path, profile, unresolved_reason = _resolve_profile()
 
+# EXHAUSTIVE DISPATCH (PR #216 THIRD fold-in, PEACHES finding 1): the
+# fourth instance of this preflight's own recurring pattern -- an
+# absent/unexpected value silently widening the candidate set instead of
+# failing closed (first-match-wins, then no-profile fallback, then partial
+# session resolution, now an unhandled resolve_kind here). _resolve_profile
+# itself only ever returns one of four literal strings ("session", "legacy",
+# "none", "unresolved" -- see its own docstring's enumerated "kind" values),
+# but that closed enumeration lived ONLY in that docstring, not in any
+# executable check at the one call site that branches on it. A single
+# `if resolve_kind == "unresolved": ... ` with no matching else meant any
+# value this dispatch does not explicitly recognize -- a future kind added
+# to _resolve_profile without updating this call site, a typo, a merge
+# conflict -- falls straight through to the "every kind other than
+# unresolved reaches here" assumption below, into the unfiltered
+# directory-scan fallback: the exact fail-open this task exists to close,
+# relocated to the caller instead of the resolver.
+#
+# FIX AS A TOTALITY PROPERTY: every known kind gets its own explicit
+# `elif`, and a final `else` FAILS CLOSED by construction -- there is no
+# path from an unrecognized resolve_kind to the scan below, because the
+# scan's own session_name/target_start_url assignment only happens inside
+# the "session"/"legacy"/"none" branches, never in the fall-through case.
+# A future 5th kind added to _resolve_profile without a matching branch
+# here now raises/exits NOT-READY naming the unexpected value, rather than
+# silently reaching the scan -- the failure is loud and at the call site
+# that needs the new branch, not a silent widening three lines later.
 if resolve_kind == "unresolved":
     # FAIL CLOSED (PR #216 finding 2 and its fold-in extension): the target
     # profile could not be resolved to a usable cache-lookup key at all --
@@ -2528,16 +2568,40 @@ if resolve_kind == "unresolved":
     # "none"), never "unresolved".
     _emit(status="not-ready", kind="profile-unresolved", reason=unresolved_reason)
     sys.exit(1)
-
-# Every kind other than "unresolved" reaches here with a COHERENT state:
-# "session"/"legacy" always carry a usable resolve_key; "none" carries no
-# key and no ambiguity attached to that absence (the profile resolved, it
-# simply declared no SSO indirection at all). There is no remaining state
-# where a session name is known but its start URL is not -- that
-# incoherent combination is exactly what made the directory-scan fallback's
-# filter a no-op before this fold-in.
-session_name = resolve_key if resolve_kind == "session" else None
-target_start_url = resolve_key if resolve_kind == "legacy" else None
+elif resolve_kind == "session":
+    # MODERN CACHE-KEY MECHANISM: resolve_key is the session name, ready to
+    # SHA1-hash below. No ambiguity -- "session" always carries a usable key
+    # (see _resolve_profile's own docstring: this kind is unrepresentable
+    # without one).
+    session_name = resolve_key
+    target_start_url = None
+elif resolve_kind == "legacy":
+    # LEGACY CACHE-KEY MECHANISM: resolve_key is the startUrl itself, ready
+    # to SHA1-hash below.
+    session_name = None
+    target_start_url = resolve_key
+elif resolve_kind == "none":
+    # The profile resolved but declared neither sso_session nor
+    # sso_start_url -- no key, no ambiguity attached to that absence (the
+    # profile is simply not SSO-configured at all). This is the ONE
+    # legitimate route to the unfiltered directory-scan fallback below
+    # (target_start_url stays None, matching every file).
+    session_name = None
+    target_start_url = None
+else:
+    # UNREACHABLE TODAY (_resolve_profile's own return statements are a
+    # closed set of exactly the four kinds handled above), but "cannot
+    # happen given the current implementation" is exactly the property a
+    # totality check exists to stop relying on informally. Fail closed by
+    # construction rather than by convention: an unrecognized kind is
+    # genuine ambiguity, identical in kind to "unresolved", and must never
+    # reach the scan below or be silently swallowed.
+    _emit(
+        status="not-ready",
+        kind="resolve-kind-unexpected",
+        reason=f"_resolve_profile() returned an unrecognized kind {resolve_kind!r} -- refusing to guess which cache file applies",
+    )
+    sys.exit(1)
 
 freshest_path = None
 freshest_dt = None

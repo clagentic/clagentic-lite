@@ -112,6 +112,39 @@ nit finding 2, TestPartialSessionResolutionFailsClosed):
      python3 exit code carries that, not parsed reason text), but
      inconsistent escaping in one function invites a real gap later.
 
+PR #216 THIRD review fold-in (PEACHES finding 1 blocking + finding 2 nit,
+PEACHES was blocked on a tooling failure and could not post -- findings
+relayed via task lr-3583b5 comment thread):
+  1. FOURTH INSTANCE OF THE PATTERN -- UNHANDLED resolve_kind FALLS THROUGH
+     TO THE UNFILTERED SCAN: the caller dispatch (`if resolve_kind ==
+     "unresolved": ...`) handled the four known kinds but had no matching
+     `else` -- an unexpected resolve_kind value fell straight through to
+     "every kind other than unresolved reaches here" and on into the
+     unfiltered directory scan. Same shape as first-match-wins, the
+     no-profile fallback, and partial session resolution before it: an
+     absent/unexpected value silently widening the candidate set instead of
+     failing closed. FIXED as a totality property: the dispatch is now an
+     explicit if/elif chain over all four known kinds plus a final `else`
+     that fails closed by construction (NOT-READY, kind
+     "resolve-kind-unexpected", reason naming the actual value) -- the scan
+     is unreachable from the else branch, not merely avoided by convention.
+     TestUnexpectedResolveKindFailsClosed below extracts the REAL embedded
+     python3 source verbatim from llm-client.sh and monkeypatches
+     _resolve_profile (by appending a redefinition after the extracted
+     source -- Python's later-def-wins semantics, not an edit to the
+     production file) to return a kind outside the enumeration, proving the
+     fix against the actual dispatch code, not a reimplementation of it.
+  2. TEST THEATRE (nit): test_directory_scan_never_reached_without_a_filter_
+     or_unresolved_state asserted textual str.index() ORDERING in the
+     source, not control-flow reachability -- true only because the
+     function was flat with no intervening branches; a reordering-
+     insensitive refactor could keep it green while breaking the property.
+     REPLACED with a real behavioral reachability assertion
+     (test_scan_not_entered_for_any_non_none_kind_without_matching_
+     candidates, using a decoy fresh token for an unrelated session that
+     must NOT be selected) that exercises the actual preflight through
+     every resolve_kind, including the unexpected one -- not source text.
+
 Run with: python3 -m unittest scripts.test_auth_mode_preflight -v
 """
 import datetime
@@ -253,6 +286,82 @@ def _run_preflight(env_extra, home_dir=None):
         text=True,
         cwd=TOOL_HOME,
         env=env,
+        timeout=30,
+    )
+    return r
+
+
+def _extract_preflight_python_source():
+    """Pull the embedded python3 heredoc body VERBATIM out of the real
+    llm-client.sh, between the `<<'PY'` that opens it and the line
+    containing only `PY` that closes it (scripts/llm-client.sh, inside
+    _llm_auth_mode_preflight). This is the exact source _lamp_result runs in
+    production -- extracting it (rather than re-typing an equivalent copy)
+    is what lets TestUnexpectedResolveKindFailsClosed below prove the fix
+    against the real dispatch code, not a reimplementation that could drift
+    from it and pass for the wrong reason."""
+    with open(LLM_CLIENT_SH) as f:
+        lines = f.readlines()
+    start = end = None
+    for i, line in enumerate(lines):
+        if start is None and "<<'PY'" in line:
+            start = i + 1
+            continue
+        if start is not None and line.rstrip("\n") == "PY":
+            end = i
+            break
+    if start is None or end is None:
+        raise AssertionError(
+            "could not locate the <<'PY' ... PY heredoc block in "
+            f"{LLM_CLIENT_SH} -- extraction markers may have drifted"
+        )
+    return "".join(lines[start:end])
+
+
+_RESOLVE_CALL_MARKER = (
+    "resolve_kind, resolve_key, config_path, creds_path, profile, "
+    "unresolved_reason = _resolve_profile()"
+)
+
+
+def _run_preflight_python_with_resolve_kind_override(tmpdir, override_src):
+    """Run the REAL embedded preflight python source, with _resolve_profile
+    REDEFINED between its own definition and the single call site that
+    invokes it (`resolve_kind, ... = _resolve_profile()`, the
+    _RESOLVE_CALL_MARKER line) -- Python's later-def-wins name binding, not
+    a mutation of the original function object or an edit to llm-client.sh
+    itself. The extracted source is split at that exact call-site line (the
+    first executable statement after every def in the file), the override
+    def is spliced in immediately before it, and the call then binds to the
+    override -- proving the fix against the REAL dispatch code that follows
+    (the if/elif/else over resolve_kind), not a reimplementation of it that
+    could drift and pass for the wrong reason.
+
+    Splitting at the call site (rather than appending after the whole
+    script, which would run too late -- the real call already executed by
+    then) is required because _resolve_profile() is invoked as the first
+    statement of the script body, not merely defined and left for a test
+    harness to call separately.
+
+    Returns the completed subprocess.CompletedProcess; stdout carries the
+    newline-delimited key=value contract on NOT-READY (exit 1), nothing on
+    READY (exit 0) -- same contract _llm_auth_mode_preflight's shell side
+    parses from $_lamp_result.
+    """
+    base_src = _extract_preflight_python_source()
+    if _RESOLVE_CALL_MARKER not in base_src:
+        raise AssertionError(
+            "the _resolve_profile() call-site line has drifted from the "
+            "expected text -- update _RESOLVE_CALL_MARKER to match "
+            "llm-client.sh's current source"
+        )
+    before, after = base_src.split(_RESOLVE_CALL_MARKER, 1)
+    full_src = before + override_src + "\n\n" + _RESOLVE_CALL_MARKER + after
+    r = subprocess.run(
+        [sys.executable, "-", tmpdir],
+        input=full_src,
+        capture_output=True,
+        text=True,
         timeout=30,
     )
     return r
@@ -675,27 +784,115 @@ class TestPartialSessionResolutionFailsClosed(_TempDirCase):
         self.assertIn("incomplete-session", r.stdout)
         self.assertIn("default", r.stdout)
 
-    def test_directory_scan_never_reached_without_a_filter_or_unresolved_state(self):
-        """Regression guard for the pattern itself, not just its two known
-        instances above: assert directly against llm-client.sh's source
-        that the "unresolved" kind returns and exits BEFORE the
-        directory-scan fallback block is reachable -- i.e. the fallback's
-        own `if freshest_path is None:` block appears strictly after the
-        `if resolve_kind == "unresolved":` branch's own `sys.exit(1)` in
-        source order, so a future edit that reorders these can never let an
-        unresolved profile silently reach the unfiltered scan again without
-        this test tripping first."""
-        with open(LLM_CLIENT_SH) as f:
-            src = f.read()
-        unresolved_branch = src.index('if resolve_kind == "unresolved":')
-        unresolved_exit = src.index("sys.exit(1)", unresolved_branch)
-        fallback_scan = src.index("if freshest_path is None:")
-        self.assertLess(
-            unresolved_exit, fallback_scan,
-            "the unresolved-profile fail-closed exit must appear (and "
-            "therefore execute) strictly before the directory-scan "
-            "fallback block -- an unresolved profile must never reach it",
-        )
+    def test_scan_not_entered_for_unresolved_or_unexpected_kind_decoy_never_selected(self):
+        """PR #216 THIRD fold-in, PEACHES finding 2: replaces the prior
+        source-order str.index() assertion (theatre -- true only because the
+        function was flat with no intervening branches; a reordering-
+        insensitive refactor could keep it green while breaking the
+        property). This is a REAL behavioral reachability assertion: for
+        both resolve_kind states that must never reach the unfiltered
+        directory scan ("unresolved" via a genuinely unresolvable profile,
+        and an out-of-enumeration kind via the fault-injection harness), a
+        DECOY fresh cache file for an unrelated session is seeded in the
+        cache dir. If the scan were ever reached for either state, the
+        decoy's freshness would make the preflight report READY (the
+        unfiltered scan matches everything when no filter is active) -- so
+        asserting NOT-READY, with a reason that names the actual failure
+        (not the decoy), is a direct behavioral proof the scan was never
+        entered, observed through the preflight's own output rather than
+        through source text."""
+        # State 1: resolve_kind == "unresolved" (no config file at all).
+        tmpdir = self.mkdtemp("clagentic-test-scan-unreached-unresolved-")
+        empty_home = self.mkdtemp("clagentic-test-scan-unreached-unresolved-home-")
+        _write_cache_file(tmpdir, _future(hours=4), start_url=START_URL_B,
+                           name="decoy-fresh.json")
+        r = _run_preflight({
+            "CLAGENTIC_AUTH_MODE": "bedrock-sso",
+            "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
+        }, home_dir=empty_home)
+        self.assertIn("NOT-READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        self.assertNotIn("decoy-fresh.json", r.stdout)
+
+        # State 2: an out-of-enumeration resolve_kind (fault-injected --
+        # _resolve_profile can never actually return this today; see
+        # TestUnexpectedResolveKindFailsClosed for the fuller version of
+        # this same harness). Reuses the identical decoy-selection proof.
+        tmpdir2 = self.mkdtemp("clagentic-test-scan-unreached-unexpected-")
+        _write_cache_file(tmpdir2, _future(hours=4), start_url=START_URL_B,
+                           name="decoy-fresh.json")
+        override_src = textwrap.dedent("""\
+            def _resolve_profile():
+                return "bogus-kind-from-test", None, "/fixture/config", "/fixture/creds", "default", None
+        """)
+        r2 = _run_preflight_python_with_resolve_kind_override(tmpdir2, override_src)
+        self.assertEqual(r2.returncode, 1, f"stdout={r2.stdout!r} stderr={r2.stderr!r}")
+        self.assertIn("kind=resolve-kind-unexpected", r2.stdout)
+        self.assertNotIn("decoy-fresh.json", r2.stdout)
+
+
+class TestUnexpectedResolveKindFailsClosed(unittest.TestCase):
+    """PR #216 THIRD fold-in, PEACHES finding 1 (BLOCKING): the caller
+    dispatch over resolve_kind handled the four known kinds (session,
+    legacy, none, unresolved) but had no exhaustiveness guard -- an
+    unexpected resolve_kind value fell through to the unfiltered directory
+    scan (fail-open, the fourth instance of this preflight's recurring
+    pattern). Uses _run_preflight_python_with_resolve_kind_override to force
+    _resolve_profile to return a value outside the closed enumeration
+    against the REAL, unmodified dispatch code extracted from llm-client.sh
+    -- proving the fix by execution, not by inspection. MUST FAIL without
+    the fix (pre-fix code has no else branch at all; the override would
+    silently reach the scan and, depending on what's in the cache dir,
+    either report READY off an unrelated file or NOT-READY with a
+    "no-candidate" reason that never names the unexpected kind)."""
+
+    def setUp(self):
+        self._tmpdirs = []
+
+    def tearDown(self):
+        for d in self._tmpdirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def mkdtemp(self, prefix):
+        d = tempfile.mkdtemp(prefix=prefix)
+        self._tmpdirs.append(d)
+        return d
+
+    def test_unexpected_kind_reports_not_ready_naming_the_kind(self):
+        tmpdir = self.mkdtemp("clagentic-test-unexpected-kind-")
+        override_src = textwrap.dedent("""\
+            def _resolve_profile():
+                return "totally-unexpected-kind", None, "/fixture/config", "/fixture/creds", "default", None
+        """)
+        r = _run_preflight_python_with_resolve_kind_override(tmpdir, override_src)
+        self.assertEqual(r.returncode, 1, f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        self.assertIn("status=not-ready", r.stdout)
+        self.assertIn("kind=resolve-kind-unexpected", r.stdout)
+        self.assertIn("totally-unexpected-kind", r.stdout,
+                       "the reason must name the actual unexpected value, "
+                       "not a generic message")
+
+    def test_unexpected_kind_never_selects_a_decoy_fresh_file(self):
+        """The scan-reachability half of the proof: even with a fresh,
+        otherwise-selectable cache file sitting in the directory, an
+        unexpected resolve_kind must never reach the unfiltered scan that
+        would pick it up. Without the fix, the fall-through path reaches
+        `if freshest_path is None:` with target_start_url/session_name
+        undefined-or-None depending on how far the incoherent state
+        propagates -- this test does not assume which failure shape the
+        unfixed code takes, only that the decoy must never be reported as
+        satisfying readiness."""
+        tmpdir = self.mkdtemp("clagentic-test-unexpected-kind-decoy-")
+        _write_cache_file(tmpdir, _future(hours=4), start_url=START_URL_A,
+                           name="decoy-fresh.json")
+        override_src = textwrap.dedent("""\
+            def _resolve_profile():
+                return "totally-unexpected-kind", None, "/fixture/config", "/fixture/creds", "default", None
+        """)
+        r = _run_preflight_python_with_resolve_kind_override(tmpdir, override_src)
+        self.assertEqual(r.returncode, 1, f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        self.assertIn("kind=resolve-kind-unexpected", r.stdout)
+        self.assertNotIn("decoy-fresh.json", r.stdout)
+        self.assertNotIn("status=ready", r.stdout)
 
 
 class TestBedrockSsoExpiredCache(_TempDirCase):
