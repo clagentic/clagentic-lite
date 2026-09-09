@@ -1216,9 +1216,18 @@ which means **run the gate**, never skip it:
 - **A force push** — the previously-known remote SHA is not an ancestor of
   the SHA being pushed (`git merge-base --is-ancestor`); `old..new` does
   not describe what the remote will actually hold afterward.
-- **Shallow/grafted history** (`git rev-parse --is-shallow-repository`) —
-  a merge-base/diff computed against a commit outside the fetched depth is
+- **Shallow history** (`git rev-parse --is-shallow-repository`) — a
+  merge-base/diff computed against a commit outside the fetched depth is
   unreliable.
+- **Grafted history** (legacy `.git/info/grafts`, or its modern
+  equivalent, a `refs/replace/*` ref) — NOT caught by
+  `--is-shallow-repository` (a separate mechanism; confirmed empirically
+  a graft does not set the shallow flag). A graft can also make the
+  ancestor check above give a FALSE POSITIVE — forging one commit as
+  another's parent can make `git merge-base --is-ancestor` report two
+  otherwise-unrelated commits as ancestor/descendant. Detected via a
+  direct, non-empty check of `info/grafts` (resolved through
+  `--absolute-git-dir`) and any ref under `refs/replace`.
 - **Merge commits** — `git diff old..new --raw` already reports the full
   diff (not first-parent-only), so a merge's actual file introductions
   are captured; the force-push/ancestor check above still refuses on an

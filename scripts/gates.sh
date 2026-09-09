@@ -742,11 +742,24 @@ EOF_GLOBS
 #     previously-known remote sha1): `git diff old..new` on a force-pushed
 #     ref does not describe what the remote will actually hold afterward —
 #     inconclusive. Detected via `git merge-base --is-ancestor`.
-#   - Shallow/grafted history: `git merge-base`/`git diff` against a commit
-#     outside a shallow clone's fetched depth fails or produces a
-#     misleading result — detected via `git rev-parse --is-shallow-repository`
-#     combined with the merge-base call itself failing; either signal alone
-#     is treated as inconclusive.
+#   - Shallow history: `git merge-base`/`git diff` against a commit outside
+#     a shallow clone's fetched depth fails or produces a misleading
+#     result — detected via `git rev-parse --is-shallow-repository`.
+#   - Grafted history (legacy `.git/info/grafts`, or its modern
+#     equivalent, a `refs/replace/*` ref rewriting a commit's recorded
+#     parents): NOT the same mechanism as shallow and NOT caught by
+#     `--is-shallow-repository` — confirmed empirically that a graft does
+#     not set the shallow flag. Worse, unlike ordinary truncated/
+#     unresolvable history, a graft does not make the ancestor check below
+#     fail closed either: it can make `git merge-base --is-ancestor`
+#     return a FALSE POSITIVE by forging an ancestry relationship between
+#     two otherwise-unrelated commits (verified: grafting one orphan
+#     chain's tip to claim a wholly unrelated chain's commit as its parent
+#     made `--is-ancestor` report that fake parent as a real ancestor).
+#     Detected via a direct check for a non-empty `info/grafts` file
+#     (resolved via `--absolute-git-dir`, since `--git-path` returns a
+#     REPO_ROOT-relative path this script's CWD may not match) or any ref
+#     under `refs/replace`; either signal alone is inconclusive.
 #   - A merge commit in the pushed range: can introduce files present in
 #     neither parent's first-parent path. `git diff old..new --raw`
 #     already reports the full diff (not first-parent-only), so a merge
@@ -756,12 +769,17 @@ EOF_GLOBS
 #     linear merge-base (the same force-push check above also catches an
 #     unrelated-history merge).
 #   - Submodule pointer changes: `git diff --raw` reports the submodule's
-#     own path changing (gitlink entries are ordinary paths in raw output)
-#     — that path is then evaluated against each gate's domain like any
-#     other path, and a submodule path almost never matches a
-#     source/manifest glob, so it is NOT proven in-domain and the resolver
-#     correctly leaves the gate running rather than silently trusting that
-#     a one-line pointer bump carries no risk.
+#     own path changing with mode 160000 (a gitlink entry) on the old
+#     and/or new side. This function additionally writes every such path
+#     to GITLINK_OUT_FILE (a second output param — see this function's own
+#     header comment), which _gate_skip_or_run_domain treats the same as
+#     a gate-config touch: no gate may be skipped on a push whose
+#     changed-path set includes a gitlink. A gitlink path almost never
+#     matches a source/manifest domain glob on its own, so without this
+#     explicit escape hatch a submodule-pointer-only push would otherwise
+#     satisfy the ordinary "every changed path proven out of domain" skip
+#     condition despite a submodule bump being able to introduce arbitrary
+#     new dependency/source content this push's own diff cannot see.
 #   - Symlink creation/retargeting and file mode changes: unlike
 #     `--name-only`, `--raw` reports every path whose MODE changed even
 #     when its blob content did not, so a path whose ONLY change is a
@@ -827,12 +845,37 @@ _gate_resolve_changed_paths() {
       return 1
     fi
 
-    # Shallow/grafted history: a merge-base or diff computed against a
-    # commit outside the fetched depth is unreliable. Refuse outright
-    # rather than trust whatever git happens to return.
+    # Shallow history: a merge-base or diff computed against a commit
+    # outside the fetched depth is unreliable. Refuse outright rather than
+    # trust whatever git happens to return.
     if _git rev-parse --is-shallow-repository 2>/dev/null | grep -q '^true$'; then
       rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp" "$_grcp_raw_tmp"
       echo "repository is shallow — changed-path range cannot be trusted — inconclusive" 1>&2
+      return 1
+    fi
+
+    # Grafted history (legacy .git/info/grafts, or its modern equivalent,
+    # a refs/replace/* ref rewriting a commit's recorded parents): NOT
+    # caught by --is-shallow-repository (grafts are a separate mechanism,
+    # confirmed empirically -- a graft does not set the shallow flag) and,
+    # unlike ordinary truncated/unresolvable history, does NOT make the
+    # ancestor check below fail closed -- it can make `git merge-base
+    # --is-ancestor` return a FALSE POSITIVE by forging an ancestry
+    # relationship between two otherwise-unrelated commits (verified: a
+    # graft giving one orphan chain's tip a fake parent from a second,
+    # wholly unrelated chain made --is-ancestor report the fake parent as
+    # an ancestor). Refuse outright whenever either mechanism is present,
+    # rather than trust an ancestor/diff computation that may be rewritten
+    # underneath it.
+    _grcp_git_dir=$(_git rev-parse --absolute-git-dir 2>/dev/null)
+    if [ -n "$_grcp_git_dir" ] && [ -s "$_grcp_git_dir/info/grafts" ]; then
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp" "$_grcp_raw_tmp"
+      echo "repository has grafted history (info/grafts) — changed-path range cannot be trusted — inconclusive" 1>&2
+      return 1
+    fi
+    if [ -n "$(_git for-each-ref refs/replace 2>/dev/null)" ]; then
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp" "$_grcp_raw_tmp"
+      echo "repository has grafted history (refs/replace) — changed-path range cannot be trusted — inconclusive" 1>&2
       return 1
     fi
 
@@ -840,7 +883,7 @@ _gate_resolve_changed_paths() {
     # the remote-known sha must be a proper ancestor of the sha being
     # pushed for old..new to describe what the remote will actually hold
     # afterward. `--is-ancestor` also fails closed on either sha being
-    # unresolvable (grafted/truncated history), which is exactly the
+    # unresolvable, which is exactly the
     # "cannot be determined" case this function must refuse on.
     if ! _git merge-base --is-ancestor "$_grcp_rsha" "$_grcp_lsha" 2>/dev/null; then
       rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp" "$_grcp_raw_tmp"
