@@ -276,6 +276,32 @@ CLAGENTIC_STRICT_PREFLIGHT=0
 # zero falls back to the default.
 CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 
+# ---------- gate input domain (lr-1ad8da) ----------
+# deps (osv-scanner) and sast (semgrep), when run via `gates.sh pre-push`
+# (the git pre-push hook), each skip with outcome "not_applicable" -- a
+# third state, never "pass" -- when this push's changed-path set provably
+# cannot affect their verdict: no manifest/lockfile in domain for deps, no
+# source/build file in domain for sast, AND no gate configuration file
+# touched (a config change never allows a skip, for any gate, on that
+# push). secrets is NEVER eligible for this -- every file, unconditionally.
+# See docs/GATES.md "Gate input domain" for the full fail-closed contract
+# (multi-ref pushes, force pushes, shallow clones, merge commits, submodule
+# pointers, symlink/mode changes -- any inconclusive range runs the gate).
+#
+# Default OFF means the mechanism is ACTIVE (deps/sast can skip when
+# genuinely out of domain). Set =1 to disable the mechanism entirely and
+# run every gate unconditionally on every push, matching pre-lr-1ad8da
+# behavior byte-for-byte.
+# CLAGENTIC_ALWAYS_RUN_ALL_GATES=0
+
+# Extend the deps/sast domain glob lists (space-separated, shell glob
+# syntax) beyond the shipped documented snapshot
+# (CLAGENTIC_DEPS_DOMAIN_VERSION / CLAGENTIC_SAST_DOMAIN_VERSION in
+# scripts/gates.sh) -- for a manifest ecosystem or source language newer
+# than the snapshot, without waiting for a clagentic-lite release.
+# CLAGENTIC_DEPS_DOMAIN_EXTRA_GLOBS=
+# CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS=
+
 # ---------- repo host ----------
 # github | gitlab | gitea | none
 CLAGENTIC_REPO_HOST=github
