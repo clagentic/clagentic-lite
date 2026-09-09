@@ -740,11 +740,19 @@ CLAGENTIC_DEFAULT_BRANCH=main
 #     credential (see scripts/llm-client.sh's enterprise|anthropic-oauth
 #     arm comment for the full sweep and why this one var is excluded).
 #   - scripts/llm-client.sh's walk_chain: a mode-implied readiness preflight
-#     runs before any review/gate LLM call. bedrock-sso reads the AWS SSO
-#     token cache's expiresAt and fails fast (a degraded envelope, not a
-#     hang) naming the expiry timestamp when it has already passed. Every
-#     other mode (including UNDECLARED) is a no-op -- this preflight never
-#     runs at all unless CLAGENTIC_AUTH_MODE=bedrock-sso specifically.
+#     runs before any review/gate LLM call. bedrock-sso enumerates every
+#     cache file, resolves the current AWS profile's startUrl (from
+#     AWS_CONFIG_FILE/AWS_SHARED_CREDENTIALS_FILE and AWS_PROFILE, the
+#     standard AWS resolution order), restricts candidates to the cache
+#     files whose own startUrl matches, and selects the ONE with the latest
+#     expiresAt among those -- failing fast (a degraded envelope, not a
+#     hang) naming BOTH the expiry timestamp AND the resolved cache path
+#     only if that freshest matching candidate has already passed. The AWS
+#     SDK never cleans up stale cache files, so multiple files per startUrl
+#     is the normal steady state, not something to fail on the first
+#     expired one found (lr-3583b5). Every other mode (including
+#     UNDECLARED) is a no-op -- this preflight never runs at all unless
+#     CLAGENTIC_AUTH_MODE=bedrock-sso specifically.
 #   - `clagentic-lite doctor`: reports a contradiction when the declared
 #     mode does not match observed ambient env (e.g. declared
 #     anthropic-oauth but CLAUDE_CODE_USE_BEDROCK=1 is set in the shell
@@ -754,9 +762,15 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # CLAGENTIC_AUTH_MODE=
 
 # CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR: override the directory the bedrock-sso
-# preflight scans for AWS SSO token cache files (each a JSON file with an
-# "expiresAt" ISO-8601 field -- the standard `aws sso login` cache shape,
+# preflight scans for AWS SSO token cache files (each a JSON file with
+# "startUrl" and "expiresAt" fields -- the standard `aws sso login` cache
+# shape,
 # https://docs.aws.amazon.com/cli/latest/userguide/sso-configure-profile-token.html).
+# Multiple files per startUrl is the NORMAL steady state (the AWS SDK never
+# cleans up stale ones): the preflight matches candidates by startUrl
+# against the resolved AWS profile, then picks the FRESHEST (latest
+# expiresAt) among those matches -- never the first file it happens to
+# enumerate (lr-3583b5).
 # Defaults to $HOME/.aws/sso/cache, the AWS CLI's own default location.
 # Override only if your SSO cache lives somewhere non-standard on this host
 # (AGENTS.md invariant 6 -- never hardcode a host-specific path in code).
