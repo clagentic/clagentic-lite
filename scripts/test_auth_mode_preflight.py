@@ -87,6 +87,31 @@ task, see the PR's own fold-in-duty framing):
      that case became load-bearing under this PR's own change and is fixed
      alongside it.
 
+PR #216 SECOND review fold-in (BOBBIE blocking finding 1 +
+nit finding 2, TestPartialSessionResolutionFailsClosed):
+  1. PARTIAL SESSION RESOLUTION WAS STILL FAIL-OPEN: a profile declaring
+     sso_session = X whose [sso-session X] block is missing, or present but
+     lacking sso_start_url, is PARTIAL resolution -- a session name with no
+     usable start URL. The pre-fix _resolve_profile() returned this as
+     resolved=True, target_start_url=None: an INCOHERENT state that made
+     the directory-scan fallback filter (`if target_start_url is not
+     None`) a silent no-op, widening the candidate set to every *.json in
+     the cache dir, freshest-wins across unrelated sibling sessions -- the
+     exact fail-open this task exists to eliminate, reached through
+     realistic config drift (a deleted/renamed sso-session block). FIXED:
+     _resolve_profile()'s return contract was reworked from a raw tuple
+     with representable-incoherent fields to a tagged
+     (kind, key, ..., unresolved_reason) contract where "unresolved" is the
+     ONLY kind that carries no usable key, and the caller fails closed on
+     "unresolved" BEFORE the directory-scan fallback is even reachable --
+     see llm-client.sh's own updated _resolve_profile docstring for the
+     full kind enumeration ("session"/"legacy"/"none"/"unresolved").
+  2. ESCAPING CONSISTENCY (nit): target_start_url is now `!r`-escaped in
+     the "no-candidate" reason string, matching session_name and profile
+     elsewhere in the same function -- it could never forge a verdict (the
+     python3 exit code carries that, not parsed reason text), but
+     inconsistent escaping in one function invites a real gap later.
+
 Run with: python3 -m unittest scripts.test_auth_mode_preflight -v
 """
 import datetime
@@ -564,6 +589,113 @@ class TestSessionIdentityCacheKey(_TempDirCase):
         }, home_dir=home)
         self.assertIn("READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
         self.assertNotIn("NOT-READY", r.stdout)
+
+
+class TestPartialSessionResolutionFailsClosed(_TempDirCase):
+    """PR #216 (fold-in #2) finding 1: a profile can declare sso_session = X
+    while the referenced [sso-session X] block is missing entirely, or is
+    present but itself lacks sso_start_url. Both are PARTIAL resolution --
+    a session name with no usable start URL -- which the pre-fix
+    _resolve_profile() reported as resolved=True with target_start_url=None,
+    an incoherent state that made the directory-scan fallback's
+    `if target_start_url is not None` filter a no-op, silently widening the
+    candidate set to every *.json in the cache dir (freshest-wins across
+    unrelated sibling sessions -- the exact fail-open this task exists to
+    close, reached through realistic config drift: a profile referencing a
+    session block someone deleted or renamed).
+
+    Both cases below MUST fail NOT-READY, naming the unresolvable session,
+    and must NEVER be satisfied by an unrelated fresh cache file elsewhere
+    in the directory -- without the fix, both would incorrectly report
+    READY off of the sibling's freshness."""
+
+    def test_sso_session_block_missing_entirely_fails_closed(self):
+        """default declares sso_session = ghost-session, but no
+        [sso-session ghost-session] block exists anywhere in the config --
+        deleted or renamed out from under the profile. A fresh, totally
+        unrelated cache file sits in the directory; it must never be
+        selected as if it satisfied the unresolvable profile."""
+        tmpdir = self.mkdtemp("clagentic-test-preflight-missing-session-block-")
+        home = self.mkdtemp("clagentic-test-preflight-missing-session-block-home-")
+
+        aws_dir = os.path.join(home, ".aws")
+        os.makedirs(aws_dir, exist_ok=True)
+        with open(os.path.join(aws_dir, "config"), "w") as f:
+            f.write(textwrap.dedent("""\
+                [default]
+                sso_session = ghost-session
+                region = us-east-1
+            """))
+
+        # An unrelated fresh cache file -- MUST NOT be picked up by a
+        # widened, unfiltered directory scan.
+        _write_cache_file(tmpdir, _future(hours=4), start_url=START_URL_B,
+                           name="unrelated-fresh.json")
+
+        r = _run_preflight({
+            "CLAGENTIC_AUTH_MODE": "bedrock-sso",
+            "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
+            "AWS_PROFILE": "default",
+        }, home_dir=home)
+        self.assertIn("NOT-READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        self.assertIn("ghost-session", r.stdout)
+        self.assertIn("default", r.stdout)
+
+    def test_sso_session_block_present_without_start_url_fails_closed(self):
+        """default declares sso_session = incomplete-session, and
+        [sso-session incomplete-session] EXISTS but has no sso_start_url of
+        its own (e.g. sso_region only) -- still unresolvable, same failure
+        class as the missing-block case, must not be conflated with a
+        legitimate 'profile declares neither mechanism' (kind 'none') which
+        DOES fall back to an unfiltered scan legitimately."""
+        tmpdir = self.mkdtemp("clagentic-test-preflight-incomplete-session-block-")
+        home = self.mkdtemp("clagentic-test-preflight-incomplete-session-block-home-")
+
+        aws_dir = os.path.join(home, ".aws")
+        os.makedirs(aws_dir, exist_ok=True)
+        with open(os.path.join(aws_dir, "config"), "w") as f:
+            f.write(textwrap.dedent("""\
+                [default]
+                sso_session = incomplete-session
+                region = us-east-1
+
+                [sso-session incomplete-session]
+                sso_region = us-east-1
+            """))
+
+        _write_cache_file(tmpdir, _future(hours=4), start_url=START_URL_B,
+                           name="unrelated-fresh.json")
+
+        r = _run_preflight({
+            "CLAGENTIC_AUTH_MODE": "bedrock-sso",
+            "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
+            "AWS_PROFILE": "default",
+        }, home_dir=home)
+        self.assertIn("NOT-READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        self.assertIn("incomplete-session", r.stdout)
+        self.assertIn("default", r.stdout)
+
+    def test_directory_scan_never_reached_without_a_filter_or_unresolved_state(self):
+        """Regression guard for the pattern itself, not just its two known
+        instances above: assert directly against llm-client.sh's source
+        that the "unresolved" kind returns and exits BEFORE the
+        directory-scan fallback block is reachable -- i.e. the fallback's
+        own `if freshest_path is None:` block appears strictly after the
+        `if resolve_kind == "unresolved":` branch's own `sys.exit(1)` in
+        source order, so a future edit that reorders these can never let an
+        unresolved profile silently reach the unfiltered scan again without
+        this test tripping first."""
+        with open(LLM_CLIENT_SH) as f:
+            src = f.read()
+        unresolved_branch = src.index('if resolve_kind == "unresolved":')
+        unresolved_exit = src.index("sys.exit(1)", unresolved_branch)
+        fallback_scan = src.index("if freshest_path is None:")
+        self.assertLess(
+            unresolved_exit, fallback_scan,
+            "the unresolved-profile fail-closed exit must appear (and "
+            "therefore execute) strictly before the directory-scan "
+            "fallback block -- an unresolved profile must never reach it",
+        )
 
 
 class TestBedrockSsoExpiredCache(_TempDirCase):

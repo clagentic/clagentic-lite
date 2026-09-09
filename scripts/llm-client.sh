@@ -2382,11 +2382,9 @@ def _sha1_cache_path(cache_key_input):
 
 
 def _resolve_profile():
-    """Resolve the current AWS profile's sso_session name (if the profile
-    uses the newer indirection) and/or its startUrl (resolved either
-    directly or via the sso_session's own [sso-session NAME] block),
-    honoring the standard AWS resolution order: AWS_CONFIG_FILE (falling
-    back to the documented default ~/.aws/config) is the primary source of
+    """Resolve the current AWS profile's cache-lookup key, honoring the
+    standard AWS resolution order: AWS_CONFIG_FILE (falling back to the
+    documented default ~/.aws/config) is the primary source of
     profile/sso-session blocks; AWS_SHARED_CREDENTIALS_FILE (falling back to
     the documented default ~/.aws/credentials) is merged in as a secondary
     source -- the AWS CLI/SDKs permit sso_start_url/sso_session to appear in
@@ -2395,15 +2393,36 @@ def _resolve_profile():
     Profile selected via AWS_PROFILE (then AWS_DEFAULT_PROFILE, then
     "default").
 
-    Returns a (session_name, start_url, config_path, creds_path, profile,
-    resolved) tuple. "resolved" is False when no config/credentials file
-    could be read at all OR the target profile's section does not exist --
-    that is genuine ambiguity the caller must fail closed on (PR #216
-    finding 2), distinct from a profile that resolved but declared neither
-    sso_session nor sso_start_url (session_name and start_url both None,
-    resolved True -- falls back to the legacy startUrl-scan path, which
-    naturally finds nothing and fails closed on ITS OWN "no candidates"
-    check instead of the unresolvable-profile check)."""
+    Returns a (kind, key, config_path, creds_path, profile, unresolved_reason)
+    tuple. "kind" is one of:
+      - "session": the profile declares a USABLE sso_session indirection --
+        "key" is the session name, ready to SHA1-hash for the modern
+        cache-key mechanism.
+      - "legacy": the profile declares sso_start_url directly -- "key" is
+        that URL, ready to SHA1-hash for the legacy cache-key mechanism.
+      - "none": the profile resolved but declared neither sso_session nor
+        sso_start_url -- "key" is None; the caller falls back to the
+        unfiltered legacy startUrl-scan path (which naturally finds nothing
+        useful to filter by and fails closed on its own "no candidates"
+        check).
+      - "unresolved": genuine ambiguity the caller must fail closed on
+        without attempting ANY fallback lookup -- "key" is None and
+        "unresolved_reason" names why: no config/credentials file could be
+        read at all (PR #216 finding 2), the target profile's section does
+        not exist (PR #216 finding 2), OR the profile names an sso_session
+        whose [sso-session NAME] block is missing or itself lacks
+        sso_start_url (PR #216 fold-in finding 1 -- a profile that names an
+        sso_session gets NO fallback-to-legacy-scan: that indirection was
+        declared explicitly, so a broken target is unresolvable, never an
+        invitation to widen the search to every cache file in the
+        directory).
+
+    This return shape makes "resolved but only partially" UNREPRESENTABLE:
+    every non-"unresolved" kind carries a usable key (or, for "none",
+    deliberately no key at all with no ambiguity attached to that absence).
+    There is no state where a caller could receive a session name without
+    its start URL and still believe resolution "succeeded" -- the code that
+    reached exactly that shape is why this signature exists."""
     config_path = os.environ.get("AWS_CONFIG_FILE") or os.path.join(
         os.path.expanduser("~"), ".aws", "config"
     )
@@ -2451,59 +2470,80 @@ def _resolve_profile():
             pass
 
     if not read_any:
-        return None, None, config_path, creds_path, profile, False
+        reason = (
+            f"AWS profile {profile!r} could not be resolved -- no "
+            f"config/credentials file could be read at {config_path} or "
+            f"{creds_path}"
+        )
+        return "unresolved", None, config_path, creds_path, profile, reason
 
     # AWS config file section-naming convention: the default profile's
     # section is literally "default"; every other profile's section is
     # "profile <name>".
     section = "default" if profile == "default" else f"profile {profile}"
     if not parser.has_section(section):
-        return None, None, config_path, creds_path, profile, False
+        reason = f"profile {profile!r} has no section in {config_path} or {creds_path}"
+        return "unresolved", None, config_path, creds_path, profile, reason
 
     direct_url = parser.get(section, "sso_start_url", fallback=None)
     if direct_url:
-        return None, direct_url.strip(), config_path, creds_path, profile, True
+        return "legacy", direct_url.strip(), config_path, creds_path, profile, None
 
     session_name = parser.get(section, "sso_session", fallback=None)
     if session_name:
         session_name = session_name.strip()
         session_section = f"sso-session {session_name}"
+        if not parser.has_section(session_section):
+            reason = (
+                f"profile {profile!r} declares sso_session {session_name!r} "
+                f"but [sso-session {session_name!r}] is missing from "
+                f"{config_path} or {creds_path}"
+            )
+            return "unresolved", None, config_path, creds_path, profile, reason
         session_url = parser.get(session_section, "sso_start_url", fallback=None)
-        return (
-            session_name,
-            session_url.strip() if session_url else None,
-            config_path,
-            creds_path,
-            profile,
-            True,
-        )
+        if not session_url:
+            reason = (
+                f"profile {profile!r} declares sso_session {session_name!r} "
+                f"but [sso-session {session_name!r}] has no sso_start_url in "
+                f"{config_path} or {creds_path}"
+            )
+            return "unresolved", None, config_path, creds_path, profile, reason
+        return "session", session_name, config_path, creds_path, profile, None
 
-    return None, None, config_path, creds_path, profile, True
+    return "none", None, config_path, creds_path, profile, None
 
 
-session_name, target_start_url, config_path, creds_path, profile, resolved = _resolve_profile()
+resolve_kind, resolve_key, config_path, creds_path, profile, unresolved_reason = _resolve_profile()
 
-if not resolved:
-    # FAIL CLOSED (PR #216 finding 2, reversing the prior "freshest wins
-    # across all cache files" no-profile fallback): the target profile
-    # could not be resolved at all, so there is no way to know which cache
-    # file -- if any -- corresponds to what will actually be used at call
-    # time. Genuine ambiguity; never assume valid on it.
-    _emit(
-        status="not-ready",
-        kind="profile-unresolved",
-        reason=(
-            f"AWS profile {profile!r} could not be resolved from "
-            f"{config_path} or {creds_path}"
-        ),
-    )
+if resolve_kind == "unresolved":
+    # FAIL CLOSED (PR #216 finding 2 and its fold-in extension): the target
+    # profile could not be resolved to a usable cache-lookup key at all --
+    # whether because no config/credentials file could be read, the
+    # profile's own section is missing, or the profile names an sso_session
+    # whose [sso-session NAME] block is missing/incomplete -- so there is no
+    # way to know which cache file, if any, corresponds to what will
+    # actually be used at call time. Genuine ambiguity; never assume valid
+    # on it, and never fall through to the directory-scan fallback below --
+    # that fallback runs ONLY for resolve_kind in ("session", "legacy",
+    # "none"), never "unresolved".
+    _emit(status="not-ready", kind="profile-unresolved", reason=unresolved_reason)
     sys.exit(1)
+
+# Every kind other than "unresolved" reaches here with a COHERENT state:
+# "session"/"legacy" always carry a usable resolve_key; "none" carries no
+# key and no ambiguity attached to that absence (the profile resolved, it
+# simply declared no SSO indirection at all). There is no remaining state
+# where a session name is known but its start URL is not -- that
+# incoherent combination is exactly what made the directory-scan fallback's
+# filter a no-op before this fold-in.
+session_name = resolve_key if resolve_kind == "session" else None
+target_start_url = resolve_key if resolve_kind == "legacy" else None
 
 freshest_path = None
 freshest_dt = None
 freshest_raw = None
 
-if session_name is not None:
+if resolve_kind == "session":
     # MODERN CACHE-KEY MECHANISM: the AWS CLI/SDKs key an sso_session-backed
     # token cache file by SHA1(session_name) -- not by startUrl. Two
     # sso_sessions can share a startUrl while using separate cache files;
@@ -2514,7 +2554,7 @@ if session_name is not None:
         dt = _parse_expires_at(data.get("expiresAt"))
         if dt is not None:
             freshest_path, freshest_dt, freshest_raw = direct_path, dt, data.get("expiresAt")
-elif target_start_url is not None:
+elif resolve_kind == "legacy":
     # LEGACY CACHE-KEY MECHANISM: a profile with sso_start_url set directly
     # (no sso_session indirection) has no session name to hash -- the SDK
     # keys its cache file by SHA1(startUrl) instead.
@@ -2530,10 +2570,12 @@ if freshest_path is None:
     # -- fall back to a startUrl-filtered directory scan (PRE-lr-3583b5
     # breadth for this branch only): every *.json candidate whose own
     # "startUrl" field matches the resolved target_start_url (when one
-    # resolved at all -- a profile that named neither sso_session nor
-    # sso_start_url has target_start_url None too, so this scans every
-    # file, unchanged from a legacy no-scoping-possible profile), and among
-    # ONLY those candidates, freshest wins.
+    # resolved at all -- resolve_kind "none" has target_start_url None too,
+    # so this scans every file, unchanged from a legacy no-scoping-possible
+    # profile). This scan is UNREACHABLE for resolve_kind == "unresolved"
+    # (handled above, before this point) -- a filter that can never be
+    # silently absent because its input was ambiguous rather than
+    # deliberately "no scoping declared".
     candidates = []  # list of (expires_at_dt, expires_at_raw, path)
     for path in sorted(glob.glob(os.path.join(cache_dir, "*.json"))):
         data = _load_cache_file(path)
@@ -2554,7 +2596,7 @@ if freshest_path is None:
         if session_name is not None:
             reason += f" for session {session_name!r} (checked {_sha1_cache_path(session_name)}, and the startUrl-scoped fallback)"
         elif target_start_url is not None:
-            reason += f" matching startUrl {target_start_url}"
+            reason += f" matching startUrl {target_start_url!r}"
         _emit(status="not-ready", kind="no-candidate", reason=reason)
         sys.exit(1)
 
