@@ -701,13 +701,23 @@ EOF_GLOBS
   return 1
 }
 
-# _gate_resolve_changed_paths OUT_FILE — resolve the changed-path set for
-# THIS invocation of cmd_pre_push and write it, one path per line, to
-# OUT_FILE. Prints a one-line derivation description on stdout on success
-# (how the set was computed — for the audit trail's "how that set was
-# derived" requirement). Returns 1 (OUT_FILE left empty/absent) whenever the
-# set cannot be determined with certainty — the caller's job is to treat
-# THAT as "run every gate," never "skip."
+# _gate_resolve_changed_paths OUT_FILE GITLINK_OUT_FILE — resolve the
+# changed-path set for THIS invocation of cmd_pre_push and write it, one
+# path per line, to OUT_FILE. GITLINK_OUT_FILE additionally receives the
+# subset of those paths whose raw diff mode (old or new side) is 160000
+# (a submodule gitlink entry) — see _gate_skip_or_run_domain's use of this
+# second file, which forces every gate to run whenever it is non-empty,
+# the same way a gate-config touch does. A gitlink path essentially never
+# matches a source/manifest domain glob on its own, so without this
+# explicit escape hatch a submodule-pointer-only push would satisfy the
+# "every changed path proven out of domain" skip condition and both deps
+# and sast would wrongly report not_applicable on a change that can
+# introduce arbitrary new dependency/source content one level down.
+# Prints a one-line derivation description on stdout on success (how the
+# set was computed — for the audit trail's "how that set was derived"
+# requirement). Returns 1 (OUT_FILE left empty/absent) whenever the set
+# cannot be determined with certainty — the caller's job is to treat THAT
+# as "run every gate," never "skip."
 #
 # stdin protocol (git's pre-push hook contract): zero or more lines of
 # "<local ref> <local sha1> <remote ref> <remote sha1>", one per ref being
@@ -772,7 +782,9 @@ EOF_GLOBS
 #     this exact reason.
 _gate_resolve_changed_paths() {
   _grcp_out="$1"
+  _grcp_gitlink_out="$2"
   : > "$_grcp_out"
+  : > "$_grcp_gitlink_out"
 
   if ! _git_repo_root_is_scoped; then
     echo "REPO_ROOT is not a git repo — changed-path set cannot be determined" 1>&2
@@ -888,11 +900,16 @@ _gate_resolve_changed_paths() {
 
     # Each raw -z record is ":oldmode newmode oldsha newsha status\0path\0"
     # -- two NUL-terminated fields per changed path (--no-renames above
-    # guarantees this shape). Convert to one token per line and keep only
-    # every second line (the path; the first is the status/mode metadata
-    # line, of no interest here since only the path drives domain
-    # membership).
-    tr '\0' '\n' < "$_grcp_raw_tmp" | awk 'NR % 2 == 0' >> "$_grcp_union_tmp"
+    # guarantees this shape). Convert to one token per line; odd lines are
+    # the status/mode metadata, even lines are the path. Every path goes
+    # to the union file; a path whose metadata line names mode 160000 on
+    # either side (a submodule gitlink) additionally goes to the gitlink
+    # file — see this function's own doc comment for why that second file
+    # exists.
+    tr '\0' '\n' < "$_grcp_raw_tmp" | awk -v union="$_grcp_union_tmp" -v gitlink="$_grcp_gitlink_out" '
+      NR % 2 == 1 { meta = $0; is_gitlink = (meta ~ /(^|[[:space:]])160000([[:space:]]|$)/); next }
+      { print > union; if (is_gitlink) print > gitlink }
+    '
     rm -f "$_grcp_raw_tmp"
 
     _grcp_reasons="${_grcp_reasons}${_grcp_reasons:+; }ref $_grcp_lref: diff ${_grcp_rsha}..${_grcp_lsha}"
@@ -945,25 +962,40 @@ _gate_skip_or_run_domain() {
   fi
 
   _gsord_changed_tmp=$(mktemp -t clagentic-domain-changed.XXXXXX)
+  _gsord_gitlink_tmp=$(mktemp -t clagentic-domain-gitlink.XXXXXX)
   _gsord_err_tmp=$(mktemp -t clagentic-domain-err.XXXXXX)
   _gsord_derivation=""
-  if ! _gsord_derivation=$(_gate_resolve_changed_paths "$_gsord_changed_tmp" < "$_gsord_refs_file" 2>"$_gsord_err_tmp"); then
+  if ! _gsord_derivation=$(_gate_resolve_changed_paths "$_gsord_changed_tmp" "$_gsord_gitlink_tmp" < "$_gsord_refs_file" 2>"$_gsord_err_tmp"); then
     echo "[gates/$_gsord_gate] $(cat "$_gsord_err_tmp" 2>/dev/null) — running (fail closed)" 1>&2
-    rm -f "$_gsord_changed_tmp" "$_gsord_err_tmp"
+    rm -f "$_gsord_changed_tmp" "$_gsord_gitlink_tmp" "$_gsord_err_tmp"
     return 0
   fi
   rm -f "$_gsord_err_tmp"
 
   if [ ! -s "$_gsord_changed_tmp" ]; then
-    rm -f "$_gsord_changed_tmp"
+    rm -f "$_gsord_changed_tmp" "$_gsord_gitlink_tmp"
     return 0
   fi
 
   if _gate_path_touches_any_gate_config "$_gsord_changed_tmp"; then
     echo "[gates/$_gsord_gate] changed-path set touches gate configuration — no gate may be skipped on this push" 1>&2
-    rm -f "$_gsord_changed_tmp"
+    rm -f "$_gsord_changed_tmp" "$_gsord_gitlink_tmp"
     return 0
   fi
+
+  # A submodule pointer (gitlink) change is never skippable either, for
+  # either gate: a gitlink path almost never matches a source/manifest
+  # domain glob on its own, which would otherwise satisfy the "every
+  # changed path proven out of domain" skip condition below even though a
+  # submodule bump can introduce an arbitrary new dependency or source
+  # tree one level down that this push's own diff cannot see the content
+  # of. Same escape-hatch shape as the gate-config check above.
+  if [ -s "$_gsord_gitlink_tmp" ]; then
+    echo "[gates/$_gsord_gate] changed-path set touches a submodule pointer (gitlink) — no gate may be skipped on this push" 1>&2
+    rm -f "$_gsord_changed_tmp" "$_gsord_gitlink_tmp"
+    return 0
+  fi
+  rm -f "$_gsord_gitlink_tmp"
 
   # A gate skips ONLY when EVERY changed path is proven to be OUTSIDE its
   # domain (allowlist semantics, task requirement 4) -- a single path that

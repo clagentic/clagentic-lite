@@ -1219,21 +1219,28 @@ which means **run the gate**, never skip it:
 - **Shallow/grafted history** (`git rev-parse --is-shallow-repository`) —
   a merge-base/diff computed against a commit outside the fetched depth is
   unreliable.
-- **Merge commits** — `git diff old..new --name-only` already reports the
-  full name-only diff (not first-parent-only), so a merge's actual file
-  introductions are captured; the force-push/ancestor check above still
-  refuses on an unrelated-history merge.
-- **Submodule pointer changes** — a gitlink path change appears in
-  `--name-only` output like any other path and is evaluated against each
-  gate's domain normally; it essentially never matches a source/manifest
-  glob, so it is correctly left running the gate rather than trusting a
-  one-line pointer bump.
-- **Symlink creation/retargeting and file mode changes** — `--name-only`
-  alone cannot distinguish a content change from a mode/symlink-target
-  change on an existing path; `_gate_resolve_changed_paths` additionally
-  parses `git diff old..new --summary` for mode-change/create-mode/
-  delete-mode lines and unions those paths in, so a path whose ONLY change
-  is a mode/symlink flip still counts as changed.
+- **Merge commits** — `git diff old..new --raw` already reports the full
+  diff (not first-parent-only), so a merge's actual file introductions
+  are captured; the force-push/ancestor check above still refuses on an
+  unrelated-history merge.
+- **Submodule pointer changes** — a gitlink path (raw diff mode `160000`)
+  essentially never matches a source/manifest glob on its own, which would
+  otherwise satisfy the "every changed path proven out of domain" skip
+  condition even though a submodule bump can introduce an arbitrary new
+  dependency or source tree this push's own diff cannot see the content
+  of. `_gate_resolve_changed_paths` reports gitlink paths separately, and
+  `_gate_skip_or_run_domain` treats a non-empty gitlink set the same way
+  it treats a gate-config touch — no gate may be skipped on that push.
+- **Symlink creation/retargeting and file mode changes** — `_gate_resolve_changed_paths`
+  resolves the changed-path set from a single `git diff -z --no-renames
+  --raw` (NUL-delimited, no rename detection). `--raw` reports every path
+  whose mode, blob sha, or existence changed, not just paths with a
+  content diff, so a path whose ONLY change is a mode/symlink flip with
+  byte-identical content still counts as changed with no second, parallel
+  parse needed. `-z` disables git's path C-quoting entirely (a prior
+  `--name-only` + `--summary`/`sed` union quoted a path containing a
+  space/quote/non-ASCII byte as a single escaped literal that no domain
+  glob could match — lr-1ad8da follow-up).
 - **Vendored dependencies under a documentation path, and generated/
   literate documents** — domain matching is by file NAME/EXTENSION shape
   only (`_gate_path_in_domain`), never by directory location. There is no
