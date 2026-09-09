@@ -160,25 +160,50 @@ ENVELOPE
     return path
 
 
-def _write_valid_sso_cache(cache_dir):
+_SSO_CACHE_FIXTURE_START_URL = "https://example.invalid/start"
+
+
+def _write_valid_sso_cache(cache_dir, home_dir=None):
     """Write one AWS SSO token-cache-shaped JSON file with expiresAt far in
     the future -- the mode-implied readiness preflight (_llm_auth_mode_preflight)
     treats this as 'ready'. Tests that exercise CLAGENTIC_AUTH_MODE=bedrock-sso
     for something OTHER than the preflight itself (the CLAUDE_CODE_USE_BEDROCK
     ensure, the gate no-fallback property, the Layer-2 fallback property) must
     point CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR at a fixture like this one so the
-    preflight does not trip first and mask what they are actually testing."""
+    preflight does not trip first and mask what they are actually testing.
+
+    PR #216 finding 2 fold-in: the preflight now fails closed when the AWS
+    profile cannot be resolved at all, so a caller of this fixture that
+    wants a READY preflight outcome must ALSO pass home_dir (used as HOME by
+    the caller's subprocess) -- this writes a matching ~/.aws/config
+    declaring the "default" profile's sso_start_url as this fixture's own
+    startUrl, so profile resolution succeeds and the (legacy, direct
+    sso_start_url) cache-key lookup falls through to the startUrl-scoped
+    scan that finds this file. When home_dir is omitted, the caller is
+    exercising something OTHER than a READY preflight outcome (e.g. a
+    scenario that no longer applies now the fallback is fail-closed) and
+    must supply its own config fixture."""
     import datetime
     os.makedirs(cache_dir, exist_ok=True)
     future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
     path = os.path.join(cache_dir, "fixture-token.json")
     with open(path, "w") as f:
         json.dump({
-            "startUrl": "https://example.invalid/start",
+            "startUrl": _SSO_CACHE_FIXTURE_START_URL,
             "region": "us-east-1",
             "accessToken": "fixture-not-a-real-token",
             "expiresAt": future.strftime("%Y-%m-%dT%H:%M:%SUTC"),
         }, f)
+    if home_dir is not None:
+        aws_dir = os.path.join(home_dir, ".aws")
+        os.makedirs(aws_dir, exist_ok=True)
+        with open(os.path.join(aws_dir, "config"), "w") as f:
+            f.write(textwrap.dedent(f"""\
+                [default]
+                sso_start_url = {_SSO_CACHE_FIXTURE_START_URL}
+                sso_region = us-east-1
+                region = us-east-1
+            """))
     return path
 
 
@@ -309,7 +334,9 @@ class TestAcceptance4GateRoleNoFallback(unittest.TestCase):
             dump_path = os.path.join(tmpdir, "child-environ.txt")
             _write_environ_dump_success_claude_gate_decision(bin_dir, dump_path)
             sso_cache_dir = os.path.join(tmpdir, "sso-cache")
-            _write_valid_sso_cache(sso_cache_dir)
+            home_dir = os.path.join(tmpdir, "home")
+            os.makedirs(home_dir, exist_ok=True)
+            _write_valid_sso_cache(sso_cache_dir, home_dir=home_dir)
 
             script = textwrap.dedent(f"""\
                 export PATH='{bin_dir}':"$PATH"
@@ -321,6 +348,11 @@ class TestAcceptance4GateRoleNoFallback(unittest.TestCase):
             env = dict(os.environ)
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
             env.pop("CLAGENTIC_AUTH_MODE", None)
+            env.pop("AWS_CONFIG_FILE", None)
+            env.pop("AWS_SHARED_CREDENTIALS_FILE", None)
+            env.pop("AWS_PROFILE", None)
+            env.pop("AWS_DEFAULT_PROFILE", None)
+            env["HOME"] = home_dir
             env["CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR"] = sso_cache_dir
             if extra_env:
                 env.update(extra_env)
@@ -368,7 +400,9 @@ class TestAcceptance5ReviewerLayer2FallbackCarriesEnsure(unittest.TestCase):
             dump_path = os.path.join(tmpdir, "child-environ.txt")
             _write_environ_dump_success_claude(bin_dir, dump_path)
             sso_cache_dir = os.path.join(tmpdir, "sso-cache")
-            _write_valid_sso_cache(sso_cache_dir)
+            home_dir = os.path.join(tmpdir, "home")
+            os.makedirs(home_dir, exist_ok=True)
+            _write_valid_sso_cache(sso_cache_dir, home_dir=home_dir)
 
             # CLAGENTIC_ROUTER_URL points at a port nothing listens on, so
             # invoke_router's curl fails fast and walk_chain falls through
@@ -385,6 +419,11 @@ class TestAcceptance5ReviewerLayer2FallbackCarriesEnsure(unittest.TestCase):
             """)
             env = dict(os.environ)
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
+            env.pop("AWS_CONFIG_FILE", None)
+            env.pop("AWS_SHARED_CREDENTIALS_FILE", None)
+            env.pop("AWS_PROFILE", None)
+            env.pop("AWS_DEFAULT_PROFILE", None)
+            env["HOME"] = home_dir
             env["CLAGENTIC_AUTH_MODE"] = "bedrock-sso"
             env["CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR"] = sso_cache_dir
             env.update(source_env(llm_client=True))

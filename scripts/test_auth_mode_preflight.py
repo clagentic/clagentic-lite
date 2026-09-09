@@ -54,11 +54,43 @@ test either points AWS_CONFIG_FILE at a fixture file (HOME is also
 overridden in every subprocess call so an unset AWS_CONFIG_FILE cannot
 accidentally resolve against the developer's real ~/.aws either) or
 deliberately leaves it unresolvable to exercise the no-profile-resolved
-fallback path.
+fail-closed path.
+
+PR #216 review fold-in (four findings, same file/function -- not a separate
+task, see the PR's own fold-in-duty framing):
+  1. SESSION IDENTITY (TestSessionIdentityCacheKey): the AWS CLI/SDKs key an
+     sso_session-backed cache file by SHA1(session_name), NOT by startUrl.
+     Filtering by startUrl alone (the lr-3583b5 shape above) can select a
+     FRESH sibling session's file while the resolved session's own file is
+     expired -- fail-open, the same defect class relocated. Fixed: resolve
+     the exact SHA1-keyed file for the resolved session (or the legacy
+     startUrl-keyed file for a profile with no sso_session), falling back to
+     the startUrl-filtered scan ONLY when neither direct lookup resolves.
+  2. NO-PROFILE FALLBACK REVERSED TO FAIL CLOSED
+     (test_no_resolvable_profile_fails_closed, formerly asserted the
+     opposite): an unresolvable profile is genuine ambiguity under the
+     task's own fail-closed mandate. The prior "freshest wins across all
+     cache files" fallback for this case is REMOVED, not merely
+     supplemented -- this is the one behavior change in this fold-in that
+     flips an existing test's assertion rather than adding new coverage.
+  3. REASON TEXT NON-POSITIONAL (see the shell-side python3 contract
+     comment in llm-client.sh itself): the python3->shell handoff was
+     restructured from fixed tab-field positions to newline-delimited
+     "key=value" pairs, and several tests here now assert the REASON TEXT
+     itself, not just the bare "NOT-READY" marker, for the empty-dir and
+     unparseable-only cases specifically (the ones the positional bug
+     silently discarded the reason for).
+  4. MISSING PYTHON3 FAILS CLOSED (TestNoPython3FailsClosed): this PR moved
+     ALL cache/config parsing onto python3 (json.load + configparser, no
+     shell-side fallback parser by design) -- a host without python3 now
+     performs ZERO validation, so the pre-existing fail-open posture for
+     that case became load-bearing under this PR's own change and is fixed
+     alongside it.
 
 Run with: python3 -m unittest scripts.test_auth_mode_preflight -v
 """
 import datetime
+import hashlib
 import json
 import os
 import shutil
@@ -91,6 +123,24 @@ def _write_cache_file(cache_dir, expires_at, start_url=START_URL_A, name="token.
             "expiresAt": expires_at,
         }, f)
     return path
+
+
+def _sha1_cache_name(cache_key_input):
+    """Reproduce the AWS CLI/SDK's own SSO token cache filename derivation:
+    SHA1 hex digest of the cache-key input (a session name for sso_session-
+    backed profiles, a startUrl for legacy direct profiles), ".json"
+    appended. PR #216 finding 1 fixture helper -- writes a cache file at the
+    exact path the SDK itself would load, distinct from _write_cache_file's
+    arbitrary name (used for the startUrl-scan fallback paths)."""
+    return hashlib.sha1(cache_key_input.encode("utf-8")).hexdigest() + ".json"
+
+
+def _write_session_keyed_cache_file(cache_dir, expires_at, session_name, start_url):
+    """Write a cache file at the SHA1(session_name)-derived path -- the
+    modern sso_session cache-key mechanism PR #216 finding 1 requires this
+    preflight to use, rather than filtering by startUrl alone."""
+    return _write_cache_file(cache_dir, expires_at, start_url=start_url,
+                              name=_sha1_cache_name(session_name))
 
 
 def _future(hours=4):
@@ -243,22 +293,26 @@ class TestBedrockSsoValidCache(_TempDirCase):
 
     def test_valid_cache_is_ready(self):
         tmpdir = self.mkdtemp("clagentic-test-preflight-valid-")
-        _write_cache_file(tmpdir, _future())
+        home = self.mkdtemp("clagentic-test-preflight-valid-home-")
+        _write_aws_config(home, start_url=START_URL_A)
+        _write_cache_file(tmpdir, _future(), start_url=START_URL_A)
         r = _run_preflight({
             "CLAGENTIC_AUTH_MODE": "bedrock-sso",
             "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
-        })
+        }, home_dir=home)
         self.assertIn("READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
         self.assertNotIn("NOT-READY", r.stdout)
 
     def test_multiple_cache_files_all_valid_is_ready(self):
         tmpdir = self.mkdtemp("clagentic-test-preflight-multi-valid-")
-        _write_cache_file(tmpdir, _future(hours=2), name="profile-a.json")
-        _write_cache_file(tmpdir, _future(hours=8), name="profile-b.json")
+        home = self.mkdtemp("clagentic-test-preflight-multi-valid-home-")
+        _write_aws_config(home, start_url=START_URL_A)
+        _write_cache_file(tmpdir, _future(hours=2), start_url=START_URL_A, name="profile-a.json")
+        _write_cache_file(tmpdir, _future(hours=8), start_url=START_URL_A, name="profile-b.json")
         r = _run_preflight({
             "CLAGENTIC_AUTH_MODE": "bedrock-sso",
             "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
-        })
+        }, home_dir=home)
         self.assertIn("READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
         self.assertNotIn("NOT-READY", r.stdout)
 
@@ -359,12 +413,19 @@ class TestFreshestMatchPerStartUrl(_TempDirCase):
         self.assertIn("READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
         self.assertNotIn("NOT-READY", r.stdout)
 
-    def test_no_resolvable_profile_still_applies_freshest_wins_across_all(self):
-        """When the AWS profile/config cannot be resolved at all (no config
-        file present), startUrl-scoping is impossible -- every cache file is
-        a candidate, but FRESHEST-WINS still applies across all of them
-        (this is the documented fallback breadth, distinct from returning
-        NOT-READY merely because resolution failed)."""
+    def test_no_resolvable_profile_fails_closed(self):
+        """PR #216 finding 2 (reverses the pre-fold-in behavior this test
+        used to assert): when the AWS profile/config cannot be resolved at
+        all (no config file present), that is GENUINE AMBIGUITY under the
+        task's own fail-closed mandate -- there is no way to know which
+        cache file, if any, corresponds to the profile that will actually be
+        used at call time. The prior "freshest wins across all files"
+        fallback here masked exactly this: a fresh token for an unrelated
+        profile/startUrl could make the preflight report READY while the
+        actually-active profile's own credential state was never examined.
+        NOT-READY, naming which config path(s) were consulted and which
+        profile name was sought -- never a silent pass merely because SOME
+        fresh file exists somewhere in the cache dir."""
         tmpdir = self.mkdtemp("clagentic-test-preflight-no-profile-")
         empty_home = self.mkdtemp("clagentic-test-preflight-no-profile-home-")
         _write_cache_file(tmpdir, _past(hours=999), start_url=START_URL_A, name="a-expired.json")
@@ -373,6 +434,134 @@ class TestFreshestMatchPerStartUrl(_TempDirCase):
             "CLAGENTIC_AUTH_MODE": "bedrock-sso",
             "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
         }, home_dir=empty_home)
+        self.assertIn("NOT-READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        # Names the profile that was sought and the config path(s)
+        # consulted -- an operator must not be left with a bare "not-ready"
+        # after this fold-in's finding 3 fix either.
+        self.assertIn("default", r.stdout)
+        self.assertIn(os.path.join(empty_home, ".aws", "config"), r.stdout)
+
+
+class TestSessionIdentityCacheKey(_TempDirCase):
+    """PR #216 finding 1: modern AWS SDKs key the SSO token cache by
+    SHA1(session_name), NOT by startUrl -- two sso_sessions can share a
+    startUrl while using SEPARATE cache files. Filtering candidates by
+    startUrl alone (this preflight's behavior before this fold-in) can
+    select a FRESH sibling session's file while the RESOLVED session's own
+    file is expired, reporting READY on an actually-expired credential --
+    fail-open, the exact defect class lr-3583b5 exists to close, just
+    relocated from "first match wins" to "wrong match wins"."""
+
+    def test_two_sessions_share_starturl_resolved_expired_sibling_fresh_is_not_ready(self):
+        """The reproduction PEACHES built the finding on: sso_session "a"
+        (the resolved/active one) and sso_session "b" (a sibling, unrelated
+        to the active profile) share one startUrl. Session "a"'s own
+        SHA1-keyed cache file is expired; session "b"'s is fresh. Because
+        the ACTIVE profile resolves to session "a", only "a"'s own cache
+        file may be consulted -- "b"'s freshness must never leak in via a
+        startUrl match. MUST fail without the fix (pre-fix code filtered by
+        startUrl alone and would have found "b"'s fresh file a "match")."""
+        tmpdir = self.mkdtemp("clagentic-test-preflight-session-key-")
+        home = self.mkdtemp("clagentic-test-preflight-session-key-home-")
+
+        aws_dir = os.path.join(home, ".aws")
+        os.makedirs(aws_dir, exist_ok=True)
+        with open(os.path.join(aws_dir, "config"), "w") as f:
+            f.write(textwrap.dedent(f"""\
+                [default]
+                sso_session = session-a
+                region = us-east-1
+
+                [profile other]
+                sso_session = session-b
+                region = us-east-1
+
+                [sso-session session-a]
+                sso_start_url = {START_URL_A}
+                sso_region = us-east-1
+
+                [sso-session session-b]
+                sso_start_url = {START_URL_A}
+                sso_region = us-east-1
+            """))
+
+        expired_dt = _past_dt(hours=1)
+        _write_session_keyed_cache_file(
+            tmpdir, expired_dt.strftime("%Y-%m-%dT%H:%M:%SUTC"),
+            session_name="session-a", start_url=START_URL_A,
+        )
+        _write_session_keyed_cache_file(
+            tmpdir, _future(hours=4),
+            session_name="session-b", start_url=START_URL_A,
+        )
+
+        r = _run_preflight({
+            "CLAGENTIC_AUTH_MODE": "bedrock-sso",
+            "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
+            "AWS_PROFILE": "default",
+        }, home_dir=home)
+        self.assertIn("NOT-READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        self.assertIn("expired", r.stdout.lower())
+        self.assertIn(expired_dt.strftime("%Y-%m-%d"), r.stdout)
+
+    def test_two_sessions_share_starturl_resolved_fresh_sibling_expired_is_ready(self):
+        """Mirror of the previous case: the resolved session's OWN file is
+        fresh even though a sibling session sharing the same startUrl is
+        expired. The sibling's staleness must never drag the resolved
+        session into NOT-READY -- only the resolved session's own
+        SHA1-keyed file matters."""
+        tmpdir = self.mkdtemp("clagentic-test-preflight-session-key-mirror-")
+        home = self.mkdtemp("clagentic-test-preflight-session-key-mirror-home-")
+
+        aws_dir = os.path.join(home, ".aws")
+        os.makedirs(aws_dir, exist_ok=True)
+        with open(os.path.join(aws_dir, "config"), "w") as f:
+            f.write(textwrap.dedent(f"""\
+                [default]
+                sso_session = session-a
+                region = us-east-1
+
+                [sso-session session-a]
+                sso_start_url = {START_URL_A}
+                sso_region = us-east-1
+
+                [sso-session session-b]
+                sso_start_url = {START_URL_A}
+                sso_region = us-east-1
+            """))
+
+        _write_session_keyed_cache_file(
+            tmpdir, _future(hours=4),
+            session_name="session-a", start_url=START_URL_A,
+        )
+        _write_session_keyed_cache_file(
+            tmpdir, _past(hours=999),
+            session_name="session-b", start_url=START_URL_A,
+        )
+
+        r = _run_preflight({
+            "CLAGENTIC_AUTH_MODE": "bedrock-sso",
+            "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
+            "AWS_PROFILE": "default",
+        }, home_dir=home)
+        self.assertIn("READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        self.assertNotIn("NOT-READY", r.stdout)
+
+    def test_legacy_profile_without_sso_session_keys_by_starturl(self):
+        """The legacy shape (sso_start_url set directly on the profile, no
+        sso_session indirection) has no session name to hash -- the SDK
+        keys its cache file by SHA1(startUrl) instead, and this preflight
+        must match that convention (not SHA1 of anything else) for the
+        direct-lookup path to find it."""
+        tmpdir = self.mkdtemp("clagentic-test-preflight-legacy-key-")
+        home = self.mkdtemp("clagentic-test-preflight-legacy-key-home-")
+        _write_aws_config(home, start_url=START_URL_A)
+        _write_cache_file(tmpdir, _future(hours=4), start_url=START_URL_A,
+                           name=_sha1_cache_name(START_URL_A))
+        r = _run_preflight({
+            "CLAGENTIC_AUTH_MODE": "bedrock-sso",
+            "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
+        }, home_dir=home)
         self.assertIn("READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
         self.assertNotIn("NOT-READY", r.stdout)
 
@@ -383,13 +572,15 @@ class TestBedrockSsoExpiredCache(_TempDirCase):
 
     def test_expired_cache_not_ready_names_expiry(self):
         tmpdir = self.mkdtemp("clagentic-test-preflight-expired-")
+        home = self.mkdtemp("clagentic-test-preflight-expired-home-")
+        _write_aws_config(home, start_url=START_URL_A)
         past_dt = _past_dt(hours=1)
         past = past_dt.strftime("%Y-%m-%dT%H:%M:%SUTC")
-        _write_cache_file(tmpdir, past)
+        _write_cache_file(tmpdir, past, start_url=START_URL_A)
         r = _run_preflight({
             "CLAGENTIC_AUTH_MODE": "bedrock-sso",
             "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
-        })
+        }, home_dir=home)
         self.assertIn("NOT-READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
         self.assertIn("expired", r.stdout.lower())
         # The actual expiry timestamp (ISO date component) must appear
@@ -447,36 +638,51 @@ class TestBedrockSsoMissingOrUnparseableCache(_TempDirCase):
 
     def test_empty_cache_dir_is_not_ready(self):
         tmpdir = self.mkdtemp("clagentic-test-preflight-empty-")
+        home = self.mkdtemp("clagentic-test-preflight-empty-home-")
+        _write_aws_config(home, start_url=START_URL_A)
         r = _run_preflight({
             "CLAGENTIC_AUTH_MODE": "bedrock-sso",
             "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
-        })
+        }, home_dir=home)
         self.assertIn("NOT-READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        # PR #216 finding 3: the REASON text must survive, not just the bare
+        # "NOT-READY" marker -- an empty dir is not the same problem as a
+        # missing dir or an expired cache, and the operator must be told
+        # which one they hit, not left with an opaque lockout.
+        self.assertIn("no aws sso cache file with a parseable expiresat", r.stdout.lower())
 
     def test_only_unparseable_json_files_is_not_ready(self):
         """Every file in the cache dir is malformed/non-JSON -- no candidate
         can be proven fresh, so this fails closed exactly like an empty dir
         (same underlying "zero candidates" condition)."""
         tmpdir = self.mkdtemp("clagentic-test-preflight-unparseable-")
+        home = self.mkdtemp("clagentic-test-preflight-unparseable-home-")
+        _write_aws_config(home, start_url=START_URL_A)
         with open(os.path.join(tmpdir, "garbage.json"), "w") as f:
             f.write("not valid json{{{")
         r = _run_preflight({
             "CLAGENTIC_AUTH_MODE": "bedrock-sso",
             "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
-        })
+        }, home_dir=home)
         self.assertIn("NOT-READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        # Same finding-3 strengthening: the reason must be present, not
+        # discarded -- this exercises a different code path (every file
+        # present but none parseable) than the empty-dir case above.
+        self.assertIn("no aws sso cache file with a parseable expiresat", r.stdout.lower())
 
     def test_malformed_file_alongside_valid_fresh_is_ready(self):
         """(c) from the task's test shape: a malformed cache file must not
         break resolution when a valid fresh token is present alongside it."""
         tmpdir = self.mkdtemp("clagentic-test-preflight-malformed-plus-valid-")
+        home = self.mkdtemp("clagentic-test-preflight-malformed-plus-valid-home-")
+        _write_aws_config(home, start_url=START_URL_A)
         with open(os.path.join(tmpdir, "garbage.json"), "w") as f:
             f.write("not valid json{{{")
-        _write_cache_file(tmpdir, _future(hours=4), name="valid.json")
+        _write_cache_file(tmpdir, _future(hours=4), start_url=START_URL_A, name="valid.json")
         r = _run_preflight({
             "CLAGENTIC_AUTH_MODE": "bedrock-sso",
             "CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR": tmpdir,
-        })
+        }, home_dir=home)
         self.assertIn("READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
         self.assertNotIn("NOT-READY", r.stdout)
 
@@ -503,6 +709,69 @@ class TestBedrockSsoMissingOrUnparseableCache(_TempDirCase):
             os.chmod(tmpdir, 0o755)
 
 
+class TestNoPython3FailsClosed(_TempDirCase):
+    """PR #216 finding 4: this preflight's ENTIRE cache/config parsing path
+    is python3's json.load + configparser (no fallback parser, by design --
+    see AGENTS.md/the constraints: never hand-roll a shell JSON parser).
+    Pre-fold-in, a host with no python3 on PATH reported READY unconditionally
+    -- ZERO validation performed, silently. This PR moves ALL cache parsing
+    onto python3, so that fail-open became load-bearing rather than a
+    pre-existing, unrelated quirk: fold-in scope, same file, same function,
+    same failure class as findings 1/2/3. NOT-READY, naming the missing
+    interpreter, is the fix."""
+
+    def test_missing_python3_reports_not_ready_naming_interpreter(self):
+        tmpdir = self.mkdtemp("clagentic-test-preflight-no-python3-")
+        home = self.mkdtemp("clagentic-test-preflight-no-python3-home-")
+        _write_cache_file(tmpdir, _future(hours=4))
+
+        # A PATH containing only a handful of POSIX coreutils (via symlinks
+        # to the real binaries) and NO python3 -- `sh` itself must still be
+        # reachable to run the preflight at all. This deliberately does NOT
+        # rely on `command -v python3` failing by chance; it constructs a
+        # PATH that structurally cannot resolve python3.
+        fake_bin = self.mkdtemp("clagentic-test-preflight-no-python3-bin-")
+        for tool in ("sh", "cat", "printf", "test", "cut", "date", "mkdir",
+                     "rm", "ls", "grep", "sed", "true", "false", "expr",
+                     "dirname", "basename", "uname", "id", "env", "sort",
+                     "head", "tail", "wc", "tr", "mktemp"):
+            real = shutil.which(tool)
+            if real:
+                try:
+                    os.symlink(real, os.path.join(fake_bin, tool))
+                except OSError:
+                    pass
+
+        script = textwrap.dedent(f"""\
+            . '{LLM_CLIENT_SH}'
+            if _llm_auth_mode_preflight; then
+              printf 'READY\\n'
+            else
+              printf 'NOT-READY\\t%s\\n' "$_LLM_AUTH_MODE_PREFLIGHT_REASON"
+            fi
+        """)
+        env = dict(os.environ)
+        env.update(source_env(llm_client=True))
+        env.pop("AWS_CONFIG_FILE", None)
+        env.pop("AWS_SHARED_CREDENTIALS_FILE", None)
+        env.pop("AWS_PROFILE", None)
+        env.pop("AWS_DEFAULT_PROFILE", None)
+        env["HOME"] = home
+        env["CLAGENTIC_AUTH_MODE"] = "bedrock-sso"
+        env["CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR"] = tmpdir
+        env["PATH"] = fake_bin
+        r = subprocess.run(
+            ["sh", "-c", script, LLM_CLIENT_SH],
+            capture_output=True,
+            text=True,
+            cwd=TOOL_HOME,
+            env=env,
+            timeout=30,
+        )
+        self.assertIn("NOT-READY", r.stdout, msg=f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        self.assertIn("python3", r.stdout.lower())
+
+
 class TestWalkChainIntegration(_TempDirCase):
     """End-to-end: a real walk_chain call for role=reviewer with an expired
     SSO cache fails through the SAME degraded-envelope channel every other
@@ -512,9 +781,11 @@ class TestWalkChainIntegration(_TempDirCase):
 
     def test_expired_cache_fails_fast_with_distinct_cause_not_schema_misreport(self):
         tmpdir = self.mkdtemp("clagentic-test-preflight-e2e-")
+        home = self.mkdtemp("clagentic-test-preflight-e2e-home-")
+        _write_aws_config(home, start_url=START_URL_A)
         past_dt = _past_dt(hours=2)
         past = past_dt.strftime("%Y-%m-%dT%H:%M:%SUTC")
-        _write_cache_file(tmpdir, past)
+        _write_cache_file(tmpdir, past, start_url=START_URL_A)
 
         bin_dir = os.path.join(tmpdir, "bin")
         os.makedirs(bin_dir)
@@ -544,7 +815,7 @@ class TestWalkChainIntegration(_TempDirCase):
         env = dict(os.environ)
         env["CLAGENTIC_AUTH_MODE"] = "bedrock-sso"
         env["CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR"] = tmpdir
-        env["HOME"] = self.mkdtemp("clagentic-test-preflight-e2e-home-")
+        env["HOME"] = home
         env.pop("AWS_CONFIG_FILE", None)
         env.pop("AWS_SHARED_CREDENTIALS_FILE", None)
         env.pop("AWS_PROFILE", None)
