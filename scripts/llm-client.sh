@@ -2183,13 +2183,15 @@ _llm_role_routable() {
   esac
 }
 
-# _llm_auth_mode_preflight (lr-6d4a1f, description scope item 4)
+# _llm_auth_mode_preflight (lr-6d4a1f, description scope item 4; freshest-
+# match-per-startUrl fix lr-3583b5)
 #
 # MODE-IMPLIED READINESS PREFLIGHT, called once at the top of walk_chain for
 # every role, before any LLM invocation (router or direct-CLI). Only
 # CLAGENTIC_AUTH_MODE=bedrock-sso does anything here: it reads the AWS SSO
-# token cache's expiresAt and fails fast, with the expiry timestamp named,
-# when the cache has already expired. ALL OTHER MODES (anthropic-oauth,
+# token cache and fails fast, with the expiry timestamp and cache path
+# named, when the freshest cache file matching the resolved profile's
+# startUrl has already expired. ALL OTHER MODES (anthropic-oauth,
 # enterprise, bedrock-api-key, and UNDECLARED) ARE A NO-OP -- this is a
 # closed enumeration, not a default-permissive one: only the one literal
 # value "bedrock-sso" triggers any check at all.
@@ -2205,13 +2207,90 @@ _llm_role_routable() {
 # preflight can usefully inspect for that value -- it stays a no-op for it,
 # same as every non-bedrock-sso value.
 #
+# lr-3583b5 FIX (FIRST-MATCH -> FRESHEST-MATCH), and PR #216 review fold-in
+# (session-identity cache-key selection, fail-closed no-profile fallback,
+# non-positional reason plumbing, fail-closed no-python3): the AWS SDK never
+# cleans up stale SSO cache files, so multiple files per startUrl -- or even
+# multiple files per SESSION -- is the NORMAL steady state, not a corrupted
+# one. The prior version of this preflight scanned every *.json file in the
+# cache dir and reported the SOONEST expiry found across ALL of them as "not
+# ready" -- that is a first-match-shaped defect by a different name: a FRESH
+# token for the same startUrl sitting in the same directory as a long-expired
+# leftover from a prior login was ignored, and the preflight failed on the
+# stale file even though a valid session existed. readdir/glob order is not
+# stable across platforms or filesystems, so "the soonest expiry found" is
+# really "whichever file the filesystem happened to enumerate that also
+# happened to be expired" -- order-DEPENDENT in effect even though the code
+# did not explicitly break on the first match.
+#
+# CACHE-KEY MECHANISM (why startUrl alone is not sufficient): the AWS
+# CLI/SDKs key an SSO token cache file by SHA1 hex digest of a cache-key
+# input, ".json" appended -- for a profile using the newer "sso_session"
+# indirection, that input is the SESSION NAME; only for a LEGACY profile
+# (sso_start_url set directly on the profile, no sso_session) is it the
+# startUrl. Two sso_sessions can share a startUrl while resolving to
+# DIFFERENT cache files. Filtering candidates by startUrl alone (this
+# preflight's pre-PR#216 behavior) can therefore select a FRESH file
+# belonging to a sibling session while the resolved session's own file is
+# expired -- fail-open, the same defect class this preflight exists to
+# catch, just relocated. THE FIX here selects by SHA1(session name) exactly
+# when a session name resolves; startUrl-based filtering is retained ONLY
+# as the legacy fallback for sso_start_url-direct profiles, where there is
+# no session name to hash.
+#
+# THE FULL RESOLUTION: resolve the target profile from AWS_CONFIG_FILE (else
+# the documented default ~/.aws/config) and AWS_SHARED_CREDENTIALS_FILE
+# (else ~/.aws/credentials), profile selected via AWS_PROFILE/
+# AWS_DEFAULT_PROFILE (default "default"). If the profile resolves and uses
+# "sso_session" indirection, the resolved cache file is the ONE whose
+# filename is SHA1(session_name) + ".json" -- checked for existence and
+# validity directly, no candidate scan needed, because the AWS SDK's own
+# cache-key derivation makes this deterministic. If the profile resolves and
+# uses the legacy direct "sso_start_url" (no sso_session), the resolved
+# cache file is SHA1(sso_start_url) + ".json", same direct lookup. Only when
+# NEITHER shape resolves (no config file, no matching profile section, or a
+# profile section with neither key) does this fall back to a directory scan
+# filtered by startUrl -- and that scan's own candidate set is used AS-IS,
+# never as a second chance once a session/startUrl-keyed file was already
+# found (a direct hit is authoritative; it is what the SDK itself would
+# load).
+#
+# WHEN THE PROFILE CANNOT BE RESOLVED AT ALL (no AWS config file, no
+# matching profile section): FAIL CLOSED (PR #216 finding 2, reversing the
+# prior "freshest-wins-across-all" fallback this preflight used to apply
+# here). Unresolvable-profile is genuine ambiguity under the task's own
+# fail-closed mandate -- trusting an arbitrary fresh file anywhere in the
+# cache dir when this tool cannot even determine which profile is active
+# risks reporting READY on a token that has nothing to do with the profile
+# that will actually be used at call time. NOT-READY names which config
+# path(s) were consulted and which profile name was sought, so the operator
+# knows exactly what to fix.
+#
+# READ-ONLY, ALWAYS: this preflight only ever opens and reads cache files
+# and the AWS config file. It never deletes, rewrites, or otherwise mutates
+# anything on disk -- cleanup of stale SSO cache files is the AWS SDK's own
+# business, not this tool's; deleting a file this preflight does not own
+# would be a foot-gun, not a fix.
+#
 # RETURNS 0 (ready, or nothing to check) or 1 (not ready) -- on 1,
 # $_LLM_AUTH_MODE_PREFLIGHT_REASON carries a human-readable reason naming
-# the expiry timestamp, for the caller to fold into its own degraded
-# envelope/log line. Never dies, never exits the process -- same
-# degrade-and-continue posture every other walk_chain failure path uses;
-# the CALLER (walk_chain) decides what a failed preflight means for the
-# gate as a whole.
+# the resolved cache path and the expiresAt actually consulted, for the
+# caller to fold into its own degraded envelope/log line and so the next
+# person does not have to re-derive which file was read. Never dies, never
+# exits the process -- same degrade-and-continue posture every other
+# walk_chain failure path uses; the CALLER (walk_chain) decides what a
+# failed preflight means for the gate as a whole.
+#
+# PYTHON3-SHELL CONTRACT: the python3 heredoc below emits its result as
+# newline-delimited "key=value" lines on stdout (never a fixed tab-field
+# position) precisely so the shell side is never coupled to field ORDER --
+# a restructure chosen over positional-field reads (PR #216 finding 3) so
+# this contract cannot silently break again by a field being added,
+# reordered, or an intermediate field going empty. Every value is produced
+# by the python3 side already newline-free (paths/timestamps cannot contain
+# a literal newline in the formats this preflight ever writes), so a
+# per-line "key=value" split is unambiguous without needing a JSON decode
+# on the shell side.
 _LLM_AUTH_MODE_PREFLIGHT_REASON=""
 _llm_auth_mode_preflight() {
   _LLM_AUTH_MODE_PREFLIGHT_REASON=""
@@ -2224,77 +2303,425 @@ _llm_auth_mode_preflight() {
   fi
 
   if ! command -v python3 >/dev/null 2>&1; then
-    # FAIL-OPEN, matching every other JSON-tool-dependent helper in this
-    # file (_llm_turn_diagnostics, the validate_output python3 branch,
-    # etc.): without python3, this preflight cannot parse the cache files'
-    # JSON/ISO-8601 content, so it cannot prove EITHER readiness or
-    # staleness -- reporting "not ready" here would be a false positive on
-    # a perfectly healthy host that merely lacks python3, and this preflight
-    # exists to catch a real, provable expiry, not to invent one. The real
-    # 401 (if the SSO session genuinely is expired) still surfaces at the
-    # actual invoke_claude call site, just without this preflight's faster,
-    # more specific diagnosis.
-    return 0
+    # FAIL CLOSED (PR #216 finding 4): this preflight's ENTIRE cache/config
+    # parsing path is python3's json.load + configparser -- there is no
+    # fallback parser (by design, see the function's own doc comment: no
+    # hand-rolled shell JSON parsing). Without python3, this preflight
+    # performs ZERO validation, so reporting readiness here is not a
+    # "matches every other JSON-tool-dependent helper's fail-open posture"
+    # judgment call, it is reporting a credential is fresh while having
+    # checked NOTHING -- exactly the fail-open this task exists to close,
+    # just relocated to a missing interpreter instead of a missing/expired
+    # file. NOT-READY, naming the missing interpreter explicitly, so an
+    # operator on a python3-less host gets an actionable message instead of
+    # a false READY that only fails much later at the real LLM call site.
+    _LLM_AUTH_MODE_PREFLIGHT_REASON="CLAGENTIC_AUTH_MODE=bedrock-sso but python3 is not on PATH -- this preflight cannot parse the AWS SSO token cache or config without it (fail closed: an unparsed cache proves nothing); install python3 or unset CLAGENTIC_AUTH_MODE to skip this check"
+    return 1
   fi
 
-  # Scan every *.json file in the cache dir for an "expiresAt" field
-  # (ISO-8601, the documented AWS CLI SSO token-cache shape). Report the
-  # SOONEST expiry found as "not ready" if it has already passed -- a
-  # conservative choice: an operator with multiple SSO profiles cached only
-  # needs ONE to be expired for THIS preflight to be honest that something
-  # in the cache is stale, and naming the soonest (most urgent) expiry is
-  # the most actionable single timestamp to report. A cache dir with zero
-  # parseable expiresAt fields (empty, or every file unparseable) is
-  # reported as "ready" -- fail-open, same rationale as the missing-python3
-  # branch above: this preflight only ever blocks on a PROVEN expiry, never
-  # on an absence of proof.
+  # Single python3 invocation does everything: resolve the target profile
+  # (session name + startUrl, honoring both the sso_session indirection and
+  # the legacy sso_start_url-direct shape -- best-effort, absence is not
+  # fatal to the FUNCTION but IS fatal per-fallback-branch, see below),
+  # locate the cache file the AWS SDK's own SHA1 cache-key derivation would
+  # load for that profile when a session/startUrl resolved, or fall back to
+  # a startUrl-filtered freshest-wins directory scan only when neither
+  # resolved. Emits its result as newline-delimited "key=value" lines (see
+  # the function's own PYTHON3-SHELL CONTRACT doc comment above) -- never
+  # mutates any file it reads.
   _lamp_result=$(python3 - "$_lamp_cache_dir" <<'PY' 2>/dev/null
+import configparser
 import datetime
 import glob
+import hashlib
 import json
 import os
 import sys
 
 cache_dir = sys.argv[1]
-soonest = None
-for path in glob.glob(os.path.join(cache_dir, "*.json")):
+
+
+def _emit(**fields):
+    for key, value in fields.items():
+        # Every value this preflight ever produces (paths, ISO timestamps,
+        # a fixed set of short reason strings, a timedelta's str()) is
+        # newline-free by construction -- a per-line "key=value" split on
+        # the shell side is therefore unambiguous with no escaping needed.
+        print(f"{key}={value}")
+
+
+def _parse_expires_at(raw):
+    """AWS SSO cache format: "2026-08-21T18:30:00UTC" or with a real offset
+    ("...+00:00"/"...Z"). Normalize the bare "UTC" suffix (not valid
+    ISO-8601 on its own) before parsing. Returns a tz-aware datetime, or
+    None on any unparseable input."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        norm = raw.replace("UTC", "+00:00").replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(norm)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _load_cache_file(path):
     try:
         with open(path) as f:
             data = json.load(f)
     except Exception:
-        continue
-    expires_at = data.get("expiresAt")
-    if not isinstance(expires_at, str):
-        continue
-    try:
-        # AWS SSO cache format: "2026-08-21T18:30:00UTC" or with a real
-        # offset ("...+00:00"/"...Z"). Normalize the bare "UTC" suffix
-        # (not valid ISO-8601 on its own) before parsing.
-        norm = expires_at.replace("UTC", "+00:00").replace("Z", "+00:00")
-        dt = datetime.datetime.fromisoformat(norm)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-    except Exception:
-        continue
-    if soonest is None or dt < soonest:
-        soonest = dt
+        return None
+    return data if isinstance(data, dict) else None
 
-if soonest is None:
-    sys.exit(0)
+
+def _sha1_cache_path(cache_key_input):
+    digest = hashlib.sha1(cache_key_input.encode("utf-8")).hexdigest()
+    return os.path.join(cache_dir, f"{digest}.json")
+
+
+def _resolve_profile():
+    """Resolve the current AWS profile's cache-lookup key, honoring the
+    standard AWS resolution order: AWS_CONFIG_FILE (falling back to the
+    documented default ~/.aws/config) is the primary source of
+    profile/sso-session blocks; AWS_SHARED_CREDENTIALS_FILE (falling back to
+    the documented default ~/.aws/credentials) is merged in as a secondary
+    source -- the AWS CLI/SDKs permit sso_start_url/sso_session to appear in
+    either file, and a value already resolved from the config file always
+    wins (config-file sections are read first below and never overwritten).
+    Profile selected via AWS_PROFILE (then AWS_DEFAULT_PROFILE, then
+    "default").
+
+    Returns a (kind, key, config_path, creds_path, profile, unresolved_reason)
+    tuple. "kind" is one of:
+      - "session": the profile declares a USABLE sso_session indirection --
+        "key" is the session name, ready to SHA1-hash for the modern
+        cache-key mechanism.
+      - "legacy": the profile declares sso_start_url directly -- "key" is
+        that URL, ready to SHA1-hash for the legacy cache-key mechanism.
+      - "none": the profile resolved but declared neither sso_session nor
+        sso_start_url -- "key" is None; the caller falls back to the
+        unfiltered legacy startUrl-scan path (which naturally finds nothing
+        useful to filter by and fails closed on its own "no candidates"
+        check).
+      - "unresolved": genuine ambiguity the caller must fail closed on
+        without attempting ANY fallback lookup -- "key" is None and
+        "unresolved_reason" names why: no config/credentials file could be
+        read at all (PR #216 finding 2), the target profile's section does
+        not exist (PR #216 finding 2), OR the profile names an sso_session
+        whose [sso-session NAME] block is missing or itself lacks
+        sso_start_url (PR #216 fold-in finding 1 -- a profile that names an
+        sso_session gets NO fallback-to-legacy-scan: that indirection was
+        declared explicitly, so a broken target is unresolvable, never an
+        invitation to widen the search to every cache file in the
+        directory).
+
+    This return shape makes "resolved but only partially" UNREPRESENTABLE:
+    every non-"unresolved" kind carries a usable key (or, for "none",
+    deliberately no key at all with no ambiguity attached to that absence).
+    There is no state where a caller could receive a session name without
+    its start URL and still believe resolution "succeeded" -- the code that
+    reached exactly that shape is why this signature exists."""
+    config_path = os.environ.get("AWS_CONFIG_FILE") or os.path.join(
+        os.path.expanduser("~"), ".aws", "config"
+    )
+    creds_path = os.environ.get("AWS_SHARED_CREDENTIALS_FILE") or os.path.join(
+        os.path.expanduser("~"), ".aws", "credentials"
+    )
+
+    profile = (
+        os.environ.get("AWS_PROFILE")
+        or os.environ.get("AWS_DEFAULT_PROFILE")
+        or "default"
+    )
+
+    parser = configparser.ConfigParser()
+    read_any = False
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                parser.read_string(f.read())
+            read_any = True
+        except Exception:
+            pass
+    if os.path.isfile(creds_path):
+        try:
+            with open(creds_path) as f:
+                # The credentials file has NO "profile " prefix on its own
+                # section names (unlike ~/.aws/config) -- read it into a
+                # second parser and copy any matching section(s) in under
+                # the SAME section-naming convention this function already
+                # uses, so the lookup below is uniform regardless of which
+                # file a value came from.
+                creds_parser = configparser.ConfigParser()
+                creds_parser.read_string(f.read())
+            read_any = True
+            for raw_section in creds_parser.sections():
+                target_section = (
+                    "default" if raw_section == "default" else f"profile {raw_section}"
+                )
+                if not parser.has_section(target_section):
+                    parser.add_section(target_section)
+                for key, value in creds_parser.items(raw_section):
+                    if not parser.has_option(target_section, key):
+                        parser.set(target_section, key, value)
+        except Exception:
+            pass
+
+    if not read_any:
+        reason = (
+            f"AWS profile {profile!r} could not be resolved -- no "
+            f"config/credentials file could be read at {config_path} or "
+            f"{creds_path}"
+        )
+        return "unresolved", None, config_path, creds_path, profile, reason
+
+    # AWS config file section-naming convention: the default profile's
+    # section is literally "default"; every other profile's section is
+    # "profile <name>".
+    section = "default" if profile == "default" else f"profile {profile}"
+    if not parser.has_section(section):
+        reason = f"profile {profile!r} has no section in {config_path} or {creds_path}"
+        return "unresolved", None, config_path, creds_path, profile, reason
+
+    # STRIP-THEN-CHECK (PR #216 third fold-in, BOBBIE non-blocking finding):
+    # normalize whitespace BEFORE the truthy check, matching session_name's
+    # own strip-then-check ordering directly below -- a whitespace-only
+    # sso_start_url (" ") is truthy as a raw string but empty after
+    # stripping; checking truthiness on the raw value would return kind
+    # "legacy" with an effectively-empty key. That already fails closed
+    # today (the SHA1-of-whitespace direct lookup misses, and the
+    # startUrl-filtered scan's `data.get("startUrl") != target_start_url`
+    # comparison stays active because "" is not None), so this was not a
+    # reproduction of the bug -- but the asymmetry with session_name invited
+    # a real gap later and costs nothing to close here.
+    direct_url = parser.get(section, "sso_start_url", fallback=None)
+    if direct_url is not None:
+        direct_url = direct_url.strip()
+    if direct_url:
+        return "legacy", direct_url, config_path, creds_path, profile, None
+
+    session_name = parser.get(section, "sso_session", fallback=None)
+    if session_name is not None:
+        session_name = session_name.strip()
+    if session_name:
+        session_section = f"sso-session {session_name}"
+        if not parser.has_section(session_section):
+            reason = (
+                f"profile {profile!r} declares sso_session {session_name!r} "
+                f"but [sso-session {session_name!r}] is missing from "
+                f"{config_path} or {creds_path}"
+            )
+            return "unresolved", None, config_path, creds_path, profile, reason
+        session_url = parser.get(session_section, "sso_start_url", fallback=None)
+        if not session_url:
+            reason = (
+                f"profile {profile!r} declares sso_session {session_name!r} "
+                f"but [sso-session {session_name!r}] has no sso_start_url in "
+                f"{config_path} or {creds_path}"
+            )
+            return "unresolved", None, config_path, creds_path, profile, reason
+        return "session", session_name, config_path, creds_path, profile, None
+
+    return "none", None, config_path, creds_path, profile, None
+
+
+resolve_kind, resolve_key, config_path, creds_path, profile, unresolved_reason = _resolve_profile()
+
+# EXHAUSTIVE DISPATCH (PR #216 THIRD fold-in, PEACHES finding 1): the
+# fourth instance of this preflight's own recurring pattern -- an
+# absent/unexpected value silently widening the candidate set instead of
+# failing closed (first-match-wins, then no-profile fallback, then partial
+# session resolution, now an unhandled resolve_kind here). _resolve_profile
+# itself only ever returns one of four literal strings ("session", "legacy",
+# "none", "unresolved" -- see its own docstring's enumerated "kind" values),
+# but that closed enumeration lived ONLY in that docstring, not in any
+# executable check at the one call site that branches on it. A single
+# `if resolve_kind == "unresolved": ... ` with no matching else meant any
+# value this dispatch does not explicitly recognize -- a future kind added
+# to _resolve_profile without updating this call site, a typo, a merge
+# conflict -- falls straight through to the "every kind other than
+# unresolved reaches here" assumption below, into the unfiltered
+# directory-scan fallback: the exact fail-open this task exists to close,
+# relocated to the caller instead of the resolver.
+#
+# FIX AS A TOTALITY PROPERTY: every known kind gets its own explicit
+# `elif`, and a final `else` FAILS CLOSED by construction -- there is no
+# path from an unrecognized resolve_kind to the scan below, because the
+# scan's own session_name/target_start_url assignment only happens inside
+# the "session"/"legacy"/"none" branches, never in the fall-through case.
+# A future 5th kind added to _resolve_profile without a matching branch
+# here now raises/exits NOT-READY naming the unexpected value, rather than
+# silently reaching the scan -- the failure is loud and at the call site
+# that needs the new branch, not a silent widening three lines later.
+if resolve_kind == "unresolved":
+    # FAIL CLOSED (PR #216 finding 2 and its fold-in extension): the target
+    # profile could not be resolved to a usable cache-lookup key at all --
+    # whether because no config/credentials file could be read, the
+    # profile's own section is missing, or the profile names an sso_session
+    # whose [sso-session NAME] block is missing/incomplete -- so there is no
+    # way to know which cache file, if any, corresponds to what will
+    # actually be used at call time. Genuine ambiguity; never assume valid
+    # on it, and never fall through to the directory-scan fallback below --
+    # that fallback runs ONLY for resolve_kind in ("session", "legacy",
+    # "none"), never "unresolved".
+    _emit(status="not-ready", kind="profile-unresolved", reason=unresolved_reason)
+    sys.exit(1)
+elif resolve_kind == "session":
+    # MODERN CACHE-KEY MECHANISM: resolve_key is the session name, ready to
+    # SHA1-hash below. No ambiguity -- "session" always carries a usable key
+    # (see _resolve_profile's own docstring: this kind is unrepresentable
+    # without one).
+    session_name = resolve_key
+    target_start_url = None
+elif resolve_kind == "legacy":
+    # LEGACY CACHE-KEY MECHANISM: resolve_key is the startUrl itself, ready
+    # to SHA1-hash below.
+    session_name = None
+    target_start_url = resolve_key
+elif resolve_kind == "none":
+    # The profile resolved but declared neither sso_session nor
+    # sso_start_url -- no key, no ambiguity attached to that absence (the
+    # profile is simply not SSO-configured at all). This is the ONE
+    # legitimate route to the unfiltered directory-scan fallback below
+    # (target_start_url stays None, matching every file).
+    session_name = None
+    target_start_url = None
+else:
+    # UNREACHABLE TODAY (_resolve_profile's own return statements are a
+    # closed set of exactly the four kinds handled above), but "cannot
+    # happen given the current implementation" is exactly the property a
+    # totality check exists to stop relying on informally. Fail closed by
+    # construction rather than by convention: an unrecognized kind is
+    # genuine ambiguity, identical in kind to "unresolved", and must never
+    # reach the scan below or be silently swallowed.
+    _emit(
+        status="not-ready",
+        kind="resolve-kind-unexpected",
+        reason=f"_resolve_profile() returned an unrecognized kind {resolve_kind!r} -- refusing to guess which cache file applies",
+    )
+    sys.exit(1)
+
+freshest_path = None
+freshest_dt = None
+freshest_raw = None
+
+if resolve_kind == "session":
+    # MODERN CACHE-KEY MECHANISM: the AWS CLI/SDKs key an sso_session-backed
+    # token cache file by SHA1(session_name) -- not by startUrl. Two
+    # sso_sessions can share a startUrl while using separate cache files;
+    # only the session's OWN file is the one the SDK would actually load.
+    direct_path = _sha1_cache_path(session_name)
+    data = _load_cache_file(direct_path)
+    if data is not None:
+        dt = _parse_expires_at(data.get("expiresAt"))
+        if dt is not None:
+            freshest_path, freshest_dt, freshest_raw = direct_path, dt, data.get("expiresAt")
+elif resolve_kind == "legacy":
+    # LEGACY CACHE-KEY MECHANISM: a profile with sso_start_url set directly
+    # (no sso_session indirection) has no session name to hash -- the SDK
+    # keys its cache file by SHA1(startUrl) instead.
+    direct_path = _sha1_cache_path(target_start_url)
+    data = _load_cache_file(direct_path)
+    if data is not None:
+        dt = _parse_expires_at(data.get("expiresAt"))
+        if dt is not None:
+            freshest_path, freshest_dt, freshest_raw = direct_path, dt, data.get("expiresAt")
+
+if freshest_path is None:
+    # Neither cache-key shape resolved to a valid, parseable file directly
+    # -- fall back to a startUrl-filtered directory scan (PRE-lr-3583b5
+    # breadth for this branch only): every *.json candidate whose own
+    # "startUrl" field matches the resolved target_start_url (when one
+    # resolved at all -- resolve_kind "none" has target_start_url None too,
+    # so this scans every file, unchanged from a legacy no-scoping-possible
+    # profile). This scan is UNREACHABLE for resolve_kind == "unresolved"
+    # (handled above, before this point) -- a filter that can never be
+    # silently absent because its input was ambiguous rather than
+    # deliberately "no scoping declared".
+    candidates = []  # list of (expires_at_dt, expires_at_raw, path)
+    for path in sorted(glob.glob(os.path.join(cache_dir, "*.json"))):
+        data = _load_cache_file(path)
+        if data is None:
+            continue
+        if target_start_url is not None and data.get("startUrl") != target_start_url:
+            continue
+        dt = _parse_expires_at(data.get("expiresAt"))
+        if dt is None:
+            continue
+        candidates.append((dt, data.get("expiresAt"), path))
+
+    if not candidates:
+        # FAIL CLOSED (lr-3583b5): either nothing matched the resolved
+        # startUrl (or session), or every matching/considered file lacked a
+        # parseable expiresAt. Never assume valid on genuine ambiguity.
+        reason = "no AWS SSO cache file with a parseable expiresAt"
+        if session_name is not None:
+            reason += f" for session {session_name!r} (checked {_sha1_cache_path(session_name)}, and the startUrl-scoped fallback)"
+        elif target_start_url is not None:
+            reason += f" matching startUrl {target_start_url!r}"
+        _emit(status="not-ready", kind="no-candidate", reason=reason)
+        sys.exit(1)
+
+    # FRESHEST WINS, ORDER-INDEPENDENT: scan every candidate, keep the one
+    # with the LATEST expiresAt regardless of enumeration order (sorted()
+    # above is for deterministic test iteration only -- max() below is what
+    # makes the result order-independent, not the sort).
+    freshest_dt, freshest_raw, freshest_path = max(candidates, key=lambda c: c[0])
 
 now = datetime.datetime.now(datetime.timezone.utc)
-if soonest <= now:
-    remaining = now - soonest
-    print(f"expired\t{soonest.isoformat()}\t{remaining}")
+if freshest_dt <= now:
+    remaining = now - freshest_dt
+    _emit(
+        status="not-ready",
+        kind="expired",
+        expiry=freshest_raw,
+        ago=remaining,
+        path=freshest_path,
+    )
     sys.exit(1)
+
+_emit(status="ready")
 sys.exit(0)
 PY
   )
   _lamp_code=$?
   if [ "$_lamp_code" -eq 1 ]; then
-    _lamp_expiry=$(printf '%s' "$_lamp_result" | cut -f2)
-    _lamp_ago=$(printf '%s' "$_lamp_result" | cut -f3)
-    _LLM_AUTH_MODE_PREFLIGHT_REASON="AWS SSO token cache expired at $_lamp_expiry (${_lamp_ago} ago) -- run 'aws sso login' to refresh before retrying (cache dir: $_lamp_cache_dir)"
+    # Parse the newline-delimited "key=value" contract (see the function's
+    # own PYTHON3-SHELL CONTRACT doc comment) -- one read per known key,
+    # never a positional field index, so an added/reordered/empty field can
+    # never silently shift a later one into the wrong variable.
+    _lamp_kind=""
+    _lamp_reason=""
+    _lamp_expiry=""
+    _lamp_ago=""
+    _lamp_path=""
+    _lamp_old_ifs="$IFS"
+    IFS='
+'
+    for _lamp_line in $_lamp_result; do
+      case "$_lamp_line" in
+        kind=*)   _lamp_kind="${_lamp_line#kind=}" ;;
+        reason=*) _lamp_reason="${_lamp_line#reason=}" ;;
+        expiry=*) _lamp_expiry="${_lamp_line#expiry=}" ;;
+        ago=*)    _lamp_ago="${_lamp_line#ago=}" ;;
+        path=*)   _lamp_path="${_lamp_line#path=}" ;;
+      esac
+    done
+    IFS="$_lamp_old_ifs"
+
+    case "$_lamp_kind" in
+      expired)
+        _LLM_AUTH_MODE_PREFLIGHT_REASON="AWS SSO token cache expired at $_lamp_expiry (${_lamp_ago} ago) -- run 'aws sso login' to refresh before retrying (freshest matching cache file: $_lamp_path)"
+        ;;
+      profile-unresolved)
+        _LLM_AUTH_MODE_PREFLIGHT_REASON="CLAGENTIC_AUTH_MODE=bedrock-sso but $_lamp_reason -- fail closed on unresolvable profile (never assume a cache file elsewhere in $_lamp_cache_dir belongs to it); configure AWS_CONFIG_FILE/AWS_PROFILE or run 'aws configure sso'"
+        ;;
+      *)
+        _LLM_AUTH_MODE_PREFLIGHT_REASON="CLAGENTIC_AUTH_MODE=bedrock-sso but $_lamp_reason in $_lamp_cache_dir -- treating as expired (fail closed on ambiguity); run 'aws sso login' (cache dir: $_lamp_cache_dir)"
+        ;;
+    esac
     return 1
   fi
   return 0
