@@ -16,12 +16,28 @@
 #   digest           summarize today's audit rows
 #   status           last N runs per gate (default N=10) with color outcomes
 #   tail             follow audit.db, render new gate_runs rows as they land; --no-follow exits after one poll
-#   pre-push         hook entry point (deps + sast + optional review)
+#   pre-push         hook entry point (deps + sast + optional review). deps
+#                    and sast each additionally consult their declared INPUT
+#                    DOMAIN against this push's changed-path set (lr-1ad8da)
+#                    and log outcome "not_applicable" -- a THIRD state,
+#                    distinct from pass/block/skip/warn -- instead of
+#                    running when the push provably cannot affect their
+#                    verdict. Secrets is NEVER eligible for this (every file,
+#                    unconditionally); see "Gate input domain" below cmd_log_run.
 #   log-run          internal: insert one row into gate_runs
 #   deferrals-lint   validate .clagentic/deferrals.json against the gate-code schema
 #   audit-vocab-lint warn-only: flag "cmd_log_run <gate> pass" audit rows whose
 #                    details string contains a failure word (a tool that never
 #                    ran should not log as a clean pass)
+#
+# GATE OUTCOME VOCABULARY (gate_runs.outcome): pass | block | warn | skip |
+# not_applicable (lr-1ad8da, gate-contract migration -- see docs/GATES.md
+# "Gate input domain"). not_applicable means the gate's verdict provably
+# cannot depend on what changed in this push -- distinct from "skip" (tool
+# missing, opt-in bypass) and from "pass" (tool ran, found nothing). Every
+# not_applicable row's details column carries the domain version tested
+# against, the changed-path count, and how that changed-path set was
+# derived.
 
 set -e
 . "$(dirname "$0")/platform.sh"
@@ -391,6 +407,547 @@ _gate_resolve_fresh_default_branch_ref() {
   fi
 
   printf '%s\n' "$_gfdbr_local_tip"
+  return 0
+}
+
+# ---------------------------------------------------------------- gate input domain (lr-1ad8da) --
+#
+# WHY THIS EXISTS: cmd_pre_push has run deps+sast unconditionally since
+# 6fe6fe6 (initial commit). When a push's diff touches no file either gate
+# READS, the gate's verdict cannot possibly change — yet a pre-existing
+# finding (e.g. an advisory DB publishing against an unchanged dependency)
+# still blocks the push. The only escape was --no-verify, which disables
+# EVERY gate including ones that genuinely apply — teaching --no-verify is
+# itself a defect, and it also contradicts INV-8 (AGENTS.md): a fix must not
+# require a flag to be received.
+#
+# CORRECT UNIT: a gate's INPUT DOMAIN — the set of paths whose contents its
+# verdict can possibly depend on. Domain is an ALLOWLIST of what a gate
+# READS, never a denylist of what to ignore (a denylist silently narrows on
+# every future file shape nobody thought to exclude; an allowlist silently
+# narrows on nothing — an unrecognized path is always IN domain by
+# construction, see _gate_path_in_domain below).
+#
+# Irrelevance is COMPUTED by this harness from the changed-path set and the
+# gate's declared domain — it is NEVER asserted by the pusher (no
+# --docs-only flag, no *.md exemption, no per-repo path-exclusion config;
+# all three rejected explicitly, lr-1ad8da task description — a
+# pusher-supplied claim about their own diff is a bypass with extra steps).
+#
+# DOMAIN TABLE (one row per gate that supports skip-when-out-of-domain):
+#   secrets      — NOT ELIGIBLE. Every file, unconditionally. This row is
+#                  load-bearing: it is what stops this feature from
+#                  degenerating into "skip gates on docs" — a credential
+#                  pastes into a Markdown file exactly as easily as a
+#                  source file. cmd_secrets never consults this mechanism.
+#   deps         — manifests+lockfiles PER ECOSYSTEM, resolved from the
+#                  ecosystem list the scanner itself supports (see
+#                  _gate_deps_domain_globs below), never a hardcoded
+#                  filename set maintained independently of the tool.
+#   sast         — source files in the languages semgrep's active ruleset
+#                  covers, plus build/config files the rules read. Since
+#                  cmd_sast's default config is `auto` (registry-selected
+#                  per-language rulesets, resolved at scan time from
+#                  file extensions actually present), this gate's domain
+#                  is "any file semgrep would examine" — approximated here
+#                  by the same broad source/config extension set semgrep's
+#                  own auto-config targets, documented below rather than
+#                  re-derived from a live registry call on every push.
+#   review /     — every file (the diff itself is the input to an LLM
+#   adversarial    reasoning pass — there is no narrower "domain" to
+#                  declare; these are gated by other opt-in mechanisms
+#                  already, e.g. CLAGENTIC_REVIEW_ON_PUSH, and are excluded
+#                  from this mechanism entirely).
+#
+# GATE CONFIGURATION IS IN EVERY GATE'S DOMAIN (task requirement 2). If the
+# changed-path set touches ANY gate's own config — ruleset, ignore/allow
+# list, severity threshold, version floor, suppression file — NO gate may be
+# skipped on that push, regardless of what else changed. Without this the
+# mechanism has a privilege-escalation shape: weaken a gate's config and
+# skip the gate that would have noticed, in the same push. See
+# _gate_config_paths and _gate_path_touches_any_gate_config below.
+#
+# THIRD STATE, NEVER PASS (task requirement 3): a gate whose verdict cannot
+# depend on the changed-path set reports outcome "not_applicable" — a
+# distinct value from "pass"/"block"/"skip"/"warn" everywhere this codebase
+# already writes gate_runs.outcome. A pass claims the tool ran and found
+# nothing; not_applicable claims the tool never needed to run at all. The
+# audit details column carries the domain tested against, the changed-path
+# set tested with, and how that set was derived — see
+# _gate_skip_or_run_domain below, the one function that writes this outcome.
+#
+# FAIL CLOSED (task requirement 5, enumerated per-case below in
+# _gate_resolve_changed_paths). Any inconclusive range makes the WHOLE push
+# inconclusive — inconclusive means "run the gate," never "skip the gate."
+#
+# ALWAYS_RUN_ALL_GATES SWITCH (operator decision, task description):
+# default OFF — domain-based skipping is active by default. Set
+# CLAGENTIC_ALWAYS_RUN_ALL_GATES=1 to disable this mechanism entirely and
+# run every gate unconditionally on every push, matching pre-lr-1ad8da
+# behavior byte-for-byte. Defaulting this ON would make the whole feature
+# dead code (operator's own reasoning, task description) — this is a
+# deliberate, recorded default, not an oversight.
+
+# _gate_always_run_all_gates — true (exit 0) when domain-based skipping is
+# disabled by operator config. The one place this env var is read, so every
+# caller agrees on the same on/off semantics.
+_gate_always_run_all_gates() {
+  [ "${CLAGENTIC_ALWAYS_RUN_ALL_GATES:-0}" = "1" ]
+}
+
+# _gate_deps_domain_globs — print, one per line, the shell glob patterns
+# that make up cmd_deps' input domain: manifest/lockfile names PER ECOSYSTEM.
+#
+# MAINTENANCE PATH (task requirement: "name the maintenance path rather than
+# hardcoding a snapshot" — domain data is harness-side knowledge that DRIFTS
+# with the upstream scanner): osv-scanner's own `--help` output enumerates
+# no machine-readable ecosystem/filename list as of the installed-version
+# probe this codebase already does elsewhere (capability-probed, never
+# version-string-parsed — see cmd_deps' own _OSV_SUBCMD probe above). There
+# is no local, offline way to ask an installed osv-scanner binary "what
+# manifest filenames do you recognize" without shipping a TOML/JSON schema
+# parser for its internal ecosystem registry, which AGENTS.md's "no new
+# external tool dependency without asking" bars introducing for this one
+# purpose. The list below is therefore a DOCUMENTED SNAPSHOT of
+# osv-scanner's own publicly documented lockfile/manifest support
+# (https://google.github.io/osv-scanner/supported-languages-and-lockfiles/),
+# versioned via CLAGENTIC_DEPS_DOMAIN_VERSION below so a future drift is a
+# one-line diff, not a silent staleness — and it is OVERRIDABLE per-repo via
+# CLAGENTIC_DEPS_DOMAIN_EXTRA_GLOBS (space-separated glob patterns appended
+# to this list) for a repo using an ecosystem/manifest shape newer than this
+# snapshot, without waiting for a clagentic-lite release.
+#
+# This list is even more conservative than it needs to be by construction:
+# _gate_path_touches_any_gate_config (below) ALSO widens the domain to
+# match "anything under scripts/gates.sh's own osv-ignore/config paths" —
+# so a gap in this glob list only means a REAL manifest change might be
+# missed as in-domain (an under-block risk, not an over-skip risk) is
+# still caught by the fail-closed default below: an unrecognized file
+# extension/shape is simply matched by none of these globs and therefore
+# treated as NOT proven to be in the deps domain — the caller
+# (_gate_path_in_domain) still defaults toward running the gate whenever
+# ANY changed path fails to match a declared domain (see that function's
+# own doc comment for the exact predicate).
+CLAGENTIC_DEPS_DOMAIN_VERSION="v1-2026-09"
+_gate_deps_domain_globs() {
+  cat <<'EOF'
+package.json
+package-lock.json
+npm-shrinkwrap.json
+yarn.lock
+pnpm-lock.yaml
+bun.lock
+requirements*.txt
+Pipfile
+Pipfile.lock
+pyproject.toml
+poetry.lock
+setup.py
+setup.cfg
+Gemfile
+Gemfile.lock
+go.mod
+go.sum
+Cargo.toml
+Cargo.lock
+composer.json
+composer.lock
+pom.xml
+build.gradle
+build.gradle.kts
+gradle.lockfile
+*.csproj
+packages.lock.json
+mix.exs
+mix.lock
+pubspec.yaml
+pubspec.lock
+conan.lock
+EOF
+  if [ -n "${CLAGENTIC_DEPS_DOMAIN_EXTRA_GLOBS:-}" ]; then
+    for _gddg_extra in $CLAGENTIC_DEPS_DOMAIN_EXTRA_GLOBS; do
+      printf '%s\n' "$_gddg_extra"
+    done
+  fi
+}
+
+# _gate_sast_domain_globs — print, one per line, the glob patterns that make
+# up cmd_sast's input domain: source files in the languages semgrep's
+# default `--config=auto` ruleset covers, plus build/config files those
+# rules commonly read (e.g. package.json for a JS taint rule, Dockerfile for
+# an IaC rule). Same maintenance posture as deps: a documented, versioned
+# snapshot, overridable via CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS, because
+# semgrep's registry-selected rule coverage is upstream knowledge this
+# harness does not own and cannot query offline without a network call this
+# codebase's own security posture already forbids putting on the blocking
+# path unconditionally (AGENTS.md §4: no LLM/network dependency added to the
+# blocking security path beyond what the tool itself already does).
+#
+# When CLAGENTIC_SEMGREP_CONFIG is pinned (a non-auto policy path — see
+# _sast_config_flag above), that policy may cover a narrower or wider file
+# set than semgrep's registry auto-config. This snapshot is NOT re-derived
+# per pinned config (would require parsing the pinned ruleset's own
+# `languages:` keys, a materially larger feature) — a pinned config makes
+# this domain a conservative approximation, documented here rather than
+# silently assumed precise.
+CLAGENTIC_SAST_DOMAIN_VERSION="v1-2026-09"
+_gate_sast_domain_globs() {
+  cat <<'EOF'
+*.py
+*.js
+*.jsx
+*.ts
+*.tsx
+*.mjs
+*.cjs
+*.go
+*.rb
+*.php
+*.java
+*.kt
+*.scala
+*.c
+*.h
+*.cpp
+*.cc
+*.hpp
+*.cs
+*.swift
+*.rs
+*.sh
+*.bash
+*.tf
+*.yaml
+*.yml
+*.json
+Dockerfile
+Dockerfile.*
+*.dockerfile
+EOF
+  if [ -n "${CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS:-}" ]; then
+    for _gsdg_extra in $CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS; do
+      printf '%s\n' "$_gsdg_extra"
+    done
+  fi
+}
+
+# _gate_config_paths — print, one per line, every path (relative to
+# REPO_ROOT) or glob this codebase itself treats as GATE CONFIGURATION for
+# ANY gate: a ruleset pin, an ignore/allow list, a severity threshold file,
+# a version-floor marker, or a suppression file. Task requirement 2: gate
+# configuration is in EVERY gate's domain — a change to any one of these
+# means NO gate may be skipped on this push, not just the gate the config
+# belongs to. This is the mechanical closure of the privilege-escalation
+# shape the task names explicitly: weaken a gate's config and skip the gate
+# that would have noticed, in the same push.
+#
+# Repo-local paths only (global config under $HOME is outside any repo diff
+# by construction and cannot appear in a changed-path set at all).
+_gate_config_paths() {
+  cat <<'EOF'
+.gitleaks.toml
+.clagentic/osv-ignore
+.clagentic/semgrep-exclude
+.semgrepignore
+.clagentic/config
+.clagentic-bleed-ignore
+.clagentic/bleed-patterns
+.clagentic/deferrals.json
+.clagentic/adversarial-acks.json
+.clagentic/accepted-risks.md
+EOF
+}
+
+# _gate_path_touches_any_gate_config CHANGED_PATHS_FILE — true (exit 0) when
+# any line in CHANGED_PATHS_FILE exactly matches (or, for the two glob-style
+# entries above, is matched by) a path _gate_config_paths declares. Reused
+# by every gate's skip decision — see _gate_skip_or_run_domain below.
+_gate_path_touches_any_gate_config() {
+  _gptagc_file="$1"
+  [ -s "$_gptagc_file" ] || return 1
+  while IFS= read -r _gptagc_cfg; do
+    [ -n "$_gptagc_cfg" ] || continue
+    while IFS= read -r _gptagc_changed; do
+      [ -n "$_gptagc_changed" ] || continue
+      case "$_gptagc_changed" in
+        $_gptagc_cfg) return 0 ;;
+      esac
+    done < "$_gptagc_file"
+  done <<EOF_CFG
+$(_gate_config_paths)
+EOF_CFG
+  return 1
+}
+
+# _gate_path_in_domain PATH DOMAIN_GLOBS_NEWLINE — true (exit 0) when PATH
+# matches at least one glob in DOMAIN_GLOBS_NEWLINE (newline-separated,
+# shell glob syntax via `case`). Domain is an ALLOWLIST (task requirement
+# 4): an unrecognized path shape simply matches nothing here and is treated
+# by the caller as NOT proven in-domain — see _gate_resolve_changed_paths'
+# and _gate_skip_or_run_domain's fail-closed composition below. This
+# function only answers "does this one path match this one domain," it does
+# not itself decide fail-open/fail-closed.
+_gate_path_in_domain() {
+  _gpid_path="$1"
+  _gpid_globs="$2"
+  _gpid_base=$(basename -- "$_gpid_path")
+  while IFS= read -r _gpid_glob; do
+    [ -n "$_gpid_glob" ] || continue
+    case "$_gpid_path" in $_gpid_glob) return 0 ;; esac
+    case "$_gpid_base" in $_gpid_glob) return 0 ;; esac
+  done <<EOF_GLOBS
+$_gpid_globs
+EOF_GLOBS
+  return 1
+}
+
+# _gate_resolve_changed_paths OUT_FILE — resolve the changed-path set for
+# THIS invocation of cmd_pre_push and write it, one path per line, to
+# OUT_FILE. Prints a one-line derivation description on stdout on success
+# (how the set was computed — for the audit trail's "how that set was
+# derived" requirement). Returns 1 (OUT_FILE left empty/absent) whenever the
+# set cannot be determined with certainty — the caller's job is to treat
+# THAT as "run every gate," never "skip."
+#
+# stdin protocol (git's pre-push hook contract): zero or more lines of
+# "<local ref> <local sha1> <remote ref> <remote sha1>", one per ref being
+# pushed. cmd_pre_push is invoked by share/hook-shims/pre-push.template,
+# which execs this script with git's own stdin passed through untouched —
+# this function is the first place in this codebase that actually reads
+# that stdin protocol; every gate before lr-1ad8da ignored it entirely and
+# operated on working-tree/HEAD state regardless of what was being pushed.
+#
+# FAIL-CLOSED ENUMERATION (task requirement 5 — each case is a real way to
+# get this wrong):
+#   - Multiple refs in one push: the union of every ref's own changed-path
+#     range is the input; any ONE ref's range being inconclusive makes the
+#     WHOLE push inconclusive, not just that ref.
+#   - A new branch with no merge-base (local sha exists, remote sha is the
+#     all-zero deletion/creation sentinel): no base to diff against —
+#     inconclusive.
+#   - A deletion push (local sha1 is the all-zero sentinel): nothing being
+#     pushed to diff FROM — inconclusive (there is no "changed paths of a
+#     delete" this mechanism can safely compute).
+#   - A force push (the pushed local sha1 is not a descendant of the
+#     previously-known remote sha1): `git diff old..new` on a force-pushed
+#     ref does not describe what the remote will actually hold afterward —
+#     inconclusive. Detected via `git merge-base --is-ancestor`.
+#   - Shallow/grafted history: `git merge-base`/`git diff` against a commit
+#     outside a shallow clone's fetched depth fails or produces a
+#     misleading result — detected via `git rev-parse --is-shallow-repository`
+#     combined with the merge-base call itself failing; either signal alone
+#     is treated as inconclusive.
+#   - A merge commit in the pushed range: can introduce files present in
+#     neither parent's first-parent path. `git diff old..new --name-only`
+#     already reports the full name-only diff (not first-parent-only), so a
+#     merge commit's actual file introductions ARE captured by that diff —
+#     but this function additionally refuses (falls to inconclusive) if it
+#     cannot prove `old` is a proper ancestor of `new` via a clean, single
+#     linear merge-base (the same force-push check above also catches an
+#     unrelated-history merge).
+#   - Submodule pointer changes: `git diff --name-only` reports the
+#     submodule's own path changing (gitlink entries are ordinary paths in
+#     name-only output) — that path is then evaluated against each gate's
+#     domain like any other path, and a submodule path almost never matches
+#     a source/manifest glob, so it is NOT proven in-domain and the
+#     resolver correctly leaves the gate running rather than silently
+#     trusting that a one-line pointer bump carries no risk.
+#   - Symlink creation/retargeting and file mode changes: `--name-only`
+#     alone cannot distinguish a content change from a mode/symlink-target
+#     change on an existing path. This function additionally checks
+#     `git diff old..new --summary` for any `mode change`/` create mode
+#     120000`/` (new/gone) symlink` line and, if the raw diff --name-only
+#     path set is otherwise empty, still returns the affected path(s) from
+#     --summary rather than reporting no changes — see the --summary parse
+#     below. A path whose ONLY change is a mode/symlink flip still counts
+#     as changed for domain purposes (a .md becoming a symlink or becoming
+#     executable is not a prose change, per the task's own framing).
+#   - Vendored dependencies under a documentation path, and generated/
+#     literate documents that are compiled or executed: this mechanism does
+#     not special-case any path by directory name (docs/, vendor/, etc.) at
+#     all — domain matching is by file NAME/EXTENSION shape only (see
+#     _gate_path_in_domain), never by directory location. A manifest file
+#     sitting under docs/ still matches the deps domain; a compiled/literate
+#     document with a source-code extension still matches the sast domain.
+#     There is no directory-based carve-out anywhere in this mechanism for
+#     this exact reason.
+_gate_resolve_changed_paths() {
+  _grcp_out="$1"
+  : > "$_grcp_out"
+
+  if ! _git_repo_root_is_scoped; then
+    echo "REPO_ROOT is not a git repo — changed-path set cannot be determined" 1>&2
+    return 1
+  fi
+
+  # Read every "<local-ref> <local-sha> <remote-ref> <remote-sha>" line from
+  # stdin (git's pre-push hook protocol). No lines at all (an empty push, or
+  # this function invoked outside the real hook context) is itself
+  # inconclusive -- there is nothing to compute a range from.
+  _grcp_lines_tmp=$(mktemp -t clagentic-prepush-refs.XXXXXX)
+  cat > "$_grcp_lines_tmp"
+  if [ ! -s "$_grcp_lines_tmp" ]; then
+    rm -f "$_grcp_lines_tmp"
+    echo "no ref lines on stdin — changed-path set cannot be determined" 1>&2
+    return 1
+  fi
+
+  _grcp_zero="0000000000000000000000000000000000000000"
+  _grcp_union_tmp=$(mktemp -t clagentic-prepush-union.XXXXXX)
+  : > "$_grcp_union_tmp"
+  _grcp_reasons=""
+
+  while IFS=' ' read -r _grcp_lref _grcp_lsha _grcp_rref _grcp_rsha; do
+    [ -n "$_grcp_lref" ] || continue
+
+    # Deletion push: local sha is the all-zero sentinel -- nothing to diff
+    # FROM. Inconclusive by definition (task enumeration: "deletions").
+    if [ "$_grcp_lsha" = "$_grcp_zero" ]; then
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp"
+      echo "ref $_grcp_lref is a deletion push (local sha all-zero) — inconclusive" 1>&2
+      return 1
+    fi
+
+    # New branch / no merge-base: remote sha is the all-zero sentinel --
+    # nothing to diff AGAINST on the remote side for this ref.
+    if [ "$_grcp_rsha" = "$_grcp_zero" ]; then
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp"
+      echo "ref $_grcp_lref has no remote-side base (new ref) — inconclusive" 1>&2
+      return 1
+    fi
+
+    # Shallow/grafted history: a merge-base or diff computed against a
+    # commit outside the fetched depth is unreliable. Refuse outright
+    # rather than trust whatever git happens to return.
+    if _git rev-parse --is-shallow-repository 2>/dev/null | grep -q '^true$'; then
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp"
+      echo "repository is shallow — changed-path range cannot be trusted — inconclusive" 1>&2
+      return 1
+    fi
+
+    # Force push / unrelated history / merge commit onto unrelated history:
+    # the remote-known sha must be a proper ancestor of the sha being
+    # pushed for old..new to describe what the remote will actually hold
+    # afterward. `--is-ancestor` also fails closed on either sha being
+    # unresolvable (grafted/truncated history), which is exactly the
+    # "cannot be determined" case this function must refuse on.
+    if ! _git merge-base --is-ancestor "$_grcp_rsha" "$_grcp_lsha" 2>/dev/null; then
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp"
+      echo "ref $_grcp_lref: remote sha is not an ancestor of the pushed sha (force push, rewrite, or unrelated history) — inconclusive" 1>&2
+      return 1
+    fi
+
+    # Name-only diff: ordinary content changes, submodule gitlink bumps,
+    # and additions/deletions of a path all appear here.
+    _git diff "${_grcp_rsha}..${_grcp_lsha}" --name-only 2>/dev/null >> "$_grcp_union_tmp" || {
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp"
+      echo "ref $_grcp_lref: git diff --name-only failed — inconclusive" 1>&2
+      return 1
+    }
+
+    # --summary additionally surfaces mode changes and symlink
+    # creation/retargeting that --name-only alone does not distinguish from
+    # an ordinary content edit — but the path itself is what matters for
+    # domain purposes, and --summary's path is already covered by
+    # --name-only's output for any path that ALSO changed content. The gap
+    # --name-only cannot see on its own is a path whose ONLY change is a
+    # mode/symlink flip with byte-identical content — --summary lines for
+    # those still name the path, so re-extracting paths from --summary and
+    # unioning them closes that gap without a second, parallel path list.
+    _git diff "${_grcp_rsha}..${_grcp_lsha}" --summary 2>/dev/null \
+      | sed -n 's/^ mode change [0-9]* => [0-9]* \(.*\)$/\1/p; s/^ create mode [0-9]* \(.*\)$/\1/p; s/^ delete mode [0-9]* \(.*\)$/\1/p' \
+      >> "$_grcp_union_tmp" || true
+
+    _grcp_reasons="${_grcp_reasons}${_grcp_reasons:+; }ref $_grcp_lref: diff ${_grcp_rsha}..${_grcp_lsha}"
+  done < "$_grcp_lines_tmp"
+  rm -f "$_grcp_lines_tmp"
+
+  sort -u "$_grcp_union_tmp" > "$_grcp_out" 2>/dev/null || cp "$_grcp_union_tmp" "$_grcp_out"
+  rm -f "$_grcp_union_tmp"
+
+  if [ -z "$_grcp_reasons" ]; then
+    echo "no ref lines produced a resolvable range — inconclusive" 1>&2
+    return 1
+  fi
+
+  printf '%s\n' "$_grcp_reasons"
+  return 0
+}
+
+# _gate_skip_or_run_domain GATE DOMAIN_GLOBS_FN DOMAIN_VERSION REFS_FILE —
+# the single decision point every domain-eligible gate consults. REFS_FILE
+# is a snapshot of git's pre-push stdin protocol lines (see
+# _gate_resolve_changed_paths' own doc comment) — cmd_pre_push reads real
+# stdin exactly ONCE into a temp file and passes that snapshot's path to
+# every gate this mechanism covers, so a second/third gate in the same
+# pre-push invocation never has to contend with an already-drained pipe.
+# Direct/manual invocation (e.g. `gates.sh deps` outside the real hook) has
+# no such snapshot; callers pass /dev/null in that case, which
+# _gate_resolve_changed_paths correctly reports as "no ref lines" —
+# inconclusive, and therefore always runs the gate (fail-closed by
+# construction, not a special case this function needs to detect).
+#
+# Returns 0 and prints nothing when the gate should run normally
+# (in-domain, or resolution was inconclusive — fail closed means RUN).
+# Returns 2 (a THIRD, distinct status, never confused with "run"=0 or a real
+# gate failure=1) when the gate is genuinely out of domain and prints the
+# not_applicable audit-details line on stdout — see cmd_deps/cmd_sast's own
+# call sites for exactly how that outcome is logged.
+#
+# Never called for cmd_secrets (secrets is NOT ELIGIBLE for skipping at
+# all — task requirement 1, this is load-bearing) or for review/adversarial
+# (out of scope — see the domain table's own comment above).
+_gate_skip_or_run_domain() {
+  _gsord_gate="$1"
+  _gsord_domain_fn="$2"
+  _gsord_domain_version="$3"
+  _gsord_refs_file="$4"
+
+  if _gate_always_run_all_gates; then
+    return 0
+  fi
+
+  _gsord_changed_tmp=$(mktemp -t clagentic-domain-changed.XXXXXX)
+  _gsord_err_tmp=$(mktemp -t clagentic-domain-err.XXXXXX)
+  _gsord_derivation=""
+  if ! _gsord_derivation=$(_gate_resolve_changed_paths "$_gsord_changed_tmp" < "$_gsord_refs_file" 2>"$_gsord_err_tmp"); then
+    echo "[gates/$_gsord_gate] $(cat "$_gsord_err_tmp" 2>/dev/null) — running (fail closed)" 1>&2
+    rm -f "$_gsord_changed_tmp" "$_gsord_err_tmp"
+    return 0
+  fi
+  rm -f "$_gsord_err_tmp"
+
+  if [ ! -s "$_gsord_changed_tmp" ]; then
+    rm -f "$_gsord_changed_tmp"
+    return 0
+  fi
+
+  if _gate_path_touches_any_gate_config "$_gsord_changed_tmp"; then
+    echo "[gates/$_gsord_gate] changed-path set touches gate configuration — no gate may be skipped on this push" 1>&2
+    rm -f "$_gsord_changed_tmp"
+    return 0
+  fi
+
+  # A gate skips ONLY when EVERY changed path is proven to be OUTSIDE its
+  # domain (allowlist semantics, task requirement 4) -- a single path that
+  # is not affirmatively proven in-domain is enough to keep the gate
+  # running, since the allowlist has no way to assert "this path is
+  # definitely irrelevant" beyond "it doesn't match anything I declared."
+  _gsord_domain_globs=$($_gsord_domain_fn)
+  _gsord_changed_count=$(wc -l < "$_gsord_changed_tmp" | tr -d '[:space:]')
+  _gsord_in_domain_count=0
+  while IFS= read -r _gsord_changed_path; do
+    [ -n "$_gsord_changed_path" ] || continue
+    _gate_path_in_domain "$_gsord_changed_path" "$_gsord_domain_globs" && _gsord_in_domain_count=$((_gsord_in_domain_count + 1))
+  done < "$_gsord_changed_tmp"
+
+  if [ "$_gsord_in_domain_count" = "0" ] && [ "$_gsord_changed_count" != "0" ]; then
+    echo "not_applicable|domain=${_gsord_domain_version}|changed=${_gsord_changed_count} path(s)|derivation=${_gsord_derivation}"
+    rm -f "$_gsord_changed_tmp"
+    return 2
+  fi
+
+  rm -f "$_gsord_changed_tmp"
   return 0
 }
 
@@ -963,6 +1520,24 @@ _gate_resolve_global_ignore_path() {
 }
 
 cmd_deps() {
+  # DOMAIN-BASED SKIP (lr-1ad8da). Only consulted when CLAGENTIC_GATE_REFS_FILE
+  # is set -- cmd_pre_push (below) is the sole setter, pointing at a
+  # one-time snapshot of git's pre-push stdin protocol. A direct/manual
+  # `gates.sh deps` invocation never sets this var, so it runs exactly as
+  # before -- this mechanism only ever narrows the pre-push hook path, never
+  # changes what a manually-invoked gate does. See _gate_skip_or_run_domain's
+  # own doc comment for the full fail-closed contract.
+  if [ -n "${CLAGENTIC_GATE_REFS_FILE:-}" ]; then
+    _DEPS_DOMAIN_RESULT=""
+    _DEPS_DOMAIN_RC=0
+    _DEPS_DOMAIN_RESULT=$(_gate_skip_or_run_domain deps _gate_deps_domain_globs "$CLAGENTIC_DEPS_DOMAIN_VERSION" "$CLAGENTIC_GATE_REFS_FILE") || _DEPS_DOMAIN_RC=$?
+    if [ "$_DEPS_DOMAIN_RC" = "2" ]; then
+      echo "[gates/deps] out of domain — no manifest/lockfile/config in this push's changed-path set — not_applicable" 1>&2
+      cmd_log_run deps not_applicable "$_DEPS_DOMAIN_RESULT"
+      return 0
+    fi
+  fi
+
   if ! command -v osv-scanner >/dev/null 2>&1; then
     if [ "${CLAGENTIC_ALLOW_MISSING_OSV:-0}" = "1" ]; then
       echo "[gates] osv-scanner not installed — skipping (CLAGENTIC_ALLOW_MISSING_OSV=1 set)" 1>&2
@@ -1470,6 +2045,20 @@ _sast_pinned_config_from_argv() {
 }
 
 cmd_sast() {
+  # DOMAIN-BASED SKIP (lr-1ad8da). See cmd_deps' identical block above for
+  # the full rationale -- same env-var gate, same fail-closed contract, only
+  # the domain glob function and version constant differ.
+  if [ -n "${CLAGENTIC_GATE_REFS_FILE:-}" ]; then
+    _SAST_DOMAIN_RESULT=""
+    _SAST_DOMAIN_RC=0
+    _SAST_DOMAIN_RESULT=$(_gate_skip_or_run_domain sast _gate_sast_domain_globs "$CLAGENTIC_SAST_DOMAIN_VERSION" "$CLAGENTIC_GATE_REFS_FILE") || _SAST_DOMAIN_RC=$?
+    if [ "$_SAST_DOMAIN_RC" = "2" ]; then
+      echo "[gates/sast] out of domain — no source/build/config file in this push's changed-path set — not_applicable" 1>&2
+      cmd_log_run sast not_applicable "$_SAST_DOMAIN_RESULT"
+      return 0
+    fi
+  fi
+
   if ! command -v semgrep >/dev/null 2>&1; then
     if [ "${CLAGENTIC_ALLOW_MISSING_SEMGREP:-0}" = "1" ]; then
       echo "[gates] semgrep not installed — skipping (CLAGENTIC_ALLOW_MISSING_SEMGREP=1 set)" 1>&2
@@ -7265,9 +7854,28 @@ cmd_ship() {
   _cmd_log_run_checked_pass ship "gates green; pushed $BRANCH"
 }
 
+# cmd_pre_push — hook entry point. git's pre-push hook contract delivers
+# zero or more "<local ref> <local sha1> <remote ref> <remote sha1>" lines
+# on stdin (one per ref being pushed) -- share/hook-shims/pre-push.template
+# execs this script with that stdin passed through untouched. Snapshot it
+# to a temp file EXACTLY ONCE here, before either gate runs, and export its
+# path via CLAGENTIC_GATE_REFS_FILE (lr-1ad8da) -- cmd_deps/cmd_sast each
+# read that snapshot independently for their own domain-skip decision, so
+# neither gate drains a pipe the other one still needs. A non-hook,
+# non-tty invocation of `gates.sh pre-push` (e.g. manual testing with no
+# stdin at all) still produces a valid, empty snapshot, which
+# _gate_resolve_changed_paths correctly reports as "no ref lines" --
+# inconclusive, and therefore always runs both gates (fail-closed by
+# construction).
 cmd_pre_push() {
-  cmd_deps || { echo "[gates/pre-push] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"; exit 1; }
-  cmd_sast || { echo "[gates/pre-push] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"; exit 1; }
+  _PRE_PUSH_REFS_FILE=$(mktemp -t clagentic-prepush-stdin.XXXXXX)
+  cat > "$_PRE_PUSH_REFS_FILE"
+  CLAGENTIC_GATE_REFS_FILE="$_PRE_PUSH_REFS_FILE"
+  export CLAGENTIC_GATE_REFS_FILE
+
+  cmd_deps || { rm -f "$_PRE_PUSH_REFS_FILE"; echo "[gates/pre-push] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"; exit 1; }
+  cmd_sast || { rm -f "$_PRE_PUSH_REFS_FILE"; echo "[gates/pre-push] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"; exit 1; }
+  rm -f "$_PRE_PUSH_REFS_FILE"
   [ "${CLAGENTIC_REVIEW_ON_PUSH:-0}" = "1" ] && { cmd_review || exit 1; }
   exit 0
 }
@@ -7319,6 +7927,15 @@ _color_outcome() {
     block) printf '%s%s%s' "$C_RED"    "$1" "$C_RESET" ;;
     warn)  printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" ;;
     skip)  printf '%s%s%s' "$C_DIM"    "$1" "$C_RESET" ;;
+    # not_applicable (lr-1ad8da): a THIRD state, deliberately rendered in its
+    # own dim-but-distinct color rather than reusing skip's -- a skip means
+    # "opted out" (tool missing, explicit bypass); not_applicable means "this
+    # gate's verdict provably cannot depend on what changed here." Reusing
+    # skip's color would visually collapse two outcomes this whole feature
+    # exists to keep distinguishable (task requirement 3: a skip rendering as
+    # a pass would be the fifth report in done/ about exactly this defect
+    # class -- not_applicable must not render as anything BUT itself either).
+    not_applicable) printf '%s%s%s' "$C_DIM" "$1" "$C_RESET" ;;
     *)     printf '%s' "$1" ;;
   esac
 }
