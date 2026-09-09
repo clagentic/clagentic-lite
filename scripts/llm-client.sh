@@ -2183,13 +2183,15 @@ _llm_role_routable() {
   esac
 }
 
-# _llm_auth_mode_preflight (lr-6d4a1f, description scope item 4)
+# _llm_auth_mode_preflight (lr-6d4a1f, description scope item 4; freshest-
+# match-per-startUrl fix lr-3583b5)
 #
 # MODE-IMPLIED READINESS PREFLIGHT, called once at the top of walk_chain for
 # every role, before any LLM invocation (router or direct-CLI). Only
 # CLAGENTIC_AUTH_MODE=bedrock-sso does anything here: it reads the AWS SSO
-# token cache's expiresAt and fails fast, with the expiry timestamp named,
-# when the cache has already expired. ALL OTHER MODES (anthropic-oauth,
+# token cache and fails fast, with the expiry timestamp and cache path
+# named, when the freshest cache file matching the resolved profile's
+# startUrl has already expired. ALL OTHER MODES (anthropic-oauth,
 # enterprise, bedrock-api-key, and UNDECLARED) ARE A NO-OP -- this is a
 # closed enumeration, not a default-permissive one: only the one literal
 # value "bedrock-sso" triggers any check at all.
@@ -2205,13 +2207,57 @@ _llm_role_routable() {
 # preflight can usefully inspect for that value -- it stays a no-op for it,
 # same as every non-bedrock-sso value.
 #
+# lr-3583b5 FIX (FIRST-MATCH -> FRESHEST-MATCH): the AWS SDK never cleans up
+# stale SSO cache files, so multiple files per startUrl is the NORMAL steady
+# state, not a corrupted one. The prior version of this preflight scanned
+# every *.json file in the cache dir and reported the SOONEST expiry found
+# across ALL of them as "not ready" -- that is a first-match-shaped defect
+# by a different name: a FRESH token for the same startUrl sitting in the
+# same directory as a long-expired leftover from a prior login was ignored,
+# and the preflight failed on the stale file even though a valid session
+# existed. readdir/glob order is not stable across platforms or
+# filesystems, so "the soonest expiry found" is really "whichever file the
+# filesystem happened to enumerate that also happened to be expired" --
+# order-DEPENDENT in effect even though the code did not explicitly break on
+# the first match.
+#
+# THE FIX: enumerate every cache file, resolve the target startUrl from the
+# AWS profile/config this host would actually use (AWS_CONFIG_FILE, then
+# the documented default ~/.aws/config; profile selected via AWS_PROFILE/
+# AWS_DEFAULT_PROFILE, default "default"; supports both the legacy
+# "sso_start_url" key directly on the profile and the newer "sso_session"
+# indirection to a "[sso-session NAME]" block's own "sso_start_url"),
+# restrict candidates to cache files whose own "startUrl" field matches that
+# value, and among ONLY those candidates select the one with the LATEST
+# expiresAt. Fail only if THAT one (the freshest matching candidate) is
+# itself expired -- never on the first, soonest, or any other non-freshest
+# match. This makes the result independent of enumeration order by
+# construction: every candidate is read and compared, not short-circuited.
+#
+# WHEN THE PROFILE'S startUrl CANNOT BE RESOLVED (no AWS config file, no
+# matching profile section, or the profile has neither sso_start_url nor a
+# resolvable sso_session): startUrl-scoping is impossible, so every cache
+# file is treated as a candidate (the pre-lr-3583b5 breadth), but the
+# FRESHEST-WINS selection still applies -- this preserves the "a valid
+# fresh token anywhere in the cache reads as ready" property even without
+# profile resolution, rather than either trusting an arbitrary file or
+# refusing outright on a resolution gap that is not itself proof of
+# anything being expired.
+#
+# READ-ONLY, ALWAYS: this preflight only ever opens and reads cache files
+# and the AWS config file. It never deletes, rewrites, or otherwise mutates
+# anything on disk -- cleanup of stale SSO cache files is the AWS SDK's own
+# business, not this tool's; deleting a file this preflight does not own
+# would be a foot-gun, not a fix.
+#
 # RETURNS 0 (ready, or nothing to check) or 1 (not ready) -- on 1,
 # $_LLM_AUTH_MODE_PREFLIGHT_REASON carries a human-readable reason naming
-# the expiry timestamp, for the caller to fold into its own degraded
-# envelope/log line. Never dies, never exits the process -- same
-# degrade-and-continue posture every other walk_chain failure path uses;
-# the CALLER (walk_chain) decides what a failed preflight means for the
-# gate as a whole.
+# the resolved cache path and the expiresAt actually consulted, for the
+# caller to fold into its own degraded envelope/log line and so the next
+# person does not have to re-derive which file was read. Never dies, never
+# exits the process -- same degrade-and-continue posture every other
+# walk_chain failure path uses; the CALLER (walk_chain) decides what a
+# failed preflight means for the gate as a whole.
 _LLM_AUTH_MODE_PREFLIGHT_REASON=""
 _llm_auth_mode_preflight() {
   _LLM_AUTH_MODE_PREFLIGHT_REASON=""
@@ -2227,28 +2273,24 @@ _llm_auth_mode_preflight() {
     # FAIL-OPEN, matching every other JSON-tool-dependent helper in this
     # file (_llm_turn_diagnostics, the validate_output python3 branch,
     # etc.): without python3, this preflight cannot parse the cache files'
-    # JSON/ISO-8601 content, so it cannot prove EITHER readiness or
-    # staleness -- reporting "not ready" here would be a false positive on
-    # a perfectly healthy host that merely lacks python3, and this preflight
-    # exists to catch a real, provable expiry, not to invent one. The real
-    # 401 (if the SSO session genuinely is expired) still surfaces at the
-    # actual invoke_claude call site, just without this preflight's faster,
-    # more specific diagnosis.
+    # JSON/ISO-8601 content or the AWS config file, so it cannot prove
+    # EITHER readiness or staleness -- reporting "not ready" here would be a
+    # false positive on a perfectly healthy host that merely lacks python3,
+    # and this preflight exists to catch a real, provable expiry, not to
+    # invent one. The real 401 (if the SSO session genuinely is expired)
+    # still surfaces at the actual invoke_claude call site, just without
+    # this preflight's faster, more specific diagnosis.
     return 0
   fi
 
-  # Scan every *.json file in the cache dir for an "expiresAt" field
-  # (ISO-8601, the documented AWS CLI SSO token-cache shape). Report the
-  # SOONEST expiry found as "not ready" if it has already passed -- a
-  # conservative choice: an operator with multiple SSO profiles cached only
-  # needs ONE to be expired for THIS preflight to be honest that something
-  # in the cache is stale, and naming the soonest (most urgent) expiry is
-  # the most actionable single timestamp to report. A cache dir with zero
-  # parseable expiresAt fields (empty, or every file unparseable) is
-  # reported as "ready" -- fail-open, same rationale as the missing-python3
-  # branch above: this preflight only ever blocks on a PROVEN expiry, never
-  # on an absence of proof.
+  # Single python3 invocation does everything: resolve the target startUrl
+  # from AWS profile/config (best-effort -- absence is not fatal, see the
+  # function's own doc comment), enumerate every cache file, filter to
+  # startUrl-matching candidates when a startUrl was resolved, select the
+  # candidate with the LATEST expiresAt among those, and report whether
+  # THAT one is expired. Never mutates any file it reads.
   _lamp_result=$(python3 - "$_lamp_cache_dir" <<'PY' 2>/dev/null
+import configparser
 import datetime
 import glob
 import json
@@ -2256,45 +2298,172 @@ import os
 import sys
 
 cache_dir = sys.argv[1]
-soonest = None
-for path in glob.glob(os.path.join(cache_dir, "*.json")):
+
+
+def _parse_expires_at(raw):
+    """AWS SSO cache format: "2026-08-21T18:30:00UTC" or with a real offset
+    ("...+00:00"/"...Z"). Normalize the bare "UTC" suffix (not valid
+    ISO-8601 on its own) before parsing. Returns a tz-aware datetime, or
+    None on any unparseable input."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        norm = raw.replace("UTC", "+00:00").replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(norm)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _resolve_profile_start_url():
+    """Best-effort resolution of the current AWS profile's SSO startUrl,
+    honoring the standard AWS resolution order: AWS_CONFIG_FILE (falling
+    back to the documented default ~/.aws/config) is the primary source of
+    profile/sso-session blocks; AWS_SHARED_CREDENTIALS_FILE (falling back to
+    the documented default ~/.aws/credentials) is merged in as a secondary
+    source -- the AWS CLI/SDKs permit sso_start_url/sso_session to appear in
+    either file, and a value already resolved from the config file always
+    wins (config-file sections are read first below and never overwritten).
+    Profile selected via AWS_PROFILE (then AWS_DEFAULT_PROFILE, then
+    "default"). Supports both the legacy shape (sso_start_url directly on
+    the profile) and the newer sso-session indirection (profile's
+    sso_session names a "[sso-session NAME]" block whose own sso_start_url
+    is the real value). Returns None on any resolution failure -- absence of
+    a resolvable startUrl is not itself evidence of anything, see the
+    caller's doc comment for how that case is handled."""
+    config_path = os.environ.get("AWS_CONFIG_FILE") or os.path.join(
+        os.path.expanduser("~"), ".aws", "config"
+    )
+    creds_path = os.environ.get("AWS_SHARED_CREDENTIALS_FILE") or os.path.join(
+        os.path.expanduser("~"), ".aws", "credentials"
+    )
+
+    profile = (
+        os.environ.get("AWS_PROFILE")
+        or os.environ.get("AWS_DEFAULT_PROFILE")
+        or "default"
+    )
+
+    parser = configparser.ConfigParser()
+    read_any = False
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                parser.read_string(f.read())
+            read_any = True
+        except Exception:
+            pass
+    if os.path.isfile(creds_path):
+        try:
+            with open(creds_path) as f:
+                # The credentials file has NO "profile " prefix on its own
+                # section names (unlike ~/.aws/config) -- read it into a
+                # second parser and copy any matching section(s) in under
+                # the SAME section-naming convention this function already
+                # uses, so the lookup below is uniform regardless of which
+                # file a value came from.
+                creds_parser = configparser.ConfigParser()
+                creds_parser.read_string(f.read())
+            read_any = True
+            for raw_section in creds_parser.sections():
+                target_section = (
+                    "default" if raw_section == "default" else f"profile {raw_section}"
+                )
+                if not parser.has_section(target_section):
+                    parser.add_section(target_section)
+                for key, value in creds_parser.items(raw_section):
+                    if not parser.has_option(target_section, key):
+                        parser.set(target_section, key, value)
+        except Exception:
+            pass
+
+    if not read_any:
+        return None
+
+    # AWS config file section-naming convention: the default profile's
+    # section is literally "default"; every other profile's section is
+    # "profile <name>".
+    section = "default" if profile == "default" else f"profile {profile}"
+    if not parser.has_section(section):
+        return None
+
+    direct = parser.get(section, "sso_start_url", fallback=None)
+    if direct:
+        return direct.strip()
+
+    session_name = parser.get(section, "sso_session", fallback=None)
+    if session_name:
+        session_section = f"sso-session {session_name}"
+        session_url = parser.get(session_section, "sso_start_url", fallback=None)
+        if session_url:
+            return session_url.strip()
+
+    return None
+
+
+target_start_url = _resolve_profile_start_url()
+
+candidates = []  # list of (expires_at_dt, expires_at_raw, path)
+for path in sorted(glob.glob(os.path.join(cache_dir, "*.json"))):
     try:
         with open(path) as f:
             data = json.load(f)
     except Exception:
         continue
-    expires_at = data.get("expiresAt")
-    if not isinstance(expires_at, str):
+    if not isinstance(data, dict):
         continue
-    try:
-        # AWS SSO cache format: "2026-08-21T18:30:00UTC" or with a real
-        # offset ("...+00:00"/"...Z"). Normalize the bare "UTC" suffix
-        # (not valid ISO-8601 on its own) before parsing.
-        norm = expires_at.replace("UTC", "+00:00").replace("Z", "+00:00")
-        dt = datetime.datetime.fromisoformat(norm)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-    except Exception:
-        continue
-    if soonest is None or dt < soonest:
-        soonest = dt
 
-if soonest is None:
-    sys.exit(0)
+    if target_start_url is not None:
+        file_start_url = data.get("startUrl")
+        if file_start_url != target_start_url:
+            continue
+
+    expires_at_raw = data.get("expiresAt")
+    dt = _parse_expires_at(expires_at_raw)
+    if dt is None:
+        continue
+    candidates.append((dt, expires_at_raw, path))
+
+if not candidates:
+    # FAIL CLOSED (lr-3583b5): either nothing matched the resolved
+    # startUrl, or every matching/considered file lacked a parseable
+    # expiresAt. Never assume valid on genuine ambiguity.
+    reason = "no AWS SSO cache file with a parseable expiresAt"
+    if target_start_url is not None:
+        reason += f" matching startUrl {target_start_url}"
+    print(f"not-ready\t{reason}\t\t")
+    sys.exit(1)
+
+# FRESHEST WINS, ORDER-INDEPENDENT: scan every candidate, keep the one with
+# the LATEST expiresAt regardless of enumeration order (sorted() above is
+# for deterministic test iteration only -- max() below is what makes the
+# result order-independent, not the sort).
+freshest = max(candidates, key=lambda c: c[0])
+freshest_dt, freshest_raw, freshest_path = freshest
 
 now = datetime.datetime.now(datetime.timezone.utc)
-if soonest <= now:
-    remaining = now - soonest
-    print(f"expired\t{soonest.isoformat()}\t{remaining}")
+if freshest_dt <= now:
+    remaining = now - freshest_dt
+    print(f"not-ready\texpired\t{freshest_raw}\t{remaining}\t{freshest_path}")
     sys.exit(1)
+
 sys.exit(0)
 PY
   )
   _lamp_code=$?
   if [ "$_lamp_code" -eq 1 ]; then
-    _lamp_expiry=$(printf '%s' "$_lamp_result" | cut -f2)
-    _lamp_ago=$(printf '%s' "$_lamp_result" | cut -f3)
-    _LLM_AUTH_MODE_PREFLIGHT_REASON="AWS SSO token cache expired at $_lamp_expiry (${_lamp_ago} ago) -- run 'aws sso login' to refresh before retrying (cache dir: $_lamp_cache_dir)"
+    _lamp_kind=$(printf '%s' "$_lamp_result" | cut -f2)
+    if [ "$_lamp_kind" = "expired" ]; then
+      _lamp_expiry=$(printf '%s' "$_lamp_result" | cut -f3)
+      _lamp_ago=$(printf '%s' "$_lamp_result" | cut -f4)
+      _lamp_path=$(printf '%s' "$_lamp_result" | cut -f5)
+      _LLM_AUTH_MODE_PREFLIGHT_REASON="AWS SSO token cache expired at $_lamp_expiry (${_lamp_ago} ago) -- run 'aws sso login' to refresh before retrying (freshest matching cache file: $_lamp_path)"
+    else
+      _lamp_reason=$(printf '%s' "$_lamp_result" | cut -f1)
+      _LLM_AUTH_MODE_PREFLIGHT_REASON="CLAGENTIC_AUTH_MODE=bedrock-sso but $_lamp_reason in $_lamp_cache_dir -- treating as expired (fail closed on ambiguity); run 'aws sso login' (cache dir: $_lamp_cache_dir)"
+    fi
     return 1
   fi
   return 0
