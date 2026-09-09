@@ -1138,6 +1138,131 @@ The fix treats a resolved `origin/<default-branch>` ref as trustworthy only when
 
 Rationale: deterministic tools, well-understood, no LLM in the security path. The LLM-driven `adversarial` layer (Gate 5) is separate and non-blocking by design.
 
+### Gate input domain — deps/sast skip-when-out-of-domain (lr-1ad8da)
+
+**Field report, not a regression.** `cmd_pre_push` has run `deps` + `sast`
+unconditionally since `6fe6fe6` (Initial commit, v0.1.0). When a push's diff
+touches no file either gate reads, the gate's verdict is identical before
+and after the change — yet a pre-existing finding (e.g. an advisory DB
+publishing against an unchanged dependency, or a pre-existing semgrep
+finding in a file the push never touched) still blocks the push. The only
+prior escape was `--no-verify`, which disables EVERY gate, including ones
+that genuinely apply — teaching `--no-verify` risks it being reached for on
+a push that DID need gating, and also contradicts INV-8 (AGENTS.md): a fix
+must not require a flag to be received.
+
+**The correct unit is a gate's INPUT DOMAIN** — the set of paths whose
+contents its verdict can possibly depend on. Domain is an **allowlist** of
+what a gate reads, never a denylist of what to ignore: an unrecognized path
+shape is always treated as IN domain (fail toward running the gate), never
+silently excluded because nobody thought to deny it.
+
+**Irrelevance is computed by the harness, never asserted by the pusher.**
+There is no `--docs-only` flag, no `*.md` exemption, and no per-repo
+path-exclusion config — all three were evaluated and rejected: a
+pusher-supplied claim about their own diff is a bypass with extra steps,
+"docs" is not a safety category (a credential pastes into Markdown exactly
+as easily as source), and a path-exclusion config drifts, goes unaudited,
+and carries the same trust model as a pusher flag.
+
+**Domain table:**
+
+| Gate | Domain | Eligible to skip? |
+|---|---|---|
+| secrets | Every file, unconditionally | **No — never.** Load-bearing: this is what stops the feature from degenerating into "skip gates on docs." `cmd_secrets` never consults this mechanism at all. |
+| deps | Manifests + lockfiles PER ECOSYSTEM (`_gate_deps_domain_globs`, `scripts/gates.sh`) | Yes |
+| sast | Source files in the languages semgrep's `--config=auto` ruleset covers, plus build/config files those rules read (`_gate_sast_domain_globs`) | Yes |
+| review / adversarial | Every file (the diff itself is the model's input — there is no narrower domain to declare) | Out of scope for this mechanism — gated by their own existing opt-in switches (e.g. `CLAGENTIC_REVIEW_ON_PUSH`) |
+
+**Gate configuration is in EVERY gate's domain (not just its own).** If the
+changed-path set touches ANY gate's own config — `.gitleaks.toml`,
+`.clagentic/osv-ignore`, `.clagentic/semgrep-exclude`, `.semgrepignore`,
+`.clagentic/config`, `.clagentic-bleed-ignore`, `.clagentic/bleed-patterns`,
+`.clagentic/deferrals.json`, `.clagentic/adversarial-acks.json`,
+`.clagentic/accepted-risks.md` (the full list: `_gate_config_paths`,
+`scripts/gates.sh`) — **no gate may be skipped on that push**, regardless of
+what else changed. Without this the mechanism has a privilege-escalation
+shape: weaken a gate's config and skip the gate that would have noticed, in
+the same push.
+
+**The outcome is a distinct third state, never `pass` (`not_applicable`).**
+`gate_runs.outcome` gains a fourth value alongside `pass`/`block`/`warn`/
+`skip`: `not_applicable`, logged only by `cmd_deps`/`cmd_sast` when their
+domain check determines the push cannot affect their verdict. The `details`
+column records the domain version tested against, the changed-path count,
+and how that set was derived (which ref range(s) were diffed). This is the
+recurring defect class this codebase already has four `done/` reports
+about — a skip rendering as a pass — closed by making "never ran because it
+provably could not matter" visibly different from "ran and found nothing"
+everywhere outcome is read: `cmd_status`/`cmd_tail`'s color-coding
+(`_color_outcome`), `cmd_digest`, and the merge-gate's `deterministic_gates`
+payload (`_read_deterministic_gates` passes `outcome` through verbatim,
+unvalidated — it already did before this task, so the wider enum needed no
+code change there to be admitted).
+
+**Fail-closed enumeration.** The changed-path set is resolved once per
+`gates.sh pre-push` invocation, from git's own pre-push hook stdin protocol
+(zero or more `<local ref> <local sha1> <remote ref> <remote sha1>` lines —
+`_gate_resolve_changed_paths`, `scripts/gates.sh`, the first place in this
+codebase that reads that protocol at all; every gate before lr-1ad8da
+ignored it). ANY of the following makes the **whole push** inconclusive,
+which means **run the gate**, never skip it:
+
+- **Multiple refs in one push** — the union of every ref's own range is the
+  input; any one ref's range being inconclusive makes the whole push
+  inconclusive, not just that ref.
+- **A new branch with no merge-base**, or **a deletion push** — the
+  pre-push protocol's all-zero SHA sentinel on either side of a ref line.
+- **A force push** — the previously-known remote SHA is not an ancestor of
+  the SHA being pushed (`git merge-base --is-ancestor`); `old..new` does
+  not describe what the remote will actually hold afterward.
+- **Shallow/grafted history** (`git rev-parse --is-shallow-repository`) —
+  a merge-base/diff computed against a commit outside the fetched depth is
+  unreliable.
+- **Merge commits** — `git diff old..new --name-only` already reports the
+  full name-only diff (not first-parent-only), so a merge's actual file
+  introductions are captured; the force-push/ancestor check above still
+  refuses on an unrelated-history merge.
+- **Submodule pointer changes** — a gitlink path change appears in
+  `--name-only` output like any other path and is evaluated against each
+  gate's domain normally; it essentially never matches a source/manifest
+  glob, so it is correctly left running the gate rather than trusting a
+  one-line pointer bump.
+- **Symlink creation/retargeting and file mode changes** — `--name-only`
+  alone cannot distinguish a content change from a mode/symlink-target
+  change on an existing path; `_gate_resolve_changed_paths` additionally
+  parses `git diff old..new --summary` for mode-change/create-mode/
+  delete-mode lines and unions those paths in, so a path whose ONLY change
+  is a mode/symlink flip still counts as changed.
+- **Vendored dependencies under a documentation path, and generated/
+  literate documents** — domain matching is by file NAME/EXTENSION shape
+  only (`_gate_path_in_domain`), never by directory location. There is no
+  directory-based carve-out anywhere in this mechanism — a manifest under
+  `docs/` still matches the deps domain; a compiled/literate document with a
+  source extension still matches the sast domain.
+
+**`always_run_all_gates` — default OFF (operator decision).** Set
+`CLAGENTIC_ALWAYS_RUN_ALL_GATES=1` to disable this mechanism entirely and
+run every gate unconditionally on every push, matching pre-lr-1ad8da
+behavior byte-for-byte. Defaulting this ON would make the whole feature
+dead code — recorded here as a deliberate default, not an oversight.
+
+**Domain data drifts with the upstream scanner — maintenance path, not a
+hardcoded snapshot pretending otherwise.** `_gate_deps_domain_globs` and
+`_gate_sast_domain_globs` are DOCUMENTED, VERSIONED snapshots
+(`CLAGENTIC_DEPS_DOMAIN_VERSION` / `CLAGENTIC_SAST_DOMAIN_VERSION`) of
+osv-scanner's and semgrep's own publicly documented ecosystem/language
+coverage — there is no local, offline way to ask an installed osv-scanner
+or semgrep binary for a machine-readable manifest/language list without
+shipping a parser for its internal registry, which this codebase's "no new
+external tool dependency without asking" rule (AGENTS.md) bars introducing
+for this one purpose. A repo needing a manifest/language shape newer than
+the shipped snapshot extends it without waiting for a release:
+`CLAGENTIC_DEPS_DOMAIN_EXTRA_GLOBS` / `CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS`
+(space-separated glob patterns, appended to the built-in list). A gap in
+either snapshot only ever widens what's treated as in-domain (the allowlist
+default), never narrows it — see "Fail-closed enumeration" above.
+
 ### Suppression policy — inline `# nosemgrep` vs the repo-level exclude ladder (lr-cfc360)
 
 Two mechanisms exist for a registry SAST rule that no correct code can satisfy. Both are legitimate; neither is a default reach-for-first. **A suppression is a claim that a specific finding is a false positive or genuinely unsatisfiable, not a shortcut around review** — see "The suppression-review loop" below for what happens when that claim doesn't hold.
@@ -1279,7 +1404,7 @@ A finding is `tier: blocking` only when reachability is `yes` (with a cited conc
 - `adversarial_advisory_count` — count of `tier: "advisory"` findings
 - `resolved_change_class` (lr-4f8316) — `"ephemeral"` if any finding declares `class: "ephemeral"`, else `"durable"` if there is at least one finding, else `null` on a clean pass with no findings
 - `adversarial_downgraded_by_class_count` (lr-4f8316) — see "Change class" below
-- `deterministic_gates` (lr-367a21, INFORMATIONAL ONLY) — `{"secrets": ..., "deps": ..., "sast": ..., "audit_db_unavailable": <bool>}`. Each of `secrets`/`deps`/`sast` is either `null` (no logged `gate_runs` row for that gate) or `{"outcome": "pass"|"warn"|"skip"|"block", "details": "..."}`, read as the LATEST logged row per gate from `.clagentic/lite/audit.db`. `audit_db_unavailable` is `true` when the read itself could not happen (no `sqlite3`, no `audit.db`, or an unreadable/corrupt DB) — in that case all three gate fields are `null` and this tells the Merge Gate nothing about whether those gates ran. See "Deterministic-gates payload block" below.
+- `deterministic_gates` (lr-367a21, INFORMATIONAL ONLY) — `{"secrets": ..., "deps": ..., "sast": ..., "audit_db_unavailable": <bool>}`. Each of `secrets`/`deps`/`sast` is either `null` (no logged `gate_runs` row for that gate) or `{"outcome": "pass"|"warn"|"skip"|"block", "details": "..."}`, read as the LATEST logged row per gate from `.clagentic/lite/audit.db`. `audit_db_unavailable` is `true` when the read itself could not happen (no `sqlite3`, no `audit.db`, or an unreadable/corrupt DB) — in that case all three gate fields are `null` and this tells the Merge Gate nothing about whether those gates ran. See "Deterministic-gates payload block" below. As of lr-1ad8da, `outcome` for `deps`/`sast` is no longer a closed `pass`/`warn`/`skip`/`block` set — it can also be `not_applicable`, a fourth, distinct state meaning the gate's verdict provably could not depend on this push's changed-path set (see "Gate input domain" below). `outcome` remains a closed enum, just a wider one; `_read_deterministic_gates` passes it through verbatim, unvalidated (it already did before this task — the enum was documentation, not code, so no gate code needed to change to admit the new value).
 - `deterministic_gates_fenced` (lr-92d931) — the same `deterministic_gates` object rendered as text inside a `===BEGIN/END DETERMINISTIC GATES DATA===` fenced block, mirroring `adversarial_findings_fenced`. See "Fenced, not just sanitized" below.
 
 The Merge Gate prompt (`ds_merge_gate_prompt`) is instructed to refuse only on `tier: "blocking"` findings not covered by `adversarial-acks.json`/`accepted-risks.md`, and to note advisory findings — including class-downgraded ones — in its `reason` text without gating on them. If `adversarial_findings` is empty or absent (e.g. a gate run predating this feature, or a model that emitted no parseable `[FINDING]` headers), the Merge Gate falls back to reasoning over the `adversarial` markdown prose directly, as it did before this change.
