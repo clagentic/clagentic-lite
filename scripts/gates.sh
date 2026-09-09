@@ -738,30 +738,29 @@ EOF_GLOBS
 #     combined with the merge-base call itself failing; either signal alone
 #     is treated as inconclusive.
 #   - A merge commit in the pushed range: can introduce files present in
-#     neither parent's first-parent path. `git diff old..new --name-only`
-#     already reports the full name-only diff (not first-parent-only), so a
-#     merge commit's actual file introductions ARE captured by that diff —
-#     but this function additionally refuses (falls to inconclusive) if it
+#     neither parent's first-parent path. `git diff old..new --raw`
+#     already reports the full diff (not first-parent-only), so a merge
+#     commit's actual file introductions ARE captured by that diff — but
+#     this function additionally refuses (falls to inconclusive) if it
 #     cannot prove `old` is a proper ancestor of `new` via a clean, single
 #     linear merge-base (the same force-push check above also catches an
 #     unrelated-history merge).
-#   - Submodule pointer changes: `git diff --name-only` reports the
-#     submodule's own path changing (gitlink entries are ordinary paths in
-#     name-only output) — that path is then evaluated against each gate's
-#     domain like any other path, and a submodule path almost never matches
-#     a source/manifest glob, so it is NOT proven in-domain and the
-#     resolver correctly leaves the gate running rather than silently
-#     trusting that a one-line pointer bump carries no risk.
-#   - Symlink creation/retargeting and file mode changes: `--name-only`
-#     alone cannot distinguish a content change from a mode/symlink-target
-#     change on an existing path. This function additionally checks
-#     `git diff old..new --summary` for any `mode change`/` create mode
-#     120000`/` (new/gone) symlink` line and, if the raw diff --name-only
-#     path set is otherwise empty, still returns the affected path(s) from
-#     --summary rather than reporting no changes — see the --summary parse
-#     below. A path whose ONLY change is a mode/symlink flip still counts
-#     as changed for domain purposes (a .md becoming a symlink or becoming
-#     executable is not a prose change, per the task's own framing).
+#   - Submodule pointer changes: `git diff --raw` reports the submodule's
+#     own path changing (gitlink entries are ordinary paths in raw output)
+#     — that path is then evaluated against each gate's domain like any
+#     other path, and a submodule path almost never matches a
+#     source/manifest glob, so it is NOT proven in-domain and the resolver
+#     correctly leaves the gate running rather than silently trusting that
+#     a one-line pointer bump carries no risk.
+#   - Symlink creation/retargeting and file mode changes: unlike
+#     `--name-only`, `--raw` reports every path whose MODE changed even
+#     when its blob content did not, so a path whose ONLY change is a
+#     mode/symlink flip with byte-identical content still appears in the
+#     changed-path set with no second, parallel parse needed — see the
+#     `--raw -z` parse below. A path whose ONLY change is a mode/symlink
+#     flip still counts as changed for domain purposes (a .md becoming a
+#     symlink or becoming executable is not a prose change, per the task's
+#     own framing).
 #   - Vendored dependencies under a documentation path, and generated/
 #     literate documents that are compiled or executed: this mechanism does
 #     not special-case any path by directory name (docs/, vendor/, etc.) at
@@ -803,7 +802,7 @@ _gate_resolve_changed_paths() {
     # Deletion push: local sha is the all-zero sentinel -- nothing to diff
     # FROM. Inconclusive by definition (task enumeration: "deletions").
     if [ "$_grcp_lsha" = "$_grcp_zero" ]; then
-      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp"
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp" "$_grcp_raw_tmp"
       echo "ref $_grcp_lref is a deletion push (local sha all-zero) — inconclusive" 1>&2
       return 1
     fi
@@ -811,7 +810,7 @@ _gate_resolve_changed_paths() {
     # New branch / no merge-base: remote sha is the all-zero sentinel --
     # nothing to diff AGAINST on the remote side for this ref.
     if [ "$_grcp_rsha" = "$_grcp_zero" ]; then
-      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp"
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp" "$_grcp_raw_tmp"
       echo "ref $_grcp_lref has no remote-side base (new ref) — inconclusive" 1>&2
       return 1
     fi
@@ -820,7 +819,7 @@ _gate_resolve_changed_paths() {
     # commit outside the fetched depth is unreliable. Refuse outright
     # rather than trust whatever git happens to return.
     if _git rev-parse --is-shallow-repository 2>/dev/null | grep -q '^true$'; then
-      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp"
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp" "$_grcp_raw_tmp"
       echo "repository is shallow — changed-path range cannot be trusted — inconclusive" 1>&2
       return 1
     fi
@@ -832,31 +831,69 @@ _gate_resolve_changed_paths() {
     # unresolvable (grafted/truncated history), which is exactly the
     # "cannot be determined" case this function must refuse on.
     if ! _git merge-base --is-ancestor "$_grcp_rsha" "$_grcp_lsha" 2>/dev/null; then
-      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp"
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp" "$_grcp_raw_tmp"
       echo "ref $_grcp_lref: remote sha is not an ancestor of the pushed sha (force push, rewrite, or unrelated history) — inconclusive" 1>&2
       return 1
     fi
 
-    # Name-only diff: ordinary content changes, submodule gitlink bumps,
-    # and additions/deletions of a path all appear here.
-    _git diff "${_grcp_rsha}..${_grcp_lsha}" --name-only 2>/dev/null >> "$_grcp_union_tmp" || {
-      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp"
-      echo "ref $_grcp_lref: git diff --name-only failed — inconclusive" 1>&2
+    # Raw diff, NUL-delimited (-z), no rename/copy detection (-M/-C never
+    # passed): a single source of every changed path, sidestepping the
+    # quoting class entirely rather than parsing around it (lr-1ad8da
+    # follow-up; PEACHES/BOBBIE both independently flagged the prior
+    # --name-only + --summary/sed union as fail-open on a quoted path).
+    #
+    # WHY --raw -z REPLACES BOTH --name-only AND --summary: `--raw` reports
+    # every path whose mode, blob sha, or existence changed -- ordinary
+    # content edits, additions, deletions, submodule gitlink bumps, AND
+    # mode-only/symlink-only flips with byte-identical content -- in one
+    # consistent record shape, so no second, parallel invocation is needed
+    # to catch the mode/symlink gap --name-only alone has.
+    #
+    # WHY -z SPECIFICALLY: without -z, git C-quotes any path containing a
+    # space, a double quote, a backslash, or a non-ASCII byte as a single
+    # double-quoted, backslash-escaped literal (core.quotepath, on by
+    # default) -- e.g. `"file with space.py"` INCLUDING the quote
+    # characters. That quoted literal then reaches _gate_path_in_domain's
+    # glob match unchanged, where `*.py` never matches `"file.py"` -- a
+    # content-identical mode flip or symlink retarget on such a path would
+    # be silently dropped from the changed-path set and could cause a
+    # gate to skip that should have run. `-z` disables this quoting
+    # entirely: paths are NUL-terminated raw bytes, never escaped.
+    #
+    # RESIDUAL, DISCLOSED GAP: converting the NUL stream to newline-
+    # delimited text below (`tr '\0' '\n'`) to parse in POSIX sh means a
+    # path containing a LITERAL embedded newline byte (permitted by git,
+    # vanishingly rare on any real filesystem/toolchain) would still
+    # mis-split. This is a narrower, pre-existing residual across most
+    # shell tooling (not the vulnerability class found here -- that was
+    # ordinary spaces/quotes/non-ASCII defeating quoting, which -z fixes
+    # completely) and is unrelated to and no worse than this function's
+    # prior --name-only behavior for that same edge case.
+    # --no-renames is REQUIRED, not cosmetic: modern git enables rename
+    # detection for `git diff` by default (diff.renames), which would
+    # widen an R-status record from two NUL-terminated fields
+    # (status\0path\0) to three (status\0oldpath\0newpath\0) and desync
+    # the fixed "every second token is a path" pairing below for exactly
+    # the pushes this mechanism most needs to get right. Forcing it off
+    # here pins the two-field shape regardless of the invoking
+    # environment's diff.renames setting; --no-renames also does not
+    # suppress the change itself -- a rename still surfaces as a plain
+    # delete-then-add pair of paths, both still present in the set.
+    _grcp_raw_tmp=$(mktemp -t clagentic-prepush-raw.XXXXXX)
+    _git diff -z --no-renames "${_grcp_rsha}..${_grcp_lsha}" --raw 2>/dev/null > "$_grcp_raw_tmp" || {
+      rm -f "$_grcp_lines_tmp" "$_grcp_union_tmp" "$_grcp_raw_tmp"
+      echo "ref $_grcp_lref: git diff --raw failed — inconclusive" 1>&2
       return 1
     }
 
-    # --summary additionally surfaces mode changes and symlink
-    # creation/retargeting that --name-only alone does not distinguish from
-    # an ordinary content edit — but the path itself is what matters for
-    # domain purposes, and --summary's path is already covered by
-    # --name-only's output for any path that ALSO changed content. The gap
-    # --name-only cannot see on its own is a path whose ONLY change is a
-    # mode/symlink flip with byte-identical content — --summary lines for
-    # those still name the path, so re-extracting paths from --summary and
-    # unioning them closes that gap without a second, parallel path list.
-    _git diff "${_grcp_rsha}..${_grcp_lsha}" --summary 2>/dev/null \
-      | sed -n 's/^ mode change [0-9]* => [0-9]* \(.*\)$/\1/p; s/^ create mode [0-9]* \(.*\)$/\1/p; s/^ delete mode [0-9]* \(.*\)$/\1/p' \
-      >> "$_grcp_union_tmp" || true
+    # Each raw -z record is ":oldmode newmode oldsha newsha status\0path\0"
+    # -- two NUL-terminated fields per changed path (--no-renames above
+    # guarantees this shape). Convert to one token per line and keep only
+    # every second line (the path; the first is the status/mode metadata
+    # line, of no interest here since only the path drives domain
+    # membership).
+    tr '\0' '\n' < "$_grcp_raw_tmp" | awk 'NR % 2 == 0' >> "$_grcp_union_tmp"
+    rm -f "$_grcp_raw_tmp"
 
     _grcp_reasons="${_grcp_reasons}${_grcp_reasons:+; }ref $_grcp_lref: diff ${_grcp_rsha}..${_grcp_lsha}"
   done < "$_grcp_lines_tmp"
