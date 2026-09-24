@@ -934,6 +934,31 @@ change-scoped pattern scan (internal-bleed):
 | **Timeout** | Every gitleaks invocation runs under `run_bounded` (default 300s, configurable via `CLAGENTIC_SECRETS_TIMEOUT_SEC`) — a full branch-history scan can legitimately take longer than a staged-only scan. A timeout counts as a block, same as a real finding. |
 | **Branch-history fetch timeout** | `CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC` (default 30). Bounds the `git fetch`/`git ls-remote` freshness check the branch-history scope below uses to resolve its baseline — expiry falls back to full history, same as any other unverifiable-baseline outcome. |
 
+**Every gitleaks invocation is pinned to `$REPO_ROOT`, never CWD (PEACHES PR
+#217 review, comment 5821185384).** All three `cmd_secrets` call sites
+(branch-history `gitleaks git`, staged `gitleaks git --staged`, and the
+older-gitleaks `gitleaks protect --staged` fallback) used to invoke gitleaks
+with no explicit target at all — gitleaks performs its own repo/source
+discovery from the process's CWD, exactly the class of defect INV-6's `_git
+-C "$REPO_ROOT"` wrapper exists to close for plain `git`. In a
+wrapper/`.clagentic-project` layout, or any invocation whose CWD differs
+from `REPO_ROOT` (a hook invoked from a subdirectory, an orchestrator that
+`cd`s elsewhere before shelling out), gitleaks silently scanned the WRONG
+repo — or a clean, unrelated CWD — while `cmd_secrets` reported whatever
+that unrelated scan found: a false pass on the real target, not an error.
+Both `gitleaks git` and `gitleaks protect` are now pinned via their shared
+`--source`/`-s` Global Flag (`gitleaks protect --help`'s Global Flags
+section, which `gitleaks git` also carries) — confirmed against this
+project's own CI host (gitleaks 8.16) that `protect` has **no** positional
+`[DIRECTORY]` argument at all; an earlier draft of this fix passed a bare
+trailing path token, which gitleaks silently ignored rather than erroring
+on, reproducing the exact false-pass shape this fix exists to close. See
+`scripts/test_secrets_branch_scope.py`'s `TestSecretsScanIsCwdIndependent`
+for the regression coverage, exercised for real against the `gitleaks
+protect --staged` fallback (runnable on any installed gitleaks, no version
+gate) since that is the one call site this project's own CI host can
+exercise without a gitleaks 8.18+ upgrade.
+
 **Branch-history scope (lr-51112e) — scan RANGE, not full history, by default.**
 On a feature branch with a clean index (no staged changes), `cmd_secrets`
 falls back to `gitleaks git`, scanning committed history rather than the
