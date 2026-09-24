@@ -2502,9 +2502,30 @@ EOF_EXCL
   fi
 
   # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
+  #
+  # CWD PINNED TO REPO_ROOT, NOT A TARGET ARGUMENT (HOLDEN decision,
+  # lr-51112e, option 3 from AMoS needs-decision on PR #217 at ae67761):
+  # unlike gitleaks/osv-scanner above, semgrep's --baseline-commit runs `git
+  # cat-file` against the process's CWD with no override flag of its own —
+  # confirmed empirically that appending REPO_ROOT as a positional target
+  # hard-fails (exit 2) whenever CWD != REPO_ROOT, and
+  # test_no_path_argument_added_in_baseline_mode (test_sast_baseline_scope.py)
+  # requires argv to carry no trailing path in baseline mode at all — so the
+  # `--source`/positional-path fix used for gitleaks/osv-scanner is not
+  # available here. Instead, each invocation runs inside its own POSIX
+  # subshell that `cd`s to REPO_ROOT FIRST, leaving argv byte-identical to
+  # the pre-existing invocation ($@ is still exactly the config/exclude
+  # tokens assembled above). `cd "$REPO_ROOT" || exit 1` inside the
+  # subshell means a failed cd aborts only that subshell (never the caller's
+  # own shell) with a guaranteed-nonzero exit, so `run_bounded`'s caller sees
+  # a gate FAILURE (never a pass) when REPO_ROOT cannot be entered — fail
+  # closed, matching every other resolution-failure branch in this
+  # function. Variables read by the caller after the call (_SAST_PASS_DETAILS
+  # etc.) are all assigned OUTSIDE the subshell, in the existing if/else
+  # arms below, so the subshell boundary never swallows them.
   if [ -n "$_SAST_BASELINE" ]; then
-    echo "[gates/sast] scoping to diff-introduced findings (baseline-commit=$_SAST_BASELINE)" 1>&2
-    if run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE"; then
+    echo "[gates/sast] scoping to diff-introduced findings (baseline-commit=$_SAST_BASELINE, cwd=$REPO_ROOT)" 1>&2
+    if ( cd "$REPO_ROOT" || exit 1; run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE" ); then
       _SAST_PASS_DETAILS="baseline-commit=$_SAST_BASELINE"
       [ -n "$_SAST_PINNED_CONFIG" ] && _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; config=$_SAST_PINNED_CONFIG"
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
@@ -2512,12 +2533,12 @@ EOF_EXCL
       fi
       _cmd_log_run_checked_pass sast "$_SAST_PASS_DETAILS"
     else
-      cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE (or timed out after ${_SAST_TIMEOUT}s)"
+      cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE (or timed out after ${_SAST_TIMEOUT}s, or REPO_ROOT could not be entered)"
       return 1
     fi
   else
-    echo "[gates/sast] full-tree scan (baseline scoping unavailable: $_SAST_BASELINE_SKIP_REASON)" 1>&2
-    if run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR; then
+    echo "[gates/sast] full-tree scan (baseline scoping unavailable: $_SAST_BASELINE_SKIP_REASON; cwd=$REPO_ROOT)" 1>&2
+    if ( cd "$REPO_ROOT" || exit 1; run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR ); then
       _SAST_PASS_DETAILS="full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"
       [ -n "$_SAST_PINNED_CONFIG" ] && _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; config=$_SAST_PINNED_CONFIG"
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
@@ -2525,7 +2546,7 @@ EOF_EXCL
       fi
       _cmd_log_run_checked_pass sast "$_SAST_PASS_DETAILS"
     else
-      cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON; or timed out after ${_SAST_TIMEOUT}s)"
+      cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON; or timed out after ${_SAST_TIMEOUT}s, or REPO_ROOT could not be entered)"
       return 1
     fi
   fi

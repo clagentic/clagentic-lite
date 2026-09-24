@@ -80,11 +80,18 @@ def _init_repo(root):
                     check=True, cwd=root, env=env)
 
 
-def _run_cmd_sast(project_root, bin_dir, argv_file, extra_env=None):
+def _run_cmd_sast(project_root, bin_dir, argv_file, extra_env=None, cwd=None):
     """Run `sh -c '. gates.sh helper source; cmd_sast'`-equivalent by
     invoking the real gates.sh's `sast` subcommand as a subprocess, with a
     fake semgrep shadowing PATH ahead of the real one, and CLAGENTIC_PROJECT_ROOT
     pointed at project_root.
+
+    cwd defaults to project_root (every pre-existing call site's exact prior
+    behavior, byte-for-byte) -- a caller exercising CWD-independence
+    (lr-51112e, HOLDEN decision on PR #217 needs-decision option 3) passes a
+    DIFFERENT directory here while CLAGENTIC_PROJECT_ROOT still names the
+    real target repo, mirroring test_secrets_branch_scope.py's identical
+    `cwd` parameter added for the sibling gitleaks/osv-scanner fix.
     """
     env = os.environ.copy()
     env["PATH"] = bin_dir + os.pathsep + env["PATH"]
@@ -98,7 +105,7 @@ def _run_cmd_sast(project_root, bin_dir, argv_file, extra_env=None):
     gates_sh = os.path.join(REAL_SCRIPTS_DIR, "gates.sh")
     result = subprocess.run(
         ["sh", gates_sh, "sast"],
-        capture_output=True, text=True, env=env, cwd=project_root,
+        capture_output=True, text=True, env=env, cwd=cwd or project_root,
     )
     return result
 
@@ -648,6 +655,169 @@ class TestRealSemgrepSupportsBaselineFlag(unittest.TestCase):
             ["semgrep", "scan", "--help"], capture_output=True, text=True,
         )
         self.assertIn("--baseline-commit", result.stdout + result.stderr)
+
+
+@unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed")
+class TestSastScanIsCwdIndependent(unittest.TestCase):
+    """Regression pin for lr-51112e (HOLDEN decision, PR #217 needs-decision
+    option 3): both semgrep invocations in cmd_sast now run inside a POSIX
+    subshell that `cd`s to $REPO_ROOT first, so semgrep's --baseline-commit
+    (which shells out to `git cat-file` against the process's OWN CWD, with
+    no override flag of its own) resolves against the real target repo
+    regardless of the CWD gates.sh itself was invoked from -- the same
+    CWD-independence property TestSecretsScanIsCwdIndependent
+    (test_secrets_branch_scope.py) already pins for gitleaks/osv-scanner,
+    via a different mechanism (--source/positional path) since semgrep has
+    neither: a positional REPO_ROOT argument was tried and empirically
+    hard-fails --baseline-commit (exit 2) whenever CWD != REPO_ROOT, and
+    test_no_path_argument_added_in_baseline_mode above requires no trailing
+    path argument in baseline mode at all.
+
+    Exercised against the REAL installed semgrep (not the fake stub the rest
+    of this module uses) since the defect this pins is in semgrep's own CWD-
+    relative git resolution, not in anything cmd_sast's argv construction
+    could fake around. CLAGENTIC_SEMGREP_CONFIG pins a tiny local, offline
+    rule file (no --config=auto network fetch) so this test is fast and
+    deterministic regardless of network availability.
+    """
+
+    _RULE_YAML = textwrap.dedent("""\
+        rules:
+          - id: clagentic-test-eval-usage
+            patterns:
+              - pattern: eval(...)
+            message: "test-only rule: flag eval() calls"
+            languages: [python]
+            severity: ERROR
+    """)
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-sast-cwd-")
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+
+        self._config_path = os.path.join(self._tmp, "rules.yml")
+        with open(self._config_path, "w") as f:
+            f.write(self._RULE_YAML)
+
+        # origin + feature-branch fixture, same shape _init_repo_with_branch_setup
+        # uses elsewhere in this module (not reused directly since this class
+        # needs to control file contents for a real semgrep finding).
+        origin = os.path.join(self._tmp, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", origin], check=True)
+        self._work = os.path.join(self._tmp, "work")
+        subprocess.run(["git", "clone", "-q", origin, self._work], check=True)
+        env = {**os.environ, **_GIT_ENV}
+        readme = os.path.join(self._work, "README")
+        with open(readme, "w") as f:
+            f.write("hello\n")
+        subprocess.run(["git", "add", "README"], check=True, cwd=self._work, env=env)
+        subprocess.run(["git", "commit", "-q", "-m", "initial"], check=True, cwd=self._work, env=env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=self._work, env=env)
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=self._work, env=env)
+
+        # A separate, unrelated directory to invoke gates.sh FROM -- neither
+        # a git repo itself nor an ancestor/descendant of self._work. This is
+        # the exact split a wrapper/`.clagentic-project` layout or a hook
+        # invoked from a subdirectory produces in the field.
+        self._elsewhere = os.path.join(self._tmp, "elsewhere")
+        os.makedirs(self._elsewhere)
+
+    def _run_real_sast(self, cwd, extra_env=None):
+        env = os.environ.copy()
+        env["CLAGENTIC_PROJECT_ROOT"] = self._work
+        env["CLAGENTIC_ALLOW_MISSING_SEMGREP"] = "0"
+        env["CLAGENTIC_SEMGREP_CONFIG"] = self._config_path
+        env["CLAGENTIC_DEFAULT_BRANCH"] = "main"
+        if extra_env:
+            env.update(extra_env)
+        gates_sh = os.path.join(REAL_SCRIPTS_DIR, "gates.sh")
+        return subprocess.run(
+            ["sh", gates_sh, "sast"],
+            capture_output=True, text=True, env=env, cwd=cwd,
+        )
+
+    def test_baseline_branch_still_blocks_when_invoked_from_a_different_cwd(self):
+        """Branch-diff (baseline-commit) path: a finding introduced on the
+        feature branch must still block when gates.sh is invoked from a CWD
+        other than REPO_ROOT -- before this fix, semgrep's --baseline-commit
+        would run `git cat-file` against self._elsewhere (not a git repo at
+        all), which fails outright rather than silently passing, but either
+        way the gate must resolve and block against the REAL target repo,
+        not error out on the invoking CWD."""
+        env = {**os.environ, **_GIT_ENV}
+        leaked = os.path.join(self._work, "bad.py")
+        with open(leaked, "w") as f:
+            f.write("eval(user_input)\n")
+        subprocess.run(["git", "add", "bad.py"], check=True, cwd=self._work, env=env)
+        subprocess.run(["git", "commit", "-q", "-m", "add eval call"], check=True, cwd=self._work, env=env)
+
+        result = self._run_real_sast(cwd=self._elsewhere)
+        self.assertEqual(
+            result.returncode, 1,
+            f"a finding introduced on the feature branch must still block when "
+            f"gates.sh is invoked from a CWD other than REPO_ROOT\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        self.assertIn("scoping to diff-introduced findings", result.stderr)
+        self.assertNotIn("REPO_ROOT could not be entered", result.stderr)
+
+    def test_baseline_branch_still_passes_clean_when_invoked_from_a_different_cwd(self):
+        """Same property, other direction: no finding introduced on the
+        branch must still report a clean pass when invoked from a different
+        CWD -- proving the scan actually reached the real target (and found
+        nothing new) rather than erroring out in a way that happened to also
+        return non-blocking."""
+        result = self._run_real_sast(cwd=self._elsewhere)
+        self.assertEqual(
+            result.returncode, 0,
+            f"a clean feature branch must still pass when gates.sh is invoked "
+            f"from a different CWD\nstdout={result.stdout}\nstderr={result.stderr}",
+        )
+        self.assertIn("scoping to diff-introduced findings", result.stderr)
+
+    def test_full_tree_branch_still_blocks_when_invoked_from_a_different_cwd(self):
+        """Full-tree fallback path (baseline scoping unavailable -- here,
+        detached HEAD): a pre-existing finding must still block when
+        gates.sh is invoked from a CWD other than REPO_ROOT."""
+        leaked = os.path.join(self._work, "bad.py")
+        with open(leaked, "w") as f:
+            f.write("eval(user_input)\n")
+        env = {**os.environ, **_GIT_ENV}
+        subprocess.run(["git", "add", "bad.py"], check=True, cwd=self._work, env=env)
+        subprocess.run(["git", "commit", "-q", "-m", "add eval call"], check=True, cwd=self._work, env=env)
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, capture_output=True,
+            text=True, cwd=self._work,
+        ).stdout.strip()
+        subprocess.run(["git", "checkout", "-q", head_sha], check=True, cwd=self._work, env=env)
+
+        result = self._run_real_sast(cwd=self._elsewhere)
+        self.assertEqual(
+            result.returncode, 1,
+            f"a pre-existing finding must still block the full-tree fallback "
+            f"when gates.sh is invoked from a CWD other than REPO_ROOT\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        self.assertIn("full-tree scan", result.stderr)
+        self.assertNotIn("REPO_ROOT could not be entered", result.stderr)
+
+    def test_full_tree_branch_still_passes_clean_when_invoked_from_a_different_cwd(self):
+        """Same full-tree fallback path, clean-tree direction."""
+        env = {**os.environ, **_GIT_ENV}
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, capture_output=True,
+            text=True, cwd=self._work,
+        ).stdout.strip()
+        subprocess.run(["git", "checkout", "-q", head_sha], check=True, cwd=self._work, env=env)
+
+        result = self._run_real_sast(cwd=self._elsewhere)
+        self.assertEqual(
+            result.returncode, 0,
+            f"a clean tree must still pass the full-tree fallback when "
+            f"gates.sh is invoked from a different CWD\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        self.assertIn("full-tree scan", result.stderr)
 
 
 if __name__ == "__main__":
