@@ -932,6 +932,104 @@ change-scoped pattern scan (internal-bleed):
 | **Override** | None for findings — secrets cannot be committed. Rotate, then re-stage. |
 | **Augment** | `.gitleaks.toml` in repo root extends the default ruleset. Path-scoped allowlists only (see `.gitleaks.toml` comment for why regex allowlists on token literals are dangerous). |
 | **Timeout** | Every gitleaks invocation runs under `run_bounded` (default 300s, configurable via `CLAGENTIC_SECRETS_TIMEOUT_SEC`) — a full branch-history scan can legitimately take longer than a staged-only scan. A timeout counts as a block, same as a real finding. |
+| **Branch-history fetch timeout** | `CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC` (default 30). Bounds the `git fetch`/`git ls-remote` freshness check the branch-history scope below uses to resolve its baseline — expiry falls back to full history, same as any other unverifiable-baseline outcome. |
+
+**Every gitleaks invocation is pinned to `$REPO_ROOT`, never CWD (PEACHES PR
+#217 review, comment 5821185384).** All three `cmd_secrets` call sites
+(branch-history `gitleaks git`, staged `gitleaks git --staged`, and the
+older-gitleaks `gitleaks protect --staged` fallback) used to invoke gitleaks
+with no explicit target at all — gitleaks performs its own repo/source
+discovery from the process's CWD, exactly the class of defect INV-6's `_git
+-C "$REPO_ROOT"` wrapper exists to close for plain `git`. In a
+wrapper/`.clagentic-project` layout, or any invocation whose CWD differs
+from `REPO_ROOT` (a hook invoked from a subdirectory, an orchestrator that
+`cd`s elsewhere before shelling out), gitleaks silently scanned the WRONG
+repo — or a clean, unrelated CWD — while `cmd_secrets` reported whatever
+that unrelated scan found: a false pass on the real target, not an error.
+Both `gitleaks git` and `gitleaks protect` are now pinned via their shared
+`--source`/`-s` Global Flag (`gitleaks protect --help`'s Global Flags
+section, which `gitleaks git` also carries) — confirmed against this
+project's own CI host (gitleaks 8.16) that `protect` has **no** positional
+`[DIRECTORY]` argument at all; an earlier draft of this fix passed a bare
+trailing path token, which gitleaks silently ignored rather than erroring
+on, reproducing the exact false-pass shape this fix exists to close. See
+`scripts/test_secrets_branch_scope.py`'s `TestSecretsScanIsCwdIndependent`
+for the regression coverage, exercised for real against the `gitleaks
+protect --staged` fallback (runnable on any installed gitleaks, no version
+gate) since that is the one call site this project's own CI host can
+exercise without a gitleaks 8.18+ upgrade.
+
+**Branch-history scope (lr-51112e) — scan RANGE, not full history, by default.**
+On a feature branch with a clean index (no staged changes), `cmd_secrets`
+falls back to `gitleaks git`, scanning committed history rather than the
+(empty) staged diff — this catches secrets in already-committed hunks
+`--staged` cannot see. Before this task, that scan ran with no `--log-opts`
+at all, so it walked **every commit reachable from HEAD**, including
+commits that predate the feature branch entirely: a secret already
+committed to the default branch (or committed before secrets scanning was
+even enabled) blocked **every** branch, and the "scanning branch history"
+log line misattributed the finding to the branch under review rather than
+to its true origin. Default scope is now `merge-base(<provably-current
+origin/${CLAGENTIC_DEFAULT_BRANCH}>, HEAD)..HEAD`, passed to gitleaks via
+`--log-opts`, resolved through the same shared, provably-current freshness
+helper `cmd_sast`'s `--baseline-commit` and `cmd_bleed`'s branch-diff
+scoping already use (`_gate_resolve_fresh_default_branch_ref`,
+`scripts/gates.sh`) — reuse, not a third freshness mechanism (see Gate 4c
+and 4d above for that helper's own full rationale). **In-branch history
+still counts**: a secret introduced then later removed earlier on the SAME
+branch is still inside `merge-base..HEAD` and still blocks — `gitleaks git`
+scans full blob history within the given log range, not just the tip tree.
+
+**Opt-in full-history scan.** `scripts/gates.sh secrets --full-scan` or
+`CLAGENTIC_SECRETS_FULL_SCAN=1` forces the pre-lr-51112e full-history
+behavior explicitly. Neither `gates ship` nor `gates pre-push` sets either
+by default — an operator who wants a periodic full-history sweep runs it
+by hand or from a separate, explicitly-scheduled invocation, not as a
+silent default embedded in the normal push path.
+
+**Never silently narrow — only a verified baseline narrows.** Same doctrine
+`cmd_bleed`'s branch-diff scoping and `cmd_sast`'s `--baseline-commit`
+scoping already apply to their own freshness resolution: a baseline that
+cannot be POSITIVELY VERIFIED current — `git fetch` failure or timeout, no
+`origin` remote, a shallow clone with no common ancestor, or `REPO_ROOT` not
+provably the repo `_git` is scoped to — widens to full history instead, with
+an explicit reason on stderr and in the `gate_runs.details` audit column.
+Only a positively-verified fresh baseline ever narrows the scan; every other
+case, including `--full-scan`/`CLAGENTIC_SECRETS_FULL_SCAN=1` themselves,
+preserves fail-closed by scanning **more**, never less.
+
+**Scope+range is named in the log line and audit trail (task requirement).**
+The stderr log line and `gate_runs.details` both state which scope was used
+and, for a branch-diff scope, the exact range and commit count:
+
+- `branch diff <mb7>..<head7> (N commits)` — a verified-fresh baseline
+  narrowed the scan.
+- `full history (--full-scan)` — the `--full-scan` CLI flag was passed.
+- `full history (CLAGENTIC_SECRETS_FULL_SCAN=1)` — only the env var was set,
+  no `--full-scan` flag.
+- `full history (--full-scan, CLAGENTIC_SECRETS_FULL_SCAN=1)` — both were
+  set at once (redundant, not a conflict — named together rather than one
+  silently discarded).
+- `full history (baseline unavailable: <reason>)` — the baseline could not
+  be positively verified current; `<reason>` names the specific cause
+  (`_gate_resolve_fresh_default_branch_ref`'s own stderr message, a failed
+  merge-base resolution, or `REPO_ROOT is not a git repo`).
+
+The flag and the env var are tracked as separate signals internally
+(PEACHES PR #217 review, comment 5820512826) specifically so the audit
+trail never credits a CLI flag nobody passed — a collapsed single boolean
+previously reported every env-only trigger as `(--full-scan)`.
+
+**Unchanged by this task.** The staged-diff path (`gitleaks git --staged
+--pre-commit`, the table above) and the older-gitleaks (pre-8.18)
+`gitleaks protect --staged` fallback are both untouched — neither consults
+the branch-history scope machinery at all. See
+`scripts/test_secrets_branch_scope.py` for the regression coverage (needs
+gitleaks 8.18+ to exercise the `gitleaks git` code path meaningfully; skips
+cleanly on an older installed gitleaks, same posture the version-floor note
+below already documents) and `scripts/test_gates_dispatcher_forwards_args.py`
+for the companion dispatcher-argument-forwarding sweep (see "Dispatcher
+argument forwarding" below).
 
 **Config preflight — fail closed on a rules-less `.gitleaks.toml` (lr-170808).**
 gitleaks' `--config` REPLACES the embedded ruleset, it does not merge with
@@ -1040,6 +1138,24 @@ Linux installs following the obvious install path, and is a standing
 coverage gap the operator should know about once, not rediscover as an
 intermittent-looking gate behavior.
 
+**Dispatcher argument forwarding (lr-51112e).** `scripts/gates.sh`'s own
+trailing `case "${1:-}" in ... esac` dispatch block is the single place that
+turns `gates.sh <subcommand> [args...]` into a call to the matching `cmd_X`
+function. Every arm that accepts arguments must `shift; cmd_X "$@"` — a bare
+`cmd_X` with no `shift`/`"$@"` silently drops every argument after the
+subcommand name before `cmd_X` ever sees them. This exact shape was found on
+`secrets` (this task's own field report — `--full-scan` would have been
+silently swallowed at the dispatcher) and, on inspection, also on
+`init`/`deps`/`sast`/`ship`/`pre-push`/`digest` — a recurring defect class,
+not a one-off typo (the same shape had already been fixed once before, for
+`adversarial`). All seven were normalized to `shift; cmd_X "$@"`, and
+`scripts/test_gates_dispatcher_forwards_args.py` sweeps every dispatcher
+case arm mechanically — both a static check anchored to the real dispatcher
+source text (so it can never silently drift from what ships) and a runtime
+check that a trailing flag does not confuse dispatch — so a future
+subcommand added with the same argument-dropping shape is caught here
+rather than rediscovered by a user whose flag silently did nothing.
+
 ### 4b. Dependencies (pre-push)
 
 | | |
@@ -1061,6 +1177,31 @@ intermittent-looking gate behavior.
 | **Missing tool** | Set `CLAGENTIC_ALLOW_MISSING_SEMGREP=1` if semgrep is not installed locally. |
 | **Baseline fetch timeout** | `CLAGENTIC_SAST_FETCH_TIMEOUT_SEC` (default 30). Bounds both the `git fetch` and the `git ls-remote` freshness check used to resolve the baseline commit (see below) — expiry falls back to full-tree, same as any other resolution failure. |
 | **Scan timeout** | Every semgrep invocation runs under `run_bounded` (default 300s, configurable via `CLAGENTIC_SAST_TIMEOUT_SEC`) — `--config=auto` downloads rules over the network on top of running the scan itself. A timeout counts as a block, same as an ERROR-severity finding. |
+
+**Every semgrep invocation runs with CWD pinned to `$REPO_ROOT` (lr-51112e,
+HOLDEN decision on PR #217 needs-decision option 3).** Unlike gitleaks and
+osv-scanner (Gate 4a/4b), which are pinned via an explicit `--source`/
+positional target argument, semgrep has no such flag for this: its
+`--baseline-commit` support shells out to `git cat-file` against the
+process's own CWD, with no override. AMoS's own PR #217 investigation
+established empirically that appending `$REPO_ROOT` as a positional target
+argument does NOT work around this — it hard-fails (`exit 2`) whenever CWD
+differs from `REPO_ROOT`, and a positional path argument in baseline mode is
+independently forbidden by `test_no_path_argument_added_in_baseline_mode`
+(`scripts/test_sast_baseline_scope.py`): semgrep must still walk (and apply
+`.semgrepignore` to) the whole tree, with `--baseline-commit` only narrowing
+which findings are *reported*, not what gets scanned. Both `cmd_sast`
+invocations (baseline-commit and full-tree fallback) therefore run inside a
+POSIX subshell that `cd`s to `$REPO_ROOT` first — `( cd "$REPO_ROOT" ||
+exit 1; run_bounded ... semgrep ... )` — leaving argv byte-identical to the
+pre-existing invocation. A `cd` failure aborts only that subshell with a
+guaranteed-nonzero exit, so a `REPO_ROOT` that cannot be entered is reported
+as a gate BLOCK, never a silent pass — fail-closed, matching every other
+resolution-failure branch this gate already has. See
+`scripts/test_sast_baseline_scope.py`'s `TestSastScanIsCwdIndependent` for
+the regression coverage, exercised against the real installed semgrep (not
+the fake stub the rest of that module uses) across both the baseline and
+full-tree branches, invoked from a CWD other than `REPO_ROOT`.
 
 **Rule-exclude ladder (lr-321e18).** `cmd_sast` had zero repo-side override
 surface for a single unsatisfiable registry rule — one false-positive
@@ -1358,7 +1499,7 @@ See lr-3b06b1 (open, tracked separately) for whether `issue_class`/`class_fix` o
 2. Otherwise, the current branch's diff against `origin/${CLAGENTIC_DEFAULT_BRANCH}` (default `main`), when a usable branch baseline exists (not detached HEAD, not on the default branch itself) **and** that ref can be shown to be provably current (see "Branch-diff freshness" below).
 3. Otherwise (fresh repo, no staged changes, no usable branch baseline, or a branch baseline that could not be verified current), full tree — this is the fallback path, not the default.
 
-**This is NOT the same fallback `cmd_secrets` uses.** `cmd_secrets`' feature-branch fallback (Gate 4a's `gitleaks git` history scan) runs over the current branch's local commit *history* — it never resolves or diffs against a remote ref at all. Step 2 above instead resolves `origin/<default-branch>` and diffs the file set against it, which is the same shape as `cmd_sast`'s `--baseline-commit`/merge-base mechanism above, not `cmd_secrets`' history scan.
+**This is NOT the same fallback `cmd_secrets` uses, but it now shares the same freshness mechanism (lr-51112e).** `cmd_secrets`' feature-branch fallback (Gate 4a's `gitleaks git` history scan) still runs over the current branch's own commit *history*, not a diffed file set — it passes `gitleaks git` a `--log-opts=<merge-base>..HEAD` commit range rather than resolving a changed-file list. But as of lr-51112e it DOES resolve and diff against a remote ref to establish that range: it calls the same `_gate_resolve_fresh_default_branch_ref` helper this step and `cmd_sast`'s `--baseline-commit` both use, then takes `git merge-base` against the verified-fresh tip, scoping the history scan to `merge-base..HEAD` instead of walking every commit reachable from HEAD. Step 2 above resolves `origin/<default-branch>` and diffs the *file set* against it (same shape as `cmd_sast`'s `--baseline-commit`/merge-base mechanism); `cmd_secrets` resolves the same fresh ref but scopes a *commit-range history scan*, not a file diff — same freshness precondition, different consumer.
 
 **Branch-diff freshness.** Step 2's `origin/<default-branch>` resolution shares the exact freshness precondition `cmd_sast` uses (`_gate_resolve_fresh_default_branch_ref` in `scripts/gates.sh`, extracted as the common helper both gates call): a bare `git rev-parse --verify` proves only that a local tracking ref *exists*, not that it is *current*. A present-but-stale ref is a successful-looking wrong resolution — it exits 0 and produces a plausible file set — so on a long-lived clone fetched once and never refreshed, a bleed pattern committed to the default branch afterward would be invisible to a scope trusting that stale ref, and the gate would report an authoritative-looking clean pass. The fix: `git fetch origin <default-branch>` under a timeout (`CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC`, default 30s, mirroring `CLAGENTIC_SAST_FETCH_TIMEOUT_SEC`), trusted only when it exits 0 *and* the resulting local tip matches an independent `git ls-remote origin <default-branch>` read taken in the same run. On a stale-or-unverifiable baseline the gate fails toward **more** coverage, never less — it falls back to the full-tree scan (step 3), exactly like `cmd_sast`. Narrowing to the branch diff requires a positively-verified fresh baseline; see "Freshness is a precondition, not an assumption" above for the full rationale (security review, lr-caebc5 follow-up to lr-06b87e).
 

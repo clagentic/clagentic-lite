@@ -246,6 +246,25 @@ CLAGENTIC_ALLOW_MISSING_GITLEAKS=0
 CLAGENTIC_ALLOW_MISSING_OSV=0
 CLAGENTIC_ALLOW_MISSING_SEMGREP=0
 
+# Secrets gate (lr-51112e): opt-in full-history scan. On a feature branch
+# with a clean index, cmd_secrets defaults to scanning only
+# merge-base(<default-branch>, HEAD)..HEAD via gitleaks' --log-opts, not the
+# entire history reachable from HEAD -- see docs/GATES.md Gate 4a "Branch-
+# history scope". Set =1 to force the pre-lr-51112e full-history behavior on
+# every run (same effect as passing `gates.sh secrets --full-scan`). Neither
+# `gates ship` nor `gates pre-push` sets this by default.
+# CLAGENTIC_SECRETS_FULL_SCAN=0
+
+# Secrets branch-scope freshness check timeout (seconds). Bounds both the
+# `git fetch origin <default-branch>` and the `git ls-remote` freshness
+# check cmd_secrets uses to resolve a trustworthy merge-base for its
+# branch-history scan range (lr-51112e; mirrors CLAGENTIC_SAST_FETCH_TIMEOUT_SEC
+# below). Expiry is treated identically to a fetch failure: falls back to a
+# full-history gitleaks scan, which still blocks on findings -- never a
+# silently narrowed scan. An unreachable remote (offline/air-gapped) always
+# falls back to full history regardless of this value.
+CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC=30
+
 # SAST baseline-scoping fetch/freshness timeout (seconds). Bounds both the
 # `git fetch origin <default-branch>` and the `git ls-remote` freshness
 # check cmd_sast uses to resolve a trustworthy --baseline-commit (lr-06b87e).
