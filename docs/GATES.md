@@ -932,6 +932,69 @@ change-scoped pattern scan (internal-bleed):
 | **Override** | None for findings — secrets cannot be committed. Rotate, then re-stage. |
 | **Augment** | `.gitleaks.toml` in repo root extends the default ruleset. Path-scoped allowlists only (see `.gitleaks.toml` comment for why regex allowlists on token literals are dangerous). |
 | **Timeout** | Every gitleaks invocation runs under `run_bounded` (default 300s, configurable via `CLAGENTIC_SECRETS_TIMEOUT_SEC`) — a full branch-history scan can legitimately take longer than a staged-only scan. A timeout counts as a block, same as a real finding. |
+| **Branch-history fetch timeout** | `CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC` (default 30). Bounds the `git fetch`/`git ls-remote` freshness check the branch-history scope below uses to resolve its baseline — expiry falls back to full history, same as any other unverifiable-baseline outcome. |
+
+**Branch-history scope (lr-51112e) — scan RANGE, not full history, by default.**
+On a feature branch with a clean index (no staged changes), `cmd_secrets`
+falls back to `gitleaks git`, scanning committed history rather than the
+(empty) staged diff — this catches secrets in already-committed hunks
+`--staged` cannot see. Before this task, that scan ran with no `--log-opts`
+at all, so it walked **every commit reachable from HEAD**, including
+commits that predate the feature branch entirely: a secret already
+committed to the default branch (or committed before secrets scanning was
+even enabled) blocked **every** branch, and the "scanning branch history"
+log line misattributed the finding to the branch under review rather than
+to its true origin. Default scope is now `merge-base(<provably-current
+origin/${CLAGENTIC_DEFAULT_BRANCH}>, HEAD)..HEAD`, passed to gitleaks via
+`--log-opts`, resolved through the same shared, provably-current freshness
+helper `cmd_sast`'s `--baseline-commit` and `cmd_bleed`'s branch-diff
+scoping already use (`_gate_resolve_fresh_default_branch_ref`,
+`scripts/gates.sh`) — reuse, not a third freshness mechanism (see Gate 4c
+and 4d above for that helper's own full rationale). **In-branch history
+still counts**: a secret introduced then later removed earlier on the SAME
+branch is still inside `merge-base..HEAD` and still blocks — `gitleaks git`
+scans full blob history within the given log range, not just the tip tree.
+
+**Opt-in full-history scan.** `scripts/gates.sh secrets --full-scan` or
+`CLAGENTIC_SECRETS_FULL_SCAN=1` forces the pre-lr-51112e full-history
+behavior explicitly. Neither `gates ship` nor `gates pre-push` sets either
+by default — an operator who wants a periodic full-history sweep runs it
+by hand or from a separate, explicitly-scheduled invocation, not as a
+silent default embedded in the normal push path.
+
+**Never silently narrow — only a verified baseline narrows.** Same doctrine
+`cmd_bleed`'s branch-diff scoping and `cmd_sast`'s `--baseline-commit`
+scoping already apply to their own freshness resolution: a baseline that
+cannot be POSITIVELY VERIFIED current — `git fetch` failure or timeout, no
+`origin` remote, a shallow clone with no common ancestor, or `REPO_ROOT` not
+provably the repo `_git` is scoped to — widens to full history instead, with
+an explicit reason on stderr and in the `gate_runs.details` audit column.
+Only a positively-verified fresh baseline ever narrows the scan; every other
+case, including `--full-scan`/`CLAGENTIC_SECRETS_FULL_SCAN=1` themselves,
+preserves fail-closed by scanning **more**, never less.
+
+**Scope+range is named in the log line and audit trail (task requirement).**
+The stderr log line and `gate_runs.details` both state which scope was used
+and, for a branch-diff scope, the exact range and commit count:
+
+- `branch diff <mb7>..<head7> (N commits)` — a verified-fresh baseline
+  narrowed the scan.
+- `full history (--full-scan)` — the explicit opt-in flag or env var was set.
+- `full history (baseline unavailable: <reason>)` — the baseline could not
+  be positively verified current; `<reason>` names the specific cause
+  (`_gate_resolve_fresh_default_branch_ref`'s own stderr message, a failed
+  merge-base resolution, or `REPO_ROOT is not a git repo`).
+
+**Unchanged by this task.** The staged-diff path (`gitleaks git --staged
+--pre-commit`, the table above) and the older-gitleaks (pre-8.18)
+`gitleaks protect --staged` fallback are both untouched — neither consults
+the branch-history scope machinery at all. See
+`scripts/test_secrets_branch_scope.py` for the regression coverage (needs
+gitleaks 8.18+ to exercise the `gitleaks git` code path meaningfully; skips
+cleanly on an older installed gitleaks, same posture the version-floor note
+below already documents) and `scripts/test_gates_dispatcher_forwards_args.py`
+for the companion dispatcher-argument-forwarding sweep (see "Dispatcher
+argument forwarding" below).
 
 **Config preflight — fail closed on a rules-less `.gitleaks.toml` (lr-170808).**
 gitleaks' `--config` REPLACES the embedded ruleset, it does not merge with
@@ -1039,6 +1102,24 @@ gitleaks` currently installs 8.16.0, below both floors — this affects most
 Linux installs following the obvious install path, and is a standing
 coverage gap the operator should know about once, not rediscover as an
 intermittent-looking gate behavior.
+
+**Dispatcher argument forwarding (lr-51112e).** `scripts/gates.sh`'s own
+trailing `case "${1:-}" in ... esac` dispatch block is the single place that
+turns `gates.sh <subcommand> [args...]` into a call to the matching `cmd_X`
+function. Every arm that accepts arguments must `shift; cmd_X "$@"` — a bare
+`cmd_X` with no `shift`/`"$@"` silently drops every argument after the
+subcommand name before `cmd_X` ever sees them. This exact shape was found on
+`secrets` (this task's own field report — `--full-scan` would have been
+silently swallowed at the dispatcher) and, on inspection, also on
+`init`/`deps`/`sast`/`ship`/`pre-push`/`digest` — a recurring defect class,
+not a one-off typo (the same shape had already been fixed once before, for
+`adversarial`). All seven were normalized to `shift; cmd_X "$@"`, and
+`scripts/test_gates_dispatcher_forwards_args.py` sweeps every dispatcher
+case arm mechanically — both a static check anchored to the real dispatcher
+source text (so it can never silently drift from what ships) and a runtime
+check that a trailing flag does not confuse dispatch — so a future
+subcommand added with the same argument-dropping shape is caught here
+rather than rediscovered by a user whose flag silently did nothing.
 
 ### 4b. Dependencies (pre-push)
 
