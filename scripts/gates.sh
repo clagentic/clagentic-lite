@@ -5,7 +5,10 @@
 # Subcommands:
 #   init             create audit schema
 #   bleed            scan committed files for internal/private string bleed
-#   secrets          run gitleaks on staged hunks; branch history scan when no staged changes
+#   secrets          run gitleaks on staged hunks; branch-diff scan (scoped
+#                    to merge-base(default-branch, HEAD)..HEAD) when no
+#                    staged changes; --full-scan / CLAGENTIC_SECRETS_FULL_SCAN=1
+#                    opts into the full-history scan
 #   deps             run osv-scanner (pre-push)
 #   sast             run semgrep (pre-push)
 #   review           run cross-vendor review on staged diff; branch diff when no staged changes
@@ -1361,6 +1364,32 @@ except Exception:
 }
 
 cmd_secrets() {
+  # FULL-SCAN OPT-IN (lr-51112e): --full-scan or CLAGENTIC_SECRETS_FULL_SCAN=1
+  # forces the branch-history path (below) to walk the entire history
+  # reachable from HEAD, the pre-lr-51112e default. Neither `gates ship` nor
+  # `gates pre-push` sets either by default — see cmd_ship's own call site.
+  #
+  # TRIGGER SOURCE (PEACHES PR #217 review, comment 5820512826): the flag and
+  # the env var are tracked in SEPARATE booleans, not collapsed into one —
+  # _SECRETS_FULL_SCAN alone cannot tell the audit trail (cmd_log_run
+  # detail, AGENTS.md rule 7 audit-first) which one actually fired, and a
+  # collapsed boolean previously reported every env-only trigger as
+  # "(--full-scan)", falsely claiming a CLI flag was supplied. Both can be
+  # true at once (redundant, not a conflict); when they are, the reason
+  # string names both rather than picking one arbitrarily.
+  _SECRETS_FULL_SCAN_FLAG=0
+  for _secrets_arg in "$@"; do
+    case "$_secrets_arg" in
+      --full-scan) _SECRETS_FULL_SCAN_FLAG=1 ;;
+    esac
+  done
+  _SECRETS_FULL_SCAN_ENV=0
+  [ "${CLAGENTIC_SECRETS_FULL_SCAN:-0}" = "1" ] && _SECRETS_FULL_SCAN_ENV=1
+  _SECRETS_FULL_SCAN=0
+  if [ "$_SECRETS_FULL_SCAN_FLAG" = "1" ] || [ "$_SECRETS_FULL_SCAN_ENV" = "1" ]; then
+    _SECRETS_FULL_SCAN=1
+  fi
+
   if ! command -v gitleaks >/dev/null 2>&1; then
     # FAIL CLOSED. AGENTS.md §4 contract: local tools own the security gate.
     # If the tool is missing, the gate is offline — the only honest outcome
@@ -1454,17 +1483,115 @@ cmd_secrets() {
       # No staged changes on a feature branch — scan the branch's committed
       # history rather than the (empty) index. This catches secrets in
       # already-committed hunks that would otherwise be invisible to --staged.
-      printf '[gates/secrets] no staged changes — scanning branch history with gitleaks git\n' 1>&2
-      # shellcheck disable=SC2086
-      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --redact --no-banner $CFG_ARG; then
-        cmd_log_run secrets pass "branch history scan (no staged changes)"
+      #
+      # SCOPE (lr-51112e): this used to run `gitleaks git` with no
+      # --log-opts at all, which walks EVERY commit reachable from HEAD —
+      # including commits that predate the feature branch entirely. Any
+      # finding already present on the default branch then blocked EVERY
+      # branch, and the "scanning branch history" log line misattributed
+      # the finding to the branch under review. Default scope is now
+      # merge-base(<provably-current default-branch ref>, HEAD)..HEAD via
+      # --log-opts, the same PROVABLY-CURRENT freshness precondition
+      # cmd_sast's --baseline-commit and cmd_bleed's branch-diff scoping
+      # both already use (_gate_resolve_fresh_default_branch_ref) — reuse,
+      # not a third freshness mechanism. In-branch history still counts: a
+      # secret introduced then removed earlier on THIS branch is still
+      # inside merge-base..HEAD and still blocks (`gitleaks git` scans full
+      # blob history within the given log range, not just the tip tree).
+      #
+      # NEVER SILENTLY NARROW (task requirement 3 — same doctrine cmd_bleed
+      # and cmd_sast already apply to their own freshness resolution): a
+      # baseline that cannot be POSITIVELY VERIFIED current — fetch
+      # failure/timeout, no remote, shallow clone with no common ancestor,
+      # REPO_ROOT not provably the repo being consulted — widens to full
+      # history instead, with an explicit reason on stderr and in the audit
+      # details. Only a verified-fresh baseline narrows; every other case
+      # (including --full-scan / CLAGENTIC_SECRETS_FULL_SCAN=1) preserves
+      # fail-closed by scanning MORE, never less.
+      _SECRETS_LOG_OPTS=""
+      _SECRETS_SCOPE_REASON=""
+      if [ "$_SECRETS_FULL_SCAN" = "1" ]; then
+        # Preserve WHICH trigger actually fired (PEACHES PR #217 review,
+        # comment 5820512826) rather than always crediting the CLI flag —
+        # an env-only trigger claiming "(--full-scan)" in the audit trail
+        # would misattribute the cause to a flag nobody passed. Both can be
+        # set at once; name both rather than picking one arbitrarily.
+        if [ "$_SECRETS_FULL_SCAN_FLAG" = "1" ] && [ "$_SECRETS_FULL_SCAN_ENV" = "1" ]; then
+          _SECRETS_SCOPE_REASON="full history (--full-scan, CLAGENTIC_SECRETS_FULL_SCAN=1)"
+        elif [ "$_SECRETS_FULL_SCAN_FLAG" = "1" ]; then
+          _SECRETS_SCOPE_REASON="full history (--full-scan)"
+        else
+          _SECRETS_SCOPE_REASON="full history (CLAGENTIC_SECRETS_FULL_SCAN=1)"
+        fi
+      elif ! _git_repo_root_is_scoped; then
+        _SECRETS_SCOPE_REASON="full history (baseline unavailable: REPO_ROOT is not a git repo)"
       else
-        cmd_log_run secrets block "gitleaks reported findings or timed out after ${_SECRETS_TIMEOUT}s (branch history scan)"
+        _SECRETS_FETCH_TIMEOUT="${CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC:-30}"
+        _SECRETS_FETCH_TIMEOUT=$(ds_positive_int_or_default "$_SECRETS_FETCH_TIMEOUT" 30)
+
+        _SECRETS_FRESH_ERR_TMP=$(mktemp -t clagentic-secrets-fresh-err.XXXXXX)
+        _SECRETS_FRESH_TIP=$(_gate_resolve_fresh_default_branch_ref "$_SECRETS_DEFAULT_BRANCH" "$_SECRETS_FETCH_TIMEOUT" 2>"$_SECRETS_FRESH_ERR_TMP") || true
+        _SECRETS_FRESH_ERR=$(cat "$_SECRETS_FRESH_ERR_TMP" 2>/dev/null || echo "")
+        rm -f "$_SECRETS_FRESH_ERR_TMP"
+
+        if [ -z "$_SECRETS_FRESH_TIP" ]; then
+          _SECRETS_SCOPE_REASON="full history (baseline unavailable: $_SECRETS_FRESH_ERR)"
+        else
+          # Merge-base off the verified-fresh SHA itself (matches cmd_sast's
+          # and cmd_bleed's own use of their verified tip) — re-resolving
+          # "origin/${_SECRETS_DEFAULT_BRANCH}" by name here would discard
+          # that proof and reopen the TOCTOU gap
+          # _gate_resolve_fresh_default_branch_ref exists to close.
+          _SECRETS_MERGE_BASE=$(_git merge-base "$_SECRETS_FRESH_TIP" HEAD 2>/dev/null || echo "")
+          if [ -z "$_SECRETS_MERGE_BASE" ]; then
+            _SECRETS_SCOPE_REASON="full history (baseline unavailable: merge-base resolution failed — shallow clone with base not fetched, or unrelated histories)"
+          else
+            _SECRETS_MB_SHORT=$(printf '%.7s' "$_SECRETS_MERGE_BASE")
+            _SECRETS_HEAD_SHORT=$(_git rev-parse --short=7 HEAD 2>/dev/null || echo "HEAD")
+            _SECRETS_RANGE_COUNT=$(_git rev-list --count "${_SECRETS_MERGE_BASE}..HEAD" 2>/dev/null || echo "?")
+            _SECRETS_LOG_OPTS="--log-opts=${_SECRETS_MERGE_BASE}..HEAD"
+            _SECRETS_SCOPE_REASON="branch diff ${_SECRETS_MB_SHORT}..${_SECRETS_HEAD_SHORT} (${_SECRETS_RANGE_COUNT} commits)"
+          fi
+        fi
+      fi
+
+      printf '[gates/secrets] no staged changes — scanning %s with gitleaks git\n' "$_SECRETS_SCOPE_REASON" 1>&2
+      # REPO_ROOT PINNED EXPLICITLY (PEACHES PR #217 review, comment
+      # 5821185384): `gitleaks git` performs its OWN git repo discovery from
+      # the process's CWD, exactly the class of defect INV-6's `_git`
+      # wrapper (:85-89 above) exists to close for plain `git` -- with no
+      # explicit target, a caller whose CWD differs from REPO_ROOT (a
+      # wrapper/`.clagentic-project` layout, or a hook invoked from a
+      # subdirectory) has gitleaks silently scan the WRONG repo (or the
+      # wrapper's own non-repo CWD) while this gate reports whatever that
+      # unrelated scan found -- a false pass on the real target, not an
+      # error. Pinned via `--source`/`-s` (verified against this host's
+      # installed gitleaks, 8.16 -- a Global Flag shared by every
+      # subcommand's own --help, including `detect`/`protect`; `gitleaks
+      # git` needs 8.18+ and could not be probed directly on this host, but
+      # Global Flags apply uniformly across subcommands in this CLI, and
+      # `--source` is the one form confirmed NOT to be silently ignored --
+      # see the sibling fix on the `protect` fallback below, where a bare
+      # trailing positional WAS silently ignored, not an error, the exact
+      # false-pass shape this fix exists to close). This makes the scanned
+      # repo explicit and CWD-independent, the same property `_git -C
+      # "$REPO_ROOT"` already guarantees for every plain git call in this
+      # file.
+      # shellcheck disable=SC2086
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --redact --no-banner $CFG_ARG $_SECRETS_LOG_OPTS --source "$REPO_ROOT"; then
+        # Runtime-assembled details string (lr-2e8444): route through the
+        # checked helper, same as cmd_bleed's own $_BLEED_SCOPE_REASON pass
+        # sites, so a scope-reason string that happens to contain a failure
+        # word (e.g. "baseline unavailable") never logs as a silent "pass".
+        _cmd_log_run_checked_pass secrets "$_SECRETS_SCOPE_REASON (no staged changes)"
+      else
+        cmd_log_run secrets block "gitleaks reported findings or timed out after ${_SECRETS_TIMEOUT}s ($_SECRETS_SCOPE_REASON)"
         return 1
       fi
     else
+      # REPO_ROOT PINNED EXPLICITLY: same CWD-independence fix as above.
       # shellcheck disable=SC2086
-      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG --source "$REPO_ROOT"; then
         cmd_log_run secrets pass ""
       else
         cmd_log_run secrets block "gitleaks reported findings or timed out after ${_SECRETS_TIMEOUT}s"
@@ -1478,8 +1605,17 @@ cmd_secrets() {
       printf '[gates/secrets] no staged changes on feature branch — older gitleaks cannot scan history; skipping staged scan\n' 1>&2
       cmd_log_run secrets warn "older gitleaks; no staged changes on feature branch (history scan unavailable)"
     else
+      # REPO_ROOT PINNED EXPLICITLY: gitleaks' older `protect` subcommand has
+      # the same repo-discovery-from-CWD default as `git` above ("path to
+      # source (default: $PWD)", per `gitleaks protect --help`), but unlike
+      # `git` it has NO positional [DIRECTORY] argument at all -- confirmed
+      # against the real installed binary (`gitleaks protect --help`
+      # advertises zero positional args; a trailing bare token is silently
+      # ignored, not an error, which is exactly the false-pass shape this
+      # fix exists to close). The correct pin for `protect` is its own
+      # `--source`/`-s` flag.
       # shellcheck disable=SC2086
-      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks protect --staged --redact --no-banner $CFG_ARG; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks protect --staged --redact --no-banner $CFG_ARG --source "$REPO_ROOT"; then
         cmd_log_run secrets pass ""
       else
         cmd_log_run secrets block "gitleaks reported findings or timed out after ${_SECRETS_TIMEOUT}s"
@@ -1878,11 +2014,19 @@ cmd_bleed() {
   #
   # NOT the same fallback cmd_secrets uses (BOBBIE, lr-caebc5 follow-up):
   # cmd_secrets' feature-branch fallback (:110-134) scans local branch
-  # HISTORY and never diffs against a remote ref. The branch-diff step here
-  # instead resolves and diffs against origin/<default-branch> — the same
+  # HISTORY within a merge-base..HEAD commit RANGE, not a diffed file set.
+  # UPDATED (lr-51112e, PEACHES PR #217 review): cmd_secrets now DOES
+  # resolve and diff against a remote ref -- it calls the same
+  # _gate_resolve_fresh_default_branch_ref helper this function uses, then
+  # takes git merge-base against the verified-fresh tip to scope its
+  # --log-opts range. The distinction from this function's own branch-diff
+  # step is the CONSUMER, not remote-ref usage: this function resolves
+  # origin/<default-branch> and diffs a FILE SET against it -- the same
   # shape as cmd_sast's --baseline-commit mechanism (:588), including its
   # freshness precondition (_gate_resolve_fresh_default_branch_ref, :88).
-  # See docs/GATES.md Gate 4d for the full writeup.
+  # cmd_secrets resolves the identical fresh ref but scopes a commit-range
+  # HISTORY scan, not a file diff. See docs/GATES.md Gate 4d for the full
+  # writeup.
   _BLEED_FULL_SCAN=0
   for _bleed_arg in "$@"; do
     case "$_bleed_arg" in
@@ -1990,9 +2134,13 @@ cmd_bleed() {
         #
         # NOTE ON PARITY: this is NOT "the same fallback cmd_secrets uses"
         # (cmd_secrets' feature-branch fallback, :110-116, scans local
-        # branch HISTORY and never diffs against a remote ref at all). The
-        # actual precedent for a remote-ref-diff scope is cmd_sast's
-        # baseline-commit mechanism (:588-663) — see docs/GATES.md.
+        # branch HISTORY within a commit RANGE, not a diffed file set). As
+        # of lr-51112e cmd_secrets DOES resolve a remote ref via the same
+        # _gate_resolve_fresh_default_branch_ref helper -- the distinction
+        # is the consumer (a --log-opts commit range vs. this function's
+        # diffed file set), not remote-ref usage. The actual precedent for
+        # a remote-ref-diffed FILE SET scope is cmd_sast's baseline-commit
+        # mechanism (:588-663) — see docs/GATES.md.
         _BLEED_FETCH_TIMEOUT="${CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC:-30}"
         _BLEED_FETCH_TIMEOUT=$(ds_positive_int_or_default "$_BLEED_FETCH_TIMEOUT" 30)
 
@@ -8273,11 +8421,11 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
   fi
 
   case "${1:-}" in
-    init)           cmd_init ;;
+    init)           shift; cmd_init "$@" ;;
     bleed)          shift; cmd_bleed "$@" ;;
-    secrets)        cmd_secrets ;;
-    deps)           cmd_deps ;;
-    sast)           cmd_sast ;;
+    secrets)        shift; cmd_secrets "$@" ;;
+    deps)           shift; cmd_deps "$@" ;;
+    sast)           shift; cmd_sast "$@" ;;
     review)         shift; cmd_review "$@" ;;
     adversarial)    shift; cmd_adversarial "$@" ;;
     merge-gate)     shift; cmd_merge_gate "$@" ;;
@@ -8285,13 +8433,13 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
     render-manifest) shift; cmd_render_manifest "$@" ;;
     deferrals-lint) shift; cmd_deferrals_lint "$@" ;;
     audit-vocab-lint) shift; cmd_audit_vocab_lint "$@" ;;
-    ship)           cmd_ship ;;
-    pre-push)       cmd_pre_push ;;
+    ship)           shift; cmd_ship "$@" ;;
+    pre-push)       shift; cmd_pre_push "$@" ;;
     log-run)        shift; cmd_log_run "$@" ;;
-    digest)         cmd_digest ;;
+    digest)         shift; cmd_digest "$@" ;;
     status)         shift; cmd_status "$@" ;;
     tail)           shift; cmd_tail "$@" ;;
-    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial [--full-review]|merge-gate [--recheck]|render-review|render-manifest [FILE]|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets [--full-scan]|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial [--full-review]|merge-gate [--recheck]|render-review|render-manifest [FILE]|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
   esac
 elif [ -z "${CLAGENTIC_GATES_DELIBERATE_SOURCE:-}" ]; then
   echo "gates.sh: CLAGENTIC_GATES_SOURCE_ONLY is set but CLAGENTIC_GATES_DELIBERATE_SOURCE is not -- dispatch suppressed with no provenance asserting deliberate sourcing, refusing to report a false pass. If dot-sourcing this file on purpose, set both variables. If you did not mean to set CLAGENTIC_GATES_SOURCE_ONLY, unset it." 1>&2
