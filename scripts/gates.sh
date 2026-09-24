@@ -1556,8 +1556,29 @@ cmd_secrets() {
       fi
 
       printf '[gates/secrets] no staged changes — scanning %s with gitleaks git\n' "$_SECRETS_SCOPE_REASON" 1>&2
+      # REPO_ROOT PINNED EXPLICITLY (PEACHES PR #217 review, comment
+      # 5821185384): `gitleaks git` performs its OWN git repo discovery from
+      # the process's CWD, exactly the class of defect INV-6's `_git`
+      # wrapper (:85-89 above) exists to close for plain `git` -- with no
+      # explicit target, a caller whose CWD differs from REPO_ROOT (a
+      # wrapper/`.clagentic-project` layout, or a hook invoked from a
+      # subdirectory) has gitleaks silently scan the WRONG repo (or the
+      # wrapper's own non-repo CWD) while this gate reports whatever that
+      # unrelated scan found -- a false pass on the real target, not an
+      # error. Pinned via `--source`/`-s` (verified against this host's
+      # installed gitleaks, 8.16 -- a Global Flag shared by every
+      # subcommand's own --help, including `detect`/`protect`; `gitleaks
+      # git` needs 8.18+ and could not be probed directly on this host, but
+      # Global Flags apply uniformly across subcommands in this CLI, and
+      # `--source` is the one form confirmed NOT to be silently ignored --
+      # see the sibling fix on the `protect` fallback below, where a bare
+      # trailing positional WAS silently ignored, not an error, the exact
+      # false-pass shape this fix exists to close). This makes the scanned
+      # repo explicit and CWD-independent, the same property `_git -C
+      # "$REPO_ROOT"` already guarantees for every plain git call in this
+      # file.
       # shellcheck disable=SC2086
-      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --redact --no-banner $CFG_ARG $_SECRETS_LOG_OPTS; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --redact --no-banner $CFG_ARG $_SECRETS_LOG_OPTS --source "$REPO_ROOT"; then
         # Runtime-assembled details string (lr-2e8444): route through the
         # checked helper, same as cmd_bleed's own $_BLEED_SCOPE_REASON pass
         # sites, so a scope-reason string that happens to contain a failure
@@ -1568,8 +1589,9 @@ cmd_secrets() {
         return 1
       fi
     else
+      # REPO_ROOT PINNED EXPLICITLY: same CWD-independence fix as above.
       # shellcheck disable=SC2086
-      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG --source "$REPO_ROOT"; then
         cmd_log_run secrets pass ""
       else
         cmd_log_run secrets block "gitleaks reported findings or timed out after ${_SECRETS_TIMEOUT}s"
@@ -1583,8 +1605,17 @@ cmd_secrets() {
       printf '[gates/secrets] no staged changes on feature branch — older gitleaks cannot scan history; skipping staged scan\n' 1>&2
       cmd_log_run secrets warn "older gitleaks; no staged changes on feature branch (history scan unavailable)"
     else
+      # REPO_ROOT PINNED EXPLICITLY: gitleaks' older `protect` subcommand has
+      # the same repo-discovery-from-CWD default as `git` above ("path to
+      # source (default: $PWD)", per `gitleaks protect --help`), but unlike
+      # `git` it has NO positional [DIRECTORY] argument at all -- confirmed
+      # against the real installed binary (`gitleaks protect --help`
+      # advertises zero positional args; a trailing bare token is silently
+      # ignored, not an error, which is exactly the false-pass shape this
+      # fix exists to close). The correct pin for `protect` is its own
+      # `--source`/`-s` flag.
       # shellcheck disable=SC2086
-      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks protect --staged --redact --no-banner $CFG_ARG; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks protect --staged --redact --no-banner $CFG_ARG --source "$REPO_ROOT"; then
         cmd_log_run secrets pass ""
       else
         cmd_log_run secrets block "gitleaks reported findings or timed out after ${_SECRETS_TIMEOUT}s"
@@ -1830,12 +1861,21 @@ cmd_deps() {
       done
     fi
 
+    # REPO_ROOT PINNED EXPLICITLY (sweep of PEACHES PR #217 review, comment
+    # 5821185384's `gitleaks git` finding to the same CWD-dependence class):
+    # a bare "." target resolves relative to the process's CWD, not
+    # REPO_ROOT -- in a wrapper/`.clagentic-project` layout, or any
+    # invocation whose CWD differs from REPO_ROOT, this silently scans the
+    # wrong tree (or an empty one) while the gate reports whatever that
+    # unrelated scan found. "$REPO_ROOT" makes the scanned tree explicit and
+    # CWD-independent, matching osv-scanner's own documented positional
+    # PATHS argument.
     _OSV_STATUS=0
     if [ "$_OSV_SUBCMD" = "source" ]; then
       # shellcheck disable=SC2086
-      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan source -r --format=json "--config=$_OSV_TMP" $_OSV_EXCL_FLAGS . > "$_OSV_JSON" || _OSV_STATUS=$?
+      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan source -r --format=json "--config=$_OSV_TMP" $_OSV_EXCL_FLAGS "$REPO_ROOT" > "$_OSV_JSON" || _OSV_STATUS=$?
     else
-      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" . > "$_OSV_JSON" || _OSV_STATUS=$?
+      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" "$REPO_ROOT" > "$_OSV_JSON" || _OSV_STATUS=$?
     fi
     case "$_OSV_STATUS" in
       0)
@@ -1878,7 +1918,9 @@ cmd_deps() {
       done < "$_IGNORE_FILE"
     done
 
-    set -- "$@" .   # trailing path arg
+    # REPO_ROOT PINNED EXPLICITLY: same CWD-dependence fix as the two
+    # scan-subcommand branches above.
+    set -- "$@" "$REPO_ROOT"   # trailing path arg
 
     if run_bounded "$_OSV_TIMEOUT" -- osv-scanner "$@"; then
       cmd_log_run deps pass ""

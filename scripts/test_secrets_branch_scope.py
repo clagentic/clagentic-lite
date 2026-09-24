@@ -87,7 +87,7 @@ def _gitleaks_git_subcommand_available():
     return r.returncode == 0
 
 
-def _run_cmd_secrets(project_root, extra_args=None, extra_env=None, bin_dir=None):
+def _run_cmd_secrets(project_root, extra_args=None, extra_env=None, bin_dir=None, cwd=None):
     env = os.environ.copy()
     env["CLAGENTIC_PROJECT_ROOT"] = project_root
     # Keep the positive-control canary out of these tests' way -- it is
@@ -101,7 +101,13 @@ def _run_cmd_secrets(project_root, extra_args=None, extra_env=None, bin_dir=None
         env.update(extra_env)
     gates_sh = os.path.join(REAL_SCRIPTS_DIR, "gates.sh")
     cmd = ["sh", gates_sh, "secrets"] + (extra_args or [])
-    return subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=project_root, timeout=120)
+    # cwd defaults to project_root (every pre-existing call site's exact
+    # prior behavior, byte-for-byte) -- a caller that wants to exercise
+    # CWD-independence (PEACHES PR #217 review, comment 5821185384) passes a
+    # DIFFERENT directory here while CLAGENTIC_PROJECT_ROOT still names the
+    # real target repo, the same split a wrapper/`.clagentic-project` layout
+    # or a hook invoked from a subdirectory produces in the field.
+    return subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd or project_root, timeout=120)
 
 
 def _init_origin_and_work(tmp):
@@ -400,6 +406,99 @@ class TestSecretsStagedPathUnchanged(unittest.TestCase):
         # must NOT appear -- the staged path short-circuits before any of
         # the branch-scope machinery runs.
         self.assertNotIn("no staged changes", result.stderr)
+
+
+class TestSecretsScanIsCwdIndependent(unittest.TestCase):
+    """Regression pin for PEACHES PR #217 review, comment 5821185384: every
+    gitleaks invocation inside cmd_secrets used to omit an explicit target
+    directory, so gitleaks performed its OWN repo discovery from the
+    process's CWD rather than $REPO_ROOT -- in a wrapper/
+    `.clagentic-project` layout, or any invocation whose CWD differs from
+    REPO_ROOT (a hook invoked from a subdirectory, an orchestrator that cds
+    elsewhere before shelling out), gitleaks silently scanned the WRONG
+    tree (or a clean unrelated one) while cmd_secrets reported whatever
+    that unrelated scan found -- a FALSE PASS on the real target, not an
+    error. Every gitleaks call site now passes "$REPO_ROOT" explicitly, the
+    same CWD-independence `_git -C "$REPO_ROOT"` already guarantees for
+    every plain git call in this file.
+
+    Exercises the `gitleaks protect --staged` fallback path specifically
+    (not `gitleaks git`) -- runnable on gitleaks 8.16 (this host's
+    installed version; `gitleaks git` needs 8.18+, see
+    _gitleaks_git_subcommand_available's own docstring above), so this
+    class carries NO version-gate skip and always runs for real. The
+    `gitleaks git` staged/branch-history call sites received the identical
+    fix but are exercised by the 8.18+-gated classes above; this class
+    proves the fix at the ONE call site this host can run for real,
+    the class-level property (fix the pattern, not the line) is the same
+    fix applied uniformly to all three call sites in cmd_secrets."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="clagentic-test-secrets-cwd-")
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        _origin, self._work = _init_origin_and_work(self._tmp)
+        env = {**os.environ, **_GIT_ENV}
+        readme = os.path.join(self._work, "README")
+        with open(readme, "w") as f:
+            f.write("hello\n")
+        subprocess.run(["git", "add", "README"], check=True, cwd=self._work, env=env)
+        subprocess.run(["git", "commit", "-q", "-m", "initial"], check=True, cwd=self._work, env=env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=self._work, env=env)
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], check=True, cwd=self._work, env=env)
+
+        # A separate, unrelated directory to invoke gates.sh FROM -- neither
+        # a git repo itself nor an ancestor/descendant of self._work. If
+        # gitleaks were still resolving its target from CWD rather than
+        # $REPO_ROOT, it would either error on a non-repo CWD (a DIFFERENT
+        # failure than a false pass, still proving the bug) or, on a host
+        # where an ancestor of this elsewhere-dir happens to be a repo,
+        # silently scan that unrelated tree instead.
+        self._elsewhere = os.path.join(self._tmp, "elsewhere")
+        os.makedirs(self._elsewhere)
+
+    @unittest.skipUnless(_gitleaks_available(), "gitleaks not installed")
+    def test_staged_secret_still_blocks_when_invoked_from_a_different_cwd(self):
+        env = {**os.environ, **_GIT_ENV}
+        leaked = os.path.join(self._work, "config.py")
+        with open(leaked, "w") as f:
+            f.write(f'GITHUB_TOKEN = "{_GITHUB_PAT}"\n')
+        subprocess.run(["git", "add", "config.py"], check=True, cwd=self._work, env=env)
+
+        result = _run_cmd_secrets(
+            self._work,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+            cwd=self._elsewhere,
+        )
+        self.assertEqual(
+            result.returncode, 1,
+            f"a staged secret must still block when gates.sh is invoked from a CWD "
+            f"other than the target repo -- CLAGENTIC_PROJECT_ROOT (not CWD) must "
+            f"decide what gitleaks scans\nstdout={result.stdout}\nstderr={result.stderr}",
+        )
+
+    @unittest.skipUnless(_gitleaks_available(), "gitleaks not installed")
+    def test_clean_staged_index_still_passes_when_invoked_from_a_different_cwd(self):
+        """The other direction of the same property: a CLEAN staged index in
+        the real target repo must still report a clean pass when invoked
+        from an unrelated CWD -- proving the scan actually reached the real
+        target (and found nothing) rather than, say, erroring out in a way
+        that happened to also return non-blocking."""
+        clean = os.path.join(self._work, "clean.py")
+        with open(clean, "w") as f:
+            f.write("def handle(x):\n    return x\n")
+        env = {**os.environ, **_GIT_ENV}
+        subprocess.run(["git", "add", "clean.py"], check=True, cwd=self._work, env=env)
+
+        result = _run_cmd_secrets(
+            self._work,
+            extra_env={"CLAGENTIC_DEFAULT_BRANCH": "main"},
+            cwd=self._elsewhere,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"a clean staged index in the real target repo must still pass when "
+            f"invoked from a different CWD\nstdout={result.stdout}\nstderr={result.stderr}",
+        )
 
 
 if __name__ == "__main__":
