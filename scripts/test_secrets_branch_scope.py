@@ -335,6 +335,34 @@ class TestSecretsLogLineNamesScopeAndRange(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
         self.assertIn("full history (--full-scan)", result.stderr)
 
+    def test_full_scan_env_var_line_names_the_env_var_reason_not_the_flag(self):
+        """PEACHES PR #217 review (comment 5820512826): the trigger source
+        must be preserved distinctly -- an env-only trigger must NOT claim
+        "(--full-scan)" in the log line/audit detail, since no CLI flag was
+        passed. Regression pin for the collapsed-boolean defect: before the
+        fix, _SECRETS_FULL_SCAN was a single boolean and every env-only
+        trigger unconditionally logged "(--full-scan)"."""
+        result = _run_cmd_secrets(self._work, extra_env={
+            "CLAGENTIC_DEFAULT_BRANCH": "main",
+            "CLAGENTIC_SECRETS_FULL_SCAN": "1",
+        })
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("full history (CLAGENTIC_SECRETS_FULL_SCAN=1)", result.stderr)
+        self.assertNotIn("full history (--full-scan)", result.stderr,
+                         f"env-only trigger must not claim a CLI flag was supplied\n"
+                         f"stdout={result.stdout}\nstderr={result.stderr}")
+
+    def test_full_scan_flag_and_env_var_both_set_names_both_reasons(self):
+        """Both triggers can be set at once (redundant, not a conflict) --
+        the log line/audit detail names both rather than silently picking
+        one and discarding the other."""
+        result = _run_cmd_secrets(self._work, extra_args=["--full-scan"], extra_env={
+            "CLAGENTIC_DEFAULT_BRANCH": "main",
+            "CLAGENTIC_SECRETS_FULL_SCAN": "1",
+        })
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("full history (--full-scan, CLAGENTIC_SECRETS_FULL_SCAN=1)", result.stderr)
+
 
 @unittest.skipUnless(_gitleaks_available(), "gitleaks not installed")
 class TestSecretsStagedPathUnchanged(unittest.TestCase):

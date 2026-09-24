@@ -37,6 +37,7 @@ Two layers of coverage, deliberately not just one:
 Run with: python3 -m unittest scripts.test_gates_dispatcher_forwards_args -v
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,58 +48,61 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_source_helpers import GATES_SH  # noqa: E402
 
-# Every subcommand `scripts/gates.sh`'s own usage string documents as taking
-# an argument. `init` is genuinely argument-less by design (cmd_init ignores
-# its own argv) but is included below too, so its dispatcher arm's own
-# `shift; cmd_init "$@"` consistency (see
-# test_init_is_deliberately_argument_less_but_still_shifts) is swept the same
-# way as every other entry, not carved out as a silent exception.
-# `status`/`tail`/`render-manifest`/`deferrals-lint`/`audit-vocab-lint`/
-# `render-review`/`log-run`/`review`/`merge-gate`/`bleed`/`adversarial`
-# already forwarded correctly before this task -- included here anyway so a
-# future regression on an already-correct entry is caught by the same sweep,
-# not just the entries this task fixed.
-_SUBCOMMANDS_WITH_ARGS = [
-    ("init", []),
-    ("bleed", ["--full-scan"]),
-    ("secrets", ["--full-scan"]),
-    ("deps", ["--some-future-flag"]),
-    ("sast", ["--some-future-flag"]),
-    ("review", ["--full-review"]),
-    ("adversarial", ["--full-review"]),
-    ("merge-gate", ["--recheck"]),
-    ("render-review", ["some-file.json"]),
-    ("render-manifest", ["some-file.json"]),
-    ("deferrals-lint", ["some-file.json"]),
-    ("audit-vocab-lint", ["some-file.sh"]),
-    ("ship", ["--some-future-flag"]),
-    ("pre-push", ["--some-future-flag"]),
-    ("log-run", ["gate", "outcome", "details"]),
-    ("digest", ["--some-future-flag"]),
-    ("status", ["5"]),
-    ("tail", ["--no-follow"]),
-]
+# PEACHES PR #217 review (comment 5820512826): a hand-enumerated subcommand
+# list can drift from the real dispatcher -- a newly added case arm that
+# forgets `shift; cmd_X "$@"` would simply never be added to a static list
+# either, so the sweep silently never reaches it. `_dispatcher_case_arms`
+# below parses every arm out of the REAL `case "${1:-}" in ... esac` block in
+# scripts/gates.sh mechanically, so the set of subcommands under test is
+# always exactly what the dispatcher itself declares, not a maintained copy
+# of it that can go stale the moment someone adds a tenth subcommand.
+#
+def _dispatcher_case_arms():
+    """Parse every `SUBCOMMAND)  shift; cmd_X "$@" ;;`-shaped arm directly
+    out of the real scripts/gates.sh dispatcher, keyed by subcommand name,
+    value is the raw arm text. Excludes the trailing `*) echo usage...`
+    catch-all (it has no cmd_X call and isn't a real subcommand). Raises if
+    the parse finds nothing, so a dispatcher restructure that breaks this
+    regex fails loudly here rather than silently sweeping zero entries."""
+    with open(GATES_SH) as f:
+        src = f.read()
+    case_start = src.index('\n  case "${1:-}" in')
+    case_end = src.index('\n  esac', case_start)
+    block = src[case_start:case_end]
+    arms = {}
+    for m in re.finditer(
+        r'\n {4}([A-Za-z0-9_-]+)\)([^\n]*);;',
+        block,
+    ):
+        name, body = m.group(1), m.group(2)
+        arms[name] = f"{name}){body};;"
+    if not arms:
+        raise AssertionError(
+            f"mechanical parse of the case \"${{1:-}}\" in ... esac block found "
+            f"no arms at all -- the dispatcher block shape in {GATES_SH} has "
+            f"changed and this parser needs updating, not the assertions below"
+        )
+    return arms
+
+
+# Subcommands under test = every real dispatcher arm, derived mechanically
+# above -- never a hand-maintained list. `init` is genuinely argument-less by
+# design (cmd_init ignores its own argv) but is swept identically to every
+# other entry (see test_init_is_deliberately_argument_less_but_still_shifts),
+# not carved out as a silent exception.
+_SUBCOMMANDS_WITH_ARGS = [(name, ["--some-future-flag"]) for name in sorted(_dispatcher_case_arms())]
 
 
 def _case_block_dispatches(subcommand):
-    """Extract the real dispatcher's own one-line case arm for `subcommand`
-    directly from the current scripts/gates.sh source, so this assertion can
-    never silently drift from what ships -- a hand-copied re-implementation
-    of the dispatch logic would only prove a COPY forwards args, not the
-    real file. Returns the raw text of the arm (e.g.
-    'secrets)        shift; cmd_secrets "$@" ;;')."""
-    with open(GATES_SH) as f:
-        src = f.read()
-    marker = f'\n    {subcommand})'
-    # bleed's own arm starts with "bleed)" with no leading space token before
-    # the paren in the alignment gates.sh uses -- match on the exact token
-    # boundary (subcommand followed immediately by `)`), not a substring
-    # that could also match a longer subcommand name sharing a prefix.
-    idx = src.find(marker)
-    if idx == -1:
+    """Return the real dispatcher's own one-line case arm for `subcommand`,
+    read directly from the mechanically parsed case block (see
+    _dispatcher_case_arms) so this assertion can never silently drift from
+    what ships -- a hand-copied re-implementation of the dispatch logic
+    would only prove a COPY forwards args, not the real file."""
+    arms = _dispatcher_case_arms()
+    if subcommand not in arms:
         raise AssertionError(f"no dispatcher case arm found for {subcommand!r} in {GATES_SH}")
-    end = src.index(";;", idx)
-    return src[idx:end + 2]
+    return arms[subcommand]
 
 
 class TestDispatcherCaseArmsShiftAndForwardArgv(unittest.TestCase):

@@ -1368,13 +1368,27 @@ cmd_secrets() {
   # forces the branch-history path (below) to walk the entire history
   # reachable from HEAD, the pre-lr-51112e default. Neither `gates ship` nor
   # `gates pre-push` sets either by default — see cmd_ship's own call site.
-  _SECRETS_FULL_SCAN=0
+  #
+  # TRIGGER SOURCE (PEACHES PR #217 review, comment 5820512826): the flag and
+  # the env var are tracked in SEPARATE booleans, not collapsed into one —
+  # _SECRETS_FULL_SCAN alone cannot tell the audit trail (cmd_log_run
+  # detail, AGENTS.md rule 7 audit-first) which one actually fired, and a
+  # collapsed boolean previously reported every env-only trigger as
+  # "(--full-scan)", falsely claiming a CLI flag was supplied. Both can be
+  # true at once (redundant, not a conflict); when they are, the reason
+  # string names both rather than picking one arbitrarily.
+  _SECRETS_FULL_SCAN_FLAG=0
   for _secrets_arg in "$@"; do
     case "$_secrets_arg" in
-      --full-scan) _SECRETS_FULL_SCAN=1 ;;
+      --full-scan) _SECRETS_FULL_SCAN_FLAG=1 ;;
     esac
   done
-  [ "${CLAGENTIC_SECRETS_FULL_SCAN:-0}" = "1" ] && _SECRETS_FULL_SCAN=1
+  _SECRETS_FULL_SCAN_ENV=0
+  [ "${CLAGENTIC_SECRETS_FULL_SCAN:-0}" = "1" ] && _SECRETS_FULL_SCAN_ENV=1
+  _SECRETS_FULL_SCAN=0
+  if [ "$_SECRETS_FULL_SCAN_FLAG" = "1" ] || [ "$_SECRETS_FULL_SCAN_ENV" = "1" ]; then
+    _SECRETS_FULL_SCAN=1
+  fi
 
   if ! command -v gitleaks >/dev/null 2>&1; then
     # FAIL CLOSED. AGENTS.md §4 contract: local tools own the security gate.
@@ -1497,7 +1511,18 @@ cmd_secrets() {
       _SECRETS_LOG_OPTS=""
       _SECRETS_SCOPE_REASON=""
       if [ "$_SECRETS_FULL_SCAN" = "1" ]; then
-        _SECRETS_SCOPE_REASON="full history (--full-scan)"
+        # Preserve WHICH trigger actually fired (PEACHES PR #217 review,
+        # comment 5820512826) rather than always crediting the CLI flag —
+        # an env-only trigger claiming "(--full-scan)" in the audit trail
+        # would misattribute the cause to a flag nobody passed. Both can be
+        # set at once; name both rather than picking one arbitrarily.
+        if [ "$_SECRETS_FULL_SCAN_FLAG" = "1" ] && [ "$_SECRETS_FULL_SCAN_ENV" = "1" ]; then
+          _SECRETS_SCOPE_REASON="full history (--full-scan, CLAGENTIC_SECRETS_FULL_SCAN=1)"
+        elif [ "$_SECRETS_FULL_SCAN_FLAG" = "1" ]; then
+          _SECRETS_SCOPE_REASON="full history (--full-scan)"
+        else
+          _SECRETS_SCOPE_REASON="full history (CLAGENTIC_SECRETS_FULL_SCAN=1)"
+        fi
       elif ! _git_repo_root_is_scoped; then
         _SECRETS_SCOPE_REASON="full history (baseline unavailable: REPO_ROOT is not a git repo)"
       else
@@ -1958,11 +1983,19 @@ cmd_bleed() {
   #
   # NOT the same fallback cmd_secrets uses (BOBBIE, lr-caebc5 follow-up):
   # cmd_secrets' feature-branch fallback (:110-134) scans local branch
-  # HISTORY and never diffs against a remote ref. The branch-diff step here
-  # instead resolves and diffs against origin/<default-branch> — the same
+  # HISTORY within a merge-base..HEAD commit RANGE, not a diffed file set.
+  # UPDATED (lr-51112e, PEACHES PR #217 review): cmd_secrets now DOES
+  # resolve and diff against a remote ref -- it calls the same
+  # _gate_resolve_fresh_default_branch_ref helper this function uses, then
+  # takes git merge-base against the verified-fresh tip to scope its
+  # --log-opts range. The distinction from this function's own branch-diff
+  # step is the CONSUMER, not remote-ref usage: this function resolves
+  # origin/<default-branch> and diffs a FILE SET against it -- the same
   # shape as cmd_sast's --baseline-commit mechanism (:588), including its
   # freshness precondition (_gate_resolve_fresh_default_branch_ref, :88).
-  # See docs/GATES.md Gate 4d for the full writeup.
+  # cmd_secrets resolves the identical fresh ref but scopes a commit-range
+  # HISTORY scan, not a file diff. See docs/GATES.md Gate 4d for the full
+  # writeup.
   _BLEED_FULL_SCAN=0
   for _bleed_arg in "$@"; do
     case "$_bleed_arg" in
@@ -2070,9 +2103,13 @@ cmd_bleed() {
         #
         # NOTE ON PARITY: this is NOT "the same fallback cmd_secrets uses"
         # (cmd_secrets' feature-branch fallback, :110-116, scans local
-        # branch HISTORY and never diffs against a remote ref at all). The
-        # actual precedent for a remote-ref-diff scope is cmd_sast's
-        # baseline-commit mechanism (:588-663) — see docs/GATES.md.
+        # branch HISTORY within a commit RANGE, not a diffed file set). As
+        # of lr-51112e cmd_secrets DOES resolve a remote ref via the same
+        # _gate_resolve_fresh_default_branch_ref helper -- the distinction
+        # is the consumer (a --log-opts commit range vs. this function's
+        # diffed file set), not remote-ref usage. The actual precedent for
+        # a remote-ref-diffed FILE SET scope is cmd_sast's baseline-commit
+        # mechanism (:588-663) — see docs/GATES.md.
         _BLEED_FETCH_TIMEOUT="${CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC:-30}"
         _BLEED_FETCH_TIMEOUT=$(ds_positive_int_or_default "$_BLEED_FETCH_TIMEOUT" 30)
 
