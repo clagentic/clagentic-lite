@@ -979,11 +979,21 @@ and, for a branch-diff scope, the exact range and commit count:
 
 - `branch diff <mb7>..<head7> (N commits)` — a verified-fresh baseline
   narrowed the scan.
-- `full history (--full-scan)` — the explicit opt-in flag or env var was set.
+- `full history (--full-scan)` — the `--full-scan` CLI flag was passed.
+- `full history (CLAGENTIC_SECRETS_FULL_SCAN=1)` — only the env var was set,
+  no `--full-scan` flag.
+- `full history (--full-scan, CLAGENTIC_SECRETS_FULL_SCAN=1)` — both were
+  set at once (redundant, not a conflict — named together rather than one
+  silently discarded).
 - `full history (baseline unavailable: <reason>)` — the baseline could not
   be positively verified current; `<reason>` names the specific cause
   (`_gate_resolve_fresh_default_branch_ref`'s own stderr message, a failed
   merge-base resolution, or `REPO_ROOT is not a git repo`).
+
+The flag and the env var are tracked as separate signals internally
+(PEACHES PR #217 review, comment 5820512826) specifically so the audit
+trail never credits a CLI flag nobody passed — a collapsed single boolean
+previously reported every env-only trigger as `(--full-scan)`.
 
 **Unchanged by this task.** The staged-diff path (`gitleaks git --staged
 --pre-commit`, the table above) and the older-gitleaks (pre-8.18)
@@ -1439,7 +1449,7 @@ See lr-3b06b1 (open, tracked separately) for whether `issue_class`/`class_fix` o
 2. Otherwise, the current branch's diff against `origin/${CLAGENTIC_DEFAULT_BRANCH}` (default `main`), when a usable branch baseline exists (not detached HEAD, not on the default branch itself) **and** that ref can be shown to be provably current (see "Branch-diff freshness" below).
 3. Otherwise (fresh repo, no staged changes, no usable branch baseline, or a branch baseline that could not be verified current), full tree — this is the fallback path, not the default.
 
-**This is NOT the same fallback `cmd_secrets` uses.** `cmd_secrets`' feature-branch fallback (Gate 4a's `gitleaks git` history scan) runs over the current branch's local commit *history* — it never resolves or diffs against a remote ref at all. Step 2 above instead resolves `origin/<default-branch>` and diffs the file set against it, which is the same shape as `cmd_sast`'s `--baseline-commit`/merge-base mechanism above, not `cmd_secrets`' history scan.
+**This is NOT the same fallback `cmd_secrets` uses, but it now shares the same freshness mechanism (lr-51112e).** `cmd_secrets`' feature-branch fallback (Gate 4a's `gitleaks git` history scan) still runs over the current branch's own commit *history*, not a diffed file set — it passes `gitleaks git` a `--log-opts=<merge-base>..HEAD` commit range rather than resolving a changed-file list. But as of lr-51112e it DOES resolve and diff against a remote ref to establish that range: it calls the same `_gate_resolve_fresh_default_branch_ref` helper this step and `cmd_sast`'s `--baseline-commit` both use, then takes `git merge-base` against the verified-fresh tip, scoping the history scan to `merge-base..HEAD` instead of walking every commit reachable from HEAD. Step 2 above resolves `origin/<default-branch>` and diffs the *file set* against it (same shape as `cmd_sast`'s `--baseline-commit`/merge-base mechanism); `cmd_secrets` resolves the same fresh ref but scopes a *commit-range history scan*, not a file diff — same freshness precondition, different consumer.
 
 **Branch-diff freshness.** Step 2's `origin/<default-branch>` resolution shares the exact freshness precondition `cmd_sast` uses (`_gate_resolve_fresh_default_branch_ref` in `scripts/gates.sh`, extracted as the common helper both gates call): a bare `git rev-parse --verify` proves only that a local tracking ref *exists*, not that it is *current*. A present-but-stale ref is a successful-looking wrong resolution — it exits 0 and produces a plausible file set — so on a long-lived clone fetched once and never refreshed, a bleed pattern committed to the default branch afterward would be invisible to a scope trusting that stale ref, and the gate would report an authoritative-looking clean pass. The fix: `git fetch origin <default-branch>` under a timeout (`CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC`, default 30s, mirroring `CLAGENTIC_SAST_FETCH_TIMEOUT_SEC`), trusted only when it exits 0 *and* the resulting local tip matches an independent `git ls-remote origin <default-branch>` read taken in the same run. On a stale-or-unverifiable baseline the gate fails toward **more** coverage, never less — it falls back to the full-tree scan (step 3), exactly like `cmd_sast`. Narrowing to the branch diff requires a positively-verified fresh baseline; see "Freshness is a precondition, not an assumption" above for the full rationale (security review, lr-caebc5 follow-up to lr-06b87e).
 

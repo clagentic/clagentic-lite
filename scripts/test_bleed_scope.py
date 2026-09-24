@@ -16,16 +16,25 @@ repo, no usable baseline, an explicit --full-scan, or a pattern-file
 change) but is no longer the default path.
 
 NOT the same fallback cmd_secrets uses (BOBBIE, lr-caebc5 follow-up):
-cmd_secrets' feature-branch fallback scans local branch HISTORY and never
-diffs against a remote ref. The branch-diff step here resolves
-origin/<default-branch> and diffs against it -- the same shape as
-cmd_sast's --baseline-commit/merge-base mechanism, including that
+cmd_secrets' feature-branch fallback scans local branch HISTORY within a
+merge-base..HEAD commit RANGE, not a diffed file set. UPDATED (lr-51112e):
+cmd_secrets now DOES resolve a remote ref -- it calls the same
+_gate_resolve_fresh_default_branch_ref helper cmd_bleed uses below, then
+takes git merge-base against the verified-fresh tip to scope its
+--log-opts range. The distinction from cmd_bleed's own branch-diff step is
+the CONSUMER (a commit-range history scan vs. a diffed file set), not
+remote-ref usage: this file's branch-diff step resolves
+origin/<default-branch> and diffs a FILE SET against it -- the same shape
+as cmd_sast's --baseline-commit/merge-base mechanism, including that
 mechanism's freshness precondition: a bare `git rev-parse --verify` proves
 only that a local tracking ref exists, not that it is current, so the
 branch-diff step delegates to the same provably-current fetch+ls-remote
-check cmd_sast uses (_gate_resolve_fresh_default_branch_ref, scripts/gates.sh)
-rather than trusting presence alone. See TestBleedBranchDiffFreshness below
-for the regression coverage on a stale/unverifiable baseline.
+check cmd_sast (and now cmd_secrets) uses
+(_gate_resolve_fresh_default_branch_ref, scripts/gates.sh) rather than
+trusting presence alone. See TestBleedBranchDiffFreshness below for the
+regression coverage on a stale/unverifiable baseline, and
+scripts/test_secrets_branch_scope.py for cmd_secrets' own equivalent
+coverage.
 
 These tests exercise the file-set resolution directly by pointing a bleed
 pattern at a marker string, planting it in both a staged (in-scope) file and
