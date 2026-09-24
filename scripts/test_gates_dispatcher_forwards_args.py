@@ -43,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -57,21 +58,47 @@ from test_source_helpers import GATES_SH  # noqa: E402
 # always exactly what the dispatcher itself declares, not a maintained copy
 # of it that can go stale the moment someone adds a tenth subcommand.
 #
+def _dispatcher_case_labels(block):
+    """Return every case-arm LABEL (subcommand name) found in `block`,
+    independent of how much of the arm's body is captured -- a separate,
+    narrower regex than _dispatcher_case_arms' own body-matching one, used
+    only to cross-check that every labeled arm actually got an entry in the
+    parsed dict (see PEACHES PR #217 review, comment 5821185384 below)."""
+    return re.findall(r'\n {4}([A-Za-z0-9_-]+)\)', block)
+
+
 def _dispatcher_case_arms():
     """Parse every `SUBCOMMAND)  shift; cmd_X "$@" ;;`-shaped arm directly
     out of the real scripts/gates.sh dispatcher, keyed by subcommand name,
     value is the raw arm text. Excludes the trailing `*) echo usage...`
     catch-all (it has no cmd_X call and isn't a real subcommand). Raises if
     the parse finds nothing, so a dispatcher restructure that breaks this
-    regex fails loudly here rather than silently sweeping zero entries."""
+    regex fails loudly here rather than silently sweeping zero entries.
+
+    MULTI-LINE ARMS (PEACHES PR #217 review, comment 5821185384): the
+    original body regex here was `([^\\n]*);;` -- `[^\\n]*` stops at the
+    first newline, so a case arm written across multiple lines (e.g.
+    `secrets)\\n    shift\\n    cmd_secrets "$@"\\n    ;;`) either failed to
+    match its own `;;` terminator at all (silently omitting that arm from
+    the swept set entirely -- the sweep then reports a clean pass while
+    never having examined that arm) or matched a truncated, wrong body. The
+    body pattern now spans newlines (`[\\s\\S]*?`, non-greedy so it stops at
+    the FIRST `;;` rather than swallowing subsequent arms), and the caller
+    below additionally asserts the parsed arm COUNT equals the number of
+    case LABELS found by _dispatcher_case_labels -- a second, narrower
+    regex that only needs to find `NAME)`, not the whole arm body -- so a
+    future shape neither regex fully handles fails loudly here (arm count
+    mismatch) instead of silently sweeping fewer arms than the dispatcher
+    actually declares."""
     with open(GATES_SH) as f:
         src = f.read()
     case_start = src.index('\n  case "${1:-}" in')
     case_end = src.index('\n  esac', case_start)
     block = src[case_start:case_end]
+    labels = _dispatcher_case_labels(block)
     arms = {}
     for m in re.finditer(
-        r'\n {4}([A-Za-z0-9_-]+)\)([^\n]*);;',
+        r'\n {4}([A-Za-z0-9_-]+)\)([\s\S]*?);;',
         block,
     ):
         name, body = m.group(1), m.group(2)
@@ -81,6 +108,17 @@ def _dispatcher_case_arms():
             f"mechanical parse of the case \"${{1:-}}\" in ... esac block found "
             f"no arms at all -- the dispatcher block shape in {GATES_SH} has "
             f"changed and this parser needs updating, not the assertions below"
+        )
+    if len(arms) != len(labels):
+        raise AssertionError(
+            f"dispatcher case block declares {len(labels)} label(s) "
+            f"({sorted(set(labels))}) but the body parse only produced "
+            f"{len(arms)} arm(s) ({sorted(arms)}) -- at least one case arm's "
+            f"body could not be matched up to its own `;;` terminator (a "
+            f"multi-line arm shape the body regex does not yet handle, or a "
+            f"duplicate label) and was SILENTLY DROPPED from the swept set. "
+            f"Fix the parser in {__file__}, not the assertions below -- a "
+            f"dropped arm here means the shift/\"$@\" sweep never examined it."
         )
     return arms
 
@@ -142,6 +180,105 @@ class TestDispatcherCaseArmsShiftAndForwardArgv(unittest.TestCase):
         arm = _case_block_dispatches("init")
         self.assertIn("shift", arm)
         self.assertIn('"$@"', arm)
+
+
+class TestDispatcherParserHandlesMultiLineArms(unittest.TestCase):
+    """Regression pin for PEACHES PR #217 review, comment 5821185384: the
+    body regex used to be `([^\\n]*);;`, which stops at the FIRST newline --
+    a multi-line case arm (a plausible style once an arm's body grows past
+    one line) either failed to match its own `;;` terminator at all, or
+    matched a truncated body missing the tokens under test. Both failure
+    modes mean the shift/"$@" sweep silently never examines that arm.
+
+    These tests exercise `_dispatcher_case_arms`/`_dispatcher_case_labels`
+    directly against small SYNTHETIC case blocks (not the real gates.sh
+    file) so the parser's own multi-line handling and count-mismatch guard
+    are pinned independently of what gates.sh's dispatcher currently
+    contains."""
+
+    def test_multiline_arm_is_captured_in_full(self):
+        block = (
+            '\n  case "${1:-}" in\n'
+            '    secrets)\n'
+            '        shift\n'
+            '        cmd_secrets "$@"\n'
+            '        ;;\n'
+            '    deps)           shift; cmd_deps "$@" ;;\n'
+            '  esac'
+        )
+        arms = {}
+        labels = _dispatcher_case_labels(block)
+        for m in re.finditer(r'\n {4}([A-Za-z0-9_-]+)\)([\s\S]*?);;', block):
+            name, body = m.group(1), m.group(2)
+            arms[name] = f"{name}){body};;"
+        self.assertEqual(sorted(arms), sorted(set(labels)))
+        self.assertIn("secrets", arms)
+        self.assertIn("shift", arms["secrets"])
+        self.assertIn('"$@"', arms["secrets"])
+        self.assertIn('cmd_secrets "$@"', arms["secrets"])
+
+    def test_multiline_arm_missing_shift_is_detected_not_silently_dropped(self):
+        """The actual regression this task fixes: a multi-line arm that
+        FORGOT shift/"$@" must still be captured (and therefore still fail
+        the shift/forward assertions in TestDispatcherCaseArmsShiftAndForwardArgv)
+        -- not silently vanish from the parsed set, which would make the
+        sweep report a clean pass despite the real defect."""
+        block = (
+            '\n  case "${1:-}" in\n'
+            '    secrets)\n'
+            '        cmd_secrets\n'
+            '        ;;\n'
+            '  esac'
+        )
+        arms = {}
+        for m in re.finditer(r'\n {4}([A-Za-z0-9_-]+)\)([\s\S]*?);;', block):
+            name, body = m.group(1), m.group(2)
+            arms[name] = f"{name}){body};;"
+        self.assertIn("secrets", arms, msg="a multi-line arm must still be parsed even when it "
+                                            "lacks shift/\"$@\" -- silently dropping it would hide "
+                                            "the exact defect this sweep exists to catch")
+        self.assertNotIn("shift", arms["secrets"])
+        self.assertNotIn('"$@"', arms["secrets"])
+
+    def test_arm_count_mismatch_raises_loudly(self):
+        """_dispatcher_case_arms itself (not the synthetic-block helpers
+        above) must raise when the body regex produces fewer arms than the
+        label regex finds -- the exact failure mode a body regex that still
+        cannot handle some future arm shape (or a duplicate label silently
+        collapsed by dict assignment) would otherwise hide silently. Patches
+        open() so a SYNTHETIC source (a duplicate `secrets)` label -- two
+        labels, one surviving dict entry) drives the real
+        _dispatcher_case_arms code path end-to-end, not a hand-reimplemented
+        copy of its parsing logic."""
+        fake_src = (
+            'x=1\n'
+            '  case "${1:-}" in\n'
+            '    secrets)        shift; cmd_secrets "$@" ;;\n'
+            '    secrets)        shift; cmd_secrets "$@" ;;\n'
+            '  esac\n'
+        )
+
+        class _FakeFile:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                return False
+
+            def read(self_inner):
+                return fake_src
+
+        real_open = open
+
+        def _fake_open(path, *a, **kw):
+            if path == GATES_SH:
+                return _FakeFile()
+            return real_open(path, *a, **kw)
+
+        with unittest.mock.patch("builtins.open", side_effect=_fake_open):
+            with self.assertRaises(AssertionError) as ctx:
+                _dispatcher_case_arms()
+        self.assertIn("SILENTLY DROPPED", str(ctx.exception))
 
 
 class TestDispatcherActuallyForwardsArgvAtRuntime(unittest.TestCase):
