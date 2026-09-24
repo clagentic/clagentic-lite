@@ -1178,6 +1178,31 @@ rather than rediscovered by a user whose flag silently did nothing.
 | **Baseline fetch timeout** | `CLAGENTIC_SAST_FETCH_TIMEOUT_SEC` (default 30). Bounds both the `git fetch` and the `git ls-remote` freshness check used to resolve the baseline commit (see below) — expiry falls back to full-tree, same as any other resolution failure. |
 | **Scan timeout** | Every semgrep invocation runs under `run_bounded` (default 300s, configurable via `CLAGENTIC_SAST_TIMEOUT_SEC`) — `--config=auto` downloads rules over the network on top of running the scan itself. A timeout counts as a block, same as an ERROR-severity finding. |
 
+**Every semgrep invocation runs with CWD pinned to `$REPO_ROOT` (lr-51112e,
+HOLDEN decision on PR #217 needs-decision option 3).** Unlike gitleaks and
+osv-scanner (Gate 4a/4b), which are pinned via an explicit `--source`/
+positional target argument, semgrep has no such flag for this: its
+`--baseline-commit` support shells out to `git cat-file` against the
+process's own CWD, with no override. AMoS's own PR #217 investigation
+established empirically that appending `$REPO_ROOT` as a positional target
+argument does NOT work around this — it hard-fails (`exit 2`) whenever CWD
+differs from `REPO_ROOT`, and a positional path argument in baseline mode is
+independently forbidden by `test_no_path_argument_added_in_baseline_mode`
+(`scripts/test_sast_baseline_scope.py`): semgrep must still walk (and apply
+`.semgrepignore` to) the whole tree, with `--baseline-commit` only narrowing
+which findings are *reported*, not what gets scanned. Both `cmd_sast`
+invocations (baseline-commit and full-tree fallback) therefore run inside a
+POSIX subshell that `cd`s to `$REPO_ROOT` first — `( cd "$REPO_ROOT" ||
+exit 1; run_bounded ... semgrep ... )` — leaving argv byte-identical to the
+pre-existing invocation. A `cd` failure aborts only that subshell with a
+guaranteed-nonzero exit, so a `REPO_ROOT` that cannot be entered is reported
+as a gate BLOCK, never a silent pass — fail-closed, matching every other
+resolution-failure branch this gate already has. See
+`scripts/test_sast_baseline_scope.py`'s `TestSastScanIsCwdIndependent` for
+the regression coverage, exercised against the real installed semgrep (not
+the fake stub the rest of that module uses) across both the baseline and
+full-tree branches, invoked from a CWD other than `REPO_ROOT`.
+
 **Rule-exclude ladder (lr-321e18).** `cmd_sast` had zero repo-side override
 surface for a single unsatisfiable registry rule — one false-positive
 finding forced multi-round review churn with no sanctioned escape. Fixed by
