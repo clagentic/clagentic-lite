@@ -947,11 +947,13 @@ from `REPO_ROOT` (a hook invoked from a subdirectory, an orchestrator that
 repo — or a clean, unrelated CWD — while `cmd_secrets` reported whatever
 that unrelated scan found: a false pass on the real target, not an error.
 `gitleaks protect` is pinned via its own `-s`/`--source` flag (`gitleaks
-protect --help`'s Global Flags section) — confirmed against this project's
-own CI host (gitleaks 8.16) that `protect` has **no** positional
-`[DIRECTORY]` argument at all; an earlier draft of this fix passed a bare
-trailing path token, which gitleaks silently ignored rather than erroring
-on, reproducing the exact false-pass shape this fix exists to close.
+protect --help`'s Global Flags section) — confirmed directly against an
+installed gitleaks below 8.19 (the `git`-subcommand floor; below it,
+`cmd_secrets` takes the `protect`/`detect` fallback path described above)
+that `protect` has **no** positional `[DIRECTORY]` argument at all; an
+earlier draft of this fix passed a bare trailing path token, which
+gitleaks silently ignored rather than erroring on, reproducing the exact
+false-pass shape this fix exists to close.
 
 **`gitleaks git` is pinned via a positional argument, not `--source`
 (CORRECTED, PEACHES PR #218 review, comment 5833150249).** An earlier draft
@@ -979,8 +981,8 @@ registers its own local `-s`/`--source` flag, confirmed unchanged through
 `scripts/test_secrets_branch_scope.py`'s `TestSecretsScanIsCwdIndependent`
 for the regression coverage, exercised for real against the `gitleaks
 protect --staged` fallback (runnable on any installed gitleaks, no version
-gate) since that is the one call site this project's own CI host can
-exercise without a gitleaks 8.19+ upgrade.
+gate) since that is the one call site that can be exercised without a
+gitleaks 8.19+ install providing the `git` subcommand.
 
 **Branch-history scope (lr-51112e) — scan RANGE, not full history, by default.**
 On a feature branch with a clean index (no staged changes), `cmd_secrets`

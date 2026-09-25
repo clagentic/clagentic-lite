@@ -32,12 +32,14 @@ arguments must forward them via `shift; cmd_X "$@"`, not drop them).
 Run with: python3 -m unittest scripts.test_secrets_branch_scope -v
 """
 import os
+import re
 import shutil
 import stat
 import subprocess
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 REAL_SCRIPTS_DIR = os.path.join(TOOL_HOME, "scripts")
@@ -531,21 +533,40 @@ def _cmd_secrets_body():
     return src[secrets_start:secrets_end]
 
 
+_GITLEAKS_INVOCATION_RE = re.compile(
+    r'\bgitleaks\s+([A-Za-z][A-Za-z0-9_-]*)\s+(?=-)'
+)
+
+
 def _gitleaks_invocation_lines(body):
-    """Select EVERY line in `body` that invokes the gitleaks binary --
-    any subcommand (`git`, `protect`, `detect`, ...), whether or not it is
-    wrapped in `run_bounded`, and skip comment-only lines. This is the
-    broadest reliable selector the task calls for (lr-51112e, PEACHES PR
-    #218 review comment 5834286140's own finding, applied one level
-    broader): the prior selector pre-filtered on `run_bounded ... gitleaks
-    git` together, which is a select-by-property flaw in narrower form --
-    a gitleaks call not wrapped in run_bounded, or a gitleaks subcommand
-    other than `git`, was excluded from the sweep before its properties
-    were ever checked. Matching is done on the invocation text itself
-    ("gitleaks <subcommand>"), never on "run_bounded" or "REPO_ROOT" --
-    those are asserted AFTERWARDS, per matched line, as their own
-    properties, so a call site missing either fails the assertion instead
-    of silently vanishing from the swept set.
+    """Select EVERY non-comment line in `body` that invokes the gitleaks
+    binary with ANY subcommand -- `git`, `protect`, `detect`, or anything
+    else a future edit might introduce -- whether or not it is wrapped in
+    `run_bounded`. This is the broadest reliable selector the task calls
+    for (lr-51112e fold-in, PEACHES PR #218 review comment 5836927583):
+    the prior selector enumerated the three subcommand names it already
+    knew about (`gitleaks git `, `gitleaks protect `, `gitleaks detect `)
+    -- an UNKNOWN subcommand introduced by a future edit (a typo, or a
+    genuinely new gitleaks verb) would not match any of those three literal
+    substrings and would be silently excluded from the swept set entirely,
+    the exact select-by-the-property-under-test flaw this task's own
+    fold-in history (comment 5834286140, then 5833150249) has already
+    found and fixed twice at other layers of this same selector.
+
+    Matching is done structurally -- "gitleaks" followed by a bare word
+    token (the subcommand), followed by a token that starts with `-` (a
+    flag, or the `--` positional-arg separator) -- so ANY subcommand is
+    captured, known or not, as long as the line is an actual invocation
+    (subcommand followed by flags) rather than a log/printf/cmd_log_run
+    string that merely mentions the word "gitleaks" in prose (e.g.
+    "gitleaks not installed", "gitleaks reported findings", or a printf
+    message naming "gitleaks git" inside a human-readable sentence with no
+    flags of its own). An unknown subcommand on a real invocation line is
+    SELECTED here and then FAILS the per-line pin assertion in
+    TestGitleaksGitInvocationUsesPositionalRepoNotSourceFlag below (no
+    rule exists for it there), rather than vanishing before that assertion
+    ever runs. See test_selector_selects_and_fails_an_unknown_subcommand
+    for the negative-control regression pin (`gitleaks dir`).
 
     Excludes `gitleaks git --help` capability probes -- cmd_secrets uses
     `gitleaks git --help` to detect whether the installed gitleaks is
@@ -562,7 +583,7 @@ def _gitleaks_invocation_lines(body):
             continue
         if "--help" in line:
             continue
-        if "gitleaks git " in line or "gitleaks protect " in line or "gitleaks detect " in line:
+        if _GITLEAKS_INVOCATION_RE.search(line):
             lines.append(line)
     return lines
 
@@ -616,7 +637,9 @@ class TestGitleaksGitInvocationUsesPositionalRepoNotSourceFlag(unittest.TestCase
                     f"run_bounded (INV-1a/INV-2, class-4 foundry fix) -- an "
                     f"unbounded gitleaks call can hang the gate indefinitely: {line!r}",
             )
-            if "gitleaks git " in line:
+            subcommand_match = _GITLEAKS_INVOCATION_RE.search(line)
+            subcommand = subcommand_match.group(1) if subcommand_match else None
+            if subcommand == "git":
                 self.assertNotIn(
                     "--source", line,
                     msg=f"a `gitleaks git` call site still passes `--source` -- this "
@@ -631,7 +654,7 @@ class TestGitleaksGitInvocationUsesPositionalRepoNotSourceFlag(unittest.TestCase
                     msg=f"`gitleaks git` call site does not pass $REPO_ROOT as a "
                         f"`--`-terminated positional argument: {line!r}",
                 )
-            else:
+            elif subcommand in ("protect", "detect"):
                 # `protect`/`detect` are the genuinely separate older-gitleaks
                 # code path (its own runProtect, never merged with `git`'s
                 # positional-arg design) that registers its own local
@@ -646,6 +669,20 @@ class TestGitleaksGitInvocationUsesPositionalRepoNotSourceFlag(unittest.TestCase
                         f"target via --source -- it has no positional [repo] "
                         f"argument at all (a trailing bare token is silently "
                         f"ignored, not an error): {line!r}",
+                )
+            else:
+                # No rule exists for any other subcommand -- fail loudly
+                # rather than falling into the protect/detect branch by
+                # default, which would let an unknown/typo'd subcommand
+                # coincidentally pass if it happened to carry --source (see
+                # test_selector_selects_and_fails_an_unknown_subcommand for
+                # the regression pin).
+                self.fail(
+                    f"gitleaks call site uses subcommand {subcommand!r}, which has "
+                        f"no pinning rule in this test -- add one (or confirm this "
+                        f"is a real, intentional new gitleaks call site and update "
+                        f"this test to cover it) before trusting it is bounded and "
+                        f"correctly pinned: {line!r}"
                 )
 
     def test_selector_catches_an_unwrapped_gitleaks_git_call(self):
@@ -679,6 +716,47 @@ class TestGitleaksGitInvocationUsesPositionalRepoNotSourceFlag(unittest.TestCase
                 "actually be missing --source, or this test is not exercising "
                 "what it claims to",
         )
+
+    def test_selector_selects_and_fails_an_unknown_subcommand(self):
+        """Negative control for lr-51112e's fold-in (PEACHES PR #218 review,
+        comment 5836927583): the selector must not be limited to the
+        subcommand names it already knows about (`git`, `protect`,
+        `detect`) -- a future call site using an unrecognized subcommand
+        (`gitleaks dir`, a typo, or a genuinely new gitleaks verb) must
+        still be SELECTED by `_gitleaks_invocation_lines`, and the
+        per-subcommand pin assertion in
+        test_every_gitleaks_call_site_in_cmd_secrets_is_bounded_and_correctly_pinned
+        must then FAIL it (no rule exists for `dir`), rather than the old
+        enumerated-substring selector silently excluding it before any
+        assertion ever ran."""
+        unknown_line = '      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks dir --redact --no-banner $CFG_ARG --source "$REPO_ROOT"; then'
+        selected = _gitleaks_invocation_lines(unknown_line + "\n")
+        self.assertEqual(
+            selected, [unknown_line],
+            msg="an unknown gitleaks subcommand (`dir`) must still be selected -- "
+                "silently excluding it would hide the exact defect this fold-in "
+                "exists to catch",
+        )
+
+        # Drive the REAL per-line assertion loop end-to-end against this one
+        # synthetic line, by patching _cmd_secrets_body to return it, rather
+        # than re-implementing the loop's logic here as a copy that could
+        # silently drift from what the real test asserts.
+        with unittest.mock.patch(
+            f"{__name__}._cmd_secrets_body",
+            return_value=unknown_line,
+        ):
+            case = TestGitleaksGitInvocationUsesPositionalRepoNotSourceFlag(
+                "test_every_gitleaks_call_site_in_cmd_secrets_is_bounded_and_correctly_pinned"
+            )
+            result = unittest.TestResult()
+            case.run(result)
+        self.assertEqual(
+            len(result.failures), 1,
+            msg=f"an unknown gitleaks subcommand must FAIL the real pin assertion "
+                f"-- got failures={result.failures}, errors={result.errors}",
+        )
+        self.assertIn("dir", result.failures[0][1])
 
 
 if __name__ == "__main__":

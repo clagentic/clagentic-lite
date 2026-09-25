@@ -162,8 +162,22 @@ def _expected_handler_name(subcommand):
     "cmd_" prefixed) -- confirmed against every current label
     (init/bleed/secrets/deps/sast/review/adversarial/merge-gate/
     render-review/render-manifest/deferrals-lint/audit-vocab-lint/ship/
-    pre-push/log-run/digest/status/tail)."""
-    return "cmd_" + subcommand.replace("-", "_")
+    pre-push/log-run/digest/status/tail).
+
+    ALTERNATION LABELS (lr-51112e fold-in, PEACHES PR #218 review comment
+    5836927583): a case label can be `foo|bar)`, one arm matching either
+    name (see TestAlternationCaseArmsAreSwept above). The old
+    implementation ran `.replace("-", "_")` on the WHOLE label, producing
+    "cmd_foo|bar" for such an arm -- not a real function name, so it could
+    never match anything and every alternation arm would silently fail the
+    ordered-binding check regardless of whether the arm actually forwards
+    args correctly. The handler name is derived from the label's FIRST
+    alternative only -- every real alternation arm in this dispatcher binds
+    a single `cmd_X "$@"` call shared by all its names (there is exactly
+    one handler function per arm, not one per name), so the first
+    alternative names it correctly."""
+    first = subcommand.split("|", 1)[0]
+    return "cmd_" + first.replace("-", "_")
 
 
 # PEACHES PR #218 review (comment 5833150249): the prior version of this
@@ -180,8 +194,19 @@ def _expected_handler_name(subcommand):
 # name (derived mechanically, never hand-maintained -- see
 # _expected_handler_name above) so a typo'd or wrong handler name in the
 # arm is caught by the SAME assertion, not a separate one.
+#
+# NEWLINE-SEPARATED FORM (lr-51112e fold-in, PEACHES PR #218 review comment
+# 5836927583): a multi-line arm shaped like `secrets)\n    shift\n
+# cmd_secrets "$@"\n    ;;` (see TestDispatcherParserHandlesMultiLineArms)
+# has no `;` between `shift` and the handler call at all -- the separator is
+# a bare newline. The prior pattern `shift\s*;\s*cmd_X` REQUIRED a literal
+# `;`, which `\s*` alone does not stand in for, so this exact multi-line
+# shape -- correctly written shell, ordered and bound -- would fail the
+# ordered-binding assertion despite being a genuine pass. The separator is
+# now `(?:;|\n)` -- either a `;` (single-line arms) or a newline (multi-line
+# arms), with surrounding whitespace still tolerated on either side.
 def _shift_then_bound_call_pattern(handler):
-    return re.compile(r'shift\s*;\s*' + re.escape(handler) + r'\s+"\$@"')
+    return re.compile(r'shift\s*(?:;|\n)\s*' + re.escape(handler) + r'\s+"\$@"')
 
 
 class TestDispatcherCaseArmsShiftAndForwardArgv(unittest.TestCase):
@@ -249,6 +274,18 @@ class TestOrderedBindingRejectsArgvDroppedToADifferentCall(unittest.TestCase):
 
     def test_correctly_bound_shift_then_call_passes(self):
         arm = 'secrets) shift; cmd_secrets "$@" ;;'
+        handler = _expected_handler_name("secrets")
+        self.assertIsNotNone(_shift_then_bound_call_pattern(handler).search(arm))
+
+    def test_correctly_bound_shift_then_call_passes_across_a_newline(self):
+        """Positive control for lr-51112e's fold-in (PEACHES PR #218 review,
+        comment 5836927583): a multi-line arm separates `shift` from its
+        `cmd_X "$@"` call with a bare newline, not a `;` -- this is
+        legitimate, correctly-forwarding shell (see
+        TestDispatcherParserHandlesMultiLineArms's own multi-line arm
+        fixtures) and must satisfy the ordered-binding pattern exactly like
+        the single-line `;`-separated form does."""
+        arm = 'secrets)\n        shift\n        cmd_secrets "$@"\n        ;;'
         handler = _expected_handler_name("secrets")
         self.assertIsNotNone(_shift_then_bound_call_pattern(handler).search(arm))
 
@@ -402,7 +439,13 @@ class TestAlternationCaseArmsAreSwept(unittest.TestCase):
                        msg="an alternation-labeled case arm (foo|bar)) must be captured by "
                            "the real dispatcher parser, not silently excluded")
         self.assertEqual(labels, ["foo|bar"])
-        self.assertTrue(_shift_then_bound_call_pattern("cmd_foo").search(arms["foo|bar"]))
+        # Call _expected_handler_name rather than hardcode "cmd_foo" (lr-51112e
+        # fold-in, PEACHES PR #218 review comment 5836927583) -- this proves
+        # the real handler-name mapping the main sweep actually uses handles
+        # an alternation label correctly, not a hand-picked stand-in for it.
+        handler = _expected_handler_name("foo|bar")
+        self.assertEqual(handler, "cmd_foo")
+        self.assertTrue(_shift_then_bound_call_pattern(handler).search(arms["foo|bar"]))
 
     def test_alternation_arm_missing_forward_is_swept_and_fails(self):
         """The actual negative control: an alternation arm that FORGOT
@@ -422,8 +465,10 @@ class TestAlternationCaseArmsAreSwept(unittest.TestCase):
                        msg="an alternation arm missing shift/\"$@\" must still be captured, "
                            "not silently dropped -- silently dropping it would hide the exact "
                            "defect this sweep exists to catch")
+        handler = _expected_handler_name("foo|bar")
+        self.assertEqual(handler, "cmd_foo")
         self.assertIsNone(
-            _shift_then_bound_call_pattern("cmd_foo").search(arms["foo|bar"]),
+            _shift_then_bound_call_pattern(handler).search(arms["foo|bar"]),
             msg="an alternation arm with no shift/\"$@\" forwarding must fail the "
                 "ordered-binding pattern, proving the sweep actually rejects this shape",
         )
