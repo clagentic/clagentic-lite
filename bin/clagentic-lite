@@ -3070,22 +3070,26 @@ cmd_doctor() {
     fi
   done
 
-  # 5a. gitleaks version floor (lr-170808 scope item 4). `gitleaks git`
+  # 5a. gitleaks version floor (lr-170808 scope item 4; floor corrected
+  # 8.18->8.19, PEACHES PR #218 review, comment 5833150249). `gitleaks git`
   # (feature-branch history scanning — scripts/gates.sh cmd_secrets,
-  # docs/GATES.md "4a. Secrets") landed in gitleaks 8.18; below that floor,
-  # cmd_secrets falls back to a staged-only scan that is a documented no-op
-  # on a clean index (a Builder commit always leaves the index clean), so
-  # committed-but-not-staged secrets on a feature branch go unscanned on
-  # EVERY run, silently, until the operator happens to have unstaged work.
-  # This is a STANDING COVERAGE GAP, not a per-run surprise — report it once,
-  # here, rather than leaving it to be rediscovered as an intermittent-looking
-  # gate behavior. GITLEAKS_MIN_VERSION mirrors the .gitleaks.toml header
+  # docs/GATES.md "4a. Secrets") landed in gitleaks 8.19, not 8.18 --
+  # confirmed directly against upstream gitleaks' own cobra command
+  # definitions (cmd/git.go absent at v8.18.4, present from v8.19.0
+  # onward); below that floor, cmd_secrets falls back to a staged-only scan
+  # that is a documented no-op on a clean index (a Builder commit always
+  # leaves the index clean), so committed-but-not-staged secrets on a
+  # feature branch go unscanned on EVERY run, silently, until the operator
+  # happens to have unstaged work. This is a STANDING COVERAGE GAP, not a
+  # per-run surprise — report it once, here, rather than leaving it to be
+  # rediscovered as an intermittent-looking gate behavior.
+  # GITLEAKS_ALLOWLIST_MIN_VERSION mirrors the .gitleaks.toml header
   # comment's own floor (8.25, required for [[allowlists]] array-of-tables +
-  # condition = "AND" semantics) as a SEPARATE, higher bar from the 8.18
+  # condition = "AND" semantics) as a SEPARATE, higher bar from the
   # history-scan floor — both are reported, since they gate different
   # capabilities and a repo can be below one but not the other.
   printf '\ngitleaks version:\n'
-  GITLEAKS_HISTORY_MIN_VERSION="8.18.0"
+  GITLEAKS_HISTORY_MIN_VERSION="8.19.0"
   GITLEAKS_ALLOWLIST_MIN_VERSION="8.25.0"
   if command -v gitleaks >/dev/null 2>&1; then
     _gl_ver_raw=$(gitleaks version 2>/dev/null || true)
