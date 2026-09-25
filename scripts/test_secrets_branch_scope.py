@@ -534,25 +534,45 @@ class TestGitleaksGitInvocationUsesPositionalRepoNotSourceFlag(unittest.TestCase
     the gate -- see _gitleaks_git_subcommand_available's own docstring)."""
 
     def test_both_gitleaks_git_call_sites_use_positional_repo_arg(self):
+        """PEACHES PR #218 review (comment 5834286140): the selector here
+        used to be `"gitleaks git " in line and "run_bounded" in line and
+        "REPO_ROOT" in line` -- requiring "REPO_ROOT" in the SELECTOR means
+        a call site that forgot to pin REPO_ROOT (the exact defect this
+        test exists to catch) would simply never be selected at all, so the
+        sweep would silently report "found N" for whatever N conforming
+        lines happen to exist and never even look at the non-conforming
+        one. The selector now finds every REAL `gitleaks git` scan
+        invocation by the broadest reliable property -- a `run_bounded`
+        call naming `gitleaks git` -- and the REPO_ROOT pin is asserted
+        AFTERWARDS, on every selected line, so an unpinned call site fails
+        the assertion instead of silently vanishing from the swept set."""
         with open(os.path.join(REAL_SCRIPTS_DIR, "gates.sh")) as f:
             src = f.read()
-        # Scoped to cmd_secrets' own $REPO_ROOT-pinned call sites only --
-        # _gitleaks_positive_control's canary scan is a THIRD `gitleaks git`
-        # call site in this file, but it deliberately targets its own
-        # scratch dir via `cd "$_gpc_dir" &&`, never $REPO_ROOT/--source, so
-        # it is out of scope for this pin (see that function's own doc
-        # comment for why cd, not a positional/--source arg, is correct
-        # there).
+        # Scoped to the cmd_secrets FUNCTION BODY (found mechanically by its
+        # own `cmd_secrets()` definition line through the next top-level
+        # `^}` at column 0, never a hand-picked line range that could drift
+        # from the real file) -- this is what task requirement (2) means by
+        # "the broadest reliable selector": every gitleaks invocation WITHIN
+        # cmd_secrets, not a narrower property-of-interest filter.
+        # _gitleaks_positive_control's canary scan is a genuinely different
+        # function (its own scratch-dir-scoped `cd "$_gpc_dir" && ...`, see
+        # that function's own doc comment for why `cd`, not a
+        # positional/--source arg, is correct there) and is out of scope
+        # for this pin by construction, not by an ad hoc substring filter
+        # that could just as easily exclude a real non-conforming line.
+        secrets_start = src.index("\ncmd_secrets()")
+        secrets_end = src.index("\n}", secrets_start)
+        secrets_body = src[secrets_start:secrets_end]
         git_call_lines = [
-            line for line in src.splitlines()
-            if "gitleaks git " in line and "run_bounded" in line and "REPO_ROOT" in line
+            line for line in secrets_body.splitlines()
+            if "gitleaks git " in line and "run_bounded" in line
         ]
         self.assertEqual(
             len(git_call_lines), 2,
-            msg=f"expected exactly 2 $REPO_ROOT-pinned `gitleaks git` invocations "
-                f"in cmd_secrets (branch-history and staged/pre-commit) -- found "
-                f"{len(git_call_lines)}: {git_call_lines}. Update this pin if "
-                f"cmd_secrets legitimately gained/lost a gitleaks git call site.",
+            msg=f"expected exactly 2 `gitleaks git` scan invocations in cmd_secrets "
+                f"(branch-history and staged/pre-commit) -- found {len(git_call_lines)}: "
+                f"{git_call_lines}. Update this pin if cmd_secrets legitimately "
+                f"gained/lost a gitleaks git call site.",
         )
         for line in git_call_lines:
             self.assertNotIn(
@@ -569,6 +589,30 @@ class TestGitleaksGitInvocationUsesPositionalRepoNotSourceFlag(unittest.TestCase
                 msg=f"`gitleaks git` call site does not pass $REPO_ROOT as a "
                     f"`--`-terminated positional argument: {line!r}",
             )
+
+    def test_selector_catches_a_call_site_that_forgot_the_repo_root_pin(self):
+        """Negative control (PEACHES PR #218 review, comment 5834286140):
+        proves the selector above actually SELECTS an unpinned `gitleaks
+        git` call site rather than silently excluding it. Exercises the
+        same selector expression against a synthetic source line, not the
+        real gates.sh -- if a future call site in gates.sh really did drop
+        the REPO_ROOT pin, `test_both_gitleaks_git_call_sites_use_positional_repo_arg`
+        above would fail its own `-- "$REPO_ROOT"` assertion; this test
+        only pins that the SELECTOR itself would have caught it, which is
+        the property PEACHES's finding was about."""
+        unpinned_line = '      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --redact --no-banner $CFG_ARG; then'
+        selected = "gitleaks git " in unpinned_line and "run_bounded" in unpinned_line
+        self.assertTrue(
+            selected,
+            msg="the selector must match a run_bounded gitleaks git call site even "
+                "when it has no REPO_ROOT pin -- a selector requiring REPO_ROOT would "
+                "silently exclude exactly this non-conforming line",
+        )
+        self.assertNotIn(
+            '-- "$REPO_ROOT"', unpinned_line,
+            msg="sanity check on the fixture itself: this synthetic line must actually "
+                "be missing the pin, or this test is not exercising what it claims to",
+        )
 
     def test_gitleaks_protect_fallback_still_uses_source_flag_unaffected(self):
         """The older `gitleaks protect` fallback is a genuinely separate
