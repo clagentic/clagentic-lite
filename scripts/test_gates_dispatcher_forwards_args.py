@@ -29,10 +29,10 @@ Two layers of coverage, deliberately not just one:
      before it ever reaches `cmd_secrets`. The POSITIVE proof that a
      forwarded flag actually changes `cmd_secrets`' own behavior (scoped vs.
      full-history stderr output) lives in `test_secrets_branch_scope.py`,
-     which needs `gitleaks git` (8.18+) to exercise meaningfully; this file
+     which needs `gitleaks git` (8.19+) to exercise meaningfully; this file
      stays gitleaks-version-independent so the dispatcher-forwarding
      property itself is verified on every installed gitleaks version, not
-     only 8.18+.
+     only 8.19+.
 
 Run with: python3 -m unittest scripts.test_gates_dispatcher_forwards_args -v
 """
@@ -143,32 +143,64 @@ def _case_block_dispatches(subcommand):
     return arms[subcommand]
 
 
+def _expected_handler_name(subcommand):
+    """Map a dispatcher subcommand LABEL to its cmd_X handler function name,
+    e.g. "merge-gate" -> "cmd_merge_gate". Every real dispatcher arm in
+    scripts/gates.sh follows this mapping (dashes become underscores,
+    "cmd_" prefixed) -- confirmed against every current label
+    (init/bleed/secrets/deps/sast/review/adversarial/merge-gate/
+    render-review/render-manifest/deferrals-lint/audit-vocab-lint/ship/
+    pre-push/log-run/digest/status/tail)."""
+    return "cmd_" + subcommand.replace("-", "_")
+
+
+# PEACHES PR #218 review (comment 5833150249): the prior version of this
+# assertion only checked that `shift;`/`shift ;` and `"$@"` occurred
+# SOMEWHERE in the arm, independently -- an arm shaped like
+# `secrets) shift; log_args "$@"; cmd_secrets ;;` would pass both
+# independent substring checks (it contains "shift;" and it contains
+# '"$@"') while cmd_secrets itself still receives NO arguments at all,
+# because "$@" was bound to a DIFFERENT call (log_args) in the same arm.
+# The real property under test is the ORDERED, BOUND sequence
+# `shift; cmd_X "$@"` -- shift immediately followed by the actual handler
+# call with "$@" attached to THAT call, not merely present somewhere in the
+# arm's text. Matched via a regex anchored on the literal expected handler
+# name (derived mechanically, never hand-maintained -- see
+# _expected_handler_name above) so a typo'd or wrong handler name in the
+# arm is caught by the SAME assertion, not a separate one.
+def _shift_then_bound_call_pattern(handler):
+    return re.compile(r'shift\s*;\s*' + re.escape(handler) + r'\s+"\$@"')
+
+
 class TestDispatcherCaseArmsShiftAndForwardArgv(unittest.TestCase):
     """Static-but-anchored check: every subcommand's own case arm, read
     directly from the real dispatcher source, must both `shift` (consume the
     subcommand token itself) and forward `"$@"` to its cmd_X call -- the
     exact shape lr-51112e's field report named as missing for
     secrets/deps/sast/ship/pre-push/digest (gates.sh's dispatcher, at the
-    time of that report)."""
+    time of that report).
+
+    Asserts the ORDERED, BOUND `shift; cmd_X "$@"` sequence directly (not
+    "shift" and '"$@"' as two independent substring checks -- see PEACHES
+    PR #218 review, comment 5833150249, and
+    TestOrderedBindingRejectsArgvDroppedToADifferentCall below for the
+    regression this closes)."""
 
     def test_every_subcommand_with_args_shifts_and_forwards(self):
-        missing_shift = []
-        missing_forward = []
+        not_bound = []
         for subcommand, _extra_args in _SUBCOMMANDS_WITH_ARGS:
             arm = _case_block_dispatches(subcommand)
-            if "shift;" not in arm and "shift ;" not in arm:
-                missing_shift.append((subcommand, arm))
-            if '"$@"' not in arm:
-                missing_forward.append((subcommand, arm))
+            handler = _expected_handler_name(subcommand)
+            if not _shift_then_bound_call_pattern(handler).search(arm):
+                not_bound.append((subcommand, handler, arm))
         self.assertEqual(
-            missing_shift, [],
-            msg=f"dispatcher case arm(s) missing `shift` before calling cmd_X -- "
-                f"the subcommand token itself would leak into cmd_X's own argv[1]: {missing_shift}",
-        )
-        self.assertEqual(
-            missing_forward, [],
-            msg=f"dispatcher case arm(s) missing `\"$@\"` -- every argument after the "
-                f"subcommand name is silently dropped before reaching cmd_X: {missing_forward}",
+            not_bound, [],
+            msg=f"dispatcher case arm(s) do not contain the ordered, bound "
+                f"`shift; cmd_X \"$@\"` sequence -- either `shift` is missing, "
+                f"`\"$@\"` is bound to a DIFFERENT call in the same arm (the "
+                f"subcommand's own argv is then silently dropped before "
+                f"reaching cmd_X), or the handler name does not match the "
+                f"expected cmd_<subcommand> mapping: {not_bound}",
         )
 
     def test_init_is_deliberately_argument_less_but_still_shifts(self):
@@ -178,8 +210,35 @@ class TestDispatcherCaseArmsShiftAndForwardArgv(unittest.TestCase):
         being a second bare-call special case future maintainers have to
         remember the reason for."""
         arm = _case_block_dispatches("init")
-        self.assertIn("shift", arm)
-        self.assertIn('"$@"', arm)
+        self.assertTrue(_shift_then_bound_call_pattern("cmd_init").search(arm))
+
+
+class TestOrderedBindingRejectsArgvDroppedToADifferentCall(unittest.TestCase):
+    """Regression pin for PEACHES PR #218 review, comment 5833150249: a
+    negative control proving the ordered-binding assertion actually rejects
+    the exact shape the old independent-substring-check version would have
+    missed -- an arm that shifts and uses "$@" somewhere, but binds it to a
+    call OTHER than the real cmd_X handler, must fail."""
+
+    def test_shift_and_dollar_at_present_but_bound_to_wrong_call_fails(self):
+        arm = 'secrets) shift; log_args "$@"; cmd_secrets ;;'
+        handler = _expected_handler_name("secrets")
+        self.assertIsNone(
+            _shift_then_bound_call_pattern(handler).search(arm),
+            msg="an arm binding \"$@\" to log_args instead of cmd_secrets "
+                "must NOT satisfy the ordered-binding pattern -- cmd_secrets "
+                "still receives no arguments in this shape",
+        )
+
+    def test_bare_cmd_call_with_no_dollar_at_fails(self):
+        arm = 'secrets) shift; cmd_secrets ;;'
+        handler = _expected_handler_name("secrets")
+        self.assertIsNone(_shift_then_bound_call_pattern(handler).search(arm))
+
+    def test_correctly_bound_shift_then_call_passes(self):
+        arm = 'secrets) shift; cmd_secrets "$@" ;;'
+        handler = _expected_handler_name("secrets")
+        self.assertIsNotNone(_shift_then_bound_call_pattern(handler).search(arm))
 
 
 class TestDispatcherParserHandlesMultiLineArms(unittest.TestCase):
@@ -293,7 +352,7 @@ class TestDispatcherActuallyForwardsArgvAtRuntime(unittest.TestCase):
     "secrets --full-scan" as a whole failed to match the `secrets)` arm) is
     caught here directly. See test_secrets_branch_scope.py for the POSITIVE
     proof that a forwarded --full-scan flag actually changes cmd_secrets'
-    own scoping behavior (needs gitleaks 8.18+ to exercise meaningfully)."""
+    own scoping behavior (needs gitleaks 8.19+ to exercise meaningfully)."""
 
     def test_secrets_full_scan_flag_does_not_confuse_the_dispatcher(self):
         tmp = tempfile.mkdtemp(prefix="clagentic-test-dispatch-argv-")
