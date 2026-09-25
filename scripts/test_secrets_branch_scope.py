@@ -68,7 +68,8 @@ def _gitleaks_available():
 
 def _gitleaks_git_subcommand_available():
     """This task's branch-history scope fix only applies to the `gitleaks
-    git` code path (8.18+, capability-probed by cmd_secrets itself via
+    git` code path (8.19+ -- corrected from 8.18, PEACHES PR #218 review,
+    comment 5833150249; capability-probed by cmd_secrets itself via
     `gitleaks git --help`, never a version-string parse -- see
     docs/GATES.md's own "Version floor" note). An older installed gitleaks
     (Ubuntu 24.04's `apt install gitleaks` ships 8.16.0, below this floor)
@@ -82,7 +83,17 @@ def _gitleaks_git_subcommand_available():
         return False
     try:
         r = subprocess.run(["gitleaks", "git", "--help"], capture_output=True, text=True, timeout=30)
-    except Exception:
+    except (OSError, subprocess.TimeoutExpired):
+        # PEACHES PR #218 review (comment 5833150249): `except Exception`
+        # here converted a programming error (e.g. a bad subprocess.run
+        # call, a typo'd kwarg) into a silent skip of all ten regression
+        # tests gated on this probe -- the exact failure mode this task's
+        # own doctrine (no bare except) exists to prevent. Only the probe's
+        # OWN anticipated failure modes are caught: gitleaks missing/broken
+        # (OSError, e.g. ENOENT/EACCES/binary-corrupted) or hanging past the
+        # 30s bound (subprocess.TimeoutExpired). Anything else -- a real bug
+        # in this probe -- must fail the suite loudly instead of masquerading
+        # as "gitleaks git subcommand not available".
         return False
     return r.returncode == 0
 
@@ -128,7 +139,7 @@ def _commit_secret_on_main(work, filename, secret_line):
     subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], check=True, cwd=work, env=env)
 
 
-@unittest.skipUnless(_gitleaks_git_subcommand_available(), "gitleaks git subcommand not available (needs 8.18+)")
+@unittest.skipUnless(_gitleaks_git_subcommand_available(), "gitleaks git subcommand not available (needs 8.19+)")
 class TestSecretsBranchScopeDoesNotFlagPreExistingDefaultBranchFinding(unittest.TestCase):
     """The exact reported defect: a secret already committed to the default
     branch, before the feature branch existed, must NOT block the feature
@@ -177,7 +188,7 @@ class TestSecretsBranchScopeDoesNotFlagPreExistingDefaultBranchFinding(unittest.
         self.assertIn("full history", result.stderr)
 
 
-@unittest.skipUnless(_gitleaks_git_subcommand_available(), "gitleaks git subcommand not available (needs 8.18+)")
+@unittest.skipUnless(_gitleaks_git_subcommand_available(), "gitleaks git subcommand not available (needs 8.19+)")
 class TestSecretsBranchScopeStillCatchesInBranchHistory(unittest.TestCase):
     """In-branch history still counts (task's own explicit requirement,
     engram 7617259): a secret introduced then removed EARLIER on this same
@@ -225,7 +236,7 @@ class TestSecretsBranchScopeStillCatchesInBranchHistory(unittest.TestCase):
         self.assertIn("branch diff", result.stderr)
 
 
-@unittest.skipUnless(_gitleaks_git_subcommand_available(), "gitleaks git subcommand not available (needs 8.18+)")
+@unittest.skipUnless(_gitleaks_git_subcommand_available(), "gitleaks git subcommand not available (needs 8.19+)")
 class TestSecretsBranchScopeFreshness(unittest.TestCase):
     """BOBBIE-class freshness precondition (mirrors
     test_bleed_scope.py's TestBleedBranchDiffFreshness and
@@ -303,7 +314,7 @@ class TestSecretsBranchScopeFreshness(unittest.TestCase):
         self.assertNotIn("branch diff", result.stderr)
 
 
-@unittest.skipUnless(_gitleaks_git_subcommand_available(), "gitleaks git subcommand not available (needs 8.18+)")
+@unittest.skipUnless(_gitleaks_git_subcommand_available(), "gitleaks git subcommand not available (needs 8.19+)")
 class TestSecretsLogLineNamesScopeAndRange(unittest.TestCase):
     """Task requirement 4: the log line and cmd_log_run's audit detail must
     state scope+range, not just "scanning branch history" with no further
@@ -424,11 +435,11 @@ class TestSecretsScanIsCwdIndependent(unittest.TestCase):
 
     Exercises the `gitleaks protect --staged` fallback path specifically
     (not `gitleaks git`) -- runnable on gitleaks 8.16 (this host's
-    installed version; `gitleaks git` needs 8.18+, see
+    installed version; `gitleaks git` needs 8.19+, see
     _gitleaks_git_subcommand_available's own docstring above), so this
     class carries NO version-gate skip and always runs for real. The
     `gitleaks git` staged/branch-history call sites received the identical
-    fix but are exercised by the 8.18+-gated classes above; this class
+    fix but are exercised by the 8.19+-gated classes above; this class
     proves the fix at the ONE call site this host can run for real,
     the class-level property (fix the pattern, not the line) is the same
     fix applied uniformly to all three call sites in cmd_secrets."""
@@ -499,6 +510,85 @@ class TestSecretsScanIsCwdIndependent(unittest.TestCase):
             f"a clean staged index in the real target repo must still pass when "
             f"invoked from a different CWD\nstdout={result.stdout}\nstderr={result.stderr}",
         )
+
+
+class TestGitleaksGitInvocationUsesPositionalRepoNotSourceFlag(unittest.TestCase):
+    """Regression pin for PEACHES PR #218 review (comment 5833150249):
+    `gitleaks git` never accepted `--source` as its own flag -- per
+    upstream gitleaks' own cobra command definitions (cmd/git.go,
+    confirmed from the v8.19.0 introduction of the `git` subcommand through
+    the current v8.30.1), `git`'s `Use` string has always been
+    `"git [flags] [repo]"` with `Args: cobra.MaximumNArgs(1)`: the repo is
+    a positional argument. `--source` briefly appeared to work on `git`
+    only via root.go's global persistent flag, removed at v8.20.0 -- so
+    `gitleaks git --source=...` fails with an unknown-flag error on every
+    gitleaks release from 8.20.0 onward, blocking every secrets gate even
+    on a clean repo.
+
+    Reads the REAL scripts/gates.sh source text directly (never a
+    hand-copied re-implementation, which could silently drift from what
+    ships) so a future edit that reintroduces `--source` on a `gitleaks
+    git` call is caught here rather than only discovered against a live
+    modern gitleaks install (this host's installed gitleaks, 8.16, predates
+    the `git` subcommand entirely and cannot itself catch this by running
+    the gate -- see _gitleaks_git_subcommand_available's own docstring)."""
+
+    def test_both_gitleaks_git_call_sites_use_positional_repo_arg(self):
+        with open(os.path.join(REAL_SCRIPTS_DIR, "gates.sh")) as f:
+            src = f.read()
+        # Scoped to cmd_secrets' own $REPO_ROOT-pinned call sites only --
+        # _gitleaks_positive_control's canary scan is a THIRD `gitleaks git`
+        # call site in this file, but it deliberately targets its own
+        # scratch dir via `cd "$_gpc_dir" &&`, never $REPO_ROOT/--source, so
+        # it is out of scope for this pin (see that function's own doc
+        # comment for why cd, not a positional/--source arg, is correct
+        # there).
+        git_call_lines = [
+            line for line in src.splitlines()
+            if "gitleaks git " in line and "run_bounded" in line and "REPO_ROOT" in line
+        ]
+        self.assertEqual(
+            len(git_call_lines), 2,
+            msg=f"expected exactly 2 $REPO_ROOT-pinned `gitleaks git` invocations "
+                f"in cmd_secrets (branch-history and staged/pre-commit) -- found "
+                f"{len(git_call_lines)}: {git_call_lines}. Update this pin if "
+                f"cmd_secrets legitimately gained/lost a gitleaks git call site.",
+        )
+        for line in git_call_lines:
+            self.assertNotIn(
+                "--source", line,
+                msg=f"a `gitleaks git` call site still passes `--source` -- this "
+                    f"flag does not exist on the `git` subcommand from gitleaks "
+                    f"8.20.0 onward (removed with the global persistent flag) and "
+                    f"was NEVER a git-local flag at any version; every gitleaks "
+                    f"git call must pass $REPO_ROOT as a positional argument "
+                    f"instead: {line!r}",
+            )
+            self.assertIn(
+                '-- "$REPO_ROOT"', line,
+                msg=f"`gitleaks git` call site does not pass $REPO_ROOT as a "
+                    f"`--`-terminated positional argument: {line!r}",
+            )
+
+    def test_gitleaks_protect_fallback_still_uses_source_flag_unaffected(self):
+        """The older `gitleaks protect` fallback is a genuinely separate
+        code path (its own runProtect, never merged with `git`'s
+        positional-arg design) that registers its own local `-s`/
+        `--source` flag, confirmed unchanged through gitleaks 8.30.1 --
+        this fix must NOT touch it."""
+        with open(os.path.join(REAL_SCRIPTS_DIR, "gates.sh")) as f:
+            src = f.read()
+        protect_call_lines = [
+            line for line in src.splitlines()
+            if "gitleaks protect " in line and "run_bounded" in line
+        ]
+        self.assertEqual(len(protect_call_lines), 1,
+                          msg=f"expected exactly 1 `gitleaks protect` invocation "
+                              f"(older-gitleaks fallback): {protect_call_lines}")
+        self.assertIn("--source", protect_call_lines[0],
+                       msg="the gitleaks protect fallback must keep using "
+                           "--source -- it is a separate code path from "
+                           "`git` and was never affected by this fix")
 
 
 if __name__ == "__main__":
