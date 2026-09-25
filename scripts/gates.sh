@@ -1403,7 +1403,7 @@ cmd_secrets() {
     cmd_log_run secrets block "gitleaks not installed (fail-closed)"
     return 1
   fi
-  # Build the invocation: gitleaks 8.18+ uses `gitleaks git --pre-commit --staged`;
+  # Build the invocation: gitleaks 8.19+ uses `gitleaks git --pre-commit --staged`;
   # older versions use `gitleaks protect --staged`. Both honor --config.
   CFG_ARG=""
   [ -f "$REPO_ROOT/.gitleaks.toml" ] && CFG_ARG="--config=$REPO_ROOT/.gitleaks.toml"
@@ -1469,8 +1469,9 @@ cmd_secrets() {
 
   # Probe by capability, not version string — `gitleaks version` output
   # format varies (`v8.18.4`, `8.18.4`, multi-line banner). The `git`
-  # subcommand was added in 8.18; if `gitleaks git --help` exits 0 we use
-  # it, otherwise we fall back to `gitleaks protect`.
+  # subcommand was added in 8.19 (corrected from an earlier "8.18" claim,
+  # PEACHES PR #218 review, comment 5833150249); if `gitleaks git --help`
+  # exits 0 we use it, otherwise we fall back to `gitleaks protect`.
   # Bound every gitleaks invocation (INV-1a/INV-2, class-4 foundry fix): a
   # full branch-history scan in particular can legitimately take longer than
   # the generic run_bounded default, so gitleaks gets its own configurable
@@ -1565,20 +1566,39 @@ cmd_secrets() {
       # subdirectory) has gitleaks silently scan the WRONG repo (or the
       # wrapper's own non-repo CWD) while this gate reports whatever that
       # unrelated scan found -- a false pass on the real target, not an
-      # error. Pinned via `--source`/`-s` (verified against this host's
-      # installed gitleaks, 8.16 -- a Global Flag shared by every
-      # subcommand's own --help, including `detect`/`protect`; `gitleaks
-      # git` needs 8.18+ and could not be probed directly on this host, but
-      # Global Flags apply uniformly across subcommands in this CLI, and
-      # `--source` is the one form confirmed NOT to be silently ignored --
-      # see the sibling fix on the `protect` fallback below, where a bare
-      # trailing positional WAS silently ignored, not an error, the exact
-      # false-pass shape this fix exists to close). This makes the scanned
-      # repo explicit and CWD-independent, the same property `_git -C
-      # "$REPO_ROOT"` already guarantees for every plain git call in this
+      # error.
+      #
+      # CORRECTED (PEACHES PR #218 review, comment 5833150249): the previous
+      # fix here pinned via a `--source`/`-s` flag on `gitleaks git` itself.
+      # That flag never reliably existed on `git`: per gitleaks' own cobra
+      # command definitions (cmd/git.go, verified against the v8.19.0
+      # introduction of the `git` subcommand through the current v8.30.1),
+      # `git`'s `Use` string has always been `"git [flags] [repo]"` with
+      # `Args: cobra.MaximumNArgs(1)` -- the repo is a POSITIONAL argument,
+      # never a `git`-local flag. `--source` briefly worked on `git` only
+      # because root.go's global `--source`/`-s` persistent flag was still
+      # inherited in the v8.19.0-v8.19.3 window; v8.20.0 removed that global
+      # flag entirely (the same release that made `detect`/`protect` hidden
+      # and deprecated in favor of `git`), so `gitleaks git --source=...`
+      # fails with an unknown-flag error on every gitleaks from 8.20.0
+      # onward -- every secrets gate blocked, even on a clean repo, on any
+      # modern gitleaks install. `detect`/`protect` are a genuinely separate
+      # code path that registers its OWN local `-s`/`--source` flag
+      # (confirmed unchanged through 8.30.1) -- that fallback below is
+      # correct as-is and untouched by this fix.
+      #
+      # The positional `[repo]` argument is the ONLY invocation shape that
+      # has worked across the entire `git`-subcommand era (8.19.0-8.30.1
+      # confirmed directly against upstream source), so it replaces
+      # `--source` here rather than adding a second version-gated branch --
+      # gitleaks 8.18 predates the `git` subcommand's existence altogether,
+      # so the `gitleaks git --help` capability probe above already excludes
+      # every version this positional form would not work on. This makes the
+      # scanned repo explicit and CWD-independent, the same property `_git
+      # -C "$REPO_ROOT"` already guarantees for every plain git call in this
       # file.
       # shellcheck disable=SC2086
-      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --redact --no-banner $CFG_ARG $_SECRETS_LOG_OPTS --source "$REPO_ROOT"; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --redact --no-banner $CFG_ARG $_SECRETS_LOG_OPTS -- "$REPO_ROOT"; then
         # Runtime-assembled details string (lr-2e8444): route through the
         # checked helper, same as cmd_bleed's own $_BLEED_SCOPE_REASON pass
         # sites, so a scope-reason string that happens to contain a failure
@@ -1589,9 +1609,13 @@ cmd_secrets() {
         return 1
       fi
     else
-      # REPO_ROOT PINNED EXPLICITLY: same CWD-independence fix as above.
+      # REPO_ROOT PINNED EXPLICITLY: same CWD-independence fix as above, and
+      # the same positional-argument correction (PEACHES PR #218 review,
+      # comment 5833150249) -- `gitleaks git` has never accepted `--source`
+      # as its own flag; see the comment above the branch-history call site
+      # for the full version history.
       # shellcheck disable=SC2086
-      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG --source "$REPO_ROOT"; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG -- "$REPO_ROOT"; then
         cmd_log_run secrets pass ""
       else
         cmd_log_run secrets block "gitleaks reported findings or timed out after ${_SECRETS_TIMEOUT}s"
