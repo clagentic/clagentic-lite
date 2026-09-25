@@ -927,7 +927,7 @@ change-scoped pattern scan (internal-bleed):
 
 | | |
 |---|---|
-| **Tool** | `gitleaks git --staged --pre-commit --redact --no-banner` (8.18+) or `gitleaks protect --staged --redact --no-banner` (older). The orchestrator capability-probes via `gitleaks git --help` and picks the right surface. |
+| **Tool** | `gitleaks git --staged --pre-commit --redact --no-banner` (8.19+, the release that introduced the `git` subcommand) or `gitleaks protect --staged --redact --no-banner` (older). The orchestrator capability-probes via `gitleaks git --help` and picks the right surface. |
 | **Blocks?** | Yes. Also blocks if gitleaks is missing entirely — set `CLAGENTIC_ALLOW_MISSING_GITLEAKS=1` to skip explicitly. |
 | **Override** | None for findings — secrets cannot be committed. Rotate, then re-stage. |
 | **Augment** | `.gitleaks.toml` in repo root extends the default ruleset. Path-scoped allowlists only (see `.gitleaks.toml` comment for why regex allowlists on token literals are dangerous). |
@@ -946,18 +946,41 @@ from `REPO_ROOT` (a hook invoked from a subdirectory, an orchestrator that
 `cd`s elsewhere before shelling out), gitleaks silently scanned the WRONG
 repo — or a clean, unrelated CWD — while `cmd_secrets` reported whatever
 that unrelated scan found: a false pass on the real target, not an error.
-Both `gitleaks git` and `gitleaks protect` are now pinned via their shared
-`--source`/`-s` Global Flag (`gitleaks protect --help`'s Global Flags
-section, which `gitleaks git` also carries) — confirmed against this
-project's own CI host (gitleaks 8.16) that `protect` has **no** positional
+`gitleaks protect` is pinned via its own `-s`/`--source` flag (`gitleaks
+protect --help`'s Global Flags section) — confirmed against this project's
+own CI host (gitleaks 8.16) that `protect` has **no** positional
 `[DIRECTORY]` argument at all; an earlier draft of this fix passed a bare
 trailing path token, which gitleaks silently ignored rather than erroring
-on, reproducing the exact false-pass shape this fix exists to close. See
+on, reproducing the exact false-pass shape this fix exists to close.
+
+**`gitleaks git` is pinned via a positional argument, not `--source`
+(CORRECTED, PEACHES PR #218 review, comment 5833150249).** An earlier draft
+of this fix pinned `gitleaks git` the same way as `protect` — via
+`--source`/`-s` — reasoning that it was a Global Flag shared by every
+subcommand. That reasoning was wrong for `git` specifically: per gitleaks'
+own cobra command definitions (`cmd/git.go`, verified directly against the
+v8.19.0 introduction of the `git` subcommand through the current v8.30.1),
+`git`'s `Use` string has always been `"git [flags] [repo]"` with
+`Args: cobra.MaximumNArgs(1)` — the repo is a positional argument, never a
+`git`-local flag. `--source` briefly appeared to work on `git` only because
+`root.go`'s global `--source`/`-s` persistent flag was still inherited in
+the narrow v8.19.0–v8.19.3 window; v8.20.0 removed that global flag
+entirely (the same release that made `detect`/`protect` hidden and
+deprecated in favor of `git`), so `gitleaks git --source=...` fails with an
+unknown-flag error on every gitleaks release from 8.20.0 onward — every
+secrets gate blocked, even on a clean repo, on any modern gitleaks install.
+The fix now passes `$REPO_ROOT` as `git`'s positional argument (`gitleaks
+git ... -- "$REPO_ROOT"`) instead — the only invocation shape confirmed to
+work across the entire `git`-subcommand era (8.19.0–8.30.1). `detect`/
+`protect` are a genuinely separate code path (their own `runDetect`/
+`runProtect`, never merged with `git`'s positional-arg design) that
+registers its own local `-s`/`--source` flag, confirmed unchanged through
+8.30.1 — that fallback is unaffected by this correction. See
 `scripts/test_secrets_branch_scope.py`'s `TestSecretsScanIsCwdIndependent`
 for the regression coverage, exercised for real against the `gitleaks
 protect --staged` fallback (runnable on any installed gitleaks, no version
 gate) since that is the one call site this project's own CI host can
-exercise without a gitleaks 8.18+ upgrade.
+exercise without a gitleaks 8.19+ upgrade.
 
 **Branch-history scope (lr-51112e) — scan RANGE, not full history, by default.**
 On a feature branch with a clean index (no staged changes), `cmd_secrets`
@@ -1021,11 +1044,11 @@ trail never credits a CLI flag nobody passed — a collapsed single boolean
 previously reported every env-only trigger as `(--full-scan)`.
 
 **Unchanged by this task.** The staged-diff path (`gitleaks git --staged
---pre-commit`, the table above) and the older-gitleaks (pre-8.18)
+--pre-commit`, the table above) and the older-gitleaks (pre-8.19)
 `gitleaks protect --staged` fallback are both untouched — neither consults
 the branch-history scope machinery at all. See
 `scripts/test_secrets_branch_scope.py` for the regression coverage (needs
-gitleaks 8.18+ to exercise the `gitleaks git` code path meaningfully; skips
+gitleaks 8.19+ to exercise the `gitleaks git` code path meaningfully; skips
 cleanly on an older installed gitleaks, same posture the version-floor note
 below already documents) and `scripts/test_gates_dispatcher_forwards_args.py`
 for the companion dispatcher-argument-forwarding sweep (see "Dispatcher
@@ -1125,18 +1148,21 @@ same downstream wire for all three causes, computed once from the fixed,
 greppable vocabulary each already writes to `gate_runs.details`, not three
 separate signals.
 
-**Version floor: `gitleaks git` requires 8.18+ (lr-170808).** `clagentic-lite
-doctor` reports the installed gitleaks version and warns below two floors
-independently: 8.18 (the `gitleaks git` subcommand cmd_secrets uses for
-feature-branch history scanning — below this floor, a feature branch with a
-clean index falls back to a staged-only scan that is a documented no-op,
-so committed-but-unstaged secrets go unscanned on EVERY such run, not just
-intermittently) and 8.25 (`[[allowlists]]`/`condition = "AND"` semantics —
-see `.gitleaks.toml`'s own header comment). Ubuntu 24.04's `apt install
-gitleaks` currently installs 8.16.0, below both floors — this affects most
-Linux installs following the obvious install path, and is a standing
-coverage gap the operator should know about once, not rediscover as an
-intermittent-looking gate behavior.
+**Version floor: `gitleaks git` requires 8.19+ (lr-170808; corrected from
+8.18, PEACHES PR #218 review, comment 5833150249).** `clagentic-lite doctor`
+reports the installed gitleaks version and warns below two floors
+independently: 8.19 (the release that introduced the `gitleaks git`
+subcommand cmd_secrets uses for feature-branch history scanning — 8.18
+predates `git`'s existence entirely, confirmed directly against upstream
+gitleaks' own cobra command definitions; below this floor, a feature branch
+with a clean index falls back to a staged-only scan that is a documented
+no-op, so committed-but-unstaged secrets go unscanned on EVERY such run,
+not just intermittently) and 8.25 (`[[allowlists]]`/`condition = "AND"`
+semantics — see `.gitleaks.toml`'s own header comment). Ubuntu 24.04's `apt
+install gitleaks` currently installs 8.16.0, below both floors — this
+affects most Linux installs following the obvious install path, and is a
+standing coverage gap the operator should know about once, not rediscover
+as an intermittent-looking gate behavior.
 
 **Dispatcher argument forwarding (lr-51112e).** `scripts/gates.sh`'s own
 trailing `case "${1:-}" in ... esac` dispatch block is the single place that
