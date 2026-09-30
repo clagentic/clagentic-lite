@@ -377,7 +377,10 @@ CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 # CLAGENTIC_SECRETS_TIMEOUT_SEC=300
 # CLAGENTIC_OSV_TIMEOUT_SEC=300
 # CLAGENTIC_SAST_TIMEOUT_SEC=300
-# `git push` and the host adapter's open-change-request call in `gates ship`:
+# `git push` and the host adapter's open-change-request call in `gates ship`.
+# The push runs the pre-push hook (deps + sast), so its default bound is
+# CLAGENTIC_OSV_TIMEOUT_SEC + CLAGENTIC_SAST_TIMEOUT_SEC + 120; setting this
+# key overrides that bound (and is the adapter call's bound, default 120):
 # CLAGENTIC_SHIP_TIMEOUT_SEC=120
 # The git fetch + ls-remote freshness check that resolves the default-branch
 # ref for a gate's diff/file scope (see also CLAGENTIC_SAST_FETCH_TIMEOUT_SEC

@@ -288,6 +288,102 @@ class TestFetchFailureReason(_ScratchBase):
         self.assertNotIn("s3cr3t-token", out)
 
 
+class TestFailureReasonMasksCredentials(_ScratchBase):
+    """_bounded_failure_reason echoes git's own error line, and git can quote
+    the remote URL in it."""
+
+    def _reason(self, stderr_text):
+        err = os.path.join(self.tmp, "err.txt")
+        with open(err, "w") as f:
+            f.write(stderr_text)
+        r = self._run_sourced(f'_bounded_failure_reason 128 5 "{err}"\n')
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        return r.stdout
+
+    def test_userinfo_is_masked_up_to_the_last_at_sign(self):
+        """A password that itself contains '@' must not leak its tail."""
+        out = self._reason(
+            "fatal: unable to access 'https://bob:p@ss-tail@host.example/r.git/': 401\n")
+        self.assertNotIn("ss-tail", out)
+        self.assertNotIn("p@ss", out)
+        self.assertNotIn("bob", out)
+        self.assertIn("https://***@host.example/r.git/", out)
+
+    def test_plain_userinfo_is_masked(self):
+        out = self._reason(
+            "fatal: unable to access 'https://bob:s3cr3t@host.example/r.git/': 401\n")
+        self.assertNotIn("s3cr3t", out)
+        self.assertIn("https://***@host.example", out)
+
+    def test_query_string_values_are_masked(self):
+        out = self._reason(
+            "fatal: unable to access 'https://host.example/r.git/?token=abc123&x=keep1': 401\n")
+        self.assertNotIn("abc123", out)
+        self.assertNotIn("keep1", out)
+        self.assertIn("token=***", out)
+        self.assertIn("x=***", out)
+
+    def test_a_url_without_credentials_is_left_readable(self):
+        out = self._reason(
+            "fatal: unable to access 'https://host.example/r.git/': Could not resolve host\n")
+        self.assertIn("https://host.example/r.git/", out)
+        self.assertIn("Could not resolve host", out)
+
+
+class TestGitNeverPromptsForCredentials(_ScratchBase):
+    """A missing credential must fail at once with git's own error, not wait
+    on a prompt until the timeout fires. The test env deliberately leaves
+    GIT_TERMINAL_PROMPT unset so only the gate's own setting can turn the
+    prompt off."""
+
+    def setUp(self):
+        super().setUp()
+        self.env.pop("GIT_TERMINAL_PROMPT", None)
+        self.spy_log = os.path.join(self.tmp, "git-spy.log")
+        spy_dir = os.path.join(self.tmp, "spy-bin")
+        os.makedirs(spy_dir)
+        real_git = shutil.which("git")
+        spy = os.path.join(spy_dir, "git")
+        with open(spy, "w") as f:
+            f.write(
+                "#!/bin/sh\n"
+                f"printf '%s|%s\\n' \"${{GIT_TERMINAL_PROMPT-unset}}\" \"$*\" >> '{self.spy_log}'\n"
+                f"exec '{real_git}' \"$@\"\n"
+            )
+        os.chmod(spy, 0o755)
+        self.spy_env = {"PATH": spy_dir + os.pathsep + self.env.get("PATH", "")}
+
+    def _spied(self, verb):
+        if not os.path.exists(self.spy_log):
+            return []
+        with open(self.spy_log) as f:
+            return [ln.strip() for ln in f if f" {verb} " in ln]
+
+    def test_fetch_and_ls_remote_run_with_the_prompt_disabled(self):
+        server = self._start(_Server(self.tmp, require_auth=True))
+        self._set_origin(f"http://127.0.0.1:{server.port}/remote.git")
+
+        rc, out = self._resolve(extra_env=self.spy_env)
+        self.assertEqual(rc, 1, msg=out)
+        fetches = self._spied("fetch")
+        self.assertTrue(fetches, "no git fetch was observed")
+        for line in fetches:
+            self.assertTrue(line.startswith("0|"), msg=line)
+
+    def test_credential_requiring_remote_fails_fast_with_gits_error(self):
+        import time
+        server = self._start(_Server(self.tmp, require_auth=True))
+        self._set_origin(f"http://127.0.0.1:{server.port}/remote.git")
+
+        started = time.monotonic()
+        rc, out = self._resolve(timeout_sec=30, extra_env=self.spy_env)
+        self.assertLess(time.monotonic() - started, 20, msg=out)
+        self.assertEqual(rc, 1, msg=out)
+        self.assertIn("failed (exit", out)
+        self.assertNotIn("timed out", out)
+        self.assertRegex(out, r"(?i)(authentication failed|could not read|fatal)")
+
+
 class TestCanaryIgnoresUserHooks(_ScratchBase):
 
     def _hooks_dir(self):
@@ -384,6 +480,65 @@ class TestShipPush(_ScratchBase):
         out = r.stdout + r.stderr
         self.assertNotEqual(r.returncode, 0, msg=out)
         self.assertIn("push timed out after 2s", out)
+        self.assertIn("may include pre-push hook time", out)
+
+    @unittest.skipUnless(_HAVE_TIMEOUT, "no timeout/gtimeout binary")
+    def test_pre_push_hook_slower_than_the_old_flat_bound_still_succeeds(self):
+        """The push runs the enrolled pre-push hook. A hook that takes longer
+        than the old 120s default, but well inside the computed bound (deps +
+        sast + allowance), must give a successful push, not a false timeout."""
+        hook = os.path.join(self.work, ".git", "hooks", "pre-push")
+        with open(hook, "w") as f:
+            f.write("#!/bin/sh\nsleep 125\nexit 0\n")
+        os.chmod(hook, 0o755)
+
+        r = self._ship(timeout=400)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, msg=out)
+        self.assertNotIn("timed out", out)
+        self.assertEqual(
+            self._head_sha(self.bare, "refs/heads/feature"),
+            self._head_sha(self.work),
+        )
+
+    def test_push_runs_with_the_credential_prompt_disabled(self):
+        env_log = os.path.join(self.tmp, "push-env.log")
+        spy_dir = os.path.join(self.tmp, "spy-bin")
+        os.makedirs(spy_dir)
+        real_git = shutil.which("git")
+        spy = os.path.join(spy_dir, "git")
+        with open(spy, "w") as f:
+            f.write(
+                "#!/bin/sh\n"
+                f"printf '%s|%s\\n' \"${{GIT_TERMINAL_PROMPT-unset}}\" \"$*\" >> '{env_log}'\n"
+                f"exec '{real_git}' \"$@\"\n"
+            )
+        os.chmod(spy, 0o755)
+        self.env.pop("GIT_TERMINAL_PROMPT", None)
+
+        r = self._ship(extra_env={
+            "PATH": spy_dir + os.pathsep + self.env.get("PATH", "")})
+        self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+        with open(env_log) as f:
+            pushes = [ln.strip() for ln in f if " push " in ln]
+        self.assertTrue(pushes, "no git push was observed")
+        for line in pushes:
+            self.assertTrue(line.startswith("0|"), msg=line)
+
+    def test_credential_requiring_remote_push_fails_fast_with_gits_error(self):
+        import time
+        server = self._start(_Server(self.tmp, require_auth=True))
+        self._set_origin(f"http://127.0.0.1:{server.port}/remote.git")
+        self.env.pop("GIT_TERMINAL_PROMPT", None)
+
+        started = time.monotonic()
+        r = self._ship(timeout=60)
+        out = r.stdout + r.stderr
+        self.assertLess(time.monotonic() - started, 30, msg=out)
+        self.assertNotEqual(r.returncode, 0, msg=out)
+        self.assertIn("push failed (exit", out)
+        self.assertNotIn("timed out", out)
+        self.assertRegex(out, r"(?i)(authentication failed|could not read|fatal)")
 
 
 if __name__ == "__main__":

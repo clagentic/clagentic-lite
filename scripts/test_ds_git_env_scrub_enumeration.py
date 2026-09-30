@@ -1,8 +1,11 @@
 """
-Regression test for lr-dfd45f: ds_git_env_scrub (scripts/platform.sh) must
-clear EXACTLY the enumerated set of git-exported env vars this task
-determined are hazardous for a scratch/canary git repo -- no more, no less,
-by ENUMERATION PARITY rather than a handful of spot-checked vars.
+Regression test for the git environment scrubs in scripts/platform.sh.
+ds_git_scratch_env_scrub (the wide, scratch-repo-only scrub) must clear
+EXACTLY the enumerated set of git-exported env vars determined hazardous for
+a scratch/canary git repo -- no more, no less, by ENUMERATION PARITY rather
+than a handful of spot-checked vars. The narrow, process-wide
+ds_git_env_scrub is covered by the last class: it clears only the
+repo-redirecting subset and must leave the user's git configuration alone.
 
 WHY PARITY, NOT SPOT-CHECKS: a spot-check test ("assert GIT_DIR is unset,
 assert GIT_WORK_TREE is unset, ...") passes even if a future edit silently
@@ -156,7 +159,7 @@ class TestDsGitEnvScrubEnumerationParity(unittest.TestCase):
         still_set = {k: v for k, v in result.items() if v is not None}
         self.assertEqual(
             still_set, {},
-            msg=f"ds_git_env_scrub left these vars set: {still_set}",
+            msg=f"ds_git_scratch_env_scrub left these vars set: {still_set}",
         )
 
     def test_no_additional_var_is_silently_unset(self):
@@ -391,6 +394,29 @@ class TestDsGitEnvScrubIsProcessWideSafe(unittest.TestCase):
         result = _run_scrub_probe(self.REDIRECT_VARS, scrub_fn="ds_git_env_scrub")
         still_set = {k: v for k, v in result.items() if v is not None}
         self.assertEqual(still_set, {}, msg=f"left set: {still_set}")
+
+    def test_every_repo_redirecting_var_is_unset_completeness(self):
+        """Completeness of the narrowed scrub: every repo-redirecting variable
+        must be cleared, and dropping any one of them fails here by name. The
+        set is EXPECTED_UNSET_VARS (the wide scrub's enumeration) minus the
+        identity and global/system-config channels, which the process-wide
+        scrub must leave to the user. Each variable is probed on its own so a
+        failure names exactly the one that was dropped."""
+        scratch_only = {
+            "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL", "GIT_CONFIG_SYSTEM",
+        }
+        process_wide = [v for v in EXPECTED_UNSET_VARS if v not in scratch_only]
+        # The variables the scrub's contract names explicitly must all be in
+        # the derived set, so a future edit to EXPECTED_UNSET_VARS cannot
+        # quietly shrink what this test proves.
+        for required in self.REDIRECT_VARS:
+            self.assertIn(required, process_wide + ["GIT_CONFIG_COUNT"])
+        for name in process_wide:
+            with self.subTest(var=name):
+                result = _run_scrub_probe([name], scrub_fn="ds_git_env_scrub")
+                self.assertIsNone(
+                    result[name], msg=f"{name} survived ds_git_env_scrub")
 
     def test_indexed_config_injection_is_unset(self):
         """GIT_CONFIG_COUNT and its KEY_n/VALUE_n pairs inject arbitrary

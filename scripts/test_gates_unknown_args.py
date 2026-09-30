@@ -27,8 +27,9 @@ from test_source_helpers import GATES_SH, source_env  # noqa: E402
 # Subcommands that legitimately take one optional positional argument.
 _FILE_POSITIONAL = {"render-manifest", "render-review", "deferrals-lint",
                     "audit-vocab-lint", "status"}
-# Subcommands with no accepted arguments at all.
-_NO_ARGS = {"init", "deps", "sast", "ship", "pre-push", "digest"}
+# Subcommands with no accepted arguments at all. pre-push is separate: git
+# invokes it with `<remote-name> <remote-url>`, so it takes exactly 0 or 2.
+_NO_ARGS = {"init", "deps", "sast", "ship", "digest"}
 # (subcommand, allowed flags) pairs, each of which must be accepted.
 _ACCEPTED_FLAGS = {
     "secrets": ["--full-scan"],
@@ -110,6 +111,44 @@ class TestPositionalArguments(_Scratch):
             r = self._gates("log-run", *args)
             self.assertEqual(r.returncode, 2, msg=f"{args}: {r.stderr}")
             self.assertIn("usage: gates.sh log-run", r.stderr)
+
+
+class TestPrePushArguments(_Scratch):
+    """git runs the hook as `pre-push <remote-name> <remote-url>` with ref
+    lines on stdin. Exactly 0 or 2 positional arguments are valid."""
+
+    def _pre_push(self, *args):
+        env = self._env()
+        # No scanner is available or wanted: the argument check runs before
+        # any gate, and the valid forms only need to get past it.
+        env["CLAGENTIC_GATES"] = "none"
+        return subprocess.run(
+            ["sh", GATES_SH, "pre-push", *args], env=env, cwd=self.repo,
+            capture_output=True, text=True, timeout=60,
+            stdin=subprocess.DEVNULL,
+        )
+
+    def test_zero_and_two_positional_arguments_are_accepted(self):
+        for args in ([], ["origin", "https://example.invalid/r.git"]):
+            r = self._pre_push(*args)
+            self.assertNotEqual(r.returncode, 2, msg=f"{args}: {r.stderr}")
+            self.assertNotIn("usage: gates.sh pre-push", r.stderr)
+
+    def test_one_positional_argument_is_rejected(self):
+        r = self._pre_push("origin")
+        self.assertEqual(r.returncode, 2, msg=r.stderr)
+        self.assertIn("usage: gates.sh pre-push", r.stderr)
+
+    def test_three_positional_arguments_are_rejected(self):
+        r = self._pre_push("origin", "url", "extra")
+        self.assertEqual(r.returncode, 2, msg=r.stderr)
+        self.assertIn("usage: gates.sh pre-push", r.stderr)
+
+    def test_a_flag_is_rejected_even_with_two_arguments(self):
+        for args in (["--full-scan"], ["--no-verify", "url"]):
+            r = self._pre_push(*args)
+            self.assertEqual(r.returncode, 2, msg=f"{args}: {r.stderr}")
+            self.assertIn("usage: gates.sh pre-push", r.stderr)
 
 
 class TestAcceptedArgumentsStillWork(_Scratch):

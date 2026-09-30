@@ -225,15 +225,22 @@ run_bounded() {
 # "deadline fired" status and is reported as a timeout; any other non-zero
 # exit is a real failure and carries the last non-empty stderr line so the
 # operator sees git's own complaint (authentication, DNS, permission) instead
-# of a generic "failed or timed out". URL userinfo is masked: git can echo the
-# remote URL, and a remote configured as https://user:token@host must not
-# land in an audit row or a terminal scrollback.
+# of a generic "failed or timed out". Credentials in a URL are masked: git can
+# echo the remote URL, and a remote configured as https://user:token@host (or
+# carrying a token in its query string) must not land in an audit row or a
+# terminal scrollback. Userinfo is masked up to the LAST '@' before the host,
+# so a password that itself contains '@' does not leak its tail; every
+# query-string value is masked.
+#
+# Optional 4th arg: a note appended to the timeout message only (the ship push
+# uses it to say the bound may include pre-push hook time).
 _bounded_failure_reason() {
   _bfr_rc="$1"
   _bfr_timeout="$2"
   _bfr_err_file="$3"
+  _bfr_timeout_note="${4:-}"
   if [ "$_bfr_rc" = "124" ]; then
-    printf 'timed out after %ss' "$_bfr_timeout"
+    printf 'timed out after %ss%s' "$_bfr_timeout" "$_bfr_timeout_note"
     return 0
   fi
   _bfr_last=""
@@ -241,7 +248,7 @@ _bounded_failure_reason() {
     # Git's multi-line failures end on a generic hint ("and the repository
     # exists."); the informative line is the last `fatal:`/`error:` one, so
     # prefer it and fall back to the last non-empty line.
-    _bfr_last=$(awk 'NF { line = $0 } /^(fatal|error):/ { fe = $0 } END { print (fe != "" ? fe : line) }' "$_bfr_err_file" | sed 's#://[^/@ ]*@#://***@#g' | cut -c1-300)
+    _bfr_last=$(awk 'NF { line = $0 } /^(fatal|error):/ { fe = $0 } END { print (fe != "" ? fe : line) }' "$_bfr_err_file" | sed -e 's#://[^/ ]*@#://***@#g' -e 's,\([?&][^=&# ]*\)=[^&# ]*,\1=***,g' | cut -c1-300)
   fi
   if [ -n "$_bfr_last" ]; then
     printf 'failed (exit %s): %s' "$_bfr_rc" "$_bfr_last"
@@ -467,9 +474,11 @@ _gate_resolve_fresh_default_branch_ref() {
   # is pinned off for this one command so a user-level hook configuration
   # (reference-transaction fires on fetch) cannot run inside a gate, without
   # wiping the rest of the user's git config the fetch needs to authenticate.
+  # GIT_TERMINAL_PROMPT=0 makes a missing credential fail at once with git's
+  # own error instead of waiting on a prompt until the timeout fires.
   _gfdbr_err=$(mktemp -t clagentic-gate-fetch-err.XXXXXX) || _gfdbr_err=/dev/null
   _gfdbr_rc=0
-  $DS_TIMEOUT_CMD "$_gfdbr_timeout" git -C "$REPO_ROOT" -c core.hooksPath=/dev/null fetch origin "$_gfdbr_branch" >/dev/null 2>"$_gfdbr_err" || _gfdbr_rc=$?
+  $DS_TIMEOUT_CMD "$_gfdbr_timeout" env GIT_TERMINAL_PROMPT=0 git -C "$REPO_ROOT" -c core.hooksPath=/dev/null fetch origin "$_gfdbr_branch" >/dev/null 2>"$_gfdbr_err" || _gfdbr_rc=$?
   if [ "$_gfdbr_rc" -ne 0 ]; then
     _gfdbr_reason=$(_bounded_failure_reason "$_gfdbr_rc" "$_gfdbr_timeout" "$_gfdbr_err")
     [ "$_gfdbr_err" = /dev/null ] || rm -f "$_gfdbr_err"
@@ -490,7 +499,7 @@ _gate_resolve_fresh_default_branch_ref() {
     _gfdbr_err=$(mktemp -t clagentic-gate-lsremote-err.XXXXXX) || _gfdbr_err=/dev/null
     _gfdbr_out=$(mktemp -t clagentic-gate-lsremote-out.XXXXXX) || _gfdbr_out=/dev/null
     _gfdbr_rc=0
-    $DS_TIMEOUT_CMD "$_gfdbr_timeout" git -C "$REPO_ROOT" ls-remote origin "refs/heads/${_gfdbr_branch}" >"$_gfdbr_out" 2>"$_gfdbr_err" || _gfdbr_rc=$?
+    $DS_TIMEOUT_CMD "$_gfdbr_timeout" env GIT_TERMINAL_PROMPT=0 git -C "$REPO_ROOT" ls-remote origin "refs/heads/${_gfdbr_branch}" >"$_gfdbr_out" 2>"$_gfdbr_err" || _gfdbr_rc=$?
     if [ "$_gfdbr_rc" -ne 0 ]; then
       _gfdbr_ls_reason=$(_bounded_failure_reason "$_gfdbr_rc" "$_gfdbr_timeout" "$_gfdbr_err")
     else
@@ -8246,10 +8255,19 @@ cmd_ship() {
     # push failure. Spell out `git -C "$REPO_ROOT"` instead.
     _SHIP_PUSH_ERR=$(mktemp -t clagentic-ship-push-err.XXXXXX) || _SHIP_PUSH_ERR=/dev/null
     _SHIP_PUSH_RC=0
-    run_bounded "$_SHIP_TIMEOUT" -- git -C "$REPO_ROOT" push -u origin "$BRANCH" 2>"$_SHIP_PUSH_ERR" || _SHIP_PUSH_RC=$?
+    #
+    # The push runs the enrolled pre-push hook (deps + sast, each under its own
+    # bound) and the user's own chained hooks, so the push bound must cover
+    # them: default = deps bound + sast bound + a network allowance, from the
+    # same keys the hook uses. CLAGENTIC_SHIP_TIMEOUT_SEC overrides it.
+    # GIT_TERMINAL_PROMPT=0 makes a missing credential fail fast with git's
+    # own error instead of hanging until the bound.
+    _SHIP_PUSH_DEFAULT=$(( $(ds_positive_int_or_default "${CLAGENTIC_OSV_TIMEOUT_SEC:-}" 300) + $(ds_positive_int_or_default "${CLAGENTIC_SAST_TIMEOUT_SEC:-}" 300) + 120 ))
+    _SHIP_PUSH_TIMEOUT=$(ds_positive_int_or_default "${CLAGENTIC_SHIP_TIMEOUT_SEC:-}" "$_SHIP_PUSH_DEFAULT")
+    run_bounded "$_SHIP_PUSH_TIMEOUT" -- env GIT_TERMINAL_PROMPT=0 git -C "$REPO_ROOT" push -u origin "$BRANCH" 2>"$_SHIP_PUSH_ERR" || _SHIP_PUSH_RC=$?
     [ -s "$_SHIP_PUSH_ERR" ] && cat "$_SHIP_PUSH_ERR" 1>&2
     if [ "$_SHIP_PUSH_RC" -ne 0 ]; then
-      _SHIP_PUSH_REASON=$(_bounded_failure_reason "$_SHIP_PUSH_RC" "$_SHIP_TIMEOUT" "$_SHIP_PUSH_ERR")
+      _SHIP_PUSH_REASON=$(_bounded_failure_reason "$_SHIP_PUSH_RC" "$_SHIP_PUSH_TIMEOUT" "$_SHIP_PUSH_ERR" " (may include pre-push hook time)")
       [ "$_SHIP_PUSH_ERR" = /dev/null ] || rm -f "$_SHIP_PUSH_ERR"
       echo "[gates/ship] push $_SHIP_PUSH_REASON"
       cmd_log_run ship block "push $_SHIP_PUSH_REASON"
@@ -8294,7 +8312,17 @@ cmd_ship() {
 # inconclusive, and therefore always runs both gates (fail-closed by
 # construction).
 cmd_pre_push() {
-  _gate_check_args pre-push "" "" "$@" || exit 2
+  # git invokes the hook as `pre-push <remote-name> <remote-url>`; accept
+  # exactly those two positionals or none, and nothing else (flags included).
+  case "$#" in
+    0|2) : ;;
+    *) echo "usage: gates.sh pre-push [<remote-name> <remote-url>]" 1>&2; exit 2 ;;
+  esac
+  for _pp_arg in "$@"; do
+    case "$_pp_arg" in
+      -*) echo "gates.sh pre-push: unknown option '$_pp_arg'" 1>&2; echo "usage: gates.sh pre-push [<remote-name> <remote-url>]" 1>&2; exit 2 ;;
+    esac
+  done
   _PRE_PUSH_REFS_FILE=$(mktemp -t clagentic-prepush-stdin.XXXXXX)
   cat > "$_PRE_PUSH_REFS_FILE"
   CLAGENTIC_GATE_REFS_FILE="$_PRE_PUSH_REFS_FILE"
