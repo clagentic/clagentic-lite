@@ -4,16 +4,23 @@
 # Load order, later wins: (1) this global config, (2) the repo's
 # .clagentic/config, (3) the repo's legacy .env, if one exists (a v0.1 leftover:
 # still honored, never created). All are dot-sourced, so a value in any of them
-# overrides the same key already exported in your shell.
+# overrides the same key already exported in your shell (except the global-only
+# keys below).
 #
 # GLOBAL-ONLY KEYS: the rendered Claude Code plugin is one per user, so the keys
-# it is built from are read from THIS global file (plus the environment), never
-# from a repo's .clagentic/config: the five CLAGENTIC_<ROLE>_AGENT_MODEL keys,
-# CLAGENTIC_ROUTER_URL, CLAGENTIC_ROUTER_INJECT_AGENT_MODEL, and the reviewer,
-# auditor and gate CLAGENTIC_<ROLE>_CMD while router injection is on (builder and
-# troubleshooter _CMD never affect the render). `clagentic-lite doctor` warns
-# when a repo's config sets one. The per-repo value still applies to the
-# gate/CLI path and is ignored only when rendering the dispatched agents.
+# it is built from are read from THIS global file and nothing else. Neither a
+# repo's .clagentic/config nor a value exported in your shell (or inherited when
+# `update` re-execs itself after a pull) can change the rendered plugin. The
+# keys: the five CLAGENTIC_<ROLE>_AGENT_MODEL keys, CLAGENTIC_ROUTER_URL,
+# CLAGENTIC_ROUTER_INJECT_AGENT_MODEL, and the reviewer, auditor and gate
+# CLAGENTIC_<ROLE>_CMD while router injection is on (builder and troubleshooter
+# _CMD never affect the render). `clagentic-lite doctor` warns when a repo's
+# config sets one, and prints an INFO when an exported value differs from this
+# file's. What a per-repo value still does: the _CMD keys and
+# CLAGENTIC_ROUTER_URL apply to the gate/CLI path (llm-client.sh) and are
+# ignored only when rendering dispatched agents; the _AGENT_MODEL keys and
+# CLAGENTIC_ROUTER_INJECT_AGENT_MODEL are read by the render alone, so set per
+# repo they have no effect anywhere.
 #
 # TIMING: a repo-local .clagentic/config does not take effect until AFTER
 # the repo has been enrolled — it is not read during the very first
@@ -143,10 +150,13 @@ CLAGENTIC_SUMMARIZER_CHAIN=codex:spark
 # Builder and Troubleshooter (which have no router path). GLOBAL-ONLY: set
 # these here, not in a repo's .clagentic/config (see the note at the top).
 #
-# Value: a Claude Code model alias, a full model ID, or `inherit`. Letters,
-# digits and . _ : / @ [ ] - only; anything else is ignored with a WARN at
-# render time and a `doctor` finding. The values below are EXAMPLES, not
-# recommendations; use whatever your Claude Code backend accepts.
+# Value: a Claude Code model alias, a full model ID, or `inherit`. Grammar:
+# ASCII letters, digits and . _ : / @ [ ] - only; must start with a letter or
+# digit; must end with a letter, digit or `]`; must not start with `role:`
+# (that prefix is the router-reference form, written only by router injection).
+# Anything else is ignored with a WARN at render time and a `doctor` finding.
+# The values below are EXAMPLES, not recommendations; use whatever your Claude
+# Code backend accepts.
 #   - A bare alias (sonnet, opus, haiku) resolves to Claude Code's built-in
 #     default for the ACTIVE backend, which on Bedrock/Vertex can lag the
 #     newest model. On those backends prefer the full model ID your account

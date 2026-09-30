@@ -161,20 +161,34 @@ optional, committed — **note:** not read on the very first `enroll` call for a
 given repo, only from the next command onward; see README.md "What init and
 enroll do"), then the repo's legacy `<repo>/.env` if one exists (a v0.1
 leftover: still honored, never created). All are dot-sourced, so a value in any
-of them also overrides the same key already exported in the shell. Edit the file directly (it's plain
+of them also overrides the same key already exported in the shell (except the
+global-only keys below, which read the global file alone). Edit the file directly (it's plain
 `KEY=value` shell, `chmod 600`); the CLI has no subcommand for editing config.
 
 **Global-only keys.** The rendered plugin is one per user, not one per repo, so
-the keys it is built from are read from the **global** config (plus the calling
-environment) only: the five `CLAGENTIC_<ROLE>_AGENT_MODEL` keys,
-`CLAGENTIC_ROUTER_URL`, `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL`, and the reviewer,
-auditor and gate `CLAGENTIC_<ROLE>_CMD` while router injection is on (the
-builder and troubleshooter `_CMD` never affect the rendered plugin). A repo's
-`.clagentic/config` (or legacy `.env`) cannot change the rendered plugin; if it
-sets one of these, `clagentic-lite doctor` warns, naming the key and the file.
-The per-repo value still applies to the gate/CLI path (`llm-client.sh`) and is
-ignored only when rendering the dispatched agents. To change the dispatched
-agents, put the key in the global config.
+the keys it is built from are read from the **global config file**
+(`~/.config/clagentic/lite/config`) and nothing else: the five
+`CLAGENTIC_<ROLE>_AGENT_MODEL` keys, `CLAGENTIC_ROUTER_URL`,
+`CLAGENTIC_ROUTER_INJECT_AGENT_MODEL`, and the reviewer, auditor and gate
+`CLAGENTIC_<ROLE>_CMD` while router injection is on (the builder and
+troubleshooter `_CMD` never affect the rendered plugin). Neither a repo's
+`.clagentic/config` (or legacy `.env`) nor a value exported in the shell can
+change the rendered plugin, and that includes a value inherited when `update`
+re-execs itself after a pull. `update`, `init` and `doctor` resolve these keys by
+sourcing only the global file, so the plugin is the same whichever repo you ran
+`update` from.
+
+Nothing is silently ignored. If a repo's `.clagentic/config` (or `.env`) sets one
+of these, `clagentic-lite doctor` warns, naming the key and the file. What the
+warning says depends on the key: the `_CMD` keys and `CLAGENTIC_ROUTER_URL` are
+also read by the gate/CLI path (`llm-client.sh`), so the per-repo value still
+applies there and is ignored only when rendering the dispatched agents; the
+`_AGENT_MODEL` keys and `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` are read by the
+render alone, so set per repo they have no effect anywhere. If a render key is
+exported in the environment `doctor` runs in with a value that differs from the
+global file's, `doctor` prints an INFO saying the exported value is ignored for
+dispatched-agent render (the value itself is never printed). To change the
+dispatched agents, put the key in the global config.
 
 `update` never rewrites an existing config's key set, so keys shipped after
 your `init` are simply absent. `clagentic-lite doctor` names them
@@ -210,9 +224,13 @@ expects a Builder dispatched from Claude Code to change model. It does not.
 Things to tell the user when they ask about models:
 
 - `CLAGENTIC_<ROLE>_AGENT_MODEL` takes a Claude Code model alias, a full model
-  ID, or `inherit`. Unset means the agent runs on the session model. Letters,
-  digits and `. _ : / @ [ ] -` only; anything else is ignored with a warning
-  and a `doctor` finding.
+  ID, or `inherit`. Unset means the agent runs on the session model. The exact
+  grammar: ASCII letters, digits and `. _ : / @ [ ] -` only; it must start with
+  a letter or digit, must end with a letter, digit or `]`, and must not start
+  with `role:` (that prefix is the router-reference form, written only by
+  router injection, never by a pinned value). Anything else, including any
+  control character or newline, is ignored with a warning and a `doctor`
+  finding; the value is never written into the agent file.
 - Precedence per role: router injection (`CLAGENTIC_ROUTER_INJECT_AGENT_MODEL`,
   reviewer/auditor/merge-gate only) beats `_AGENT_MODEL`, which beats no
   `model:` line. `doctor` says when an `_AGENT_MODEL` key is shadowed.
