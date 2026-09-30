@@ -215,22 +215,18 @@ class _RenderTestBase(unittest.TestCase):
             for key, value in values.items():
                 f.write(f"{key}={shlex.quote(value)}\n")
 
-    def _run(self, script_body, extra_env=None, exported_env=None):
+    def _run(self, script_body, extra_env=None):
         """Runs script_body in a throwaway `sh`.
 
         extra_env: CLAGENTIC_* entries are written to the fixture GLOBAL
             config (the only place the render reads), everything else (PATH,
             ...) is exported into the child environment. Written afresh on
             every call, so one call's config never leaks into the next.
-        exported_env: exported into the child environment verbatim, for the
-            tests that prove an inherited variable does NOT reach the render.
         """
         extra_env = dict(extra_env or {})
         config_values = {k: v for k, v in extra_env.items() if k.startswith("CLAGENTIC_")}
         extra_env = {k: v for k, v in extra_env.items() if k not in config_values}
         self._write_fixture_global_config(config_values)
-        if exported_env:
-            extra_env.update(exported_env)
         env = self._scrubbed_env()
         # HOME is ALWAYS pinned to a fixture dir under self.tmp, never the
         # real environment's HOME -- _LEGACY_ROUTER_PLUGIN_CACHE_DIR derives
