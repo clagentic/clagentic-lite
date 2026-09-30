@@ -1024,8 +1024,15 @@ _llm_field_sanitize() {
     # text into the same stdin would either be silently discarded or
     # interleaved with the script depending on shell/buffering — the data
     # channel and the script channel must be different file descriptors.
-    _lfs_tmp=$(mktemp -t clagentic-llm-sanitize.XXXXXX)
-    printf '%s' "$_lfs_text" > "$_lfs_tmp"
+    # A failed mktemp/write returns nonzero with NO output rather than running
+    # the sanitizer over an empty or truncated temp file: every caller that
+    # feeds a prompt must see the failure, not an empty "sanitized" string.
+    _lfs_tmp=$(mktemp -t clagentic-llm-sanitize.XXXXXX 2>/dev/null) || return 1
+    [ -n "$_lfs_tmp" ] || return 1
+    if ! printf '%s' "$_lfs_text" > "$_lfs_tmp" 2>/dev/null; then
+      rm -f "$_lfs_tmp"
+      return 1
+    fi
     python3 - "$_lfs_tmp" "$_lfs_max" <<'PYEOF'
 import re
 import sys
@@ -1336,6 +1343,12 @@ PYEOF
 # Args: JSON (a JSON array of objects, as a single string), FIELD1..FIELDN
 # (one or more field names to sanitize on every object in the array).
 # stdout: the sanitized JSON array (or the original JSON, on any failure).
+#
+# This wrapper keeps the fail-open contract for its existing callers. A caller
+# on the merge-gate payload path must NOT use it: fail-open there hands the
+# original, unsanitized text to the model. Use
+# _llm_json_array_sanitize_fields_strict instead, which never returns the
+# input on failure.
 _llm_json_array_sanitize_fields() {
   _ljasf_json="$1"
   shift
@@ -1346,106 +1359,144 @@ _llm_json_array_sanitize_fields() {
     printf '%s' "$_ljasf_json"
     return 0
   fi
+  if _ljasf_result=$(_llm_json_array_sanitize_fields_strict "$_ljasf_json" $_ljasf_fields); then
+    printf '%s' "$_ljasf_result"
+  else
+    printf '%s' "$_ljasf_json"
+  fi
+  return 0
+}
 
+# _llm_json_array_sanitize_fields_strict JSON FIELD1 [FIELD2 ...] — same
+# decompose/sanitize/rebuild as _llm_json_array_sanitize_fields, but FAIL
+# CLOSED: any failure (no JSON tool, input not an array, a temp file that
+# cannot be created, a JSON tool error on any item or field, an empty
+# intermediate result) returns 1 and prints NOTHING. It never prints the
+# original input and never a partial array, so a caller cannot mistake a
+# failure for "sanitized" or for "no entries". Exit 0 prints the sanitized
+# array.
+_llm_json_array_sanitize_fields_strict() {
+  _ljass_json="$1"
+  shift
+  _ljass_fields="$*"
+  [ -n "$_ljass_fields" ] || return 1
   if command -v jq >/dev/null 2>&1; then
-    # Type check FIRST, not just "length parses as a number" -- jq's
-    # `length` returns a number for strings/objects too (e.g. a JSON string
-    # scalar's character count), which would otherwise silently pass the
-    # numeric guard below and then fail differently (indexing a non-array
-    # with .[$i] and producing garbage/empty results) instead of hitting
-    # the fail-open path. A non-array input must return the ORIGINAL input
-    # unchanged, never an empty array -- an empty array is indistinguishable
-    # from "genuinely no entries" and would silently make malformed-but-
-    # non-empty content disappear instead of degrading visibly.
-    if ! printf '%s' "$_ljasf_json" | jq -e '. | type == "array"' >/dev/null 2>&1; then
-      printf '%s' "$_ljasf_json"
-      return 0
-    fi
-    _ljasf_count=$(printf '%s' "$_ljasf_json" | jq 'length' 2>/dev/null)
-    case "$_ljasf_count" in ''|*[!0-9]*) printf '%s' "$_ljasf_json"; return 0 ;; esac
-    _ljasf_out="[]"
-    _ljasf_i=0
-    while [ "$_ljasf_i" -lt "$_ljasf_count" ]; do
-      _ljasf_item=$(printf '%s' "$_ljasf_json" | jq -c ".[$_ljasf_i]" 2>/dev/null) || break
-      _ljasf_jq_args=""
-      for _ljasf_field in $_ljasf_fields; do
-        _ljasf_raw=$(printf '%s' "$_ljasf_item" | jq -r --arg f "$_ljasf_field" '.[$f] // ""' 2>/dev/null)
-        _ljasf_clean=$(_llm_field_sanitize "$_ljasf_raw")
-        _ljasf_item=$(printf '%s' "$_ljasf_item" | jq -c --arg f "$_ljasf_field" --arg v "$_ljasf_clean" \
-          'if has($f) then .[$f] = $v else . end' 2>/dev/null)
-      done
-      # Accumulator and item travel on stdin (slurped), not --argjson: an
-      # argv string over MAX_ARG_STRLEN (~128 KiB) fails exec, which would
-      # make this loop fail open with the unsanitized input.
-      _ljasf_out=$(printf '%s\n%s' "$_ljasf_out" "$_ljasf_item" | jq -c -s '.[0] + [.[1]]' 2>/dev/null)
-      [ -n "$_ljasf_out" ] || { printf '%s' "$_ljasf_json"; return 0; }
-      _ljasf_i=$((_ljasf_i + 1))
-    done
-    printf '%s' "$_ljasf_out"
-    return 0
+    _llm_json_array_sanitize_fields_jq "$_ljass_json" $_ljass_fields
+    return $?
   fi
-
   if command -v python3 >/dev/null 2>&1; then
-    _llm_json_array_sanitize_fields_py "$_ljasf_json" $_ljasf_fields
-    return 0
+    _llm_json_array_sanitize_fields_py "$_ljass_json" $_ljass_fields
+    return $?
   fi
+  return 1
+}
 
-  # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open: same
-  # posture as _sanitize_adversarial_findings_json's own no-JSON-tool path.
-  printf '%s' "$_ljasf_json"
+# _llm_json_array_sanitize_fields_jq JSON FIELD... — jq implementation of the
+# strict helper above; same fail-closed contract.
+_llm_json_array_sanitize_fields_jq() {
+  _ljasj_json="$1"
+  shift
+  _ljasj_fields="$*"
+  # Type check FIRST, not just "length parses as a number" -- jq's `length`
+  # returns a number for strings/objects too (e.g. a JSON string scalar's
+  # character count), which would otherwise pass the numeric guard below and
+  # then index a non-array into garbage/empty results. A non-array input is a
+  # failure, never an empty array: an empty array is indistinguishable from
+  # "genuinely no entries".
+  printf '%s' "$_ljasj_json" | jq -e '. | type == "array"' >/dev/null 2>&1 || return 1
+  _ljasj_count=$(printf '%s' "$_ljasj_json" | jq 'length' 2>/dev/null) || return 1
+  case "$_ljasj_count" in ''|*[!0-9]*) return 1 ;; esac
+  _ljasj_out="[]"
+  _ljasj_i=0
+  while [ "$_ljasj_i" -lt "$_ljasj_count" ]; do
+    _ljasj_item=$(printf '%s' "$_ljasj_json" | jq -c ".[$_ljasj_i]" 2>/dev/null) || return 1
+    [ -n "$_ljasj_item" ] || return 1
+    for _ljasj_field in $_ljasj_fields; do
+      _ljasj_raw=$(printf '%s' "$_ljasj_item" | jq -r --arg f "$_ljasj_field" '.[$f] // ""' 2>/dev/null) || return 1
+      _ljasj_clean=$(_llm_field_sanitize "$_ljasj_raw") || return 1
+      _ljasj_item=$(printf '%s' "$_ljasj_item" | jq -c --arg f "$_ljasj_field" --arg v "$_ljasj_clean" \
+        'if has($f) then .[$f] = $v else . end' 2>/dev/null) || return 1
+      [ -n "$_ljasj_item" ] || return 1
+    done
+    # Accumulator and item travel on stdin (slurped), not --argjson: an argv
+    # string over MAX_ARG_STRLEN (~128 KiB) fails exec.
+    _ljasj_out=$(printf '%s\n%s' "$_ljasj_out" "$_ljasj_item" | jq -c -s '.[0] + [.[1]]' 2>/dev/null) || return 1
+    [ -n "$_ljasj_out" ] || return 1
+    _ljasj_i=$((_ljasj_i + 1))
+  done
+  printf '%s' "$_ljasj_out"
 }
 
 # _llm_json_array_sanitize_fields_py JSON FIELD1 [FIELD2 ...] — python3
-# implementation of _llm_json_array_sanitize_fields, same contract and same
-# fail-open results. Nothing of unbounded size is carried as an argv string:
-# the array and each cleaned value go through temp files and the per-item
-# and accumulator JSON through stdin, because exec of an argv string over
-# MAX_ARG_STRLEN (~128 KiB) fails with E2BIG. The old argv-carried form
-# failed its own "is this an array" check on a large array and returned the
-# ORIGINAL, unsanitized input -- a silent bypass of the sanitizer exactly
-# when the payload is big.
+# implementation of the strict helper, same fail-closed contract. Nothing of
+# unbounded size is carried as an argv string: the array and each cleaned
+# value go through temp files and the per-item and accumulator JSON through
+# stdin, because exec of an argv string over MAX_ARG_STRLEN (~128 KiB) fails
+# with E2BIG. The old argv-carried form failed its own "is this an array"
+# check on a large array and returned the ORIGINAL, unsanitized input -- a
+# silent bypass of the sanitizer exactly when the payload is big. The temp
+# files are created here and removed on every exit; the work is in
+# _llm_json_array_sanitize_fields_py_run so cleanup is written once.
 _llm_json_array_sanitize_fields_py() {
   _ljasp_json="$1"
   shift
   _ljasp_fields="$*"
-  _ljasp_result="$_ljasp_json"
   _ljasp_arr=$(mktemp -t clagentic-llm-arrsan-a.XXXXXX 2>/dev/null) || _ljasp_arr=""
   _ljasp_itf=$(mktemp -t clagentic-llm-arrsan-i.XXXXXX 2>/dev/null) || _ljasp_itf=""
   _ljasp_val=$(mktemp -t clagentic-llm-arrsan-v.XXXXXX 2>/dev/null) || _ljasp_val=""
+  _ljasp_rc=1
   if [ -n "$_ljasp_arr" ] && [ -n "$_ljasp_itf" ] && [ -n "$_ljasp_val" ]; then
-    printf '%s' "$_ljasp_json" > "$_ljasp_arr"
-    # Distinguish "valid JSON but not an array" (fail open with the ORIGINAL
-    # input) from "a genuine empty array".
-    _ljasp_is_array=$(python3 -c 'import json,sys
+    if _ljasp_result=$(_llm_json_array_sanitize_fields_py_run "$_ljasp_arr" "$_ljasp_itf" "$_ljasp_val" "$_ljasp_json" $_ljasp_fields); then
+      _ljasp_rc=0
+    fi
+  fi
+  rm -f "$_ljasp_arr" "$_ljasp_itf" "$_ljasp_val"
+  [ "$_ljasp_rc" -eq 0 ] || return 1
+  printf '%s' "$_ljasp_result"
+}
+
+# _llm_json_array_sanitize_fields_py_run ARR_FILE ITEM_FILE VALUE_FILE JSON
+# FIELD... — the python3 decompose/sanitize/rebuild loop. Every step is
+# checked: any tool error or empty intermediate result returns 1 with no
+# output, never the input and never a partial array.
+_llm_json_array_sanitize_fields_py_run() {
+  _ljapr_arr="$1"
+  _ljapr_itf="$2"
+  _ljapr_val="$3"
+  _ljapr_json="$4"
+  shift 4
+  _ljapr_fields="$*"
+  printf '%s' "$_ljapr_json" > "$_ljapr_arr" || return 1
+  # "valid JSON but not an array" is a failure, distinct from a genuine empty
+  # array (count 0).
+  _ljapr_is_array=$(python3 -c 'import json,sys
 try:
     with open(sys.argv[1], "rb") as f:
         d = json.loads(f.read())
     print("1" if isinstance(d, list) else "0")
 except Exception:
-    print("0")' "$_ljasp_arr" 2>/dev/null)
-    if [ "$_ljasp_is_array" = "1" ]; then
-      _ljasp_count=$(python3 -c 'import json,sys
+    print("0")' "$_ljapr_arr" 2>/dev/null) || return 1
+  [ "$_ljapr_is_array" = "1" ] || return 1
+  _ljapr_count=$(python3 -c 'import json,sys
 with open(sys.argv[1], "rb") as f:
-    print(len(json.loads(f.read())))' "$_ljasp_arr" 2>/dev/null)
-      case "$_ljasp_count" in
-        ''|*[!0-9]*) ;;
-        *)
-          _ljasp_out="[]"
-          _ljasp_i=0
-          _ljasp_failed=0
-          while [ "$_ljasp_i" -lt "$_ljasp_count" ]; do
-            _ljasp_item=$(python3 -c 'import json,sys
+    print(len(json.loads(f.read())))' "$_ljapr_arr" 2>/dev/null) || return 1
+  case "$_ljapr_count" in ''|*[!0-9]*) return 1 ;; esac
+  _ljapr_out="[]"
+  _ljapr_i=0
+  while [ "$_ljapr_i" -lt "$_ljapr_count" ]; do
+    _ljapr_item=$(python3 -c 'import json,sys
 with open(sys.argv[1], "rb") as f:
     d = json.loads(f.read())
-print(json.dumps(d[int(sys.argv[2])]))' "$_ljasp_arr" "$_ljasp_i" 2>/dev/null) || break
-            for _ljasp_field in $_ljasp_fields; do
-              _ljasp_raw=$(printf '%s' "$_ljasp_item" | python3 -c 'import json,sys
+print(json.dumps(d[int(sys.argv[2])]))' "$_ljapr_arr" "$_ljapr_i" 2>/dev/null) || return 1
+    [ -n "$_ljapr_item" ] || return 1
+    for _ljapr_field in $_ljapr_fields; do
+      _ljapr_raw=$(printf '%s' "$_ljapr_item" | python3 -c 'import json,sys
 d = json.loads(sys.stdin.buffer.read())
 v = d.get(sys.argv[1], "")
-print(v if isinstance(v, str) else "")' "$_ljasp_field" 2>/dev/null)
-              _ljasp_clean=$(_llm_field_sanitize "$_ljasp_raw")
-              printf '%s' "$_ljasp_clean" > "$_ljasp_val"
-              _ljasp_item=$(printf '%s' "$_ljasp_item" | python3 -c '
+print(v if isinstance(v, str) else "")' "$_ljapr_field" 2>/dev/null) || return 1
+      _ljapr_clean=$(_llm_field_sanitize "$_ljapr_raw") || return 1
+      printf '%s' "$_ljapr_clean" > "$_ljapr_val" || return 1
+      _ljapr_item=$(printf '%s' "$_ljapr_item" | python3 -c '
 import json, sys
 item = json.loads(sys.stdin.buffer.read())
 field = sys.argv[1]
@@ -1453,24 +1504,19 @@ if field in item:
     with open(sys.argv[2], "rb") as f:
         item[field] = f.read().decode("utf-8", "surrogateescape")
 print(json.dumps(item))
-' "$_ljasp_field" "$_ljasp_val" 2>/dev/null)
-            done
-            printf '%s' "$_ljasp_item" > "$_ljasp_itf"
-            _ljasp_out=$(printf '%s' "$_ljasp_out" | python3 -c 'import json,sys
+' "$_ljapr_field" "$_ljapr_val" 2>/dev/null) || return 1
+      [ -n "$_ljapr_item" ] || return 1
+    done
+    printf '%s' "$_ljapr_item" > "$_ljapr_itf" || return 1
+    _ljapr_out=$(printf '%s' "$_ljapr_out" | python3 -c 'import json,sys
 arr = json.loads(sys.stdin.buffer.read())
 with open(sys.argv[1], "rb") as f:
     arr.append(json.loads(f.read()))
-print(json.dumps(arr))' "$_ljasp_itf" 2>/dev/null)
-            [ -n "$_ljasp_out" ] || { _ljasp_failed=1; break; }
-            _ljasp_i=$((_ljasp_i + 1))
-          done
-          [ "$_ljasp_failed" -eq 0 ] && _ljasp_result="$_ljasp_out"
-          ;;
-      esac
-    fi
-  fi
-  rm -f "$_ljasp_arr" "$_ljasp_itf" "$_ljasp_val"
-  printf '%s' "$_ljasp_result"
+print(json.dumps(arr))' "$_ljapr_itf" 2>/dev/null) || return 1
+    [ -n "$_ljapr_out" ] || return 1
+    _ljapr_i=$((_ljapr_i + 1))
+  done
+  printf '%s' "$_ljapr_out"
 }
 
 # _adversarial_findings_sort_blocking_first JSON — reorder a JSON array of
