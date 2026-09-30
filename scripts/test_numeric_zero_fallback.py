@@ -16,8 +16,12 @@ Run with: python3 -m unittest scripts.test_numeric_zero_fallback -v
 """
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import unittest
+
+from scripts.test_config_key_drift import _ROLES, _code_files
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
@@ -25,8 +29,8 @@ GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
 MEMORY_SH = os.path.join(TOOL_HOME, "scripts", "memory.sh")
 CONFIG_EXAMPLE = os.path.join(TOOL_HOME, "share", "config.example")
 
-# 0 or invalid falls back to the default (helper or an equivalent
-# ds_positive_int_or_default guard at every read site).
+# 0 or invalid falls back to the default with a WARN: every read site goes
+# through ds_positive_int_or_warn (TestEveryReadSiteUsesTheHelper).
 ZERO_FALLS_BACK = {
     "CLAGENTIC_LLM_TIMEOUT_SEC",
     "CLAGENTIC_REVIEWER_TIMEOUT_SEC",
@@ -106,11 +110,22 @@ class TestHelper(unittest.TestCase):
                 self.assertIn("WARN", r.stderr)
 
     def test_valid_and_empty_pass_through_silently(self):
-        for value, expected in (("7", "7"), ("007", "007"), ("", "30")):
+        for value, expected in (("7", "7"), ("", "30")):
             with self.subTest(value=value):
                 r = self._call("CLAGENTIC_X", value, 30)
                 self.assertEqual(r.stdout, expected)
                 self.assertEqual(r.stderr, "")
+
+    def test_leading_zeros_are_normalized_not_octal_and_not_warned(self):
+        # "08" and "09" are octal parse errors in $(( )); the helper hands
+        # callers a plain decimal.
+        for value, expected in (("08", "8"), ("09", "9"), ("010", "10"), ("007", "7"), ("0100", "100")):
+            with self.subTest(value=value):
+                r = self._call("CLAGENTIC_X", value, 30)
+                self.assertEqual(r.stdout, expected, msg=r.stderr)
+                self.assertEqual(r.stderr, "")
+                arith = _sh(f"echo $(( {r.stdout} + 1 ))")
+                self.assertEqual(arith.stdout.strip(), str(int(expected) + 1))
 
 
 class TestCallSites(unittest.TestCase):
@@ -166,6 +181,113 @@ class TestCallSites(unittest.TestCase):
         with open(MEMORY_SH) as f:
             text = f.read()
         self.assertRegex(text, r"ds_positive_int_or_warn CLAGENTIC_MEMORY_MAX_ROWS\b")
+
+
+_HELPER = "ds_positive_int_or_warn"
+
+
+def _read_site_regex(key):
+    """Matches a line that READS `key`: a parameter expansion of the name, or,
+    for a per-role key, a `role_env <role> <SUFFIX>` call (how llm-client.sh
+    builds CLAGENTIC_<ROLE>_<SUFFIX> at run time)."""
+    pats = [r"\$\{?" + re.escape(key) + r"\b"]
+    m = re.match(r"CLAGENTIC_(" + "|".join(_ROLES) + r")_(.+)$", key)
+    if m:
+        pats.append(r"\brole_env\s+\S+\s+" + re.escape(m.group(2)) + r"\b")
+    return re.compile("|".join(pats))
+
+
+def read_sites(key, files):
+    """[(path, lineno, line)] of every non-comment line reading `key`."""
+    rx = _read_site_regex(key)
+    sites = []
+    for path in files:
+        with open(path, errors="replace") as f:
+            for lineno, line in enumerate(f, 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                if rx.search(line):
+                    sites.append((path, lineno, line.strip()))
+    return sites
+
+
+def unguarded_read_sites(keys, files):
+    """Read sites of `keys` whose own line does not go through the helper."""
+    bad = []
+    for key in sorted(keys):
+        for path, lineno, line in read_sites(key, files):
+            if _HELPER not in line:
+                bad.append(f"{os.path.relpath(path, TOOL_HOME)}:{lineno}: {key}: {line}")
+    return bad
+
+
+class TestEveryReadSiteUsesTheHelper(unittest.TestCase):
+    maxDiff = None
+
+    def _guarded_keys(self):
+        return _numeric_keys_in_config_example() - set(ZERO_IS_MEANINGFUL)
+
+    def test_every_read_site_of_every_zero_falls_back_key_uses_the_helper(self):
+        bad = unguarded_read_sites(self._guarded_keys(), _code_files())
+        self.assertEqual(
+            bad, [],
+            "numeric key read without ds_positive_int_or_warn on the same line "
+            "(a 0 would reach a timeout/cap/loop unchecked): route it through the "
+            "helper, or classify the key in ZERO_IS_MEANINGFUL",
+        )
+
+    def test_every_guarded_key_has_at_least_one_read_site(self):
+        # A regex that stopped matching would make the sweep pass vacuously.
+        files = _code_files()
+        for key in sorted(self._guarded_keys()):
+            with self.subTest(key=key):
+                self.assertTrue(read_sites(key, files), f"no read site found for {key}")
+
+    def _fixture(self, text):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "fixture.sh")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def test_a_new_timeout_read_without_the_helper_fails(self):
+        path = self._fixture('T="${CLAGENTIC_NEW_THING_TIMEOUT_SEC:-30}"\n')
+        bad = unguarded_read_sites({"CLAGENTIC_NEW_THING_TIMEOUT_SEC"}, [path])
+        self.assertEqual(len(bad), 1, bad)
+
+    def test_a_read_through_the_helper_passes(self):
+        path = self._fixture(
+            'T=$(ds_positive_int_or_warn CLAGENTIC_NEW_THING_TIMEOUT_SEC '
+            '"${CLAGENTIC_NEW_THING_TIMEOUT_SEC:-}" 30)\n'
+        )
+        self.assertEqual(unguarded_read_sites({"CLAGENTIC_NEW_THING_TIMEOUT_SEC"}, [path]), [])
+
+    def test_a_per_role_role_env_read_without_the_helper_fails(self):
+        path = self._fixture('B=$(role_env "$ROLE_U" TIMEOUT_SEC 180)\n')
+        self.assertEqual(len(unguarded_read_sites({"CLAGENTIC_REVIEWER_TIMEOUT_SEC"}, [path])), 1)
+
+    def test_comments_and_message_text_are_not_read_sites(self):
+        path = self._fixture(
+            '# T="${CLAGENTIC_NEW_THING_TIMEOUT_SEC:-30}"\n'
+            'echo "raise CLAGENTIC_NEW_THING_TIMEOUT_SEC"\n'
+        )
+        self.assertEqual(unguarded_read_sites({"CLAGENTIC_NEW_THING_TIMEOUT_SEC"}, [path]), [])
+
+    def test_reviewer_max_diff_kb_zero_warns(self):
+        r = _sh(
+            f". '{PLATFORM_SH}'\n"
+            'ds_positive_int_or_warn CLAGENTIC_REVIEWER_MAX_DIFF_KB "${CLAGENTIC_REVIEWER_MAX_DIFF_KB:-}" 0\n',
+            env={"CLAGENTIC_REVIEWER_MAX_DIFF_KB": "0"},
+        )
+        self.assertIn("CLAGENTIC_REVIEWER_MAX_DIFF_KB=0", r.stderr)
+
+    def test_reviewer_max_diff_kb_unset_is_silent(self):
+        r = _sh(
+            f". '{PLATFORM_SH}'\n"
+            'ds_positive_int_or_warn CLAGENTIC_REVIEWER_MAX_DIFF_KB "${CLAGENTIC_REVIEWER_MAX_DIFF_KB:-}" 0\n'
+        )
+        self.assertEqual((r.stdout, r.stderr), ("0", ""))
 
 
 class TestEveryNumericKeyIsClassified(unittest.TestCase):

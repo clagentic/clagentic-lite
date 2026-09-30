@@ -195,7 +195,7 @@ _git_repo_scoped_head_sha() {
 run_bounded() {
   case "$1" in
     --)
-      _rb_timeout="${CLAGENTIC_EXTERNAL_TIMEOUT_SEC:-120}"
+      _rb_timeout=""
       shift
       ;;
     *)
@@ -207,8 +207,7 @@ run_bounded() {
       [ "${1:-}" = "--" ] && shift
       ;;
   esac
-  _rb_timeout=$(ds_positive_int_or_default "$_rb_timeout" "${CLAGENTIC_EXTERNAL_TIMEOUT_SEC:-120}")
-  _rb_timeout=$(ds_positive_int_or_default "$_rb_timeout" 120)
+  _rb_timeout=$(ds_positive_int_or_default "$_rb_timeout" "$(ds_positive_int_or_warn CLAGENTIC_EXTERNAL_TIMEOUT_SEC "${CLAGENTIC_EXTERNAL_TIMEOUT_SEC:-}" 120)")
   $DS_TIMEOUT_CMD "$_rb_timeout" "$@"
 }
 
@@ -1302,8 +1301,7 @@ _gitleaks_positive_control() {
     git commit -q -m "canary fixture" --no-verify
   ) >/dev/null 2>&1
 
-  _gpc_timeout="${CLAGENTIC_SECRETS_TIMEOUT_SEC:-300}"
-  _gpc_timeout=$(ds_positive_int_or_default "$_gpc_timeout" 300)
+  _gpc_timeout=$(ds_positive_int_or_warn CLAGENTIC_SECRETS_TIMEOUT_SEC "${CLAGENTIC_SECRETS_TIMEOUT_SEC:-}" 300)
 
   _gpc_report="$_gpc_dir/report.json"
   _gpc_status=0
@@ -1476,8 +1474,7 @@ cmd_secrets() {
   # full branch-history scan in particular can legitimately take longer than
   # the generic run_bounded default, so gitleaks gets its own configurable
   # timeout rather than sharing CLAGENTIC_EXTERNAL_TIMEOUT_SEC's 120s.
-  _SECRETS_TIMEOUT="${CLAGENTIC_SECRETS_TIMEOUT_SEC:-300}"
-  _SECRETS_TIMEOUT=$(ds_positive_int_or_default "$_SECRETS_TIMEOUT" 300)
+  _SECRETS_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SECRETS_TIMEOUT_SEC "${CLAGENTIC_SECRETS_TIMEOUT_SEC:-}" 300)
 
   if gitleaks git --help >/dev/null 2>&1; then
     if [ "$_SECRETS_ON_FEATURE" = "1" ]; then
@@ -1527,8 +1524,7 @@ cmd_secrets() {
       elif ! _git_repo_root_is_scoped; then
         _SECRETS_SCOPE_REASON="full history (baseline unavailable: REPO_ROOT is not a git repo)"
       else
-        _SECRETS_FETCH_TIMEOUT="${CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC:-30}"
-        _SECRETS_FETCH_TIMEOUT=$(ds_positive_int_or_default "$_SECRETS_FETCH_TIMEOUT" 30)
+        _SECRETS_FETCH_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC "${CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC:-}" 30)
 
         _SECRETS_FRESH_ERR_TMP=$(mktemp -t clagentic-secrets-fresh-err.XXXXXX)
         _SECRETS_FRESH_TIP=$(_gate_resolve_fresh_default_branch_ref "$_SECRETS_DEFAULT_BRANCH" "$_SECRETS_FETCH_TIMEOUT" 2>"$_SECRETS_FRESH_ERR_TMP") || true
@@ -1835,8 +1831,7 @@ cmd_deps() {
   # Bound every osv-scanner invocation (INV-1a/INV-2, class-4 foundry fix):
   # one path does a network vulnerability-DB lookup, so this defaults higher
   # than the generic run_bounded default.
-  _OSV_TIMEOUT="${CLAGENTIC_OSV_TIMEOUT_SEC:-300}"
-  _OSV_TIMEOUT=$(ds_positive_int_or_default "$_OSV_TIMEOUT" 300)
+  _OSV_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_OSV_TIMEOUT_SEC "${CLAGENTIC_OSV_TIMEOUT_SEC:-}" 300)
 
   # Capability-probe: osv-scanner v2.x uses `scan source` subcommand; v1.x
   # used a flat invocation with --severity / --ignore-vulns flags (removed in
@@ -2165,8 +2160,7 @@ cmd_bleed() {
         # diffed file set), not remote-ref usage. The actual precedent for
         # a remote-ref-diffed FILE SET scope is cmd_sast's baseline-commit
         # mechanism (:588-663) — see docs/GATES.md.
-        _BLEED_FETCH_TIMEOUT="${CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC:-30}"
-        _BLEED_FETCH_TIMEOUT=$(ds_positive_int_or_default "$_BLEED_FETCH_TIMEOUT" 30)
+        _BLEED_FETCH_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC "${CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC:-}" 30)
 
         _BLEED_FRESH_ERR_TMP=$(mktemp -t clagentic-bleed-fresh-err.XXXXXX)
         _BLEED_FRESH_TIP=$(_gate_resolve_fresh_default_branch_ref "$_BLEED_DEFAULT_BRANCH" "$_BLEED_FETCH_TIMEOUT" 2>"$_BLEED_FRESH_ERR_TMP") || true
@@ -2410,8 +2404,7 @@ cmd_sast() {
       # follow-up to lr-06b87e); this call site only adds the merge-base
       # step, which is specific to semgrep's --baseline-commit and not part
       # of the shared freshness precondition itself.
-      _SAST_FETCH_TIMEOUT="${CLAGENTIC_SAST_FETCH_TIMEOUT_SEC:-30}"
-      _SAST_FETCH_TIMEOUT=$(ds_positive_int_or_default "$_SAST_FETCH_TIMEOUT" 30)
+      _SAST_FETCH_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SAST_FETCH_TIMEOUT_SEC "${CLAGENTIC_SAST_FETCH_TIMEOUT_SEC:-}" 30)
 
       _SAST_FRESH_ERR_TMP=$(mktemp -t clagentic-sast-fresh-err.XXXXXX)
       _SAST_FRESH_TIP=$(_gate_resolve_fresh_default_branch_ref "$_SAST_DEFAULT_BRANCH" "$_SAST_FETCH_TIMEOUT" 2>"$_SAST_FRESH_ERR_TMP") || true
@@ -2441,8 +2434,7 @@ cmd_sast() {
   # Bound every semgrep invocation (INV-1a/INV-2, class-4 foundry fix):
   # --config=auto DOWNLOADS RULES FROM THE NETWORK on top of running a scan,
   # so this defaults higher than the generic run_bounded default.
-  _SAST_TIMEOUT="${CLAGENTIC_SAST_TIMEOUT_SEC:-300}"
-  _SAST_TIMEOUT=$(ds_positive_int_or_default "$_SAST_TIMEOUT" 300)
+  _SAST_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SAST_TIMEOUT_SEC "${CLAGENTIC_SAST_TIMEOUT_SEC:-}" 300)
 
   # Config: --config=auto by default, or CLAGENTIC_SEMGREP_CONFIG when set —
   # DEFAULT STAYS auto (lite ships to other people; pinning is per-repo
@@ -3415,8 +3407,7 @@ get_review_diff() {
     # does not explicitly guard the call (cmd_review, cmd_adversarial both
     # call it unguarded via `get_review_diff > "$tmp"`) aborts the gate
     # rather than proceeding to review a partial diff as if it were complete.
-    _grd_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-    _grd_fetch_timeout=$(ds_positive_int_or_default "$_grd_fetch_timeout" 30)
+    _grd_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
 
     _grd_fresh_err_tmp=$(mktemp -t clagentic-review-fresh-err.XXXXXX)
     _grd_fresh_tip=$(_gate_resolve_fresh_default_branch_ref "$DEFAULT_BRANCH" "$_grd_fetch_timeout" 2>"$_grd_fresh_err_tmp") || true
@@ -4620,8 +4611,7 @@ cmd_review() {
     if [ -n "$_review_sha" ]; then
       _stamp_envelope "$OUT" "$_review_sha"
     fi
-    _crv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-    _crv_fetch_timeout=$(ds_positive_int_or_default "$_crv_fetch_timeout" 30)
+    _crv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
     _crv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_crv_fetch_timeout")
     cmd_log_run review skip "empty-resolved-diff: $_crv_empty_reason"
     printf '[gates/review] SKIP: %s — no findings can be reported on an empty input, this is not a pass\n' "$_crv_empty_reason" 1>&2
@@ -4637,11 +4627,11 @@ cmd_review() {
   # 0 or invalid falls back to the default for both keys: a 0-byte threshold
   # would chunk every diff into one LLM call per fragment.
   _crv_chunk_bytes=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_CHUNK_BYTES "${CLAGENTIC_REVIEW_CHUNK_BYTES:-}" 262144)
-  if [ -n "${CLAGENTIC_REVIEWER_MAX_DIFF_KB:-}" ]; then
-    _crv_max_diff_kb=$(ds_positive_int_or_warn CLAGENTIC_REVIEWER_MAX_DIFF_KB "$CLAGENTIC_REVIEWER_MAX_DIFF_KB" 0)
-    if [ "$_crv_max_diff_kb" -gt 0 ]; then
-      _crv_chunk_bytes=$(( _crv_max_diff_kb * 1024 ))
-    fi
+  # Unset is silent and yields 0 (no override); a set value of 0 or junk WARNs
+  # and also yields 0, so the byte threshold above stays in force.
+  _crv_max_diff_kb=$(ds_positive_int_or_warn CLAGENTIC_REVIEWER_MAX_DIFF_KB "${CLAGENTIC_REVIEWER_MAX_DIFF_KB:-}" 0)
+  if [ "$_crv_max_diff_kb" -gt 0 ]; then
+    _crv_chunk_bytes=$(( _crv_max_diff_kb * 1024 ))
   fi
 
   # Squash hint: warn the operator when the diff is large, before the chunking decision.
@@ -4763,8 +4753,7 @@ cmd_review() {
       # baseline scoping uses. Empty on any resolution failure; a ledger
       # entry with empty base_sha is still valid as long as head_sha
       # resolved (see _resolve_base_sha's own doc comment).
-      _crv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-      _crv_fetch_timeout=$(ds_positive_int_or_default "$_crv_fetch_timeout" 30)
+      _crv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
       _crv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_crv_fetch_timeout")
 
       # Cross-round dedup (default-on). Suppresses findings already seen in a prior
@@ -4884,8 +4873,7 @@ cmd_review() {
   fi
   # base_sha for the ledger entry (item 1/2) — see the chunked-path comment
   # above for the full rationale (same logic, single-pass path).
-  _crv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-  _crv_fetch_timeout=$(ds_positive_int_or_default "$_crv_fetch_timeout" 30)
+  _crv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
   _crv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_crv_fetch_timeout")
 
   # Cross-round dedup (default-on). Suppresses findings already seen in a prior
@@ -5638,8 +5626,7 @@ cmd_adversarial() {
     printf '{"dropped_count": 0, "total_before_cap": 0}\n' > "$REPO_ROOT/.clagentic/lite/last-adversarial-findings-meta.json"
     cmd_log_run adversarial skip "empty-resolved-diff: $_adv_empty_reason"
     printf '[gates/adversarial] SKIP: %s — no findings can be reported on an empty input, this is not a clean pass\n' "$_adv_empty_reason" 1>&2
-    _adv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-    _adv_fetch_timeout=$(ds_positive_int_or_default "$_adv_fetch_timeout" 30)
+    _adv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
     _adv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_adv_fetch_timeout")
     _ledger_record_review_verdict adversarial "$OUT" "$_adv_diff_tmp" "skip" "$_adv_base_sha" "$_adv_sha"
     rm -f "$_adv_diff_tmp"
@@ -5817,8 +5804,7 @@ EOF3
   # base_sha for the ledger entry -- same provably-current resolution
   # cmd_review's own ledger write uses (see _resolve_base_sha's own doc
   # comment).
-  _adv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-  _adv_fetch_timeout=$(ds_positive_int_or_default "$_adv_fetch_timeout" 30)
+  _adv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
   _adv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_adv_fetch_timeout")
 
   # cmd_adversarial can no longer report a clean audit when the auditor was
@@ -8107,8 +8093,7 @@ cmd_ship() {
   # call were both previously untimed -- a hung push or a stalled host API
   # call would block `ship` indefinitely with no diagnostic, the last step
   # of an otherwise fully-bounded gate sequence.
-  _SHIP_TIMEOUT="${CLAGENTIC_SHIP_TIMEOUT_SEC:-120}"
-  _SHIP_TIMEOUT=$(ds_positive_int_or_default "$_SHIP_TIMEOUT" 120)
+  _SHIP_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SHIP_TIMEOUT_SEC "${CLAGENTIC_SHIP_TIMEOUT_SEC:-}" 120)
 
   # Push + open a change request via the host adapter (lr-2b07a8), else
   # print a template. Host-neutral by contract (docs/GATES.md "Host adapter

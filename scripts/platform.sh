@@ -464,6 +464,11 @@ ds_positive_int_or_default() {
   _dpiod_val="$1"
   _dpiod_default="$2"
   case "$_dpiod_val" in ''|*[!0-9]*) _dpiod_val="$_dpiod_default" ;; esac
+  # Leading zeros are stripped before any caller does arithmetic: `$((08))`
+  # is an octal parse error in POSIX sh, and "08" is a plausible typo. An
+  # all-zero value strips to empty and is treated as 0 (rejected below).
+  _dpiod_val=$(printf '%s' "$_dpiod_val" | sed 's/^0*//')
+  [ -n "$_dpiod_val" ] || _dpiod_val=0
   [ "$_dpiod_val" -le 0 ] 2>/dev/null && _dpiod_val="$_dpiod_default"
   printf '%s' "$_dpiod_val"
 }
@@ -477,7 +482,10 @@ ds_positive_int_or_default() {
 # normal case and stays silent.
 ds_positive_int_or_warn() {
   _dpiow_out=$(ds_positive_int_or_default "$2" "$3")
-  if [ -n "$2" ] && [ "$_dpiow_out" != "$2" ]; then
+  # Compare against the zero-stripped input, so "08" (accepted as 8) is not
+  # reported as a rejection.
+  _dpiow_norm=$(printf '%s' "$2" | sed 's/^0*//')
+  if [ -n "$2" ] && [ "$_dpiow_out" != "$_dpiow_norm" ]; then
     printf '[clagentic-lite] WARN: %s=%s is not a positive integer; using the default (%s).\n' "$1" "$2" "$3" 1>&2
   fi
   printf '%s' "$_dpiow_out"
@@ -597,8 +605,7 @@ ds_llm_role_is_bash_unrestricted() {
 # unchanged, and `.timeout 0` disables the busy wait entirely, reopening the
 # exact SQLITE_BUSY failure class this wrapper exists to close.
 ds_sqlite3() {
-  _ds3_timeout_ms="${CLAGENTIC_SQLITE_BUSY_TIMEOUT_MS:-5000}"
-  _ds3_timeout_ms=$(ds_positive_int_or_default "$_ds3_timeout_ms" 5000)
+  _ds3_timeout_ms=$(ds_positive_int_or_warn CLAGENTIC_SQLITE_BUSY_TIMEOUT_MS "${CLAGENTIC_SQLITE_BUSY_TIMEOUT_MS:-}" 5000)
   sqlite3 -cmd ".timeout $_ds3_timeout_ms" "$@"
 }
 
@@ -1508,8 +1515,8 @@ print(json.dumps(ordered))
 # direction).
 _llm_json_array_cap() {
   _ljac_json="$1"
-  _ljac_max="${2:-${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}}"
-  case "$_ljac_max" in ''|*[!0-9]*) _ljac_max="${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}" ;; esac
+  _ljac_max="${2:-}"
+  case "$_ljac_max" in ''|*[!0-9]*) _ljac_max=$(ds_positive_int_or_warn CLAGENTIC_ADVERSARIAL_FINDINGS_MAX "${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-}" 200) ;; esac
   # 0 is not "no findings": it falls back to 200 like any other invalid value.
   _ljac_max=$(ds_positive_int_or_default "$_ljac_max" 200)
 

@@ -216,7 +216,7 @@ host_adapter_read_comments() {
 # GitHub CLI; every vendor-specific detail is confined to these three
 # functions and _host_adapter_detect above.
 
-_HOST_ADAPTER_SHIP_TIMEOUT="${CLAGENTIC_SHIP_TIMEOUT_SEC:-120}"
+_HOST_ADAPTER_SHIP_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SHIP_TIMEOUT_SEC "${CLAGENTIC_SHIP_TIMEOUT_SEC:-}" 120)
 
 _host_adapter_gh_open_change_request() {
   _hagocr_base="$1"

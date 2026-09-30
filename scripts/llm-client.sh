@@ -1233,7 +1233,7 @@ notify_step_outcome() {
 # Configurable per-call timeout (seconds). Defaults to 3 minutes — long
 # enough for a high-effort review on a deep prompt, short enough that a
 # hung CLI surfaces as a step failure rather than wedging the gate.
-LLM_TIMEOUT="${CLAGENTIC_LLM_TIMEOUT_SEC:-180}"
+LLM_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_LLM_TIMEOUT_SEC "${CLAGENTIC_LLM_TIMEOUT_SEC:-}" 180)
 
 # Compute a per-call timeout scaled to the combined input size.
 # Args: ROLE_U (uppercase role, e.g. REVIEWER) BYTES (combined input bytes)
@@ -1251,12 +1251,12 @@ llm_timeout_for() {
   ROLE_U="$1"
   BYTES="$2"
 
-  BASE=$(role_env "$ROLE_U" TIMEOUT_SEC "${CLAGENTIC_LLM_TIMEOUT_SEC:-180}")
-  RATE="${CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC:-300}"
+  BASE=$(ds_positive_int_or_warn "CLAGENTIC_${ROLE_U}_TIMEOUT_SEC" "$(role_env "$ROLE_U" TIMEOUT_SEC "${CLAGENTIC_LLM_TIMEOUT_SEC:-}")" 180)
+  RATE=$(ds_positive_int_or_warn CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC "${CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC:-}" 300)
   MAX=$(role_env "$ROLE_U" TIMEOUT_MAX_SEC "${CLAGENTIC_LLM_TIMEOUT_MAX_SEC:-1800}")
 
   # Normalize config to integers; use safe defaults on parse failure.
-  # BASE goes through ds_positive_int_or_default (platform.sh), not a bare
+  # BASE goes through ds_positive_int_or_warn (platform.sh), not a bare
   # case guard (lr-49df97 fold-in, BOBBIE finding 3): BASE is the wall-clock
   # seconds handed to $DS_TIMEOUT_CMD below, and a bare `''|*[!0-9]*` guard
   # admits the literal string "0" unchanged (it contains no non-digit
@@ -1266,10 +1266,7 @@ llm_timeout_for() {
   # deliberately: MAX=0 is a pre-existing, DOCUMENTED "no cap" sentinel (see
   # "Cap at max when max is set and positive" below) — a different, intended
   # meaning of zero, not an instance of this defect.
-  BASE=$(ds_positive_int_or_default "$BASE" 180)
-  case "$RATE" in ''|*[!0-9]*) RATE=300 ;; esac
   case "$MAX"  in ''|*[!0-9]*) MAX=1800 ;; esac
-  [ "$RATE" -le 0 ] && RATE=300
 
   # Exit early if auto-scaling disabled.
   [ "${CLAGENTIC_LLM_TIMEOUT_AUTO_SCALE:-1}" = "0" ] && { printf '%s\n' "$BASE"; return; }

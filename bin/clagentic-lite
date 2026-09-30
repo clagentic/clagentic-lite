@@ -958,7 +958,7 @@ _LEGACY_ROUTER_PLUGIN_CACHE_DIR="$HOME/.claude/plugins/cache/$_LEGACY_ROUTER_PLU
 # as the single fix at the platform.sh capability-detection site rather
 # than ALSO redirecting stdin at 14 call sites, per the same fix-the-pattern-
 # once discipline as the timeout constant itself.
-_CLAUDE_PLUGIN_TIMEOUT=$(ds_positive_int_or_default "${CLAGENTIC_PLUGIN_TIMEOUT_SEC:-}" 30)
+_CLAUDE_PLUGIN_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_PLUGIN_TIMEOUT_SEC "${CLAGENTIC_PLUGIN_TIMEOUT_SEC:-}" 30)
 
 # EMPTY-OUTPUT-EQUALS-ABSENCE SWEEP (lr-c65d8a absorbing lr-f8117f,
 # fnd-bc204a): every $DS_TIMEOUT_FOREGROUND_CMD-bound `claude plugin ...`/
@@ -4048,7 +4048,7 @@ cmd_doctor() {
   printf '\nmemory tunables:\n'
   _ok "CLAGENTIC_RECALL_LIMIT=${CLAGENTIC_RECALL_LIMIT:-5 (default)}"
   _ok "CLAGENTIC_RECALL_MAX_CHARS=${CLAGENTIC_RECALL_MAX_CHARS:-1500 (default)}"
-  _ok "CLAGENTIC_MEMORY_MAX_ROWS=${CLAGENTIC_MEMORY_MAX_ROWS:-5000 (default)}"
+  _ok "CLAGENTIC_MEMORY_MAX_ROWS=$(ds_positive_int_or_warn CLAGENTIC_MEMORY_MAX_ROWS "${CLAGENTIC_MEMORY_MAX_ROWS:-}" 5000) (effective; 0 or invalid falls back to 5000)"
 
   # 10b. Global config drift check (lr-e33f73): compares the key set in
   # share/config.example against the installed global config. `update`
