@@ -8262,8 +8262,10 @@ cmd_ship() {
     # same keys the hook uses. CLAGENTIC_SHIP_TIMEOUT_SEC overrides it.
     # GIT_TERMINAL_PROMPT=0 makes a missing credential fail fast with git's
     # own error instead of hanging until the bound.
-    _SHIP_PUSH_DEFAULT=$(( $(ds_positive_int_or_default "${CLAGENTIC_OSV_TIMEOUT_SEC:-}" 300) + $(ds_positive_int_or_default "${CLAGENTIC_SAST_TIMEOUT_SEC:-}" 300) + 120 ))
-    _SHIP_PUSH_TIMEOUT=$(ds_positive_int_or_default "${CLAGENTIC_SHIP_TIMEOUT_SEC:-}" "$_SHIP_PUSH_DEFAULT")
+    _SHIP_PUSH_OSV=$(ds_positive_int_or_warn CLAGENTIC_OSV_TIMEOUT_SEC "${CLAGENTIC_OSV_TIMEOUT_SEC:-}" 300)
+    _SHIP_PUSH_SAST=$(ds_positive_int_or_warn CLAGENTIC_SAST_TIMEOUT_SEC "${CLAGENTIC_SAST_TIMEOUT_SEC:-}" 300)
+    _SHIP_PUSH_DEFAULT=$((_SHIP_PUSH_OSV + _SHIP_PUSH_SAST + 120))
+    _SHIP_PUSH_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SHIP_TIMEOUT_SEC "${CLAGENTIC_SHIP_TIMEOUT_SEC:-}" "$_SHIP_PUSH_DEFAULT")
     run_bounded "$_SHIP_PUSH_TIMEOUT" -- env GIT_TERMINAL_PROMPT=0 git -C "$REPO_ROOT" push -u origin "$BRANCH" 2>"$_SHIP_PUSH_ERR" || _SHIP_PUSH_RC=$?
     [ -s "$_SHIP_PUSH_ERR" ] && cat "$_SHIP_PUSH_ERR" 1>&2
     if [ "$_SHIP_PUSH_RC" -ne 0 ]; then
