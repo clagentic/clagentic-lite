@@ -1969,7 +1969,7 @@ invoke_generic() {
 #   nonlocal  -- well-formed, but the host is not localhost/127.0.0.0/8/::1.
 #     Refused HERE (unlike bin/clagentic-lite's stamp-time check, which
 #     WARNS-but-allows a nonlocal host for the INTERACTIVE session -- see
-#     docs/DESIGN.md "Layer 0" for the full reasoning): the gate path runs
+#     docs/ROUTER.md "Layer 0" for the full reasoning): the gate path runs
 #     unattended inside a merge gate with no human-in-the-loop moment to
 #     absorb a warning, so "this URL looks like exfiltration" and
 #     "operator deliberately configured a LAN router" are not

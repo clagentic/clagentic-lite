@@ -468,6 +468,21 @@ ds_positive_int_or_default() {
   printf '%s' "$_dpiod_val"
 }
 
+# ds_positive_int_or_warn NAME VALUE DEFAULT — ds_positive_int_or_default,
+# plus a stderr WARN when VALUE was set but rejected (non-numeric or 0). Use
+# for operator-set CLAGENTIC_* keys documented as "0 or invalid falls back to
+# the default": a silently substituted default hides a typo, and for a key
+# whose 0 would disable a timeout or drop findings that is a fail-open
+# outcome the operator should be told about. An unset/empty VALUE is the
+# normal case and stays silent.
+ds_positive_int_or_warn() {
+  _dpiow_out=$(ds_positive_int_or_default "$2" "$3")
+  if [ -n "$2" ] && [ "$_dpiow_out" != "$2" ]; then
+    printf '[clagentic-lite] WARN: %s=%s is not a positive integer; using the default (%s).\n' "$1" "$2" "$3" 1>&2
+  fi
+  printf '%s' "$_dpiow_out"
+}
+
 # ds_llm_role_is_bash_unrestricted ROLE — returns 0 (true) iff ROLE is one
 # of the explicitly enumerated LLM roles that legitimately keeps Bash;
 # returns 1 (restricted) for anything else, including empty, unset, or a
@@ -865,9 +880,7 @@ ds_pending_reset() {
 # controlled finding cannot balloon invariants.json or the prompt it is later
 # injected into).
 _invariant_feed_max_field_chars() {
-  _ifmfc_max="${CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS:-500}"
-  case "$_ifmfc_max" in ''|*[!0-9]*) _ifmfc_max=500 ;; esac
-  printf '%s' "$_ifmfc_max"
+  ds_positive_int_or_warn CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS "${CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS:-}" 500
 }
 
 # _llm_field_sanitize TEXT [MAX_CHARS] — neutralize LLM-controlled OR
@@ -1497,7 +1510,8 @@ _llm_json_array_cap() {
   _ljac_json="$1"
   _ljac_max="${2:-${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}}"
   case "$_ljac_max" in ''|*[!0-9]*) _ljac_max="${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}" ;; esac
-  case "$_ljac_max" in ''|*[!0-9]*) _ljac_max=200 ;; esac
+  # 0 is not "no findings": it falls back to 200 like any other invalid value.
+  _ljac_max=$(ds_positive_int_or_default "$_ljac_max" 200)
 
   if command -v jq >/dev/null 2>&1; then
     if ! printf '%s' "$_ljac_json" | jq -e '. | type == "array"' >/dev/null 2>&1; then

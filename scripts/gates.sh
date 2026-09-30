@@ -3596,7 +3596,8 @@ _review_recurrence_threshold() {
 # at least _review_recurrence_threshold DISTINCT rounds, counting this one --
 # a finding on its first-ever reported round always has count 1 and is never
 # demotable. When count >= threshold, the finding's SEVERITY IS NEVER
-# TOUCHED (docs/GATES.md "wrong suppressions are worse than missed dedups"
+# TOUCHED (docs/GATES.md "Cross-round finding dedup": wrong suppressions
+# are worse than missed dedups
 # — the same posture forbids silently rewriting a finding's own reported
 # severity). Instead two fields are added to the finding object:
 #   _recurrence_count    — integer, rounds this key has been reported in
@@ -3832,8 +3833,8 @@ PYEOF2
 #
 # WHY THIS EXISTS: lr-c567 shipped .clagentic/deferrals.json and injected it
 # into the Reviewer's prompt as context to weigh — suppression was left
-# entirely inside model judgment (docs/GATES.md "Suppression is inside model
-# judgment, not gate code"). Field evidence (lr-2ebc41 task description):
+# entirely inside model judgment (docs/GATES.md "Reviewer-consulted
+# deferrals"). Field evidence (lr-2ebc41 task description):
 # a single stage-contract finding, accepted with a stable documented
 # rationale, was re-raised by the stateless Reviewer SIX times across a
 # 7-round run because nothing MECHANICALLY excluded it once accepted — the
@@ -3912,8 +3913,8 @@ PYEOF2
 # "stable-contract" (only supported value — see capture-side validation);
 # the named file missing on disk; no sha256 tool available; more than one
 # LIVE (hash-matching) deferral entry claiming the same finding (ambiguous
-# match — "preserve when uncertain" per docs/GATES.md "wrong suppressions
-# are worse than missed dedups"; the task's own restated principle). No
+# match — "preserve when uncertain" per docs/GATES.md "Cross-round finding
+# dedup": wrong suppressions are worse than missed dedups). No
 # JSON tool at all is a full passthrough — ENVELOPE_FILE is left untouched,
 # matching every other splice step in this file's fail-open-on-tooling,
 # fail-closed-on-ambiguity posture.
@@ -4168,7 +4169,7 @@ _extract_findings_json() {
 # THE FIX IS AT INGEST, THE SAME CHOKE-POINT PATTERN THIS CODEBASE ALREADY
 # USES: _sanitize_adversarial_findings_json sanitizes immediately after
 # _parse_adversarial_findings and before the sidecar is EVER written to
-# disk (docs/GATES.md "Round-trip sanitization"); ds_review_prompt
+# disk (docs/GATES.md "Merge Gate", round-trip sanitization); ds_review_prompt
 # allowlists deferrals.json before it is EVER interpolated into a prompt.
 # This function is the equivalent choke point for review findings: it MUST
 # run immediately after every raw LLM write to an envelope file (both the
@@ -4261,9 +4262,7 @@ PYEOF
 # Configurable via CLAGENTIC_INVARIANT_FEED_MAX (default 200 — generous for a
 # single branch's review lifetime; oldest entries are dropped first on cap).
 _invariant_feed_max_lines() {
-  _ifml_max="${CLAGENTIC_INVARIANT_FEED_MAX:-200}"
-  case "$_ifml_max" in ''|*[!0-9]*) _ifml_max=200 ;; esac
-  printf '%s' "$_ifml_max"
+  ds_positive_int_or_warn CLAGENTIC_INVARIANT_FEED_MAX "${CLAGENTIC_INVARIANT_FEED_MAX:-}" 200
 }
 
 # _invariant_feed_max_field_chars and _llm_field_sanitize moved to
@@ -4635,16 +4634,15 @@ cmd_review() {
   # Chunking threshold: CLAGENTIC_REVIEWER_MAX_DIFF_KB (operator-facing alias,
   # in KB) takes precedence; CLAGENTIC_REVIEW_CHUNK_BYTES (in bytes) is the
   # secondary alias; default 262144 bytes (256 KB).
-  _crv_chunk_bytes="${CLAGENTIC_REVIEW_CHUNK_BYTES:-262144}"
+  # 0 or invalid falls back to the default for both keys: a 0-byte threshold
+  # would chunk every diff into one LLM call per fragment.
+  _crv_chunk_bytes=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_CHUNK_BYTES "${CLAGENTIC_REVIEW_CHUNK_BYTES:-}" 262144)
   if [ -n "${CLAGENTIC_REVIEWER_MAX_DIFF_KB:-}" ]; then
-    case "$CLAGENTIC_REVIEWER_MAX_DIFF_KB" in
-      ''|*[!0-9]*) : ;;
-      *) _crv_chunk_bytes=$(( CLAGENTIC_REVIEWER_MAX_DIFF_KB * 1024 )) ;;
-    esac
+    _crv_max_diff_kb=$(ds_positive_int_or_warn CLAGENTIC_REVIEWER_MAX_DIFF_KB "$CLAGENTIC_REVIEWER_MAX_DIFF_KB" 0)
+    if [ "$_crv_max_diff_kb" -gt 0 ]; then
+      _crv_chunk_bytes=$(( _crv_max_diff_kb * 1024 ))
+    fi
   fi
-  case "$_crv_chunk_bytes" in
-    ''|*[!0-9]*) _crv_chunk_bytes=262144 ;;
-  esac
 
   # Squash hint: warn the operator when the diff is large, before the chunking decision.
   # lr-e33f73: name CLAGENTIC_REVIEW_CHUNKING explicitly, not just "chunking" --
@@ -5743,7 +5741,10 @@ cmd_adversarial() {
   fi
   _adv_findings_json_sanitized=$(_sanitize_adversarial_findings_json "$_adv_findings_json_raw")
   _adv_findings_json_sorted=$(_adversarial_findings_sort_blocking_first "$_adv_findings_json_sanitized")
-  _adv_findings_json=$(_llm_json_array_cap "$_adv_findings_json_sorted" "${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}")
+  # 0 would slice every finding away; resolved once here so the cap and the
+  # dropped-count message below name the same effective value.
+  _adv_findings_max=$(ds_positive_int_or_warn CLAGENTIC_ADVERSARIAL_FINDINGS_MAX "${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-}" 200)
+  _adv_findings_json=$(_llm_json_array_cap "$_adv_findings_json_sorted" "$_adv_findings_max")
   printf '%s\n' "$_adv_findings_json" > "$FINDINGS_OUT"
 
   # DROPPED-COUNT VISIBILITY (BOBBIE, lr-33958f PR-C fold-in review): a
@@ -5786,7 +5787,7 @@ EOF3
   if [ "$_adv_findings_dropped_count" -gt 0 ]; then
     cmd_log_run adversarial warn "adversarial findings count cap dropped $_adv_findings_dropped_count finding(s) (severity/tier-sorted before cap, so only the least-severe tail was dropped)"
     printf '[gates/adversarial] %d finding(s) dropped by the count cap (CLAGENTIC_ADVERSARIAL_FINDINGS_MAX=%s) -- lowest severity/advisory-tier findings only, sorted before truncation.\n' \
-      "$_adv_findings_dropped_count" "${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}" 1>&2
+      "$_adv_findings_dropped_count" "$_adv_findings_max" 1>&2
   fi
 
   # Invariant-feed writer (lr-63359e), adversarial half. Reuses the same
@@ -6564,9 +6565,9 @@ _read_deterministic_gates() {
 # for host-side CI, and not per-reviewer credentials or attestation (ruled
 # out, lr-96f8ba). A hostile local user who wants to fabricate a clean
 # manifest can already do so, the same way they could hand-edit
-# last-review.json or review-ledger.jsonl today (see docs/GATES.md "What
-# the ledger is not: a control against a user who edits it" for the
-# identical threat-model posture applied to that file). What this manifest
+# last-review.json or review-ledger.jsonl today (see docs/GATES.md "Review
+# ledger and anchored verdicts" for the identical threat-model posture
+# applied to that file). What this manifest
 # defends against is an HONEST but UNOBSERVANT run silently mis-reporting
 # its own provenance -- a same-vendor fallback masquerading as the
 # configured primary, a declared-but-inert router opt-in, a degraded LLM
@@ -7192,8 +7193,9 @@ build_gate_summary() {
     # than hard-errors — but it must still attempt the verified resolution
     # first, not skip straight to an unverified guess.
     _DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
-    _bgs_fetch_timeout="${CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC:-30}"
-    case "$_bgs_fetch_timeout" in ''|*[!0-9]*) _bgs_fetch_timeout=30 ;; esac
+    # 0 must not reach `timeout` (coreutils reads it as "no timeout"): a
+    # disabled bound on a freshness fetch is fail-open.
+    _bgs_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC "${CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC:-}" 30)
 
     _bgs_fresh_err_tmp=$(mktemp -t clagentic-bgs-fresh-err.XXXXXX)
     _bgs_fresh_tip=$(_gate_resolve_fresh_default_branch_ref "$_DEFAULT_BRANCH" "$_bgs_fetch_timeout" 2>"$_bgs_fresh_err_tmp") || true
@@ -8302,15 +8304,12 @@ cmd_tail() {
     return 0
   fi
 
-  INTERVAL="${CLAGENTIC_TAIL_INTERVAL_SEC:-1}"
-  # Numeric guard (lr-53dc6e): every other timeout/interval var in this file
-  # gets this same case-based validation before use (e.g. _BLEED_FETCH_TIMEOUT
-  # gates.sh:538, _SAST_FETCH_TIMEOUT :689, BASE/RATE/MAX llm-client.sh:1041-
-  # 1043) — INTERVAL was the one sibling that reached `sleep "$INTERVAL"`
-  # below unguarded. An operator-set non-numeric CLAGENTIC_TAIL_INTERVAL_SEC
-  # would otherwise reach `sleep` raw and fail there instead of falling back
-  # to a safe default.
-  case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=1 ;; esac
+  # Numeric guard: every other timeout/interval var in this file is
+  # validated before use; INTERVAL was the one sibling that reached
+  # `sleep "$INTERVAL"` unguarded. Non-numeric would fail in `sleep`, and 0
+  # would turn the poll into a tight loop against the audit DB, so both fall
+  # back to the default with a WARN.
+  INTERVAL=$(ds_positive_int_or_warn CLAGENTIC_TAIL_INTERVAL_SEC "${CLAGENTIC_TAIL_INTERVAL_SEC:-}" 1)
   printf '== clagentic-lite gate tail (Ctrl-C to quit, polling every %ss) ==\n' "$INTERVAL"
   printf '   starting from gate_runs.id > %s\n\n' "$LAST_ID"
 

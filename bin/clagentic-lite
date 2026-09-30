@@ -445,7 +445,7 @@ claude_hooks_version() {
 # on every invocation — a maintainer working in this checkout who wants the
 # tool to dogfood itself runs `clagentic-lite init` (or `enroll --self`) once,
 # same as any other consuming machine. Cloning the repo alone does not wire
-# anything; see AGENTS.md and README.md "Developing clagentic-lite itself".
+# anything; see AGENTS.md "Developing clagentic-lite itself".
 #
 # Renders to a same-directory temp file, then atomic `mv` over the real
 # target — mirrors _stamp_claude_settings's validate-then-temp-then-move
@@ -991,7 +991,7 @@ _CLAUDE_PLUGIN_TIMEOUT=$(ds_positive_int_or_default "${CLAGENTIC_PLUGIN_TIMEOUT_
 # as GENUINELY-NO-MATCH.
 
 # RENDER INPUTS ARE GLOBAL-ONLY. The rendered plugin is ONE per user (see
-# AGENTS.md "One plugin, always"), not one per repo. If the render read a key
+# AGENTS.md "Single-plugin config-aware render + render stamp"), not one per repo. If the render read a key
 # from whichever repo's .clagentic/config happened to be loaded when
 # update/doctor ran, the plugin baked for EVERY project would flip depending
 # on which repo `update` was last run from. So every key the render (and its

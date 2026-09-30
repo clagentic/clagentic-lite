@@ -22,6 +22,7 @@ Run with: python3 -m unittest scripts.test_config_key_drift -v
 """
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -35,7 +36,14 @@ CONFIG_EXAMPLE = os.path.join(TOOL_HOME, "share", "config.example")
 _KEY_RE = re.compile(r"\bCLAGENTIC_[A-Z][A-Z0-9_]*[A-Z0-9]\b")
 # CLAGENTIC_${ROLE}_SUFFIX / CLAGENTIC_$ROLE... style dynamic reads.
 _DYNAMIC_RE = re.compile(r"CLAGENTIC_\$\{?[A-Za-z_][A-Za-z0-9_]*[^}\s'\"]*\}?_([A-Z][A-Z0-9_]*[A-Z0-9])\b")
-# The role prefixes the dynamic constructions expand over.
+# `role_env <ROLE> <SUFFIX> ...` (scripts/llm-client.sh) reads
+# CLAGENTIC_<ROLE>_<SUFFIX>; the suffix is a literal word in the call.
+_ROLE_ENV_RE = re.compile(r"\brole_env\s+\"?\$?\{?\w+\}?\"?\s+([A-Z][A-Z0-9_]*[A-Z0-9])\b")
+# CLAGENTIC_$(<command substitution>)_SUFFIX: a name built by a pipeline.
+_CONSTRUCTED_RE = re.compile(r"CLAGENTIC_\$\([^)]*\)_([A-Z][A-Z0-9_]*[A-Z0-9])\b")
+# The role prefixes the dynamic constructions expand over. Must cover every
+# prefix in bin/clagentic-lite's _AGENT_ROLE_TABLE (asserted below) plus the
+# CLI-only SUMMARIZER role.
 _ROLES = ("BUILDER", "REVIEWER", "AUDITOR", "GATE", "SUMMARIZER", "TROUBLESHOOTER")
 
 # Names that appear in code but are deliberately NOT operator-settable config
@@ -81,18 +89,13 @@ DOCUMENT_ONLY = {
 # find). Each entry: a regex over documented keys, the file, and a substring of
 # the construction site. The substring is asserted present, so deleting the
 # code that reads the family makes its documented keys "unread" again.
-_ROLE_ALT = "|".join(_ROLES)
+#
+# Per-role families (_REQUIRED, _TIMEOUT_SEC, _TIMEOUT_MAX_SEC) are NOT listed
+# here: they are extracted from the code itself (_ROLE_ENV_RE, _CONSTRUCTED_RE),
+# so deleting one read makes its documented keys "unread" again instead of being
+# masked by a blanket pattern. Only the CLI x tier table, which has no literal
+# suffix to extract, stays evidence-based.
 DYNAMIC_FAMILIES = (
-    (
-        re.compile(rf"^CLAGENTIC_({_ROLE_ALT})_REQUIRED$"),
-        "scripts/llm-client.sh",
-        "_REQUIRED\"",
-    ),
-    (
-        re.compile(rf"^CLAGENTIC_({_ROLE_ALT})_TIMEOUT(_MAX)?_SEC$"),
-        "scripts/llm-client.sh",
-        'role_env "$ROLE_U" TIMEOUT_SEC',
-    ),
     (
         re.compile(r"^CLAGENTIC_MODEL_[A-Z]+_[A-Z]+$"),
         "scripts/llm-client.sh",
@@ -138,6 +141,8 @@ def keys_read_in_code(files=None):
             )
         literal.update(_KEY_RE.findall(text))
         suffixes.update(_DYNAMIC_RE.findall(text))
+        suffixes.update(_ROLE_ENV_RE.findall(text))
+        suffixes.update(_CONSTRUCTED_RE.findall(text))
     return literal, suffixes
 
 
@@ -159,6 +164,12 @@ def drift(literal, suffixes, documented, internal_only, document_only, families=
         k for k in literal if k not in documented and k not in internal_only
     )
     dynamic_reads = {f"CLAGENTIC_{r}_{s}" for r in _ROLES for s in suffixes}
+    # A per-role suffix the code reads must be documented for at least one role.
+    undocumented += sorted(
+        f"CLAGENTIC_<ROLE>_{s}" for s in suffixes
+        if not any(f"CLAGENTIC_{r}_{s}" in documented or f"CLAGENTIC_{r}_{s}" in internal_only
+                   for r in _ROLES)
+    )
     unread = sorted(
         k for k in documented
         if k not in literal and k not in dynamic_reads and k not in document_only
@@ -249,6 +260,70 @@ class TestConfigKeyDrift(unittest.TestCase):
         self.assertEqual(undocumented, ["CLAGENTIC_FIXTURE_READ_KEY"])
         self.assertEqual(unread, ["CLAGENTIC_FIXTURE_COMMENT_ONLY_KEY"])
 
+    def _fixture_drift(self, code_text, example_text):
+        with tempfile.TemporaryDirectory() as tmp:
+            code = os.path.join(tmp, "fixture.sh")
+            example = os.path.join(tmp, "config.example")
+            with open(code, "w") as f:
+                f.write(code_text)
+            with open(example, "w") as f:
+                f.write(example_text)
+            literal, suffixes = keys_read_in_code([code])
+            documented = keys_in_config_example(example)
+        return drift(literal, suffixes, documented, {}, {})
+
+    def test_role_env_reads_are_extracted_as_role_suffixes(self):
+        _, suffixes = keys_read_in_code(
+            [self._write_tmp('x=$(role_env "$ROLE_U" TIMEOUT_MAX_SEC "300")\n')]
+        )
+        self.assertEqual(suffixes, {"TIMEOUT_MAX_SEC"})
+
+    def test_constructed_names_are_extracted(self):
+        _, suffixes = keys_read_in_code(
+            [self._write_tmp("K=\"CLAGENTIC_$(printf '%s' \"$R\" | tr a-z A-Z)_REQUIRED\"\n")]
+        )
+        self.assertEqual(suffixes, {"REQUIRED"})
+
+    def test_deleted_per_role_timeout_max_read_is_reported_unread(self):
+        # Both documented; only the base read remains in code. The old blanket
+        # family pattern hid this.
+        example = (
+            "# CLAGENTIC_REVIEWER_TIMEOUT_SEC=1\n"
+            "# CLAGENTIC_REVIEWER_TIMEOUT_MAX_SEC=1\n"
+        )
+        code_before = 'a=$(role_env "$R" TIMEOUT_SEC 1)\nb=$(role_env "$R" TIMEOUT_MAX_SEC 1)\n'
+        code_after = 'a=$(role_env "$R" TIMEOUT_SEC 1)\n'
+        self.assertEqual(self._fixture_drift(code_before, example), ([], []))
+        undocumented, unread = self._fixture_drift(code_after, example)
+        self.assertEqual(undocumented, [])
+        self.assertIn("CLAGENTIC_REVIEWER_TIMEOUT_MAX_SEC", unread)
+
+    def test_deleted_constructed_required_read_is_reported_unread(self):
+        example = "# CLAGENTIC_GATE_REQUIRED=0\n"
+        code = "K=\"CLAGENTIC_$(printf x)_REQUIRED\"\n"
+        self.assertEqual(self._fixture_drift(code, example), ([], []))
+        _, unread = self._fixture_drift("echo nothing\n", example)
+        self.assertEqual(unread, ["CLAGENTIC_GATE_REQUIRED"])
+
+    def test_undocumented_per_role_suffix_is_reported(self):
+        undocumented, _ = self._fixture_drift('a=$(role_env "$R" BRAND_NEW 1)\n', "")
+        self.assertEqual(undocumented, ["CLAGENTIC_<ROLE>_BRAND_NEW"])
+
+    def test_role_list_covers_the_cli_role_table(self):
+        with open(os.path.join(TOOL_HOME, "bin", "clagentic-lite")) as f:
+            m = re.search(r'^_AGENT_ROLE_TABLE="([^"]*)"', f.read(), re.M)
+        self.assertIsNotNone(m)
+        prefixes = {entry.split(":")[0] for entry in m.group(1).split()}
+        self.assertEqual(prefixes - set(_ROLES), set(), "role table has a role _ROLES does not enumerate")
+
+    def _write_tmp(self, text):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "fixture.sh")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
 
 DOC_FILES = ("README.md", "AGENTS.md", "docs/DESIGN.md", "docs/GATES.md",
              "docs/LLM-USAGE.md", "docs/PORTABILITY.md", "docs/ROUTER.md",
@@ -285,12 +360,13 @@ class TestDocKeyMentions(unittest.TestCase):
 # git history and PR threads, never in shipped prose (a public repo's docs are
 # read by people who have no idea what they refer to).
 _CREW_NAME_RE = re.compile(
-    r"\b(PEACHES|BOBBIE|HOLDEN|NAOMI|AMOS|MILLER|ASHFORD|AVASARALA|DRUMMER|TIAMUT|PRAX)\b"
+    r"\b(PEACHES|BOBBIE|HOLDEN|NAOMI|AMOS|MILLER|ASHFORD|AVASARALA|DRUMMER|TIAMUT|PRAX)\b",
+    re.IGNORECASE,
 )
 
 
 def crew_names_in(text):
-    return sorted(set(_CREW_NAME_RE.findall(text)))
+    return sorted({m.upper() for m in _CREW_NAME_RE.findall(text)})
 
 
 class TestShippedProseHygiene(unittest.TestCase):
@@ -312,7 +388,15 @@ class TestShippedProseHygiene(unittest.TestCase):
 
     def test_detector_fails_on_a_drifted_fixture(self):
         self.assertEqual(crew_names_in("accepted after PEACHES review"), ["PEACHES"])
-        self.assertEqual(crew_names_in("Miller and Holden are people's names"), [])
+
+    def test_detector_is_case_insensitive(self):
+        # The mixed-case product spelling is the one an upper-case-only
+        # pattern missed.
+        self.assertEqual(crew_names_in("built by AMoS"), ["AMOS"])
+        self.assertEqual(crew_names_in("Amos and holden"), ["AMOS", "HOLDEN"])
+
+    def test_detector_respects_word_boundaries(self):
+        self.assertEqual(crew_names_in("Tiamutant, Praxis, Damos, Millerite"), [])
 
 
 # Shipped manifests are read by every installer; a personal address in one is
@@ -342,6 +426,117 @@ class TestShippedManifestsCarryNoEmail(unittest.TestCase):
         drifted = '{"author": {"name": "x", "email": "someone@example.com"}}'
         self.assertEqual(emails_in(drifted), ["someone@example.com"])
         self.assertEqual(emails_in('{"author": {"name": "clagentic"}}'), [])
+
+
+# Pointers in shipped code that send a reader to a doc section: either
+# `FILE.md#anchor`, or a doc name followed by a quoted section title
+# (`see README "Some heading"`, `docs/ROUTER.md § 2 "Some heading"`). Each must
+# resolve to a real heading in the named file, or the pointer is a dead end (the
+# README section a comment named had moved to docs/ROUTER.md).
+_DOC_NAME = r"(README|AGENTS|(?:docs/)?(?:DESIGN|GATES|LLM-USAGE|PORTABILITY|ROUTER|DEMO-SCRIPT))"
+_POINTER_TITLE_RE = re.compile(
+    _DOC_NAME + r"(?:\.md)?\s+(?:§\s*[\d.]+\s+)?[\"'“]([^\"'”]{4,})[\"'”]"
+)
+_POINTER_ANCHOR_RE = re.compile(_DOC_NAME + r"\.md#([A-Za-z0-9_-]+)")
+
+
+def _doc_path(name):
+    if name in ("README", "AGENTS"):
+        return f"{name}.md"
+    return f"{name}.md" if name.startswith("docs/") else f"docs/{name}.md"
+
+
+def _flatten_comment_wraps(text):
+    """Join a pointer a comment wrapped across lines back into one line."""
+    text = re.sub(r"-\n[ \t]*#[ \t]*", "-", text)
+    text = re.sub(r"\n[ \t]*#[ \t]*", " ", text)
+    return re.sub(r"[ \t]{2,}", " ", text)
+
+
+def doc_headings(text):
+    """Heading texts of a markdown file, backticks and trailing #s removed."""
+    heads = []
+    inside = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            inside = not inside
+            continue
+        m = None if inside else re.match(r"^#{1,6}\s+(.*?)\s*#*\s*$", line)
+        if m:
+            heads.append(m.group(1).replace("`", ""))
+    return heads
+
+
+def heading_slug(heading):
+    slug = re.sub(r"[^a-z0-9 _-]", "", heading.lower())
+    return slug.replace(" ", "-")
+
+
+def unresolved_pointers(code_text, headings_by_file):
+    """(pointer, reason) for every doc pointer in CODE_TEXT that does not
+    resolve. headings_by_file maps a doc path to its heading list."""
+    bad = []
+    code_text = _flatten_comment_wraps(code_text)
+    for name, title in _POINTER_TITLE_RE.findall(code_text):
+        heads = headings_by_file.get(_doc_path(name))
+        if heads is None:
+            bad.append((f"{name} \"{title}\"", "no such doc file"))
+        elif not any(title.lower() in h.lower() for h in heads):
+            bad.append((f"{name} \"{title}\"", f"no heading contains it in {_doc_path(name)}"))
+    for name, anchor in _POINTER_ANCHOR_RE.findall(code_text):
+        heads = headings_by_file.get(_doc_path(name))
+        if heads is None:
+            bad.append((f"{name}.md#{anchor}", "no such doc file"))
+        elif anchor not in {heading_slug(h) for h in heads}:
+            bad.append((f"{name}.md#{anchor}", f"no heading slug matches in {_doc_path(name)}"))
+    return bad
+
+
+def _headings_by_file():
+    out = {}
+    for rel in DOC_FILES:
+        with open(os.path.join(TOOL_HOME, rel)) as f:
+            out[rel] = doc_headings(f.read())
+    return out
+
+
+class TestCodeDocPointersResolve(unittest.TestCase):
+    maxDiff = None
+
+    def test_every_doc_pointer_in_shipped_code_resolves_to_a_heading(self):
+        heads = _headings_by_file()
+        found = []
+        for path in _code_files():
+            with open(path, errors="replace") as f:
+                text = f.read()
+            for pointer, reason in unresolved_pointers(text, heads):
+                found.append(f"{os.path.relpath(path, TOOL_HOME)}: {pointer}: {reason}")
+        self.assertEqual(found, [], "doc pointer(s) in shipped code that do not resolve")
+
+    def test_a_pointer_at_a_moved_section_is_flagged(self):
+        # The exact stale shapes bin/clagentic-lite carried: the section now
+        # lives in docs/ROUTER.md, not README.
+        heads = _headings_by_file()
+        for stale in (
+            "see README.md \"Verifying on your machine\" and",
+            "see README 'Verifying on your machine'",
+            "See README \"Verifying on your machine\".",
+        ):
+            with self.subTest(stale=stale):
+                self.assertTrue(unresolved_pointers(stale, heads), stale)
+
+    def test_the_corrected_pointer_resolves(self):
+        heads = _headings_by_file()
+        self.assertEqual(
+            unresolved_pointers("see docs/ROUTER.md \"Verifying on your machine\"", heads), []
+        )
+
+    def test_a_dead_anchor_is_flagged(self):
+        heads = _headings_by_file()
+        self.assertTrue(unresolved_pointers("see docs/ROUTER.md#no-such-section", heads))
+        self.assertEqual(
+            unresolved_pointers("see docs/ROUTER.md#verifying-on-your-machine", heads), []
+        )
 
 
 def _cli_text():
