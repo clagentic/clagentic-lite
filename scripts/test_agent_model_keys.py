@@ -164,6 +164,64 @@ class TestInvalidValue(_AgentModelBase):
                 self.assertEqual(rendered, _source_lines("builder"))
                 self.assertFalse(any(ln.startswith("model:") for ln in _frontmatter(rendered)))
 
+    def test_router_reference_prefix_is_never_accepted_as_a_pinned_value(self):
+        # Only the router-injection path may emit role:<x>. A pinned
+        # role:<chain> on the builder would route it through the router, which
+        # is exactly what the builder must never do.
+        for value in ("role:x", "role:builder-chain", "role:reviewer-chain", "role:a:b"):
+            for prefix, agent in ROLES:
+                with self.subTest(value=value, role=prefix):
+                    result = self._render(extra_env={f"CLAGENTIC_{prefix}_AGENT_MODEL": value})
+                    self.assertIn(f"CLAGENTIC_{prefix}_AGENT_MODEL has an invalid value", result.stderr)
+                    rendered = self._rendered_lines(agent)
+                    self.assertFalse(any(ln.startswith("model:") for ln in _frontmatter(rendered)))
+
+    def test_a_value_merely_containing_role_is_still_accepted(self):
+        for value in ("roleplay-model-1", "my-role:x"):
+            with self.subTest(value=value):
+                self._render(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": value})
+                self.assertEqual(self._rendered_lines("builder")[2], f"model: {value}\n")
+
+    def test_every_control_character_is_rejected_anywhere_in_the_value(self):
+        controls = [c for c in range(1, 32) if c != 10] + [127]
+        for c in controls:
+            with self.subTest(control=hex(c)):
+                result = self._run(
+                    f"_agent_model_value_is_valid \"$(printf 'op\\{c:03o}us')\" && echo valid || echo invalid\n"
+                )
+                self.assertEqual(result.stdout.strip(), "invalid", msg=hex(c))
+
+    def test_newline_in_a_config_file_value_is_rejected_not_truncated(self):
+        # The value is transported out of the config file intact: a value that
+        # continues past a newline must not be cut down to its first line and
+        # then accepted.
+        for value in ("opus\nname: evil", "opus\n", "\nopus", "opus\n\n"):
+            with self.subTest(value=value):
+                result = self._render(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": value})
+                self.assertIn("has an invalid value", result.stderr)
+                self.assertEqual(self._rendered_lines("builder"), _source_lines("builder"))
+
+    def test_documented_start_and_end_rules(self):
+        accepted = ("a", "opus", "sonnet[1m]", "example.model-v1:0", "arn:x:y/z", "a]", "inherit")
+        rejected = (
+            "-opus", ".opus", "_opus", ":opus", "/opus", "@opus", "[opus", "]opus",
+            "opus-", "opus.", "opus_", "opus/", "opus@", "opus[", "opus:",
+        )
+        for value in accepted:
+            with self.subTest(accepted=value):
+                r = self._run(f"_agent_model_value_is_valid '{value}' && echo valid || echo invalid\n")
+                self.assertEqual(r.stdout.strip(), "valid", msg=value)
+        for value in rejected:
+            with self.subTest(rejected=value):
+                r = self._run(f"_agent_model_value_is_valid '{value}' && echo valid || echo invalid\n")
+                self.assertEqual(r.stdout.strip(), "invalid", msg=value)
+
+    def test_non_ascii_letters_are_rejected_regardless_of_locale(self):
+        for value in ("opusé", "éopus", "opüs"):
+            with self.subTest(value=value):
+                result = self._render(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": value})
+                self.assertIn("has an invalid value", result.stderr)
+
     def test_warn_does_not_echo_raw_control_characters(self):
         result = self._render(
             extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": "a\x1b[31mb\nname: evil"}
