@@ -2092,7 +2092,7 @@ _run_prereq_checks() {
   if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
     printf '  %-15s MISSING (optional) — install: %s\n' "timeout" \
       "brew install coreutils (macOS) | apt install coreutils (Linux)"
-    warn "no timeout/gtimeout — LLM calls will run without per-call timeouts"
+    warn "no timeout/gtimeout — every timeout-bounded gate and LLM call will refuse to run (exit 99) until one is installed"
   fi
 
   # Single collated summary at the bottom of the run.
@@ -3709,7 +3709,7 @@ cmd_doctor() {
     printf '  WARN Builder and Reviewer both use "%s" — cross-vendor review is disabled.\n' "$_builder_cmd"
     printf '       Set CLAGENTIC_REVIEWER_CMD to a different CLI (e.g. codex vs claude).\n'
     printf '       Or set CLAGENTIC_REVIEWER_REQUIRED=1 to make same-vendor fallback a hard failure.\n'
-    printf '       See docs/DESIGN.md §"The three roles" for rationale.\n'
+    printf '       See docs/DESIGN.md §"The five roles" for rationale.\n'
   else
     _ok "Builder=$_builder_cmd / Reviewer=$_reviewer_cmd (cross-vendor OK)"
   fi

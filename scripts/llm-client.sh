@@ -8,6 +8,7 @@
 # table, invokes the configured CLI, and falls through the chain on failure.
 #
 # Subcommands:
+#   build        stdin = instruction; stdout = builder output (diff or prose)
 #   review       stdin = diff;       stdout = JSON findings (reviewer.md schema)
 #   summarize    stdin = transcript; stdout = one-line summary (<=200 chars)
 #   adversarial  stdin = diff;       stdout = markdown attack scenarios
