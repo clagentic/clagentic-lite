@@ -117,12 +117,17 @@ ds_tool_install_method() {
   if command -v brew >/dev/null 2>&1; then
     _dtim_to=$(ds_positive_int_or_warn CLAGENTIC_TOOL_VERSION_TIMEOUT_SEC "${CLAGENTIC_TOOL_VERSION_TIMEOUT_SEC:-}" 30)
     _dtim_prefix=$($DS_TIMEOUT_CMD "$_dtim_to" brew --prefix 2>/dev/null </dev/null || true)
-    if [ -n "$_dtim_prefix" ] && [ -d "$_dtim_prefix" ] && [ -w "$_dtim_prefix" ]; then
+    # Writability is judged on the tool's own keg directory, not the prefix: on
+    # Intel macOS the prefix (/usr/local) is root-owned while Cellar and the
+    # kegs are user-owned, so a prefix test would never allow a real upgrade.
+    if [ -n "$_dtim_prefix" ] && [ -d "$_dtim_prefix" ]; then
       _dtim_prefix=$(ds_resolve_path "$_dtim_prefix")
       case "$_dtim_real" in
-        "$_dtim_prefix"/Cellar/*)
-          printf 'brew'
-          return 0
+        "$_dtim_prefix"/Cellar/"$_dtim_tool"/*)
+          if [ -d "$_dtim_prefix/Cellar/$_dtim_tool" ] && [ -w "$_dtim_prefix/Cellar/$_dtim_tool" ]; then
+            printf 'brew'
+            return 0
+          fi
           ;;
       esac
     fi

@@ -2352,8 +2352,10 @@ _run_prereq_checks() {
 # _floor_rows_each TOOL CALLBACK
 # Runs ds_tool_floor_report for TOOL and calls CALLBACK in THIS shell once per
 # row (STATE TOOL VERSION ID MIN LABEL LOSS), so callbacks can update counters.
+# Returns 1, with no callback run, when the scratch file cannot be created: the
+# check did not run, and callers must say so rather than report "all met".
 _floor_rows_each() {
-  _fre_tmp=$(mktemp "${TMPDIR:-/tmp}/clagentic-floor-XXXXXX") || return 0
+  _fre_tmp=$(mktemp "${TMPDIR:-/tmp}/clagentic-floor-XXXXXX") || return 1
   ds_tool_floor_report "$1" > "$_fre_tmp" || true
   while IFS='|' read -r _f_state _f_tool _f_ver _f_id _f_min _f_label _f_loss; do
     "$2" "$_f_state" "$_f_tool" "$_f_ver" "$_f_id" "$_f_min" "$_f_label" "$_f_loss"
@@ -2413,7 +2415,8 @@ _doctor_tool_versions() {
   printf '\nsecurity tool versions:\n'
   for _dtv_tool in $CLAGENTIC_SECURITY_TOOLS; do
     _dfr_any_below=0; _dfr_seen_unparse=0; _dfr_seen_missing=0
-    _floor_rows_each "$_dtv_tool" _doctor_floor_row
+    _floor_rows_each "$_dtv_tool" _doctor_floor_row || \
+      printf '  WARN %s: the version floor check could not run (scratch file could not be created under %s)\n' "$_dtv_tool" "${TMPDIR:-/tmp}"
     if [ "$_dfr_any_below" -eq 1 ]; then
       printf '       Upgrade %s: %s\n' "$_dtv_tool" "$(_tool_floor_upgrade_text "$_dtv_tool")"
     fi
@@ -2432,8 +2435,8 @@ _update_floor_collect_row() {
 }
 
 _update_floor_collect() {
-  _ufr_below=""; _ufr_unparse=""; _ufr_missing=""
-  _floor_rows_each "$1" _update_floor_collect_row
+  _ufr_below=""; _ufr_unparse=""; _ufr_missing=""; _ufr_failed=0
+  _floor_rows_each "$1" _update_floor_collect_row || _ufr_failed=1
 }
 
 # update: check every security tool against the (possibly just-raised) floor
@@ -2443,6 +2446,11 @@ _update_tool_floors() {
   _utf_bad=0
   for _utf_tool in $CLAGENTIC_SECURITY_TOOLS; do
     _update_floor_collect "$_utf_tool"
+    if [ "$_ufr_failed" -eq 1 ]; then
+      warn "the version floor check could not run for $_utf_tool (scratch file could not be created under ${TMPDIR:-/tmp}); its floors are unverified"
+      _utf_bad=$((_utf_bad+1))
+      continue
+    fi
     _utf_upgrade_note=""
     if [ -n "$_ufr_below" ]; then
       _utf_rc=0

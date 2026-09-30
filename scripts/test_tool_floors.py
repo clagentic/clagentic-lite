@@ -304,6 +304,7 @@ STUB
         _write_exec(os.path.join(old_dir, "gitleaks"), _version_script("8.16.0"))
         rc_old, _, err = self._update([old_dir])
         self.assertIn("is below the required", err)
+        self.assertEqual(rc_ok, 0)
         self.assertEqual(rc_old, rc_ok)
 
     def test_undetected_install_method_is_never_upgraded(self):
@@ -316,14 +317,33 @@ STUB
         self.assertIn("install method not detected", err)
         self.assertNotIn("sudo", self._calls())
 
-    @unittest.skipIf(os.geteuid() == 0, "root can write any prefix")
-    def test_unwritable_brew_prefix_is_never_upgraded(self):
+    @unittest.skipIf(os.geteuid() == 0, "root can write any keg")
+    def test_unwritable_brew_keg_is_never_upgraded(self):
+        prefix = self._brew_layout()
+        keg = os.path.join(prefix, "Cellar", "gitleaks")
+        os.chmod(keg, 0o555)
+        self.addCleanup(os.chmod, keg, 0o755)
+        rc, out, err = self._update([os.path.join(prefix, "bin")])
+        self.assertNotIn("upgrade", self._calls())
+        self.assertIn("install method not detected", err)
+
+    def test_root_owned_style_prefix_with_writable_keg_is_upgraded(self):
+        # Intel macOS: the prefix is root-owned, Cellar and the keg are not.
         prefix = self._brew_layout()
         os.chmod(prefix, 0o555)
         self.addCleanup(os.chmod, prefix, 0o755)
         rc, out, err = self._update([os.path.join(prefix, "bin")])
-        self.assertNotIn("upgrade", self._calls())
-        self.assertIn("install method not detected", err)
+        self.assertIn("brew upgrade gitleaks", self._calls())
+        self.assertNotIn("sudo", self._calls())
+
+    def test_floor_check_that_cannot_run_is_not_reported_as_met(self):
+        ok_dir = os.path.join(self.tmp, "ok")
+        _write_exec(os.path.join(ok_dir, "gitleaks"), _version_script("8.30.1"))
+        broken_tmp = os.path.join(self.tmp, "no-such-tmpdir")
+        rc, out, err = self._update([ok_dir], extra={"TMPDIR": broken_tmp})
+        combined = out + err
+        self.assertIn("version floor check could not run for gitleaks", combined)
+        self.assertNotIn("meet their version floors", combined)
 
     def test_pipx_venv_install_is_upgraded(self):
         real = os.path.join(self.tmp, "pipx", "venvs", "gitleaks", "bin", "gitleaks")
@@ -516,6 +536,7 @@ class TestUpdateRemoteCheck(_RemoteBase):
         rc_bad, out_bad = self._update()
         self.assertIn("origin authentication FAILED", out_bad)
         self.assertIn("credential.helper git would consult: none configured", out_bad)
+        self.assertEqual(rc_ok, 0)
         self.assertEqual(rc_bad, rc_ok)
 
 
