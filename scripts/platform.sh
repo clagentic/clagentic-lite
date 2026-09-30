@@ -1374,7 +1374,10 @@ _llm_json_array_sanitize_fields() {
         _ljasf_item=$(printf '%s' "$_ljasf_item" | jq -c --arg f "$_ljasf_field" --arg v "$_ljasf_clean" \
           'if has($f) then .[$f] = $v else . end' 2>/dev/null)
       done
-      _ljasf_out=$(printf '%s' "$_ljasf_out" | jq -c --argjson item "$_ljasf_item" '. + [$item]' 2>/dev/null)
+      # Accumulator and item travel on stdin (slurped), not --argjson: an
+      # argv string over MAX_ARG_STRLEN (~128 KiB) fails exec, which would
+      # make this loop fail open with the unsanitized input.
+      _ljasf_out=$(printf '%s\n%s' "$_ljasf_out" "$_ljasf_item" | jq -c -s '.[0] + [.[1]]' 2>/dev/null)
       [ -n "$_ljasf_out" ] || { printf '%s' "$_ljasf_json"; return 0; }
       _ljasf_i=$((_ljasf_i + 1))
     done
@@ -1383,50 +1386,91 @@ _llm_json_array_sanitize_fields() {
   fi
 
   if command -v python3 >/dev/null 2>&1; then
-    # Same type check as the jq branch above: distinguish "valid JSON but
-    # not an array" (fail open with the ORIGINAL input) from "a genuine
-    # empty array" (both would otherwise produce _ljasf_count=0 and fall
-    # through to the same code path, but only one of them should return the
-    # original text unchanged).
-    _ljasf_is_array=$(python3 -c 'import json,sys
-try:
-    d = json.loads(sys.argv[1])
-    print("1" if isinstance(d, list) else "0")
-except Exception:
-    print("0")' "$_ljasf_json" 2>/dev/null)
-    if [ "$_ljasf_is_array" != "1" ]; then
-      printf '%s' "$_ljasf_json"
-      return 0
-    fi
-    _ljasf_count=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(len(d))' "$_ljasf_json" 2>/dev/null)
-    case "$_ljasf_count" in ''|*[!0-9]*) printf '%s' "$_ljasf_json"; return 0 ;; esac
-    _ljasf_out="[]"
-    _ljasf_i=0
-    while [ "$_ljasf_i" -lt "$_ljasf_count" ]; do
-      _ljasf_item=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(json.dumps(d[int(sys.argv[2])]))' "$_ljasf_json" "$_ljasf_i" 2>/dev/null) || break
-      for _ljasf_field in $_ljasf_fields; do
-        _ljasf_raw=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); v=d.get(sys.argv[2], ""); print(v if isinstance(v, str) else "")' "$_ljasf_item" "$_ljasf_field" 2>/dev/null)
-        _ljasf_clean=$(_llm_field_sanitize "$_ljasf_raw")
-        _ljasf_item=$(python3 -c '
-import json, sys
-item = json.loads(sys.argv[1])
-field = sys.argv[2]
-if field in item:
-    item[field] = sys.argv[3]
-print(json.dumps(item))
-' "$_ljasf_item" "$_ljasf_field" "$_ljasf_clean" 2>/dev/null)
-      done
-      _ljasf_out=$(python3 -c 'import json,sys; arr=json.loads(sys.argv[1]); arr.append(json.loads(sys.argv[2])); print(json.dumps(arr))' "$_ljasf_out" "$_ljasf_item" 2>/dev/null)
-      [ -n "$_ljasf_out" ] || { printf '%s' "$_ljasf_json"; return 0; }
-      _ljasf_i=$((_ljasf_i + 1))
-    done
-    printf '%s' "$_ljasf_out"
+    _llm_json_array_sanitize_fields_py "$_ljasf_json" $_ljasf_fields
     return 0
   fi
 
   # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open: same
   # posture as _sanitize_adversarial_findings_json's own no-JSON-tool path.
   printf '%s' "$_ljasf_json"
+}
+
+# _llm_json_array_sanitize_fields_py JSON FIELD1 [FIELD2 ...] — python3
+# implementation of _llm_json_array_sanitize_fields, same contract and same
+# fail-open results. Nothing of unbounded size is carried as an argv string:
+# the array and each cleaned value go through temp files and the per-item
+# and accumulator JSON through stdin, because exec of an argv string over
+# MAX_ARG_STRLEN (~128 KiB) fails with E2BIG. The old argv-carried form
+# failed its own "is this an array" check on a large array and returned the
+# ORIGINAL, unsanitized input -- a silent bypass of the sanitizer exactly
+# when the payload is big.
+_llm_json_array_sanitize_fields_py() {
+  _ljasp_json="$1"
+  shift
+  _ljasp_fields="$*"
+  _ljasp_result="$_ljasp_json"
+  _ljasp_arr=$(mktemp -t clagentic-llm-arrsan-a.XXXXXX 2>/dev/null) || _ljasp_arr=""
+  _ljasp_itf=$(mktemp -t clagentic-llm-arrsan-i.XXXXXX 2>/dev/null) || _ljasp_itf=""
+  _ljasp_val=$(mktemp -t clagentic-llm-arrsan-v.XXXXXX 2>/dev/null) || _ljasp_val=""
+  if [ -n "$_ljasp_arr" ] && [ -n "$_ljasp_itf" ] && [ -n "$_ljasp_val" ]; then
+    printf '%s' "$_ljasp_json" > "$_ljasp_arr"
+    # Distinguish "valid JSON but not an array" (fail open with the ORIGINAL
+    # input) from "a genuine empty array".
+    _ljasp_is_array=$(python3 -c 'import json,sys
+try:
+    with open(sys.argv[1], "rb") as f:
+        d = json.loads(f.read())
+    print("1" if isinstance(d, list) else "0")
+except Exception:
+    print("0")' "$_ljasp_arr" 2>/dev/null)
+    if [ "$_ljasp_is_array" = "1" ]; then
+      _ljasp_count=$(python3 -c 'import json,sys
+with open(sys.argv[1], "rb") as f:
+    print(len(json.loads(f.read())))' "$_ljasp_arr" 2>/dev/null)
+      case "$_ljasp_count" in
+        ''|*[!0-9]*) ;;
+        *)
+          _ljasp_out="[]"
+          _ljasp_i=0
+          _ljasp_failed=0
+          while [ "$_ljasp_i" -lt "$_ljasp_count" ]; do
+            _ljasp_item=$(python3 -c 'import json,sys
+with open(sys.argv[1], "rb") as f:
+    d = json.loads(f.read())
+print(json.dumps(d[int(sys.argv[2])]))' "$_ljasp_arr" "$_ljasp_i" 2>/dev/null) || break
+            for _ljasp_field in $_ljasp_fields; do
+              _ljasp_raw=$(printf '%s' "$_ljasp_item" | python3 -c 'import json,sys
+d = json.loads(sys.stdin.buffer.read())
+v = d.get(sys.argv[1], "")
+print(v if isinstance(v, str) else "")' "$_ljasp_field" 2>/dev/null)
+              _ljasp_clean=$(_llm_field_sanitize "$_ljasp_raw")
+              printf '%s' "$_ljasp_clean" > "$_ljasp_val"
+              _ljasp_item=$(printf '%s' "$_ljasp_item" | python3 -c '
+import json, sys
+item = json.loads(sys.stdin.buffer.read())
+field = sys.argv[1]
+if field in item:
+    with open(sys.argv[2], "rb") as f:
+        item[field] = f.read().decode("utf-8", "surrogateescape")
+print(json.dumps(item))
+' "$_ljasp_field" "$_ljasp_val" 2>/dev/null)
+            done
+            printf '%s' "$_ljasp_item" > "$_ljasp_itf"
+            _ljasp_out=$(printf '%s' "$_ljasp_out" | python3 -c 'import json,sys
+arr = json.loads(sys.stdin.buffer.read())
+with open(sys.argv[1], "rb") as f:
+    arr.append(json.loads(f.read()))
+print(json.dumps(arr))' "$_ljasp_itf" 2>/dev/null)
+            [ -n "$_ljasp_out" ] || { _ljasp_failed=1; break; }
+            _ljasp_i=$((_ljasp_i + 1))
+          done
+          [ "$_ljasp_failed" -eq 0 ] && _ljasp_result="$_ljasp_out"
+          ;;
+      esac
+    fi
+  fi
+  rm -f "$_ljasp_arr" "$_ljasp_itf" "$_ljasp_val"
+  printf '%s' "$_ljasp_result"
 }
 
 # _adversarial_findings_sort_blocking_first JSON — reorder a JSON array of
