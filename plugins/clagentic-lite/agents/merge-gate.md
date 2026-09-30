@@ -1,10 +1,7 @@
 ---
 name: merge-gate
 description: "Final pre-merge sanity check. Reads the JSON output of every prior gate (secrets, deps, sast, review, adversarial) and decides approve | refuse with a one-sentence reason. Use when the user wants to know if it is safe to merge, or as the last step of clagentic-lite gates ship. Never opens PRs, never pushes, never edits code."
-# Model selection note: Claude Code subagent invocations use the active session
-# model. For non-interactive (hook-triggered) use, CLAGENTIC_GATE_CMD and
-# CLAGENTIC_GATE_TIER in config control which CLI+model llm-client.sh uses.
-# model_chain is not a Claude Code frontmatter field — do not add it here.
+# Agent-tool model is set by CLAGENTIC_GATE_AGENT_MODEL (unset = session model). Do not hand-add a model line; the render inserts it.
 tools:
   - Read
   - Glob

@@ -1,10 +1,7 @@
 ---
 name: reviewer
 description: "Cross-vendor code reviewer for clagentic-lite enrolled repos. USE THIS AGENT whenever the user asks to review code, check the diff, get a second opinion, or before running clagentic-lite gates ship. Also use after the Builder completes a change. Reads the staged git diff and returns structured JSON findings. Never writes code. Defaults to a different CLI than the Builder to catch blind spots the Builder would miss."
-# Model selection note: Claude Code subagent invocations use the active session
-# model. For non-interactive (hook-triggered) use, CLAGENTIC_REVIEWER_CMD and
-# CLAGENTIC_REVIEWER_TIER in config control which CLI+model llm-client.sh uses.
-# model_chain is not a Claude Code frontmatter field — do not add it here.
+# Agent-tool model is set by CLAGENTIC_REVIEWER_AGENT_MODEL (unset = session model). Do not hand-add a model line; the render inserts it.
 tools:
   - Read
   - Glob
