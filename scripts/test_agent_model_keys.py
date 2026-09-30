@@ -105,7 +105,7 @@ class TestRenderPinnedModel(_AgentModelBase):
                 # Removing the one inserted line restores the source exactly.
                 self.assertEqual(rendered[:2] + rendered[3:], _source_lines(agent))
                 self.assertEqual(
-                    sum(1 for l in _frontmatter(rendered) if l.startswith("model:")), 1
+                    sum(1 for ln in _frontmatter(rendered) if ln.startswith("model:")), 1
                 )
                 for other_prefix, other in ROLES:
                     if other != agent:
@@ -176,7 +176,7 @@ class TestInvalidValue(_AgentModelBase):
                 rendered = self._rendered_lines("builder")
                 # Byte-identical to the source: frontmatter cannot have been altered.
                 self.assertEqual(rendered, _source_lines("builder"))
-                self.assertFalse(any(l.startswith("model:") for l in _frontmatter(rendered)))
+                self.assertFalse(any(ln.startswith("model:") for ln in _frontmatter(rendered)))
 
     def test_warn_does_not_echo_raw_control_characters(self):
         result = self._render(
