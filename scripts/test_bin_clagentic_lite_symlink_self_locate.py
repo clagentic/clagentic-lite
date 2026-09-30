@@ -47,7 +47,7 @@ def _make_fake_checkout(root):
     shutil.copyfile(CLI, dest_cli)
     os.chmod(dest_cli, 0o755)
 
-    for name in ("platform.sh", "gates.sh"):
+    for name in ("platform.sh", "gates.sh", "tool-floors.sh", "remote-check.sh"):
         src = os.path.join(TOOL_HOME, "scripts", name)
         shutil.copyfile(src, os.path.join(scripts_dir, name))
 
