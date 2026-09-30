@@ -1302,79 +1302,33 @@ PYEOF
   printf '%s' "$_ljaaf_json"
 }
 
-# _llm_json_array_sanitize_fields JSON FIELD1 [FIELD2 ...] — decompose a
-# JSON array of objects, run _llm_field_sanitize over each named string
-# field on every object, rebuild, and print the sanitized array. Generic
-# extraction of the decompose/sanitize/rebuild shape
-# _sanitize_adversarial_findings_json (scripts/gates.sh) already used for
-# the adversarial findings sidecar (file/category/message), so a second
-# caller with a different field set — the deferrals array
-# (id/category/file/description/expires/acknowledged_by), lr-4f8316 follow-
-# up — reuses the same machinery instead of hand-rolling a variant. Any
-# array-of-objects round-trip in this codebase should extend this function
-# rather than growing a parallel decompose/sanitize/rebuild loop.
+# _llm_json_array_sanitize_fields_strict JSON FIELD1 [FIELD2 ...] — decompose
+# a JSON array of objects, run _llm_field_sanitize over each named string
+# field on every object, rebuild, and print the sanitized array. The one
+# shared decompose/sanitize/rebuild helper: the adversarial findings sidecar
+# (_sanitize_adversarial_findings_json, gates.sh), the merge-gate review
+# findings and the deferrals array (ds_review_prompt, llm-client.sh) all use
+# it. Any array-of-objects round-trip in this codebase should extend this
+# function rather than growing a parallel loop.
+#
+# FAIL CLOSED, and there is deliberately no fail-open sibling: any failure
+# (no JSON tool, input not an array, a temp file that cannot be created, a
+# JSON tool error on any item or field, an empty intermediate result) returns
+# 1 and prints NOTHING. It never prints the original input and never a partial
+# array, so a caller cannot mistake a failure for "sanitized" or for "no
+# entries"; each caller decides its own degraded behavior. Exit 0 prints the
+# sanitized array.
 #
 # Fields not named in FIELD... pass through UNCHANGED, undefanged, uncapped
 # -- this function sanitizes exactly the fields it is told to and nothing
 # else; it does not know or enforce a schema. That is SAFE ONLY when the
-# caller controls the object's field set in code -- e.g.
-# _sanitize_adversarial_findings_json (gates.sh), where
-# _parse_adversarial_findings constructs every finding from named regex
-# capture groups, so no key outside file/line/category/message/severity/
-# reachable/tier/class can ever exist on the object in the first place.
+# caller controls the object's field set in code (the adversarial findings,
+# built from named regex capture groups) or has reduced it first. A caller
+# whose array has an attacker-influenceable field set MUST run
+# _llm_json_array_allowlist_fields (above) FIRST.
 #
-# It is UNSAFE to call this function alone on a JSON array whose field set
-# an attacker can influence (e.g. an on-disk file an attacker can write) --
-# any key not in FIELD... rides through byte-identical: undefanged,
-# unstripped, uncapped (BOBBIE, lr-4f8316 third follow-up). A caller in
-# that position MUST run _llm_json_array_allowlist_fields (above) FIRST, to
-# reduce every object to the closed schema before this function ever sees
-# it -- see that function's docstring for why this is a separate function
-# rather than a change to this one's contract (this contract is depended
-# on by the adversarial-findings caller and must not change).
-#
-# Fail-open, matching every other JSON-tool-dependent helper in this
-# codebase: an empty/malformed JSON array, or the complete absence of jq
-# AND python3, returns the ORIGINAL input unchanged rather than dropping
-# entries or raising — the caller's own fail-open posture (e.g. "absent/
-# unreadable deferrals file must not break review") is preserved by never
-# turning a decompose failure into an empty result.
-#
-# Args: JSON (a JSON array of objects, as a single string), FIELD1..FIELDN
-# (one or more field names to sanitize on every object in the array).
-# stdout: the sanitized JSON array (or the original JSON, on any failure).
-#
-# This wrapper keeps the fail-open contract for its existing callers. A caller
-# on the merge-gate payload path must NOT use it: fail-open there hands the
-# original, unsanitized text to the model. Use
-# _llm_json_array_sanitize_fields_strict instead, which never returns the
-# input on failure.
-_llm_json_array_sanitize_fields() {
-  _ljasf_json="$1"
-  shift
-  _ljasf_fields="$*"
-  if [ -z "$_ljasf_fields" ]; then
-    # No fields named — nothing to sanitize; pass through unchanged rather
-    # than silently no-op-ing in a way that could be mistaken for "sanitized".
-    printf '%s' "$_ljasf_json"
-    return 0
-  fi
-  if _ljasf_result=$(_llm_json_array_sanitize_fields_strict "$_ljasf_json" $_ljasf_fields); then
-    printf '%s' "$_ljasf_result"
-  else
-    printf '%s' "$_ljasf_json"
-  fi
-  return 0
-}
-
-# _llm_json_array_sanitize_fields_strict JSON FIELD1 [FIELD2 ...] — same
-# decompose/sanitize/rebuild as _llm_json_array_sanitize_fields, but FAIL
-# CLOSED: any failure (no JSON tool, input not an array, a temp file that
-# cannot be created, a JSON tool error on any item or field, an empty
-# intermediate result) returns 1 and prints NOTHING. It never prints the
-# original input and never a partial array, so a caller cannot mistake a
-# failure for "sanitized" or for "no entries". Exit 0 prints the sanitized
-# array.
+# Args: JSON (a JSON array of objects, as a single string), FIELD1..FIELDN.
+# stdout: the sanitized JSON array (exit 0), nothing (exit 1).
 _llm_json_array_sanitize_fields_strict() {
   _ljass_json="$1"
   shift

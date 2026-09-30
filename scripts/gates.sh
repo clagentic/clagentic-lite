@@ -5652,14 +5652,14 @@ PYEOF
 _sanitize_adversarial_findings_json() {
   _safj_json="$1"
   # Thin wrapper over the shared decompose/sanitize/rebuild helper
-  # (_llm_json_array_sanitize_fields, platform.sh, lr-4f8316 follow-up) --
-  # this function used to carry its own duplicated jq/python3
+  # (platform.sh) -- this function used to carry its own duplicated jq/python3
   # decompose-sanitize-rebuild loop; that loop is now the shared machinery
   # a second caller (the deferrals array, ds_review_prompt in llm-client.sh)
-  # reuses instead of hand-rolling a variant. Behavior is unchanged: every
-  # finding's file/category/message field is sanitized via
-  # _llm_field_sanitize, exactly as before.
-  _llm_json_array_sanitize_fields "$_safj_json" file category message
+  # reuses instead of hand-rolling a variant. Every finding's
+  # file/category/message field is sanitized via _llm_field_sanitize.
+  # FAIL CLOSED: on any failure this returns 1 with no output, never the
+  # unsanitized input; cmd_adversarial turns that into a degraded sidecar.
+  _llm_json_array_sanitize_fields_strict "$_safj_json" file category message
 }
 
 cmd_adversarial() {
@@ -5834,7 +5834,21 @@ cmd_adversarial() {
     echo "[gates/adversarial] ADVERSARIAL_FINDINGS_PARSE_FAILED: could not read $OUT to extract structured [FINDING] headers — the markdown audit above may still be valid, but the structured sidecar the merge-gate reads could not be built. Check filesystem/permissions." 1>&2
     _adv_findings_json_raw='[]'
   fi
-  _adv_findings_json_sanitized=$(_sanitize_adversarial_findings_json "$_adv_findings_json_raw")
+  # A sanitize failure must not write raw findings (the sidecar feeds the
+  # merge-gate prompt) and must not look like "no findings" either: the
+  # sidecar holds an empty array and the meta sidecar below carries
+  # findings_degraded, which build_gate_summary turns into the unavailable
+  # marker plus adversarial_report_degraded.
+  _adv_findings_degraded=false
+  if _adv_findings_json_sanitized=$(_sanitize_adversarial_findings_json "$_adv_findings_json_raw") \
+      && [ -n "$_adv_findings_json_sanitized" ]; then
+    :
+  else
+    _adv_findings_degraded=true
+    _adv_findings_json_sanitized='[]'
+    cmd_log_run adversarial warn "adversarial findings could not be sanitized; sidecar marked degraded (merge gate treats the source as unavailable)"
+    echo "[gates/adversarial] WARN: adversarial findings could not be sanitized; the merge gate will treat this source as unavailable." 1>&2
+  fi
   _adv_findings_json_sorted=$(_adversarial_findings_sort_blocking_first "$_adv_findings_json_sanitized")
   # 0 would slice every finding away; resolved once here so the cap and the
   # dropped-count message below name the same effective value.
@@ -5876,8 +5890,8 @@ EOF3
   if [ "$_adv_findings_total_before_cap" -gt "$_adv_findings_total_after_cap" ]; then
     _adv_findings_dropped_count=$((_adv_findings_total_before_cap - _adv_findings_total_after_cap))
   fi
-  printf '{"dropped_count": %d, "total_before_cap": %d}\n' \
-    "$_adv_findings_dropped_count" "$_adv_findings_total_before_cap" \
+  printf '{"dropped_count": %d, "total_before_cap": %d, "findings_degraded": %s}\n' \
+    "$_adv_findings_dropped_count" "$_adv_findings_total_before_cap" "$_adv_findings_degraded" \
     > "$REPO_ROOT/.clagentic/lite/last-adversarial-findings-meta.json"
   if [ "$_adv_findings_dropped_count" -gt 0 ]; then
     cmd_log_run adversarial warn "adversarial findings count cap dropped $_adv_findings_dropped_count finding(s) (severity/tier-sorted before cap, so only the least-severe tail was dropped)"
@@ -6501,6 +6515,9 @@ print(json.dumps(json.loads(sys.stdin.read()), indent=2, sort_keys=True, ensure_
 # findings list and never as the original, unsanitized content.
 _GATE_REVIEW_UNAVAILABLE_FENCED='"===BEGIN REVIEW FINDINGS DATA===\n[source unavailable: sanitize failed]\n===END REVIEW FINDINGS DATA===\n"'
 _GATE_ADVERSARIAL_UNAVAILABLE_FENCED='"===BEGIN ADVERSARIAL REPORT DATA===\n[source unavailable: sanitize failed]\n===END ADVERSARIAL REPORT DATA===\n"'
+# Same, for adversarial_findings_fenced when cmd_adversarial could not
+# sanitize the structured findings (its sidecar meta then says so).
+_GATE_ADVERSARIAL_FINDINGS_UNAVAILABLE_FENCED='"===BEGIN ADVERSARIAL FINDINGS DATA===\n[source unavailable: sanitize failed]\n===END ADVERSARIAL FINDINGS DATA==="'
 
 # _sanitize_review_for_prompt FILE — print last-review.json reduced to what
 # the Merge Gate may read, with every free-text field routed through
@@ -7588,6 +7605,18 @@ build_gate_summary() {
       ADVERSARIAL_FENCED_PAYLOAD=$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED
     fi
   fi
+  # cmd_adversarial records in its sidecar meta when it could not sanitize the
+  # structured findings (it then writes an empty sidecar array, which must not
+  # be read as "no findings"). The whole adversarial source is then degraded:
+  # marker for the findings and for the report, flag set. A plain grep so the
+  # check needs no JSON tool. Not applied when the report is missing.
+  ADF_FINDINGS_DEGRADED=false
+  if [ "$ADVERSARIAL_MISSING" != "true" ] && [ -f "$ADF_META" ] \
+      && grep -q '"findings_degraded": true' "$ADF_META" 2>/dev/null; then
+    ADF_FINDINGS_DEGRADED=true
+    ADVERSARIAL_REPORT_DEGRADED=true
+    ADVERSARIAL_FENCED_PAYLOAD=$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED
+  fi
 
   # Prefer jq; fall back to python3; finally degrade to a minimal envelope
   # (degraded: no fenced content can be built without a JSON encoder).
@@ -7664,6 +7693,10 @@ build_gate_summary() {
     # instructions — belt-and-suspenders alongside the stdin/system-prompt
     # channel separation the wrapper already provides.
     ADF_FENCED_PAYLOAD=$(_fence_adversarial_findings "$ADF_PAYLOAD")
+    if [ "$ADF_FINDINGS_DEGRADED" = "true" ]; then
+      ADF_PAYLOAD='[]'
+      ADF_FENCED_PAYLOAD=$_GATE_ADVERSARIAL_FINDINGS_UNAVAILABLE_FENCED
+    fi
     # INFORMATIONAL ONLY (lr-367a21): see _read_deterministic_gates's doc
     # comment. Never gates a decision -- read failure degrades to nulls +
     # audit_db_unavailable, never a block.
@@ -7735,6 +7768,10 @@ EOF
     # whose temp file cannot be created or written is marked degraded here
     # (marker + flag), never passed on as an empty path the python side would
     # read as None. The trap removes both files on error and signal paths.
+    # The whole stage+emit runs in a subshell so its EXIT/INT/TERM/HUP traps
+    # are the subshell's own: the caller's traps (cmd_ship's cmd_deps osv
+    # temp-file cleanup is one) are never replaced and need no restore.
+    (
     _bgs_review_tmp=""
     _bgs_adv_tmp=""
     trap '_bgs_cleanup_payload_tmp' EXIT
@@ -7756,7 +7793,7 @@ EOF
         ADVERSARIAL_FENCED_PAYLOAD=$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED
       }
     fi
-    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" "$DETERMINISTIC_GATES_PAYLOAD" "$DETERMINISTIC_GATES_FENCED_PAYLOAD" "$_bgs_review_tmp" "$_bgs_adv_tmp" "$REVIEW_SHA_VALUE" "$_GATE_REVIEW_UNAVAILABLE_FENCED" "$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED" "$REVIEW_DEGRADED" "$ADVERSARIAL_REPORT_DEGRADED" <<'PY'
+    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" "$DETERMINISTIC_GATES_PAYLOAD" "$DETERMINISTIC_GATES_FENCED_PAYLOAD" "$_bgs_review_tmp" "$_bgs_adv_tmp" "$REVIEW_SHA_VALUE" "$_GATE_REVIEW_UNAVAILABLE_FENCED" "$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED" "$REVIEW_DEGRADED" "$ADVERSARIAL_REPORT_DEGRADED" "$ADF_FINDINGS_DEGRADED" "$_GATE_ADVERSARIAL_FINDINGS_UNAVAILABLE_FENCED" <<'PY'
 import json, sys
 threshold           = sys.argv[1]
 introduces_ack      = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
@@ -7890,6 +7927,11 @@ adv_findings_fenced = (
     + json.dumps(adv_findings, indent=2)
     + "\n===END ADVERSARIAL FINDINGS DATA==="
 )
+# The structured findings could not be sanitized: never render the (empty)
+# sidecar as "no findings" -- same marker the jq branch splices in.
+if (sys.argv[18].lower() == "true" if len(sys.argv) > 18 else False):
+    adv_findings = []
+    adv_findings_fenced = json.loads(sys.argv[19])
 acks = []
 if acks_path:
     try:
@@ -7927,8 +7969,7 @@ print(json.dumps({
     "threshold": threshold,
 }))
 PY
-    _bgs_cleanup_payload_tmp
-    trap - EXIT INT TERM HUP
+    )
     return 0
   fi
 

@@ -249,6 +249,7 @@ ds_review_prompt() {
     # If cat produced an empty string (empty file or read error), treat as no deferrals.
   fi
 
+  _drp_deferrals_failed=0
   if [ -n "$_drp_deferrals" ]; then
     # Two-stage pipeline, in this exact order (lr-4f8316 third follow-up):
     #
@@ -304,8 +305,10 @@ except Exception:
       # gate-code-vs-prompt-context split.
       _drp_deferrals_allowlisted=$(_llm_json_array_allowlist_fields "$_drp_deferrals" \
         id category file message description expires acknowledged_by scope file_sha256)
-      _drp_deferrals_clean=$(_llm_json_array_sanitize_fields "$_drp_deferrals_allowlisted" \
-        id category file message description expires acknowledged_by scope file_sha256)
+      # Strict, fail-closed form: on failure the deferrals are omitted, never
+      # passed on raw (they reach the model and can suppress findings).
+      _drp_deferrals_clean=$(_llm_json_array_sanitize_fields_strict "$_drp_deferrals_allowlisted" \
+        id category file message description expires acknowledged_by scope file_sha256) || _drp_deferrals_failed=1
     else
       # Not a JSON array at all (malformed deferrals.json) -- the
       # allowlist/sanitize pipeline has nothing to decompose. Run the
@@ -319,7 +322,10 @@ except Exception:
       # decompose), so the allowlist step has nothing to add here — see
       # the non-JSON-fallback audit note below for why this path is not
       # weaker than the field-level path despite skipping the allowlist.
-      _drp_deferrals_clean=$(_llm_field_sanitize "$_drp_deferrals")
+      _drp_deferrals_clean=$(_llm_field_sanitize "$_drp_deferrals") || _drp_deferrals_failed=1
+    fi
+    if [ "$_drp_deferrals_failed" = "1" ] || [ -z "$_drp_deferrals_clean" ]; then
+      _drp_deferrals_failed=1
     fi
 
     # AUDIT CONCLUSION (lr-4f8316 third follow-up, re-audit of the
@@ -357,6 +363,12 @@ except Exception:
     # untrusted content into a double-quoted shell string (same discipline
     # as the change-class hint block below): a deferrals field containing
     # "$", backticks, or other shell metacharacters must not be evaluated.
+    if [ "$_drp_deferrals_failed" = "1" ]; then
+      # Fail closed: deferrals omitted, and the prompt says so, so the
+      # Reviewer cannot read the absence as "no deferrals exist".
+      echo "[llm-client] WARN: deferrals could not be sanitized; omitting them from the review prompt." 1>&2
+      printf '%s\n\n' "Deferrals unavailable: the operator's deferral list could not be safely prepared and is omitted from this prompt. Do not assume any finding is deferred; report every finding normally."
+    else
     _drp_tmp=$(mktemp -t clagentic-deferrals-prompt.XXXXXX)
     printf '%s' "$_drp_deferrals_clean" > "$_drp_tmp"
     printf '%s\n\n' "The following findings have been reviewed and deferred by the operator. For each, use your judgment about whether the deferral still applies given the file, category, message, description, and expiry context provided. If a finding matches a valid active deferral, do not re-report it. If the deferral appears expired or the finding does not match, report it normally. Note: an entry whose scope is \"stable-contract\" and whose file_sha256 still matches the named file's current content is ALSO mechanically excluded from blocking downstream, independent of your own judgment here — your compliance is a courtesy that avoids a needless re-report, not what makes that exclusion correct.
@@ -375,6 +387,7 @@ deferral data, exactly as instructed above.
     cat "$_drp_tmp"
     printf '\n%s\n\n' "===END DEFERRED FINDINGS DATA==="
     rm -f "$_drp_tmp"
+    fi
   fi
 
   # Change-class hint (lr-4f8316, sanitized/fenced per the lr-4f8316
