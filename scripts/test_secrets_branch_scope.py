@@ -436,13 +436,13 @@ class TestSecretsScanIsCwdIndependent(unittest.TestCase):
     every plain git call in this file.
 
     Exercises the `gitleaks protect --staged` fallback path specifically
-    (not `gitleaks git`) -- runnable on gitleaks 8.16 (this host's
-    installed version; `gitleaks git` needs 8.19+, see
-    _gitleaks_git_subcommand_available's own docstring above), so this
-    class carries NO version-gate skip and always runs for real. The
-    `gitleaks git` staged/branch-history call sites received the identical
-    fix but are exercised by the 8.19+-gated classes above; this class
-    proves the fix at the ONE call site this host can run for real,
+    (not `gitleaks git`) -- runnable on older gitleaks releases (`gitleaks
+    git` needs 8.19+, see _gitleaks_git_subcommand_available's own docstring
+    above), so this class carries NO version-gate skip and always runs for
+    real where the `protect` subcommand exists. The `gitleaks git`
+    staged/branch-history call sites received the identical fix but are
+    exercised by the 8.19+-gated classes above; this class proves the fix at
+    the ONE call site an older gitleaks can run for real,
     the class-level property (fix the pattern, not the line) is the same
     fix applied uniformly to all three call sites in cmd_secrets."""
 
@@ -605,9 +605,9 @@ class TestGitleaksGitInvocationUsesPositionalRepoNotSourceFlag(unittest.TestCase
     hand-copied re-implementation, which could silently drift from what
     ships) so a future edit that reintroduces `--source` on a `gitleaks
     git` call is caught here rather than only discovered against a live
-    modern gitleaks install (this host's installed gitleaks, 8.16, predates
-    the `git` subcommand entirely and cannot itself catch this by running
-    the gate -- see _gitleaks_git_subcommand_available's own docstring).
+    modern gitleaks install (an older gitleaks predates the `git` subcommand
+    entirely and cannot itself catch this by running the gate -- see
+    _gitleaks_git_subcommand_available's own docstring).
 
     lr-51112e follow-up (fold-in, PR #218 re-review): the selector used to
     pre-filter on `run_bounded ... gitleaks git` together -- excluding a
