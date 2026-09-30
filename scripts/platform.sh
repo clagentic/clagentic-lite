@@ -980,7 +980,9 @@ _invariant_feed_max_field_chars() {
 #     ds_adversarial_prompt in llm-client.sh), the adversarial-findings
 #     fence the merge-gate prompt uses (===BEGIN/END ADVERSARIAL FINDINGS
 #     DATA===), and the deterministic-gates fence the merge-gate prompt uses
-#     (===BEGIN/END DETERMINISTIC GATES DATA===, lr-92d931) are all defanged
+#     (===BEGIN/END DETERMINISTIC GATES DATA===), the review-findings fence
+#     (===BEGIN/END REVIEW FINDINGS DATA===) and the raw adversarial-report
+#     fence (===BEGIN/END ADVERSARIAL REPORT DATA===) are all defanged
 #     unconditionally, regardless of which pipeline a given finding is
 #     travelling through — a payload could be planted once and land in any
 #     round-trip. Case-insensitively replaces each literal label string with
@@ -1070,7 +1072,11 @@ for label in ("INVARIANTS:", "DEFERRED FINDINGS:", "END INVARIANTS",
               "===BEGIN DEFERRED FINDINGS DATA===",
               "===END DEFERRED FINDINGS DATA===",
               "===BEGIN DETERMINISTIC GATES DATA===",
-              "===END DETERMINISTIC GATES DATA==="):
+              "===END DETERMINISTIC GATES DATA===",
+              "===BEGIN REVIEW FINDINGS DATA===",
+              "===END REVIEW FINDINGS DATA===",
+              "===BEGIN ADVERSARIAL REPORT DATA===",
+              "===END ADVERSARIAL REPORT DATA==="):
     pattern = re.compile(re.escape(label), re.IGNORECASE)
     text = pattern.sub(lambda m: ' '.join(m.group(0)), text)
 
@@ -1105,7 +1111,7 @@ PYEOF
   # closes that specific gap even though it cannot close the general one.
   printf '%s' "$_lfs_text" \
     | tr -d '\001-\010\013-\037\177' \
-    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g; s|===BEGIN ADVERSARIAL FINDINGS DATA===|= = =BEGIN ADVERSARIAL FINDINGS DATA= = =|g; s|===END ADVERSARIAL FINDINGS DATA===|= = =END ADVERSARIAL FINDINGS DATA= = =|g; s|===BEGIN CHANGE-CLASS HINT DATA===|= = =BEGIN CHANGE-CLASS HINT DATA= = =|g; s|===END CHANGE-CLASS HINT DATA===|= = =END CHANGE-CLASS HINT DATA= = =|g; s|===BEGIN DEFERRED FINDINGS DATA===|= = =BEGIN DEFERRED FINDINGS DATA= = =|g; s|===END DEFERRED FINDINGS DATA===|= = =END DEFERRED FINDINGS DATA= = =|g; s|===BEGIN DETERMINISTIC GATES DATA===|= = =BEGIN DETERMINISTIC GATES DATA= = =|g; s|===END DETERMINISTIC GATES DATA===|= = =END DETERMINISTIC GATES DATA= = =|g' \
+    | sed 's|===BEGIN INVARIANTS DATA===|= = =BEGIN INVARIANTS DATA= = =|g; s|===END INVARIANTS DATA===|= = =END INVARIANTS DATA= = =|g; s|===BEGIN ADVERSARIAL FINDINGS DATA===|= = =BEGIN ADVERSARIAL FINDINGS DATA= = =|g; s|===END ADVERSARIAL FINDINGS DATA===|= = =END ADVERSARIAL FINDINGS DATA= = =|g; s|===BEGIN CHANGE-CLASS HINT DATA===|= = =BEGIN CHANGE-CLASS HINT DATA= = =|g; s|===END CHANGE-CLASS HINT DATA===|= = =END CHANGE-CLASS HINT DATA= = =|g; s|===BEGIN DEFERRED FINDINGS DATA===|= = =BEGIN DEFERRED FINDINGS DATA= = =|g; s|===END DEFERRED FINDINGS DATA===|= = =END DEFERRED FINDINGS DATA= = =|g; s|===BEGIN DETERMINISTIC GATES DATA===|= = =BEGIN DETERMINISTIC GATES DATA= = =|g; s|===END DETERMINISTIC GATES DATA===|= = =END DETERMINISTIC GATES DATA= = =|g; s|===BEGIN REVIEW FINDINGS DATA===|= = =BEGIN REVIEW FINDINGS DATA= = =|g; s|===END REVIEW FINDINGS DATA===|= = =END REVIEW FINDINGS DATA= = =|g; s|===BEGIN ADVERSARIAL REPORT DATA===|= = =BEGIN ADVERSARIAL REPORT DATA= = =|g; s|===END ADVERSARIAL REPORT DATA===|= = =END ADVERSARIAL REPORT DATA= = =|g' \
     | cut -c "1-${_lfs_max}"
 }
 

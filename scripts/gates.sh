@@ -6055,8 +6055,10 @@ cmd_merge_gate() {
 
     # SHA-staleness guard: --recheck is for retrying a transient LLM failure,
     # not for replaying an old summary against a new commit. Read the SHA
-    # stamped inside gate-summary.json (review._clagentic_diff_sha, written by
-    # _stamp_envelope via build_gate_summary) and compare it to HEAD. Refuse
+    # stamped inside gate-summary.json (review_sha, lifted from the review's
+    # _clagentic_diff_sha by build_gate_summary; a summary written before
+    # review_sha existed still carries it under review._clagentic_diff_sha,
+    # which is read as a fallback) and compare it to HEAD. Refuse
     # if the SHA is missing or mismatches — the caller must rebuild first.
     #
     # HEAD resolution goes through _git_repo_scoped_head_sha (gates.sh, near
@@ -6069,14 +6071,14 @@ cmd_merge_gate() {
     _mg_head_sha=$(_git_repo_scoped_head_sha)
     if [ -n "$_mg_head_sha" ]; then
       if command -v jq >/dev/null 2>&1; then
-        _mg_summary_sha=$(jq -r '.review._clagentic_diff_sha // ""' "$IN" 2>/dev/null || echo "")
+        _mg_summary_sha=$(jq -r '.review_sha // .review._clagentic_diff_sha // ""' "$IN" 2>/dev/null || echo "")
       elif command -v python3 >/dev/null 2>&1; then
         _mg_summary_sha=$(python3 -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
     rv = d.get("review") or {}
-    print(rv.get("_clagentic_diff_sha", ""))
+    print(d.get("review_sha") or rv.get("_clagentic_diff_sha", ""))
 except Exception:
     print("")
 ' "$IN" 2>/dev/null || echo "")
@@ -6442,6 +6444,171 @@ print(json.dumps(block))
     return 0
   fi
   printf '""'
+}
+
+# _fence_data_block LABEL KIND TEXT — render TEXT as a JSON string value
+# wrapped in a ===BEGIN/END <LABEL> DATA=== fence, for the merge-gate payload
+# fields that carry review/adversarial output (review_fenced,
+# adversarial_fenced). KIND is "json" (TEXT is a JSON document, pretty-printed
+# with sorted keys so the jq and python3 paths agree byte-for-byte) or "text"
+# (TEXT is free prose, fenced verbatim). TEXT must already be sanitized
+# (_sanitize_review_for_prompt / _sanitize_adversarial_report_for_prompt) --
+# this only renders and fences.
+#
+# Unlike _fence_adversarial_findings/_fence_deterministic_gates, the block is
+# assembled in sh and only the final string-encoding step differs by tool, so
+# the two paths cannot diverge on the fence wording or trailing newline. A
+# fixed "\n" follows the closing marker in both.
+_fence_data_block() {
+  _fdb_label="$1"
+  _fdb_kind="$2"
+  _fdb_text="$3"
+  _fdb_body="$_fdb_text"
+  if [ "$_fdb_kind" = "json" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      _fdb_body=$(printf '%s' "$_fdb_text" | jq -S '.' 2>/dev/null) || _fdb_body="$_fdb_text"
+    elif command -v python3 >/dev/null 2>&1; then
+      _fdb_body=$(python3 -c '
+import json, sys
+print(json.dumps(json.loads(sys.argv[1]), indent=2, sort_keys=True, ensure_ascii=False))
+' "$_fdb_text" 2>/dev/null) || _fdb_body="$_fdb_text"
+    fi
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    printf '===BEGIN %s DATA===\n%s\n===END %s DATA===\n' "$_fdb_label" "$_fdb_body" "$_fdb_label" | jq -Rs '.'
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    printf '===BEGIN %s DATA===\n%s\n===END %s DATA===\n' "$_fdb_label" "$_fdb_body" "$_fdb_label" \
+      | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read(), ensure_ascii=False))'
+    return 0
+  fi
+  printf '""'
+}
+
+# _sanitize_review_for_prompt FILE — print last-review.json reduced to what
+# the Merge Gate may read, with every free-text field routed through
+# _llm_field_sanitize, as compact JSON on stdout ("null" when FILE is absent
+# or not a JSON object, matching the old raw-field behavior).
+#
+# Reviewer findings carry attacker-influenced text from the diff under review
+# (paths, code excerpts, prose about hostile input), and "review" is the
+# Merge Gate's primary refusal basis. The field set is a closed allowlist:
+# top level keeps only summary/findings/_clagentic_diff_sha; each finding's
+# free-text fields (and _deferral_id, which originates in an operator-writable
+# file) are sanitized. Findings were already reduced to the closed review
+# schema at ingest (_sanitize_review_findings_envelope) and the repo's own
+# _-prefixed annotations (_recurrence_*, _deferral_matched) are not free text,
+# so they pass through unchanged. Length truncation uses the shared default
+# cap; severity/line never carry free text.
+#
+# Sanitized ONCE here and handed to both build_gate_summary emitter branches,
+# so they cannot diverge.
+_sanitize_review_for_prompt() {
+  _srp_file="$1"
+  if [ ! -f "$_srp_file" ]; then
+    printf 'null'
+    return 0
+  fi
+  _srp_fields="severity file category message evidence suggestion issue_class class_fix _deferral_id"
+  # Keys a finding may carry into the payload: the closed review schema, the
+  # repo-written annotations (not free text), and nothing else.
+  _srp_keep_keys="severity file line category message evidence suggestion issue_class class_fix _recurrence_demoted _recurrence_count _deferral_matched _deferral_id"
+  if command -v jq >/dev/null 2>&1; then
+    if ! jq -e 'type == "object"' "$_srp_file" >/dev/null 2>&1; then
+      printf 'null'
+      return 0
+    fi
+    _srp_findings=$(jq -c --arg keys "$_srp_keep_keys" '
+      ($keys | split(" ")) as $keep
+      | (.findings // []) | if type == "array" then . else [] end
+      | [.[] | if type == "object" then with_entries(select(.key as $k | $keep | index($k))) else {} end]
+    ' "$_srp_file" 2>/dev/null) || _srp_findings='[]'
+    _srp_findings=$(_llm_json_array_sanitize_fields "$_srp_findings" $_srp_fields)
+    _srp_summary=$(_llm_field_sanitize "$(jq -r '.summary // "" | if type == "string" then . else "" end' "$_srp_file" 2>/dev/null)")
+    _srp_sha=$(_llm_field_sanitize "$(jq -r '._clagentic_diff_sha // "" | if type == "string" then . else "" end' "$_srp_file" 2>/dev/null)")
+    jq -c --argjson f "$_srp_findings" --arg s "$_srp_summary" --arg sha "$_srp_sha" '
+      (if (.summary | type) == "string" then {summary: $s} else {} end)
+      + {findings: $f}
+      + (if (._clagentic_diff_sha | type) == "string" then {_clagentic_diff_sha: $sha} else {} end)
+    ' "$_srp_file" 2>/dev/null || printf 'null'
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    # One getter for every piece of the envelope; MODE picks the piece. Exit
+    # 1 from "isobj" means "not a JSON object" (same null result as jq above).
+    _srp_get='
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)
+mode = sys.argv[2]
+if mode == "isobj":
+    sys.exit(0)
+if mode == "findings":
+    v = d.get("findings")
+    keep = sys.argv[3].split(" ")
+    print(json.dumps([
+        {k: x[k] for k in x if k in keep} if isinstance(x, dict) else {}
+        for x in (v if isinstance(v, list) else [])
+    ]))
+elif mode in ("summary", "sha"):
+    v = d.get("summary" if mode == "summary" else "_clagentic_diff_sha")
+    sys.stdout.write(v if isinstance(v, str) else "")
+elif mode in ("has_summary", "has_sha"):
+    v = d.get("summary" if mode == "has_summary" else "_clagentic_diff_sha")
+    print("1" if isinstance(v, str) else "0")
+'
+    python3 -c "$_srp_get" "$_srp_file" isobj 2>/dev/null || { printf 'null'; return 0; }
+    _srp_findings=$(_llm_json_array_sanitize_fields "$(python3 -c "$_srp_get" "$_srp_file" findings "$_srp_keep_keys")" $_srp_fields)
+    _srp_summary=$(_llm_field_sanitize "$(python3 -c "$_srp_get" "$_srp_file" summary)")
+    _srp_sha=$(_llm_field_sanitize "$(python3 -c "$_srp_get" "$_srp_file" sha)")
+    _srp_has_summary=$(python3 -c "$_srp_get" "$_srp_file" has_summary)
+    _srp_has_sha=$(python3 -c "$_srp_get" "$_srp_file" has_sha)
+    python3 -c '
+import json, sys
+out = {}
+if sys.argv[4] == "1":
+    out["summary"] = sys.argv[1]
+out["findings"] = json.loads(sys.argv[2])
+if sys.argv[5] == "1":
+    out["_clagentic_diff_sha"] = sys.argv[3]
+print(json.dumps(out, separators=(",", ":"), ensure_ascii=False))
+' "$_srp_summary" "$_srp_findings" "$_srp_sha" "$_srp_has_summary" "$_srp_has_sha" 2>/dev/null || printf 'null'
+    return 0
+  fi
+  printf 'null'
+}
+
+# _json_string_field JSON_OBJECT KEY — print the string value at KEY ("" when
+# absent or not a string, or when no JSON tool exists).
+_json_string_field() {
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // "" | if type == "string" then . else "" end' 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json, sys
+v = json.loads(sys.argv[1]).get(sys.argv[2])
+sys.stdout.write(v if isinstance(v, str) else "")' "$1" "$2" 2>/dev/null
+  fi
+  return 0
+}
+
+# _sanitize_adversarial_report_for_prompt FILE — print last-adversarial.md's
+# content run through _llm_field_sanitize, uncapped. This prose is the
+# Merge Gate's fallback refusal basis when adversarial_findings is empty, so
+# truncating it would silently change what the gate can refuse on. The cap is
+# three times the file's byte length: defanging a forged fence label roughly
+# doubles that label, and the cap is applied after defanging, so the file's own
+# length alone could still truncate a report full of forged markers.
+_sanitize_adversarial_report_for_prompt() {
+  _sar_file="$1"
+  _sar_len=$(wc -c < "$_sar_file" | tr -d ' ')
+  case "$_sar_len" in ''|*[!0-9]*|0) _sar_len=1 ;; esac
+  _llm_field_sanitize "$(cat "$_sar_file")" "$((_sar_len * 3))"
 }
 
 # _read_deterministic_gates (lr-367a21) — INFORMATIONAL ONLY.
@@ -7308,18 +7475,33 @@ build_gate_summary() {
     INTRODUCES_ACK_FILE="true"
   fi
 
+  # Review and adversarial output reach the Merge Gate ONLY as sanitized,
+  # fenced text (review_fenced, adversarial_fenced) plus review_sha, which
+  # --recheck's staleness guard reads. The raw "review"/"adversarial" fields
+  # are no longer emitted: they carried attacker-influenced text (the review
+  # findings are the gate's primary refusal basis; the adversarial markdown is
+  # its fallback basis) with neither sanitization nor a fence. Both emitter
+  # branches below are handed these pre-built, so they cannot diverge.
+  # A missing/non-object review and a missing adversarial file stay null,
+  # distinct from any fenced content.
+  REVIEW_SANITIZED=$(_sanitize_review_for_prompt "$RV")
+  REVIEW_FENCED_PAYLOAD='null'
+  REVIEW_SHA_VALUE=""
+  if [ "$REVIEW_SANITIZED" != "null" ]; then
+    REVIEW_FENCED_PAYLOAD=$(_fence_data_block "REVIEW FINDINGS" json "$REVIEW_SANITIZED")
+    REVIEW_SHA_VALUE=$(_json_string_field "$REVIEW_SANITIZED" _clagentic_diff_sha)
+  fi
+  ADVERSARIAL_FENCED_PAYLOAD='null'
+  if [ -f "$AD" ]; then
+    ADVERSARIAL_FENCED_PAYLOAD=$(_fence_data_block "ADVERSARIAL REPORT" text "$(_sanitize_adversarial_report_for_prompt "$AD")")
+  fi
+
   # Prefer jq; fall back to python3; finally degrade to a minimal envelope
-  # with the review embedded raw (validated as JSON beforehand) and
-  # adversarial dropped (we can't safely escape arbitrary markdown without
-  # a JSON encoder).
+  # (degraded: no fenced content can be built without a JSON encoder).
   if command -v jq >/dev/null 2>&1; then
-    RV_PAYLOAD='null'
-    AD_PAYLOAD='null'
     ADF_PAYLOAD='[]'
     ACKS_PAYLOAD='[]'
     AR_PAYLOAD='""'
-    [ -f "$RV" ] && jq -e . "$RV" >/dev/null 2>&1 && RV_PAYLOAD=$(cat "$RV")
-    [ -f "$AD" ] && AD_PAYLOAD=$(jq -Rs . < "$AD")
     [ -f "$ADF" ] && ADF_PAYLOAD=$(jq -c '. // []' "$ADF" 2>/dev/null || echo '[]')
     [ -f "$ACKS_FILE" ] && ACKS_PAYLOAD=$(jq -c . "$ACKS_FILE" 2>/dev/null || echo '[]')
     [ -f "$AR_FILE" ] && AR_PAYLOAD=$(jq -Rs . < "$AR_FILE")
@@ -7400,10 +7582,12 @@ build_gate_summary() {
     # same convention, same reasoning: every external-text payload field
     # reaching the Merge Gate prompt is both sanitized and fenced.
     DETERMINISTIC_GATES_FENCED_PAYLOAD=$(_fence_deterministic_gates "$DETERMINISTIC_GATES_PAYLOAD")
+    REVIEW_SHA_JSON=$(printf '%s' "$REVIEW_SHA_VALUE" | jq -Rs '.')
     cat <<EOF
 {
-  "review": $RV_PAYLOAD,
-  "adversarial": $AD_PAYLOAD,
+  "review_fenced": $REVIEW_FENCED_PAYLOAD,
+  "review_sha": $REVIEW_SHA_JSON,
+  "adversarial_fenced": $ADVERSARIAL_FENCED_PAYLOAD,
   "adversarial_missing": $ADVERSARIAL_MISSING,
   "adversarial_degraded": $ADVERSARIAL_DEGRADED,
   "adversarial_findings": $ADF_PAYLOAD,
@@ -7425,14 +7609,10 @@ EOF
   fi
 
   if command -v python3 >/dev/null 2>&1; then
-    RV_ARG=""
-    AD_ARG=""
     ADF_ARG=""
     ADF_META_ARG=""
     ACKS_ARG=""
     AR_ARG=""
-    [ -f "$RV" ] && RV_ARG="$RV"
-    [ -f "$AD" ] && AD_ARG="$AD"
     [ -f "$ADF" ] && ADF_ARG="$ADF"
     [ -f "$ADF_META" ] && ADF_META_ARG="$ADF_META"
     [ -f "$ACKS_FILE" ] && ACKS_ARG="$ACKS_FILE"
@@ -7449,27 +7629,40 @@ EOF
     # one render site, one fence text, for both emitter branches -- they
     # cannot diverge on the fence wording either.
     DETERMINISTIC_GATES_FENCED_PAYLOAD=$(_fence_deterministic_gates "$DETERMINISTIC_GATES_PAYLOAD")
-    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$RV_ARG" "$AD_ARG" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" "$DETERMINISTIC_GATES_PAYLOAD" "$DETERMINISTIC_GATES_FENCED_PAYLOAD" <<'PY'
+    # review_fenced/adversarial_fenced arrive as the same pre-built JSON
+    # string literals (or null) the jq branch splices in, for the same
+    # reason: one sanitize+fence site for both emitter branches.
+    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" "$DETERMINISTIC_GATES_PAYLOAD" "$DETERMINISTIC_GATES_FENCED_PAYLOAD" "$REVIEW_FENCED_PAYLOAD" "$ADVERSARIAL_FENCED_PAYLOAD" "$REVIEW_SHA_VALUE" <<'PY'
 import json, sys
 threshold           = sys.argv[1]
 introduces_ack      = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
 adversarial_missing = sys.argv[3].lower() == "true" if len(sys.argv) > 3 else False
-rv_path             = sys.argv[4] if len(sys.argv) > 4 else ""
-ad_path             = sys.argv[5] if len(sys.argv) > 5 else ""
-acks_path           = sys.argv[6] if len(sys.argv) > 6 else ""
-ar_path             = sys.argv[7] if len(sys.argv) > 7 else ""
-adf_path            = sys.argv[8] if len(sys.argv) > 8 else ""
-adversarial_degraded = sys.argv[9].lower() == "true" if len(sys.argv) > 9 else False
-adf_meta_path       = sys.argv[10] if len(sys.argv) > 10 else ""
-deterministic_gates_fenced_arg = sys.argv[12] if len(sys.argv) > 12 else ""
+acks_path           = sys.argv[4] if len(sys.argv) > 4 else ""
+ar_path             = sys.argv[5] if len(sys.argv) > 5 else ""
+adf_path            = sys.argv[6] if len(sys.argv) > 6 else ""
+adversarial_degraded = sys.argv[7].lower() == "true" if len(sys.argv) > 7 else False
+adf_meta_path       = sys.argv[8] if len(sys.argv) > 8 else ""
+deterministic_gates_fenced_arg = sys.argv[10] if len(sys.argv) > 10 else ""
+# Pre-built by the sh helpers (_sanitize_review_for_prompt/_fence_data_block,
+# _sanitize_adversarial_report_for_prompt): JSON string literals, or the
+# literal null when the source file is absent. An unparseable value degrades
+# to null rather than raising -- degrade, never block.
+def _decode_literal(raw):
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+review_fenced      = _decode_literal(sys.argv[11]) if len(sys.argv) > 11 else None
+adversarial_fenced = _decode_literal(sys.argv[12]) if len(sys.argv) > 12 else None
+review_sha         = sys.argv[13] if len(sys.argv) > 13 else ""
 # Pre-built by _read_deterministic_gates (sh) -- fail-open to an
 # audit-db-unavailable envelope if this somehow arrives empty/unparseable
 # (defense in depth; the sh helper always emits valid JSON on this path).
 # deterministic_gates_fenced (lr-92d931) tracks the SAME fallback: if the
 # raw object couldn't be parsed, the fenced text handed in from sh (rendered
-# from that same unparseable/empty argv[11]) cannot be trusted to describe
+# from that same unparseable/empty argv[9]) cannot be trusted to describe
 # the fallback dict either, so it is re-derived from the fallback dict
-# itself rather than trusting the pre-rendered argv[12] in this one branch
+# itself rather than trusting the pre-rendered argv[10] in this one branch
 # -- the two emitter branches must not diverge on what "deterministic_gates
 # was unreadable" looks like.
 # Trailing "\n" before the closing marker matches _fence_deterministic_gates'
@@ -7479,8 +7672,8 @@ deterministic_gates_fenced_arg = sys.argv[12] if len(sys.argv) > 12 else ""
 _DETGATES_FENCE_BEGIN = "===BEGIN DETERMINISTIC GATES DATA===\n"
 _DETGATES_FENCE_END = "\n===END DETERMINISTIC GATES DATA===\n"
 try:
-    if len(sys.argv) > 11 and sys.argv[11]:
-        deterministic_gates = json.loads(sys.argv[11])
+    if len(sys.argv) > 9 and sys.argv[9]:
+        deterministic_gates = json.loads(sys.argv[9])
         # _fence_deterministic_gates (sh) emits a JSON STRING LITERAL
         # (quoted) on stdout -- the same contract _fence_adversarial_findings
         # uses, which the jq branch above splices directly into a JSON
@@ -7497,22 +7690,6 @@ except Exception:
     deterministic_gates_fenced = (
         _DETGATES_FENCE_BEGIN + json.dumps(deterministic_gates, indent=2) + _DETGATES_FENCE_END
     )
-review = None
-if rv_path:
-    try:
-        with open(rv_path) as f:
-            review = json.load(f)
-    except Exception:
-        review = None
-adv = None
-if adversarial_missing:
-    adv = None
-elif ad_path:
-    try:
-        with open(ad_path) as f:
-            adv = f.read()
-    except Exception:
-        adv = None
 adv_findings = []
 if adf_path:
     try:
@@ -7587,8 +7764,9 @@ if ar_path:
     except Exception:
         ar = ""
 print(json.dumps({
-    "review": review,
-    "adversarial": adv,
+    "review_fenced": review_fenced,
+    "review_sha": review_sha,
+    "adversarial_fenced": adversarial_fenced,
     "adversarial_missing": adversarial_missing,
     "adversarial_degraded": adversarial_degraded,
     "adversarial_findings": adv_findings,
@@ -7639,13 +7817,14 @@ PY
   # fallback shape to sanitize, only the fence itself to add.
   DETGATES_UNAVAILABLE_JSON='{"secrets": null, "deps": null, "sast": null, "audit_db_unavailable": true}'
   DETGATES_UNAVAILABLE_FENCED='"===BEGIN DETERMINISTIC GATES DATA===\n{\n  \"secrets\": null,\n  \"deps\": null,\n  \"sast\": null,\n  \"audit_db_unavailable\": true\n}\n===END DETERMINISTIC GATES DATA==="'
-  if [ -f "$RV" ]; then
-    cat <<EOF
-{"review": $(cat "$RV"), "adversarial": null, "adversarial_missing": $ADVERSARIAL_MISSING, "adversarial_degraded": $ADVERSARIAL_DEGRADED, "adversarial_findings": [], "adversarial_findings_fenced": "===BEGIN ADVERSARIAL FINDINGS DATA===\n[]\n===END ADVERSARIAL FINDINGS DATA===", "adversarial_blocking_count": 0, "adversarial_advisory_count": 0, "resolved_change_class": null, "adversarial_downgraded_by_class_count": 0, "adversarial_findings_dropped_count": 0, "adversarial_acks": [], "accepted_risks": "", "introduces_ack_file": false, "threshold": "$THRESHOLD", "deterministic_gates": $DETGATES_UNAVAILABLE_JSON, "deterministic_gates_fenced": $DETGATES_UNAVAILABLE_FENCED, "gate_summary_degraded": true}
-EOF
-  else
-    echo "{\"review\": null, \"adversarial\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_degraded\": $ADVERSARIAL_DEGRADED, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_findings_dropped_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\", \"deterministic_gates\": $DETGATES_UNAVAILABLE_JSON, \"deterministic_gates_fenced\": $DETGATES_UNAVAILABLE_FENCED, \"gate_summary_degraded\": true}"
-  fi
+  # review_fenced/adversarial_fenced/review_sha: schema-complete with the other
+  # branches but always null/empty here. Review and adversarial text cannot be
+  # sanitized or encoded without a JSON tool, so none is ever embedded raw
+  # (the old raw review embed was the same unsanitized, unfenced path this
+  # change closes); cmd_merge_gate refuses this envelope before any LLM call.
+  # printf, not echo: dash's echo expands the literal \n sequences inside
+  # DETGATES_UNAVAILABLE_FENCED into real newlines, corrupting the JSON.
+  printf '%s\n' "{\"review_fenced\": null, \"review_sha\": \"\", \"adversarial_fenced\": null, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_degraded\": $ADVERSARIAL_DEGRADED, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_findings_dropped_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\", \"deterministic_gates\": $DETGATES_UNAVAILABLE_JSON, \"deterministic_gates_fenced\": $DETGATES_UNAVAILABLE_FENCED, \"gate_summary_degraded\": true}"
 }
 
 # cmd_render_manifest [FILE] (lr-37a9c8) — pretty-print the gate attestation
