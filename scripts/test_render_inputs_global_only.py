@@ -44,13 +44,9 @@ class _GlobalOnlyBase(_RenderTestBase):
     def _run_in_repo(self, repo, script_body):
         """Global load, then the render block (snapshot), then the per-repo
         load, then script_body, run with cwd inside `repo`."""
-        env = os.environ.copy()
-        env["CLAGENTIC_LITE_HOME"] = self.fake_home
+        env = self._scrubbed_env()
         env["HOME"] = self.fake_home_dir
         env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
-        for key in list(env):
-            if key.startswith("CLAGENTIC_") and key != "CLAGENTIC_LITE_HOME":
-                del env[key]
         script = (
             f". '{PLATFORM_SH}'\n"
             "say()  { printf '[clagentic-lite] %s\\n' \"$*\"; }\n"
@@ -131,6 +127,73 @@ class TestDoctorWarnsOnPerRepoRenderKey(_GlobalOnlyBase):
         repo = self._make_repo("repo-warn-router", "CLAGENTIC_ROUTER_URL=http://127.0.0.1:1\n")
         result = self._run_in_repo(repo, DOCTOR_KEYS)
         self.assertIn("WARN CLAGENTIC_ROUTER_URL is set in", result.stdout)
+
+    def test_warning_says_the_value_still_applies_to_the_cli_path(self):
+        repo = self._make_repo("repo-warn-cli", "CLAGENTIC_GATE_AGENT_MODEL=opus\n")
+        result = self._run_in_repo(repo, DOCTOR_KEYS)
+        self.assertIn("still applies to the gate/CLI path", result.stdout)
+
+    ROUTER_GLOBAL = (
+        "CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765\n"
+        "CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1\n"
+    )
+
+    def test_injection_cmd_key_warns_only_while_router_injection_is_on(self):
+        for role in ("REVIEWER", "AUDITOR", "GATE"):
+            with self.subTest(role=role):
+                repo = self._make_repo(f"repo-cmd-{role}", f"CLAGENTIC_{role}_CMD=codex\n")
+                off = self._run_in_repo(repo, DOCTOR_KEYS)
+                self.assertEqual(off.stdout, "", msg=f"{role} CMD warned with injection off")
+                self._write_global_config(self.ROUTER_GLOBAL)
+                on = self._run_in_repo(repo, DOCTOR_KEYS)
+                self.assertIn(f"WARN CLAGENTIC_{role}_CMD is set in", on.stdout)
+                os.remove(os.path.join(self.fake_home_dir, ".config", "clagentic", "lite", "config"))
+
+    def test_builder_and_troubleshooter_cmd_never_warn(self):
+        self._write_global_config(self.ROUTER_GLOBAL)
+        for role in ("BUILDER", "TROUBLESHOOTER"):
+            with self.subTest(role=role):
+                repo = self._make_repo(f"repo-cmd-{role}", f"CLAGENTIC_{role}_CMD=codex\n")
+                self.assertEqual(self._run_in_repo(repo, DOCTOR_KEYS).stdout, "")
+
+    def test_always_keys_warn_regardless_of_router_state(self):
+        for key in (
+            "CLAGENTIC_ROUTER_URL", "CLAGENTIC_ROUTER_INJECT_AGENT_MODEL",
+            "CLAGENTIC_BUILDER_AGENT_MODEL", "CLAGENTIC_REVIEWER_AGENT_MODEL",
+            "CLAGENTIC_AUDITOR_AGENT_MODEL", "CLAGENTIC_GATE_AGENT_MODEL",
+            "CLAGENTIC_TROUBLESHOOTER_AGENT_MODEL",
+        ):
+            with self.subTest(key=key):
+                repo = self._make_repo(f"repo-{key}", f"{key}=x\n")
+                self.assertIn(f"WARN {key} is set in", self._run_in_repo(repo, DOCTOR_KEYS).stdout)
+
+    def test_the_warning_set_and_the_injection_rule_share_one_table(self):
+        # Every _CMD key the table marks 'injection' belongs to a role that
+        # _plugin_agent_needs_injection can inject; every 'never' one does not.
+        repo = self._make_repo("repo-table")
+        result = self._run_in_repo(
+            repo,
+            "_render_key_table | grep -E '_CMD ' \n"
+            "for p in BUILDER REVIEWER AUDITOR GATE TROUBLESHOOTER; do\n"
+            "  eval \"_RI_CLAGENTIC_${p}_CMD=codex\"\n"
+            "  _RI_CLAGENTIC_ROUTER_URL=http://x _RI_CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1\n"
+            "  if _plugin_agent_needs_injection $p; then echo \"inject $p\"; else echo \"skip $p\"; fi\n"
+            "done\n",
+        )
+        table = {}
+        verdicts = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if parts and parts[0].startswith("CLAGENTIC_"):
+                table[parts[0]] = parts[1]
+            elif parts and parts[0] in ("inject", "skip"):
+                verdicts[parts[1]] = parts[0]
+        self.assertEqual(len(table), 5, msg=result.stdout)
+        for role, verdict in verdicts.items():
+            expected = "inject" if table[f"CLAGENTIC_{role}_CMD"] == "injection" else "skip"
+            self.assertEqual(verdict, expected, msg=role)
+        self.assertEqual(table["CLAGENTIC_BUILDER_CMD"], "never")
+        self.assertEqual(table["CLAGENTIC_REVIEWER_CMD"], "injection")
 
     def test_silent_when_unset_or_commented(self):
         repo = self._make_repo("repo-quiet", "# CLAGENTIC_BUILDER_AGENT_MODEL=opus\nCLAGENTIC_BUILDER_TIER=fast\n")

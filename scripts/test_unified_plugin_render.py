@@ -186,9 +186,20 @@ class _RenderTestBase(unittest.TestCase):
         with open(self.argv_log) as f:
             return [l.strip() for l in f if l.strip()]
 
-    def _run(self, script_body, extra_env=None):
+    def _scrubbed_env(self):
+        """Child environment for every subprocess in this suite family: the
+        parent's env minus EVERY CLAGENTIC_* variable (a prefix scrub, not a
+        list, so an operator's own config -- any key, including ones added
+        later -- can never change a result), with only CLAGENTIC_LITE_HOME
+        set back."""
         env = os.environ.copy()
+        for key in [k for k in env if k.startswith("CLAGENTIC_")]:
+            del env[key]
         env["CLAGENTIC_LITE_HOME"] = self.fake_home
+        return env
+
+    def _run(self, script_body, extra_env=None):
+        env = self._scrubbed_env()
         # HOME is ALWAYS pinned to a fixture dir under self.tmp, never the
         # real environment's HOME -- _LEGACY_ROUTER_PLUGIN_CACHE_DIR derives
         # from $HOME (see bin/clagentic-lite), and several tests below
@@ -198,10 +209,6 @@ class _RenderTestBase(unittest.TestCase):
         # test runs or what order they run in.
         env["HOME"] = self.fake_home_dir
         env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
-        env.pop("CLAGENTIC_ROUTER_URL", None)
-        env.pop("CLAGENTIC_ROUTER_INJECT_AGENT_MODEL", None)
-        for role in ("REVIEWER", "AUDITOR", "GATE", "BUILDER"):
-            env.pop(f"CLAGENTIC_{role}_CMD", None)
         if extra_env:
             env.update(extra_env)
         # say()/warn() are used by the extracted functions but defined
@@ -700,6 +707,28 @@ class TestDoctorOrphanedRouterPluginCheck(_RenderTestBase):
         )
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("FAIL:", result.stdout, msg=result.stdout)
+
+    def test_injection_state_is_read_through_the_render_snapshot(self):
+        # The render inputs are snapshotted once at source time (global config
+        # plus environment). A value assigned AFTER the snapshot must not
+        # change what this check reports; reading the live env would.
+        self._write_legacy_cache_fixture(with_model_override=True)
+        result = self._run(
+            self._script_with_reporters(
+                "CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1\n"
+                "_doctor_check_orphaned_router_plugin test_ok test_fail\n"
+            ),
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("INJECT_AGENT_MODEL is UNSET", result.stdout, msg=result.stdout)
+
+    def test_snapshotted_injection_on_suppresses_the_unset_line(self):
+        self._write_legacy_cache_fixture(with_model_override=True)
+        result = self._run(
+            self._script_with_reporters("_doctor_check_orphaned_router_plugin test_ok test_fail"),
+            extra_env={"CLAGENTIC_ROUTER_INJECT_AGENT_MODEL": "1"},
+        )
+        self.assertNotIn("INJECT_AGENT_MODEL is UNSET", result.stdout, msg=result.stdout)
 
 
 class TestDoctorPluginCollisionCheck(_RenderTestBase):

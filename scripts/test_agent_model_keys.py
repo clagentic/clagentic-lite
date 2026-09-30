@@ -14,12 +14,11 @@ throwaway `sh`; bin/clagentic-lite's own subcommands are never executed.
 Run with: python3 -m unittest scripts.test_agent_model_keys -v
 """
 import os
-import re
 import unittest
+from unittest import mock
 
 from scripts.test_unified_plugin_render import (
     AGENTS_SRC,
-    CLI,
     _RenderTestBase,
 )
 
@@ -57,19 +56,6 @@ def _frontmatter(lines):
 
 
 class _AgentModelBase(_RenderTestBase):
-    def _run(self, script_body, extra_env=None):
-        # Ambient operator config must never leak into these tests.
-        saved = {}
-        for role, _ in ROLES:
-            key = f"CLAGENTIC_{role}_AGENT_MODEL"
-            saved[key] = os.environ.pop(key, None)
-        try:
-            return super()._run(script_body, extra_env=extra_env)
-        finally:
-            for key, val in saved.items():
-                if val is not None:
-                    os.environ[key] = val
-
     def _render(self, extra_env=None):
         result = self._run("_render_clagentic_lite_plugin_dir", extra_env=extra_env)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
@@ -220,13 +206,59 @@ class TestStamp(_AgentModelBase):
         )
         self.assertIn("OK:", fresh.stdout, msg=fresh.stdout)
 
-    def test_render_version_is_bumped_past_v1(self):
-        # The extracted block does not define the constant, so read it from
-        # the CLI source directly.
-        with open(CLI) as f:
-            match = re.search(r'^PLUGIN_RENDER_VERSION="([^"]*)"', f.read(), re.M)
-        self.assertIsNotNone(match)
-        self.assertNotEqual(match.group(1), "v1")
+    def test_changing_a_shadowed_key_does_not_change_the_stamp(self):
+        # Router injection wins for the reviewer, so its _AGENT_MODEL value
+        # changes nothing about the render and must not read as stale.
+        a = self._stamp(extra_env=dict(ROUTER_ENV, CLAGENTIC_REVIEWER_AGENT_MODEL="opus"))
+        b = self._stamp(extra_env=dict(ROUTER_ENV, CLAGENTIC_REVIEWER_AGENT_MODEL="sonnet"))
+        c = self._stamp(extra_env=ROUTER_ENV)
+        self.assertEqual(a, b)
+        self.assertEqual(a, c)
+        self.assertIn("am_reviewer=router", a)
+
+    def test_shadowed_key_change_is_not_reported_stale(self):
+        env = dict(ROUTER_ENV, CLAGENTIC_REVIEWER_AGENT_MODEL="opus")
+        self._render(extra_env=env)
+        result = self._run(
+            "test_ok() { printf 'OK:%s\\n' \"$*\"; }\n"
+            "_doctor_check_render_stamp_staleness test_ok\n",
+            extra_env=dict(ROUTER_ENV, CLAGENTIC_REVIEWER_AGENT_MODEL="sonnet"),
+        )
+        self.assertIn("OK:", result.stdout, msg=result.stdout)
+        self.assertNotIn("STALE", result.stdout)
+
+    def test_stamp_records_the_effective_pinned_value(self):
+        self.assertIn(
+            "am_builder=sonnet[1m]",
+            self._stamp(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": "sonnet[1m]"}),
+        )
+
+
+class TestParentEnvIsolation(_AgentModelBase):
+    """The shared base scrubs every CLAGENTIC_* variable from the child env."""
+
+    def test_no_parent_clagentic_variable_reaches_the_child(self):
+        parent = {
+            "CLAGENTIC_BUILDER_AGENT_MODEL": "opus",
+            "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:1",
+            "CLAGENTIC_SOME_KEY_ADDED_LATER": "x",
+        }
+        with mock.patch.dict(os.environ, parent):
+            result = self._run("env")
+        leaked = [ln for ln in result.stdout.splitlines() if ln.startswith("CLAGENTIC_")]
+        self.assertEqual(leaked, [f"CLAGENTIC_LITE_HOME={self.fake_home}"])
+
+    def test_render_ignores_operator_env_in_the_parent(self):
+        parent = {
+            "CLAGENTIC_BUILDER_AGENT_MODEL": "opus",
+            "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+            "CLAGENTIC_ROUTER_INJECT_AGENT_MODEL": "1",
+            "CLAGENTIC_REVIEWER_CMD": "codex",
+        }
+        with mock.patch.dict(os.environ, parent):
+            self._render()
+        for _, agent in ROLES:
+            self.assertEqual(self._rendered_lines(agent), _source_lines(agent), msg=agent)
 
 
 class TestDoctorPerRole(_AgentModelBase):

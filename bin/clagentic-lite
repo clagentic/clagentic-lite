@@ -1002,7 +1002,55 @@ _CLAUDE_PLUGIN_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_PLUGIN_TIMEOUT_SEC "$
 # _render_clagentic_lite_plugin_dir both read through _render_input, so the
 # stamp and the render cannot disagree. Per-repo _CMD/_TIER stay per-repo on
 # the llm-client.sh CLI path; that path never goes through here.
-_RENDER_INPUT_ROLES="BUILDER REVIEWER AUDITOR GATE TROUBLESHOOTER"
+
+# Single source of truth for the five role agents the plugin ships, one
+# ROLE_ENV_PREFIX:agent-file:router-chain entry per role (space-separated;
+# POSIX sh has no arrays). An empty router-chain means the role is never
+# eligible for a `model: role:<x>-chain` router reference -- builder and
+# troubleshooter do real tool-calling, and clagentic-router refuses
+# tool-bearing requests (docs/ROUTER.md). That says nothing against pinning
+# a plain Claude model on them via CLAGENTIC_<ROLE>_AGENT_MODEL below.
+# Consumers: _render_key_table (which render inputs exist),
+# _plugin_agent_needs_injection, _render_config_fingerprint,
+# _render_clagentic_lite_plugin_dir, _doctor_check_agent_models. Defined
+# before the snapshot below because the snapshot's key list is derived from it.
+_AGENT_ROLE_TABLE="BUILDER:builder: REVIEWER:reviewer:reviewer-chain AUDITOR:auditor:auditor-chain GATE:merge-gate:merge-gate-chain TROUBLESHOOTER:troubleshooter:"
+
+# _agent_role_chain ROLE_ENV_PREFIX
+# Prints the role's router chain name ('' when the role is never router-referenced).
+_agent_role_chain() {
+  for _arc_entry in $_AGENT_ROLE_TABLE; do
+    if [ "${_arc_entry%%:*}" = "$1" ]; then
+      _arc_rest="${_arc_entry#*:}"
+      printf '%s' "${_arc_rest#*:}"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# _render_key_table
+# THE table of render inputs: one "KEY WHEN" line per env key the render
+# depends on. WHEN says when a value for that key changes the rendered plugin:
+#   always     every time it is set (router URL/inject switch, every _AGENT_MODEL)
+#   injection  only while router injection is on (the reviewer/auditor/gate
+#              _CMD: a non-claude CMD is what makes a role router-referenced)
+#   never      builder/troubleshooter _CMD: no chain, so the render ignores it
+# _render_input_keys (the startup snapshot), _plugin_agent_needs_injection
+# (which _CMD keys matter) and _doctor_check_repo_render_keys (which per-repo
+# keys to warn about) all read this one table, so they cannot drift apart.
+_render_key_table() {
+  printf 'CLAGENTIC_ROUTER_URL always\nCLAGENTIC_ROUTER_INJECT_AGENT_MODEL always\n'
+  for _rkt_entry in $_AGENT_ROLE_TABLE; do
+    _rkt_prefix="${_rkt_entry%%:*}"
+    printf 'CLAGENTIC_%s_AGENT_MODEL always\n' "$_rkt_prefix"
+    if [ -n "$(_agent_role_chain "$_rkt_prefix")" ]; then
+      printf 'CLAGENTIC_%s_CMD injection\n' "$_rkt_prefix"
+    else
+      printf 'CLAGENTIC_%s_CMD never\n' "$_rkt_prefix"
+    fi
+  done
+}
 
 # Character class allowed in a CLAGENTIC_<ROLE>_AGENT_MODEL value. ONE
 # constant shared by the validator (_agent_model_value_is_valid, as a glob
@@ -1012,11 +1060,11 @@ _RENDER_INPUT_ROLES="BUILDER REVIEWER AUDITOR GATE TROUBLESHOOTER"
 _AGENT_MODEL_CHARS=']A-Za-z0-9._:/@[-'
 
 # _render_input_keys
-# Prints every env key the render depends on, space-separated.
+# Prints every env key the render depends on, space-separated (the first
+# column of _render_key_table).
 _render_input_keys() {
-  printf 'CLAGENTIC_ROUTER_URL CLAGENTIC_ROUTER_INJECT_AGENT_MODEL'
-  for _rik_role in $_RENDER_INPUT_ROLES; do
-    printf ' CLAGENTIC_%s_CMD CLAGENTIC_%s_AGENT_MODEL' "$_rik_role" "$_rik_role"
+  _render_key_table | while read -r _rik_key _rik_when; do
+    printf '%s ' "$_rik_key"
   done
 }
 
@@ -1054,6 +1102,9 @@ _render_router_injection_on() {
 _plugin_agent_needs_injection() {
   _pani_prefix="$1"
   _render_router_injection_on || return 1
+  # A role with no router chain (see _render_key_table) is never injected,
+  # whatever its CMD is.
+  [ -n "$(_agent_role_chain "$_pani_prefix")" ] || return 1
   _pani_cmd=$(_render_input "CLAGENTIC_${_pani_prefix}_CMD")
   [ -n "$_pani_cmd" ] && [ "$_pani_cmd" != "claude" ]
 }
@@ -1070,26 +1121,21 @@ _doctor_check_repo_render_keys() {
   for _dcrrk_rel in .clagentic/config .env; do
     _dcrrk_file="$_dcrrk_root/$_dcrrk_rel"
     [ -f "$_dcrrk_file" ] || continue
-    for _dcrrk_key in $(_render_input_keys); do
+    # Only keys that actually change the rendered plugin are named (WHEN
+    # column of _render_key_table); a key the render ignores is not noise.
+    _render_key_table | while read -r _dcrrk_key _dcrrk_when; do
+      case "$_dcrrk_when" in
+        never) continue ;;
+        injection) _render_router_injection_on || continue ;;
+      esac
       if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${_dcrrk_key}=" "$_dcrrk_file" 2>/dev/null; then
-        printf '  WARN %s is set in %s. Render-affecting keys are read from the global config only (one rendered plugin per user), so this has no effect on dispatched agents. Move it to %s.\n' \
+        printf '  WARN %s is set in %s. Render-affecting keys are read from the global config only (one rendered plugin per user), so this per-repo value has no effect on dispatched agents. It still applies to the gate/CLI path (llm-client.sh) here. To change the dispatched agents, set it in %s.\n' \
           "$_dcrrk_key" "$_dcrrk_file" "$GLOBAL_CONFIG"
       fi
     done
   done
   return 0
 }
-
-# Single source of truth for the five role agents the plugin ships, one
-# ROLE_ENV_PREFIX:agent-file:router-chain entry per role (space-separated;
-# POSIX sh has no arrays). An empty router-chain means the role is never
-# eligible for a `model: role:<x>-chain` router reference -- builder and
-# troubleshooter do real tool-calling, and clagentic-router refuses
-# tool-bearing requests (docs/ROUTER.md). That says nothing against pinning
-# a plain Claude model on them via CLAGENTIC_<ROLE>_AGENT_MODEL below.
-# Consumers: _render_config_fingerprint, _render_clagentic_lite_plugin_dir,
-# _doctor_check_agent_models.
-_AGENT_ROLE_TABLE="BUILDER:builder: REVIEWER:reviewer:reviewer-chain AUDITOR:auditor:auditor-chain GATE:merge-gate:merge-gate-chain TROUBLESHOOTER:troubleshooter:"
 
 # _agent_model_value ROLE_ENV_PREFIX
 # Prints the raw CLAGENTIC_<PREFIX>_AGENT_MODEL render input ('' when unset).
@@ -1155,26 +1201,29 @@ _agent_model_resolve() {
 # identical either way; only reachability/auth changes, which doctor's
 # router probe already covers separately).
 #
-# The per-role _AGENT_MODEL values are included as am_<agent>=<value>: '-'
-# when unset, the value itself when valid, 'invalid' otherwise (an invalid
-# value renders no model: line, and must not put raw text into the stamp,
-# which is embedded in JSON).
+# One am_<agent>=<v> entry per role, where v is the EFFECTIVE render for that
+# role, from the same resolver the render uses (_agent_model_resolve): 'router'
+# when router injection wins, the pinned value when valid, 'invalid' when the
+# key is set but rejected, '-' when the role inherits. Recording the effective
+# result, not the raw keys, means changing a key that router injection shadows
+# does not mark the plugin stale (nothing about the render changed), and an
+# invalid value never puts raw text into the stamp, which is embedded in JSON.
 _render_config_fingerprint() {
-  _rcf_reviewer=$(_plugin_agent_needs_injection REVIEWER && echo 1 || echo 0)
-  _rcf_auditor=$(_plugin_agent_needs_injection AUDITOR && echo 1 || echo 0)
-  _rcf_gate=$(_plugin_agent_needs_injection GATE && echo 1 || echo 0)
-  printf 'reviewer=%s,auditor=%s,gate=%s' "$_rcf_reviewer" "$_rcf_auditor" "$_rcf_gate"
+  _rcf_sep=""
   for _rcf_entry in $_AGENT_ROLE_TABLE; do
     _rcf_prefix="${_rcf_entry%%:*}"
     _rcf_rest="${_rcf_entry#*:}"
     _rcf_file="${_rcf_rest%%:*}"
-    _rcf_val=$(_agent_model_value "$_rcf_prefix")
-    if [ -z "$_rcf_val" ]; then
-      _rcf_val="-"
-    elif ! _agent_model_value_is_valid "$_rcf_val"; then
-      _rcf_val="invalid"
-    fi
-    printf ',am_%s=%s' "$_rcf_file" "$_rcf_val"
+    _rcf_chain="${_rcf_rest#*:}"
+    _rcf_res=$(_agent_model_resolve "$_rcf_prefix" "$_rcf_chain")
+    case "${_rcf_res%% *}" in
+      router) _rcf_val="router" ;;
+      pinned) _rcf_val="${_rcf_res#* }" ;;
+      invalid) _rcf_val="invalid" ;;
+      *) _rcf_val="-" ;;
+    esac
+    printf '%sam_%s=%s' "$_rcf_sep" "$_rcf_file" "$_rcf_val"
+    _rcf_sep=","
   done
 }
 
@@ -1566,7 +1615,7 @@ _doctor_check_orphaned_router_plugin() {
     printf '%s\n' "$_dcorp_model_files" | while IFS= read -r _dcorp_f; do
       [ -n "$_dcorp_f" ] && printf '         %s\n' "$_dcorp_f"
     done
-    if [ "${CLAGENTIC_ROUTER_INJECT_AGENT_MODEL:-0}" != "1" ]; then
+    if [ "$(_render_input CLAGENTIC_ROUTER_INJECT_AGENT_MODEL)" != "1" ]; then
       printf '       CLAGENTIC_ROUTER_INJECT_AGENT_MODEL is UNSET on this machine — any dispatch that resolves to this orphaned copy sends a router model: string with no injection intended, which 422s at clagentic-router in routed mode.\n'
     fi
     printf '       run `clagentic-lite update` to remove it (lr-35315f hardened migration).\n'
