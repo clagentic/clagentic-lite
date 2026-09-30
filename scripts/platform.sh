@@ -1797,10 +1797,30 @@ ds_router_url_classify() {
   fi
 }
 
+# TWO SCRUBS, TWO BLAST RADII. Read this before adding a caller.
+#
+#   ds_git_env_scrub          PROCESS-WIDE. Unsets only the env vars that
+#                             redirect WHICH repo/index/object store a git
+#                             call touches. Never touches the user's own git
+#                             configuration (GIT_CONFIG_GLOBAL/SYSTEM/NOSYSTEM,
+#                             HOME, XDG_CONFIG_HOME), so credential helpers,
+#                             url.*.insteadOf, http.* proxy/CA settings,
+#                             core.sshCommand and includeIf keep working for
+#                             every later fetch/ls-remote/push. Safe to call
+#                             once at top level of a script that talks to a
+#                             remote.
+#   ds_git_scratch_env_scrub  SCRATCH-REPO ONLY. Everything the above does,
+#                             plus unset the author/committer identity vars and
+#                             wipe global/system git config. Call it ONLY
+#                             inside a subshell that builds or scans a
+#                             throwaway repo (the secrets canary). Calling it
+#                             process-wide disables every credential helper
+#                             the user has configured, so every remote
+#                             operation afterwards fails authentication.
+#
 # ds_git_env_scrub — unset every git-exported env var that can redirect a
 # git invocation away from the caller's own explicit `-C DIR`/`cd DIR`
-# choice, and pin the scratch repo to its own identity/config rather than
-# inheriting the invoking process's.
+# choice.
 #
 # WHY THIS EXISTS (lr-dfd45f): git hooks (pre-commit, pre-push, ...) run
 # with GIT_DIR (and sometimes GIT_WORK_TREE/GIT_INDEX_FILE) exported by git
@@ -1865,7 +1885,8 @@ ds_router_url_classify() {
 #                                     scratch repo's own boundary is decided
 #                                     by its own tree, not an inherited limit
 #   GIT_AUTHOR_NAME/EMAIL,
-#   GIT_COMMITTER_NAME/EMAIL       - override `user.name`/`user.email`
+#   GIT_COMMITTER_NAME/EMAIL       - (SCRATCH ONLY, ds_git_scratch_env_scrub)
+#                                     override `user.name`/`user.email`
 #                                     config for the ACTUAL commit identity
 #                                     used, regardless of `git config` calls
 #                                     made after this scrub -- a caller that
@@ -1873,7 +1894,8 @@ ds_router_url_classify() {
 #                                     (e.g. "clagentic-secrets-canary") via
 #                                     `git config` needs these cleared first
 #                                     or the inherited identity wins
-#   GIT_CONFIG_GLOBAL/SYSTEM        - override which global/system config
+#   GIT_CONFIG_GLOBAL/SYSTEM        - (SCRATCH ONLY, ds_git_scratch_env_scrub)
+#                                     override which global/system config
 #                                     file git reads; cleared together with
 #                                     GIT_CONFIG_NOSYSTEM=1 (set, not
 #                                     unset)
@@ -1993,8 +2015,15 @@ ds_git_env_scrub() {
     GIT_GRAFT_FILE GIT_SHALLOW_FILE \
     GIT_NO_REPLACE_OBJECTS GIT_REPLACE_REF_BASE \
     GIT_NAMESPACE GIT_CEILING_DIRECTORIES \
-    GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL \
     GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+}
+
+# ds_git_scratch_env_scrub — the wider, SCRATCH-REPO-ONLY scrub. See the
+# "TWO SCRUBS" note above ds_git_env_scrub: call this only inside a subshell
+# that builds/scans a throwaway repo, never at process level.
+ds_git_scratch_env_scrub() {
+  ds_git_env_scrub
+  unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
 
   # GIT_CONFIG_SYSTEM is unset (not pointed at /dev/null) because
   # GIT_CONFIG_NOSYSTEM=1 below already fully disables system-config

@@ -1,8 +1,11 @@
 """
-Regression test for lr-dfd45f: ds_git_env_scrub (scripts/platform.sh) must
-clear EXACTLY the enumerated set of git-exported env vars this task
-determined are hazardous for a scratch/canary git repo -- no more, no less,
-by ENUMERATION PARITY rather than a handful of spot-checked vars.
+Regression test for the git environment scrubs in scripts/platform.sh.
+ds_git_scratch_env_scrub (the wide, scratch-repo-only scrub) must clear
+EXACTLY the enumerated set of git-exported env vars determined hazardous for
+a scratch/canary git repo -- no more, no less, by ENUMERATION PARITY rather
+than a handful of spot-checked vars. The narrow, process-wide
+ds_git_env_scrub is covered by the last class: it clears only the
+repo-redirecting subset and must leave the user's git configuration alone.
 
 WHY PARITY, NOT SPOT-CHECKS: a spot-check test ("assert GIT_DIR is unset,
 assert GIT_WORK_TREE is unset, ...") passes even if a future edit silently
@@ -114,9 +117,16 @@ GIT_LOCAL_ENV_VARS_SNAPSHOT = [
 DELIBERATELY_PRESERVED_VARS = ["GIT_PREFIX", "GIT_INDEX_VERSION"]
 
 
-def _run_scrub_probe(preset_vars, extra_setup=""):
+# The wide, scratch-repo-only scrub. The enumeration, pinned-config and
+# indexed-channel tests below exercise it: it is the superset that clears
+# identity vars and wipes global/system config. The narrow, process-wide
+# ds_git_env_scrub has its own contract, tested in the last class.
+SCRATCH_SCRUB = "ds_git_scratch_env_scrub"
+
+
+def _run_scrub_probe(preset_vars, extra_setup="", scrub_fn=SCRATCH_SCRUB):
     """Source platform.sh, set every var in preset_vars to a sentinel
-    value, call ds_git_env_scrub, then print every one of those vars'
+    value, call scrub_fn, then print every one of those vars'
     post-scrub state as `NAME=<value-or-UNSET>` lines. extra_setup is
     injected verbatim before the preset_vars are applied via the
     environment (used for the indexed GIT_CONFIG_KEY_N/VALUE_N probes,
@@ -129,7 +139,7 @@ def _run_scrub_probe(preset_vars, extra_setup=""):
         f'else printf "{name}=__UNSET__\\n"; fi'
         for name in preset_vars
     )
-    script = f". '{PLATFORM_SH}'\n{extra_setup}\nds_git_env_scrub\n{probe_lines}\n"
+    script = f". '{PLATFORM_SH}'\n{extra_setup}\n{scrub_fn}\n{probe_lines}\n"
     r = subprocess.run(["sh", "-c", script, PLATFORM_SH],
                         capture_output=True, text=True, env=env, timeout=30)
     assert r.returncode == 0, f"probe script failed: {r.stderr}"
@@ -149,7 +159,7 @@ class TestDsGitEnvScrubEnumerationParity(unittest.TestCase):
         still_set = {k: v for k, v in result.items() if v is not None}
         self.assertEqual(
             still_set, {},
-            msg=f"ds_git_env_scrub left these vars set: {still_set}",
+            msg=f"ds_git_scratch_env_scrub left these vars set: {still_set}",
         )
 
     def test_no_additional_var_is_silently_unset(self):
@@ -173,7 +183,7 @@ class TestDsGitEnvScrubEnumerationParity(unittest.TestCase):
         env.pop("GIT_CONFIG_NOSYSTEM", None)
         script = (
             f". '{PLATFORM_SH}'\n"
-            "ds_git_env_scrub\n"
+            f"{SCRATCH_SCRUB}\n"
             'printf "%s\\n" "$GIT_CONFIG_NOSYSTEM"\n'
         )
         r = subprocess.run(["sh", "-c", script, PLATFORM_SH],
@@ -192,7 +202,7 @@ class TestDsGitEnvScrubEnumerationParity(unittest.TestCase):
         env["GIT_CONFIG_GLOBAL"] = "/some/real/gitconfig/an/attacker/controls"
         script = (
             f". '{PLATFORM_SH}'\n"
-            "ds_git_env_scrub\n"
+            f"{SCRATCH_SCRUB}\n"
             'printf "%s\\n" "$GIT_CONFIG_GLOBAL"\n'
         )
         r = subprocess.run(["sh", "-c", script, PLATFORM_SH],
@@ -253,7 +263,7 @@ class TestDsGitEnvScrubIndexedConfigChannel(unittest.TestCase):
             f'else printf "{name}=__UNSET__\\n"; fi'
             for name in probe_names
         )
-        script = f". '{PLATFORM_SH}'\nds_git_env_scrub\n{probe_lines}\n"
+        script = f". '{PLATFORM_SH}'\n{SCRATCH_SCRUB}\n{probe_lines}\n"
         r = subprocess.run(["sh", "-c", script, PLATFORM_SH],
                             capture_output=True, text=True, env=env, timeout=30)
         assert r.returncode == 0, f"probe script failed: {r.stderr}"
@@ -298,7 +308,7 @@ class TestDsGitEnvScrubIndexedConfigChannel(unittest.TestCase):
         unbounded/negative loop bound."""
         env = os.environ.copy()
         env["GIT_CONFIG_COUNT"] = "not-a-number"
-        script = f". '{PLATFORM_SH}'\nds_git_env_scrub\nprintf done\n"
+        script = f". '{PLATFORM_SH}'\n{SCRATCH_SCRUB}\nprintf done\n"
         r = subprocess.run(["sh", "-c", script, PLATFORM_SH],
                             capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -328,7 +338,7 @@ class TestDsGitEnvScrubIndexedConfigChannel(unittest.TestCase):
         re-running with a comparable large count)."""
         env = os.environ.copy()
         env["GIT_CONFIG_COUNT"] = "5000000"
-        script = f". '{PLATFORM_SH}'\nds_git_env_scrub\nprintf done\n"
+        script = f". '{PLATFORM_SH}'\n{SCRATCH_SCRUB}\nprintf done\n"
         try:
             r = subprocess.run(["sh", "-c", script, PLATFORM_SH],
                                 capture_output=True, text=True, env=env, timeout=5)
@@ -357,6 +367,113 @@ class TestDsGitEnvScrubIndexedConfigChannel(unittest.TestCase):
         # function.
         self.assertEqual(result["GIT_CONFIG_KEY_0"], "commit.gpgsign")
         self.assertEqual(result["GIT_CONFIG_VALUE_0"], "true")
+
+
+class TestDsGitEnvScrubIsProcessWideSafe(unittest.TestCase):
+    """The narrow, process-wide ds_git_env_scrub must clear only the vars
+    that redirect WHICH repo git touches, and leave the user's own git
+    configuration alone. Wiping it (GIT_CONFIG_GLOBAL=/dev/null,
+    GIT_CONFIG_NOSYSTEM=1) disabled every credential helper, url rewrite,
+    proxy and ssh setting for every later fetch/ls-remote/push in the same
+    process, so authenticated remote operations failed on any host that
+    relies on a helper."""
+
+    REDIRECT_VARS = [
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES", "GIT_CONFIG_PARAMETERS",
+    ]
+    USER_CONFIG_VARS = [
+        "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM",
+        "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL", "HOME", "XDG_CONFIG_HOME",
+    ]
+
+    def test_repo_redirecting_vars_are_unset(self):
+        result = _run_scrub_probe(self.REDIRECT_VARS, scrub_fn="ds_git_env_scrub")
+        still_set = {k: v for k, v in result.items() if v is not None}
+        self.assertEqual(still_set, {}, msg=f"left set: {still_set}")
+
+    def test_every_repo_redirecting_var_is_unset_completeness(self):
+        """Completeness of the narrowed scrub: every repo-redirecting variable
+        must be cleared, and dropping any one of them fails here by name. The
+        set is EXPECTED_UNSET_VARS (the wide scrub's enumeration) minus the
+        identity and global/system-config channels, which the process-wide
+        scrub must leave to the user. Each variable is probed on its own so a
+        failure names exactly the one that was dropped."""
+        scratch_only = {
+            "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL", "GIT_CONFIG_SYSTEM",
+        }
+        process_wide = [v for v in EXPECTED_UNSET_VARS if v not in scratch_only]
+        # The variables the scrub's contract names explicitly must all be in
+        # the derived set, so a future edit to EXPECTED_UNSET_VARS cannot
+        # quietly shrink what this test proves.
+        for required in self.REDIRECT_VARS:
+            self.assertIn(required, process_wide + ["GIT_CONFIG_COUNT"])
+        for name in process_wide:
+            with self.subTest(var=name):
+                result = _run_scrub_probe([name], scrub_fn="ds_git_env_scrub")
+                self.assertIsNone(
+                    result[name], msg=f"{name} survived ds_git_env_scrub")
+
+    def test_indexed_config_injection_is_unset(self):
+        """GIT_CONFIG_COUNT and its KEY_n/VALUE_n pairs inject arbitrary
+        config (core.hooksPath, url rewrites) and are cleared, bounded by the
+        same clamp as the wide scrub."""
+        env = os.environ.copy()
+        env.update({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": "/tmp/hooks",
+        })
+        script = (
+            f". '{PLATFORM_SH}'\nds_git_env_scrub\n"
+            'printf "%s|%s|%s" "${GIT_CONFIG_COUNT-U}" '
+            '"${GIT_CONFIG_KEY_0-U}" "${GIT_CONFIG_VALUE_0-U}"\n'
+        )
+        r = subprocess.run(["sh", "-c", script, PLATFORM_SH],
+                            capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "U|U|U")
+
+    def test_user_git_config_channels_survive(self):
+        result = _run_scrub_probe(self.USER_CONFIG_VARS, scrub_fn="ds_git_env_scrub")
+        for name in self.USER_CONFIG_VARS:
+            self.assertEqual(
+                result[name], "sentinel-value-for-" + name,
+                msg=f"{name} must survive the process-wide scrub, got "
+                    f"{result[name]!r}",
+            )
+
+    def test_does_not_invent_config_overrides(self):
+        """With no git config vars set on entry, none may be set on exit:
+        the old behaviour exported GIT_CONFIG_GLOBAL=/dev/null and
+        GIT_CONFIG_NOSYSTEM=1 unconditionally."""
+        env = os.environ.copy()
+        for name in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"):
+            env.pop(name, None)
+        script = (
+            f". '{PLATFORM_SH}'\nds_git_env_scrub\n"
+            'printf "%s|%s|%s" "${GIT_CONFIG_GLOBAL-U}" '
+            '"${GIT_CONFIG_SYSTEM-U}" "${GIT_CONFIG_NOSYSTEM-U}"\n'
+        )
+        r = subprocess.run(["sh", "-c", script, PLATFORM_SH],
+                            capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "U|U|U")
+
+    def test_large_config_count_is_still_bounded(self):
+        env = os.environ.copy()
+        env["GIT_CONFIG_COUNT"] = "5000000"
+        script = f". '{PLATFORM_SH}'\nds_git_env_scrub\nprintf done\n"
+        try:
+            r = subprocess.run(["sh", "-c", script, PLATFORM_SH],
+                                capture_output=True, text=True, env=env, timeout=5)
+        except subprocess.TimeoutExpired:
+            self.fail("ds_git_env_scrub hung on a large GIT_CONFIG_COUNT")
+        self.assertEqual(r.stdout, "done")
 
 
 if __name__ == "__main__":

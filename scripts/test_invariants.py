@@ -1049,6 +1049,16 @@ def _find_gates_sh_scoping_violations(lines):
             # line-number allowlist.
             if '$DS_TIMEOUT_CMD' in stripped and '_gfdbr_timeout' in stripped:
                 continue
+            # cmd_ship's push: run_bounded cannot exec the `_git` shell
+            # function, so the call spells out `git -C "$REPO_ROOT"`. It is
+            # only reached with a non-empty BRANCH, which cmd_ship resolves
+            # solely behind _git_repo_root_is_scoped (an unscoped REPO_ROOT
+            # returns before the push).
+            # `env GIT_TERMINAL_PROMPT=0` sits between `--` and `git` so a
+            # missing credential fails fast instead of prompting.
+            if ('run_bounded "$_SHIP_PUSH_TIMEOUT" -- env GIT_TERMINAL_PROMPT=0'
+                    ' git -C "$REPO_ROOT" push' in stripped):
+                continue
             violations.append((i + 1, line.rstrip('\n')))
     return violations
 
