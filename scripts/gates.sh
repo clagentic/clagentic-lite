@@ -80,6 +80,13 @@ fi
 # keep overriding every `_git` call for the rest of this script's run, not
 # just the canary. Scrubbing here pins `-C "$REPO_ROOT"` from "usually
 # right" to authoritative for the remainder of this invocation.
+#
+# This is the NARROW scrub: it clears only the vars that redirect which repo
+# git touches, and leaves the user's own git configuration (credential
+# helpers, url.*.insteadOf, proxy/CA, core.sshCommand, includeIf) alone.
+# Every fetch, ls-remote and push below depends on that configuration to
+# authenticate. The config-wiping scrub is ds_git_scratch_env_scrub, used
+# only inside the secrets canary's scratch-repo subshell.
 ds_git_env_scrub
 
 # _git — run git against REPO_ROOT, not $PWD. In wrapper/repo layouts $PWD may
@@ -211,10 +218,79 @@ run_bounded() {
   $DS_TIMEOUT_CMD "$_rb_timeout" "$@"
 }
 
+# _bounded_failure_reason EXIT_CODE TIMEOUT_SEC STDERR_FILE
+#
+# Prints a one-line, human-readable reason for a non-zero exit from a command
+# run under $DS_TIMEOUT_CMD/run_bounded. Exit 124 is the timeout wrapper's own
+# "deadline fired" status and is reported as a timeout; any other non-zero
+# exit is a real failure and carries the last non-empty stderr line so the
+# operator sees git's own complaint (authentication, DNS, permission) instead
+# of a generic "failed or timed out". URL userinfo is masked: git can echo the
+# remote URL, and a remote configured as https://user:token@host must not
+# land in an audit row or a terminal scrollback.
+_bounded_failure_reason() {
+  _bfr_rc="$1"
+  _bfr_timeout="$2"
+  _bfr_err_file="$3"
+  if [ "$_bfr_rc" = "124" ]; then
+    printf 'timed out after %ss' "$_bfr_timeout"
+    return 0
+  fi
+  _bfr_last=""
+  if [ -s "$_bfr_err_file" ]; then
+    _bfr_last=$(awk 'NF { line = $0 } END { print line }' "$_bfr_err_file" | sed 's#://[^/@ ]*@#://***@#g' | cut -c1-300)
+  fi
+  if [ -n "$_bfr_last" ]; then
+    printf 'failed (exit %s): %s' "$_bfr_rc" "$_bfr_last"
+  else
+    printf 'failed (exit %s)' "$_bfr_rc"
+  fi
+}
+
+# _gate_check_args SUBCOMMAND "ALLOWED FLAGS" POSITIONAL_NAME ARGS...
+#
+# Argument hygiene for every subcommand. The dispatcher forwards "$@" to each
+# cmd_X, so a subcommand that silently ignores an argument it does not know
+# turns a typo (--fullscan) into a quietly narrower or different run.
+# Returns 2 with a usage line on stderr for any `-`-prefixed argument not in
+# the space-separated ALLOWED FLAGS, and for more than one positional
+# argument (POSITIONAL_NAME, empty when the subcommand takes none, names the
+# single optional positional in the usage line).
+_gate_check_args() {
+  _gca_sub="$1"
+  _gca_flags="$2"
+  _gca_posname="$3"
+  shift 3
+  _gca_usage="usage: gates.sh $_gca_sub"
+  for _gca_f in $_gca_flags; do _gca_usage="$_gca_usage [$_gca_f]"; done
+  [ -n "$_gca_posname" ] && _gca_usage="$_gca_usage [$_gca_posname]"
+  _gca_pos=0
+  for _gca_arg in "$@"; do
+    case "$_gca_arg" in
+      -*)
+        case " $_gca_flags " in
+          *" $_gca_arg "*) continue ;;
+        esac
+        printf "gates.sh %s: unknown option '%s'\n%s\n" "$_gca_sub" "$_gca_arg" "$_gca_usage" 1>&2
+        return 2
+        ;;
+      *)
+        _gca_pos=$((_gca_pos + 1))
+        if [ -z "$_gca_posname" ] || [ "$_gca_pos" -gt 1 ]; then
+          printf "gates.sh %s: unexpected argument '%s'\n%s\n" "$_gca_sub" "$_gca_arg" "$_gca_usage" 1>&2
+          return 2
+        fi
+        ;;
+    esac
+  done
+  return 0
+}
+
 AUDIT_DB="$REPO_ROOT/.clagentic/lite/audit.db"
 mkdir -p "$REPO_ROOT/.clagentic/lite"
 
 cmd_init() {
+  _gate_check_args init "" "" "$@" || return 2
   ds_sqlite3 "$AUDIT_DB" <<'SQL'
 CREATE TABLE IF NOT EXISTS gate_runs (
   id         INTEGER PRIMARY KEY,
@@ -382,10 +458,22 @@ _gate_resolve_fresh_default_branch_ref() {
     return 1
   fi
 
-  if ! $DS_TIMEOUT_CMD "$_gfdbr_timeout" git -C "$REPO_ROOT" fetch origin "$_gfdbr_branch" >/dev/null 2>&1; then
-    echo "git fetch origin ${_gfdbr_branch} failed or timed out after ${_gfdbr_timeout}s — cannot establish a provably current baseline" 1>&2
+  # stderr is captured (not discarded) so the reason names git's own error: a
+  # credential-helper or DNS failure must not read as a generic timeout, and
+  # the two must stay distinguishable (exit 124 = deadline fired). hooksPath
+  # is pinned off for this one command so a user-level hook configuration
+  # (reference-transaction fires on fetch) cannot run inside a gate, without
+  # wiping the rest of the user's git config the fetch needs to authenticate.
+  _gfdbr_err=$(mktemp -t clagentic-gate-fetch-err.XXXXXX) || _gfdbr_err=/dev/null
+  _gfdbr_rc=0
+  $DS_TIMEOUT_CMD "$_gfdbr_timeout" git -C "$REPO_ROOT" -c core.hooksPath=/dev/null fetch origin "$_gfdbr_branch" >/dev/null 2>"$_gfdbr_err" || _gfdbr_rc=$?
+  if [ "$_gfdbr_rc" -ne 0 ]; then
+    _gfdbr_reason=$(_bounded_failure_reason "$_gfdbr_rc" "$_gfdbr_timeout" "$_gfdbr_err")
+    [ "$_gfdbr_err" = /dev/null ] || rm -f "$_gfdbr_err"
+    echo "git fetch origin ${_gfdbr_branch} ${_gfdbr_reason} — cannot establish a provably current baseline" 1>&2
     return 1
   fi
+  [ "$_gfdbr_err" = /dev/null ] || rm -f "$_gfdbr_err"
 
   if ! _git rev-parse --verify -q "origin/${_gfdbr_branch}" >/dev/null 2>&1; then
     echo "origin/${_gfdbr_branch} not resolvable (missing remote-tracking ref)" 1>&2
@@ -394,12 +482,23 @@ _gate_resolve_fresh_default_branch_ref() {
 
   _gfdbr_local_tip=$(_git rev-parse "origin/${_gfdbr_branch}" 2>/dev/null || echo "")
   _gfdbr_remote_tip=""
+  _gfdbr_ls_reason="returned no tip for the branch"
   if [ -n "$_gfdbr_local_tip" ]; then
-    _gfdbr_remote_tip=$($DS_TIMEOUT_CMD "$_gfdbr_timeout" git -C "$REPO_ROOT" ls-remote origin "refs/heads/${_gfdbr_branch}" 2>/dev/null | awk '{print $1}')
+    _gfdbr_err=$(mktemp -t clagentic-gate-lsremote-err.XXXXXX) || _gfdbr_err=/dev/null
+    _gfdbr_out=$(mktemp -t clagentic-gate-lsremote-out.XXXXXX) || _gfdbr_out=/dev/null
+    _gfdbr_rc=0
+    $DS_TIMEOUT_CMD "$_gfdbr_timeout" git -C "$REPO_ROOT" ls-remote origin "refs/heads/${_gfdbr_branch}" >"$_gfdbr_out" 2>"$_gfdbr_err" || _gfdbr_rc=$?
+    if [ "$_gfdbr_rc" -ne 0 ]; then
+      _gfdbr_ls_reason=$(_bounded_failure_reason "$_gfdbr_rc" "$_gfdbr_timeout" "$_gfdbr_err")
+    else
+      _gfdbr_remote_tip=$(awk '{print $1; exit}' "$_gfdbr_out")
+    fi
+    [ "$_gfdbr_err" = /dev/null ] || rm -f "$_gfdbr_err"
+    [ "$_gfdbr_out" = /dev/null ] || rm -f "$_gfdbr_out"
   fi
 
   if [ -z "$_gfdbr_local_tip" ] || [ -z "$_gfdbr_remote_tip" ]; then
-    echo "could not verify origin/${_gfdbr_branch} freshness (ls-remote failed or timed out) — resolution not provably current" 1>&2
+    echo "could not verify origin/${_gfdbr_branch} freshness (ls-remote ${_gfdbr_ls_reason}) — resolution not provably current" 1>&2
     return 1
   fi
 
@@ -1292,13 +1391,20 @@ _gitleaks_positive_control() {
     # caller's real repo instead of this scratch dir, staging
     # fake-but-detectable credentials into real history and replacing the
     # caller's commit message. See ds_git_env_scrub's own doc comment
-    # (scripts/platform.sh) for exactly what it clears and why.
-    ds_git_env_scrub
+    # (scripts/platform.sh) for exactly what it clears and why. This is the
+    # SCRATCH-repo scrub: it also wipes global/system git config and the
+    # identity vars, which is right for a throwaway repo and wrong anywhere
+    # else (the process-wide call near the top of this file deliberately
+    # leaves the user's credential helpers intact). core.hooksPath is pinned
+    # off per command as a second layer, so no hook of the user's can fire
+    # during the canary commit even if a future config source slips past the
+    # wipe.
+    ds_git_scratch_env_scrub
     git init -q -b canary . 2>/dev/null || git init -q .
     git config user.email "canary@example.invalid"
     git config user.name "clagentic-secrets-canary"
-    git add canary.env
-    git commit -q -m "canary fixture" --no-verify
+    git -c core.hooksPath=/dev/null add canary.env
+    git -c core.hooksPath=/dev/null commit -q -m "canary fixture" --no-verify
   ) >/dev/null 2>&1
 
   _gpc_timeout=$(ds_positive_int_or_warn CLAGENTIC_SECRETS_TIMEOUT_SEC "${CLAGENTIC_SECRETS_TIMEOUT_SEC:-}" 300)
@@ -1315,7 +1421,7 @@ _gitleaks_positive_control() {
     # leaks in real history, proving nothing about the scanner -- the
     # exact fail-open this function's own doc comment above warns against).
     # shellcheck disable=SC2086
-    ( cd "$_gpc_dir" && ds_git_env_scrub && run_bounded "$_gpc_timeout" -- gitleaks git --no-banner --report-format json --report-path "$_gpc_report" $_gpc_cfg_arg ) >/dev/null 2>&1 || _gpc_status=$?
+    ( cd "$_gpc_dir" && ds_git_scratch_env_scrub && run_bounded "$_gpc_timeout" -- gitleaks git --no-banner --report-format json --report-path "$_gpc_report" $_gpc_cfg_arg ) >/dev/null 2>&1 || _gpc_status=$?
   else
     # shellcheck disable=SC2086
     ( cd "$_gpc_dir" && run_bounded "$_gpc_timeout" -- gitleaks detect --no-banner --no-git --source "$_gpc_dir" --report-format json --report-path "$_gpc_report" $_gpc_cfg_arg ) >/dev/null 2>&1 || _gpc_status=$?
@@ -1362,6 +1468,7 @@ except Exception:
 }
 
 cmd_secrets() {
+  _gate_check_args secrets "--full-scan" "" "$@" || return 2
   # FULL-SCAN OPT-IN (lr-51112e): --full-scan or CLAGENTIC_SECRETS_FULL_SCAN=1
   # forces the branch-history path (below) to walk the entire history
   # reachable from HEAD, the pre-lr-51112e default. Neither `gates ship` nor
@@ -1788,6 +1895,7 @@ _gate_resolve_global_ignore_path() {
 }
 
 cmd_deps() {
+  _gate_check_args deps "" "" "$@" || return 2
   # DOMAIN-BASED SKIP (lr-1ad8da). Only consulted when CLAGENTIC_GATE_REFS_FILE
   # is set -- cmd_pre_push (below) is the sole setter, pointing at a
   # one-time snapshot of git's pre-push stdin protocol. A direct/manual
@@ -1880,12 +1988,21 @@ cmd_deps() {
       done
     fi
 
+    # CWD PINNED TO REPO_ROOT: the "." target and any CLAGENTIC_OSV_EXCLUDE
+    # path resolve against the process CWD, which differs from REPO_ROOT in a
+    # wrapper/.clagentic-project layout or when a hook runs from a
+    # subdirectory -- the scan would then cover the wrong tree and report a
+    # clean pass. Each invocation runs in a POSIX subshell that cds first,
+    # leaving argv unchanged. A failed cd exits the subshell nonzero, which
+    # the status handling below treats as a failed scan (fail closed).
+    # $_OSV_JSON and $_OSV_TMP are absolute mktemp paths, so the redirect and
+    # --config are unaffected by the cd.
     _OSV_STATUS=0
     if [ "$_OSV_SUBCMD" = "source" ]; then
       # shellcheck disable=SC2086
-      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan source -r --format=json "--config=$_OSV_TMP" $_OSV_EXCL_FLAGS . > "$_OSV_JSON" || _OSV_STATUS=$?
+      ( cd "$REPO_ROOT" || exit 1; run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan source -r --format=json "--config=$_OSV_TMP" $_OSV_EXCL_FLAGS . ) > "$_OSV_JSON" || _OSV_STATUS=$?
     else
-      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" . > "$_OSV_JSON" || _OSV_STATUS=$?
+      ( cd "$REPO_ROOT" || exit 1; run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" . ) > "$_OSV_JSON" || _OSV_STATUS=$?
     fi
     case "$_OSV_STATUS" in
       0)
@@ -1930,10 +2047,11 @@ cmd_deps() {
 
     set -- "$@" .   # trailing path arg
 
-    if run_bounded "$_OSV_TIMEOUT" -- osv-scanner "$@"; then
+    # Same CWD pin as the scan-subcommand branches above.
+    if ( cd "$REPO_ROOT" || exit 1; run_bounded "$_OSV_TIMEOUT" -- osv-scanner "$@" ); then
       cmd_log_run deps pass ""
     else
-      cmd_log_run deps block "osv-scanner reported vulnerabilities or timed out after ${_OSV_TIMEOUT}s"
+      cmd_log_run deps block "osv-scanner reported vulnerabilities, timed out after ${_OSV_TIMEOUT}s, or REPO_ROOT could not be entered"
       return 1
     fi
   fi
@@ -1993,6 +2111,7 @@ PY
 }
 
 cmd_bleed() {
+  _gate_check_args bleed "--full-scan" "" "$@" || return 2
   # Internal-bleed scan: grep the changed-file set for patterns loaded from a
   # user-supplied pattern file. Patterns are BRE (grep -f), one per line;
   # lines starting with # and blank lines are ignored.
@@ -2323,6 +2442,7 @@ _sast_pinned_config_from_argv() {
 }
 
 cmd_sast() {
+  _gate_check_args sast "" "" "$@" || return 2
   # DOMAIN-BASED SKIP (lr-1ad8da). See cmd_deps' identical block above for
   # the full rationale -- same env-var gate, same fail-closed contract, only
   # the domain glob function and version constant differ.
@@ -2507,9 +2627,18 @@ EOF_EXCL
   fi
 
   # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
+  #
+  # CWD PINNED TO REPO_ROOT VIA SUBSHELL, NOT A TARGET ARGUMENT: semgrep's
+  # --baseline-commit runs `git cat-file` against the process CWD with no
+  # override flag, and a positional target exits 2 whenever CWD != REPO_ROOT,
+  # so the positional-path pin available for other scanners does not work
+  # here. Each invocation runs in a POSIX subshell that cds first, leaving
+  # argv byte-identical. A failed cd exits the subshell nonzero, so an
+  # unenterable REPO_ROOT is a gate BLOCK, never a pass. Everything the
+  # caller reads afterwards is assigned outside the subshell.
   if [ -n "$_SAST_BASELINE" ]; then
-    echo "[gates/sast] scoping to diff-introduced findings (baseline-commit=$_SAST_BASELINE)" 1>&2
-    if run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE"; then
+    echo "[gates/sast] scoping to diff-introduced findings (baseline-commit=$_SAST_BASELINE, cwd=$REPO_ROOT)" 1>&2
+    if ( cd "$REPO_ROOT" || exit 1; run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE" ); then
       _SAST_PASS_DETAILS="baseline-commit=$_SAST_BASELINE"
       [ -n "$_SAST_PINNED_CONFIG" ] && _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; config=$_SAST_PINNED_CONFIG"
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
@@ -2517,12 +2646,12 @@ EOF_EXCL
       fi
       _cmd_log_run_checked_pass sast "$_SAST_PASS_DETAILS"
     else
-      cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE (or timed out after ${_SAST_TIMEOUT}s)"
+      cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE (or timed out after ${_SAST_TIMEOUT}s, or REPO_ROOT could not be entered)"
       return 1
     fi
   else
-    echo "[gates/sast] full-tree scan (baseline scoping unavailable: $_SAST_BASELINE_SKIP_REASON)" 1>&2
-    if run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR; then
+    echo "[gates/sast] full-tree scan (baseline scoping unavailable: $_SAST_BASELINE_SKIP_REASON; cwd=$REPO_ROOT)" 1>&2
+    if ( cd "$REPO_ROOT" || exit 1; run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR ); then
       _SAST_PASS_DETAILS="full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"
       [ -n "$_SAST_PINNED_CONFIG" ] && _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; config=$_SAST_PINNED_CONFIG"
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
@@ -2530,7 +2659,7 @@ EOF_EXCL
       fi
       _cmd_log_run_checked_pass sast "$_SAST_PASS_DETAILS"
     else
-      cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON; or timed out after ${_SAST_TIMEOUT}s)"
+      cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON; or timed out after ${_SAST_TIMEOUT}s, or REPO_ROOT could not be entered)"
       return 1
     fi
   fi
@@ -4508,6 +4637,7 @@ _invariant_feed_distill() {
 }
 
 cmd_review() {
+  _gate_check_args review "--full-review --since-last-review --reset-dedup" "" "$@" || return 2
   # Parse flags; all args consumed by the subcommand dispatcher.
   #
   # --since-last-review: RETAINED as a backward-compatible no-op (lr-01ae73
@@ -5556,6 +5686,7 @@ _sanitize_adversarial_findings_json() {
 }
 
 cmd_adversarial() {
+  _gate_check_args adversarial "--full-review" "" "$@" || return 2
   # --full-review: gates.sh's dispatcher now forwards argv
   # to this function (previously a bare `cmd_adversarial ;;` with no shift/
   # "$@" -- a documented, accepted flag was silently discarded, producing a
@@ -5885,6 +6016,7 @@ _mg_state_identity() {
 }
 
 cmd_merge_gate() {
+  _gate_check_args merge-gate "--recheck" "" "$@" || return 2
   # Final LLM sanity check: feed gate outputs back through the merge-gate
   # role, which decides approve/refuse. BLOCKING BY DEFAULT — set
   # CLAGENTIC_MERGE_GATE_BLOCKING=0 to make a 'refuse' decision advisory only.
@@ -7546,6 +7678,7 @@ EOF
 # -- consistent with acceptance criterion 4 ("missing manifest is reported
 # as failure, never inferred as success").
 cmd_render_manifest() {
+  _gate_check_args render-manifest "" "FILE" "$@" || return 2
   FILE="${1:-$(_gate_manifest_path)}"
   [ -f "$FILE" ] || { echo "no gate attestation manifest at $FILE -- absence is reported, never inferred as a clean run" 1>&2; return 1; }
   if command -v jq >/dev/null 2>&1; then
@@ -7564,6 +7697,7 @@ cmd_render_manifest() {
 }
 
 cmd_render_review() {
+  _gate_check_args render-review "" "FILE" "$@" || return 2
   FILE="${1:-$REPO_ROOT/.clagentic/lite/last-review.json}"
   [ -f "$FILE" ] || { echo "no review file at $FILE" 1>&2; return 1; }
   if command -v jq >/dev/null 2>&1; then
@@ -7638,6 +7772,7 @@ cmd_render_review() {
 # provided (lr-2ebc41 comment 1: a subcommand the operator must remember to
 # run is the same failure mode with a shorter path).
 cmd_deferrals_lint() {
+  _gate_check_args deferrals-lint "" "FILE" "$@" || return 2
   _cdl_file="${1:-$REPO_ROOT/.clagentic/deferrals.json}"
   [ -f "$_cdl_file" ] || { echo "[gates/deferrals-lint] no deferrals file at $_cdl_file — nothing to lint" ; return 0; }
 
@@ -7791,6 +7926,7 @@ PYEOF
 # covers that case completely, and requiring every literal pass call to
 # route through the helper too would be pure churn with no coverage gain.
 cmd_audit_vocab_lint() {
+  _gate_check_args audit-vocab-lint "" "FILE" "$@" || return 2
   _cavl_file="${1:-$TOOL_HOME/scripts/gates.sh}"
   [ -f "$_cavl_file" ] || { echo "[gates/audit-vocab-lint] no file at $_cavl_file"; return 0; }
 
@@ -7964,6 +8100,7 @@ gate_enabled() {
 }
 
 cmd_ship() {
+  _gate_check_args ship "" "" "$@" || return 2
   echo "[gates/ship] running gate sequence (enabled: ${CLAGENTIC_GATES:-all})"
   # Gate attestation manifest (lr-37a9c8): written unconditionally, before
   # any gate runs -- see the module doc comment above _gate_manifest_path
@@ -8100,7 +8237,22 @@ cmd_ship() {
   # contract"): gate logic never names a vendor CLI/API directly -- see
   # scripts/host-adapter.sh for the one place that's allowed.
   if _git remote get-url origin >/dev/null 2>&1; then
-    run_bounded "$_SHIP_TIMEOUT" -- _git push -u origin "$BRANCH" || { echo "[gates/ship] push failed or timed out after ${_SHIP_TIMEOUT}s"; cmd_log_run ship block "push failed"; exit 1; }
+    # The command word handed to run_bounded must be a real executable:
+    # $DS_TIMEOUT_CMD execs it, and `_git` is a shell function, so passing it
+    # here made every push fail to start and logged a fully green ship as a
+    # push failure. Spell out `git -C "$REPO_ROOT"` instead.
+    _SHIP_PUSH_ERR=$(mktemp -t clagentic-ship-push-err.XXXXXX) || _SHIP_PUSH_ERR=/dev/null
+    _SHIP_PUSH_RC=0
+    run_bounded "$_SHIP_TIMEOUT" -- git -C "$REPO_ROOT" push -u origin "$BRANCH" 2>"$_SHIP_PUSH_ERR" || _SHIP_PUSH_RC=$?
+    [ -s "$_SHIP_PUSH_ERR" ] && cat "$_SHIP_PUSH_ERR" 1>&2
+    if [ "$_SHIP_PUSH_RC" -ne 0 ]; then
+      _SHIP_PUSH_REASON=$(_bounded_failure_reason "$_SHIP_PUSH_RC" "$_SHIP_TIMEOUT" "$_SHIP_PUSH_ERR")
+      [ "$_SHIP_PUSH_ERR" = /dev/null ] || rm -f "$_SHIP_PUSH_ERR"
+      echo "[gates/ship] push $_SHIP_PUSH_REASON"
+      cmd_log_run ship block "push $_SHIP_PUSH_REASON"
+      exit 1
+    fi
+    [ "$_SHIP_PUSH_ERR" = /dev/null ] || rm -f "$_SHIP_PUSH_ERR"
   fi
   if host_adapter_available; then
     # Render the PR body gate-side (lr-429b32) before handing off to the
@@ -8139,6 +8291,7 @@ cmd_ship() {
 # inconclusive, and therefore always runs both gates (fail-closed by
 # construction).
 cmd_pre_push() {
+  _gate_check_args pre-push "" "" "$@" || exit 2
   _PRE_PUSH_REFS_FILE=$(mktemp -t clagentic-prepush-stdin.XXXXXX)
   cat > "$_PRE_PUSH_REFS_FILE"
   CLAGENTIC_GATE_REFS_FILE="$_PRE_PUSH_REFS_FILE"
@@ -8152,6 +8305,7 @@ cmd_pre_push() {
 }
 
 cmd_digest() {
+  _gate_check_args digest "" "" "$@" || return 2
   cmd_init
   printf '\n== clagentic-lite gate digest (last 24h) ==\n\n'
   ds_sqlite3 -header -column "$AUDIT_DB" \
@@ -8212,6 +8366,7 @@ _color_outcome() {
 }
 
 cmd_status() {
+  _gate_check_args status "" "N" "$@" || return 2
   cmd_init
   _color_init
   N="${1:-10}"
@@ -8246,6 +8401,7 @@ cmd_status() {
 }
 
 cmd_tail() {
+  _gate_check_args tail "--no-follow" "" "$@" || return 2
   cmd_init
   _color_init
 
@@ -8426,6 +8582,14 @@ cmd_tail() {
 if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
   if [ "${1:-}" != "init" ]; then
     ds_load_env
+  fi
+
+  # log-run takes GATE OUTCOME [DETAILS] positionally and cmd_log_run is also
+  # called internally, so its argument-count check sits here, before dispatch,
+  # rather than inside the function or the case arm.
+  if [ "${1:-}" = "log-run" ] && { [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; }; then
+    echo "usage: gates.sh log-run GATE OUTCOME [DETAILS]" 1>&2
+    exit 2
   fi
 
   case "${1:-}" in
