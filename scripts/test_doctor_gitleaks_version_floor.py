@@ -1,10 +1,13 @@
 """
 Regression tests for lr-170808 scope item 4: `clagentic-lite doctor` reports
-the installed gitleaks version and warns below the 8.18 floor that
-feature-branch history scanning (cmd_secrets, scripts/gates.sh) is
-unavailable -- a standing coverage gap, not a per-run surprise. Also warns
-below 8.25 (the [[allowlists]]/condition="AND" floor .gitleaks.toml's own
-header comment already documents).
+the installed gitleaks version and warns below the 8.19 floor (corrected
+from an earlier "8.18" claim -- PEACHES PR #218 review, comment
+5833150249: gitleaks' `git` subcommand was introduced in 8.19, confirmed
+directly against upstream gitleaks' own cobra command definitions, not
+8.18) that feature-branch history scanning (cmd_secrets, scripts/gates.sh)
+is unavailable -- a standing coverage gap, not a per-run surprise. Also
+warns below 8.25 (the [[allowlists]]/condition="AND" floor .gitleaks.toml's
+own header comment already documents).
 
 Uses a fake `gitleaks` binary on PATH ahead of any real one so the version
 comparison is exercised deterministically for both the below-floor and
@@ -87,10 +90,10 @@ class _DoctorGitleaksTestBase(unittest.TestCase):
 class TestBelowHistoryFloorWarns(_DoctorGitleaksTestBase):
     def test_ubuntu_2404_apt_version_warns_history_scan_unavailable(self):
         """The exact reported environment: 8.16.0-1ubuntu0.24.04.3, below
-        the 8.18 history-scan floor."""
+        the 8.19 history-scan floor."""
         _write_fake_gitleaks(self.fake_bin, "8.16.0-1ubuntu0.24.04.3")
         rc, out, err = _run_doctor(cwd=self.repo, home=self.home, fake_bin_dir=self.fake_bin)
-        self.assertIn("WARN gitleaks 8.16.0 < 8.18.0", out, msg=out)
+        self.assertIn("WARN gitleaks 8.16.0 < 8.19.0", out, msg=out)
         self.assertIn("feature-branch history scanning is UNAVAILABLE", out, msg=out)
 
     def test_below_allowlist_floor_also_warns(self):
@@ -101,16 +104,25 @@ class TestBelowHistoryFloorWarns(_DoctorGitleaksTestBase):
 
 
 class TestAtOrAboveFloorReportsOk(_DoctorGitleaksTestBase):
-    def test_8_18_0_ok_for_history_but_warns_allowlist(self):
+    def test_8_19_0_ok_for_history_but_warns_allowlist(self):
+        _write_fake_gitleaks(self.fake_bin, "8.19.0")
+        rc, out, err = _run_doctor(cwd=self.repo, home=self.home, fake_bin_dir=self.fake_bin)
+        self.assertIn("OK   gitleaks 8.19.0 (>= 8.19.0", out, msg=out)
+        self.assertIn("< 8.25.0", out, msg=out)
+
+    def test_8_18_0_warns_history_below_corrected_floor(self):
+        """Regression pin for PEACHES PR #218 review (comment 5833150249):
+        8.18.0 predates the `git` subcommand's existence entirely -- it
+        must WARN, not report OK, now that the floor is correctly 8.19."""
         _write_fake_gitleaks(self.fake_bin, "8.18.0")
         rc, out, err = _run_doctor(cwd=self.repo, home=self.home, fake_bin_dir=self.fake_bin)
-        self.assertIn("OK   gitleaks 8.18.0 (>= 8.18.0", out, msg=out)
-        self.assertIn("< 8.25.0", out, msg=out)
+        self.assertIn("WARN gitleaks 8.18.0 < 8.19.0", out, msg=out)
+        self.assertIn("feature-branch history scanning is UNAVAILABLE", out, msg=out)
 
     def test_8_30_1_ok_for_both_floors(self):
         _write_fake_gitleaks(self.fake_bin, "8.30.1")
         rc, out, err = _run_doctor(cwd=self.repo, home=self.home, fake_bin_dir=self.fake_bin)
-        self.assertIn("OK   gitleaks 8.30.1 (>= 8.18.0", out, msg=out)
+        self.assertIn("OK   gitleaks 8.30.1 (>= 8.19.0", out, msg=out)
         self.assertNotIn("misread by older gitleaks", out, msg=out)
 
 

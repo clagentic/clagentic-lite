@@ -29,10 +29,10 @@ Two layers of coverage, deliberately not just one:
      before it ever reaches `cmd_secrets`. The POSITIVE proof that a
      forwarded flag actually changes `cmd_secrets`' own behavior (scoped vs.
      full-history stderr output) lives in `test_secrets_branch_scope.py`,
-     which needs `gitleaks git` (8.18+) to exercise meaningfully; this file
+     which needs `gitleaks git` (8.19+) to exercise meaningfully; this file
      stays gitleaks-version-independent so the dispatcher-forwarding
      property itself is verified on every installed gitleaks version, not
-     only 8.18+.
+     only 8.19+.
 
 Run with: python3 -m unittest scripts.test_gates_dispatcher_forwards_args -v
 """
@@ -63,8 +63,20 @@ def _dispatcher_case_labels(block):
     independent of how much of the arm's body is captured -- a separate,
     narrower regex than _dispatcher_case_arms' own body-matching one, used
     only to cross-check that every labeled arm actually got an entry in the
-    parsed dict (see PEACHES PR #217 review, comment 5821185384 below)."""
-    return re.findall(r'\n {4}([A-Za-z0-9_-]+)\)', block)
+    parsed dict (see PEACHES PR #217 review, comment 5821185384 below).
+
+    PEACHES PR #218 review (comment 5834286140): the character class here
+    used to be `[A-Za-z0-9_-]+`, which cannot match a POSIX case-label using
+    alternation (e.g. `foo|bar)` -- a single arm matching two subcommand
+    names). Such an arm would simply not match this regex at all, so it
+    would be SILENTLY EXCLUDED from the swept label set -- the exact
+    select-by-the-property-under-test flaw this sweep exists to avoid: an
+    alternation arm that forgot `shift; cmd_X "$@"` would never even be
+    counted, let alone checked. The class now also allows `|`, so any
+    number of pipe-separated names in one label is captured as a single
+    arm (see TestAlternationCaseArmsAreSwept below for the regression
+    pin -- a synthetic alternation arm missing the forward must fail)."""
+    return re.findall(r'\n {4}([A-Za-z0-9_|-]+)\)', block)
 
 
 def _dispatcher_case_arms():
@@ -98,7 +110,7 @@ def _dispatcher_case_arms():
     labels = _dispatcher_case_labels(block)
     arms = {}
     for m in re.finditer(
-        r'\n {4}([A-Za-z0-9_-]+)\)([\s\S]*?);;',
+        r'\n {4}([A-Za-z0-9_|-]+)\)([\s\S]*?);;',
         block,
     ):
         name, body = m.group(1), m.group(2)
@@ -143,32 +155,89 @@ def _case_block_dispatches(subcommand):
     return arms[subcommand]
 
 
+def _expected_handler_name(subcommand):
+    """Map a dispatcher subcommand LABEL to its cmd_X handler function name,
+    e.g. "merge-gate" -> "cmd_merge_gate". Every real dispatcher arm in
+    scripts/gates.sh follows this mapping (dashes become underscores,
+    "cmd_" prefixed) -- confirmed against every current label
+    (init/bleed/secrets/deps/sast/review/adversarial/merge-gate/
+    render-review/render-manifest/deferrals-lint/audit-vocab-lint/ship/
+    pre-push/log-run/digest/status/tail).
+
+    ALTERNATION LABELS (lr-51112e fold-in, PEACHES PR #218 review comment
+    5836927583): a case label can be `foo|bar)`, one arm matching either
+    name (see TestAlternationCaseArmsAreSwept above). The old
+    implementation ran `.replace("-", "_")` on the WHOLE label, producing
+    "cmd_foo|bar" for such an arm -- not a real function name, so it could
+    never match anything and every alternation arm would silently fail the
+    ordered-binding check regardless of whether the arm actually forwards
+    args correctly. The handler name is derived from the label's FIRST
+    alternative only -- every real alternation arm in this dispatcher binds
+    a single `cmd_X "$@"` call shared by all its names (there is exactly
+    one handler function per arm, not one per name), so the first
+    alternative names it correctly."""
+    first = subcommand.split("|", 1)[0]
+    return "cmd_" + first.replace("-", "_")
+
+
+# PEACHES PR #218 review (comment 5833150249): the prior version of this
+# assertion only checked that `shift;`/`shift ;` and `"$@"` occurred
+# SOMEWHERE in the arm, independently -- an arm shaped like
+# `secrets) shift; log_args "$@"; cmd_secrets ;;` would pass both
+# independent substring checks (it contains "shift;" and it contains
+# '"$@"') while cmd_secrets itself still receives NO arguments at all,
+# because "$@" was bound to a DIFFERENT call (log_args) in the same arm.
+# The real property under test is the ORDERED, BOUND sequence
+# `shift; cmd_X "$@"` -- shift immediately followed by the actual handler
+# call with "$@" attached to THAT call, not merely present somewhere in the
+# arm's text. Matched via a regex anchored on the literal expected handler
+# name (derived mechanically, never hand-maintained -- see
+# _expected_handler_name above) so a typo'd or wrong handler name in the
+# arm is caught by the SAME assertion, not a separate one.
+#
+# NEWLINE-SEPARATED FORM (lr-51112e fold-in, PEACHES PR #218 review comment
+# 5836927583): a multi-line arm shaped like `secrets)\n    shift\n
+# cmd_secrets "$@"\n    ;;` (see TestDispatcherParserHandlesMultiLineArms)
+# has no `;` between `shift` and the handler call at all -- the separator is
+# a bare newline. The prior pattern `shift\s*;\s*cmd_X` REQUIRED a literal
+# `;`, which `\s*` alone does not stand in for, so this exact multi-line
+# shape -- correctly written shell, ordered and bound -- would fail the
+# ordered-binding assertion despite being a genuine pass. The separator is
+# now `(?:;|\n)` -- either a `;` (single-line arms) or a newline (multi-line
+# arms), with surrounding whitespace still tolerated on either side.
+def _shift_then_bound_call_pattern(handler):
+    return re.compile(r'shift\s*(?:;|\n)\s*' + re.escape(handler) + r'\s+"\$@"')
+
+
 class TestDispatcherCaseArmsShiftAndForwardArgv(unittest.TestCase):
     """Static-but-anchored check: every subcommand's own case arm, read
     directly from the real dispatcher source, must both `shift` (consume the
     subcommand token itself) and forward `"$@"` to its cmd_X call -- the
     exact shape lr-51112e's field report named as missing for
     secrets/deps/sast/ship/pre-push/digest (gates.sh's dispatcher, at the
-    time of that report)."""
+    time of that report).
+
+    Asserts the ORDERED, BOUND `shift; cmd_X "$@"` sequence directly (not
+    "shift" and '"$@"' as two independent substring checks -- see PEACHES
+    PR #218 review, comment 5833150249, and
+    TestOrderedBindingRejectsArgvDroppedToADifferentCall below for the
+    regression this closes)."""
 
     def test_every_subcommand_with_args_shifts_and_forwards(self):
-        missing_shift = []
-        missing_forward = []
+        not_bound = []
         for subcommand, _extra_args in _SUBCOMMANDS_WITH_ARGS:
             arm = _case_block_dispatches(subcommand)
-            if "shift;" not in arm and "shift ;" not in arm:
-                missing_shift.append((subcommand, arm))
-            if '"$@"' not in arm:
-                missing_forward.append((subcommand, arm))
+            handler = _expected_handler_name(subcommand)
+            if not _shift_then_bound_call_pattern(handler).search(arm):
+                not_bound.append((subcommand, handler, arm))
         self.assertEqual(
-            missing_shift, [],
-            msg=f"dispatcher case arm(s) missing `shift` before calling cmd_X -- "
-                f"the subcommand token itself would leak into cmd_X's own argv[1]: {missing_shift}",
-        )
-        self.assertEqual(
-            missing_forward, [],
-            msg=f"dispatcher case arm(s) missing `\"$@\"` -- every argument after the "
-                f"subcommand name is silently dropped before reaching cmd_X: {missing_forward}",
+            not_bound, [],
+            msg=f"dispatcher case arm(s) do not contain the ordered, bound "
+                f"`shift; cmd_X \"$@\"` sequence -- either `shift` is missing, "
+                f"`\"$@\"` is bound to a DIFFERENT call in the same arm (the "
+                f"subcommand's own argv is then silently dropped before "
+                f"reaching cmd_X), or the handler name does not match the "
+                f"expected cmd_<subcommand> mapping: {not_bound}",
         )
 
     def test_init_is_deliberately_argument_less_but_still_shifts(self):
@@ -178,8 +247,47 @@ class TestDispatcherCaseArmsShiftAndForwardArgv(unittest.TestCase):
         being a second bare-call special case future maintainers have to
         remember the reason for."""
         arm = _case_block_dispatches("init")
-        self.assertIn("shift", arm)
-        self.assertIn('"$@"', arm)
+        self.assertTrue(_shift_then_bound_call_pattern("cmd_init").search(arm))
+
+
+class TestOrderedBindingRejectsArgvDroppedToADifferentCall(unittest.TestCase):
+    """Regression pin for PEACHES PR #218 review, comment 5833150249: a
+    negative control proving the ordered-binding assertion actually rejects
+    the exact shape the old independent-substring-check version would have
+    missed -- an arm that shifts and uses "$@" somewhere, but binds it to a
+    call OTHER than the real cmd_X handler, must fail."""
+
+    def test_shift_and_dollar_at_present_but_bound_to_wrong_call_fails(self):
+        arm = 'secrets) shift; log_args "$@"; cmd_secrets ;;'
+        handler = _expected_handler_name("secrets")
+        self.assertIsNone(
+            _shift_then_bound_call_pattern(handler).search(arm),
+            msg="an arm binding \"$@\" to log_args instead of cmd_secrets "
+                "must NOT satisfy the ordered-binding pattern -- cmd_secrets "
+                "still receives no arguments in this shape",
+        )
+
+    def test_bare_cmd_call_with_no_dollar_at_fails(self):
+        arm = 'secrets) shift; cmd_secrets ;;'
+        handler = _expected_handler_name("secrets")
+        self.assertIsNone(_shift_then_bound_call_pattern(handler).search(arm))
+
+    def test_correctly_bound_shift_then_call_passes(self):
+        arm = 'secrets) shift; cmd_secrets "$@" ;;'
+        handler = _expected_handler_name("secrets")
+        self.assertIsNotNone(_shift_then_bound_call_pattern(handler).search(arm))
+
+    def test_correctly_bound_shift_then_call_passes_across_a_newline(self):
+        """Positive control for lr-51112e's fold-in (PEACHES PR #218 review,
+        comment 5836927583): a multi-line arm separates `shift` from its
+        `cmd_X "$@"` call with a bare newline, not a `;` -- this is
+        legitimate, correctly-forwarding shell (see
+        TestDispatcherParserHandlesMultiLineArms's own multi-line arm
+        fixtures) and must satisfy the ordered-binding pattern exactly like
+        the single-line `;`-separated form does."""
+        arm = 'secrets)\n        shift\n        cmd_secrets "$@"\n        ;;'
+        handler = _expected_handler_name("secrets")
+        self.assertIsNotNone(_shift_then_bound_call_pattern(handler).search(arm))
 
 
 class TestDispatcherParserHandlesMultiLineArms(unittest.TestCase):
@@ -208,7 +316,7 @@ class TestDispatcherParserHandlesMultiLineArms(unittest.TestCase):
         )
         arms = {}
         labels = _dispatcher_case_labels(block)
-        for m in re.finditer(r'\n {4}([A-Za-z0-9_-]+)\)([\s\S]*?);;', block):
+        for m in re.finditer(r'\n {4}([A-Za-z0-9_|-]+)\)([\s\S]*?);;', block):
             name, body = m.group(1), m.group(2)
             arms[name] = f"{name}){body};;"
         self.assertEqual(sorted(arms), sorted(set(labels)))
@@ -231,7 +339,7 @@ class TestDispatcherParserHandlesMultiLineArms(unittest.TestCase):
             '  esac'
         )
         arms = {}
-        for m in re.finditer(r'\n {4}([A-Za-z0-9_-]+)\)([\s\S]*?);;', block):
+        for m in re.finditer(r'\n {4}([A-Za-z0-9_|-]+)\)([\s\S]*?);;', block):
             name, body = m.group(1), m.group(2)
             arms[name] = f"{name}){body};;"
         self.assertIn("secrets", arms, msg="a multi-line arm must still be parsed even when it "
@@ -257,28 +365,113 @@ class TestDispatcherParserHandlesMultiLineArms(unittest.TestCase):
             '    secrets)        shift; cmd_secrets "$@" ;;\n'
             '  esac\n'
         )
-
-        class _FakeFile:
-            def __enter__(self_inner):
-                return self_inner
-
-            def __exit__(self_inner, *exc):
-                return False
-
-            def read(self_inner):
-                return fake_src
-
-        real_open = open
-
-        def _fake_open(path, *a, **kw):
-            if path == GATES_SH:
-                return _FakeFile()
-            return real_open(path, *a, **kw)
-
-        with unittest.mock.patch("builtins.open", side_effect=_fake_open):
+        with _patched_gates_src(fake_src):
             with self.assertRaises(AssertionError) as ctx:
                 _dispatcher_case_arms()
         self.assertIn("SILENTLY DROPPED", str(ctx.exception))
+
+
+def _patched_gates_src(fake_src):
+    """Context manager: patches builtins.open so any read of GATES_SH
+    returns `fake_src` instead of the real file, while every other open()
+    call (e.g. this test module's own imports) is untouched. Reuse of the
+    same _FakeFile/_fake_open shape TestDispatcherParserHandlesMultiLineArms
+    already uses for test_arm_count_mismatch_raises_loudly, factored out
+    here rather than copied a third time for
+    TestAlternationCaseArmsAreSwept below."""
+
+    class _FakeFile:
+        def __enter__(self_inner):
+            return self_inner
+
+        def __exit__(self_inner, *exc):
+            return False
+
+        def read(self_inner):
+            return fake_src
+
+    real_open = open
+
+    def _fake_open(path, *a, **kw):
+        if path == GATES_SH:
+            return _FakeFile()
+        return real_open(path, *a, **kw)
+
+    return unittest.mock.patch("builtins.open", side_effect=_fake_open)
+
+
+class TestAlternationCaseArmsAreSwept(unittest.TestCase):
+    """Regression pin for PEACHES PR #218 review (comment 5834286140): the
+    dispatcher sweep's own case-arm parser used a character class of
+    `[A-Za-z0-9_-]+` for arm labels -- POSIX case syntax also allows
+    alternation in a single label (`foo|bar)  ...  ;;`, one arm matching
+    either name). Such a label contains `|`, which the old class could not
+    match, so the arm was silently excluded from BOTH
+    `_dispatcher_case_labels` and `_dispatcher_case_arms` -- the arm-count
+    cross-check (see _dispatcher_case_arms' own guard) could not catch this
+    either, because both the label count and the arm count were undercounted
+    by exactly the same missing arm, so they still agreed with each other.
+    This is the same select-by-the-property-under-test flaw named in
+    lr-51112e's fold-in scope: a sweep silently excludes exactly the
+    non-conforming instances it exists to catch.
+
+    These tests drive the REAL `_dispatcher_case_arms`/`_dispatcher_case_labels`
+    functions end-to-end against a synthetic source (patched via
+    _patched_gates_src), not a hand-reimplemented copy of the parsing logic
+    -- proving the actual shipped parser handles alternation, not a stand-in
+    for it."""
+
+    def test_alternation_arm_with_forwarding_is_swept_and_passes(self):
+        fake_src = (
+            'x=1\n'
+            '  case "${1:-}" in\n'
+            '    foo|bar)        shift; cmd_foo "$@" ;;\n'
+            '  esac\n'
+        )
+        with _patched_gates_src(fake_src):
+            arms = _dispatcher_case_arms()
+            labels = _dispatcher_case_labels(
+                '\n  case "${1:-}" in\n'
+                '    foo|bar)        shift; cmd_foo "$@" ;;\n'
+                '  esac'
+            )
+        self.assertIn("foo|bar", arms,
+                       msg="an alternation-labeled case arm (foo|bar)) must be captured by "
+                           "the real dispatcher parser, not silently excluded")
+        self.assertEqual(labels, ["foo|bar"])
+        # Call _expected_handler_name rather than hardcode "cmd_foo" (lr-51112e
+        # fold-in, PEACHES PR #218 review comment 5836927583) -- this proves
+        # the real handler-name mapping the main sweep actually uses handles
+        # an alternation label correctly, not a hand-picked stand-in for it.
+        handler = _expected_handler_name("foo|bar")
+        self.assertEqual(handler, "cmd_foo")
+        self.assertTrue(_shift_then_bound_call_pattern(handler).search(arms["foo|bar"]))
+
+    def test_alternation_arm_missing_forward_is_swept_and_fails(self):
+        """The actual negative control: an alternation arm that FORGOT
+        `shift; cmd_X "$@"` must still be captured by the parser (proving
+        the sweep would have examined it) and must FAIL the ordered-binding
+        assertion -- not vanish from the swept set, which would let the
+        exact defect this sweep exists to catch pass silently."""
+        fake_src = (
+            'x=1\n'
+            '  case "${1:-}" in\n'
+            '    foo|bar)        cmd_foo ;;\n'
+            '  esac\n'
+        )
+        with _patched_gates_src(fake_src):
+            arms = _dispatcher_case_arms()
+        self.assertIn("foo|bar", arms,
+                       msg="an alternation arm missing shift/\"$@\" must still be captured, "
+                           "not silently dropped -- silently dropping it would hide the exact "
+                           "defect this sweep exists to catch")
+        handler = _expected_handler_name("foo|bar")
+        self.assertEqual(handler, "cmd_foo")
+        self.assertIsNone(
+            _shift_then_bound_call_pattern(handler).search(arms["foo|bar"]),
+            msg="an alternation arm with no shift/\"$@\" forwarding must fail the "
+                "ordered-binding pattern, proving the sweep actually rejects this shape",
+        )
 
 
 class TestDispatcherActuallyForwardsArgvAtRuntime(unittest.TestCase):
@@ -293,7 +486,7 @@ class TestDispatcherActuallyForwardsArgvAtRuntime(unittest.TestCase):
     "secrets --full-scan" as a whole failed to match the `secrets)` arm) is
     caught here directly. See test_secrets_branch_scope.py for the POSITIVE
     proof that a forwarded --full-scan flag actually changes cmd_secrets'
-    own scoping behavior (needs gitleaks 8.18+ to exercise meaningfully)."""
+    own scoping behavior (needs gitleaks 8.19+ to exercise meaningfully)."""
 
     def test_secrets_full_scan_flag_does_not_confuse_the_dispatcher(self):
         tmp = tempfile.mkdtemp(prefix="clagentic-test-dispatch-argv-")

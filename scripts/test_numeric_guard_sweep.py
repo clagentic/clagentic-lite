@@ -34,7 +34,12 @@ GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
 # `sleep "${INTERVAL}"` written in an equally valid but different shell style
 # would otherwise be invisible to the sweep (lr-53dc6e fold-in review).
 _SLEEP_CALL_RE = re.compile(r'sleep\s+"?\$\{?(\w+)\}?"?')
-_NUMERIC_GUARD_RE = re.compile(r"case\s+\"?\$\{?(\w+)\}?\"?\s+in\s+''\|\*\[!0-9\]\*\)")
+# Either the open-coded case guard, or the shared platform.sh helper
+# (VAR=$(ds_positive_int_or_default|_warn ...)), which also rejects 0.
+_NUMERIC_GUARD_RE = re.compile(
+    r"case\s+\"?\$\{?(\w+)\}?\"?\s+in\s+''\|\*\[!0-9\]\*\)"
+    r"|(\w+)=\$\(ds_positive_int_or_(?:default|warn)\b"
+)
 
 
 def _find_enclosing_function_start(lines, call_idx):
@@ -69,7 +74,7 @@ def _find_unguarded_sleep_violations(lines):
         guarded = False
         for j in range(func_start, i):
             gm = _NUMERIC_GUARD_RE.search(lines[j])
-            if gm and gm.group(1) == var_name:
+            if gm and (gm.group(1) or gm.group(2)) == var_name:
                 guarded = True
                 break
         if not guarded:

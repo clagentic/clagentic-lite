@@ -195,7 +195,7 @@ _git_repo_scoped_head_sha() {
 run_bounded() {
   case "$1" in
     --)
-      _rb_timeout="${CLAGENTIC_EXTERNAL_TIMEOUT_SEC:-120}"
+      _rb_timeout=""
       shift
       ;;
     *)
@@ -207,8 +207,7 @@ run_bounded() {
       [ "${1:-}" = "--" ] && shift
       ;;
   esac
-  _rb_timeout=$(ds_positive_int_or_default "$_rb_timeout" "${CLAGENTIC_EXTERNAL_TIMEOUT_SEC:-120}")
-  _rb_timeout=$(ds_positive_int_or_default "$_rb_timeout" 120)
+  _rb_timeout=$(ds_positive_int_or_default "$_rb_timeout" "$(ds_positive_int_or_warn CLAGENTIC_EXTERNAL_TIMEOUT_SEC "${CLAGENTIC_EXTERNAL_TIMEOUT_SEC:-}" 120)")
   $DS_TIMEOUT_CMD "$_rb_timeout" "$@"
 }
 
@@ -1302,8 +1301,7 @@ _gitleaks_positive_control() {
     git commit -q -m "canary fixture" --no-verify
   ) >/dev/null 2>&1
 
-  _gpc_timeout="${CLAGENTIC_SECRETS_TIMEOUT_SEC:-300}"
-  _gpc_timeout=$(ds_positive_int_or_default "$_gpc_timeout" 300)
+  _gpc_timeout=$(ds_positive_int_or_warn CLAGENTIC_SECRETS_TIMEOUT_SEC "${CLAGENTIC_SECRETS_TIMEOUT_SEC:-}" 300)
 
   _gpc_report="$_gpc_dir/report.json"
   _gpc_status=0
@@ -1403,7 +1401,7 @@ cmd_secrets() {
     cmd_log_run secrets block "gitleaks not installed (fail-closed)"
     return 1
   fi
-  # Build the invocation: gitleaks 8.18+ uses `gitleaks git --pre-commit --staged`;
+  # Build the invocation: gitleaks 8.19+ uses `gitleaks git --pre-commit --staged`;
   # older versions use `gitleaks protect --staged`. Both honor --config.
   CFG_ARG=""
   [ -f "$REPO_ROOT/.gitleaks.toml" ] && CFG_ARG="--config=$REPO_ROOT/.gitleaks.toml"
@@ -1469,14 +1467,14 @@ cmd_secrets() {
 
   # Probe by capability, not version string — `gitleaks version` output
   # format varies (`v8.18.4`, `8.18.4`, multi-line banner). The `git`
-  # subcommand was added in 8.18; if `gitleaks git --help` exits 0 we use
-  # it, otherwise we fall back to `gitleaks protect`.
+  # subcommand was added in 8.19 (corrected from an earlier "8.18" claim,
+  # PEACHES PR #218 review, comment 5833150249); if `gitleaks git --help`
+  # exits 0 we use it, otherwise we fall back to `gitleaks protect`.
   # Bound every gitleaks invocation (INV-1a/INV-2, class-4 foundry fix): a
   # full branch-history scan in particular can legitimately take longer than
   # the generic run_bounded default, so gitleaks gets its own configurable
   # timeout rather than sharing CLAGENTIC_EXTERNAL_TIMEOUT_SEC's 120s.
-  _SECRETS_TIMEOUT="${CLAGENTIC_SECRETS_TIMEOUT_SEC:-300}"
-  _SECRETS_TIMEOUT=$(ds_positive_int_or_default "$_SECRETS_TIMEOUT" 300)
+  _SECRETS_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SECRETS_TIMEOUT_SEC "${CLAGENTIC_SECRETS_TIMEOUT_SEC:-}" 300)
 
   if gitleaks git --help >/dev/null 2>&1; then
     if [ "$_SECRETS_ON_FEATURE" = "1" ]; then
@@ -1526,8 +1524,7 @@ cmd_secrets() {
       elif ! _git_repo_root_is_scoped; then
         _SECRETS_SCOPE_REASON="full history (baseline unavailable: REPO_ROOT is not a git repo)"
       else
-        _SECRETS_FETCH_TIMEOUT="${CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC:-30}"
-        _SECRETS_FETCH_TIMEOUT=$(ds_positive_int_or_default "$_SECRETS_FETCH_TIMEOUT" 30)
+        _SECRETS_FETCH_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC "${CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC:-}" 30)
 
         _SECRETS_FRESH_ERR_TMP=$(mktemp -t clagentic-secrets-fresh-err.XXXXXX)
         _SECRETS_FRESH_TIP=$(_gate_resolve_fresh_default_branch_ref "$_SECRETS_DEFAULT_BRANCH" "$_SECRETS_FETCH_TIMEOUT" 2>"$_SECRETS_FRESH_ERR_TMP") || true
@@ -1565,20 +1562,39 @@ cmd_secrets() {
       # subdirectory) has gitleaks silently scan the WRONG repo (or the
       # wrapper's own non-repo CWD) while this gate reports whatever that
       # unrelated scan found -- a false pass on the real target, not an
-      # error. Pinned via `--source`/`-s` (verified against this host's
-      # installed gitleaks, 8.16 -- a Global Flag shared by every
-      # subcommand's own --help, including `detect`/`protect`; `gitleaks
-      # git` needs 8.18+ and could not be probed directly on this host, but
-      # Global Flags apply uniformly across subcommands in this CLI, and
-      # `--source` is the one form confirmed NOT to be silently ignored --
-      # see the sibling fix on the `protect` fallback below, where a bare
-      # trailing positional WAS silently ignored, not an error, the exact
-      # false-pass shape this fix exists to close). This makes the scanned
-      # repo explicit and CWD-independent, the same property `_git -C
-      # "$REPO_ROOT"` already guarantees for every plain git call in this
+      # error.
+      #
+      # CORRECTED (PEACHES PR #218 review, comment 5833150249): the previous
+      # fix here pinned via a `--source`/`-s` flag on `gitleaks git` itself.
+      # That flag never reliably existed on `git`: per gitleaks' own cobra
+      # command definitions (cmd/git.go, verified against the v8.19.0
+      # introduction of the `git` subcommand through the current v8.30.1),
+      # `git`'s `Use` string has always been `"git [flags] [repo]"` with
+      # `Args: cobra.MaximumNArgs(1)` -- the repo is a POSITIONAL argument,
+      # never a `git`-local flag. `--source` briefly worked on `git` only
+      # because root.go's global `--source`/`-s` persistent flag was still
+      # inherited in the v8.19.0-v8.19.3 window; v8.20.0 removed that global
+      # flag entirely (the same release that made `detect`/`protect` hidden
+      # and deprecated in favor of `git`), so `gitleaks git --source=...`
+      # fails with an unknown-flag error on every gitleaks from 8.20.0
+      # onward -- every secrets gate blocked, even on a clean repo, on any
+      # modern gitleaks install. `detect`/`protect` are a genuinely separate
+      # code path that registers its OWN local `-s`/`--source` flag
+      # (confirmed unchanged through 8.30.1) -- that fallback below is
+      # correct as-is and untouched by this fix.
+      #
+      # The positional `[repo]` argument is the ONLY invocation shape that
+      # has worked across the entire `git`-subcommand era (8.19.0-8.30.1
+      # confirmed directly against upstream source), so it replaces
+      # `--source` here rather than adding a second version-gated branch --
+      # gitleaks 8.18 predates the `git` subcommand's existence altogether,
+      # so the `gitleaks git --help` capability probe above already excludes
+      # every version this positional form would not work on. This makes the
+      # scanned repo explicit and CWD-independent, the same property `_git
+      # -C "$REPO_ROOT"` already guarantees for every plain git call in this
       # file.
       # shellcheck disable=SC2086
-      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --redact --no-banner $CFG_ARG $_SECRETS_LOG_OPTS --source "$REPO_ROOT"; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --redact --no-banner $CFG_ARG $_SECRETS_LOG_OPTS -- "$REPO_ROOT"; then
         # Runtime-assembled details string (lr-2e8444): route through the
         # checked helper, same as cmd_bleed's own $_BLEED_SCOPE_REASON pass
         # sites, so a scope-reason string that happens to contain a failure
@@ -1589,9 +1605,13 @@ cmd_secrets() {
         return 1
       fi
     else
-      # REPO_ROOT PINNED EXPLICITLY: same CWD-independence fix as above.
+      # REPO_ROOT PINNED EXPLICITLY: same CWD-independence fix as above, and
+      # the same positional-argument correction (PEACHES PR #218 review,
+      # comment 5833150249) -- `gitleaks git` has never accepted `--source`
+      # as its own flag; see the comment above the branch-history call site
+      # for the full version history.
       # shellcheck disable=SC2086
-      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG --source "$REPO_ROOT"; then
+      if run_bounded "$_SECRETS_TIMEOUT" -- gitleaks git --staged --pre-commit --redact --no-banner $CFG_ARG -- "$REPO_ROOT"; then
         cmd_log_run secrets pass ""
       else
         cmd_log_run secrets block "gitleaks reported findings or timed out after ${_SECRETS_TIMEOUT}s"
@@ -1811,8 +1831,7 @@ cmd_deps() {
   # Bound every osv-scanner invocation (INV-1a/INV-2, class-4 foundry fix):
   # one path does a network vulnerability-DB lookup, so this defaults higher
   # than the generic run_bounded default.
-  _OSV_TIMEOUT="${CLAGENTIC_OSV_TIMEOUT_SEC:-300}"
-  _OSV_TIMEOUT=$(ds_positive_int_or_default "$_OSV_TIMEOUT" 300)
+  _OSV_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_OSV_TIMEOUT_SEC "${CLAGENTIC_OSV_TIMEOUT_SEC:-}" 300)
 
   # Capability-probe: osv-scanner v2.x uses `scan source` subcommand; v1.x
   # used a flat invocation with --severity / --ignore-vulns flags (removed in
@@ -1861,21 +1880,12 @@ cmd_deps() {
       done
     fi
 
-    # REPO_ROOT PINNED EXPLICITLY (sweep of PEACHES PR #217 review, comment
-    # 5821185384's `gitleaks git` finding to the same CWD-dependence class):
-    # a bare "." target resolves relative to the process's CWD, not
-    # REPO_ROOT -- in a wrapper/`.clagentic-project` layout, or any
-    # invocation whose CWD differs from REPO_ROOT, this silently scans the
-    # wrong tree (or an empty one) while the gate reports whatever that
-    # unrelated scan found. "$REPO_ROOT" makes the scanned tree explicit and
-    # CWD-independent, matching osv-scanner's own documented positional
-    # PATHS argument.
     _OSV_STATUS=0
     if [ "$_OSV_SUBCMD" = "source" ]; then
       # shellcheck disable=SC2086
-      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan source -r --format=json "--config=$_OSV_TMP" $_OSV_EXCL_FLAGS "$REPO_ROOT" > "$_OSV_JSON" || _OSV_STATUS=$?
+      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan source -r --format=json "--config=$_OSV_TMP" $_OSV_EXCL_FLAGS . > "$_OSV_JSON" || _OSV_STATUS=$?
     else
-      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" "$REPO_ROOT" > "$_OSV_JSON" || _OSV_STATUS=$?
+      run_bounded "$_OSV_TIMEOUT" -- osv-scanner scan --recursive --format=json "--config=$_OSV_TMP" . > "$_OSV_JSON" || _OSV_STATUS=$?
     fi
     case "$_OSV_STATUS" in
       0)
@@ -1918,9 +1928,7 @@ cmd_deps() {
       done < "$_IGNORE_FILE"
     done
 
-    # REPO_ROOT PINNED EXPLICITLY: same CWD-dependence fix as the two
-    # scan-subcommand branches above.
-    set -- "$@" "$REPO_ROOT"   # trailing path arg
+    set -- "$@" .   # trailing path arg
 
     if run_bounded "$_OSV_TIMEOUT" -- osv-scanner "$@"; then
       cmd_log_run deps pass ""
@@ -2152,8 +2160,7 @@ cmd_bleed() {
         # diffed file set), not remote-ref usage. The actual precedent for
         # a remote-ref-diffed FILE SET scope is cmd_sast's baseline-commit
         # mechanism (:588-663) — see docs/GATES.md.
-        _BLEED_FETCH_TIMEOUT="${CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC:-30}"
-        _BLEED_FETCH_TIMEOUT=$(ds_positive_int_or_default "$_BLEED_FETCH_TIMEOUT" 30)
+        _BLEED_FETCH_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC "${CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC:-}" 30)
 
         _BLEED_FRESH_ERR_TMP=$(mktemp -t clagentic-bleed-fresh-err.XXXXXX)
         _BLEED_FRESH_TIP=$(_gate_resolve_fresh_default_branch_ref "$_BLEED_DEFAULT_BRANCH" "$_BLEED_FETCH_TIMEOUT" 2>"$_BLEED_FRESH_ERR_TMP") || true
@@ -2397,8 +2404,7 @@ cmd_sast() {
       # follow-up to lr-06b87e); this call site only adds the merge-base
       # step, which is specific to semgrep's --baseline-commit and not part
       # of the shared freshness precondition itself.
-      _SAST_FETCH_TIMEOUT="${CLAGENTIC_SAST_FETCH_TIMEOUT_SEC:-30}"
-      _SAST_FETCH_TIMEOUT=$(ds_positive_int_or_default "$_SAST_FETCH_TIMEOUT" 30)
+      _SAST_FETCH_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SAST_FETCH_TIMEOUT_SEC "${CLAGENTIC_SAST_FETCH_TIMEOUT_SEC:-}" 30)
 
       _SAST_FRESH_ERR_TMP=$(mktemp -t clagentic-sast-fresh-err.XXXXXX)
       _SAST_FRESH_TIP=$(_gate_resolve_fresh_default_branch_ref "$_SAST_DEFAULT_BRANCH" "$_SAST_FETCH_TIMEOUT" 2>"$_SAST_FRESH_ERR_TMP") || true
@@ -2428,8 +2434,7 @@ cmd_sast() {
   # Bound every semgrep invocation (INV-1a/INV-2, class-4 foundry fix):
   # --config=auto DOWNLOADS RULES FROM THE NETWORK on top of running a scan,
   # so this defaults higher than the generic run_bounded default.
-  _SAST_TIMEOUT="${CLAGENTIC_SAST_TIMEOUT_SEC:-300}"
-  _SAST_TIMEOUT=$(ds_positive_int_or_default "$_SAST_TIMEOUT" 300)
+  _SAST_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SAST_TIMEOUT_SEC "${CLAGENTIC_SAST_TIMEOUT_SEC:-}" 300)
 
   # Config: --config=auto by default, or CLAGENTIC_SEMGREP_CONFIG when set —
   # DEFAULT STAYS auto (lite ships to other people; pinning is per-repo
@@ -2502,30 +2507,9 @@ EOF_EXCL
   fi
 
   # Semgrep natively honors .semgrepignore at the repo root. Add paths or rules there to suppress findings.
-  #
-  # CWD PINNED TO REPO_ROOT, NOT A TARGET ARGUMENT (HOLDEN decision,
-  # lr-51112e, option 3 from AMoS needs-decision on PR #217 at ae67761):
-  # unlike gitleaks/osv-scanner above, semgrep's --baseline-commit runs `git
-  # cat-file` against the process's CWD with no override flag of its own —
-  # confirmed empirically that appending REPO_ROOT as a positional target
-  # hard-fails (exit 2) whenever CWD != REPO_ROOT, and
-  # test_no_path_argument_added_in_baseline_mode (test_sast_baseline_scope.py)
-  # requires argv to carry no trailing path in baseline mode at all — so the
-  # `--source`/positional-path fix used for gitleaks/osv-scanner is not
-  # available here. Instead, each invocation runs inside its own POSIX
-  # subshell that `cd`s to REPO_ROOT FIRST, leaving argv byte-identical to
-  # the pre-existing invocation ($@ is still exactly the config/exclude
-  # tokens assembled above). `cd "$REPO_ROOT" || exit 1` inside the
-  # subshell means a failed cd aborts only that subshell (never the caller's
-  # own shell) with a guaranteed-nonzero exit, so `run_bounded`'s caller sees
-  # a gate FAILURE (never a pass) when REPO_ROOT cannot be entered — fail
-  # closed, matching every other resolution-failure branch in this
-  # function. Variables read by the caller after the call (_SAST_PASS_DETAILS
-  # etc.) are all assigned OUTSIDE the subshell, in the existing if/else
-  # arms below, so the subshell boundary never swallows them.
   if [ -n "$_SAST_BASELINE" ]; then
-    echo "[gates/sast] scoping to diff-introduced findings (baseline-commit=$_SAST_BASELINE, cwd=$REPO_ROOT)" 1>&2
-    if ( cd "$REPO_ROOT" || exit 1; run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE" ); then
+    echo "[gates/sast] scoping to diff-introduced findings (baseline-commit=$_SAST_BASELINE)" 1>&2
+    if run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR "--baseline-commit=$_SAST_BASELINE"; then
       _SAST_PASS_DETAILS="baseline-commit=$_SAST_BASELINE"
       [ -n "$_SAST_PINNED_CONFIG" ] && _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; config=$_SAST_PINNED_CONFIG"
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
@@ -2533,12 +2517,12 @@ EOF_EXCL
       fi
       _cmd_log_run_checked_pass sast "$_SAST_PASS_DETAILS"
     else
-      cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE (or timed out after ${_SAST_TIMEOUT}s, or REPO_ROOT could not be entered)"
+      cmd_log_run sast block "semgrep reported ERROR-severity findings introduced since $_SAST_BASELINE (or timed out after ${_SAST_TIMEOUT}s)"
       return 1
     fi
   else
-    echo "[gates/sast] full-tree scan (baseline scoping unavailable: $_SAST_BASELINE_SKIP_REASON; cwd=$REPO_ROOT)" 1>&2
-    if ( cd "$REPO_ROOT" || exit 1; run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR ); then
+    echo "[gates/sast] full-tree scan (baseline scoping unavailable: $_SAST_BASELINE_SKIP_REASON)" 1>&2
+    if run_bounded "$_SAST_TIMEOUT" -- semgrep "$@" --error --severity=ERROR; then
       _SAST_PASS_DETAILS="full-tree (baseline unavailable: $_SAST_BASELINE_SKIP_REASON)"
       [ -n "$_SAST_PINNED_CONFIG" ] && _SAST_PASS_DETAILS="$_SAST_PASS_DETAILS; config=$_SAST_PINNED_CONFIG"
       if [ "$_SAST_EXCL_COUNT" -gt 0 ]; then
@@ -2546,7 +2530,7 @@ EOF_EXCL
       fi
       _cmd_log_run_checked_pass sast "$_SAST_PASS_DETAILS"
     else
-      cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON; or timed out after ${_SAST_TIMEOUT}s, or REPO_ROOT could not be entered)"
+      cmd_log_run sast block "semgrep reported ERROR-severity findings (full-tree scan: $_SAST_BASELINE_SKIP_REASON; or timed out after ${_SAST_TIMEOUT}s)"
       return 1
     fi
   fi
@@ -3423,8 +3407,7 @@ get_review_diff() {
     # does not explicitly guard the call (cmd_review, cmd_adversarial both
     # call it unguarded via `get_review_diff > "$tmp"`) aborts the gate
     # rather than proceeding to review a partial diff as if it were complete.
-    _grd_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-    _grd_fetch_timeout=$(ds_positive_int_or_default "$_grd_fetch_timeout" 30)
+    _grd_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
 
     _grd_fresh_err_tmp=$(mktemp -t clagentic-review-fresh-err.XXXXXX)
     _grd_fresh_tip=$(_gate_resolve_fresh_default_branch_ref "$DEFAULT_BRANCH" "$_grd_fetch_timeout" 2>"$_grd_fresh_err_tmp") || true
@@ -3604,7 +3587,8 @@ _review_recurrence_threshold() {
 # at least _review_recurrence_threshold DISTINCT rounds, counting this one --
 # a finding on its first-ever reported round always has count 1 and is never
 # demotable. When count >= threshold, the finding's SEVERITY IS NEVER
-# TOUCHED (docs/GATES.md "wrong suppressions are worse than missed dedups"
+# TOUCHED (docs/GATES.md "Cross-round finding dedup": wrong suppressions
+# are worse than missed dedups
 # — the same posture forbids silently rewriting a finding's own reported
 # severity). Instead two fields are added to the finding object:
 #   _recurrence_count    — integer, rounds this key has been reported in
@@ -3840,8 +3824,8 @@ PYEOF2
 #
 # WHY THIS EXISTS: lr-c567 shipped .clagentic/deferrals.json and injected it
 # into the Reviewer's prompt as context to weigh — suppression was left
-# entirely inside model judgment (docs/GATES.md "Suppression is inside model
-# judgment, not gate code"). Field evidence (lr-2ebc41 task description):
+# entirely inside model judgment (docs/GATES.md "Reviewer-consulted
+# deferrals"). Field evidence (lr-2ebc41 task description):
 # a single stage-contract finding, accepted with a stable documented
 # rationale, was re-raised by the stateless Reviewer SIX times across a
 # 7-round run because nothing MECHANICALLY excluded it once accepted — the
@@ -3920,8 +3904,8 @@ PYEOF2
 # "stable-contract" (only supported value — see capture-side validation);
 # the named file missing on disk; no sha256 tool available; more than one
 # LIVE (hash-matching) deferral entry claiming the same finding (ambiguous
-# match — "preserve when uncertain" per docs/GATES.md "wrong suppressions
-# are worse than missed dedups"; the task's own restated principle). No
+# match — "preserve when uncertain" per docs/GATES.md "Cross-round finding
+# dedup": wrong suppressions are worse than missed dedups). No
 # JSON tool at all is a full passthrough — ENVELOPE_FILE is left untouched,
 # matching every other splice step in this file's fail-open-on-tooling,
 # fail-closed-on-ambiguity posture.
@@ -4176,7 +4160,7 @@ _extract_findings_json() {
 # THE FIX IS AT INGEST, THE SAME CHOKE-POINT PATTERN THIS CODEBASE ALREADY
 # USES: _sanitize_adversarial_findings_json sanitizes immediately after
 # _parse_adversarial_findings and before the sidecar is EVER written to
-# disk (docs/GATES.md "Round-trip sanitization"); ds_review_prompt
+# disk (docs/GATES.md "Merge Gate", round-trip sanitization); ds_review_prompt
 # allowlists deferrals.json before it is EVER interpolated into a prompt.
 # This function is the equivalent choke point for review findings: it MUST
 # run immediately after every raw LLM write to an envelope file (both the
@@ -4269,9 +4253,7 @@ PYEOF
 # Configurable via CLAGENTIC_INVARIANT_FEED_MAX (default 200 — generous for a
 # single branch's review lifetime; oldest entries are dropped first on cap).
 _invariant_feed_max_lines() {
-  _ifml_max="${CLAGENTIC_INVARIANT_FEED_MAX:-200}"
-  case "$_ifml_max" in ''|*[!0-9]*) _ifml_max=200 ;; esac
-  printf '%s' "$_ifml_max"
+  ds_positive_int_or_warn CLAGENTIC_INVARIANT_FEED_MAX "${CLAGENTIC_INVARIANT_FEED_MAX:-}" 200
 }
 
 # _invariant_feed_max_field_chars and _llm_field_sanitize moved to
@@ -4629,8 +4611,7 @@ cmd_review() {
     if [ -n "$_review_sha" ]; then
       _stamp_envelope "$OUT" "$_review_sha"
     fi
-    _crv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-    _crv_fetch_timeout=$(ds_positive_int_or_default "$_crv_fetch_timeout" 30)
+    _crv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
     _crv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_crv_fetch_timeout")
     cmd_log_run review skip "empty-resolved-diff: $_crv_empty_reason"
     printf '[gates/review] SKIP: %s — no findings can be reported on an empty input, this is not a pass\n' "$_crv_empty_reason" 1>&2
@@ -4643,16 +4624,15 @@ cmd_review() {
   # Chunking threshold: CLAGENTIC_REVIEWER_MAX_DIFF_KB (operator-facing alias,
   # in KB) takes precedence; CLAGENTIC_REVIEW_CHUNK_BYTES (in bytes) is the
   # secondary alias; default 262144 bytes (256 KB).
-  _crv_chunk_bytes="${CLAGENTIC_REVIEW_CHUNK_BYTES:-262144}"
-  if [ -n "${CLAGENTIC_REVIEWER_MAX_DIFF_KB:-}" ]; then
-    case "$CLAGENTIC_REVIEWER_MAX_DIFF_KB" in
-      ''|*[!0-9]*) : ;;
-      *) _crv_chunk_bytes=$(( CLAGENTIC_REVIEWER_MAX_DIFF_KB * 1024 )) ;;
-    esac
+  # 0 or invalid falls back to the default for both keys: a 0-byte threshold
+  # would chunk every diff into one LLM call per fragment.
+  _crv_chunk_bytes=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_CHUNK_BYTES "${CLAGENTIC_REVIEW_CHUNK_BYTES:-}" 262144)
+  # Unset is silent and yields 0 (no override); a set value of 0 or junk WARNs
+  # and also yields 0, so the byte threshold above stays in force.
+  _crv_max_diff_kb=$(ds_positive_int_or_warn CLAGENTIC_REVIEWER_MAX_DIFF_KB "${CLAGENTIC_REVIEWER_MAX_DIFF_KB:-}" 0)
+  if [ "$_crv_max_diff_kb" -gt 0 ]; then
+    _crv_chunk_bytes=$(( _crv_max_diff_kb * 1024 ))
   fi
-  case "$_crv_chunk_bytes" in
-    ''|*[!0-9]*) _crv_chunk_bytes=262144 ;;
-  esac
 
   # Squash hint: warn the operator when the diff is large, before the chunking decision.
   # lr-e33f73: name CLAGENTIC_REVIEW_CHUNKING explicitly, not just "chunking" --
@@ -4773,8 +4753,7 @@ cmd_review() {
       # baseline scoping uses. Empty on any resolution failure; a ledger
       # entry with empty base_sha is still valid as long as head_sha
       # resolved (see _resolve_base_sha's own doc comment).
-      _crv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-      _crv_fetch_timeout=$(ds_positive_int_or_default "$_crv_fetch_timeout" 30)
+      _crv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
       _crv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_crv_fetch_timeout")
 
       # Cross-round dedup (default-on). Suppresses findings already seen in a prior
@@ -4894,8 +4873,7 @@ cmd_review() {
   fi
   # base_sha for the ledger entry (item 1/2) — see the chunked-path comment
   # above for the full rationale (same logic, single-pass path).
-  _crv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-  _crv_fetch_timeout=$(ds_positive_int_or_default "$_crv_fetch_timeout" 30)
+  _crv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
   _crv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_crv_fetch_timeout")
 
   # Cross-round dedup (default-on). Suppresses findings already seen in a prior
@@ -5648,8 +5626,7 @@ cmd_adversarial() {
     printf '{"dropped_count": 0, "total_before_cap": 0}\n' > "$REPO_ROOT/.clagentic/lite/last-adversarial-findings-meta.json"
     cmd_log_run adversarial skip "empty-resolved-diff: $_adv_empty_reason"
     printf '[gates/adversarial] SKIP: %s — no findings can be reported on an empty input, this is not a clean pass\n' "$_adv_empty_reason" 1>&2
-    _adv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-    _adv_fetch_timeout=$(ds_positive_int_or_default "$_adv_fetch_timeout" 30)
+    _adv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
     _adv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_adv_fetch_timeout")
     _ledger_record_review_verdict adversarial "$OUT" "$_adv_diff_tmp" "skip" "$_adv_base_sha" "$_adv_sha"
     rm -f "$_adv_diff_tmp"
@@ -5751,7 +5728,10 @@ cmd_adversarial() {
   fi
   _adv_findings_json_sanitized=$(_sanitize_adversarial_findings_json "$_adv_findings_json_raw")
   _adv_findings_json_sorted=$(_adversarial_findings_sort_blocking_first "$_adv_findings_json_sanitized")
-  _adv_findings_json=$(_llm_json_array_cap "$_adv_findings_json_sorted" "${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}")
+  # 0 would slice every finding away; resolved once here so the cap and the
+  # dropped-count message below name the same effective value.
+  _adv_findings_max=$(ds_positive_int_or_warn CLAGENTIC_ADVERSARIAL_FINDINGS_MAX "${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-}" 200)
+  _adv_findings_json=$(_llm_json_array_cap "$_adv_findings_json_sorted" "$_adv_findings_max")
   printf '%s\n' "$_adv_findings_json" > "$FINDINGS_OUT"
 
   # DROPPED-COUNT VISIBILITY (BOBBIE, lr-33958f PR-C fold-in review): a
@@ -5794,7 +5774,7 @@ EOF3
   if [ "$_adv_findings_dropped_count" -gt 0 ]; then
     cmd_log_run adversarial warn "adversarial findings count cap dropped $_adv_findings_dropped_count finding(s) (severity/tier-sorted before cap, so only the least-severe tail was dropped)"
     printf '[gates/adversarial] %d finding(s) dropped by the count cap (CLAGENTIC_ADVERSARIAL_FINDINGS_MAX=%s) -- lowest severity/advisory-tier findings only, sorted before truncation.\n' \
-      "$_adv_findings_dropped_count" "${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}" 1>&2
+      "$_adv_findings_dropped_count" "$_adv_findings_max" 1>&2
   fi
 
   # Invariant-feed writer (lr-63359e), adversarial half. Reuses the same
@@ -5824,8 +5804,7 @@ EOF3
   # base_sha for the ledger entry -- same provably-current resolution
   # cmd_review's own ledger write uses (see _resolve_base_sha's own doc
   # comment).
-  _adv_fetch_timeout="${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}"
-  _adv_fetch_timeout=$(ds_positive_int_or_default "$_adv_fetch_timeout" 30)
+  _adv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
   _adv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_adv_fetch_timeout")
 
   # cmd_adversarial can no longer report a clean audit when the auditor was
@@ -6572,9 +6551,9 @@ _read_deterministic_gates() {
 # for host-side CI, and not per-reviewer credentials or attestation (ruled
 # out, lr-96f8ba). A hostile local user who wants to fabricate a clean
 # manifest can already do so, the same way they could hand-edit
-# last-review.json or review-ledger.jsonl today (see docs/GATES.md "What
-# the ledger is not: a control against a user who edits it" for the
-# identical threat-model posture applied to that file). What this manifest
+# last-review.json or review-ledger.jsonl today (see docs/GATES.md "Review
+# ledger and anchored verdicts" for the identical threat-model posture
+# applied to that file). What this manifest
 # defends against is an HONEST but UNOBSERVANT run silently mis-reporting
 # its own provenance -- a same-vendor fallback masquerading as the
 # configured primary, a declared-but-inert router opt-in, a degraded LLM
@@ -7200,8 +7179,9 @@ build_gate_summary() {
     # than hard-errors — but it must still attempt the verified resolution
     # first, not skip straight to an unverified guess.
     _DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
-    _bgs_fetch_timeout="${CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC:-30}"
-    case "$_bgs_fetch_timeout" in ''|*[!0-9]*) _bgs_fetch_timeout=30 ;; esac
+    # 0 must not reach `timeout` (coreutils reads it as "no timeout"): a
+    # disabled bound on a freshness fetch is fail-open.
+    _bgs_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC "${CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC:-}" 30)
 
     _bgs_fresh_err_tmp=$(mktemp -t clagentic-bgs-fresh-err.XXXXXX)
     _bgs_fresh_tip=$(_gate_resolve_fresh_default_branch_ref "$_DEFAULT_BRANCH" "$_bgs_fetch_timeout" 2>"$_bgs_fresh_err_tmp") || true
@@ -8113,8 +8093,7 @@ cmd_ship() {
   # call were both previously untimed -- a hung push or a stalled host API
   # call would block `ship` indefinitely with no diagnostic, the last step
   # of an otherwise fully-bounded gate sequence.
-  _SHIP_TIMEOUT="${CLAGENTIC_SHIP_TIMEOUT_SEC:-120}"
-  _SHIP_TIMEOUT=$(ds_positive_int_or_default "$_SHIP_TIMEOUT" 120)
+  _SHIP_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SHIP_TIMEOUT_SEC "${CLAGENTIC_SHIP_TIMEOUT_SEC:-}" 120)
 
   # Push + open a change request via the host adapter (lr-2b07a8), else
   # print a template. Host-neutral by contract (docs/GATES.md "Host adapter
@@ -8310,15 +8289,12 @@ cmd_tail() {
     return 0
   fi
 
-  INTERVAL="${CLAGENTIC_TAIL_INTERVAL_SEC:-1}"
-  # Numeric guard (lr-53dc6e): every other timeout/interval var in this file
-  # gets this same case-based validation before use (e.g. _BLEED_FETCH_TIMEOUT
-  # gates.sh:538, _SAST_FETCH_TIMEOUT :689, BASE/RATE/MAX llm-client.sh:1041-
-  # 1043) — INTERVAL was the one sibling that reached `sleep "$INTERVAL"`
-  # below unguarded. An operator-set non-numeric CLAGENTIC_TAIL_INTERVAL_SEC
-  # would otherwise reach `sleep` raw and fail there instead of falling back
-  # to a safe default.
-  case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=1 ;; esac
+  # Numeric guard: every other timeout/interval var in this file is
+  # validated before use; INTERVAL was the one sibling that reached
+  # `sleep "$INTERVAL"` unguarded. Non-numeric would fail in `sleep`, and 0
+  # would turn the poll into a tight loop against the audit DB, so both fall
+  # back to the default with a WARN.
+  INTERVAL=$(ds_positive_int_or_warn CLAGENTIC_TAIL_INTERVAL_SEC "${CLAGENTIC_TAIL_INTERVAL_SEC:-}" 1)
   printf '== clagentic-lite gate tail (Ctrl-C to quit, polling every %ss) ==\n' "$INTERVAL"
   printf '   starting from gate_runs.id > %s\n\n' "$LAST_ID"
 

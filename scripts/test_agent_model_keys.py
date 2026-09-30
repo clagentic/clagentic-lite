@@ -1,0 +1,340 @@
+"""
+Tests for the per-role agent-path model keys (CLAGENTIC_<ROLE>_AGENT_MODEL).
+
+Two model paths exist: the gate/CLI path (llm-client.sh, configured by
+CLAGENTIC_<ROLE>_CMD/_TIER/_CHAIN) and the Agent path (Claude Code dispatching
+clagentic-lite:<role>), where the model is the session model unless the
+rendered agent file has a `model:` frontmatter line. These tests cover the
+render/stamp/doctor mechanism that lets every role set that line.
+
+Same technique as test_unified_plugin_render.py: the real function
+definitions are extracted from bin/clagentic-lite and sourced into a
+throwaway `sh`; bin/clagentic-lite's own subcommands are never executed.
+
+Run with: python3 -m unittest scripts.test_agent_model_keys -v
+"""
+import os
+import unittest
+from unittest import mock
+
+from scripts.test_unified_plugin_render import (
+    AGENTS_SRC,
+    _RenderTestBase,
+)
+
+# (env prefix, agent file)
+ROLES = (
+    ("BUILDER", "builder"),
+    ("REVIEWER", "reviewer"),
+    ("AUDITOR", "auditor"),
+    ("GATE", "merge-gate"),
+    ("TROUBLESHOOTER", "troubleshooter"),
+)
+
+ROUTER_ENV = {
+    "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+    "CLAGENTIC_ROUTER_INJECT_AGENT_MODEL": "1",
+    "CLAGENTIC_REVIEWER_CMD": "codex",
+}
+
+DOCTOR = (
+    "test_ok() { printf 'OK:%s\\n' \"$*\"; }\n"
+    "_doctor_check_agent_models test_ok\n"
+)
+
+
+def _source_lines(agent):
+    with open(os.path.join(AGENTS_SRC, f"{agent}.md")) as f:
+        return f.read().splitlines(keepends=True)
+
+
+def _frontmatter(lines):
+    """Lines strictly between the opening and closing '---'."""
+    assert lines[0].strip() == "---"
+    end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    return lines[1:end]
+
+
+class _AgentModelBase(_RenderTestBase):
+    def _render(self, extra_env=None):
+        result = self._run("_render_clagentic_lite_plugin_dir", extra_env=extra_env)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        return result
+
+    def _rendered_lines(self, agent):
+        with open(self._rendered_agent_path(agent)) as f:
+            return f.read().splitlines(keepends=True)
+
+    def _stamp(self, extra_env=None):
+        result = self._run("_render_stamp", extra_env=extra_env)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        return result.stdout
+
+    def _doctor(self, extra_env=None):
+        result = self._run(DOCTOR, extra_env=extra_env)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        return result.stdout
+
+
+class TestRenderPinnedModel(_AgentModelBase):
+    def test_unset_is_byte_identical_to_checked_in_files(self):
+        self._render()
+        for _, agent in ROLES:
+            self.assertEqual(self._rendered_lines(agent), _source_lines(agent), msg=agent)
+
+    def test_each_role_key_sets_line_three_and_leaves_others_unchanged(self):
+        for prefix, agent in ROLES:
+            with self.subTest(role=prefix):
+                self._render(extra_env={f"CLAGENTIC_{prefix}_AGENT_MODEL": "opus"})
+                rendered = self._rendered_lines(agent)
+                self.assertEqual(rendered[2], "model: opus\n")
+                # Removing the one inserted line restores the source exactly.
+                self.assertEqual(rendered[:2] + rendered[3:], _source_lines(agent))
+                self.assertEqual(
+                    sum(1 for ln in _frontmatter(rendered) if ln.startswith("model:")), 1
+                )
+                for other_prefix, other in ROLES:
+                    if other != agent:
+                        self.assertEqual(
+                            self._rendered_lines(other), _source_lines(other), msg=other
+                        )
+
+    def test_full_ids_and_inherit_are_accepted(self):
+        for value in (
+            "inherit",
+            "example-model-id-1",
+            "example.provider.model-v1:0",
+            "sonnet[1m]",
+            "arn:example:bedrock:region:000000000000:profile/example",
+        ):
+            with self.subTest(value=value):
+                self._render(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": value})
+                self.assertEqual(self._rendered_lines("builder")[2], f"model: {value}\n")
+
+    def test_builder_is_never_router_referenced(self):
+        env = dict(ROUTER_ENV, CLAGENTIC_BUILDER_CMD="codex")
+        self._render(extra_env=env)
+        self.assertEqual(self._rendered_lines("builder"), _source_lines("builder"))
+
+
+class TestRouterPrecedence(_AgentModelBase):
+    def test_router_wins_over_agent_model_for_reviewer(self):
+        env = dict(ROUTER_ENV, CLAGENTIC_REVIEWER_AGENT_MODEL="opus")
+        self._render(extra_env=env)
+        rendered = self._rendered_lines("reviewer")
+        self.assertEqual(rendered[2], "model: role:reviewer-chain\n")
+        self.assertNotIn("model: opus\n", rendered)
+
+    def test_doctor_reports_shadowed_key(self):
+        env = dict(ROUTER_ENV, CLAGENTIC_REVIEWER_AGENT_MODEL="opus")
+        out = self._doctor(extra_env=env)
+        self.assertIn("reviewer agent model: router: role:reviewer-chain", out)
+        self.assertIn("CLAGENTIC_REVIEWER_AGENT_MODEL=opus is SHADOWED", out)
+
+    def test_router_off_for_role_lets_agent_model_apply(self):
+        # Router is on, but auditor's CMD is claude: injection does not apply
+        # to it, so the pinned value is used.
+        env = dict(ROUTER_ENV, CLAGENTIC_AUDITOR_CMD="claude", CLAGENTIC_AUDITOR_AGENT_MODEL="opus")
+        self._render(extra_env=env)
+        self.assertEqual(self._rendered_lines("auditor")[2], "model: opus\n")
+
+
+class TestInvalidValue(_AgentModelBase):
+    INVALID = (
+        "opus\nname: evil",
+        "opus: x",
+        "opus:",
+        'opus"',
+        "'opus'",
+        "opus # c",
+        "op us",
+        "---",
+        "-opus",
+        "{a: b}",
+        "opus\r",
+    )
+
+    def test_invalid_values_render_no_model_line_and_warn(self):
+        for value in self.INVALID:
+            with self.subTest(value=value):
+                result = self._render(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": value})
+                self.assertIn("CLAGENTIC_BUILDER_AGENT_MODEL has an invalid value", result.stderr)
+                rendered = self._rendered_lines("builder")
+                # Byte-identical to the source: frontmatter cannot have been altered.
+                self.assertEqual(rendered, _source_lines("builder"))
+                self.assertFalse(any(ln.startswith("model:") for ln in _frontmatter(rendered)))
+
+    def test_router_reference_prefix_is_never_accepted_as_a_pinned_value(self):
+        # Only the router-injection path may emit role:<x>. A pinned
+        # role:<chain> on the builder would route it through the router, which
+        # is exactly what the builder must never do.
+        for value in ("role:x", "role:builder-chain", "role:reviewer-chain", "role:a:b"):
+            for prefix, agent in ROLES:
+                with self.subTest(value=value, role=prefix):
+                    result = self._render(extra_env={f"CLAGENTIC_{prefix}_AGENT_MODEL": value})
+                    self.assertIn(f"CLAGENTIC_{prefix}_AGENT_MODEL has an invalid value", result.stderr)
+                    rendered = self._rendered_lines(agent)
+                    self.assertFalse(any(ln.startswith("model:") for ln in _frontmatter(rendered)))
+
+    def test_a_value_merely_containing_role_is_still_accepted(self):
+        for value in ("roleplay-model-1", "my-role:x"):
+            with self.subTest(value=value):
+                self._render(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": value})
+                self.assertEqual(self._rendered_lines("builder")[2], f"model: {value}\n")
+
+    def test_every_control_character_is_rejected_anywhere_in_the_value(self):
+        controls = [c for c in range(1, 32) if c != 10] + [127]
+        for c in controls:
+            with self.subTest(control=hex(c)):
+                result = self._run(
+                    f"_agent_model_value_is_valid \"$(printf 'op\\{c:03o}us')\" && echo valid || echo invalid\n"
+                )
+                self.assertEqual(result.stdout.strip(), "invalid", msg=hex(c))
+
+    def test_newline_in_a_config_file_value_is_rejected_not_truncated(self):
+        # The value is transported out of the config file intact: a value that
+        # continues past a newline must not be cut down to its first line and
+        # then accepted.
+        for value in ("opus\nname: evil", "opus\n", "\nopus", "opus\n\n"):
+            with self.subTest(value=value):
+                result = self._render(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": value})
+                self.assertIn("has an invalid value", result.stderr)
+                self.assertEqual(self._rendered_lines("builder"), _source_lines("builder"))
+
+    def test_documented_start_and_end_rules(self):
+        accepted = ("a", "opus", "sonnet[1m]", "example.model-v1:0", "arn:x:y/z", "a]", "inherit")
+        rejected = (
+            "-opus", ".opus", "_opus", ":opus", "/opus", "@opus", "[opus", "]opus",
+            "opus-", "opus.", "opus_", "opus/", "opus@", "opus[", "opus:",
+        )
+        for value in accepted:
+            with self.subTest(accepted=value):
+                r = self._run(f"_agent_model_value_is_valid '{value}' && echo valid || echo invalid\n")
+                self.assertEqual(r.stdout.strip(), "valid", msg=value)
+        for value in rejected:
+            with self.subTest(rejected=value):
+                r = self._run(f"_agent_model_value_is_valid '{value}' && echo valid || echo invalid\n")
+                self.assertEqual(r.stdout.strip(), "invalid", msg=value)
+
+    def test_non_ascii_letters_are_rejected_regardless_of_locale(self):
+        for value in ("opusé", "éopus", "opüs"):
+            with self.subTest(value=value):
+                result = self._render(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": value})
+                self.assertIn("has an invalid value", result.stderr)
+
+    def test_warn_does_not_echo_raw_control_characters(self):
+        result = self._render(
+            extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": "a\x1b[31mb\nname: evil"}
+        )
+        self.assertNotIn("\x1b", result.stderr)
+
+    def test_doctor_reports_invalid_value(self):
+        out = self._doctor(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": "opus: x"})
+        self.assertIn("invalid value", out)
+        self.assertIn("builder agent model: inherit", out)
+
+    def test_invalid_value_is_not_written_into_the_stamp(self):
+        stamp = self._stamp(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": 'x"y'})
+        self.assertIn("am_builder=invalid", stamp)
+        self.assertNotIn('x"y', stamp)
+
+
+class TestStamp(_AgentModelBase):
+    def test_changing_only_the_value_changes_the_stamp(self):
+        base = self._stamp()
+        a = self._stamp(extra_env={"CLAGENTIC_TROUBLESHOOTER_AGENT_MODEL": "sonnet"})
+        b = self._stamp(extra_env={"CLAGENTIC_TROUBLESHOOTER_AGENT_MODEL": "opus"})
+        self.assertEqual(len({base, a, b}), 3, msg=(base, a, b))
+
+    def test_doctor_reports_stale_and_update_would_rerender(self):
+        self._render()
+        result = self._run(
+            "test_ok() { printf 'OK:%s\\n' \"$*\"; }\n"
+            "_doctor_check_render_stamp_staleness test_ok\n",
+            extra_env={"CLAGENTIC_GATE_AGENT_MODEL": "opus"},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("STALE", result.stdout, msg=result.stdout)
+        # The re-render itself picks the new value up.
+        self._render(extra_env={"CLAGENTIC_GATE_AGENT_MODEL": "opus"})
+        fresh = self._run(
+            "test_ok() { printf 'OK:%s\\n' \"$*\"; }\n"
+            "_doctor_check_render_stamp_staleness test_ok\n",
+            extra_env={"CLAGENTIC_GATE_AGENT_MODEL": "opus"},
+        )
+        self.assertIn("OK:", fresh.stdout, msg=fresh.stdout)
+
+    def test_changing_a_shadowed_key_does_not_change_the_stamp(self):
+        # Router injection wins for the reviewer, so its _AGENT_MODEL value
+        # changes nothing about the render and must not read as stale.
+        a = self._stamp(extra_env=dict(ROUTER_ENV, CLAGENTIC_REVIEWER_AGENT_MODEL="opus"))
+        b = self._stamp(extra_env=dict(ROUTER_ENV, CLAGENTIC_REVIEWER_AGENT_MODEL="sonnet"))
+        c = self._stamp(extra_env=ROUTER_ENV)
+        self.assertEqual(a, b)
+        self.assertEqual(a, c)
+        self.assertIn("am_reviewer=router", a)
+
+    def test_shadowed_key_change_is_not_reported_stale(self):
+        env = dict(ROUTER_ENV, CLAGENTIC_REVIEWER_AGENT_MODEL="opus")
+        self._render(extra_env=env)
+        result = self._run(
+            "test_ok() { printf 'OK:%s\\n' \"$*\"; }\n"
+            "_doctor_check_render_stamp_staleness test_ok\n",
+            extra_env=dict(ROUTER_ENV, CLAGENTIC_REVIEWER_AGENT_MODEL="sonnet"),
+        )
+        self.assertIn("OK:", result.stdout, msg=result.stdout)
+        self.assertNotIn("STALE", result.stdout)
+
+    def test_stamp_records_the_effective_pinned_value(self):
+        self.assertIn(
+            "am_builder=sonnet[1m]",
+            self._stamp(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": "sonnet[1m]"}),
+        )
+
+
+class TestParentEnvIsolation(_AgentModelBase):
+    """The shared base scrubs every CLAGENTIC_* variable from the child env."""
+
+    def test_no_parent_clagentic_variable_reaches_the_child(self):
+        parent = {
+            "CLAGENTIC_BUILDER_AGENT_MODEL": "opus",
+            "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:1",
+            "CLAGENTIC_SOME_KEY_ADDED_LATER": "x",
+        }
+        with mock.patch.dict(os.environ, parent):
+            result = self._run("env")
+        leaked = [ln for ln in result.stdout.splitlines() if ln.startswith("CLAGENTIC_")]
+        self.assertEqual(leaked, [f"CLAGENTIC_LITE_HOME={self.fake_home}"])
+
+    def test_render_ignores_operator_env_in_the_parent(self):
+        parent = {
+            "CLAGENTIC_BUILDER_AGENT_MODEL": "opus",
+            "CLAGENTIC_ROUTER_URL": "http://127.0.0.1:8765",
+            "CLAGENTIC_ROUTER_INJECT_AGENT_MODEL": "1",
+            "CLAGENTIC_REVIEWER_CMD": "codex",
+        }
+        with mock.patch.dict(os.environ, parent):
+            self._render()
+        for _, agent in ROLES:
+            self.assertEqual(self._rendered_lines(agent), _source_lines(agent), msg=agent)
+
+
+class TestDoctorPerRole(_AgentModelBase):
+    def test_inherit_when_unset_for_all_roles(self):
+        out = self._doctor()
+        for _, agent in ROLES:
+            self.assertIn(f"OK:{agent} agent model: inherit", out)
+
+    def test_pinned(self):
+        out = self._doctor(extra_env={"CLAGENTIC_BUILDER_AGENT_MODEL": "opus"})
+        self.assertIn("OK:builder agent model: pinned: opus", out)
+        self.assertIn("OK:reviewer agent model: inherit", out)
+
+    def test_router(self):
+        out = self._doctor(extra_env=ROUTER_ENV)
+        self.assertIn("OK:reviewer agent model: router: role:reviewer-chain", out)
+        self.assertNotIn("SHADOWED", out)
+
+
+if __name__ == "__main__":
+    unittest.main()

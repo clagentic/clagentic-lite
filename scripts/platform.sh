@@ -71,6 +71,51 @@ ds_repo_root() {
   # Both failed — return empty; callers handle the empty case.
 }
 
+# ds_global_config_path — print the global config file that applies, or
+# nothing when neither exists. The product path
+# (~/.config/clagentic/lite/config) wins whenever it exists; the deprecated
+# brand-root path is only a fallback and the two are never merged. One
+# definition, used by the loader below and by every reader that must resolve
+# the same file without sourcing it into the live environment.
+ds_global_config_path() {
+  if [ -f "$HOME/.config/clagentic/lite/config" ]; then
+    printf '%s' "$HOME/.config/clagentic/lite/config"
+  elif [ -f "$HOME/.config/clagentic/config" ]; then
+    printf '%s' "$HOME/.config/clagentic/config"
+  fi
+}
+
+# ds_config_file_values FILE KEY... — print one KEY=value line per KEY, as FILE
+# (a shell-syntax config file) defines it, and nothing else. FILE is sourced in
+# a subshell that starts with every CLAGENTIC_* variable unset, so the result is
+# what the file says and never what the calling process inherited: the env
+# loaders export what they source and latch, so an exec'd child sees the values
+# of every layer already loaded. A KEY the file does not set prints as empty.
+# Newlines inside a value are printed as \001 (which no accepted value may
+# contain) so one value is always one line and cannot inject a second KEY=.
+ds_config_file_values() {
+  _dcfv_file="$1"
+  shift
+  [ -f "$_dcfv_file" ] || return 0
+  (
+    set +e +u
+    for _dcfv_var in $(env | sed -n 's/^\(CLAGENTIC_[A-Za-z0-9_]*\)=.*/\1/p'); do
+      unset "$_dcfv_var"
+    done
+    # Non-exported variables are not in env(1)'s listing; the asked-for keys
+    # are unset explicitly so an inherited shell variable cannot leak through.
+    for _dcfv_key in "$@"; do
+      unset "$_dcfv_key"
+    done
+    # shellcheck disable=SC1090
+    . "$_dcfv_file" >/dev/null 2>&1 </dev/null
+    for _dcfv_key in "$@"; do
+      eval "_dcfv_val=\${${_dcfv_key}:-}"
+      printf '%s=%s\n' "$_dcfv_key" "$(printf '%s' "$_dcfv_val" | tr '\n' '\001')"
+    done
+  ) || true
+}
+
 # ds_load_global_env — load ONLY the operator-owned global config
 # (~/.config/clagentic/lite/config, written by `clagentic-lite init`). Trust
 # boundary: this file lives outside any repo, so no amount of cloning or
@@ -107,16 +152,15 @@ ds_load_global_env() {
   [ "${CLAGENTIC_ENV_LOADED:-0}" = "1" ] && return 0
   [ "${CLAGENTIC_GLOBAL_ENV_LOADED:-0}" = "1" ] && return 0
 
-  _GLOBAL_CFG="$HOME/.config/clagentic/lite/config"
+  _GLOBAL_CFG=$(ds_global_config_path)
   _GLOBAL_CFG_OLD="$HOME/.config/clagentic/config"
-  if [ ! -f "$_GLOBAL_CFG" ] && [ -f "$_GLOBAL_CFG_OLD" ]; then
-    _GLOBAL_CFG="$_GLOBAL_CFG_OLD"
+  if [ -n "$_GLOBAL_CFG" ] && [ "$_GLOBAL_CFG" = "$_GLOBAL_CFG_OLD" ]; then
     if [ -z "${CLAGENTIC_GLOBAL_CONFIG_OLD_PATH_WARNED:-}" ]; then
       printf 'clagentic-lite: reading global config from deprecated path %s -- run `clagentic-lite update` to migrate to ~/.config/clagentic/lite/config\n' "$_GLOBAL_CFG_OLD" >&2
       export CLAGENTIC_GLOBAL_CONFIG_OLD_PATH_WARNED=1
     fi
   fi
-  if [ -f "$_GLOBAL_CFG" ]; then
+  if [ -n "$_GLOBAL_CFG" ]; then
     set -a
     # shellcheck disable=SC1090
     . "$_GLOBAL_CFG"
@@ -464,8 +508,31 @@ ds_positive_int_or_default() {
   _dpiod_val="$1"
   _dpiod_default="$2"
   case "$_dpiod_val" in ''|*[!0-9]*) _dpiod_val="$_dpiod_default" ;; esac
+  # Leading zeros are stripped before any caller does arithmetic: `$((08))`
+  # is an octal parse error in POSIX sh, and "08" is a plausible typo. An
+  # all-zero value strips to empty and is treated as 0 (rejected below).
+  _dpiod_val=$(printf '%s' "$_dpiod_val" | sed 's/^0*//')
+  [ -n "$_dpiod_val" ] || _dpiod_val=0
   [ "$_dpiod_val" -le 0 ] 2>/dev/null && _dpiod_val="$_dpiod_default"
   printf '%s' "$_dpiod_val"
+}
+
+# ds_positive_int_or_warn NAME VALUE DEFAULT — ds_positive_int_or_default,
+# plus a stderr WARN when VALUE was set but rejected (non-numeric or 0). Use
+# for operator-set CLAGENTIC_* keys documented as "0 or invalid falls back to
+# the default": a silently substituted default hides a typo, and for a key
+# whose 0 would disable a timeout or drop findings that is a fail-open
+# outcome the operator should be told about. An unset/empty VALUE is the
+# normal case and stays silent.
+ds_positive_int_or_warn() {
+  _dpiow_out=$(ds_positive_int_or_default "$2" "$3")
+  # Compare against the zero-stripped input, so "08" (accepted as 8) is not
+  # reported as a rejection.
+  _dpiow_norm=$(printf '%s' "$2" | sed 's/^0*//')
+  if [ -n "$2" ] && [ "$_dpiow_out" != "$_dpiow_norm" ]; then
+    printf '[clagentic-lite] WARN: %s=%s is not a positive integer; using the default (%s).\n' "$1" "$2" "$3" 1>&2
+  fi
+  printf '%s' "$_dpiow_out"
 }
 
 # ds_llm_role_is_bash_unrestricted ROLE — returns 0 (true) iff ROLE is one
@@ -582,8 +649,7 @@ ds_llm_role_is_bash_unrestricted() {
 # unchanged, and `.timeout 0` disables the busy wait entirely, reopening the
 # exact SQLITE_BUSY failure class this wrapper exists to close.
 ds_sqlite3() {
-  _ds3_timeout_ms="${CLAGENTIC_SQLITE_BUSY_TIMEOUT_MS:-5000}"
-  _ds3_timeout_ms=$(ds_positive_int_or_default "$_ds3_timeout_ms" 5000)
+  _ds3_timeout_ms=$(ds_positive_int_or_warn CLAGENTIC_SQLITE_BUSY_TIMEOUT_MS "${CLAGENTIC_SQLITE_BUSY_TIMEOUT_MS:-}" 5000)
   sqlite3 -cmd ".timeout $_ds3_timeout_ms" "$@"
 }
 
@@ -865,9 +931,7 @@ ds_pending_reset() {
 # controlled finding cannot balloon invariants.json or the prompt it is later
 # injected into).
 _invariant_feed_max_field_chars() {
-  _ifmfc_max="${CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS:-500}"
-  case "$_ifmfc_max" in ''|*[!0-9]*) _ifmfc_max=500 ;; esac
-  printf '%s' "$_ifmfc_max"
+  ds_positive_int_or_warn CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS "${CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS:-}" 500
 }
 
 # _llm_field_sanitize TEXT [MAX_CHARS] — neutralize LLM-controlled OR
@@ -1495,9 +1559,10 @@ print(json.dumps(ordered))
 # direction).
 _llm_json_array_cap() {
   _ljac_json="$1"
-  _ljac_max="${2:-${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}}"
-  case "$_ljac_max" in ''|*[!0-9]*) _ljac_max="${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-200}" ;; esac
-  case "$_ljac_max" in ''|*[!0-9]*) _ljac_max=200 ;; esac
+  _ljac_max="${2:-}"
+  case "$_ljac_max" in ''|*[!0-9]*) _ljac_max=$(ds_positive_int_or_warn CLAGENTIC_ADVERSARIAL_FINDINGS_MAX "${CLAGENTIC_ADVERSARIAL_FINDINGS_MAX:-}" 200) ;; esac
+  # 0 is not "no findings": it falls back to 200 like any other invalid value.
+  _ljac_max=$(ds_positive_int_or_default "$_ljac_max" 200)
 
   if command -v jq >/dev/null 2>&1; then
     if ! printf '%s' "$_ljac_json" | jq -e '. | type == "array"' >/dev/null 2>&1; then
