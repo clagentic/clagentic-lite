@@ -94,7 +94,7 @@ The goal is to let the user recognize repeated summaries without hiding any row.
 
 ### Defaults
 
-Three variables govern the recall and retention budget (code defaults; override in `~/.config/clagentic/lite/config` or `.clagentic/config`). Non-integer values fall back silently to the documented default.
+Three variables govern the recall and retention budget (code defaults; override in `~/.config/clagentic/lite/config` or `.clagentic/config`). Non-integer values fall back to the documented default. For `CLAGENTIC_MEMORY_MAX_ROWS` a zero falls back too (a cap of 0 would prune every row on each write), and both cases print a WARN; `CLAGENTIC_RECALL_LIMIT=0` returns no rows and `CLAGENTIC_RECALL_MAX_CHARS=0` injects no text.
 
 | Var | Default | Effect |
 |---|---|---|

@@ -1,7 +1,17 @@
 # clagentic-lite — global config template.
 # Written to ~/.config/clagentic/lite/config by `clagentic-lite init`.
 # Per-repo .clagentic/config is OPTIONAL and SPARSE — only override keys.
-# Load order at gate-run time: global config → per-repo .clagentic/config → env vars.
+# Load order: global config, then per-repo .clagentic/config (the later file
+# wins). Both are dot-sourced, so a value in either overrides the same key
+# already exported in your shell.
+#
+# GLOBAL-ONLY KEYS: the rendered Claude Code plugin is one per user, so the keys
+# it is built from are read from THIS global file (plus the environment), never
+# from a repo's .clagentic/config: the five CLAGENTIC_<ROLE>_AGENT_MODEL keys,
+# CLAGENTIC_ROUTER_URL, CLAGENTIC_ROUTER_INJECT_AGENT_MODEL, and the role
+# CLAGENTIC_<ROLE>_CMD values that router injection checks. `clagentic-lite
+# doctor` warns when a repo's config sets one. Per-repo _CMD/_TIER/_CHAIN still
+# work per repo on the CLI/hook path.
 #
 # TIMING: a repo-local .clagentic/config does not take effect until AFTER
 # the repo has been enrolled — it is not read during the very first
@@ -128,7 +138,8 @@ CLAGENTIC_SUMMARIZER_CHAIN=codex:spark
 # Optional, one per role, all unset by default (= today's behavior: a
 # dispatched agent runs on the session model). Set one to pin the model for
 # that role's Agent-tool dispatch. Applies to all five roles, including
-# Builder and Troubleshooter (which have no router path).
+# Builder and Troubleshooter (which have no router path). GLOBAL-ONLY: set
+# these here, not in a repo's .clagentic/config (see the note at the top).
 #
 # Value: a Claude Code model alias, a full model ID, or `inherit`. Letters,
 # digits and . _ : / @ [ ] - only; anything else is ignored with a WARN at
@@ -366,7 +377,8 @@ CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 #
 # Cap on structured findings kept in the adversarial sidecar the merge-gate
 # reads. Lowest-severity findings are dropped first, and the dropped count is
-# printed. Non-numeric falls back to the default.
+# printed. Non-numeric or zero falls back to the default with a WARN (zero does
+# not mean "keep none").
 # CLAGENTIC_ADVERSARIAL_FINDINGS_MAX=200
 #
 # =1 makes the git pre-push hook (`gates pre-push`) also run `gates review`
@@ -389,7 +401,20 @@ CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 # CLAGENTIC_SKIP_FETCH=0
 #
 # Poll interval for `clagentic-lite gates tail`, whole seconds (default 1).
+# Non-numeric or zero falls back to the default with a WARN.
 # CLAGENTIC_TAIL_INTERVAL_SEC=1
+#
+# Zero handling for the other numeric keys. Fall back to the default with a
+# WARN on zero or non-numeric: CLAGENTIC_MEMORY_MAX_ROWS,
+# CLAGENTIC_INVARIANT_FEED_MAX, CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS,
+# CLAGENTIC_REVIEW_CHUNK_BYTES, CLAGENTIC_REVIEWER_MAX_DIFF_KB. Zero is a real
+# setting for: CLAGENTIC_LLM_TIMEOUT_MAX_SEC / CLAGENTIC_<ROLE>_TIMEOUT_MAX_SEC
+# (no cap), CLAGENTIC_LEDGER_MAX_PER_BRANCH (unlimited),
+# CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC (no debounce), CLAGENTIC_RECALL_MIN_KEYWORDS
+# (never gate on keyword count), CLAGENTIC_RECALL_LIMIT (return no rows),
+# CLAGENTIC_RECALL_MAX_CHARS (inject no text), CLAGENTIC_RESULT_TOKEN_WARN /
+# CLAGENTIC_SESSION_TOKEN_WARN (warn on every result) and
+# CLAGENTIC_AUTOSUMMARIZE_BYTES (summarize every result).
 
 # ---------- gate input domain (lr-1ad8da) ----------
 # deps (osv-scanner) and sast (semgrep), when run via `gates.sh pre-push`
@@ -741,7 +766,9 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # CLAGENTIC_ROUTER_USE_API_KEY_HELPER=0
 
 # CLAGENTIC_ROUTER_INJECT_AGENT_MODEL: separate opt-in, OFF by default even
-# when CLAGENTIC_ROUTER_URL is set. Setting CLAGENTIC_ROUTER_URL alone gets
+# when CLAGENTIC_ROUTER_URL is set. GLOBAL-ONLY (it feeds the one rendered
+# plugin): a value in a repo's .clagentic/config is not applied, and `doctor`
+# warns about it. Setting CLAGENTIC_ROUTER_URL alone gets
 # you the settings.json env-block passthrough and the doctor probe with zero
 # additional risk. This second key additionally renders a per-role-injected
 # copy of the reviewer/auditor/merge-gate subagent definitions (model:

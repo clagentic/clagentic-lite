@@ -159,8 +159,19 @@ Config is layered: `~/.config/clagentic/lite/config` (global, applies everywhere
 then `<repo>/.clagentic/config` (per-repo override, optional, committed —
 **note:** not read on the very first `enroll` call for a given repo, only
 from the next command onward; see README.md "What init and enroll do").
-Edit the file directly (it's plain `KEY=value` shell, `chmod 600`); the CLI has
-no subcommand for editing config.
+Both files are dot-sourced, so a value in either one also overrides the same
+key already exported in the shell. Edit the file directly (it's plain
+`KEY=value` shell, `chmod 600`); the CLI has no subcommand for editing config.
+
+**Global-only keys.** The rendered plugin is one per user, not one per repo, so
+the keys it is built from are read from the **global** config (plus the calling
+environment) only: the five `CLAGENTIC_<ROLE>_AGENT_MODEL` keys,
+`CLAGENTIC_ROUTER_URL`, `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL`, and each role's
+`CLAGENTIC_<ROLE>_CMD` as it feeds router injection. A repo's `.clagentic/config`
+cannot change the rendered plugin; if it sets one of these, `clagentic-lite
+doctor` warns, naming the key and the file, and the value never reaches the
+rendered agents. Put it in the global config. The per-repo `_CMD`/`_TIER`/`_CHAIN`
+keys still work per repo on the CLI/hook path.
 
 `update` never rewrites an existing config's key set, so keys shipped after
 your `init` are simply absent. `clagentic-lite doctor` names them
@@ -208,7 +219,8 @@ Things to tell the user when they ask about models:
   there. Never copy a model ID from documentation or another machine; ask the
   user which one their backend accepts.
 - The value takes effect after `clagentic-lite update` re-renders the plugin;
-  until then `doctor` shows a stale render stamp.
+  until then `doctor` shows a stale render stamp. Set it in the global config:
+  a per-repo value is not applied (see "Global-only keys" above).
 - `CLAGENTIC_<ROLE>_CMD`, `_TIER` and `_CHAIN` never affect an Agent-tool
   dispatch, for any role: `CLAGENTIC_REVIEWER_CMD=codex` does not make the
   Reviewer subagent run on codex. Only `_AGENT_MODEL` or router injection
@@ -367,7 +379,8 @@ at that repo's own README for build/run instructions. Once it's running
 locally, wiring clagentic-lite to it is two config keys plus a re-enroll:
 
 ```sh
-# In ~/.config/clagentic/lite/config or <repo>/.clagentic/config:
+# In ~/.config/clagentic/lite/config (keep every router key global; see
+# "Global-only keys" above):
 CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765
 CLAGENTIC_ROUTER_TOKEN=<the router's own proxy token>
 
