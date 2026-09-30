@@ -343,7 +343,10 @@ class TestFailClosedFallbacks(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self._assert_full_tree_fallback(result)
-        self.assertIn("failed or timed out", result.stderr)
+        # The fallback reason now names git's own failure (exit code plus its
+        # error line) instead of the old undifferentiated "failed or timed
+        # out"; a timeout is reported separately as "timed out after Ns".
+        self.assertIn("git fetch origin main failed (exit", result.stderr)
 
     def test_missing_origin_remote_still_blocks(self):
         work = os.path.join(self._tmp, "work_no_origin")

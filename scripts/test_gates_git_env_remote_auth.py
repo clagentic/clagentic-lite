@@ -255,6 +255,17 @@ class TestFetchFailureReason(_ScratchBase):
         self.assertNotIn("timed out", out)
         self.assertRegex(out, r"(?i)(could not connect|unable to access|fatal)")
 
+    def test_reason_is_git_fatal_line_not_its_trailing_hint(self):
+        """git ends a multi-line failure on a generic hint ('and the
+        repository exists.'); the reason must carry the fatal: line."""
+        self._set_origin(os.path.join(self.tmp, "no-such-repo.git"))
+
+        rc, out = self._resolve()
+        self.assertEqual(rc, 1)
+        self.assertIn("failed (exit", out)
+        self.assertIn("fatal:", out)
+        self.assertNotIn("and the repository exists", out)
+
     @unittest.skipUnless(_HAVE_TIMEOUT, "no timeout/gtimeout binary")
     def test_timeout_is_reported_as_a_timeout(self):
         server = self._start(_HangingServer())

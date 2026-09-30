@@ -238,7 +238,10 @@ _bounded_failure_reason() {
   fi
   _bfr_last=""
   if [ -s "$_bfr_err_file" ]; then
-    _bfr_last=$(awk 'NF { line = $0 } END { print line }' "$_bfr_err_file" | sed 's#://[^/@ ]*@#://***@#g' | cut -c1-300)
+    # Git's multi-line failures end on a generic hint ("and the repository
+    # exists."); the informative line is the last `fatal:`/`error:` one, so
+    # prefer it and fall back to the last non-empty line.
+    _bfr_last=$(awk 'NF { line = $0 } /^(fatal|error):/ { fe = $0 } END { print (fe != "" ? fe : line) }' "$_bfr_err_file" | sed 's#://[^/@ ]*@#://***@#g' | cut -c1-300)
   fi
   if [ -n "$_bfr_last" ]; then
     printf 'failed (exit %s): %s' "$_bfr_rc" "$_bfr_last"
