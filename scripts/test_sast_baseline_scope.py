@@ -88,10 +88,12 @@ def _run_cmd_sast(project_root, bin_dir, argv_file, extra_env=None, cwd=None):
 
     cwd defaults to project_root (every pre-existing call site's exact prior
     behavior, byte-for-byte) -- a caller exercising CWD-independence
-    (lr-51112e, HOLDEN decision on PR #217 needs-decision option 3) passes a
-    DIFFERENT directory here while CLAGENTIC_PROJECT_ROOT still names the
-    real target repo, mirroring test_secrets_branch_scope.py's identical
-    `cwd` parameter added for the sibling gitleaks/osv-scanner fix.
+    passes a DIFFERENT directory here while CLAGENTIC_PROJECT_ROOT still names
+    the real target repo, mirroring test_secrets_branch_scope.py's identical
+    `cwd` parameter for the sibling gitleaks/osv-scanner fix. semgrep has no
+    source-dir flag, and a positional REPO_ROOT argument makes
+    --baseline-commit exit 2 when CWD != REPO_ROOT, so both invocations run
+    in a subshell that cds to REPO_ROOT.
     """
     env = os.environ.copy()
     env["PATH"] = bin_dir + os.pathsep + env["PATH"]
@@ -662,8 +664,9 @@ class TestRealSemgrepSupportsBaselineFlag(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed")
 class TestSastScanIsCwdIndependent(unittest.TestCase):
-    """Regression pin for lr-51112e (HOLDEN decision, PR #217 needs-decision
-    option 3): both semgrep invocations in cmd_sast now run inside a POSIX
+    """Regression pin: semgrep has no source-dir flag, and a positional
+    REPO_ROOT argument makes --baseline-commit exit 2 when CWD != REPO_ROOT,
+    so both semgrep invocations in cmd_sast run inside a POSIX
     subshell that `cd`s to $REPO_ROOT first, so semgrep's --baseline-commit
     (which shells out to `git cat-file` against the process's OWN CWD, with
     no override flag of its own) resolves against the real target repo
