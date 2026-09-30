@@ -135,6 +135,13 @@ CLAGENTIC_BLOCK_SEVERITY=high
 # Set to LOW to restore the original block-on-any-finding behavior.
 CLAGENTIC_OSV_SEVERITY=CRITICAL
 
+# pre-push input domains. By default the pre-push hook skips the deps or sast
+# gate (logged as skipped_out_of_domain, never as a pass) only when the push
+# provably cannot reach that gate's input domain; any uncertainty, and any
+# change to a gate's own config, runs every gate. Secrets is never skipped.
+# Set =1 to run every gate on every push regardless.
+CLAGENTIC_ALWAYS_RUN_ALL_GATES=0
+
 # Stop-hook debounce: only summarize after N seconds of quiet.
 CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC=20
 

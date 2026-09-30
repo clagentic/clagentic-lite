@@ -16,7 +16,9 @@
 #   digest           summarize today's audit rows
 #   status           last N runs per gate (default N=10) with color outcomes
 #   tail             follow audit.db, render new gate_runs rows as they land; --no-follow exits after one poll
-#   pre-push         hook entry point (deps + sast + optional review)
+#   pre-push         hook entry point (deps + sast + optional review); deps/sast
+#                    are skipped as skipped_out_of_domain only when the push
+#                    provably cannot reach their input domain (gate-domain.sh)
 #   log-run          internal: insert one row into gate_runs
 #   deferrals-lint   validate .clagentic/deferrals.json against the gate-code schema
 #   audit-vocab-lint warn-only: flag "cmd_log_run <gate> pass" audit rows whose
@@ -27,6 +29,7 @@ set -e
 . "$(dirname "$0")/platform.sh"
 . "$(dirname "$0")/review-merge.sh"
 . "$(dirname "$0")/host-adapter.sh"
+. "$(dirname "$0")/gate-domain.sh"
 
 # Tool home: the directory containing scripts/ — resolved from this script's
 # own location so it's correct whether invoked via PATH, symlink, or directly.
@@ -5487,8 +5490,12 @@ print(json.dumps(block))
 #
 # A gate with no row at all (never ran) is null — distinct from an outcome
 # string, so the payload can tell "absent" apart from any real outcome
-# (pass/warn/skip/block). Nothing here changes a merge decision: this
-# function only reads what cmd_secrets/cmd_deps/cmd_sast already wrote via
+# (pass/warn/skip/block/skipped_out_of_domain). skipped_out_of_domain is
+# the pre-push third state (gate-domain.sh): the push provably could not
+# reach the gate's input domain, so the gate did not run -- it is carried
+# through verbatim and must never be read as a pass. Nothing here changes
+# a merge decision: this function only reads what
+# cmd_secrets/cmd_deps/cmd_sast already wrote via
 # cmd_log_run; it does not re-run them, does not re-derive their outcome,
 # and its own read failure never blocks (see below).
 #
@@ -7266,8 +7273,23 @@ cmd_ship() {
 }
 
 cmd_pre_push() {
-  cmd_deps || { echo "[gates/pre-push] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"; exit 1; }
-  cmd_sast || { echo "[gates/pre-push] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"; exit 1; }
+  # Each gate runs unless the harness proves this push cannot reach its input
+  # domain (scripts/gate-domain.sh). A skip is logged under its own outcome,
+  # never as a pass, so the audit trail and the merge-gate payload can tell
+  # "did not apply" from "ran and passed" from "never ran".
+  _gd_plan_pre_push
+  if [ "$_GD_RUN_DEPS" = "1" ]; then
+    cmd_deps || { echo "[gates/pre-push] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"; exit 1; }
+  else
+    echo "[gates/pre-push] deps: $_GD_OUTCOME_SKIPPED -- $_GD_SKIP_DETAILS_DEPS" 1>&2
+    cmd_log_run deps "$_GD_OUTCOME_SKIPPED" "$_GD_SKIP_DETAILS_DEPS"
+  fi
+  if [ "$_GD_RUN_SAST" = "1" ]; then
+    cmd_sast || { echo "[gates/pre-push] diagnose with the Troubleshooter agent (plugins/clagentic-lite/agents/troubleshooter.md)"; exit 1; }
+  else
+    echo "[gates/pre-push] sast: $_GD_OUTCOME_SKIPPED -- $_GD_SKIP_DETAILS_SAST" 1>&2
+    cmd_log_run sast "$_GD_OUTCOME_SKIPPED" "$_GD_SKIP_DETAILS_SAST"
+  fi
   [ "${CLAGENTIC_REVIEW_ON_PUSH:-0}" = "1" ] && { cmd_review || exit 1; }
   exit 0
 }
@@ -7318,7 +7340,7 @@ _color_outcome() {
     pass)  printf '%s%s%s' "$C_GREEN"  "$1" "$C_RESET" ;;
     block) printf '%s%s%s' "$C_RED"    "$1" "$C_RESET" ;;
     warn)  printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" ;;
-    skip)  printf '%s%s%s' "$C_DIM"    "$1" "$C_RESET" ;;
+    skip|skipped_out_of_domain) printf '%s%s%s' "$C_DIM" "$1" "$C_RESET" ;;
     *)     printf '%s' "$1" ;;
   esac
 }

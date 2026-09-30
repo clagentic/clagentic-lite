@@ -108,6 +108,7 @@ This checkout does not ship a tracked, live `.claude/hooks/*.sh` + `.claude/sett
 | `scripts/memory.sh` | SQLite session memory CRUD |
 | `scripts/llm-client.sh` | role-aware LLM wrapper with model_chain fallback |
 | `scripts/gates.sh` | gate orchestrator + digest + ship + merge-gate |
+| `scripts/gate-domain.sh` | pre-push gate input domains: computes whether a push can reach deps/sast's input domain, sourced by `gates.sh`; see `docs/GATES.md` "Pre-push input domains" |
 | `scripts/smoke.sh` | non-interactive end-to-end (local sanity check) |
 | `docs/` | DESIGN, GATES, ROUTER (clagentic-router integration, operator-facing), DEMO-SCRIPT, PORTABILITY, LLM-USAGE (checklist for an LLM/agent setting up or operating clagentic-lite on a user's behalf) |
 | `examples/{python,node,go}/` | demo projects with planted issues |

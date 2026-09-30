@@ -1229,6 +1229,40 @@ _doctor_check_orphaned_router_plugin() {
   fi
 }
 
+# _doctor_check_gate_domain_tables
+# The pre-push input-domain tables (scripts/gate-domain.sh) are a snapshot of
+# what osv-scanner and semgrep read; neither tool reports that set itself.
+# Each table records the scanner version it was last audited against. An
+# installed scanner NEWER than that record may read files the table does not
+# list, so the table should be re-audited (see gate-domain.sh header).
+# Advisory WARN only, same convention as the render-stamp and config-drift
+# checks above: a stale table is a maintenance signal, not a broken install.
+_doctor_check_gate_domain_tables() {
+  _dcgd_ok_fn="$1"
+  if [ ! -f "$SCRIPTS_DIR/gate-domain.sh" ]; then
+    printf '  (scripts/gate-domain.sh not found at %s — skipping)\n' "$SCRIPTS_DIR"
+    return 0
+  fi
+  . "$SCRIPTS_DIR/gate-domain.sh"
+  for _dcgd_pair in "osv-scanner:$_GD_OSV_TABLE_VERSION" "semgrep:$_GD_SEMGREP_TABLE_VERSION"; do
+    _dcgd_tool="${_dcgd_pair%%:*}"
+    _dcgd_recorded="${_dcgd_pair#*:}"
+    if ! command -v "$_dcgd_tool" >/dev/null 2>&1; then
+      printf '  INFO %s not installed — domain table check skipped\n' "$_dcgd_tool"
+      continue
+    fi
+    _dcgd_installed=$(_gd_scanner_version "$_dcgd_tool")
+    if [ -z "$_dcgd_installed" ]; then
+      printf '  WARN could not read a version from `%s --version` — cannot compare against domain table snapshot %s\n' "$_dcgd_tool" "$_dcgd_recorded"
+    elif _gd_version_gt "$_dcgd_installed" "$_dcgd_recorded"; then
+      printf '  WARN installed %s %s is newer than its pre-push domain table snapshot (%s) — it may read files the table does not list.\n' "$_dcgd_tool" "$_dcgd_installed" "$_dcgd_recorded"
+      printf '       audit the release notes, extend the table in scripts/gate-domain.sh, then bump its recorded version. Set CLAGENTIC_ALWAYS_RUN_ALL_GATES=1 to bypass domain skipping meanwhile.\n'
+    else
+      "$_dcgd_ok_fn" "$_dcgd_tool $_dcgd_installed covered by domain table snapshot $_dcgd_recorded"
+    fi
+  done
+}
+
 # _secret_tmp_create PATH
 # lr-25e73e fold-in (BOBBIE bobbie.secret.7 + PEACHES amos.code-craft.12):
 # creates PATH truncated and chmod 600 BEFORE any content ever reaches it,
@@ -3567,6 +3601,9 @@ cmd_doctor() {
 
   printf '\norphaned legacy router plugin check:\n'
   _doctor_check_orphaned_router_plugin _ok _fail
+
+  printf '\npre-push gate input-domain tables:\n'
+  _doctor_check_gate_domain_tables _ok
 
   # 10. Memory tunables.
   printf '\nmemory tunables:\n'

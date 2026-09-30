@@ -904,7 +904,8 @@ threshold, or on an uncovered blocking adversarial finding (see below).
 Deterministic gates (lr-367a21): "deterministic_gates" holds
 "secrets"/"deps"/"sast", each either null (that gate has no logged run at
 all) or an object with "outcome" (the literal value cmd_secrets/cmd_deps/
-cmd_sast last logged: "pass", "warn", "skip", or "block") and "details".
+cmd_sast last logged: "pass", "warn", "skip", "block", or
+"skipped_out_of_domain") and "details".
 "audit_db_unavailable" is true when this block could not be read at all
 (no sqlite3, no audit.db, or an unreadable/corrupt DB) — in that case
 every one of the three fields is null and this tells you nothing about
@@ -918,6 +919,13 @@ that its logged outcome was not "pass" or that the log could not be
 read. You may note it in your "reason" text, but the sole grounds for a
 merge-gate refusal remain the review/adversarial signals described
 below.
+
+"skipped_out_of_domain" is a distinct third state: the gate was
+deliberately not run because the pre-push change set provably touched
+nothing in that gate's input domain ("details" names the domain, the
+changed paths tested, and how they were derived). It is NOT a pass and
+NOT a failure. Never describe such a gate as passed or clean in your
+"reason" text; say it did not apply to the change.
 
 The payload's "deterministic_gates_fenced" field (lr-92d931) is the same
 "deterministic_gates" object rendered as text inside a fenced block,
