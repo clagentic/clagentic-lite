@@ -1870,8 +1870,9 @@ invoke_generic() {
 # builder/gate/summarizer because walk_chain never checks the router opt-in
 # for those roles (see _llm_role_routable below). Builder is deliberately
 # excluded: it holds unrestricted Bash and does real multi-turn
-# tool-calling, and every router adapter currently declares
-# SupportsTools=false (lr-be9454) -- a tool-bearing routed request 422s.
+# tool-calling, and the router refuses a tool-bearing request unless its
+# chain resolves to a tool-capable backend (docs/ROUTER.md section 3);
+# lite defines no such chain for it.
 # Gate (merge-gate's internal role literal) is excluded for the IDENTICAL
 # reason as Builder -- ds_llm_role_is_bash_unrestricted (scripts/
 # platform.sh) marks gate Bash-unrestricted too, so its direct-CLI
