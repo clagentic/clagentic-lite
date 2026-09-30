@@ -165,11 +165,12 @@ cmd_log_turn() {
   # CLAGENTIC_MEMORY_MAX_ROWS: opportunistic row cap (default 5000).
   # After each INSERT, oldest rows beyond the cap are silently pruned.
   # No scheduler, no daemon — one DELETE per write path. Silent housekeeping.
-  MAX_ROWS="${CLAGENTIC_MEMORY_MAX_ROWS:-5000}"
   # Integer guard: reject non-integer values (empty, float, or injection attempt)
   # and fall back to the documented default. ds_sql_escape does not protect an
   # unquoted numeric SQL position; the integer check makes the slot unconditionally safe.
-  case "$MAX_ROWS" in ''|*[!0-9]*) MAX_ROWS=5000 ;; esac
+  # 0 also falls back: LIMIT 0 would make the DELETE below wipe every row on
+  # each write.
+  MAX_ROWS=$(ds_positive_int_or_warn CLAGENTIC_MEMORY_MAX_ROWS "${CLAGENTIC_MEMORY_MAX_ROWS:-}" 5000)
   # String slots go through ds_sql_escape. Including the branch —
   # a value like `feat/o'hare` would otherwise break the INSERT.
   SUMMARY_ESC=$(ds_sql_escape "$SUMMARY")

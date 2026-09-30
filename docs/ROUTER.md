@@ -89,7 +89,10 @@ see §3 for the gate path's stricter application of the same check.
 # 1. Run clagentic-router (see that repo's README for build/run instructions).
 #    It listens on 127.0.0.1:8765 by default.
 
-# 2. Set the two config keys (~/.config/clagentic/lite/config or .clagentic/config):
+# 2. Set the two config keys in ~/.config/clagentic/lite/config. Keep router
+#    keys global: the rendered plugin is one per user and is built from the
+#    global file alone, so a router key in a repo's .clagentic/config or one
+#    exported in your shell is never applied to it, and `doctor` says so:
 CLAGENTIC_ROUTER_URL=http://127.0.0.1:8765
 CLAGENTIC_ROUTER_TOKEN=<your router's proxy.token / CLAGENTIC_ROUTER_TOKEN>
 
@@ -148,15 +151,26 @@ intended or default backend.
 
 ## 2. `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` — agent-model injection (UNVERIFIED)
 
+**Not the only way to set a dispatched agent's model.** If all you want is
+a different *Claude* model for an agent dispatched from Claude Code, use
+`CLAGENTIC_<ROLE>_AGENT_MODEL` instead (all five roles; see
+`docs/LLM-USAGE.md` "Two model paths"). It needs no router and writes a
+plain model name, not a `role:` chain reference. This section's key is for
+sending the dispatched agent to a router chain. Where both are set for a
+role, this key wins and `clagentic-lite doctor` reports the
+`_AGENT_MODEL` value as shadowed. `CLAGENTIC_<ROLE>_CMD` alone reaches
+neither: it governs the gate path only, for every role.
+
 **What it turns on.** `CLAGENTIC_ROUTER_URL` alone gets you the
 settings.json passthrough above with no further risk. This second,
 independent key additionally causes `clagentic-lite init`/`update` to
 render the Reviewer/Auditor/Merge-Gate subagent definitions with `model:
 role:<role>-chain` injected into frontmatter (matching
-`router.example.yaml`'s `reviewer-chain`/`auditor-chain` examples). There
+`router.example.yaml`'s `reviewer-chain`/`auditor-chain` examples), for
+each role whose own `CLAGENTIC_<ROLE>_CMD` is a non-`claude` CLI. There
 is exactly one `clagentic-lite` plugin at all times — this key changes what
 that ONE plugin's render looks like, it does not install a second plugin
-alongside it (pre-lr-1b5a31 versions installed a separate
+alongside it (older versions installed a separate
 `clagentic-lite-router` overlay plugin; that design is retired — `update`
 on an older install automatically detects and removes the stale overlay).
 The checked-in `plugins/clagentic-lite/agents/*.md` files are never
@@ -183,9 +197,9 @@ you've run the verification below at least once.**
 ### Verifying on your machine
 
 This is the one part of the router integration that could not be tested
-from this development environment (no route to a fresh interactive Claude
-Code session or a local HTTP capture listener from a crew-dispatched
-build). Run this on a real machine with `claude` installed:
+from the automated development environment (no route to a fresh interactive
+Claude Code session or a local HTTP capture listener). Run this on a real
+machine with `claude` installed:
 
 1. Stand up a minimal capture listener, e.g. `python3 -m http.server 8765`
    in a scratch directory, or any tool that logs the raw HTTP request it
@@ -207,8 +221,8 @@ build). Run this on a real machine with `claude` installed:
      reads a normal model alias/ID (e.g. `claude-sonnet-4-6`), Claude Code
      silently ignored the frontmatter field and fell back to the parent
      session's model — this is the GH#44385 failure mode. Either way,
-     record what you saw as a comment on lr-49f25e (or the equivalent
-     follow-up task) so the next person doesn't have to re-run this.
+     record what you saw in an issue on the clagentic-lite repository so
+     the next person doesn't have to re-run this.
    - **Which auth header arrived**: `x-api-key` or `Authorization: Bearer
      <token>`. clagentic-router's routed-mode auth
      (`internal/server/messages.go` in that repo) accepts either, keyed off
@@ -286,12 +300,24 @@ belongs to is worth understanding before you enable this switch for
 
 **Builder and Merge-Gate are both deliberately excluded, for the same
 reason.** Both hold unrestricted Bash and do real multi-turn agentic
-tool-calling; every clagentic-router adapter currently declares
-`SupportsTools=false` (`lr-be9454`), so a tool-bearing routed request gets
-refused (422), not silently degraded — a defense Builder/Merge-Gate never
-reach because they never route in the first place. Reviewer/Auditor are
-already tool-restricted and single-shot on both CLI carriers
-(`invoke_claude`'s `--allowedTools`/`--disallowedTools`, `invoke_codex`'s
+tool-calling on the direct-CLI path. What clagentic-router does with a
+tool-bearing request today (read from its adapter source and
+`docs/AGENT-REFERENCE.md`): its CLI-subprocess adapters (`claude_cli`,
+`codex_cli`, `codex_subagent`, `gemini_cli`) declare
+`supports_tools: false`, its HTTP API adapters (`anthropic_api`,
+`openai_api`, `bedrock_api`, `ollama_http`) declare `true`, and a routed
+request that carries `tools` is refused with 422
+`no_tool_capable_backend` unless its chain resolves to at least one
+tool-capable backend (the chain is then narrowed to those). So a
+CLI-only chain, which is what a reviewer/auditor chain usually is, cannot
+serve Builder or Merge-Gate, and the refusal is loud, not a silent
+degrade. clagentic-lite does not define, render, or test a tool-capable
+chain for either role, so they stay out of scope here: Builder and
+Merge-Gate never route, and `_llm_role_routable` enforces that. (The
+router's own reference doc still says every adapter declares `false`; the
+adapter source is authoritative.) Reviewer/Auditor are already
+tool-restricted and single-shot on both CLI carriers (`invoke_claude`'s
+`--allowedTools`/`--disallowedTools`, `invoke_codex`'s
 `--disable shell_tool -s read-only`) and never send a `tools` field either
 way, so routing them carries no tool-drop risk.
 
@@ -305,7 +331,7 @@ fixed upstream as `lr-009423`), every gate-path call made with
 `CLAGENTIC_REVIEWER_VIA_ROUTER=1` / `CLAGENTIC_AUDITOR_VIA_ROUTER=1`
 reached the model with the diff text only and **no filesystem access to
 the repo under review**. This was silent: no error, no timeout, no gate
-failure — reviews simply got worse. Measured impact on project-coldest-tea:
+failure — reviews simply got worse. Measured impact on one real project:
 block rate on active days fell from a historical 10-40% to 0% (0/25) the
 day router opt-in went live, ~4% the next day. Closest miss: a PR passed
 review with zero findings and failed CI seven minutes later on a missing
@@ -427,15 +453,18 @@ surface (`$CLAGENTIC_LITE_HOME/share/config.example` once installed).
 
 ## Honest limitation across all three
 
-Routed roles lose tool-calling and true streaming through
-clagentic-router's CLI adapters — fine for a one-shot pass that only reads
-a diff and returns text, wrong for a role that needs to read/write files
-or run commands mid-conversation. Do not point the Builder role through
-the router — this is why §2's frontmatter injection still touches
-Reviewer/Auditor/Merge-Gate (it changes what model a subagent's
-frontmatter *names*, not whether the gate path routes), but §3's gate-path
-switch touches only Reviewer/Auditor: Merge-Gate needs the same
-tool-calling Builder does on the direct-CLI path (§3 "Merge-Gate is
+Routed roles that land on a CLI-subprocess backend lose tool-calling, and
+no clagentic-router adapter streams — fine for a one-shot pass that only
+reads a diff and returns text, wrong for a role that needs to read/write
+files or run commands mid-conversation. clagentic-lite therefore does not
+route the Builder: it renders no Builder router reference and
+`_llm_role_routable` refuses the role on the gate path (§3 explains what
+the router does with tool-bearing requests today, and why lite has not
+verified a tool-capable Builder chain). That is why §2's frontmatter
+injection touches Reviewer/Auditor/Merge-Gate (it changes what model a
+subagent's frontmatter *names*, not whether the gate path routes), but
+§3's gate-path switch touches only Reviewer/Auditor: Merge-Gate needs the
+same tool-calling Builder does on the direct-CLI path (§3 "Merge-Gate is
 excluded"), so it stays off §3's routable set even though §2's injection
 key still applies to it.
 

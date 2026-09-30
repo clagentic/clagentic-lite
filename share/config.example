@@ -1,7 +1,26 @@
 # clagentic-lite — global config template.
 # Written to ~/.config/clagentic/lite/config by `clagentic-lite init`.
 # Per-repo .clagentic/config is OPTIONAL and SPARSE — only override keys.
-# Load order at gate-run time: global config → per-repo .clagentic/config → env vars.
+# Load order, later wins: (1) this global config, (2) the repo's
+# .clagentic/config, (3) the repo's legacy .env, if one exists (a v0.1 leftover:
+# still honored, never created). All are dot-sourced, so a value in any of them
+# overrides the same key already exported in your shell (except the global-only
+# keys below).
+#
+# GLOBAL-ONLY KEYS: the rendered Claude Code plugin is one per user, so the keys
+# it is built from are read from THIS global file and nothing else. Neither a
+# repo's .clagentic/config nor a value exported in your shell (or inherited when
+# `update` re-execs itself after a pull) can change the rendered plugin. The
+# keys: the five CLAGENTIC_<ROLE>_AGENT_MODEL keys, CLAGENTIC_ROUTER_URL,
+# CLAGENTIC_ROUTER_INJECT_AGENT_MODEL, and the reviewer, auditor and gate
+# CLAGENTIC_<ROLE>_CMD while router injection is on (builder and troubleshooter
+# _CMD never affect the render). `clagentic-lite doctor` warns when a repo's
+# config sets one, and prints an INFO when an exported value differs from this
+# file's. What a per-repo value still does: the _CMD keys and
+# CLAGENTIC_ROUTER_URL apply to the gate/CLI path (llm-client.sh) and are
+# ignored only when rendering dispatched agents; the _AGENT_MODEL keys and
+# CLAGENTIC_ROUTER_INJECT_AGENT_MODEL are read by the render alone, so set per
+# repo they have no effect anywhere.
 #
 # TIMING: a repo-local .clagentic/config does not take effect until AFTER
 # the repo has been enrolled — it is not read during the very first
@@ -11,10 +30,23 @@
 # config before that repo is enrolled/trusted. The global config above is
 # unaffected and applies at enroll time as normal.
 #
-# Per-role contract: each role has its own primary CLI+model and an ordered
-# fallback chain. The chain is walked left-to-right when the primary fails
-# (non-zero exit, parse failure, timeout). Each entry is "cmd:tier" where
-# tier resolves to a concrete model via the CLAGENTIC_MODEL_* table below.
+# TWO MODEL PATHS. Which keys control which model depends on how the role runs:
+#   CLI/hook path   `gates review|ship`, git hooks, Claude Code lifecycle hooks
+#                   -> scripts/llm-client.sh. Model comes from
+#                   CLAGENTIC_<ROLE>_CMD / _TIER / _CHAIN plus the
+#                   CLAGENTIC_MODEL_<CLI>_<TIER> table below (and optionally
+#                   clagentic-router, see the router section).
+#   Agent path      the Claude Code Agent tool dispatching clagentic-lite:<role>.
+#                   Runs on the session model unless CLAGENTIC_<ROLE>_AGENT_MODEL
+#                   (below) or router injection sets one. _CMD/_TIER/_CHAIN do
+#                   NOT reach this path. Claude Code only; codex/gemini users
+#                   are unaffected.
+#
+# Per-role contract (CLI/hook path): each role has its own primary CLI+model
+# and an ordered fallback chain. The chain is walked left-to-right when the
+# primary fails (non-zero exit, parse failure, timeout). Each entry is
+# "cmd:tier" where tier resolves to a concrete model via the
+# CLAGENTIC_MODEL_* table below.
 #
 # Roles are independent. Codex does not implicitly fall back to Claude (or
 # vice versa) — every fallback step is something you wrote down on purpose.
@@ -36,9 +68,9 @@ CLAGENTIC_CONFIG_SCHEMA_VERSION=
 CLAGENTIC_LITE_HOME=
 
 # ---------- model tier table ----------
-# Resolve symbolic tier names to concrete model strings for each CLI.
-# This is the only place model version literals live. Agent files and the
-# wrapper script reference tier names only.
+# Resolve symbolic tier names to concrete model strings for each CLI. Used by
+# the CLI/hook path only (llm-client.sh); the Agent path never reads it. The
+# checked-in agent files and the wrapper script reference tier names only.
 #
 # Format: CLAGENTIC_MODEL_<CLI>_<TIER>=<model-id-for-that-cli>
 # Tiers (suggested): flagship, default, cheap
@@ -67,11 +99,15 @@ CLAGENTIC_MODEL_CLAUDE_CHEAP=haiku
 # Example for a local ollama-backed entry:
 # CLAGENTIC_MODEL_OLLAMA_DEFAULT=llama3.1:8b
 
-# ---------- roles ----------
+# ---------- roles (CLI/hook path) ----------
 # Each role: PRIMARY (cmd + tier) and CHAIN (comma-separated cmd:tier list).
 # Empty CHAIN means "no fallback — fail to degraded envelope on primary failure".
+# Every _CMD/_TIER/_CHAIN key below affects the CLI/hook path only. To set the
+# model an Agent-tool dispatch runs on, use CLAGENTIC_<ROLE>_AGENT_MODEL in the
+# "agent-path model" section that follows.
 
 # Builder = primary author. Most edits go through this.
+# CLI/hook path only: `llm-client.sh build`. Not the Agent-tool Builder.
 CLAGENTIC_BUILDER_CMD=claude
 CLAGENTIC_BUILDER_TIER=default
 CLAGENTIC_BUILDER_CHAIN=codex:default,claude:flagship
@@ -81,27 +117,63 @@ CLAGENTIC_BUILDER_CHAIN=codex:default,claude:flagship
 # Tier names in chains: use flagship/mini/spark for codex (matching models.json),
 # or flagship/default/cheap for claude. Both work; models.json names are canonical
 # for codex since that file is the live source of model strings.
+# CLI/hook path only: `gates review`. Not the Agent-tool Reviewer.
 CLAGENTIC_REVIEWER_CMD=codex
 CLAGENTIC_REVIEWER_TIER=flagship
 CLAGENTIC_REVIEWER_CHAIN=claude:default,codex:flagship
 
 # Auditor = LLM narration on top of deterministic scans (gitleaks/semgrep/osv).
 # The Auditor never gates. Local tools own the security path.
+# CLI/hook path only: `gates adversarial`. Not the Agent-tool Auditor.
 CLAGENTIC_AUDITOR_CMD=codex
 CLAGENTIC_AUDITOR_TIER=flagship
 CLAGENTIC_AUDITOR_CHAIN=claude:default
 
 # Merge-gate = final pre-merge sanity check. Reads all green-gate output,
 # either approves or refuses. Never opens a PR, never pushes.
+# CLI/hook path only: `gates merge-gate`. Not the Agent-tool merge-gate.
 CLAGENTIC_GATE_CMD=claude
 CLAGENTIC_GATE_TIER=default
 CLAGENTIC_GATE_CHAIN=codex:flagship
 
 # Summarizer = cheap model used for per-turn Stop-hook summaries.
 # Uses :spark (codex) / :cheap (claude) — the lightest available tier.
+# CLI/hook path only (Stop hook). The Summarizer has no Agent-tool agent.
 CLAGENTIC_SUMMARIZER_CMD=claude
 CLAGENTIC_SUMMARIZER_TIER=cheap
 CLAGENTIC_SUMMARIZER_CHAIN=codex:spark
+
+# ---------- agent-path model (Claude Code Agent tool) ----------
+# Optional, one per role, all unset by default (= today's behavior: a
+# dispatched agent runs on the session model). Set one to pin the model for
+# that role's Agent-tool dispatch. Applies to all five roles, including
+# Builder and Troubleshooter (which have no router path). GLOBAL-ONLY: set
+# these here, not in a repo's .clagentic/config (see the note at the top).
+#
+# Value: a Claude Code model alias, a full model ID, or `inherit`. Grammar:
+# ASCII letters, digits and . _ : / @ [ ] - only; must start with a letter or
+# digit; must end with a letter, digit or `]`; must not start with `role:`
+# (that prefix is the router-reference form, written only by router injection).
+# Anything else is ignored with a WARN at render time and a `doctor` finding.
+# The values below are EXAMPLES, not recommendations; use whatever your Claude
+# Code backend accepts.
+#   - A bare alias (sonnet, opus, haiku) resolves to Claude Code's built-in
+#     default for the ACTIVE backend, which on Bedrock/Vertex can lag the
+#     newest model. On those backends prefer the full model ID your account
+#     has access to.
+#   - Precedence per role: router injection (CLAGENTIC_ROUTER_INJECT_AGENT_MODEL,
+#     reviewer/auditor/merge-gate only) > this key > no model: line.
+#     `clagentic-lite doctor` reports the effective value per role and says
+#     when a key is shadowed by router injection.
+#   - Takes effect after `clagentic-lite update` re-renders the plugin
+#     (`doctor` shows a stale render stamp until then).
+#   - Claude Code only. codex/gemini users are unaffected; use the CLI-path
+#     keys above.
+# CLAGENTIC_BUILDER_AGENT_MODEL=sonnet
+# CLAGENTIC_TROUBLESHOOTER_AGENT_MODEL=inherit
+# CLAGENTIC_REVIEWER_AGENT_MODEL=opus
+# CLAGENTIC_AUDITOR_AGENT_MODEL=opus
+# CLAGENTIC_GATE_AGENT_MODEL=sonnet
 
 # ---------- role enforcement ----------
 # By default, when every step in a role's chain fails, the wrapper emits a
@@ -116,11 +188,11 @@ CLAGENTIC_SUMMARIZER_CHAIN=codex:spark
 # CLAGENTIC_GATE_REQUIRED=0
 
 # ---------- gates ----------
-# Comma-separated list of gates to run on /ship. Omit to run all.
+# Comma-separated list of gates to run on `gates ship`. Omit to run all.
 # Available: secrets,deps,sast,review,adversarial,merge-gate
 CLAGENTIC_GATES=secrets,deps,sast,review,adversarial,merge-gate
 
-# Severity threshold for blocking on /review findings.
+# Severity threshold for blocking on `gates review` findings.
 # Values: low | medium | high | critical
 CLAGENTIC_BLOCK_SEVERITY=high
 
@@ -236,7 +308,7 @@ CLAGENTIC_LLM_TIMEOUT_AUTO_SCALE=1
 CLAGENTIC_CLAUDE_BARE=0
 
 # Merge Gate: blocking by default. Set to 0 to make it advisory (the gate
-# still runs and logs, but a 'refuse' decision won't stop /ship).
+# still runs and logs, but a 'refuse' decision won't stop `gates ship`).
 CLAGENTIC_MERGE_GATE_BLOCKING=1
 
 # Fail-closed overrides for missing deterministic security tools. The default
@@ -295,6 +367,67 @@ CLAGENTIC_STRICT_PREFLIGHT=0
 # zero falls back to the default.
 CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 
+# ---------- gate subprocess timeouts and small tunables ----------
+# Every external process a gate runs is wall-clock bounded. Values are
+# seconds unless noted; a non-numeric, empty, or zero value falls back to the
+# default shown. The LLM-call timeouts are CLAGENTIC_LLM_TIMEOUT_* above.
+# Generic bound for external commands that have no dedicated key below:
+# CLAGENTIC_EXTERNAL_TIMEOUT_SEC=120
+# gitleaks (secrets gate), osv-scanner (deps gate), semgrep (sast gate):
+# CLAGENTIC_SECRETS_TIMEOUT_SEC=300
+# CLAGENTIC_OSV_TIMEOUT_SEC=300
+# CLAGENTIC_SAST_TIMEOUT_SEC=300
+# `git push` and the host adapter's open-change-request call in `gates ship`:
+# CLAGENTIC_SHIP_TIMEOUT_SEC=120
+# The git fetch + ls-remote freshness check that resolves the default-branch
+# ref for a gate's diff/file scope (see also CLAGENTIC_SAST_FETCH_TIMEOUT_SEC
+# and CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC above): review and adversarial diff
+# scope, the bleed gate's changed-file scope, and the merge-gate's payload.
+# CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC=30
+# CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC=30
+# CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC=30
+#
+# Cap on structured findings kept in the adversarial sidecar the merge-gate
+# reads. Lowest-severity findings are dropped first, and the dropped count is
+# printed. Non-numeric or zero falls back to the default with a WARN (zero does
+# not mean "keep none").
+# CLAGENTIC_ADVERSARIAL_FINDINGS_MAX=200
+#
+# =1 makes the git pre-push hook (`gates pre-push`) also run `gates review`
+# after deps and sast. Off by default: review is an LLM call.
+# CLAGENTIC_REVIEW_ON_PUSH=0
+#
+# Semgrep config for the sast gate. Unset or empty (the default) runs
+# `--config=auto`, which downloads rules from the network. When set, this
+# value (a rule file/directory path or registry ruleset) replaces
+# `--config=auto` outright; use it to pin a policy per repo or run offline.
+# CLAGENTIC_SEMGREP_CONFIG=
+#
+# =1 skips the secrets gate's positive-control canary (a throwaway local repo
+# with a planted fake credential that proves the scanner can detect one before
+# its own "no leaks" result is trusted). For air-gapped/offline environments.
+# CLAGENTIC_SKIP_SECRETS_CANARY=0
+#
+# =1 skips the best-effort `git fetch` freshness check `clagentic-lite init`
+# runs against the tool checkout at CLAGENTIC_LITE_HOME (offline use).
+# CLAGENTIC_SKIP_FETCH=0
+#
+# Poll interval for `clagentic-lite gates tail`, whole seconds (default 1).
+# Non-numeric or zero falls back to the default with a WARN.
+# CLAGENTIC_TAIL_INTERVAL_SEC=1
+#
+# Zero handling for the other numeric keys. Fall back to the default with a
+# WARN on zero or non-numeric: CLAGENTIC_MEMORY_MAX_ROWS,
+# CLAGENTIC_INVARIANT_FEED_MAX, CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS,
+# CLAGENTIC_REVIEW_CHUNK_BYTES, CLAGENTIC_REVIEWER_MAX_DIFF_KB. Zero is a real
+# setting for: CLAGENTIC_LLM_TIMEOUT_MAX_SEC / CLAGENTIC_<ROLE>_TIMEOUT_MAX_SEC
+# (no cap), CLAGENTIC_LEDGER_MAX_PER_BRANCH (unlimited),
+# CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC (no debounce), CLAGENTIC_RECALL_MIN_KEYWORDS
+# (never gate on keyword count), CLAGENTIC_RECALL_LIMIT (return no rows),
+# CLAGENTIC_RECALL_MAX_CHARS (inject no text), CLAGENTIC_RESULT_TOKEN_WARN /
+# CLAGENTIC_SESSION_TOKEN_WARN (warn on every result) and
+# CLAGENTIC_AUTOSUMMARIZE_BYTES (summarize every result).
+
 # ---------- gate input domain (lr-1ad8da) ----------
 # deps (osv-scanner) and sast (semgrep), when run via `gates.sh pre-push`
 # (the git pre-push hook), each skip with outcome "not_applicable" -- a
@@ -322,7 +455,11 @@ CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 # CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS=
 
 # ---------- repo host ----------
-# github | gitlab | gitea | none
+# Which host adapter `gates ship` uses to open the PR (and to post the review
+# verdict comment). `github` (needs the `gh` CLI, authenticated) is the only
+# adapter shipped. Any other value, or `none`, falls back to sniffing the
+# origin remote for github.com and, failing that, to printing "open a PR
+# manually" with the base/head/remote; the gates themselves are unaffected.
 CLAGENTIC_REPO_HOST=github
 
 # Default branch (assumed protected — writes blocked by pre-write-guard).
@@ -437,7 +574,7 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # the review findings array, cmd_render_review's terminal output ("reported
 # N rounds running — decide"), and the audit trail (gate='review-recurrence'
 # row with demoted:N threshold:T). This is a THRESHOLD change, never
-# suppression — nothing is hidden or dropped, only whether it can gate /ship
+# suppression — nothing is hidden or dropped, only whether it can gate `gates ship`
 # on its own.
 #
 # Runs only when CLAGENTIC_CROSS_ROUND_DEDUP=1 (the same flag gates both —
@@ -641,21 +778,26 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # CLAGENTIC_ROUTER_USE_API_KEY_HELPER=0
 
 # CLAGENTIC_ROUTER_INJECT_AGENT_MODEL: separate opt-in, OFF by default even
-# when CLAGENTIC_ROUTER_URL is set. Setting CLAGENTIC_ROUTER_URL alone gets
+# when CLAGENTIC_ROUTER_URL is set. GLOBAL-ONLY (it feeds the one rendered
+# plugin): a value in a repo's .clagentic/config is not applied, and `doctor`
+# warns about it. Setting CLAGENTIC_ROUTER_URL alone gets
 # you the settings.json env-block passthrough and the doctor probe with zero
 # additional risk. This second key additionally renders a per-role-injected
 # copy of the reviewer/auditor/merge-gate subagent definitions (model:
 # role:<role>-chain in frontmatter, chain names matching clagentic-router's
 # router.example.yaml) and installs THAT rendered plugin instead of the
 # checked-in one — checked-in agent .md files under plugins/clagentic-lite/
-# are never modified on disk.
+# are never modified on disk. It wins over CLAGENTIC_<ROLE>_AGENT_MODEL for
+# the roles it applies to (a role is injected only when its own
+# CLAGENTIC_<ROLE>_CMD is non-claude); for a plain Claude model instead of a
+# router chain, use CLAGENTIC_<ROLE>_AGENT_MODEL in the agent-path section.
 #
 # UNVERIFIED: whether Claude Code actually honors a subagent frontmatter
 # `model:` field set to a non-standard string like "role:reviewer-chain" —
 # vs. silently ignoring it and falling back to the parent session's model —
 # has NOT been confirmed against a live interactive session from this
-# codebase (claude-code GH#44385 territory; see README "Verifying on your
-# machine" for the exact steps to confirm or refute this on a real machine).
+# codebase (claude-code GH#44385 territory; see docs/ROUTER.md "Verifying on
+# your machine" for the exact steps to confirm or refute this on a real machine).
 # Leave this key unset until you have run that verification once.
 # CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=0
 
@@ -748,7 +890,7 @@ CLAGENTIC_DEFAULT_BRANCH=main
 #     the same gate-path call instead BLANKS ANTHROPIC_BASE_URL,
 #     ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BEDROCK_BASE_URL,
 #     AWS_BEARER_TOKEN_BEDROCK, AND CLAUDE_CODE_USE_BEDROCK (the fifth var
-#     added post-review, PR #200 finding amos.path-choice.4: an ambient
+#     added after PR #200 review: an ambient
 #     CLAUDE_CODE_USE_BEDROCK=1 in the operator's own shell would otherwise
 #     survive into this spawn unblanked and force Bedrock protocol despite
 #     a declared direct-API mode), so a CLAGENTIC_ROUTER_URL settings.json
@@ -802,10 +944,9 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # affects the GATE-PATH one-shot scripts/llm-client.sh call). Scoped to
 # exactly two roles: reviewer, auditor. Builder AND Merge-Gate are both
 # deliberately excluded -- both hold unrestricted Bash and do real
-# multi-turn tool-calling, and every clagentic-router adapter currently
-# declares SupportsTools=false (a routed request carrying tools gets
-# refused with a 422, not silently degraded -- see clagentic-router's own
-# adapter-capability work). Setting CLAGENTIC_GATE_VIA_ROUTER=1 below is a
+# multi-turn tool-calling, and clagentic-router refuses a routed request
+# carrying tools (422) unless its chain resolves to a tool-capable backend,
+# which the CLI-subprocess adapters are not. Setting CLAGENTIC_GATE_VIA_ROUTER=1 below is a
 # harmless no-op, not a working opt-in -- see docs/ROUTER.md §3
 # "Merge-Gate is excluded" (lr-250d9d) for why it stays that way even
 # though the key still exists for doctor to warn about a stale config.

@@ -516,7 +516,9 @@ class TestNoTimeoutVariableUsesTheZeroAdmittingBareGuard(unittest.TestCase):
         future regression to the old idiom is not silently invisible."""
         lines = _iter_gates_sh_lines()
         ds_positive_calls = sum(
-            1 for ln in lines if "ds_positive_int_or_default" in ln and not ln.strip().startswith('#')
+            1 for ln in lines
+            if ("ds_positive_int_or_default" in ln or "ds_positive_int_or_warn" in ln)
+            and not ln.strip().startswith('#')
         )
         self.assertGreaterEqual(
             ds_positive_calls, 7,

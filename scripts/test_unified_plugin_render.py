@@ -42,6 +42,7 @@ cmd_update, cmd_doctor) or gates.sh.
 Run with: python3 -m unittest scripts.test_unified_plugin_render -v
 """
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -186,9 +187,47 @@ class _RenderTestBase(unittest.TestCase):
         with open(self.argv_log) as f:
             return [l.strip() for l in f if l.strip()]
 
-    def _run(self, script_body, extra_env=None):
+    def _scrubbed_env(self):
+        """Child environment for every subprocess in this suite family: the
+        parent's env minus EVERY CLAGENTIC_* variable (a prefix scrub, not a
+        list, so an operator's own config -- any key, including ones added
+        later -- can never change a result), with only CLAGENTIC_LITE_HOME
+        set back."""
         env = os.environ.copy()
+        for key in [k for k in env if k.startswith("CLAGENTIC_")]:
+            del env[key]
         env["CLAGENTIC_LITE_HOME"] = self.fake_home
+        return env
+
+    def _write_fixture_global_config(self, values):
+        """Rewrites the fixture global config from `values` (a dict of KEY ->
+        value, shell-quoted so any byte a test wants to try survives), or
+        removes it when `values` is empty. The render reads its inputs from
+        this file only, never from the process environment."""
+        cfg_dir = os.path.join(self.fake_home_dir, ".config", "clagentic", "lite")
+        cfg = os.path.join(cfg_dir, "config")
+        if not values:
+            if os.path.exists(cfg):
+                os.remove(cfg)
+            return
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(cfg, "w") as f:
+            for key, value in values.items():
+                f.write(f"{key}={shlex.quote(value)}\n")
+
+    def _run(self, script_body, extra_env=None):
+        """Runs script_body in a throwaway `sh`.
+
+        extra_env: CLAGENTIC_* entries are written to the fixture GLOBAL
+            config (the only place the render reads), everything else (PATH,
+            ...) is exported into the child environment. Written afresh on
+            every call, so one call's config never leaks into the next.
+        """
+        extra_env = dict(extra_env or {})
+        config_values = {k: v for k, v in extra_env.items() if k.startswith("CLAGENTIC_")}
+        extra_env = {k: v for k, v in extra_env.items() if k not in config_values}
+        self._write_fixture_global_config(config_values)
+        env = self._scrubbed_env()
         # HOME is ALWAYS pinned to a fixture dir under self.tmp, never the
         # real environment's HOME -- _LEGACY_ROUTER_PLUGIN_CACHE_DIR derives
         # from $HOME (see bin/clagentic-lite), and several tests below
@@ -198,10 +237,6 @@ class _RenderTestBase(unittest.TestCase):
         # test runs or what order they run in.
         env["HOME"] = self.fake_home_dir
         env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
-        env.pop("CLAGENTIC_ROUTER_URL", None)
-        env.pop("CLAGENTIC_ROUTER_INJECT_AGENT_MODEL", None)
-        for role in ("REVIEWER", "AUDITOR", "GATE", "BUILDER"):
-            env.pop(f"CLAGENTIC_{role}_CMD", None)
         if extra_env:
             env.update(extra_env)
         # say()/warn() are used by the extracted functions but defined
@@ -700,6 +735,28 @@ class TestDoctorOrphanedRouterPluginCheck(_RenderTestBase):
         )
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("FAIL:", result.stdout, msg=result.stdout)
+
+    def test_injection_state_is_read_through_the_render_snapshot(self):
+        # The render inputs are snapshotted once at source time (global config
+        # plus environment). A value assigned AFTER the snapshot must not
+        # change what this check reports; reading the live env would.
+        self._write_legacy_cache_fixture(with_model_override=True)
+        result = self._run(
+            self._script_with_reporters(
+                "CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1\n"
+                "_doctor_check_orphaned_router_plugin test_ok test_fail\n"
+            ),
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("INJECT_AGENT_MODEL is UNSET", result.stdout, msg=result.stdout)
+
+    def test_snapshotted_injection_on_suppresses_the_unset_line(self):
+        self._write_legacy_cache_fixture(with_model_override=True)
+        result = self._run(
+            self._script_with_reporters("_doctor_check_orphaned_router_plugin test_ok test_fail"),
+            extra_env={"CLAGENTIC_ROUTER_INJECT_AGENT_MODEL": "1"},
+        )
+        self.assertNotIn("INJECT_AGENT_MODEL is UNSET", result.stdout, msg=result.stdout)
 
 
 class TestDoctorPluginCollisionCheck(_RenderTestBase):

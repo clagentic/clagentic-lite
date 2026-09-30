@@ -8,6 +8,7 @@
 # table, invokes the configured CLI, and falls through the chain on failure.
 #
 # Subcommands:
+#   build        stdin = instruction; stdout = builder output (diff or prose)
 #   review       stdin = diff;       stdout = JSON findings (reviewer.md schema)
 #   summarize    stdin = transcript; stdout = one-line summary (<=200 chars)
 #   adversarial  stdin = diff;       stdout = markdown attack scenarios
@@ -1232,7 +1233,7 @@ notify_step_outcome() {
 # Configurable per-call timeout (seconds). Defaults to 3 minutes — long
 # enough for a high-effort review on a deep prompt, short enough that a
 # hung CLI surfaces as a step failure rather than wedging the gate.
-LLM_TIMEOUT="${CLAGENTIC_LLM_TIMEOUT_SEC:-180}"
+LLM_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_LLM_TIMEOUT_SEC "${CLAGENTIC_LLM_TIMEOUT_SEC:-}" 180)
 
 # Compute a per-call timeout scaled to the combined input size.
 # Args: ROLE_U (uppercase role, e.g. REVIEWER) BYTES (combined input bytes)
@@ -1250,12 +1251,12 @@ llm_timeout_for() {
   ROLE_U="$1"
   BYTES="$2"
 
-  BASE=$(role_env "$ROLE_U" TIMEOUT_SEC "${CLAGENTIC_LLM_TIMEOUT_SEC:-180}")
-  RATE="${CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC:-300}"
+  BASE=$(ds_positive_int_or_warn "CLAGENTIC_${ROLE_U}_TIMEOUT_SEC" "$(role_env "$ROLE_U" TIMEOUT_SEC "${CLAGENTIC_LLM_TIMEOUT_SEC:-}")" 180)
+  RATE=$(ds_positive_int_or_warn CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC "${CLAGENTIC_LLM_TIMEOUT_BYTES_PER_SEC:-}" 300)
   MAX=$(role_env "$ROLE_U" TIMEOUT_MAX_SEC "${CLAGENTIC_LLM_TIMEOUT_MAX_SEC:-1800}")
 
   # Normalize config to integers; use safe defaults on parse failure.
-  # BASE goes through ds_positive_int_or_default (platform.sh), not a bare
+  # BASE goes through ds_positive_int_or_warn (platform.sh), not a bare
   # case guard (lr-49df97 fold-in, BOBBIE finding 3): BASE is the wall-clock
   # seconds handed to $DS_TIMEOUT_CMD below, and a bare `''|*[!0-9]*` guard
   # admits the literal string "0" unchanged (it contains no non-digit
@@ -1265,10 +1266,7 @@ llm_timeout_for() {
   # deliberately: MAX=0 is a pre-existing, DOCUMENTED "no cap" sentinel (see
   # "Cap at max when max is set and positive" below) — a different, intended
   # meaning of zero, not an instance of this defect.
-  BASE=$(ds_positive_int_or_default "$BASE" 180)
-  case "$RATE" in ''|*[!0-9]*) RATE=300 ;; esac
   case "$MAX"  in ''|*[!0-9]*) MAX=1800 ;; esac
-  [ "$RATE" -le 0 ] && RATE=300
 
   # Exit early if auto-scaling disabled.
   [ "${CLAGENTIC_LLM_TIMEOUT_AUTO_SCALE:-1}" = "0" ] && { printf '%s\n' "$BASE"; return; }
@@ -1869,8 +1867,9 @@ invoke_generic() {
 # builder/gate/summarizer because walk_chain never checks the router opt-in
 # for those roles (see _llm_role_routable below). Builder is deliberately
 # excluded: it holds unrestricted Bash and does real multi-turn
-# tool-calling, and every router adapter currently declares
-# SupportsTools=false (lr-be9454) -- a tool-bearing routed request 422s.
+# tool-calling, and the router refuses a tool-bearing request unless its
+# chain resolves to a tool-capable backend (docs/ROUTER.md section 3);
+# lite defines no such chain for it.
 # Gate (merge-gate's internal role literal) is excluded for the IDENTICAL
 # reason as Builder -- ds_llm_role_is_bash_unrestricted (scripts/
 # platform.sh) marks gate Bash-unrestricted too, so its direct-CLI
@@ -1967,7 +1966,7 @@ invoke_generic() {
 #   nonlocal  -- well-formed, but the host is not localhost/127.0.0.0/8/::1.
 #     Refused HERE (unlike bin/clagentic-lite's stamp-time check, which
 #     WARNS-but-allows a nonlocal host for the INTERACTIVE session -- see
-#     docs/DESIGN.md "Layer 0" for the full reasoning): the gate path runs
+#     docs/ROUTER.md "Layer 0" for the full reasoning): the gate path runs
 #     unattended inside a merge gate with no human-in-the-loop moment to
 #     absorb a warning, so "this URL looks like exfiltration" and
 #     "operator deliberately configured a LAN router" are not
