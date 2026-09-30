@@ -22,7 +22,7 @@ clagentic-lite is the smallest credible expression of that thesis. It is built t
 | 1 | **Memory recall** | `UserPromptSubmit` | `scripts/memory.sh recall <keywords>` → top `CLAGENTIC_RECALL_LIMIT` (default 5) summaries injected, capped at `CLAGENTIC_RECALL_MAX_CHARS` (default 1500) chars | no |
 | 2 | **Safe Bash + writes** | `PreToolUse` (Bash, Write, Edit) | regex deny-list on dangerous commands; path-scope check; default-branch protection; hooks fail closed when no JSON validator (jq/python3) available | yes |
 | 3 | **Cross-CLI review** | `clagentic-lite gates review` (or subagent), optional pre-push | Builder's staged diff piped to Reviewer; schema-validated JSON findings | findings ≥ `BLOCK_SEVERITY` block `gates ship`; degraded envelopes also block |
-| 4 | **Local security scan** | git `pre-commit` (secrets) and `pre-push` (deps, SAST) | gitleaks; osv-scanner; semgrep --error --severity=ERROR. Missing tool fails closed unless `CLAGENTIC_ALLOW_MISSING_*=1` | yes |
+| 4 | **Local security scan** | git `pre-commit` (secrets) and `pre-push` (deps, SAST); `gates ship` also runs an opt-in internal-bleed pattern scan | gitleaks; osv-scanner; semgrep --error --severity=ERROR; `grep` against a pattern file you supply. Missing tool fails closed unless `CLAGENTIC_ALLOW_MISSING_*=1` | yes |
 | 5 | **Adversarial pass** | `clagentic-lite gates adversarial` (or subagent) | Auditor role plays attacker on the diff; each finding is tagged `reachable: yes/no`, `tier: blocking/advisory`, and `class: durable/ephemeral` | no on its own (commentary); `tier: blocking` findings are what Gate 6 can refuse on |
 | 6 | **Merge Gate** | `clagentic-lite gates ship` (or subagent) | LLM reads every prior gate's structured output and returns `{decision, reason}` JSON | yes by default (`CLAGENTIC_MERGE_GATE_BLOCKING=1`); only `tier: blocking` adversarial findings are refusal-eligible, `tier: advisory` findings are never gating |
 | 7 | **Session summarize** | `Stop` | async, debounced: Summarizer reads transcript → one-line summary → SQLite | no (best-effort) |
@@ -32,21 +32,23 @@ clagentic-lite is the smallest credible expression of that thesis. It is built t
 | Role | CLI (default) | Job | Tools allowed |
 |---|---|---|---|
 | **Builder** | `claude` | Write code on a feature branch. Never merges. | Read, Write, Edit, Bash (allowlisted) |
-| **Reviewer** | `codex` | Read staged diff, return structured findings. Never writes code. | Read, Grep, Glob — no Bash. Enforced on `claude` via `--allowedTools`/`--disallowedTools` (see `scripts/llm-client.sh` `invoke_claude`) and on `codex` via `--disable shell_tool -s read-only` (`invoke_codex`) — both driven by the same `ds_llm_role_is_bash_unrestricted` predicate (`scripts/platform.sh`), AGENTS.md Invariants INV-2. codex's flags were verified empirically against the installed CLI (codex-cli 0.142.5): `--disable shell_tool` removes the model's shell-execution tool entirely (distinct from `-s`/`--sandbox`, which only scopes what an *available* shell tool may touch), and `-s read-only` additionally blocks codex's `apply_patch` file-write tool, which is not gated by `--disable shell_tool` alone. File reads still work under both flags. Only the version-gated minimal codex flag set (installed codex older than `CODEX_MIN_VERSION`, or a third CLI outside claude/codex) remains genuinely unrestrictable — `walk_chain` prints a loud stderr warning on that remaining case and `clagentic-lite doctor` reports it under "reviewer tool-restriction check." Changing the shipped default away from `codex` was considered and rejected — it would defeat cross-vendor review (§"Cross-vendor is the point" below) to work around a gap in one CLI's flag surface, and that gap is now closed for the shipped default anyway. |
+| **Reviewer** | `codex` | Read staged diff, return structured findings. Never writes code. | Read, Grep, Glob — no Bash. Enforced on `claude` via `--allowedTools`/`--disallowedTools` (see `scripts/llm-client.sh` `invoke_claude`) and on `codex` via `--disable shell_tool -s read-only` (`invoke_codex`) — both driven by the same `ds_llm_role_is_bash_unrestricted` predicate (`scripts/platform.sh`), AGENTS.md Invariants INV-2. codex's flags were verified empirically against the installed CLI (codex-cli 0.142.5): `--disable shell_tool` removes the model's shell-execution tool entirely (distinct from `-s`/`--sandbox`, which only scopes what an *available* shell tool may touch), and `-s read-only` additionally blocks codex's `apply_patch` file-write tool, which is not gated by `--disable shell_tool` alone. File reads still work under both flags. Only the version-gated minimal codex flag set (installed codex older than `CODEX_MIN_VERSION`, or a third CLI outside claude/codex) remains genuinely unrestrictable — `walk_chain` prints a loud stderr warning on that remaining case and `clagentic-lite doctor` reports it under "reviewer tool-restriction check." Changing the shipped default away from `codex` was considered and rejected — it would defeat cross-vendor review (see the cross-CLI paragraph after this table) to work around a gap in one CLI's flag surface, and that gap is now closed for the shipped default anyway. |
 | **Auditor** | `codex` | LLM narration on top of deterministic security scans. Adversarial mode plays attacker. | Two distinct surfaces, not one: (1) the non-interactive `TOOL_ROLE=auditor` chain-step invocation (`gates.sh cmd_adversarial` → `llm-client.sh adversarial` → `invoke_claude`/`invoke_codex`) reads ONLY a diff on stdin (`ds_adversarial_prompt`) and never shells out to gitleaks/semgrep/osv-scanner itself — those run as separate, deterministic gates invoked directly by `gates.sh`'s own shell code (AGENTS.md §4). This surface gets the SAME Read/Grep/Glob-no-Bash restriction as the Reviewer (lr-8a28e0 adjudication) since it has no genuine execution need. (2) `plugins/clagentic-lite/agents/auditor.md`, the interactive Claude Code subagent a human/session invokes directly, DOES run `gitleaks`/`semgrep`/`osv-scanner` itself, via its own scoped Bash allowlist (`tools: Read, Glob, Grep, Bash # security-tool allowlist only`) — a structurally different mechanism (Claude Code's native subagent tool list) untouched by `--allowedTools`/`--disallowedTools`/`ds_llm_role_is_bash_unrestricted` and unaffected by this restriction. |
 | **Merge Gate** | `claude` | Final approve/refuse decision over every prior gate's output. Never opens PRs, never pushes. | Read, Bash — unrestricted. `TOOL_ROLE=gate` is one of the three roles `ds_llm_role_is_bash_unrestricted` (`scripts/platform.sh`) returns true for, so `invoke_claude`/`invoke_codex` skip the `--allowedTools`/`--disallowedTools`/`--disable shell_tool -s read-only` restriction entirely on this role's non-interactive chain-step invocation (`gates.sh cmd_merge_gate` → `walk_chain` → `invoke_claude`/`invoke_codex`) — the gate reads a real diff and prior gates' output and needs to inspect the tree to do that job (`invoke_claude`'s own comment states explicitly that the merge-gate must not lose Bash). This is exactly why `_llm_role_routable` (`scripts/llm-client.sh`) excludes gate from routing through clagentic-router (lr-250d9d): routing would silently trade this unrestricted Bash for a one-shot, tool-free router call. |
 | **Troubleshooter** | `claude` | Read-only failure diagnosis. Receives one artifact, emits root cause + bounce target. Never writes, never dispatches. | Read, Glob, Grep, Bash (read-only) |
 
 Plus a non-role **Summarizer** (default `claude` at cheap tier) wired into the Stop hook for per-turn session memory.
 
-Cross-CLI is the point — a Reviewer that shares the Builder's training distribution shares its blind spots. Each role declares its own `model_chain` (primary `(cmd, tier)` + ordered fallback list) in `.env` so the *vendor* is configurable per role, not hard-coded.
+Cross-CLI is the point — a Reviewer that shares the Builder's training distribution shares its blind spots. Each role declares its own `model_chain` (primary `(cmd, tier)` + ordered fallback list) in `~/.config/clagentic/lite/config` (or a repo's `.clagentic/config`) so the *vendor* is configurable per role, not hard-coded.
+
+**Two model paths.** That chain configuration drives the gate/CLI path only (`llm-client.sh`: `gates review|ship`, git hooks, Claude Code lifecycle hooks). A role dispatched from Claude Code through its Agent tool is a second path, on which the model is the session model unless the rendered agent file carries a `model:` line. `CLAGENTIC_<ROLE>_AGENT_MODEL` (all five roles, Claude Code only) or router injection (reviewer/auditor/merge-gate) sets that line; `CLAGENTIC_<ROLE>_CMD`/`_TIER`/`_CHAIN` never does. The two paths are deliberately configured by different keys: reusing `_TIER` at render time would give one key two meanings and silently change behavior for existing installs, and Claude Code's own subagent-model environment override pins every subagent at once with no per-role control. See `docs/LLM-USAGE.md` § "Two model paths" for the table.
 
 Two commentary skills are installed globally via the `clagentic-lite` plugin (discovered by Claude Code from `plugins/clagentic-lite/skills/`):
 
 - `/eng-consult` — multi-voice consulting panel (Principal + PM + Security/QA/SRE/UX, plus optional Perf/A11y/Tech Writer/Supply Chain).
 - `/infosec-rt` — structured red-team threat model (Pen Tester + Insider, optional Supply Chain Analyst).
 
-Skills are commentary only — they do not gate `/ship`. See `docs/GATES.md` § "Skills vs gates" for the boundary.
+Skills are commentary only — they do not gate `gates ship`. See `docs/GATES.md` § "Skills vs gates" for the boundary.
 
 ## Memory — minimal viable recall
 
@@ -66,7 +68,7 @@ CREATE INDEX idx_turns_ts   ON turns(ts);
 CREATE INDEX idx_turns_tags ON turns(tags);
 ```
 
-Recall is LIKE-based keyword search over `summary` and `tags` with prompt-keyword extraction in shell. No vector search. The SQLite `LIKE` over a few thousand rows is microseconds; if a project ever produces enough history that this becomes slow, that project has outgrown clagentic-lite.
+Recall is keyword search over `summary` and `tags` with prompt-keyword extraction in shell. When SQLite was built with FTS5, candidate rows are filtered with an FTS5 `MATCH`; otherwise, or with `CLAGENTIC_DISABLE_FTS=1`, it falls back to `LIKE`. Either way the filter only decides which rows are candidates; ordering and display are unchanged. No vector search. If a project ever produces enough history that this becomes slow, that project has outgrown clagentic-lite.
 
 ### Recall ordering — pin-first
 
@@ -92,14 +94,7 @@ The goal is to let the user recognize repeated summaries without hiding any row.
 
 ### Defaults
 
-| Variable | Default | Effect |
-|---|---|---|
-| `CLAGENTIC_RECALL_LIMIT` | `5` | Maximum rows returned by `recall` |
-| `CLAGENTIC_RECALL_MAX_CHARS` | `1500` | Hard cap on total injected text; whole rows dropped from the tail |
-
-Non-integer values for either variable fall back silently to the documented default.
-
-Three env vars govern the recall and retention budget (code defaults; override in `~/.config/clagentic/lite/config` or `.clagentic/config`):
+Three variables govern the recall and retention budget (code defaults; override in `~/.config/clagentic/lite/config` or `.clagentic/config`). Non-integer values fall back silently to the documented default.
 
 | Var | Default | Effect |
 |---|---|---|
@@ -125,11 +120,11 @@ The Reviewer never edits files. The Builder never gates its own work. `gates rev
 
 `clagentic-lite gates adversarial` (or the subagent) adds a second pass:
 
-1. Reviewer is reprompted: "you are an attacker. What would you exploit in this diff?"
-2. Builder is reprompted: "the reviewer suggests these attacks. Which are plausible? Which are overstated?"
-3. Both outputs land in `.clagentic/lite/last-adversarial.md`, attached to the PR as a comment.
+1. The Auditor role is prompted, on the same diff the review gate reads: "you are an attacker. What would you exploit in this diff?"
+2. Its output lands in `.clagentic/lite/last-adversarial.md`, and each `[FINDING]` is parsed into `.clagentic/lite/last-adversarial-findings.json` with a `reachable`, `tier` and `class` field (see `docs/GATES.md` Gate 5).
+3. The Merge Gate reads that sidecar; only `tier: blocking` findings can make it refuse. There is no Builder rebuttal step.
 
-This is the demo flourish. It's also genuinely useful, but it's not on the blocking path.
+The pass itself is not on the blocking path. Loop budget: one round.
 
 ## Change class — durability-aware thresholds (lr-4f8316)
 
@@ -156,6 +151,7 @@ Gates review all code as if it ships forever by default. That is usually right, 
 
 ```sh
 llm-client.sh <subcmd>
+# build        stdin = instruction; stdout = builder output (diff or prose)
 # review       stdin = diff;       stdout = JSON findings (reviewer.md schema)
 # summarize    stdin = transcript; stdout = one-line summary (<=200 chars)
 # adversarial  stdin = diff;       stdout = markdown attack scenarios
@@ -164,7 +160,7 @@ llm-client.sh <subcmd>
 
 Implementation is **one-shot per call**. Each subcommand resolves the configured chain for its role (`CLAGENTIC_<ROLE>_CMD/_TIER/_CHAIN`), tries each `(cmd, tier)` entry in order, validates the output's schema, and falls through on failure to a degraded envelope marked `"degraded": true`. The gate orchestrator (`scripts/gates.sh`) detects degraded envelopes and blocks rather than treats them as clean reviews.
 
-Per-call timeout is `$CLAGENTIC_LLM_TIMEOUT_SEC` (default 180s) via `timeout` or `gtimeout` — exposed as `$DS_TIMEOUT_CMD` from `scripts/platform.sh`. If neither is available, `$DS_TIMEOUT_CMD` resolves to `ds_timeout_missing`, which fails closed at the point of use: it refuses to run the wrapped command at all and returns a distinct exit status (99) rather than running it unbounded. `clagentic-lite doctor` should be run to install a real timeout binary before any gate or LLM call is attempted on such a host.
+Per-call timeout is `$CLAGENTIC_LLM_TIMEOUT_SEC` (default 180s) via `timeout` or `gtimeout` — exposed as `$DS_TIMEOUT_CMD` from `scripts/platform.sh`. If neither is available, `$DS_TIMEOUT_CMD` resolves to `ds_timeout_missing`, which fails closed at the point of use: it refuses to run the wrapped command at all and returns a distinct exit status (99) rather than running it unbounded. `clagentic-lite init`/`update` warn about the missing binary in their prerequisite sweep; install one before any gate or LLM call is attempted on such a host.
 
 Persistent codex sessions and persistent claude sessions were both considered and deferred. The wall-clock difference between repeated one-shots and one persistent session is small on the cadence clagentic-lite is built for (a few `gates review` calls per coding session, not hundreds), and the persistent path would require either codex's experimental `app-server` or a long-running daemon — both of which violate the no-server constraint.
 
@@ -178,11 +174,11 @@ opt-in turns on/off, verification status, setup walkthroughs), see
 
 Everything above describes the **gate path**: `clagentic-lite gates review`/`ship`/etc. invoking `scripts/llm-client.sh` directly, which resolves `CLAGENTIC_<ROLE>_CMD/_TIER/_CHAIN` and dispatches to the right CLI. That path honors per-role CLI selection correctly today.
 
-There is a second, structurally different path: a Claude Code session dispatching a subagent (Reviewer, Auditor, …) mid-conversation via its own Agent/Task tool — e.g. the user asking "review this diff" inline, or a workflow that invokes the Reviewer agent directly rather than through `clagentic-lite gates review`. On that path, `CLAGENTIC_REVIEWER_CMD=codex` is silently **ignored**: Claude Code dispatches the subagent using its own session model, because clagentic-lite has no interception point on that request at all. clagentic-lite is not Claude Code's parent process — there is nothing to intercept a request Claude Code sends directly to `api.anthropic.com`. A startup-time `export CLAGENTIC_REVIEWER_CMD=codex` reaches the gate-path shell scripts; it never reaches Claude Code's own outbound HTTP client.
+There is a second, structurally different path (the "Agent path"; see "Two model paths" above): a Claude Code session dispatching a subagent (Reviewer, Auditor, …) mid-conversation via its own Agent/Task tool — e.g. the user asking "review this diff" inline, or a workflow that invokes the Reviewer agent directly rather than through `clagentic-lite gates review`. On that path, `CLAGENTIC_REVIEWER_CMD=codex` is silently **ignored**: Claude Code dispatches the subagent using its own session model unless the agent file names one, because clagentic-lite has no interception point on that request at all. Pinning a plain Claude model for that dispatch needs no router: `CLAGENTIC_<ROLE>_AGENT_MODEL` writes a `model:` line into the rendered agent file. The router is for the different goal of sending a dispatched agent to a non-default backend or chain. clagentic-lite is not Claude Code's parent process — there is nothing to intercept a request Claude Code sends directly to `api.anthropic.com`. A startup-time `export CLAGENTIC_REVIEWER_CMD=codex` reaches the gate-path shell scripts; it never reaches Claude Code's own outbound HTTP client.
 
 [clagentic-router](https://github.com/clagentic/clagentic-router) — a separate, optionally-run local proxy, not part of clagentic-lite itself — closes this gap through the one channel that *does* reach an interactive session: Claude Code's own `settings.json` `env` block, specifically `ANTHROPIC_BASE_URL` (and the credential variable Claude Code forwards as `Authorization: Bearer <token>`, `ANTHROPIC_AUTH_TOKEN`). When `CLAGENTIC_ROUTER_URL` is set, `clagentic-lite enroll`/`update` stamps that env block into the enrolled repo's `.claude/settings.json`, so every request from that session — gate-path and interactive-path alike — is transparently proxied through the router. In the router's passthrough mode this changes nothing observable; in routed mode (`model: role:<chain-name>`, resolved by the router's own scoring/fallback policy) it gives the interactive path the same per-role CLI selection the gate path already has.
 
-This still cannot make Claude Code itself select a non-default model for a subagent dispatch on its own — the router only controls where the request is SENT once Claude Code decides to send one. Reaching per-subagent model selection additionally requires the subagent's own frontmatter to carry a `model:` value the router recognizes as a routed reference (`role:reviewer-chain`). Whether Claude Code's subagent dispatch machinery actually honors a non-standard `model:` string in frontmatter, rather than silently falling back to the parent session's model, is UNVERIFIED from this codebase — see `docs/ROUTER.md` § "Agent-model injection (UNVERIFIED)" § "Verifying on your machine" for the exact steps to confirm or refute this on a machine that can drive a real interactive session, and for how `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` is gated separately from the (verified-safe) settings.json passthrough so that turning on the router does not implicitly gamble on this open question.
+This still cannot make Claude Code itself select a non-default model for a subagent dispatch on its own — the router only controls where the request is SENT once Claude Code decides to send one. Reaching per-subagent model selection additionally requires the subagent's own frontmatter to carry a `model:` value the router recognizes as a routed reference (`role:reviewer-chain`). Whether Claude Code's subagent dispatch machinery actually honors a non-standard `model:` string in frontmatter, rather than silently falling back to the parent session's model, is UNVERIFIED from this codebase — see `docs/ROUTER.md` § 2 ("agent-model injection (UNVERIFIED)"), "Verifying on your machine", for the exact steps to confirm or refute this on a machine that can drive a real interactive session, and for how `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL` is gated separately from the (verified-safe) settings.json passthrough so that turning on the router does not implicitly gamble on this open question.
 
 A third key, `CLAGENTIC_ROUTER_BEDROCK_MODE=1`, additionally stamps `ANTHROPIC_BEDROCK_BASE_URL`/`AWS_BEARER_TOKEN_BEDROCK` alongside the direct-API pair — required because `CLAUDE_CODE_USE_BEDROCK=1` sessions ignore `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` entirely and speak the AWS Bedrock Runtime wire protocol instead, so `CLAGENTIC_ROUTER_URL` alone is silently inert for such a session (`lr-4af4c4`). Both pairs are stamped together, not one instead of the other, since a single `settings.json` may be opened by sessions in either auth mode.
 
@@ -194,7 +190,7 @@ Because `CLAGENTIC_ROUTER_URL` redirects the entire session's traffic (and, in p
 
 A third, distinct integration point from the two above (both of which affect an *interactive* Claude Code session). `CLAGENTIC_<ROLE>_VIA_ROUTER=1`, scoped to exactly `reviewer`/`auditor`, makes `scripts/llm-client.sh`'s `walk_chain` POST to `${CLAGENTIC_ROUTER_URL}/v1/messages` (`invoke_router`, model `role:<role>-chain`) instead of shelling out to `CLAGENTIC_<ROLE>_CMD` for that role's gate-path calls. Unset (either the per-role key or `CLAGENTIC_ROUTER_URL`) leaves this path byte-for-byte inert — the pre-existing direct-CLI chain runs unmodified.
 
-**Builder and Merge-Gate are both deliberately excluded, for the same reason (`lr-250d9d` for Merge-Gate, correcting `lr-02f048`).** Both hold unrestricted Bash and do real multi-turn agentic tool-calling; every clagentic-router adapter currently declares `SupportsTools=false` (`lr-be9454`), so a tool-bearing routed request gets refused (422), not silently degraded — a defense Builder/Merge-Gate never even reach, since `_llm_role_routable` never routes them in the first place. `lr-02f048` originally included Merge-Gate in the routable set on the claim that all three roles were "already tool-restricted and single-shot" on both CLI carriers — true for Reviewer/Auditor, false for Merge-Gate: `ds_llm_role_is_bash_unrestricted` (`scripts/platform.sh`) returns `true` for `gate`, meaning its direct-CLI invocation holds full, unrestricted Bash (the same predicate `invoke_claude` consults to skip the `--allowedTools`/`--disallowedTools` restriction for it). Routing it would have silently converted a Bash-capable, multi-turn merge-authorization step into a one-shot, tool-free text completion, logged as an ordinary `pass` row indistinguishable from a full-capability run — `invoke_router` never sends a `tools` key on the wire (see "Repo-scoping" below), so nothing in the response would have surfaced the loss either. A loud-but-still-routable fix (a stderr warning, a distinct audit outcome on the capability loss) was considered and rejected: it would tell an operator, after the fact, that a merge had already been authorized by a gate that could not run Bash — on the one gate whose entire job is the final authorization before code lands on the default branch. Fail-closed wins here for the identical reason it already won for Builder: exclusion from the routable set, not a label on the degradation. Reviewer/Auditor are already tool-restricted and single-shot on both CLI carriers (`invoke_claude`'s `--allowedTools`/`--disallowedTools`, `invoke_codex`'s `--disable shell_tool -s read-only`) and never send a `tools` field either way, so routing them carries no tool-drop risk.
+**Builder and Merge-Gate are both deliberately excluded, for the same reason (`lr-250d9d` for Merge-Gate, correcting `lr-02f048`).** Both hold unrestricted Bash and do real multi-turn agentic tool-calling on the direct-CLI path. The router refuses a tool-bearing routed request (422 `no_tool_capable_backend`) unless the chain resolves to a tool-capable backend, and its CLI-subprocess adapters (`claude_cli`, `codex_cli`, `codex_subagent`, `gemini_cli`) declare no tool support, so a chain built from them cannot carry either role. That is a defense Builder/Merge-Gate never reach here, since `_llm_role_routable` never routes them in the first place, and clagentic-lite does not define or verify a tool-capable chain for them. `lr-02f048` originally included Merge-Gate in the routable set on the claim that all three roles were "already tool-restricted and single-shot" on both CLI carriers — true for Reviewer/Auditor, false for Merge-Gate: `ds_llm_role_is_bash_unrestricted` (`scripts/platform.sh`) returns `true` for `gate`, meaning its direct-CLI invocation holds full, unrestricted Bash (the same predicate `invoke_claude` consults to skip the `--allowedTools`/`--disallowedTools` restriction for it). Routing it would have silently converted a Bash-capable, multi-turn merge-authorization step into a one-shot, tool-free text completion, logged as an ordinary `pass` row indistinguishable from a full-capability run — `invoke_router` never sends a `tools` key on the wire (see "Repo-scoping" below), so nothing in the response would have surfaced the loss either. A loud-but-still-routable fix (a stderr warning, a distinct audit outcome on the capability loss) was considered and rejected: it would tell an operator, after the fact, that a merge had already been authorized by a gate that could not run Bash — on the one gate whose entire job is the final authorization before code lands on the default branch. Fail-closed wins here for the identical reason it already won for Builder: exclusion from the routable set, not a label on the degradation. Reviewer/Auditor are already tool-restricted and single-shot on both CLI carriers (`invoke_claude`'s `--allowedTools`/`--disallowedTools`, `invoke_codex`'s `--disable shell_tool -s read-only`) and never send a `tools` field either way, so routing them carries no tool-drop risk.
 
 **Repo-scoping via `working_dir` (lr-4a6268).** `invoke_router`'s request body carries `working_dir: <REPO_ROOT>` (this file's own module-level `REPO_ROOT`, the same value every other repo-scoped read in `scripts/llm-client.sh` uses) — the consumer-side fix for a measured silent quality regression where a routed Reviewer/Auditor call reached the model with the diff text only and no filesystem access to the repo under review (upstream cause: clagentic-router's `codex_cli` adapter never set the spawned subprocess's cwd, fixed as `lr-009423`). A router that rejects `working_dir` (4xx, per its own fail-loud `ResolveWorkingDir` validator) is surfaced with a distinctly labeled diagnostic, never silently folded into a generic non-200 hint — but remains non-blocking for the gate, falling through to Layer 2 like any other `invoke_router` failure. Routed mode is still one-shot text-in/text-out with no tool loop, so this is not equivalent to the direct-CLI path's real multi-turn filesystem access. See `docs/ROUTER.md` § "Repo-scoping via `working_dir`" for the full operator-facing account, including the measured before/after impact.
 
@@ -213,9 +209,10 @@ A third, distinct integration point from the two above (both of which affect an 
 `scripts/platform.sh` is sourced by every script and exports:
 
 - `DS_SED_INPLACE` — `-i` on GNU sed, `-i ''` on BSD sed
-- `DS_DATE_ISO` — `date -Iseconds` (GNU) or `date -u +%Y-%m-%dT%H:%M:%SZ` (BSD)
-- `DS_STAT_MTIME` — `stat -c %Y` (GNU) or `stat -f %m` (BSD)
-- `DS_OS` — `linux` (incl. WSL) or `darwin`
+- `ds_date_iso` — `date -Iseconds` (GNU) or `date -u +%Y-%m-%dT%H:%M:%SZ` (BSD)
+- `ds_stat_mtime` — `stat -c %Y` (GNU) or `stat -f %m` (BSD)
+- `DS_OS` — `linux`, `darwin` or `unknown`; `DS_WSL` — `1` under WSL
+- `$DS_TIMEOUT_CMD` — `timeout`/`gtimeout`, failing closed when neither exists (see `docs/PORTABILITY.md`)
 
 Hooks call only POSIX sh + the shims. No `bash-4` features (associative arrays, `${var^^}`, etc.). Verified by `sh -n` syntax check + `scripts/smoke.sh --quick` local run; not gated by hosted CI.
 
@@ -227,9 +224,9 @@ Every gate run inserts one row into `.clagentic/lite/audit.db`:
 CREATE TABLE gate_runs (
   id INTEGER PRIMARY KEY,
   ts TEXT NOT NULL,
-  gate TEXT NOT NULL,        -- 'secrets' | 'sast' | 'deps' | 'review' | 'adversarial' | 'bash-guard' | 'write-guard'
-  outcome TEXT NOT NULL,     -- 'pass' | 'block' | 'warn' | 'skip'
-  details TEXT,              -- JSON
+  gate TEXT NOT NULL,        -- e.g. 'secrets' | 'sast' | 'deps' | 'bleed' | 'review' | 'adversarial' | 'merge-gate' | 'bash-guard' | 'write-guard' | 'llm-call' (open-ended)
+  outcome TEXT NOT NULL,     -- e.g. 'pass' | 'block' | 'warn' | 'skip' | 'degraded' (open-ended)
+  details TEXT,              -- free text, not JSON
   session_id TEXT,
   branch TEXT
 );
@@ -241,9 +238,9 @@ CREATE TABLE gate_runs (
 
 The tool is cloned once to `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). The tool's own repo is never the thing under gates by default — `clagentic-lite enroll --self` is the dogfood escape hatch.
 
-Per-repo footprint is `.clagentic/lite/{audit.db,memory.db}`, thin shims in `.git/hooks/` that call back to `$CLAGENTIC_LITE_HOME/scripts/`, and a `.claude/` directory containing a generated `settings.json` (with absolute hook paths pointing to `$CLAGENTIC_LITE_HOME/.claude/hooks/`) plus symlinks to `$CLAGENTIC_LITE_HOME/.claude/{commands,agents}`. The `.claude/` directory is added to the project's `.gitignore` automatically. Update the tool once; every enrolled repo picks up the new version automatically because the hook scripts and the symlinked commands/agents resolve back to `$CLAGENTIC_LITE_HOME`.
+Per-repo footprint is `.clagentic/lite/{audit.db,memory.db}`, thin shims in `.git/hooks/` that call back to `$CLAGENTIC_LITE_HOME/scripts/`, and a `.claude/` directory containing a generated `settings.json` (with absolute hook paths pointing to `$CLAGENTIC_LITE_HOME/.claude/hooks/`) plus a symlink to `$CLAGENTIC_LITE_HOME/.claude/commands`. The `.claude/` directory is added to the project's `.gitignore` automatically. The role agents and the two skills are not copied into repos: they are installed once, globally, as the `clagentic-lite` Claude Code plugin. Update the tool once; every enrolled repo picks up the new version automatically because the hook scripts and the symlinked commands resolve back to `$CLAGENTIC_LITE_HOME`, and the plugin is re-rendered by `update`.
 
-`bin/clagentic-lite` is the CLI entry point. It dispatches `init` (setup + symlink), `enroll` (hook stamp + DB init + register), `unenroll` (remove clagentic-owned hooks + deregister), `list` (enrolled status table), `doctor` (diagnostics punch list), and `update` (ff-only pull + re-stamp).
+`bin/clagentic-lite` is the CLI entry point. It dispatches `init` (setup, hook materialization, symlink, plugin install), `enroll` (hook stamp + DB init + register), `unenroll` (remove clagentic-owned hooks + deregister), `list` (enrolled status table), `doctor` (diagnostics), `rotate` (re-stamp router tokens), `update` (ff-only pull, prereqs, re-stamp, plugin re-render; `--restamp`, `--refresh-config`), `recall`/`remember` (session memory), `show` (recent memory or gate rows), `export` (HTML report), and `gates` (a proxy to `scripts/gates.sh`).
 
 Project root isolation: `gates.sh`, `memory.sh`, and `llm-client.sh` resolve the project root via `CLAGENTIC_PROJECT_ROOT` env var when set, falling back to `git rev-parse --show-toplevel` of cwd. Hook shims run from inside the enrolled repo's working tree, so git show-toplevel finds the enrolled project automatically without the shim needing to know the path at stamp time.
 
@@ -296,6 +293,6 @@ No `eject` subcommand and no schema bridge are provided, and none are planned. T
 
 ## Open design questions
 
-- **Summarizer cost control:** spark-tier model is fine for one-paragraph summaries, but a chatty session could rack up calls. Add a debounce (`Stop` fires often) — only summarize after N seconds of quiet. Implementation deferred to weekend 2.
+- **Summarizer cost control:** the Stop hook is debounced (`CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC`), but a very chatty session can still rack up cheap-tier calls. Revisit if it shows up in the audit trail.
 - **Adversarial loop budget:** how many rounds before declaring "the model isn't finding new issues"? Currently capped at 1. Revisit after first real use.
 - **Cross-platform sqlite3:** macOS ships an old SQLite. Document `brew install sqlite` as a soft requirement; test on the macOS-default version anyway.

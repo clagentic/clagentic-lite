@@ -8,19 +8,18 @@ It is **not** tested on bare Windows (no WSL), on Alpine, or on BSDs other than 
 
 ## The portability strategy in one paragraph
 
-Every script that uses `sed`, `date`, `stat`, or `find` sources `scripts/platform.sh`, which detects GNU vs BSD at load time and exports shims (`DS_SED_INPLACE`, `DS_DATE_ISO`, `DS_STAT_MTIME`, `DS_FIND_DELETE`). Scripts use the shims. No script directly invokes the bare tool flag where it differs across platforms.
+Every script that uses `sed`, `date`, `stat`, or a timeout sources `scripts/platform.sh`, which detects GNU vs BSD at load time and provides shims (`DS_SED_INPLACE`, `ds_date_iso`, `ds_stat_mtime`, `$DS_TIMEOUT_CMD`). Scripts use the shims rather than invoking the bare tool flag where it differs across platforms.
 
 ## Known footguns
 
 | Issue | WSL/Linux | macOS | Our shim |
 |---|---|---|---|
 | `sed -i` | `sed -i 's/x/y/' f` | requires backup suffix: `sed -i '' 's/x/y/' f` | `sed $DS_SED_INPLACE` |
-| `date -Iseconds` | works | not portable; use `date -u +%FT%TZ` | `$DS_DATE_ISO` |
-| `stat -c %Y` | works | macOS uses `stat -f %m` | `$DS_STAT_MTIME` |
-| `find -delete` | works | works in modern macOS but not all BSD | `$DS_FIND_DELETE` |
+| `date -Iseconds` | works | not portable; use `date -u +%FT%TZ` | `ds_date_iso` |
+| `stat -c %Y` | works | macOS uses `stat -f %m` | `ds_stat_mtime` |
 | `grep -P` | Perl regex | not supported on BSD grep | avoided; use POSIX or `awk` |
 | `xargs -I {}` | works | works but flag order is finicky | explicit `sh -c` wrappers |
-| `readlink -f` | works | not on macOS by default | shimmed via `cd && pwd` |
+| `readlink -f` | works | older macOS lacks `-f` | `ds_realpath` (`bin/clagentic-lite`): `realpath`, then `python3 os.path.realpath`, then `cd && pwd`; the CLI's own bootstrap adds a manual `readlink` hop loop |
 | `mktemp -d -t` | template optional | template required | always provide template |
 | `timeout` | GNU coreutils default | not installed by default; `brew install coreutils` provides `gtimeout` | `$DS_TIMEOUT_CMD` (detects `timeout`, falls back to `gtimeout`; if neither exists, resolves to `ds_timeout_missing`, which FAILS CLOSED — refuses to run the wrapped command unbounded and returns exit 99 with an install hint, rather than silently running without a bound. See AGENTS.md Invariants, INV-1a.) |
 | JSON parsing in hooks | `jq` or `python3` | `jq` or `python3` (python3 ships on modern macOS) | `ds_json_field` helper in `scripts/platform.sh`. **Required** — hooks fail closed without either. |
@@ -34,7 +33,7 @@ You can install bash 5 on macOS via Homebrew (`brew install bash`) but clagentic
 
 ## SQLite version
 
-macOS ships SQLite ~3.43; Ubuntu 24.04 ships ~3.45. clagentic-lite uses only features available since 3.35. No JSON1 dependency, no FTS5, no window functions.
+macOS ships SQLite ~3.43; Ubuntu 24.04 ships ~3.45. clagentic-lite uses only features available since 3.35, with no JSON1 dependency and no window functions. FTS5 is optional: `memory.sh` creates the `turns_fts` index only when the installed SQLite was built with it, and recall falls back to `LIKE` otherwise (or when `CLAGENTIC_DISABLE_FTS=1`).
 
 ## Filesystem watching
 
@@ -49,13 +48,13 @@ If macOS users have Homebrew GNU tools on PATH ahead of system tools, clagentic-
 ## What we deliberately don't do
 
 - Shell out to anything Node-only on the harness side (examples are fine; the harness itself is POSIX sh + sqlite + a small `python3 -c` for JSON parsing where shell isn't safe).
-- Assume `gh` (GitHub CLI). `gates ship` uses `gh` if present and falls back to printing the PR URL template.
+- Assume `gh` (GitHub CLI). `gates ship` uses `gh` if present (the GitHub adapter in `scripts/host-adapter.sh`) and otherwise prints the base branch, head branch and remote so you can open the PR yourself.
 
 ## What we DO require
 
 - `jq` **or** `python3` for JSON parsing in PreToolUse hooks. The previous `sed`-based JSON parser was a known security bypass surface (escaped-quote truncation). Without a real validator the hooks fail closed and block every Bash/Write/Edit tool call. `clagentic-lite doctor` flags this as a hard miss.
-- `sqlite3` for the memory and audit databases. macOS ships an old SQLite; we use only features available since 3.35 (no JSON1, no FTS5, no window functions).
-- `timeout` or `gtimeout` for LLM-call timeouts. If absent, `$DS_TIMEOUT_CMD` resolves to `ds_timeout_missing`, which **fails closed**: it refuses to run the wrapped command at all and returns exit 99, rather than running it unbounded (see the `timeout` row above and AGENTS.md Invariants, INV-1a). `clagentic-lite doctor` flags a missing `timeout`/`gtimeout` so you can install one before this bites you.
+- `sqlite3` for the memory and audit databases. macOS ships an old SQLite; we use only features available since 3.35 (no JSON1, no window functions; FTS5 optional, see above).
+- `timeout` or `gtimeout` for LLM-call timeouts. If absent, `$DS_TIMEOUT_CMD` resolves to `ds_timeout_missing`, which **fails closed**: it refuses to run the wrapped command at all and returns exit 99, rather than running it unbounded (see the `timeout` row above and AGENTS.md Invariants, INV-1a). `clagentic-lite init` and `update` warn about a missing `timeout`/`gtimeout` in their prerequisite sweep, so you can install one before this bites you.
 
 ## Shell idioms in bin/clagentic-lite
 
@@ -63,11 +62,10 @@ If macOS users have Homebrew GNU tools on PATH ahead of system tools, clagentic-
 
 | Pattern | Why |
 |---|---|
-| `ds_realpath` (in platform.sh) | `readlink -f` is not on macOS by default. Shims via `realpath` if present, `python3 os.path.realpath` fallback, then `cd && pwd + basename` POSIX fallback. |
-| `python3 -c "import os; os.makedirs(...)"` | `mkdir -p` is POSIX but cannot set permissions atomically. Python `makedirs` accepts a mode argument. Used for `~/.config/clagentic/`, `~/.local/state/clagentic/`, and per-repo `.clagentic/`. |
-| `python3 -c "import os; print(os.readlink(...))"` | `readlink` with no flags is POSIX but output varies; Python `os.readlink` is unambiguous. Used by `clagentic-lite doctor` to verify the symlink target. |
-| `python3 -c "import shutil; shutil.rmtree(...)"` | `rm -rf` is POSIX but the path argument handling on edge cases (trailing slash, non-existent) varies. Python `shutil.rmtree` is predictable. Used by `clagentic-lite unenroll --purge`. |
-| `awk` for in-place config edits | `sed -i` portability issues are already in the table above. `awk` with a temp file and `mv` is portable and handles values that contain `/` or other sed metacharacters. |
+| `ds_realpath` (in `bin/clagentic-lite`) | `readlink -f` is not on macOS by default. Uses `realpath` if present, `python3 os.path.realpath` fallback, then `cd && pwd + basename` POSIX fallback. |
+| `awk` for in-place edits | `sed -i` portability issues are already in the table above. `awk` with a temp file and `mv` is portable and handles values that contain `/` or other sed metacharacters (config merges, the plugin render's `model:` line insertion). |
+| `( umask 077 && : > file )` | Creates a config-bearing temp file at mode 600 in one syscall, instead of a `> file` followed by `chmod` with a window between them. POSIX sh only; no GNU/BSD difference. |
+| `python3 -c` for JSON export | `clagentic-lite export` builds its JSON with `python3`; everything else in the CLI avoids it except as a `ds_realpath` fallback. |
 
 ## Quick verify
 
@@ -75,4 +73,4 @@ If macOS users have Homebrew GNU tools on PATH ahead of system tools, clagentic-
 clagentic-lite doctor
 ```
 
-Prints what it found, what's missing, and a numbered punch list for any broken items. Exits 0 if clean, non-zero if any check fails.
+Prints an `OK`/`FAIL`/`WARN` line per check and a summary count. Exits 0 if no check failed, non-zero if any did (`WARN` lines are advisory and do not affect the exit status).

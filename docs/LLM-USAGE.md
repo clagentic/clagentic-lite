@@ -89,19 +89,23 @@ fi
 ```
 
 This one snippet is safe to re-run: fresh machine → clones; machine that
-already has it → pulls and re-runs `init` (this is exactly what
-`clagentic-lite update` also does under the hood).
+already has it → pulls and re-runs `init`. After the first install, the
+steady-state upgrade is `clagentic-lite update` (pull, prereq check, restamp,
+plugin re-render), not this snippet.
 
 `init` does, in order (verified against `cmd_init()`, `bin/clagentic-lite`):
 
 1. Verifies `$CLAGENTIC_LITE_HOME` looks like a real checkout (checks for
    `scripts/gates.sh`) — refuses with a clear error if not.
-2. Detects missing required tools (`sqlite3`, `git`, `jq`-or-`python3`, an LLM
-   CLI) and offers to install each one for you (`y`/`N` prompt); on decline,
-   prints the exact manual install command and exits non-zero.
-3. Materializes the Claude Code lifecycle hook scripts into
+2. Materializes the Claude Code lifecycle hook scripts into
    `$CLAGENTIC_LITE_HOME/.claude/hooks/` — this is the ONE shared copy every
    later-enrolled repo's hooks call back into.
+3. Detects missing required tools (`sqlite3`, `git`, `jq`-or-`python3`) and the
+   security scanners, and offers to install each one for you (`y`/`N`
+   prompt); on decline, prints the exact manual install command, reports how
+   many required tools are still missing, and carries on. With
+   `CLAGENTIC_STRICT_PREFLIGHT=1` a missing required tool makes `init` exit
+   non-zero instead.
 4. Runs a two-question front door (accept defaults? which vendor mode?) and
    writes `~/.config/clagentic/lite/config` (global config, `chmod 600`).
 5. Symlinks `~/.local/bin/clagentic-lite` → `$CLAGENTIC_LITE_HOME/bin/clagentic-lite`
@@ -144,8 +148,9 @@ The settings a user is most likely to need to change, and where they live:
 | Setting | Default | What it controls |
 |---|---|---|
 | `CLAGENTIC_LITE_HOME` | `~/.clagentic/lite` | Where the tool itself lives. Set once by `init`; edit only if you move the install. |
-| `CLAGENTIC_BUILDER_CMD` / `_TIER` / `_CHAIN` | `claude` / `default` / `codex:default,claude:flagship` | Which CLI writes code. |
-| `CLAGENTIC_REVIEWER_CMD` / `_TIER` / `_CHAIN` | `codex` / `flagship` / `claude:default,codex:flagship` | Which CLI reviews the diff — deliberately a **different vendor** than the Builder by default (cross-vendor review is the point of the tool; same-CLI is allowed but `init` warns). |
+| `CLAGENTIC_BUILDER_CMD` / `_TIER` / `_CHAIN` | `claude` / `default` / `codex:default,claude:flagship` | Which CLI and model the **CLI/hook path** uses for the Builder role (`llm-client.sh build`). Not the Agent-tool Builder; see "Two model paths" below. |
+| `CLAGENTIC_REVIEWER_CMD` / `_TIER` / `_CHAIN` | `codex` / `flagship` / `claude:default,codex:flagship` | Which CLI reviews the diff on the **CLI/hook path** (`gates review`) — deliberately a **different vendor** than the Builder by default (cross-vendor review is the point of the tool; same-CLI is allowed but `init` warns). Same for `AUDITOR`, `GATE` and `SUMMARIZER` keys in `share/config.example`. |
+| `CLAGENTIC_BUILDER_AGENT_MODEL` (and `_TROUBLESHOOTER_`, `_REVIEWER_`, `_AUDITOR_`, `_GATE_`) | unset | The model the **Agent path** runs that role on (Claude Code dispatching `clagentic-lite:<role>`). Unset = the session model. |
 | `CLAGENTIC_BLOCK_SEVERITY` | `high` | Review-finding severity that blocks `gates ship`. |
 | `CLAGENTIC_ALLOW_MISSING_GITLEAKS` / `_OSV` / `_SEMGREP` | `0` (i.e. required) | Set to `1` to run without that specific security scanner installed — see "Minimal install" in README.md. |
 | `CLAGENTIC_REPO_HOST` / `CLAGENTIC_DEFAULT_BRANCH` | `github` / `main` | Where `gates ship` opens PRs and what branch write-guard protects. |
@@ -154,14 +159,60 @@ Config is layered: `~/.config/clagentic/lite/config` (global, applies everywhere
 then `<repo>/.clagentic/config` (per-repo override, optional, committed —
 **note:** not read on the very first `enroll` call for a given repo, only
 from the next command onward; see README.md "What init and enroll do").
-Edit the file directly (it's plain `KEY=value` shell, `chmod 600`) — there is
-no `clagentic-lite config set` subcommand.
+Edit the file directly (it's plain `KEY=value` shell, `chmod 600`); the CLI has
+no subcommand for editing config.
+
+`update` never rewrites an existing config's key set, so keys shipped after
+your `init` are simply absent. `clagentic-lite doctor` names them
+("global config drift"); `clagentic-lite update --refresh-config` appends them
+as commented-out lines without touching anything you set. `init --reconfigure`
+re-prompts but merges: every value you already set is kept.
 
 **Verify a config change took effect:**
 
 ```sh
-clagentic-lite doctor   # re-run after any global config edit; reports current CMD/TIER/CHAIN per role
+clagentic-lite doctor   # re-run after any config edit
 ```
+
+`doctor` reports the Builder/Reviewer CLIs (cross-vendor check), whether the
+rendered plugin is stale, and the effective agent-path model per role. It does
+not print every role's `_TIER`/`_CHAIN`; read the config file for those.
+
+### Two model paths — which keys control which model
+
+A role's model is chosen by one of two independent mechanisms. Setting the
+keys for one does **not** change the other, and this is the most common
+misdiagnosis: a user sets `CLAGENTIC_BUILDER_TIER=default` (or `_CMD`) and
+expects a Builder dispatched from Claude Code to change model. It does not.
+
+| | Gate/CLI path | Agent path |
+|---|---|---|
+| What runs it | `gates review\|adversarial\|merge-gate\|ship`, git hooks, Claude Code lifecycle hooks (Stop-hook summaries), all through `scripts/llm-client.sh` | The Claude Code Agent tool dispatching `clagentic-lite:<role>` |
+| Roles | builder, reviewer, auditor, merge-gate (`GATE`), summarizer | builder, reviewer, auditor, merge-gate, troubleshooter |
+| Model comes from | `CLAGENTIC_<ROLE>_CMD` / `_TIER` / `_CHAIN`, resolved through the `CLAGENTIC_MODEL_<CLI>_<TIER>` table; optionally routed through clagentic-router | The session model, unless the rendered agent file has a `model:` line |
+| Set it with | the `_CMD`/`_TIER`/`_CHAIN` keys (every role) | `CLAGENTIC_<ROLE>_AGENT_MODEL` (every role), or router injection (reviewer/auditor/merge-gate only) |
+| CLIs | claude, codex, or any CLI with an `invoke_<cli>` | Claude Code only. codex/gemini users are unaffected; use the CLI-path keys |
+
+Things to tell the user when they ask about models:
+
+- `CLAGENTIC_<ROLE>_AGENT_MODEL` takes a Claude Code model alias, a full model
+  ID, or `inherit`. Unset means the agent runs on the session model. Letters,
+  digits and `. _ : / @ [ ] -` only; anything else is ignored with a warning
+  and a `doctor` finding.
+- Precedence per role: router injection (`CLAGENTIC_ROUTER_INJECT_AGENT_MODEL`,
+  reviewer/auditor/merge-gate only) beats `_AGENT_MODEL`, which beats no
+  `model:` line. `doctor` says when an `_AGENT_MODEL` key is shadowed.
+- A bare alias (`sonnet`, `opus`, `haiku`) resolves to whatever Claude Code
+  treats as the default for the **active backend**. On Bedrock or Vertex that
+  can lag the newest model, so prefer the full model ID your account can use
+  there. Never copy a model ID from documentation or another machine; ask the
+  user which one their backend accepts.
+- The value takes effect after `clagentic-lite update` re-renders the plugin;
+  until then `doctor` shows a stale render stamp.
+- `CLAGENTIC_<ROLE>_CMD`, `_TIER` and `_CHAIN` never affect an Agent-tool
+  dispatch, for any role: `CLAGENTIC_REVIEWER_CMD=codex` does not make the
+  Reviewer subagent run on codex. Only `_AGENT_MODEL` or router injection
+  does. See "Optional: clagentic-router" below for the router side.
 
 ---
 
@@ -296,9 +347,10 @@ nothing to say, which is correct behavior, not a bug.
 
 If the user asks about routing interactive Claude Code subagent dispatch
 (Reviewer/Auditor/etc. invoked mid-session via the Task/Agent tool, as opposed
-to via `clagentic-lite gates review`) through a specific CLI/vendor —
-`CLAGENTIC_REVIEWER_CMD` alone does NOT reach that path; only the gate-path
-commands honor it directly.
+to via `clagentic-lite gates review`) through a specific CLI/vendor — that is
+the Agent path (see "Two model paths" above): `CLAGENTIC_<ROLE>_CMD` does not
+reach it. If the user only wants a different Claude model for a role, set
+`CLAGENTIC_<ROLE>_AGENT_MODEL`; no router is needed.
 
 **clagentic-router is a separate GitHub repository
 (<https://github.com/clagentic/clagentic-router>), not part of this repo, not
@@ -338,9 +390,9 @@ passthrough mode. Do not suppress or silently pass through that warning;
 surface it to the user verbatim.
 
 Do not enable `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=1` without reading
-`docs/ROUTER.md`'s "Agent-model injection (UNVERIFIED)" section first —
+`docs/ROUTER.md` section 2 ("agent-model injection (UNVERIFIED)") first —
 this feature's core mechanism (Claude Code honoring a non-standard
-`model:` frontmatter value) is explicitly unverified upstream.
+`model:` frontmatter value) is explicitly unverified.
 
 There is also a third, independent opt-in — `CLAGENTIC_<ROLE>_VIA_ROUTER`,
 which routes the gate path (`clagentic-lite gates review`/`ship`) rather

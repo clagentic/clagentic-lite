@@ -165,11 +165,11 @@ CLAGENTIC_SUMMARIZER_CHAIN=codex:spark
 # CLAGENTIC_GATE_REQUIRED=0
 
 # ---------- gates ----------
-# Comma-separated list of gates to run on /ship. Omit to run all.
+# Comma-separated list of gates to run on `gates ship`. Omit to run all.
 # Available: secrets,deps,sast,review,adversarial,merge-gate
 CLAGENTIC_GATES=secrets,deps,sast,review,adversarial,merge-gate
 
-# Severity threshold for blocking on /review findings.
+# Severity threshold for blocking on `gates review` findings.
 # Values: low | medium | high | critical
 CLAGENTIC_BLOCK_SEVERITY=high
 
@@ -285,7 +285,7 @@ CLAGENTIC_LLM_TIMEOUT_AUTO_SCALE=1
 CLAGENTIC_CLAUDE_BARE=0
 
 # Merge Gate: blocking by default. Set to 0 to make it advisory (the gate
-# still runs and logs, but a 'refuse' decision won't stop /ship).
+# still runs and logs, but a 'refuse' decision won't stop `gates ship`).
 CLAGENTIC_MERGE_GATE_BLOCKING=1
 
 # Fail-closed overrides for missing deterministic security tools. The default
@@ -418,7 +418,11 @@ CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 # CLAGENTIC_SAST_DOMAIN_EXTRA_GLOBS=
 
 # ---------- repo host ----------
-# github | gitlab | gitea | none
+# Which host adapter `gates ship` uses to open the PR (and to post the review
+# verdict comment). `github` (needs the `gh` CLI, authenticated) is the only
+# adapter shipped. Any other value, or `none`, falls back to sniffing the
+# origin remote for github.com and, failing that, to printing "open a PR
+# manually" with the base/head/remote; the gates themselves are unaffected.
 CLAGENTIC_REPO_HOST=github
 
 # Default branch (assumed protected — writes blocked by pre-write-guard).
@@ -533,7 +537,7 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # the review findings array, cmd_render_review's terminal output ("reported
 # N rounds running — decide"), and the audit trail (gate='review-recurrence'
 # row with demoted:N threshold:T). This is a THRESHOLD change, never
-# suppression — nothing is hidden or dropped, only whether it can gate /ship
+# suppression — nothing is hidden or dropped, only whether it can gate `gates ship`
 # on its own.
 #
 # Runs only when CLAGENTIC_CROSS_ROUND_DEDUP=1 (the same flag gates both —
@@ -744,14 +748,17 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # role:<role>-chain in frontmatter, chain names matching clagentic-router's
 # router.example.yaml) and installs THAT rendered plugin instead of the
 # checked-in one — checked-in agent .md files under plugins/clagentic-lite/
-# are never modified on disk.
+# are never modified on disk. It wins over CLAGENTIC_<ROLE>_AGENT_MODEL for
+# the roles it applies to (a role is injected only when its own
+# CLAGENTIC_<ROLE>_CMD is non-claude); for a plain Claude model instead of a
+# router chain, use CLAGENTIC_<ROLE>_AGENT_MODEL in the agent-path section.
 #
 # UNVERIFIED: whether Claude Code actually honors a subagent frontmatter
 # `model:` field set to a non-standard string like "role:reviewer-chain" —
 # vs. silently ignoring it and falling back to the parent session's model —
 # has NOT been confirmed against a live interactive session from this
-# codebase (claude-code GH#44385 territory; see README "Verifying on your
-# machine" for the exact steps to confirm or refute this on a real machine).
+# codebase (claude-code GH#44385 territory; see docs/ROUTER.md "Verifying on
+# your machine" for the exact steps to confirm or refute this on a real machine).
 # Leave this key unset until you have run that verification once.
 # CLAGENTIC_ROUTER_INJECT_AGENT_MODEL=0
 
@@ -844,7 +851,7 @@ CLAGENTIC_DEFAULT_BRANCH=main
 #     the same gate-path call instead BLANKS ANTHROPIC_BASE_URL,
 #     ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BEDROCK_BASE_URL,
 #     AWS_BEARER_TOKEN_BEDROCK, AND CLAUDE_CODE_USE_BEDROCK (the fifth var
-#     added post-review, PR #200 finding amos.path-choice.4: an ambient
+#     added after PR #200 review: an ambient
 #     CLAUDE_CODE_USE_BEDROCK=1 in the operator's own shell would otherwise
 #     survive into this spawn unblanked and force Bedrock protocol despite
 #     a declared direct-API mode), so a CLAGENTIC_ROUTER_URL settings.json
@@ -898,10 +905,9 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # affects the GATE-PATH one-shot scripts/llm-client.sh call). Scoped to
 # exactly two roles: reviewer, auditor. Builder AND Merge-Gate are both
 # deliberately excluded -- both hold unrestricted Bash and do real
-# multi-turn tool-calling, and every clagentic-router adapter currently
-# declares SupportsTools=false (a routed request carrying tools gets
-# refused with a 422, not silently degraded -- see clagentic-router's own
-# adapter-capability work). Setting CLAGENTIC_GATE_VIA_ROUTER=1 below is a
+# multi-turn tool-calling, and clagentic-router refuses a routed request
+# carrying tools (422) unless its chain resolves to a tool-capable backend,
+# which the CLI-subprocess adapters are not. Setting CLAGENTIC_GATE_VIA_ROUTER=1 below is a
 # harmless no-op, not a working opt-in -- see docs/ROUTER.md §3
 # "Merge-Gate is excluded" (lr-250d9d) for why it stays that way even
 # though the key still exists for doctor to warn about a stale config.

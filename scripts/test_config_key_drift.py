@@ -250,6 +250,71 @@ class TestConfigKeyDrift(unittest.TestCase):
         self.assertEqual(unread, ["CLAGENTIC_FIXTURE_COMMENT_ONLY_KEY"])
 
 
+DOC_FILES = ("README.md", "AGENTS.md", "docs/DESIGN.md", "docs/GATES.md",
+             "docs/LLM-USAGE.md", "docs/PORTABILITY.md", "docs/ROUTER.md",
+             "docs/DEMO-SCRIPT.md")
+
+# Names the docs may mention although no shipped code reads them. Each states
+# why; a doc naming a key that does not exist is otherwise a stale claim.
+DOC_MENTION_ALLOWED = {
+}
+
+
+class TestDocKeyMentions(unittest.TestCase):
+    maxDiff = None
+
+    def test_docs_only_name_keys_that_exist(self):
+        literal, suffixes = keys_read_in_code()
+        documented = keys_in_config_example()
+        dynamic = {f"CLAGENTIC_{r}_{s}" for r in _ROLES for s in suffixes}
+        known = literal | documented | dynamic
+        stale = []
+        for rel in DOC_FILES:
+            with open(os.path.join(TOOL_HOME, rel)) as f:
+                for lineno, line in enumerate(f, 1):
+                    for key in _KEY_RE.findall(line):
+                        if key in known or key in DOC_MENTION_ALLOWED:
+                            continue
+                        if any(p.match(key) for p, _, _ in DYNAMIC_FAMILIES):
+                            continue
+                        stale.append(f"{rel}:{lineno}: {key}")
+        self.assertEqual(stale, [], "docs name CLAGENTIC_* keys that no code or config.example has")
+
+
+# Names of the crew agents that build and review this repo. They belong in
+# git history and PR threads, never in shipped prose (a public repo's docs are
+# read by people who have no idea what they refer to).
+_CREW_NAME_RE = re.compile(
+    r"\b(PEACHES|BOBBIE|HOLDEN|NAOMI|AMOS|MILLER|ASHFORD|AVASARALA|DRUMMER|TIAMUT|PRAX)\b"
+)
+
+
+def crew_names_in(text):
+    return sorted(set(_CREW_NAME_RE.findall(text)))
+
+
+class TestShippedProseHygiene(unittest.TestCase):
+    def _shipped_prose_files(self):
+        out = subprocess.run(
+            ["git", "-C", TOOL_HOME, "ls-files", "plugins", "share/config.example"],
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+        return list(DOC_FILES) + [p for p in out if p.endswith((".md", ".example"))]
+
+    def test_no_crew_agent_names_in_shipped_prose(self):
+        found = []
+        for rel in self._shipped_prose_files():
+            with open(os.path.join(TOOL_HOME, rel)) as f:
+                for lineno, line in enumerate(f, 1):
+                    for name in crew_names_in(line):
+                        found.append(f"{rel}:{lineno}: {name}")
+        self.assertEqual(found, [], "crew agent names in shipped prose")
+
+    def test_detector_fails_on_a_drifted_fixture(self):
+        self.assertEqual(crew_names_in("accepted after PEACHES review"), ["PEACHES"])
+        self.assertEqual(crew_names_in("Miller and Holden are people's names"), [])
+
+
 def _cli_text():
     with open(os.path.join(TOOL_HOME, "bin", "clagentic-lite")) as f:
         return f.read()
@@ -278,9 +343,7 @@ class TestSubcommandDrift(unittest.TestCase):
     subcommands. Docs are checked in the direction that matters to a reader:
     a documented `clagentic-lite <sub>` must exist."""
 
-    DOCS = ("README.md", "AGENTS.md", "docs/DESIGN.md", "docs/GATES.md",
-            "docs/LLM-USAGE.md", "docs/PORTABILITY.md", "docs/ROUTER.md",
-            "docs/DEMO-SCRIPT.md")
+    DOCS = DOC_FILES
 
     @classmethod
     def setUpClass(cls):
