@@ -1,17 +1,19 @@
 # clagentic-lite — global config template.
 # Written to ~/.config/clagentic/lite/config by `clagentic-lite init`.
 # Per-repo .clagentic/config is OPTIONAL and SPARSE — only override keys.
-# Load order: global config, then per-repo .clagentic/config (the later file
-# wins). Both are dot-sourced, so a value in either overrides the same key
-# already exported in your shell.
+# Load order, later wins: (1) this global config, (2) the repo's
+# .clagentic/config, (3) the repo's legacy .env, if one exists (a v0.1 leftover:
+# still honored, never created). All are dot-sourced, so a value in any of them
+# overrides the same key already exported in your shell.
 #
 # GLOBAL-ONLY KEYS: the rendered Claude Code plugin is one per user, so the keys
 # it is built from are read from THIS global file (plus the environment), never
 # from a repo's .clagentic/config: the five CLAGENTIC_<ROLE>_AGENT_MODEL keys,
-# CLAGENTIC_ROUTER_URL, CLAGENTIC_ROUTER_INJECT_AGENT_MODEL, and the role
-# CLAGENTIC_<ROLE>_CMD values that router injection checks. `clagentic-lite
-# doctor` warns when a repo's config sets one. Per-repo _CMD/_TIER/_CHAIN still
-# work per repo on the CLI/hook path.
+# CLAGENTIC_ROUTER_URL, CLAGENTIC_ROUTER_INJECT_AGENT_MODEL, and the reviewer,
+# auditor and gate CLAGENTIC_<ROLE>_CMD while router injection is on (builder and
+# troubleshooter _CMD never affect the render). `clagentic-lite doctor` warns
+# when a repo's config sets one. The per-repo value still applies to the
+# gate/CLI path and is ignored only when rendering the dispatched agents.
 #
 # TIMING: a repo-local .clagentic/config does not take effect until AFTER
 # the repo has been enrolled — it is not read during the very first

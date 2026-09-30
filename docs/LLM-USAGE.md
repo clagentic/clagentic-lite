@@ -155,23 +155,26 @@ The settings a user is most likely to need to change, and where they live:
 | `CLAGENTIC_ALLOW_MISSING_GITLEAKS` / `_OSV` / `_SEMGREP` | `0` (i.e. required) | Set to `1` to run without that specific security scanner installed — see "Minimal install" in README.md. |
 | `CLAGENTIC_REPO_HOST` / `CLAGENTIC_DEFAULT_BRANCH` | `github` / `main` | Where `gates ship` opens PRs and what branch write-guard protects. |
 
-Config is layered: `~/.config/clagentic/lite/config` (global, applies everywhere)
-then `<repo>/.clagentic/config` (per-repo override, optional, committed —
-**note:** not read on the very first `enroll` call for a given repo, only
-from the next command onward; see README.md "What init and enroll do").
-Both files are dot-sourced, so a value in either one also overrides the same
-key already exported in the shell. Edit the file directly (it's plain
+Config is layered, later wins: `~/.config/clagentic/lite/config` (global,
+applies everywhere), then `<repo>/.clagentic/config` (per-repo override,
+optional, committed — **note:** not read on the very first `enroll` call for a
+given repo, only from the next command onward; see README.md "What init and
+enroll do"), then the repo's legacy `<repo>/.env` if one exists (a v0.1
+leftover: still honored, never created). All are dot-sourced, so a value in any
+of them also overrides the same key already exported in the shell. Edit the file directly (it's plain
 `KEY=value` shell, `chmod 600`); the CLI has no subcommand for editing config.
 
 **Global-only keys.** The rendered plugin is one per user, not one per repo, so
 the keys it is built from are read from the **global** config (plus the calling
 environment) only: the five `CLAGENTIC_<ROLE>_AGENT_MODEL` keys,
-`CLAGENTIC_ROUTER_URL`, `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL`, and each role's
-`CLAGENTIC_<ROLE>_CMD` as it feeds router injection. A repo's `.clagentic/config`
-cannot change the rendered plugin; if it sets one of these, `clagentic-lite
-doctor` warns, naming the key and the file, and the value never reaches the
-rendered agents. Put it in the global config. The per-repo `_CMD`/`_TIER`/`_CHAIN`
-keys still work per repo on the CLI/hook path.
+`CLAGENTIC_ROUTER_URL`, `CLAGENTIC_ROUTER_INJECT_AGENT_MODEL`, and the reviewer,
+auditor and gate `CLAGENTIC_<ROLE>_CMD` while router injection is on (the
+builder and troubleshooter `_CMD` never affect the rendered plugin). A repo's
+`.clagentic/config` (or legacy `.env`) cannot change the rendered plugin; if it
+sets one of these, `clagentic-lite doctor` warns, naming the key and the file.
+The per-repo value still applies to the gate/CLI path (`llm-client.sh`) and is
+ignored only when rendering the dispatched agents. To change the dispatched
+agents, put the key in the global config.
 
 `update` never rewrites an existing config's key set, so keys shipped after
 your `init` are simply absent. `clagentic-lite doctor` names them

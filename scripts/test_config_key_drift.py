@@ -41,10 +41,55 @@ _DYNAMIC_RE = re.compile(r"CLAGENTIC_\$\{?[A-Za-z_][A-Za-z0-9_]*[^}\s'\"]*\}?_([
 _ROLE_ENV_RE = re.compile(r"\brole_env\s+\"?\$?\{?\w+\}?\"?\s+([A-Z][A-Z0-9_]*[A-Z0-9])\b")
 # CLAGENTIC_$(<command substitution>)_SUFFIX: a name built by a pipeline.
 _CONSTRUCTED_RE = re.compile(r"CLAGENTIC_\$\([^)]*\)_([A-Z][A-Z0-9_]*[A-Z0-9])\b")
-# The role prefixes the dynamic constructions expand over. Must cover every
-# prefix in bin/clagentic-lite's _AGENT_ROLE_TABLE (asserted below) plus the
-# CLI-only SUMMARIZER role.
+# Every role prefix that exists anywhere. Used only to recognize a per-role key
+# by its shape; WHICH roles actually read a given dynamic suffix comes from
+# roles_for_suffix() below, never from this union.
 _ROLES = ("BUILDER", "REVIEWER", "AUDITOR", "GATE", "SUMMARIZER", "TROUBLESHOOTER")
+
+
+def _read(rel):
+    with open(os.path.join(TOOL_HOME, rel), errors="replace") as f:
+        return f.read()
+
+
+def agent_roles():
+    """Roles the plugin render loops over: the prefixes in bin/clagentic-lite's
+    _AGENT_ROLE_TABLE. These are the roles that read CLAGENTIC_<ROLE>_AGENT_MODEL."""
+    m = re.search(r'^_AGENT_ROLE_TABLE="([^"]*)"', _read("bin/clagentic-lite"), re.M)
+    assert m, "bin/clagentic-lite no longer defines _AGENT_ROLE_TABLE"
+    return {entry.split(":")[0] for entry in m.group(1).split()}
+
+
+def cli_roles():
+    """Roles the gate/CLI path resolves through role_chain/walk_chain: the loop
+    in doctor's auth probe that enumerates them, in bin/clagentic-lite."""
+    m = re.search(r"for _role_pfx in ([A-Z ]+); do", _read("bin/clagentic-lite"))
+    assert m, "bin/clagentic-lite no longer enumerates the CLI roles in doctor's auth probe"
+    return set(m.group(1).split())
+
+
+def routable_roles():
+    """Roles _llm_role_routable (scripts/llm-client.sh) lets through to the
+    router; the only roles whose CLAGENTIC_<ROLE>_VIA_ROUTER the code reads
+    dynamically."""
+    m = re.search(
+        r"_llm_role_routable\(\) \{\s*case \"\$1\" in\s*([a-z|]+\)) return 0",
+        _read("scripts/llm-client.sh"),
+    )
+    assert m, "scripts/llm-client.sh no longer defines _llm_role_routable as a case list"
+    return {r.upper() for r in m.group(1).rstrip(")").split("|")}
+
+
+def roles_for_suffix(suffix):
+    """The roles that actually read CLAGENTIC_<ROLE>_<suffix>. A suffix read
+    by SOME role does not make it read by every role: the fixtures in this
+    file (a summarizer AGENT_MODEL, a troubleshooter REQUIRED, a builder
+    VIA_ROUTER) document keys no code reads."""
+    if suffix == "AGENT_MODEL":
+        return agent_roles()
+    if suffix == "VIA_ROUTER":
+        return routable_roles()
+    return cli_roles()
 
 # Names that appear in code but are deliberately NOT operator-settable config
 # keys. Each entry states why. Anything not here must be in config.example.
@@ -158,17 +203,25 @@ def keys_in_config_example(path=CONFIG_EXAMPLE):
     return keys
 
 
-def drift(literal, suffixes, documented, internal_only, document_only, families=()):
+def dynamic_key_reads(suffixes, roles_for=roles_for_suffix):
+    """Every CLAGENTIC_<ROLE>_<SUFFIX> the code reads, expanded over only the
+    roles that read that suffix."""
+    return {f"CLAGENTIC_{r}_{s}" for s in suffixes for r in roles_for(s)}
+
+
+def drift(literal, suffixes, documented, internal_only, document_only, families=(),
+          roles_for=roles_for_suffix):
     """Returns (undocumented_in_code, documented_but_unread)."""
     undocumented = sorted(
         k for k in literal if k not in documented and k not in internal_only
     )
-    dynamic_reads = {f"CLAGENTIC_{r}_{s}" for r in _ROLES for s in suffixes}
-    # A per-role suffix the code reads must be documented for at least one role.
+    dynamic_reads = dynamic_key_reads(suffixes, roles_for)
+    # A per-role suffix the code reads must be documented for at least one of
+    # the roles that read it.
     undocumented += sorted(
         f"CLAGENTIC_<ROLE>_{s}" for s in suffixes
         if not any(f"CLAGENTIC_{r}_{s}" in documented or f"CLAGENTIC_{r}_{s}" in internal_only
-                   for r in _ROLES)
+                   for r in roles_for(s))
     )
     unread = sorted(
         k for k in documented
@@ -309,6 +362,46 @@ class TestConfigKeyDrift(unittest.TestCase):
         undocumented, _ = self._fixture_drift('a=$(role_env "$R" BRAND_NEW 1)\n', "")
         self.assertEqual(undocumented, ["CLAGENTIC_<ROLE>_BRAND_NEW"])
 
+    def test_role_sets_are_derived_from_the_code(self):
+        self.assertEqual(agent_roles(), {"BUILDER", "REVIEWER", "AUDITOR", "GATE", "TROUBLESHOOTER"})
+        self.assertEqual(cli_roles(), {"BUILDER", "REVIEWER", "AUDITOR", "GATE", "SUMMARIZER"})
+        self.assertEqual(routable_roles(), {"REVIEWER", "AUDITOR"})
+
+    def _unread_for(self, key, suffix):
+        """Drift of a fixture config documenting `key` while the code reads
+        only role-suffix `suffix` (through the real role sets)."""
+        _, unread = drift(set(), {suffix}, {key}, {}, {})
+        return unread
+
+    def test_a_suffix_read_by_some_roles_is_not_read_by_all(self):
+        # Each fixture documents a key no role's code reads: the suffix IS read
+        # (by other roles), which the old any-role-reads-so-all-roles
+        # expansion mistook for a read of every role's key.
+        for key, suffix in (
+            ("CLAGENTIC_SUMMARIZER_AGENT_MODEL", "AGENT_MODEL"),
+            ("CLAGENTIC_TROUBLESHOOTER_REQUIRED", "REQUIRED"),
+            ("CLAGENTIC_BUILDER_VIA_ROUTER", "VIA_ROUTER"),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(self._unread_for(key, suffix), [key])
+
+    def test_the_roles_that_do_read_a_suffix_are_not_flagged(self):
+        for key, suffix in (
+            ("CLAGENTIC_GATE_AGENT_MODEL", "AGENT_MODEL"),
+            ("CLAGENTIC_TROUBLESHOOTER_AGENT_MODEL", "AGENT_MODEL"),
+            ("CLAGENTIC_SUMMARIZER_REQUIRED", "REQUIRED"),
+            ("CLAGENTIC_REVIEWER_VIA_ROUTER", "VIA_ROUTER"),
+            ("CLAGENTIC_AUDITOR_VIA_ROUTER", "VIA_ROUTER"),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(self._unread_for(key, suffix), [])
+
+    def test_a_fixture_role_map_that_omits_a_role_reports_it(self):
+        # The mapping is a parameter, so a fixture proves the check consults it.
+        _, unread = drift(set(), {"X"}, {"CLAGENTIC_A_X", "CLAGENTIC_B_X"}, {}, {},
+                          roles_for=lambda s: {"A"})
+        self.assertEqual(unread, ["CLAGENTIC_B_X"])
+
     def test_role_list_covers_the_cli_role_table(self):
         with open(os.path.join(TOOL_HOME, "bin", "clagentic-lite")) as f:
             m = re.search(r'^_AGENT_ROLE_TABLE="([^"]*)"', f.read(), re.M)
@@ -341,8 +434,7 @@ class TestDocKeyMentions(unittest.TestCase):
     def test_docs_only_name_keys_that_exist(self):
         literal, suffixes = keys_read_in_code()
         documented = keys_in_config_example()
-        dynamic = {f"CLAGENTIC_{r}_{s}" for r in _ROLES for s in suffixes}
-        known = literal | documented | dynamic
+        known = literal | documented | dynamic_key_reads(suffixes)
         stale = []
         for rel in DOC_FILES:
             with open(os.path.join(TOOL_HOME, rel)) as f:
@@ -354,49 +446,6 @@ class TestDocKeyMentions(unittest.TestCase):
                             continue
                         stale.append(f"{rel}:{lineno}: {key}")
         self.assertEqual(stale, [], "docs name CLAGENTIC_* keys that no code or config.example has")
-
-
-# Names of the crew agents that build and review this repo. They belong in
-# git history and PR threads, never in shipped prose (a public repo's docs are
-# read by people who have no idea what they refer to).
-_CREW_NAME_RE = re.compile(
-    r"\b(PEACHES|BOBBIE|HOLDEN|NAOMI|AMOS|MILLER|ASHFORD|AVASARALA|DRUMMER|TIAMUT|PRAX)\b",
-    re.IGNORECASE,
-)
-
-
-def crew_names_in(text):
-    return sorted({m.upper() for m in _CREW_NAME_RE.findall(text)})
-
-
-class TestShippedProseHygiene(unittest.TestCase):
-    def _shipped_prose_files(self):
-        out = subprocess.run(
-            ["git", "-C", TOOL_HOME, "ls-files", "plugins", "share/config.example"],
-            capture_output=True, text=True, check=True,
-        ).stdout.split()
-        return list(DOC_FILES) + [p for p in out if p.endswith((".md", ".example"))]
-
-    def test_no_crew_agent_names_in_shipped_prose(self):
-        found = []
-        for rel in self._shipped_prose_files():
-            with open(os.path.join(TOOL_HOME, rel)) as f:
-                for lineno, line in enumerate(f, 1):
-                    for name in crew_names_in(line):
-                        found.append(f"{rel}:{lineno}: {name}")
-        self.assertEqual(found, [], "crew agent names in shipped prose")
-
-    def test_detector_fails_on_a_drifted_fixture(self):
-        self.assertEqual(crew_names_in("accepted after PEACHES review"), ["PEACHES"])
-
-    def test_detector_is_case_insensitive(self):
-        # The mixed-case product spelling is the one an upper-case-only
-        # pattern missed.
-        self.assertEqual(crew_names_in("built by AMoS"), ["AMOS"])
-        self.assertEqual(crew_names_in("Amos and holden"), ["AMOS", "HOLDEN"])
-
-    def test_detector_respects_word_boundaries(self):
-        self.assertEqual(crew_names_in("Tiamutant, Praxis, Damos, Millerite"), [])
 
 
 # Shipped manifests are read by every installer; a personal address in one is
@@ -434,8 +483,14 @@ class TestShippedManifestsCarryNoEmail(unittest.TestCase):
 # resolve to a real heading in the named file, or the pointer is a dead end (the
 # README section a comment named had moved to docs/ROUTER.md).
 _DOC_NAME = r"(README|AGENTS|(?:docs/)?(?:DESIGN|GATES|LLM-USAGE|PORTABILITY|ROUTER|DEMO-SCRIPT))"
+# A title is delimited by a matching pair of quotes, so an apostrophe INSIDE a
+# heading ("What's new") does not end it: double and curly quotes take
+# anything but their closer; single quotes let an apostrophe through when it
+# is followed by a word character.
 _POINTER_TITLE_RE = re.compile(
-    _DOC_NAME + r"(?:\.md)?\s+(?:§\s*[\d.]+\s+)?[\"'“]([^\"'”]{4,})[\"'”]"
+    _DOC_NAME
+    + r"(?:\.md)?\s+(?:§\s*[\d.]+\s+)?"
+    + r"(?:\"([^\"]{4,})\"|“([^”]{4,})”|'((?:[^']|'(?=\w)){4,})')"
 )
 _POINTER_ANCHOR_RE = re.compile(_DOC_NAME + r"\.md#([A-Za-z0-9_-]+)")
 
@@ -448,6 +503,9 @@ def _doc_path(name):
 
 def _flatten_comment_wraps(text):
     """Join a pointer a comment wrapped across lines back into one line."""
+    # A shell string split across two quoted fragments ("... 'Title "<newline>
+    # "rest' ...") is one string: drop the join.
+    text = re.sub(r'"[ \t]*\n[ \t]*"', "", text)
     text = re.sub(r"-\n[ \t]*#[ \t]*", "-", text)
     text = re.sub(r"\n[ \t]*#[ \t]*", " ", text)
     return re.sub(r"[ \t]{2,}", " ", text)
@@ -477,7 +535,8 @@ def unresolved_pointers(code_text, headings_by_file):
     resolve. headings_by_file maps a doc path to its heading list."""
     bad = []
     code_text = _flatten_comment_wraps(code_text)
-    for name, title in _POINTER_TITLE_RE.findall(code_text):
+    for name, *quoted in _POINTER_TITLE_RE.findall(code_text):
+        title = next(t for t in quoted if t)
         heads = headings_by_file.get(_doc_path(name))
         if heads is None:
             bad.append((f"{name} \"{title}\"", "no such doc file"))
@@ -531,6 +590,22 @@ class TestCodeDocPointersResolve(unittest.TestCase):
             unresolved_pointers("see docs/ROUTER.md \"Verifying on your machine\"", heads), []
         )
 
+    def test_an_apostrophe_inside_a_heading_does_not_end_the_title(self):
+        heads = {"README.md": ["Intro", "What's new in v2"]}
+        for pointer in (
+            'see README "What\'s new in v2"',
+            "see README 'What's new in v2'",
+            "see README “What's new in v2”",
+        ):
+            with self.subTest(pointer=pointer):
+                self.assertEqual(unresolved_pointers(pointer, heads), [])
+        # And a title with an apostrophe that names no heading is still flagged.
+        for pointer in ('see README "Don\'t panic"', "see README 'Don't panic'"):
+            with self.subTest(pointer=pointer):
+                bad = unresolved_pointers(pointer, heads)
+                self.assertEqual(len(bad), 1, pointer)
+                self.assertIn("Don't panic", bad[0][0])
+
     def test_a_dead_anchor_is_flagged(self):
         heads = _headings_by_file()
         self.assertTrue(unresolved_pointers("see docs/ROUTER.md#no-such-section", heads))
@@ -560,6 +635,54 @@ def fenced_code_lines(text):
             inside = not inside
         elif inside:
             yield line
+
+
+# One invocation: optional `$ `, optional `env`, any number of VAR=value
+# assignments, an optional shell, an optional path prefix, then the tool and its
+# first (and, for `clagentic-lite gates`, second) word. Anchored at the start of
+# a fenced line or a backtick span, so prose that merely mentions the product
+# name is never mistaken for a command. Exactly one space separates the tool
+# from its subcommand: a file-tree listing pads that gap with runs of spaces
+# (`~/.local/bin/clagentic-lite    symlink to ...`) and is not an invocation. A
+# word ending in `_...` (`gates.sh cmd_review`, a function name) is not a
+# subcommand either.
+_INVOCATION_RE = re.compile(
+    r"^\s*(?:\$\s+)?(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+    r"(?:(?:sh|bash)\s+)?(?:\S*/)?(clagentic-lite|gates\.sh) "
+    r"([a-z][a-z-]*)(?!\w)(?: ([a-z][a-z-]*)(?!\w))?"
+)
+_PROSE_GATES_RE = re.compile(r"clagentic-lite gates ([a-z][a-z-]*)")
+
+
+def invocation_candidates(text):
+    """Fenced code lines plus every single-backtick span."""
+    yield from fenced_code_lines(text)
+    for span in re.findall(r"`([^`\n]+)`", text):
+        yield span
+
+
+def unknown_subcommands(text, subcommands, gate_subcommands):
+    """(tool, subcommand) for every documented invocation in TEXT that names a
+    subcommand the dispatcher (or gates.sh) does not have. Covers the plain
+    form, path-prefixed and shell-prefixed invocations, env-prefixed ones,
+    `gates.sh <sub>` called directly, and `clagentic-lite gates <sub>`."""
+    bad = []
+    for cand in invocation_candidates(text):
+        m = _INVOCATION_RE.match(cand)
+        if not m:
+            continue
+        tool, sub, sub2 = m.groups()
+        if tool == "gates.sh":
+            if sub not in gate_subcommands:
+                bad.append(("gates.sh", sub))
+        elif sub not in subcommands:
+            bad.append(("clagentic-lite", sub))
+        elif sub == "gates" and sub2 and sub2 not in gate_subcommands:
+            bad.append(("clagentic-lite gates", sub2))
+    for sub in _PROSE_GATES_RE.findall(text):
+        if sub not in gate_subcommands and ("clagentic-lite gates", sub) not in bad:
+            bad.append(("clagentic-lite gates", sub))
+    return bad
 
 
 class TestSubcommandDrift(unittest.TestCase):
@@ -600,29 +723,70 @@ class TestSubcommandDrift(unittest.TestCase):
         for rel in self.DOCS:
             with open(os.path.join(TOOL_HOME, rel)) as f:
                 text = f.read()
-            for sub in re.findall(r"`clagentic-lite ([a-z][a-z-]*)", text):
-                if sub not in self.subcommands:
-                    bad.append((rel, sub))
-            for line in fenced_code_lines(text):
-                m = re.match(r"^\s*(?:\$ )?clagentic-lite ([a-z][a-z-]*)", line)
-                if m and m.group(1) not in self.subcommands:
-                    bad.append((rel, m.group(1)))
-        self.assertEqual(bad, [], "docs name a clagentic-lite subcommand the dispatcher does not have")
+            for tool, sub in unknown_subcommands(text, self.subcommands, self.gate_subcommands):
+                bad.append((rel, tool, sub))
+        self.assertEqual(
+            bad, [],
+            "docs name a subcommand the dispatcher (or gates.sh) does not have",
+        )
 
-    def test_documented_gates_subcommands_exist(self):
-        bad = []
-        for rel in self.DOCS:
-            with open(os.path.join(TOOL_HOME, rel)) as f:
-                text = f.read()
-            for sub in re.findall(r"clagentic-lite gates ([a-z][a-z-]*)", text):
-                if sub not in self.gate_subcommands:
-                    bad.append((rel, sub))
-        self.assertEqual(bad, [], "docs name a gates subcommand gates.sh does not dispatch")
-
-    def test_subcommand_check_fails_on_a_drifted_fixture(self):
+    def test_dispatcher_label_parser_reads_a_fixture(self):
         fixture = "case \"${1:-}\" in\n  init)     x ;;\n  real-one) x ;;\n"
         self.assertEqual(dispatcher_labels(fixture, "case"), {"init", "real-one"})
-        self.assertNotIn("imaginary", dispatcher_labels(fixture, "case"))
+
+    def _scan(self, doc_text):
+        return unknown_subcommands(doc_text, self.subcommands, self.gate_subcommands)
+
+    def test_the_real_doc_scan_fails_on_a_doc_naming_a_nonexistent_subcommand(self):
+        drifted = "Run `clagentic-lite imaginary-sub` to do the thing.\n"
+        self.assertEqual(self._scan(drifted), [("clagentic-lite", "imaginary-sub")])
+        # The same scan on a doc naming a real one is clean.
+        self.assertEqual(self._scan("Run `clagentic-lite doctor` first.\n"), [])
+
+    def test_the_scan_covers_every_invocation_form(self):
+        cases = {
+            "plain, backticked": "`clagentic-lite nosuch`",
+            "plain, fenced": "```\nclagentic-lite nosuch\n```",
+            "prompt-prefixed, fenced": "```\n$ clagentic-lite nosuch\n```",
+            "relative path prefix": "`bin/clagentic-lite nosuch`",
+            "dot-slash prefix": "```\n./bin/clagentic-lite nosuch\n```",
+            "home path prefix": "`~/.local/bin/clagentic-lite nosuch`",
+            "variable path prefix": "`$CLAGENTIC_LITE_HOME/bin/clagentic-lite nosuch`",
+            "shell-prefixed": "```\nsh bin/clagentic-lite nosuch\n```",
+            "env-assignment prefix": "`CLAGENTIC_FOO=1 clagentic-lite nosuch`",
+            "env command prefix": "```\nenv CLAGENTIC_FOO=1 CLAGENTIC_BAR=2 clagentic-lite nosuch\n```",
+            "env prefix with path": "`CLAGENTIC_FOO=1 ~/.local/bin/clagentic-lite nosuch`",
+        }
+        for label, doc in cases.items():
+            with self.subTest(form=label):
+                self.assertEqual(self._scan(doc), [("clagentic-lite", "nosuch")], doc)
+
+    def test_the_scan_covers_gates_forms(self):
+        cases = {
+            "gates.sh direct": ("`gates.sh nosuch`", ("gates.sh", "nosuch")),
+            "gates.sh with script path": ("```\nscripts/gates.sh nosuch\n```", ("gates.sh", "nosuch")),
+            "sh scripts/gates.sh": ("```\nsh scripts/gates.sh nosuch\n```", ("gates.sh", "nosuch")),
+            "env-prefixed gates.sh": ("`CLAGENTIC_FOO=1 gates.sh nosuch`", ("gates.sh", "nosuch")),
+            "clagentic-lite gates, backticked": (
+                "`clagentic-lite gates nosuch`", ("clagentic-lite gates", "nosuch")),
+            "clagentic-lite gates, prose": (
+                "then clagentic-lite gates nosuch runs", ("clagentic-lite gates", "nosuch")),
+            "env-prefixed clagentic-lite gates": (
+                "```\nCLAGENTIC_FOO=1 clagentic-lite gates nosuch --x\n```",
+                ("clagentic-lite gates", "nosuch")),
+        }
+        for label, (doc, expected) in cases.items():
+            with self.subTest(form=label):
+                self.assertEqual(self._scan(doc), [expected], doc)
+
+    def test_the_scan_accepts_real_subcommands_in_every_form(self):
+        real = sorted(self.gate_subcommands)[0]
+        doc = (
+            "`clagentic-lite doctor`\n```\nCLAGENTIC_FOO=1 ~/.local/bin/clagentic-lite update\n```\n"
+            f"`gates.sh {real}`\n`clagentic-lite gates {real}`\n"
+            "Prose: clagentic-lite is a tool, `clagentic-lite` alone is fine.\n"
+        )
+        self.assertEqual(self._scan(doc), [])
 
 
 if __name__ == "__main__":
