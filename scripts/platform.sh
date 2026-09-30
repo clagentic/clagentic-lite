@@ -2067,15 +2067,18 @@ ds_version_extract() {
 # ds_version_ge INSTALLED MIN
 #
 # Exit 0 when INSTALLED >= MIN, 1 otherwise. Both arguments must be dotted
-# numeric versions (run ds_version_extract first; an empty or non-numeric
-# argument is treated as 0 components, which can only make INSTALLED compare
-# LOWER, never spuriously pass a floor). `sort -V` is a GNU/BSD extension and
-# is probed, not assumed: hosts without it take the component-wise arithmetic
-# path below, so this is the one place the GNU/BSD difference is handled for
-# every version comparison in the codebase.
+# numeric versions (run ds_version_extract first). An empty or non-numeric
+# argument returns 1: `sort -V` orders letters AFTER digits, so a garbage
+# "installed" string would otherwise compare as newer than any floor and
+# silently pass it. `sort -V` is a GNU/BSD extension and is probed, not
+# assumed: hosts without it take the component-wise arithmetic path below, so
+# this is the one place the GNU/BSD difference is handled for every version
+# comparison in the codebase.
 ds_version_ge() {
   _dvg_inst="${1#v}"
   _dvg_min="${2#v}"
+  case "$_dvg_inst" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+  case "$_dvg_min" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
   [ "$_dvg_inst" = "$_dvg_min" ] && return 0
   if sort -V /dev/null 2>/dev/null; then
     _dvg_lowest=$(printf '%s\n%s\n' "$_dvg_inst" "$_dvg_min" | sort -V | head -1)

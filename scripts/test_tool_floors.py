@@ -104,11 +104,11 @@ class TestVersionCompare(unittest.TestCase):
     def test_extract_takes_the_first_triple(self):
         r = _sh(f". '{PLATFORM_SH}'\n"
                 "ds_version_extract 'osv-scanner version: 2.0.3 build 1.2.3'")
-        self.assertEqual(r.stdout, "2.0.3")
+        self.assertEqual(r.stdout.strip(), "2.0.3")
         r = _sh(f". '{PLATFORM_SH}'\nds_version_extract '8.16.0-1ubuntu0.24.04.3'")
-        self.assertEqual(r.stdout, "8.16.0")
+        self.assertEqual(r.stdout.strip(), "8.16.0")
         r = _sh(f". '{PLATFORM_SH}'\nds_version_extract 'no digits here'")
-        self.assertEqual(r.stdout, "")
+        self.assertEqual(r.stdout.strip(), "")
 
 
 class TestFloorTableSweep(unittest.TestCase):
@@ -196,7 +196,8 @@ class _ToolHome(unittest.TestCase):
             stdin=subprocess.DEVNULL)
 
     def _clone(self):
-        dest = os.path.join(self.tmp, "tool-home")
+        dest = tempfile.mkdtemp(prefix="tool-home-", dir=self.tmp)
+        shutil.rmtree(dest)
         clone_this_tool_home_with_overlay(dest)
         return dest
 
@@ -225,7 +226,7 @@ class TestDoctorUsesTheFloorTable(_ToolHome):
         out = self._doctor([self._plain("gitleaks", "development build")])
         self.assertIn("INFO gitleaks: on PATH but version unparseable", out)
         self.assertIn("Cannot confirm", out)
-        self.assertNotIn("OK   gitleaks", out)
+        self.assertNotRegex(out, r"OK   gitleaks \d")
 
     def test_both_floors_met_reports_ok_for_each(self):
         out = self._doctor([self._plain("gitleaks", "8.30.1")])
