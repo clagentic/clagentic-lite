@@ -1087,13 +1087,22 @@ _render_input_keys() {
 # inherited.
 _capture_render_inputs() {
   _cri_keys=$(_render_input_keys)
+  for _cri_key in $_cri_keys; do
+    eval "_RI_${_cri_key}="
+  done
   # $_cri_keys is a fixed list of identifiers, split on purpose.
   # shellcheck disable=SC2086
   _cri_dump=$(ds_config_file_values "$(ds_global_config_path)" $_cri_keys) || _cri_dump=""
-  for _cri_key in $_cri_keys; do
-    _cri_val=$(printf '%s\n' "$_cri_dump" | sed -n "s/^${_cri_key}=//p" | head -n 1)
+  # One KEY=value line per key (newlines inside a value were already turned
+  # into \001 by the reader, so a value can never start a second line).
+  while IFS='=' read -r _cri_key _cri_val; do
+    case "$_cri_key" in
+      ''|*[!A-Za-z0-9_]*) continue ;;
+    esac
     eval "_RI_${_cri_key}=\$_cri_val"
-  done
+  done <<EOF
+$_cri_dump
+EOF
 }
 
 # _render_input KEY
