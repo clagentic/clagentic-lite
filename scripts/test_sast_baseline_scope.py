@@ -695,6 +695,13 @@ class TestSastScanIsCwdIndependent(unittest.TestCase):
         self._tmp = tempfile.mkdtemp(prefix="clagentic-test-sast-cwd-")
         self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
 
+        # Real semgrep writes settings, logs, and its version-check cache on
+        # every run. Keep all three inside this fixture: a read-only or
+        # otherwise unwritable user home must not turn a semgrep startup
+        # crash into a false-positive "finding" in the two blocking cases.
+        self._semgrep_state = os.path.join(self._tmp, "semgrep-state")
+        os.makedirs(self._semgrep_state)
+
         self._config_path = os.path.join(self._tmp, "rules.yml")
         with open(self._config_path, "w") as f:
             f.write(self._RULE_YAML)
@@ -728,6 +735,16 @@ class TestSastScanIsCwdIndependent(unittest.TestCase):
         env["CLAGENTIC_ALLOW_MISSING_SEMGREP"] = "0"
         env["CLAGENTIC_SEMGREP_CONFIG"] = self._config_path
         env["CLAGENTIC_DEFAULT_BRANCH"] = "main"
+        env["SEMGREP_SETTINGS_FILE"] = os.path.join(
+            self._semgrep_state, "settings.yml"
+        )
+        env["SEMGREP_LOG_FILE"] = os.path.join(
+            self._semgrep_state, "semgrep.log"
+        )
+        env["SEMGREP_VERSION_CACHE_PATH"] = os.path.join(
+            self._semgrep_state, "version-cache"
+        )
+        env["SEMGREP_ENABLE_VERSION_CHECK"] = "0"
         if extra_env:
             env.update(extra_env)
         gates_sh = os.path.join(REAL_SCRIPTS_DIR, "gates.sh")
