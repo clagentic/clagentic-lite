@@ -389,6 +389,12 @@ CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 # CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC=30
 # CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC=30
 # CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC=30
+# `doctor`/`update` environment checks: each scanner `--version` probe, an
+# unprivileged scanner upgrade attempt by `update` (brew or pipx only), and the
+# per-enrolled-repo `git ls-remote origin HEAD` reachability check:
+# CLAGENTIC_TOOL_VERSION_TIMEOUT_SEC=30
+# CLAGENTIC_TOOL_UPGRADE_TIMEOUT_SEC=300
+# CLAGENTIC_REMOTE_CHECK_TIMEOUT_SEC=20
 #
 # Cap on structured findings kept in the adversarial sidecar the merge-gate
 # reads. Lowest-severity findings are dropped first, and the dropped count is

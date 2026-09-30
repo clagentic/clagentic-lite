@@ -2052,3 +2052,105 @@ ds_git_scratch_env_scrub() {
   GIT_CONFIG_GLOBAL=/dev/null
   export GIT_CONFIG_GLOBAL
 }
+
+# ds_version_extract TEXT
+#
+# Prints the first MAJOR.MINOR.PATCH triple found in TEXT (a pre-release or
+# distro suffix such as "-1ubuntu0.24.04.3" is dropped), or nothing when TEXT
+# carries none. The single parser every version-floor check uses, so an
+# unparseable `--version` output is detected in one place and reported as
+# unknown rather than compared as if it were a number.
+ds_version_extract() {
+  printf '%s' "$1" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+# ds_version_ge INSTALLED MIN
+#
+# Exit 0 when INSTALLED >= MIN, 1 otherwise. Both arguments must be dotted
+# numeric versions (run ds_version_extract first; an empty or non-numeric
+# argument is treated as 0 components, which can only make INSTALLED compare
+# LOWER, never spuriously pass a floor). `sort -V` is a GNU/BSD extension and
+# is probed, not assumed: hosts without it take the component-wise arithmetic
+# path below, so this is the one place the GNU/BSD difference is handled for
+# every version comparison in the codebase.
+ds_version_ge() {
+  _dvg_inst="${1#v}"
+  _dvg_min="${2#v}"
+  [ "$_dvg_inst" = "$_dvg_min" ] && return 0
+  if sort -V /dev/null 2>/dev/null; then
+    _dvg_lowest=$(printf '%s\n%s\n' "$_dvg_inst" "$_dvg_min" | sort -V | head -1)
+    [ "$_dvg_lowest" = "$_dvg_min" ] && return 0
+    return 1
+  fi
+  _dvg_n=1
+  while [ "$_dvg_n" -le 3 ]; do
+    _dvg_i=$(printf '%s' "$_dvg_inst" | cut -d. -f"$_dvg_n" | tr -cd '0-9')
+    _dvg_m=$(printf '%s' "$_dvg_min" | cut -d. -f"$_dvg_n" | tr -cd '0-9')
+    _dvg_i="${_dvg_i:-0}"
+    _dvg_m="${_dvg_m:-0}"
+    [ "$_dvg_i" -gt "$_dvg_m" ] && return 0
+    [ "$_dvg_i" -lt "$_dvg_m" ] && return 1
+    _dvg_n=$((_dvg_n + 1))
+  done
+  return 0
+}
+
+# ds_resolve_path PATH
+#
+# Prints PATH with symlinks resolved. readlink -f is not assumed (absent on
+# older BSD); python3 is the second choice; the unresolved input is the last
+# resort, so a caller comparing the result against a prefix fails closed
+# (no match) rather than erroring.
+ds_resolve_path() {
+  _drp_out=""
+  if command -v readlink >/dev/null 2>&1; then
+    _drp_out=$(readlink -f "$1" 2>/dev/null || true)
+  fi
+  if [ -z "$_drp_out" ] && command -v python3 >/dev/null 2>&1; then
+    _drp_out=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$1" 2>/dev/null || true)
+  fi
+  printf '%s' "${_drp_out:-$1}"
+}
+
+# _bounded_failure_reason EXIT_CODE TIMEOUT_SEC STDERR_FILE [TIMEOUT_NOTE]
+#
+# Prints a one-line, human-readable reason for a non-zero exit from a command
+# run under $DS_TIMEOUT_CMD/run_bounded. Exit 124 is the timeout wrapper's own
+# "deadline fired" status and is reported as a timeout; any other non-zero
+# exit is a real failure and carries the last non-empty stderr line so the
+# operator sees git's own complaint (authentication, DNS, permission) instead
+# of a generic "failed or timed out". Credentials in a URL are masked: git can
+# echo the remote URL, and a remote configured as https://user:token@host (or
+# carrying a token in its query string) must not land in an audit row or a
+# terminal scrollback. Userinfo is masked up to the LAST '@' before the host,
+# so a password that itself contains '@' does not leak its tail; every
+# query-string value is masked.
+#
+# Optional 4th arg: a note appended to the timeout message only (the ship push
+# uses it to say the bound may include pre-push hook time).
+#
+# Lives here, not in gates.sh, because gates.sh and bin/clagentic-lite
+# (doctor/update remote checks) both need the identical masking and gates.sh
+# cannot be sourced by the CLI.
+_bounded_failure_reason() {
+  _bfr_rc="$1"
+  _bfr_timeout="$2"
+  _bfr_err_file="$3"
+  _bfr_timeout_note="${4:-}"
+  if [ "$_bfr_rc" = "124" ]; then
+    printf 'timed out after %ss%s' "$_bfr_timeout" "$_bfr_timeout_note"
+    return 0
+  fi
+  _bfr_last=""
+  if [ -s "$_bfr_err_file" ]; then
+    # Git's multi-line failures end on a generic hint ("and the repository
+    # exists."); the informative line is the last `fatal:`/`error:` one, so
+    # prefer it and fall back to the last non-empty line.
+    _bfr_last=$(awk 'NF { line = $0 } /^(fatal|error):/ { fe = $0 } END { print (fe != "" ? fe : line) }' "$_bfr_err_file" | sed -e 's#://[^/ ]*@#://***@#g' -e 's,\([?&][^=&# ]*\)=[^&# ]*,\1=***,g' | cut -c1-300)
+  fi
+  if [ -n "$_bfr_last" ]; then
+    printf 'failed (exit %s): %s' "$_bfr_rc" "$_bfr_last"
+  else
+    printf 'failed (exit %s)' "$_bfr_rc"
+  fi
+}

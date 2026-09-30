@@ -1168,6 +1168,38 @@ affects most Linux installs following the obvious install path, and is a
 standing coverage gap the operator should know about once, not rediscover
 as an intermittent-looking gate behavior.
 
+**Tool version floors in `doctor` and `update`.** Every scanner in
+`CLAGENTIC_SECURITY_TOOLS` has rows in one table, `DS_TOOL_FLOOR_TABLE`
+(`scripts/tool-floors.sh`): the minimum version of each capability the gates
+use and what is lost below it. `doctor` reports against the table. `update`
+re-reads it from the freshly pulled code, so a floor raised by an update is
+enforced by that same run, with no flag: a missing, below-floor or
+unparseable-version tool produces a WARN naming the tool, the installed
+version, the required version, the lost capability and the upgrade command.
+An unparseable version is never reported as passing. semgrep and osv-scanner
+record "no floor" with a reason, because `gates.sh` capability-probes both at
+run time and no release gates a blocking capability.
+
+`update` attempts an upgrade only for an already-installed tool whose install
+method is detected and unprivileged: Homebrew under a prefix the user can
+write, or a pipx venv the user can write. It never uses sudo, a system package
+manager or a piped download, never installs a missing tool, and never prompts.
+A failed attempt, or one that does not reach the floor, falls back to the WARN
+with the manual command. Dependency warnings never change `update`'s exit
+status. `CLAGENTIC_TOOL_UPGRADE_TIMEOUT_SEC` (default 300) bounds the attempt
+and `CLAGENTIC_TOOL_VERSION_TIMEOUT_SEC` (default 30) bounds each version probe.
+
+**Remote reachability in `doctor` and `update`.** For every enrolled repo,
+both run `git ls-remote origin HEAD` under the git environment `gates.sh`
+uses (repo-redirecting variables cleared, the user's credential helpers,
+`url.*.insteadOf` and proxy settings left in place, prompts disabled,
+`CLAGENTIC_REMOTE_CHECK_TIMEOUT_SEC` default 20). An authentication failure is
+reported by name with git's own error line (URL credentials masked) and the
+`credential.helper` entries git would consult, and is kept distinct from a
+timeout. Only the first word of each helper is shown, so an inline helper
+script is never echoed. An ssh remote can still ask for a passphrase on the
+controlling terminal; the timeout bounds that.
+
 **Dispatcher argument forwarding (lr-51112e).** `scripts/gates.sh`'s own
 trailing `case "${1:-}" in ... esac` dispatch block is the single place that
 turns `gates.sh <subcommand> [args...]` into a call to the matching `cmd_X`

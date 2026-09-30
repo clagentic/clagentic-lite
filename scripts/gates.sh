@@ -218,44 +218,9 @@ run_bounded() {
   $DS_TIMEOUT_CMD "$_rb_timeout" "$@"
 }
 
-# _bounded_failure_reason EXIT_CODE TIMEOUT_SEC STDERR_FILE
-#
-# Prints a one-line, human-readable reason for a non-zero exit from a command
-# run under $DS_TIMEOUT_CMD/run_bounded. Exit 124 is the timeout wrapper's own
-# "deadline fired" status and is reported as a timeout; any other non-zero
-# exit is a real failure and carries the last non-empty stderr line so the
-# operator sees git's own complaint (authentication, DNS, permission) instead
-# of a generic "failed or timed out". Credentials in a URL are masked: git can
-# echo the remote URL, and a remote configured as https://user:token@host (or
-# carrying a token in its query string) must not land in an audit row or a
-# terminal scrollback. Userinfo is masked up to the LAST '@' before the host,
-# so a password that itself contains '@' does not leak its tail; every
-# query-string value is masked.
-#
-# Optional 4th arg: a note appended to the timeout message only (the ship push
-# uses it to say the bound may include pre-push hook time).
-_bounded_failure_reason() {
-  _bfr_rc="$1"
-  _bfr_timeout="$2"
-  _bfr_err_file="$3"
-  _bfr_timeout_note="${4:-}"
-  if [ "$_bfr_rc" = "124" ]; then
-    printf 'timed out after %ss%s' "$_bfr_timeout" "$_bfr_timeout_note"
-    return 0
-  fi
-  _bfr_last=""
-  if [ -s "$_bfr_err_file" ]; then
-    # Git's multi-line failures end on a generic hint ("and the repository
-    # exists."); the informative line is the last `fatal:`/`error:` one, so
-    # prefer it and fall back to the last non-empty line.
-    _bfr_last=$(awk 'NF { line = $0 } /^(fatal|error):/ { fe = $0 } END { print (fe != "" ? fe : line) }' "$_bfr_err_file" | sed -e 's#://[^/ ]*@#://***@#g' -e 's,\([?&][^=&# ]*\)=[^&# ]*,\1=***,g' | cut -c1-300)
-  fi
-  if [ -n "$_bfr_last" ]; then
-    printf 'failed (exit %s): %s' "$_bfr_rc" "$_bfr_last"
-  else
-    printf 'failed (exit %s)' "$_bfr_rc"
-  fi
-}
+# _bounded_failure_reason (EXIT_CODE TIMEOUT_SEC STDERR_FILE [NOTE]) is defined
+# in scripts/platform.sh: bin/clagentic-lite's remote checks share the same
+# credential masking and cannot source this file.
 
 # _gate_check_args SUBCOMMAND "ALLOWED FLAGS" POSITIONAL_NAME ARGS...
 #

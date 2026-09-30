@@ -41,49 +41,11 @@ TOOL_HOME="$(dirname "$SCRIPTS_DIR")"
 CODEX_MIN_VERSION="0.137.0"
 
 # version_ge INSTALLED_VER MIN_VER
-# Returns 0 (true) if INSTALLED_VER >= MIN_VER, 1 otherwise.
-# Compares dotted MAJOR.MINOR.PATCH version strings.
-# Each component is compared numerically; extra trailing components are treated
-# as zero on the shorter version. Non-numeric components (pre-release suffixes)
-# cause the comparison to treat that component as 0 — conservative/safe.
-# Uses sort -V (GNU coreutils + BSD sort both support -V on the target platforms
-# per docs/PORTABILITY.md). Falls back to a pure-arithmetic POSIX path when
-# sort -V is unavailable.
+# Returns 0 (true) if INSTALLED_VER >= MIN_VER, 1 otherwise. Thin alias for
+# ds_version_ge (scripts/platform.sh), the one version comparison in the
+# codebase: sort -V when the host has it, component-wise arithmetic otherwise.
 version_ge() {
-  _vge_inst="$1"
-  _vge_min="$2"
-  # Normalize: strip any leading 'v'.
-  _vge_inst="${_vge_inst#v}"
-  _vge_min="${_vge_min#v}"
-  # Identical strings — fast path.
-  [ "$_vge_inst" = "$_vge_min" ] && return 0
-  # Use sort -V if available: feed both versions, take the first (lowest).
-  # If the lowest is the min version, installed >= min.
-  if sort -V /dev/null 2>/dev/null; then
-    _vge_lowest=$(printf '%s\n%s\n' "$_vge_inst" "$_vge_min" | sort -V | head -1)
-    [ "$_vge_lowest" = "$_vge_min" ] && return 0 || return 1
-  fi
-  # Pure-arithmetic POSIX fallback: compare component by component.
-  _vge_i_maj=$(printf '%s' "$_vge_inst" | cut -d. -f1)
-  _vge_i_min=$(printf '%s' "$_vge_inst" | cut -d. -f2)
-  _vge_i_pat=$(printf '%s' "$_vge_inst" | cut -d. -f3)
-  _vge_m_maj=$(printf '%s' "$_vge_min"  | cut -d. -f1)
-  _vge_m_min=$(printf '%s' "$_vge_min"  | cut -d. -f2)
-  _vge_m_pat=$(printf '%s' "$_vge_min"  | cut -d. -f3)
-  # Strip non-numeric suffixes (e.g. pre-release tags); treat as 0 if absent.
-  _vge_i_maj=$(printf '%s' "${_vge_i_maj:-0}" | tr -cd '0-9'); _vge_i_maj="${_vge_i_maj:-0}"
-  _vge_i_min=$(printf '%s' "${_vge_i_min:-0}" | tr -cd '0-9'); _vge_i_min="${_vge_i_min:-0}"
-  _vge_i_pat=$(printf '%s' "${_vge_i_pat:-0}" | tr -cd '0-9'); _vge_i_pat="${_vge_i_pat:-0}"
-  _vge_m_maj=$(printf '%s' "${_vge_m_maj:-0}" | tr -cd '0-9'); _vge_m_maj="${_vge_m_maj:-0}"
-  _vge_m_min=$(printf '%s' "${_vge_m_min:-0}" | tr -cd '0-9'); _vge_m_min="${_vge_m_min:-0}"
-  _vge_m_pat=$(printf '%s' "${_vge_m_pat:-0}" | tr -cd '0-9'); _vge_m_pat="${_vge_m_pat:-0}"
-  if   [ "$_vge_i_maj" -gt "$_vge_m_maj" ]; then return 0
-  elif [ "$_vge_i_maj" -lt "$_vge_m_maj" ]; then return 1
-  elif [ "$_vge_i_min" -gt "$_vge_m_min" ]; then return 0
-  elif [ "$_vge_i_min" -lt "$_vge_m_min" ]; then return 1
-  elif [ "$_vge_i_pat" -ge "$_vge_m_pat" ]; then return 0
-  else return 1
-  fi
+  ds_version_ge "$1" "$2"
 }
 
 # codex_version_check
