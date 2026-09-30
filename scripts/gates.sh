@@ -6468,10 +6468,12 @@ _fence_data_block() {
     if command -v jq >/dev/null 2>&1; then
       _fdb_body=$(printf '%s' "$_fdb_text" | jq -S '.' 2>/dev/null) || _fdb_body="$_fdb_text"
     elif command -v python3 >/dev/null 2>&1; then
-      _fdb_body=$(python3 -c '
+      # TEXT goes over stdin, never argv: a single argv string over the
+      # kernel's MAX_ARG_STRLEN (~128 KiB) fails exec with E2BIG.
+      _fdb_body=$(printf '%s' "$_fdb_text" | python3 -c '
 import json, sys
-print(json.dumps(json.loads(sys.argv[1]), indent=2, sort_keys=True, ensure_ascii=False))
-' "$_fdb_text" 2>/dev/null) || _fdb_body="$_fdb_text"
+print(json.dumps(json.loads(sys.stdin.read()), indent=2, sort_keys=True, ensure_ascii=False))
+' 2>/dev/null) || _fdb_body="$_fdb_text"
     fi
   fi
   if command -v jq >/dev/null 2>&1; then
@@ -6527,11 +6529,15 @@ _sanitize_review_for_prompt() {
     _srp_findings=$(_llm_json_array_sanitize_fields "$_srp_findings" $_srp_fields)
     _srp_summary=$(_llm_field_sanitize "$(jq -r '.summary // "" | if type == "string" then . else "" end' "$_srp_file" 2>/dev/null)")
     _srp_sha=$(_llm_field_sanitize "$(jq -r '._clagentic_diff_sha // "" | if type == "string" then . else "" end' "$_srp_file" 2>/dev/null)")
-    jq -c --argjson f "$_srp_findings" --arg s "$_srp_summary" --arg sha "$_srp_sha" '
-      (if (.summary | type) == "string" then {summary: $s} else {} end)
-      + {findings: $f}
-      + (if (._clagentic_diff_sha | type) == "string" then {_clagentic_diff_sha: $sha} else {} end)
-    ' "$_srp_file" 2>/dev/null || printf 'null'
+    # Findings arrive on stdin and the review file via --slurpfile, not
+    # --argjson: argv strings over MAX_ARG_STRLEN (~128 KiB) fail exec.
+    printf '%s' "$_srp_findings" | jq -c --slurpfile rv "$_srp_file" --arg s "$_srp_summary" --arg sha "$_srp_sha" '
+      . as $f
+      | $rv[0]
+      | (if (.summary | type) == "string" then {summary: $s} else {} end)
+        + {findings: $f}
+        + (if (._clagentic_diff_sha | type) == "string" then {_clagentic_diff_sha: $sha} else {} end)
+    ' 2>/dev/null || printf 'null'
     return 0
   fi
   if command -v python3 >/dev/null 2>&1; then
@@ -6569,16 +6575,16 @@ elif mode in ("has_summary", "has_sha"):
     _srp_sha=$(_llm_field_sanitize "$(python3 -c "$_srp_get" "$_srp_file" sha)")
     _srp_has_summary=$(python3 -c "$_srp_get" "$_srp_file" has_summary)
     _srp_has_sha=$(python3 -c "$_srp_get" "$_srp_file" has_sha)
-    python3 -c '
+    printf '%s' "$_srp_findings" | python3 -c '
 import json, sys
 out = {}
-if sys.argv[4] == "1":
+if sys.argv[3] == "1":
     out["summary"] = sys.argv[1]
-out["findings"] = json.loads(sys.argv[2])
-if sys.argv[5] == "1":
-    out["_clagentic_diff_sha"] = sys.argv[3]
+out["findings"] = json.loads(sys.stdin.read())
+if sys.argv[4] == "1":
+    out["_clagentic_diff_sha"] = sys.argv[2]
 print(json.dumps(out, separators=(",", ":"), ensure_ascii=False))
-' "$_srp_summary" "$_srp_findings" "$_srp_sha" "$_srp_has_summary" "$_srp_has_sha" 2>/dev/null || printf 'null'
+' "$_srp_summary" "$_srp_sha" "$_srp_has_summary" "$_srp_has_sha" 2>/dev/null || printf 'null'
     return 0
   fi
   printf 'null'
@@ -6590,20 +6596,23 @@ _json_string_field() {
   if command -v jq >/dev/null 2>&1; then
     printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // "" | if type == "string" then . else "" end' 2>/dev/null
   elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json, sys
-v = json.loads(sys.argv[1]).get(sys.argv[2])
-sys.stdout.write(v if isinstance(v, str) else "")' "$1" "$2" 2>/dev/null
+    printf '%s' "$1" | python3 -c 'import json, sys
+v = json.loads(sys.stdin.read()).get(sys.argv[1])
+sys.stdout.write(v if isinstance(v, str) else "")' "$2" 2>/dev/null
   fi
   return 0
 }
 
 # _sanitize_adversarial_report_for_prompt FILE — print last-adversarial.md's
-# content run through _llm_field_sanitize, uncapped. This prose is the
-# Merge Gate's fallback refusal basis when adversarial_findings is empty, so
-# truncating it would silently change what the gate can refuse on. The cap is
-# three times the file's byte length: defanging a forged fence label roughly
-# doubles that label, and the cap is applied after defanging, so the file's own
-# length alone could still truncate a report full of forged markers.
+# content run through _llm_field_sanitize. This prose is the Merge Gate's
+# fallback refusal basis when adversarial_findings is empty, so it is NOT
+# subject to the shared per-field cap (truncating it would silently change
+# what the gate can refuse on). The only bound is per-call: three times the
+# file's byte length, because defanging a forged fence label roughly doubles
+# that label and the cap is applied after defanging, so the file's own length
+# alone could still truncate a report full of forged markers. The text is
+# passed as a shell-function argument (no exec), and _llm_field_sanitize hands
+# it to python3 through a temp file, so no argv string carries the report.
 _sanitize_adversarial_report_for_prompt() {
   _sar_file="$1"
   _sar_len=$(wc -c < "$_sar_file" | tr -d ' ')
@@ -7631,8 +7640,15 @@ EOF
     DETERMINISTIC_GATES_FENCED_PAYLOAD=$(_fence_deterministic_gates "$DETERMINISTIC_GATES_PAYLOAD")
     # review_fenced/adversarial_fenced arrive as the same pre-built JSON
     # string literals (or null) the jq branch splices in, for the same
-    # reason: one sanitize+fence site for both emitter branches.
-    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" "$DETERMINISTIC_GATES_PAYLOAD" "$DETERMINISTIC_GATES_FENCED_PAYLOAD" "$REVIEW_FENCED_PAYLOAD" "$ADVERSARIAL_FENCED_PAYLOAD" "$REVIEW_SHA_VALUE" <<'PY'
+    # reason: one sanitize+fence site for both emitter branches. They are
+    # handed over as temp-file paths, not argv strings: the adversarial report
+    # is unbounded, and one argv string over MAX_ARG_STRLEN (~128 KiB) fails
+    # exec with E2BIG, which would drop the Merge Gate's adversarial basis.
+    _bgs_review_tmp=$(mktemp -t clagentic-gate-review.XXXXXX)
+    _bgs_adv_tmp=$(mktemp -t clagentic-gate-adversarial.XXXXXX)
+    printf '%s' "$REVIEW_FENCED_PAYLOAD" > "$_bgs_review_tmp"
+    printf '%s' "$ADVERSARIAL_FENCED_PAYLOAD" > "$_bgs_adv_tmp"
+    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" "$DETERMINISTIC_GATES_PAYLOAD" "$DETERMINISTIC_GATES_FENCED_PAYLOAD" "$_bgs_review_tmp" "$_bgs_adv_tmp" "$REVIEW_SHA_VALUE" <<'PY'
 import json, sys
 threshold           = sys.argv[1]
 introduces_ack      = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
@@ -7647,13 +7663,14 @@ deterministic_gates_fenced_arg = sys.argv[10] if len(sys.argv) > 10 else ""
 # _sanitize_adversarial_report_for_prompt): JSON string literals, or the
 # literal null when the source file is absent. An unparseable value degrades
 # to null rather than raising -- degrade, never block.
-def _decode_literal(raw):
+def _decode_literal_file(path):
     try:
-        return json.loads(raw)
+        with open(path) as f:
+            return json.loads(f.read())
     except Exception:
         return None
-review_fenced      = _decode_literal(sys.argv[11]) if len(sys.argv) > 11 else None
-adversarial_fenced = _decode_literal(sys.argv[12]) if len(sys.argv) > 12 else None
+review_fenced      = _decode_literal_file(sys.argv[11]) if len(sys.argv) > 11 else None
+adversarial_fenced = _decode_literal_file(sys.argv[12]) if len(sys.argv) > 12 else None
 review_sha         = sys.argv[13] if len(sys.argv) > 13 else ""
 # Pre-built by _read_deterministic_gates (sh) -- fail-open to an
 # audit-db-unavailable envelope if this somehow arrives empty/unparseable
@@ -7784,6 +7801,7 @@ print(json.dumps({
     "threshold": threshold,
 }))
 PY
+    rm -f "$_bgs_review_tmp" "$_bgs_adv_tmp"
     return 0
   fi
 
