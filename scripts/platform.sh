@@ -71,6 +71,51 @@ ds_repo_root() {
   # Both failed — return empty; callers handle the empty case.
 }
 
+# ds_global_config_path — print the global config file that applies, or
+# nothing when neither exists. The product path
+# (~/.config/clagentic/lite/config) wins whenever it exists; the deprecated
+# brand-root path is only a fallback and the two are never merged. One
+# definition, used by the loader below and by every reader that must resolve
+# the same file without sourcing it into the live environment.
+ds_global_config_path() {
+  if [ -f "$HOME/.config/clagentic/lite/config" ]; then
+    printf '%s' "$HOME/.config/clagentic/lite/config"
+  elif [ -f "$HOME/.config/clagentic/config" ]; then
+    printf '%s' "$HOME/.config/clagentic/config"
+  fi
+}
+
+# ds_config_file_values FILE KEY... — print one KEY=value line per KEY, as FILE
+# (a shell-syntax config file) defines it, and nothing else. FILE is sourced in
+# a subshell that starts with every CLAGENTIC_* variable unset, so the result is
+# what the file says and never what the calling process inherited: the env
+# loaders export what they source and latch, so an exec'd child sees the values
+# of every layer already loaded. A KEY the file does not set prints as empty.
+# Newlines inside a value are printed as \001 (which no accepted value may
+# contain) so one value is always one line and cannot inject a second KEY=.
+ds_config_file_values() {
+  _dcfv_file="$1"
+  shift
+  [ -f "$_dcfv_file" ] || return 0
+  (
+    set +e +u
+    for _dcfv_var in $(env | sed -n 's/^\(CLAGENTIC_[A-Za-z0-9_]*\)=.*/\1/p'); do
+      unset "$_dcfv_var"
+    done
+    # Non-exported variables are not in env(1)'s listing; the asked-for keys
+    # are unset explicitly so an inherited shell variable cannot leak through.
+    for _dcfv_key in "$@"; do
+      unset "$_dcfv_key"
+    done
+    # shellcheck disable=SC1090
+    . "$_dcfv_file" >/dev/null 2>&1 </dev/null
+    for _dcfv_key in "$@"; do
+      eval "_dcfv_val=\${${_dcfv_key}:-}"
+      printf '%s=%s\n' "$_dcfv_key" "$(printf '%s' "$_dcfv_val" | tr '\n' '\001')"
+    done
+  ) || true
+}
+
 # ds_load_global_env — load ONLY the operator-owned global config
 # (~/.config/clagentic/lite/config, written by `clagentic-lite init`). Trust
 # boundary: this file lives outside any repo, so no amount of cloning or
@@ -107,16 +152,15 @@ ds_load_global_env() {
   [ "${CLAGENTIC_ENV_LOADED:-0}" = "1" ] && return 0
   [ "${CLAGENTIC_GLOBAL_ENV_LOADED:-0}" = "1" ] && return 0
 
-  _GLOBAL_CFG="$HOME/.config/clagentic/lite/config"
+  _GLOBAL_CFG=$(ds_global_config_path)
   _GLOBAL_CFG_OLD="$HOME/.config/clagentic/config"
-  if [ ! -f "$_GLOBAL_CFG" ] && [ -f "$_GLOBAL_CFG_OLD" ]; then
-    _GLOBAL_CFG="$_GLOBAL_CFG_OLD"
+  if [ -n "$_GLOBAL_CFG" ] && [ "$_GLOBAL_CFG" = "$_GLOBAL_CFG_OLD" ]; then
     if [ -z "${CLAGENTIC_GLOBAL_CONFIG_OLD_PATH_WARNED:-}" ]; then
       printf 'clagentic-lite: reading global config from deprecated path %s -- run `clagentic-lite update` to migrate to ~/.config/clagentic/lite/config\n' "$_GLOBAL_CFG_OLD" >&2
       export CLAGENTIC_GLOBAL_CONFIG_OLD_PATH_WARNED=1
     fi
   fi
-  if [ -f "$_GLOBAL_CFG" ]; then
+  if [ -n "$_GLOBAL_CFG" ]; then
     set -a
     # shellcheck disable=SC1090
     . "$_GLOBAL_CFG"

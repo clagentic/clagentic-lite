@@ -990,18 +990,23 @@ _CLAUDE_PLUGIN_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_PLUGIN_TIMEOUT_SEC "$
 # reported and the mutating step is skipped, rather than silently treated
 # as GENUINELY-NO-MATCH.
 
-# RENDER INPUTS ARE GLOBAL-ONLY. The rendered plugin is ONE per user (see
-# AGENTS.md "Single-plugin config-aware render + render stamp"), not one per repo. If the render read a key
-# from whichever repo's .clagentic/config happened to be loaded when
-# update/doctor ran, the plugin baked for EVERY project would flip depending
-# on which repo `update` was last run from. So every key the render (and its
-# stamp) branches on is snapshotted here, once, at startup, right after the
-# global config load and BEFORE the registry-gated per-repo load in dispatch
-# (_cli_maybe_load_repo_env). Result: global config plus the calling
-# environment, never per-repo config. _render_config_fingerprint and
-# _render_clagentic_lite_plugin_dir both read through _render_input, so the
-# stamp and the render cannot disagree. Per-repo _CMD/_TIER stay per-repo on
-# the llm-client.sh CLI path; that path never goes through here.
+# RENDER INPUTS COME FROM THE GLOBAL CONFIG FILE ONLY. The rendered plugin is
+# ONE per user (see AGENTS.md "Single-plugin config-aware render + render
+# stamp"), not one per repo. If the render read a key from whichever repo's
+# .clagentic/config happened to be loaded when update/doctor ran, the plugin
+# baked for EVERY project would flip depending on which repo `update` was last
+# run from. The process environment is no safer: the env loaders export what
+# they source and latch (platform.sh), and `update` re-execs itself after a
+# pull, so the new process inherits the repo's values with the global load
+# already marked done. So every key the render (and its stamp) branches on is
+# resolved once, at startup, by sourcing ONLY the global config file
+# (ds_global_config_path) in a subshell that starts with every CLAGENTIC_*
+# variable unset (ds_config_file_values). Neither per-repo config nor exported
+# shell values can reach it, whatever the loader latches say.
+# _render_config_fingerprint and _render_clagentic_lite_plugin_dir both read
+# through _render_input, so the stamp and the render cannot disagree. Per-repo
+# _CMD/_TIER stay per-repo on the llm-client.sh CLI path; that path never goes
+# through here.
 
 # Single source of truth for the five role agents the plugin ships, one
 # ROLE_ENV_PREFIX:agent-file:router-chain entry per role (space-separated;
@@ -1030,24 +1035,30 @@ _agent_role_chain() {
 }
 
 # _render_key_table
-# THE table of render inputs: one "KEY WHEN" line per env key the render
+# THE table of render inputs: one "KEY WHEN PATH" line per key the render
 # depends on. WHEN says when a value for that key changes the rendered plugin:
 #   always     every time it is set (router URL/inject switch, every _AGENT_MODEL)
 #   injection  only while router injection is on (the reviewer/auditor/gate
 #              _CMD: a non-claude CMD is what makes a role router-referenced)
 #   never      builder/troubleshooter _CMD: no chain, so the render ignores it
+# PATH says whether the key is ALSO read on the gate/CLI path (llm-client.sh),
+# which is where a per-repo value still matters:
+#   both       read by the render AND by the gate/CLI path (the _CMD keys and
+#              CLAGENTIC_ROUTER_URL)
+#   render     read by the render only (every _AGENT_MODEL, the inject switch)
 # _render_input_keys (the startup snapshot), _plugin_agent_needs_injection
-# (which _CMD keys matter) and _doctor_check_repo_render_keys (which per-repo
-# keys to warn about) all read this one table, so they cannot drift apart.
+# (which _CMD keys matter) and the two doctor checks that name a misplaced
+# render key (which keys, and what the warning says) all read this one table,
+# so they cannot drift apart.
 _render_key_table() {
-  printf 'CLAGENTIC_ROUTER_URL always\nCLAGENTIC_ROUTER_INJECT_AGENT_MODEL always\n'
+  printf 'CLAGENTIC_ROUTER_URL always both\nCLAGENTIC_ROUTER_INJECT_AGENT_MODEL always render\n'
   for _rkt_entry in $_AGENT_ROLE_TABLE; do
     _rkt_prefix="${_rkt_entry%%:*}"
-    printf 'CLAGENTIC_%s_AGENT_MODEL always\n' "$_rkt_prefix"
+    printf 'CLAGENTIC_%s_AGENT_MODEL always render\n' "$_rkt_prefix"
     if [ -n "$(_agent_role_chain "$_rkt_prefix")" ]; then
-      printf 'CLAGENTIC_%s_CMD injection\n' "$_rkt_prefix"
+      printf 'CLAGENTIC_%s_CMD injection both\n' "$_rkt_prefix"
     else
-      printf 'CLAGENTIC_%s_CMD never\n' "$_rkt_prefix"
+      printf 'CLAGENTIC_%s_CMD never both\n' "$_rkt_prefix"
     fi
   done
 }
@@ -1063,17 +1074,25 @@ _AGENT_MODEL_CHARS=']A-Za-z0-9._:/@[-'
 # Prints every env key the render depends on, space-separated (the first
 # column of _render_key_table).
 _render_input_keys() {
-  _render_key_table | while read -r _rik_key _rik_when; do
+  _render_key_table | while read -r _rik_key _rik_when _rik_path; do
     printf '%s ' "$_rik_key"
   done
 }
 
 # _capture_render_inputs
-# Snapshots every render input into _RI_<KEY>. Called once at startup (below);
-# the keys come from _render_input_keys, never from user input.
+# Resolves every render input into _RI_<KEY> from the global config FILE only
+# (see RENDER INPUTS COME FROM THE GLOBAL CONFIG FILE ONLY above). Called once
+# at startup (below); the keys come from _render_input_keys, never from user
+# input. A key the file does not set resolves to empty, whatever the process
+# inherited.
 _capture_render_inputs() {
-  for _cri_key in $(_render_input_keys); do
-    eval "_RI_${_cri_key}=\${${_cri_key}:-}"
+  _cri_keys=$(_render_input_keys)
+  # $_cri_keys is a fixed list of identifiers, split on purpose.
+  # shellcheck disable=SC2086
+  _cri_dump=$(ds_config_file_values "$(ds_global_config_path)" $_cri_keys) || _cri_dump=""
+  for _cri_key in $_cri_keys; do
+    _cri_val=$(printf '%s\n' "$_cri_dump" | sed -n "s/^${_cri_key}=//p" | head -n 1)
+    eval "_RI_${_cri_key}=\$_cri_val"
   done
 }
 
@@ -1109,30 +1128,88 @@ _plugin_agent_needs_injection() {
   [ -n "$_pani_cmd" ] && [ "$_pani_cmd" != "claude" ]
 }
 
+# _render_key_is_relevant WHEN
+# Succeeds when a key of table class WHEN currently changes the rendered
+# plugin: 'always' keys always do, 'injection' keys only while router injection
+# is on (per the global inputs), 'never' keys do not.
+_render_key_is_relevant() {
+  case "$1" in
+    never) return 1 ;;
+    injection) _render_router_injection_on ;;
+    *) return 0 ;;
+  esac
+}
+
+# _repo_config_sets_key KEY
+# Succeeds, and prints the file, when the current repo's own config
+# (.clagentic/config, legacy .env) assigns KEY. Reads the files as text (grep);
+# never sources them.
+_repo_config_sets_key() {
+  _rcsk_root=$(ds_repo_root)
+  [ -n "$_rcsk_root" ] || return 1
+  for _rcsk_rel in .clagentic/config .env; do
+    _rcsk_file="$_rcsk_root/$_rcsk_rel"
+    [ -f "$_rcsk_file" ] || continue
+    if grep -Eq "^[[:space:]]*(export[[:space:]]+)?$1=" "$_rcsk_file" 2>/dev/null; then
+      printf '%s' "$_rcsk_file"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # _doctor_check_repo_render_keys
 # Warns when the current repo's own config (.clagentic/config, legacy .env)
 # sets a render-affecting key. Such a key is never applied (see RENDER INPUTS
-# ARE GLOBAL-ONLY above) and is never silently ignored either: it is named
-# here so the operator moves it to the global config. Reads the files as text
-# (grep), never sources them.
+# COME FROM THE GLOBAL CONFIG FILE ONLY above) and is never silently ignored
+# either: it is named here so the operator can act. Only keys that actually
+# change the rendered plugin are named (WHEN column of _render_key_table); the
+# wording follows the PATH column: a key the gate/CLI path also reads still
+# applies there, a render-only key has no effect anywhere per repo.
 _doctor_check_repo_render_keys() {
   _dcrrk_root=$(ds_repo_root)
   [ -n "$_dcrrk_root" ] || return 0
   for _dcrrk_rel in .clagentic/config .env; do
     _dcrrk_file="$_dcrrk_root/$_dcrrk_rel"
     [ -f "$_dcrrk_file" ] || continue
-    # Only keys that actually change the rendered plugin are named (WHEN
-    # column of _render_key_table); a key the render ignores is not noise.
-    _render_key_table | while read -r _dcrrk_key _dcrrk_when; do
-      case "$_dcrrk_when" in
-        never) continue ;;
-        injection) _render_router_injection_on || continue ;;
-      esac
+    _render_key_table | while read -r _dcrrk_key _dcrrk_when _dcrrk_path; do
+      _render_key_is_relevant "$_dcrrk_when" || continue
       if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${_dcrrk_key}=" "$_dcrrk_file" 2>/dev/null; then
-        printf '  WARN %s is set in %s. Render-affecting keys are read from the global config only (one rendered plugin per user), so this per-repo value has no effect on dispatched agents. It still applies to the gate/CLI path (llm-client.sh) here. To change the dispatched agents, set it in %s.\n' \
-          "$_dcrrk_key" "$_dcrrk_file" "$GLOBAL_CONFIG"
+        case "$_dcrrk_path" in
+          both)
+            printf '  WARN %s is set in %s: still applies to the gate/CLI path; ignored for dispatched-agent render, which reads only %s. To change the dispatched agents, set it there.\n' \
+              "$_dcrrk_key" "$_dcrrk_file" "$GLOBAL_CONFIG"
+            ;;
+          *)
+            printf '  WARN %s is set in %s: has no effect anywhere when set per repo; set it in %s.\n' \
+              "$_dcrrk_key" "$_dcrrk_file" "$GLOBAL_CONFIG"
+            ;;
+        esac
       fi
     done
+  done
+  return 0
+}
+
+# _doctor_check_env_render_keys
+# INFO when a render-affecting key is exported in the environment doctor runs
+# in with a value that differs from the global config file's. The render never
+# reads exported values (see RENDER INPUTS COME FROM THE GLOBAL CONFIG FILE
+# ONLY above), so a shell export or a value inherited across `update`'s re-exec
+# is ignored for dispatched-agent render; naming it here keeps that from being
+# a silent surprise. The value itself is never printed. A key already named by
+# the per-repo warning is skipped, so one misplaced key is reported once.
+_doctor_check_env_render_keys() {
+  _dcerk_global=$(ds_global_config_path)
+  [ -n "$_dcerk_global" ] || _dcerk_global="$GLOBAL_CONFIG"
+  _render_key_table | while read -r _dcerk_key _dcerk_when _dcerk_path; do
+    _render_key_is_relevant "$_dcerk_when" || continue
+    _dcerk_env=$(eval "printf '%s' \"\${${_dcerk_key}:-}\"")
+    [ -n "$_dcerk_env" ] || continue
+    [ "$_dcerk_env" != "$(_render_input "$_dcerk_key")" ] || continue
+    _repo_config_sets_key "$_dcerk_key" >/dev/null && continue
+    printf '  INFO %s is exported in this environment with a value that differs from %s; ignored for dispatched-agent render (that reads only the global config file). Set it in %s to change the dispatched agents.\n' \
+      "$_dcerk_key" "$_dcerk_global" "$_dcerk_global"
   done
   return 0
 }
@@ -1143,21 +1220,38 @@ _agent_model_value() {
   _render_input "CLAGENTIC_${1}_AGENT_MODEL"
 }
 
+# The accepted grammar in words, for every message that rejects a value.
+_AGENT_MODEL_GRAMMAR="a model alias, a full model ID or 'inherit': ASCII letters, digits and . _ : / @ [ ] -, starting with a letter or digit, ending with a letter, digit or ']', and not starting with 'role:'"
+
 # _agent_model_value_is_valid VALUE
-# Conservative allowlist, because the value is written into YAML frontmatter:
-# alnum start; then alnum . _ : / @ [ ] -; no trailing colon (a trailing ':'
-# turns the scalar into a mapping key). This admits aliases (sonnet), full
-# model IDs, Bedrock/Vertex IDs and ARNs, and 'inherit'. Whitespace, quotes,
-# '#', newlines and every other YAML-significant character are rejected, so
-# a value can never open a second frontmatter key or close the block.
+# The accepted grammar for a CLAGENTIC_<ROLE>_AGENT_MODEL value, because it is
+# written into YAML frontmatter (docs/LLM-USAGE.md states the same rules):
+#   - non-empty, ASCII only: letters, digits and  . _ : / @ [ ] -
+#     (the class is _AGENT_MODEL_CHARS, shared with the display filter, so a
+#     value accepted here is never mangled when doctor prints it);
+#   - starts with a letter or digit;
+#   - ends with a letter, a digit or ']'  (so never a trailing ':', which would
+#     turn the scalar into a mapping key, and never a dangling separator);
+#   - does not start with 'role:'. That prefix is the router-reference form
+#     (role:<x>-chain); only router injection may write it, and a pinned model
+#     is by definition not a router reference.
+# Every other byte is rejected: whitespace, quotes, '#', braces, newlines and
+# every control character, so a value can never open a second frontmatter key
+# or close the block. The checks run in the C locale so a bracket range means
+# the same ASCII bytes on every platform.
 _agent_model_value_is_valid() {
-  case "$1" in
-    "") return 1 ;;
-    [!A-Za-z0-9]*) return 1 ;;
-    *:) return 1 ;;
-    *[!$_AGENT_MODEL_CHARS]*) return 1 ;;
-  esac
-  return 0
+  (
+    LC_ALL=C
+    export LC_ALL
+    case "$1" in
+      "") return 1 ;;
+      role:*) return 1 ;;
+      [!A-Za-z0-9]*) return 1 ;;
+      *[!]A-Za-z0-9]) return 1 ;;
+      *[!$_AGENT_MODEL_CHARS]*) return 1 ;;
+    esac
+    return 0
+  )
 }
 
 # _agent_model_display VALUE
@@ -1287,7 +1381,7 @@ _render_clagentic_lite_plugin_dir() {
     case "$_rcpd_kind" in
       router|pinned) _rcpd_model_line="model: $_rcpd_arg" ;;
       invalid)
-        warn "CLAGENTIC_${_rcpd_prefix}_AGENT_MODEL has an invalid value ('$(_agent_model_display "$(_agent_model_value "$_rcpd_prefix")")') -- allowed: a model alias, a full model ID, or 'inherit' (letters, digits, . _ : / @ [ ] -). Ignored; ${_rcpd_file} renders with no model: line."
+        warn "CLAGENTIC_${_rcpd_prefix}_AGENT_MODEL has an invalid value ('$(_agent_model_display "$(_agent_model_value "$_rcpd_prefix")")') -- allowed: $_AGENT_MODEL_GRAMMAR. Ignored; ${_rcpd_file} renders with no model: line."
         ;;
     esac
 
@@ -1562,8 +1656,8 @@ _doctor_check_agent_models() {
         ;;
       invalid)
         "$_dcam_ok_fn" "$_dcam_file agent model: inherit (CLAGENTIC_${_dcam_prefix}_AGENT_MODEL ignored, see below)"
-        printf '  WARN CLAGENTIC_%s_AGENT_MODEL has an invalid value (%s) and is ignored. Allowed: a model alias, a full model ID, or inherit (letters, digits, . _ : / @ [ ] -).\n' \
-          "$_dcam_prefix" "$(_agent_model_display "$_dcam_raw")"
+        printf '  WARN CLAGENTIC_%s_AGENT_MODEL has an invalid value (%s) and is ignored. Allowed: %s.\n' \
+          "$_dcam_prefix" "$(_agent_model_display "$_dcam_raw")" "$_AGENT_MODEL_GRAMMAR"
         ;;
       *)
         "$_dcam_ok_fn" "$_dcam_file agent model: inherit"
@@ -4089,6 +4183,7 @@ cmd_doctor() {
   printf '\nagent-path model per role (Agent-tool dispatch; the gate/CLI path is configured separately):\n'
   _doctor_check_agent_models _ok
   _doctor_check_repo_render_keys
+  _doctor_check_env_render_keys
 
   printf '\norphaned legacy router plugin check:\n'
   _doctor_check_orphaned_router_plugin _ok _fail
