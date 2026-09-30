@@ -315,6 +315,35 @@ class TestShippedProseHygiene(unittest.TestCase):
         self.assertEqual(crew_names_in("Miller and Holden are people's names"), [])
 
 
+# Shipped manifests are read by every installer; a personal address in one is
+# an identity leak. Org-level name/url only.
+SHIPPED_MANIFESTS = (
+    ".claude-plugin/marketplace.json",
+    "plugins/clagentic-lite/.claude-plugin/plugin.json",
+)
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+
+
+def emails_in(text):
+    return sorted(set(_EMAIL_RE.findall(text)))
+
+
+class TestShippedManifestsCarryNoEmail(unittest.TestCase):
+    def test_no_email_address_in_shipped_manifests(self):
+        found = []
+        for rel in SHIPPED_MANIFESTS:
+            with open(os.path.join(TOOL_HOME, rel)) as f:
+                for lineno, line in enumerate(f, 1):
+                    for addr in emails_in(line):
+                        found.append(f"{rel}:{lineno}: {addr}")
+        self.assertEqual(found, [], "email address in a shipped manifest")
+
+    def test_detector_fails_on_a_drifted_fixture(self):
+        drifted = '{"author": {"name": "x", "email": "someone@example.com"}}'
+        self.assertEqual(emails_in(drifted), ["someone@example.com"])
+        self.assertEqual(emails_in('{"author": {"name": "clagentic"}}'), [])
+
+
 def _cli_text():
     with open(os.path.join(TOOL_HOME, "bin", "clagentic-lite")) as f:
         return f.read()

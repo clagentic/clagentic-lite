@@ -4,8 +4,8 @@
   "version": "1.2.5",
   "description": "The five clagentic-lite role agents (builder, reviewer, auditor, merge-gate, troubleshooter) plus commentary skills (/infosec-rt, /eng-consult). Install once via clagentic-lite init; Claude Code discovers agents and skills globally via the plugin directory structure.",
   "author": {
-    "name": "andy",
-    "email": "akuehner@gmail.com"
+    "name": "clagentic",
+    "url": "https://github.com/clagentic/clagentic-lite"
   },
   "homepage": "https://github.com/clagentic/clagentic-lite",
   "keywords": ["agents", "code-review", "security", "gates", "clagentic"]

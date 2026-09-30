@@ -1,8 +1,8 @@
 {
   "name": "clagentic-lite",
   "owner": {
-    "name": "andy",
-    "email": "akuehner@gmail.com"
+    "name": "clagentic",
+    "url": "https://github.com/clagentic/clagentic-lite"
   },
   "metadata": {
     "description": "Plugins shipped alongside clagentic-lite. Installs the five AI role agents (builder, reviewer, auditor, merge-gate, troubleshooter) and commentary skills (/infosec-rt, /eng-consult) globally so Claude Code discovers them in any enrolled project."
