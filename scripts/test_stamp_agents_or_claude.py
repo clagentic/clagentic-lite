@@ -193,8 +193,9 @@ class TestRegularRepoStampedInAgentsMd(_StampBase):
         self.assertEqual(rc, 0, err)
         _write(self.agents, _read(self.agents).replace(
             b"clagentic-notice-version: v2", b"clagentic-notice-version: v1"))
-        _rc, out, _err = self.run_doctor(self.tmpdir, self.repo)
-        notice_lines = [l for l in self.lines_about(out, self.repo) if "notice" in l]
+        canonical = os.path.realpath(self.repo)
+        _rc, out, _err = self.run_doctor(self.tmpdir, canonical)
+        notice_lines = [l for l in self.lines_about(out, canonical) if "notice" in l]
         self.assertTrue(notice_lines, out)
         for line in notice_lines:
             self.assertNotIn("WARN", line, line)
@@ -447,8 +448,59 @@ class TestWrapperImportsNestedAgentsMd(_StampBase):
         rc, out, err = self.update(self.nested, "--restamp")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(_read(self.wrapper_claude), PROJECT_OWNED)
-        _rc, out, _err = self.run_doctor(self.tmpdir, os.path.realpath(self.nested))
+        canonical = os.path.realpath(self.nested)
+        _rc, out, _err = self.run_doctor(self.tmpdir, canonical)
+        self.assertTrue(self.lines_about(out, canonical), out)
         self.assertNotIn("not imported", out)
+
+
+class TestRepoLevelAgentsImportTracksAgentsMd(_StampBase):
+    """The repo-level @AGENTS.md import is regenerated like the wrapper's: it
+    appears when AGENTS.md is added later and goes when AGENTS.md is deleted."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmpdir, "repo")
+        _init_repo(self.repo)
+        rc, _o, err = self.run_cli(["enroll", self.repo], cwd=self.repo)
+        self.assertEqual(rc, 0, err)
+        self.claude = os.path.join(self.repo, "CLAUDE.md")
+        self.agents = os.path.join(self.repo, "AGENTS.md")
+
+    def _imports(self):
+        return _read(self.claude).count(b"@AGENTS.md")
+
+    def test_import_added_when_agents_md_appears_later(self):
+        self.assertEqual(self._imports(), 0)
+        _write(self.agents, PROJECT_OWNED)
+        rc, out, err = self.update(self.repo)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self._imports(), 1)
+        self.assertEqual(_read(self.agents), PROJECT_OWNED)
+        rc, out, err = self.update(self.repo, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self._imports(), 1)
+
+    def test_import_dropped_when_agents_md_is_deleted(self):
+        _write(self.agents, PROJECT_OWNED)
+        rc, out, err = self.update(self.repo, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self._imports(), 1)
+        os.remove(self.agents)
+        rc, out, err = self.update(self.repo)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self._imports(), 0)
+        self.assertIn(MARKER, _read(self.claude))
+
+    def test_enroll_regenerates_the_import(self):
+        _write(self.agents, PROJECT_OWNED)
+        rc, _o, err = self.run_cli(["enroll", "--force", self.repo], cwd=self.repo)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._imports(), 1)
+        os.remove(self.agents)
+        rc, _o, err = self.run_cli(["enroll", "--force", self.repo], cwd=self.repo)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._imports(), 0)
 
 
 if __name__ == "__main__":

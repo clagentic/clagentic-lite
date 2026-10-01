@@ -2111,7 +2111,7 @@ _stamp_wrapper_claude_md() {
   # file, so the import appears when AGENTS.md is added and goes when it is
   # deleted. Only a CLAUDE.md shadows a sibling AGENTS.md.
   _wcd_import=0
-  if [ "$_wcd_name" = "CLAUDE.md" ] && [ -f "$_wcd/AGENTS.md" ]; then
+  if [ "$_wcd_name" = "CLAUDE.md" ] && _same_dir_import_wanted "$_wcd"; then
     _wcd_import=1
   fi
 
@@ -3155,12 +3155,46 @@ _wrapper_imports_drift() {
   _wid_want=$(_wrapper_nested_imports "$1" | sort)
   _wid_have=$(grep -E '^@.+/AGENTS\.md$' "$1/CLAUDE.md" 2>/dev/null | sort)
   [ "$_wid_want" != "$_wid_have" ] && return 0
-  # The same-directory import tracks whether the wrapper has an AGENTS.md.
-  _wid_same=0
-  grep -qxF '@AGENTS.md' "$1/CLAUDE.md" 2>/dev/null && _wid_same=1
-  _wid_exp=0
-  [ -f "$1/AGENTS.md" ] && _wid_exp=1
-  [ "$_wid_same" != "$_wid_exp" ]
+  _same_dir_import_drift "$1"
+}
+
+# _same_dir_import_wanted DIR
+# True when DIR's managed CLAUDE.md should carry an "@AGENTS.md" import: a
+# CLAUDE.md shadows a sibling AGENTS.md in Claude Code, so the import keeps the
+# AGENTS.md loading. One rule for the repo and the wrapper level.
+_same_dir_import_wanted() {
+  [ -f "$1/AGENTS.md" ]
+}
+
+# _same_dir_import_drift DIR
+# True when DIR's clagentic-managed CLAUDE.md carries the "@AGENTS.md" import
+# line when it should not (AGENTS.md deleted: a dangling import) or lacks it
+# when it should (AGENTS.md added later). An unmanaged or absent CLAUDE.md is
+# never drift: it is not ours to rewrite.
+_same_dir_import_drift() {
+  [ -f "$1/CLAUDE.md" ] && grep -q 'managed-by: clagentic' "$1/CLAUDE.md" 2>/dev/null || return 1
+  _sdid_have=0
+  grep -qxF '@AGENTS.md' "$1/CLAUDE.md" 2>/dev/null && _sdid_have=1
+  _sdid_want=0
+  _same_dir_import_wanted "$1" && _sdid_want=1
+  [ "$_sdid_have" != "$_sdid_want" ]
+}
+
+# _sync_same_dir_import DIR
+# Brings the "@AGENTS.md" import line of DIR's managed CLAUDE.md in line with
+# _same_dir_import_wanted: appended below the managed block when missing, the
+# exact line removed when AGENTS.md is gone. Nothing else in the file changes.
+_sync_same_dir_import() {
+  _same_dir_import_drift "$1" || return 0
+  if _same_dir_import_wanted "$1"; then
+    printf '\n@AGENTS.md\n' >> "$1/CLAUDE.md"
+  else
+    _ssdi_tmp=$(mktemp "${TMPDIR:-/tmp}/clagentic-import.XXXXXX") || return 1
+    grep -vxF '@AGENTS.md' "$1/CLAUDE.md" > "$_ssdi_tmp" || true
+    cp "$_ssdi_tmp" "$1/CLAUDE.md"
+    rm -f "$_ssdi_tmp"
+  fi
+  return 0
 }
 
 # _restamp_notice_in FILE TEMPLATE [FULL]
@@ -3524,6 +3558,7 @@ _enroll_one() {
         _restamp_notice_in "$_canon/$_cms_name" "$_claude_md_template"
         say "re-stamped $_cms_name (preserved project-owned content): $_canon/$_cms_name"
       done
+      _sync_same_dir_import "$_canon"
     elif _repo_is_wrapper_enrolled "$_canon"; then
       # Wrapper layout: the wrapper notice already carries the rules and
       # Claude Code loads it as an ancestor file, so the nested repo's own
@@ -3543,7 +3578,7 @@ _enroll_one() {
       # when no CLAUDE.md exists), so beside one the notice carries an
       # @AGENTS.md import below the managed block, which restamp preserves.
       cp "$_claude_md_template" "$_claude_md_target"
-      if [ -f "$_canon/AGENTS.md" ]; then
+      if _same_dir_import_wanted "$_canon"; then
         printf '\n@AGENTS.md\n' >> "$_claude_md_target"
         say "stamped CLAUDE.md (imports the project's AGENTS.md): $_claude_md_target"
       else
@@ -4856,6 +4891,9 @@ _restamp_repo_artifacts() {
       _ra_count=$((_ra_count+1))
     fi
   done
+  # The same-directory @AGENTS.md import follows AGENTS.md's existence on every
+  # restamp, like the wrapper's imports.
+  _sync_same_dir_import "$_ra_path"
 
   # Re-stamp .clagentic/lite/builder-contract.md — always a full restamp (gitignored,
   # no user content, local only).
@@ -5355,6 +5393,9 @@ cmd_update() {
           _need_restamp=1
         fi
       done
+      # An AGENTS.md added or deleted since the last stamp changes whether the
+      # CLAUDE.md should import it; the version tags cannot see that.
+      _same_dir_import_drift "$_rpath" && _need_restamp=1
     elif _repo_is_wrapper_enrolled "$_rpath"; then
       # Wrapper layout: the stamp belongs to the wrapper and the nested repo's
       # own CLAUDE.md/AGENTS.md is project-owned. Nothing to say about it.
