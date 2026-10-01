@@ -76,10 +76,25 @@ class TestWrapperNestedFilesAreProjectOwned(_StampBase):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(_read(owned), PROJECT_OWNED)
 
-        _rc, out, err = self.run_doctor(self.tmpdir, nested)
-        for line in self.lines_about(out, nested):
+        # The registry holds canonical paths, so match on the resolved one; an
+        # empty match would make the checks below pass vacuously.
+        canonical = os.path.realpath(nested)
+        _rc, out, err = self.run_doctor(self.tmpdir, canonical)
+        nested_lines = self.lines_about(out, canonical)
+        self.assertTrue(nested_lines, out)
+        for line in nested_lines:
             if filename in line or "notice" in line.lower():
                 self.assertNotIn("WARN", line, line)
+        owned_ok = [l for l in nested_lines if "project-owned" in l]
+        self.assertEqual(len(owned_ok), 1, out)
+        self.assertNotIn("no CLAUDE.md by design", owned_ok[0])
+
+        # tty update: no prompt about the nested repo's own file.
+        rc, out, err = self.run_cli_tty(["update"], cwd=nested, answer=b"n\n", **UPDATE_ENV)
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("Re-add the enrollment notice", out + err)
+        self.assertNotIn("enrollment notice", out + err)
+        self.assertEqual(_read(owned), PROJECT_OWNED)
 
     def test_claude_md(self):
         self._check("CLAUDE.md", "proj")
@@ -116,6 +131,18 @@ class TestWrapperStampInAgentsMd(_StampBase):
         restamped = _read(self.agents)
         self.assertIn(b"clagentic-wrapper-version: v2", restamped)
         self.assertEqual(restamped.count(MARKER), 1)
+
+    def test_doctor_reports_each_wrapper_once_despite_several_repos(self):
+        _init_repo(os.path.join(self.wrapper, "other"))
+        self.enroll_wrapper(self.wrapper)
+        _write(os.path.join(self.wrapper, "CLAUDE.md"), PROJECT_OWNED)
+        _rc, out, _err = self.run_doctor(self.tmpdir, self.nested)
+        stamp_ok = [l for l in out.splitlines() if "carries the enrollment stamp" in l]
+        self.assertEqual(len(stamp_ok), 1, out)
+        info = [l for l in out.splitlines() if "does not load AGENTS.md by default" in l]
+        self.assertEqual(len(info), 1, out)
+        checking = [l for l in out.splitlines() if l.strip().startswith("checking ")]
+        self.assertEqual(len(checking), 1, out)
 
     def test_enroll_does_not_add_a_second_stamp(self):
         _init_repo(os.path.join(self.wrapper, "other"))
@@ -156,6 +183,7 @@ class TestRegularRepoStampedInAgentsMd(_StampBase):
         self.assertIn(b"clagentic-notice-version: v2", body)
         self.assertIn(b"project-owned line", body)
         self.assertTrue(body.startswith(b"# AGENTS.md\n"))
+        self.assertEqual(body.count(MARKER), 1)
 
     def test_doctor_ok_and_update_restamps_only_agents_md(self):
         rc, _o, err = self.run_cli(["enroll", self.repo], cwd=self.repo)
@@ -163,9 +191,10 @@ class TestRegularRepoStampedInAgentsMd(_StampBase):
         _write(self.agents, _read(self.agents).replace(
             b"clagentic-notice-version: v2", b"clagentic-notice-version: v1"))
         _rc, out, _err = self.run_doctor(self.tmpdir, self.repo)
-        for line in self.lines_about(out, self.repo):
-            if "notice" in line:
-                self.assertNotIn("WARN", line, line)
+        notice_lines = [l for l in self.lines_about(out, self.repo) if "notice" in l]
+        self.assertTrue(notice_lines, out)
+        for line in notice_lines:
+            self.assertNotIn("WARN", line, line)
 
         rc, out, err = self.update(self.repo)
         self.assertEqual(rc, 0, out + err)
@@ -186,6 +215,7 @@ class TestRegularRepoStampedInAgentsMd(_StampBase):
         self.assertTrue(info[0].lstrip().startswith("INFO"), info[0])
         self.assertEqual(_read(claude), PROJECT_OWNED)
         rc, out, err = self.update(self.repo)
+        self.assertEqual(rc, 0, out + err)
         self.assertEqual(_read(claude), PROJECT_OWNED)
         self.assertNotIn("enrollment notice", out + err)
 

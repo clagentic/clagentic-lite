@@ -3873,7 +3873,11 @@ cmd_doctor() {
       _cm_stamped=$(_stamped_files_in "$_rpath")
       if [ -z "$_cm_stamped" ]; then
         if _repo_is_wrapper_enrolled "$_rpath"; then
-          _ok "$_rpath: no CLAUDE.md by design (wrapper layout: the wrapper notice applies)"
+          if [ -f "$_rpath/CLAUDE.md" ] || [ -f "$_rpath/AGENTS.md" ]; then
+            _ok "$_rpath: own CLAUDE.md/AGENTS.md is project-owned and left untouched (wrapper layout: the wrapper notice applies)"
+          else
+            _ok "$_rpath: no CLAUDE.md by design (wrapper layout: the wrapper notice applies)"
+          fi
         elif [ -f "$_rpath/CLAUDE.md" ]; then
           printf '  WARN  %s: no enrollment notice (the existing CLAUDE.md has no clagentic marker and is project-owned: enroll never overwrites it; delete or rename it and run `clagentic-lite enroll` to have enroll write the notice into CLAUDE.md)\n' "$_rpath"
         elif [ -f "$_rpath/AGENTS.md" ]; then
@@ -3996,10 +4000,15 @@ cmd_doctor() {
   # 7. Wrapper .clagentic-project pointer files
   printf '\nwrapper .clagentic-project pointers:\n'
   _wrapper_found=0
+  _wrappers_seen=""
   if [ -f "$REGISTRY" ]; then
     while IFS= read -r _rpath; do
       [ -z "$_rpath" ] && continue
       _parent=$(_wrapper_dir_for "$_rpath") || continue
+      # Several registry repos share one wrapper; report each wrapper once.
+      printf '%s\n' "$_wrappers_seen" | grep -qxF "$_parent" && continue
+      _wrappers_seen="$_wrappers_seen
+$_parent"
       _ptr="$_parent/.clagentic-project"
       _wrapper_found=1
       printf '  checking %s\n' "$_ptr"
