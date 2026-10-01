@@ -179,7 +179,7 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 3. Refuses if already enrolled (use `--force` to re-enroll).
 4. Initializes `.clagentic/lite/audit.db` and `.clagentic/lite/memory.db` in that repo.
 5. Stamps `.git/hooks/pre-commit` and `.git/hooks/pre-push` from `share/hook-shims/*.template`, substituting `$CLAGENTIC_LITE_HOME` at stamp time. Refuses to overwrite non-clagentic hooks unless `--force`.
-6. Generates `.claude/settings.json` (absolute hook paths → `$CLAGENTIC_LITE_HOME`), symlinks `.claude/commands`, and and ignores `.claude/` and `.clagentic/lite/` (see "Which project files enroll and update write" below for where). These are local-only artifacts. Role agents and commentary skills are installed globally via the `clagentic-lite` plugin at `init` time — no per-repo copies.
+6. Generates `.claude/settings.json` (absolute hook paths → `$CLAGENTIC_LITE_HOME`), symlinks `.claude/commands`, and ignores `.claude/` and `.clagentic/lite/` (see "Which project files enroll and update write" below for where). These are local-only artifacts. Role agents and commentary skills are installed globally via the `clagentic-lite` plugin at `init` time — no per-repo copies.
 7. Stamps `CLAUDE.md` at the repo root when none exists — activates the Builder contract and exposes agents for Claude Code auto-dispatch. A `CLAUDE.md` without the `managed-by: clagentic` marker is project-owned and is never overwritten, not even with `--force`.
 8. Registers the repo path in `~/.local/state/clagentic/registry`.
 

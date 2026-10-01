@@ -3062,13 +3062,22 @@ _register_wrapper_repo() {
 }
 
 # _repo_is_wrapper_enrolled REPO
-# True when REPO's parent directory holds a .clagentic-project pointer that
-# lists REPO. Membership, not mere existence: an unrelated repo that happens
-# to sit beside a pointer file is not wrapper-enrolled.
+# True when a .clagentic-project pointer in an ancestor directory of REPO
+# lists REPO. Walks every ancestor, nearest first, and stops at the first
+# pointer found — the same walk ds_repo_root (platform.sh) uses, so a repo at
+# wrapper/group/repo is classified the way the rest of the tool resolves it.
+# Membership, not mere existence: an unrelated repo that happens to sit
+# beneath a pointer file is not wrapper-enrolled.
 _repo_is_wrapper_enrolled() {
-  _rwe_ptr="$(dirname "$1")/.clagentic-project"
-  [ -f "$_rwe_ptr" ] || return 1
-  grep -qxF "$1" "$_rwe_ptr" 2>/dev/null
+  _rwe_d=$(dirname "$1")
+  while [ "$_rwe_d" != "/" ] && [ "$_rwe_d" != "." ]; do
+    if [ -f "$_rwe_d/.clagentic-project" ]; then
+      grep -qxF "$1" "$_rwe_d/.clagentic-project" 2>/dev/null
+      return $?
+    fi
+    _rwe_d=$(dirname "$_rwe_d")
+  done
+  return 1
 }
 
 # _repo_exclude_file REPO

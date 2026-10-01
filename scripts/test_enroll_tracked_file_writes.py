@@ -68,12 +68,12 @@ class _Base(unittest.TestCase):
         self.cli = os.path.join(self.tool_home, "bin", "clagentic-lite")
 
     def _env(self, **extra):
-        env = dict(os.environ)
+        # Scrub every CLAGENTIC_* variable so an exported operator setting
+        # (e.g. CLAGENTIC_IGNORE_TARGET) cannot change a result.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAGENTIC_")}
         env["HOME"] = self.home
         env["CLAGENTIC_LITE_HOME"] = self.tool_home
         env["CLAGENTIC_SKIP_UPDATE_ALERT"] = "1"
-        env.pop("CLAGENTIC_HOME", None)
-        env.pop("CLAGENTIC_IGNORE_TARGET", None)
         env.update(extra)
         return env
 
@@ -95,6 +95,21 @@ class _Base(unittest.TestCase):
             return proc.returncode, out, err
         finally:
             os.close(master)
+
+    def run_doctor(self, cwd, repo):
+        """Run doctor and assert its exit code is explained by its own output.
+
+        The scratch tool home was never `init`ed, so doctor reports unrelated
+        FAIL lines (missing hook shims, PATH) and exits 1. The exit code must be
+        non-zero exactly when a FAIL line exists, and no FAIL line may concern
+        the enrolled repo under test.
+        """
+        rc, out, err = self.run_cli(["doctor"], cwd=cwd)
+        fail_lines = [l for l in (out + err).splitlines() if l.lstrip().startswith("FAIL")]
+        self.assertEqual(rc, 1 if fail_lines else 0, out + err)
+        for line in fail_lines:
+            self.assertNotIn(repo, line, line)
+        return rc, out, err
 
     def exclude_lines(self, repo):
         path = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude")
@@ -249,7 +264,7 @@ class TestWrapperLayout(_Base):
 
     def test_doctor_reports_no_missing_claude_md_warning(self):
         self._enroll_wrapper()
-        rc, out, err = self.run_cli(["doctor"], cwd=self.tmpdir)
+        rc, out, err = self.run_doctor(self.tmpdir, self.nested)
         self.assertIn("no CLAUDE.md by design", out)
         for line in out.splitlines():
             if self.nested in line and "CLAUDE.md" in line:
@@ -268,10 +283,26 @@ class TestWrapperLayout(_Base):
     def test_doctor_info_for_existing_harness_lines_in_nested_gitignore(self):
         self._enroll_wrapper()
         _write(self.gi, self.original_gi + b".claude/\n")
-        rc, out, err = self.run_cli(["doctor"], cwd=self.tmpdir)
+        rc, out, err = self.run_doctor(self.tmpdir, self.nested)
         self.assertTrue(any("INFO" in l and self.nested in l and ".gitignore" in l
                             for l in out.splitlines()), out)
         self.assertEqual(_read(self.gi), self.original_gi + b".claude/\n")
+
+
+class TestWrapperLayoutTwoLevelsDeep(_Base):
+    def test_deeply_nested_repo_is_treated_as_wrapper_enrolled(self):
+        wrapper = os.path.join(self.tmpdir, "wrapper")
+        nested = os.path.join(wrapper, "group", "proj")
+        _init_repo(nested)
+        gi = os.path.join(nested, ".gitignore")
+        original = b"dist/\n\n# mine\n"
+        _write(gi, original)
+        rc, out, err = self.run_cli_tty(["enroll", wrapper], cwd=wrapper)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(_read(gi), original)
+        self.assertFalse(os.path.exists(os.path.join(nested, "CLAUDE.md")))
+        for pat in HARNESS_PATTERNS:
+            self.assertIn(pat, self.exclude_lines(nested))
 
 
 class TestUpdateMigrationPreservesGitignore(_Base):
