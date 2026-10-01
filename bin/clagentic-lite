@@ -641,7 +641,7 @@ _render_api_key_helper_command() {
 # template output, so the sentinel line is DELETED (not replaced with an
 # empty line) when unset. sed one-liner substitution cannot conditionally
 # delete-or-multiline-replace a single line, so this reads the template
-# line-by-line, mirroring the established pattern in _stamp_wrapper_claude_md.
+# line-by-line, mirroring the established pattern in _instr_write_wrapper.
 #
 # ANTHROPIC_AUTH_TOKEN (not ANTHROPIC_API_KEY) is stamped because Claude Code
 # sends that variable as `Authorization: Bearer <token>`, which is one of the
@@ -2079,29 +2079,269 @@ _install_clagentic_lite_plugin() {
   fi
 }
 
-# Stamp a wrapper-flavored CLAUDE.md into a non-git wrapper directory.
-# Args: WRAPPER_DIR  ENROLLED_REPOS (space-separated absolute paths)
+# ---------------------------------------------------------------- instruction files
+#
+# The enrollment stamp (the managed-by marker) lives in CLAUDE.md or AGENTS.md,
+# at the repo level and at the wrapper level. Everything that decides about or
+# writes those files goes through three functions, so enroll, update,
+# update --restamp and doctor cannot disagree about what a directory should hold:
+#
+#   _instr_desired DIR KIND            what DIR should hold (desired state)
+#   _instr_diff    DIR KIND            actual state against it (the comparer)
+#   _instr_sync    DIR KIND MODE [LABEL]   the only writer
+#
+# KIND is "repo" (a regular enrolled repo), "nested" (a repo enrolled through a
+# wrapper: its own CLAUDE.md/AGENTS.md are project-owned and nothing is ever
+# created there) or "wrapper" (the wrapper directory). _instr_kind_of resolves
+# a repo's kind. _instr_doctor_report renders the comparer's findings for doctor.
+# Everything else named _instr_* below is internal to those functions.
+#
+# Never overwritten: a CLAUDE.md or AGENTS.md without the marker is project-owned.
+# Never created twice: the tool never writes a second stamp, or moves the stamp
+# to the other file.
+
+# _instr_kind_of REPO
+# Prints "nested" when REPO is enrolled through a wrapper, else "repo".
+_instr_kind_of() {
+  if _repo_is_wrapper_enrolled "$1"; then
+    printf 'nested\n'
+  else
+    printf 'repo\n'
+  fi
+}
+
+# _instr_desired DIR KIND
+# Prints the desired state of DIR's instruction files, one record per line:
+#   stamped NAME        NAME carries the marker (CLAUDE.md first, then AGENTS.md)
+#   owned NAME          NAME exists without the marker: project-owned
+#   create CLAUDE.md    nothing is stamped and enroll should write CLAUDE.md
+#                       (never in a nested repo; never beside a project-owned
+#                       CLAUDE.md)
+#   import LINE         the @-import lines a stamped CLAUDE.md must carry. A
+#                       CLAUDE.md shadows a sibling AGENTS.md in Claude Code, so
+#                       "@AGENTS.md" keeps it loading; at the wrapper level a
+#                       "@<relative path>/AGENTS.md" line per pointer repo that
+#                       has an AGENTS.md and no CLAUDE.md of its own does the
+#                       same one level down. Decided from the filesystem on every
+#                       call, never from the previous file, so the lines appear
+#                       and disappear as files do. An AGENTS.md stamp never
+#                       imports anything.
+_instr_desired() {
+  _id_dir="$1"; _id_kind="$2"
+  _id_stamped=0
+  for _id_n in CLAUDE.md AGENTS.md; do
+    [ -f "$_id_dir/$_id_n" ] || continue
+    if grep -q 'managed-by: clagentic' "$_id_dir/$_id_n" 2>/dev/null; then
+      printf 'stamped %s\n' "$_id_n"
+      _id_stamped=1
+    else
+      printf 'owned %s\n' "$_id_n"
+    fi
+  done
+  if [ "$_id_stamped" -eq 0 ] && [ "$_id_kind" != "nested" ] && [ ! -f "$_id_dir/CLAUDE.md" ]; then
+    printf 'create CLAUDE.md\n'
+  fi
+  if [ -f "$_id_dir/AGENTS.md" ]; then
+    printf 'import @AGENTS.md\n'
+  fi
+  if [ "$_id_kind" = "wrapper" ] && [ -f "$_id_dir/.clagentic-project" ]; then
+    while IFS= read -r _id_repo; do
+      [ -n "$_id_repo" ] || continue
+      case "$_id_repo" in "$_id_dir"/*) ;; *) continue ;; esac
+      [ -f "$_id_repo/AGENTS.md" ] || continue
+      [ -f "$_id_repo/CLAUDE.md" ] && continue
+      printf 'import @%s/AGENTS.md\n' "${_id_repo#"$_id_dir"/}"
+    done < "$_id_dir/.clagentic-project" | awk '!seen[$0]++'
+  fi
+  return 0
+}
+
+# _instr_present_imports FILE KIND
+# Prints the @-import lines FILE actually carries where the writer puts them:
+# the generated region for a wrapper file, any exact "@AGENTS.md" line otherwise.
+# A hand-written import elsewhere in a wrapper file is project-owned and never
+# listed, so it cannot read as drift no restamp could clear.
+_instr_present_imports() {
+  case "$2" in
+    wrapper) _instr_region_imports "$1" ;;
+    *) grep -xF '@AGENTS.md' "$1" 2>/dev/null || true ;;
+  esac
+  return 0
+}
+
+# _instr_diff DIR KIND
+# The comparer: prints one finding per line when DIR's actual instruction files
+# differ from _instr_desired, nothing when they match. Both update's drift
+# decision and doctor's report read these lines.
+#   drift notice-version NAME VER   a repo/nested notice at another version
+#   drift old-format NAME VER       an old fat notice, migrated on restamp
+#   drift wrapper-version NAME VER  a wrapper file at another version
+#   drift import-missing LINE       a wanted import line is absent
+#   drift import-extra LINE         an import line the tool wrote is now stale
+#   note no-version NAME            marker without a version tag
+#   note agents-only                the marker is in AGENTS.md only while a
+#                                   CLAUDE.md in the same directory shadows it
+#   unstamped REASON                nothing is stamped; REASON is nested-owned,
+#                                   nested-absent, owned-claude, owned-agents
+#                                   or absent
+# "drift" lines are what update acts on; "note" and "unstamped" lines are
+# reported only (update additionally restamps the other artifacts of a repo
+# whose reason is owned-agents or absent, and warns for owned-claude).
+_instr_diff() {
+  _idf_dir="$1"; _idf_kind="$2"
+  _idf_desired=$(_instr_desired "$_idf_dir" "$_idf_kind")
+  _idf_stamped=$(printf '%s\n' "$_idf_desired" | sed -n 's/^stamped //p')
+  if [ -z "$_idf_stamped" ]; then
+    _idf_owned=$(printf '%s\n' "$_idf_desired" | sed -n 's/^owned //p')
+    if [ "$_idf_kind" = "nested" ]; then
+      if [ -n "$_idf_owned" ]; then
+        printf 'unstamped nested-owned\n'
+      else
+        printf 'unstamped nested-absent\n'
+      fi
+    else
+      case "$_idf_owned" in
+        *CLAUDE.md*) printf 'unstamped owned-claude\n' ;;
+        *AGENTS.md*) printf 'unstamped owned-agents\n' ;;
+        *)           printf 'unstamped absent\n' ;;
+      esac
+    fi
+    return 0
+  fi
+  for _idf_n in $_idf_stamped; do
+    _idf_f="$_idf_dir/$_idf_n"
+    if [ "$_idf_kind" = "wrapper" ]; then
+      _idf_ver=$(claude_wrapper_version "$_idf_f")
+      if [ "$_idf_ver" != "$CLAUDE_WRAPPER_VERSION" ]; then
+        printf 'drift wrapper-version %s %s\n' "$_idf_n" "$_idf_ver"
+      fi
+    else
+      _idf_ver=$(claude_notice_version "$_idf_f")
+      _idf_old=$(claude_md_version "$_idf_f")
+      if [ -n "$_idf_ver" ]; then
+        if [ "$_idf_ver" != "$CLAUDE_NOTICE_VERSION" ]; then
+          printf 'drift notice-version %s %s\n' "$_idf_n" "$_idf_ver"
+        fi
+      elif [ -n "$_idf_old" ]; then
+        printf 'drift old-format %s %s\n' "$_idf_n" "$_idf_old"
+      else
+        printf 'note no-version %s\n' "$_idf_n"
+      fi
+    fi
+  done
+  if printf '%s\n' "$_idf_stamped" | grep -qxF 'CLAUDE.md'; then
+    _idf_want=$(printf '%s\n' "$_idf_desired" | sed -n 's/^import //p')
+    _idf_have=$(_instr_present_imports "$_idf_dir/CLAUDE.md" "$_idf_kind")
+    printf '%s\n' "$_idf_want" | while IFS= read -r _idf_l; do
+      [ -n "$_idf_l" ] || continue
+      printf '%s\n' "$_idf_have" | grep -qxF -- "$_idf_l" || printf 'drift import-missing %s\n' "$_idf_l"
+    done
+    printf '%s\n' "$_idf_have" | while IFS= read -r _idf_l; do
+      [ -n "$_idf_l" ] || continue
+      printf '%s\n' "$_idf_want" | grep -qxF -- "$_idf_l" || printf 'drift import-extra %s\n' "$_idf_l"
+    done
+  fi
+  if [ "$_idf_kind" != "nested" ] && [ "$_idf_stamped" = "AGENTS.md" ] && [ -f "$_idf_dir/CLAUDE.md" ]; then
+    printf 'note agents-only\n'
+  fi
+  return 0
+}
+
+# _instr_retitled TEMPLATE NAME
+# Prints TEMPLATE with its "# CLAUDE.md" heading renamed to "# NAME", so a stamp
+# living in AGENTS.md reads as AGENTS.md.
+_instr_retitled() {
+  sed "1s/^# CLAUDE\\.md\$/# $2/" "$1"
+}
+
+# _instr_region_above FILE
+# Prints what precedes the generated region of a managed wrapper FILE. The
+# region starts at the template's heading, the line right above the managed-by
+# comment. Returns 1 when that comment is not found.
+_instr_region_above() {
+  awk '
+    /^<!-- managed-by: clagentic/ { found = 1; exit }
+    { if (have) print prev; prev = $0; have = 1 }
+    END { exit (!found) }
+  ' "$1"
+}
+
+# _instr_region_imports FILE
+# Prints the generated "@...AGENTS.md" import lines of a managed wrapper FILE:
+# the blank-separated block right after the template's closing fence (the same
+# anchor _instr_region_outside uses). Prints nothing when the region end is not
+# found.
+_instr_region_imports() {
+  awk '
+    state == 0 { if ($0 == "clagentic-lite show memory [N]") state = 1; next }
+    state == 1 { if ($0 == "```") state = 2; else state = 0; next }
+    state == 2 {
+      if ($0 ~ /^@.*AGENTS\.md$/) { print; next }
+      if ($0 == "") next
+      state = 3
+    }
+  ' "$1"
+}
+
+# _instr_region_outside FILE
+# Prints what follows the generated region of a managed wrapper FILE, and
+# returns 1 when the region end is not found. The region ends at the closing
+# fence of the wrapper template's last code block (anchored on the template's
+# final command line), plus any blank-separated lines of the form
+# "@<path>AGENTS.md" the tool generated after it. Keep the anchor in step with
+# the template's tail (a test pins it).
+_instr_region_outside() {
+  awk '
+    state == 0 { if ($0 == "clagentic-lite show memory [N]") state = 1; next }
+    state == 1 { if ($0 == "```") state = 2; else state = 0; next }
+    state == 2 {
+      if ($0 ~ /^@.*AGENTS\.md$/) { pending = ""; next }
+      if ($0 == "") { pending = pending "\n"; next }
+      printf "%s", pending; pending = ""; print; state = 3; next
+    }
+    state == 3 { print }
+    END { if (state == 2) printf "%s", pending; exit (state < 2) }
+  ' "$1"
+}
+
+# _instr_write_wrapper WRAPPER_DIR NAME TEMPLATE IMPORTS
+# Writes the generated region of WRAPPER_DIR/NAME (the wrapper-flavored notice:
+# the project table built from the .clagentic-project pointer, then IMPORTS, the
+# newline-separated "import" lines of _instr_desired, for a CLAUDE.md only).
+# NAME is a managed file or the CLAUDE.md to create; _instr_sync guarantees it
+# is never a project-owned file.
 # Note: Claude Code lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse,
 # PostToolUse, Stop) are CWD-agnostic — they load from .claude/settings.json
 # relative to the CWD at session open, NOT from the git repo root. Only git
 # pre-commit/pre-push hooks are git-repo-rooted. Wrapper sessions must also
 # have .claude/settings.json stamped so lifecycle hooks fire correctly.
 # See _stamp_wrapper_settings for that wiring.
-# Skips if a non-clagentic CLAUDE.md already exists (unless ENROLL_FORCE=1).
-_stamp_wrapper_claude_md() {
-  _wcd="$1"; _wcd_repos="$2"
-  _wcd_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
-  [ -f "$_wcd_template" ] || { warn "CLAUDE.md.wrapper.template missing — skipping wrapper CLAUDE.md"; return 0; }
+#
+# Only the generated region is rewritten. Anything after the region is
+# project-owned content (in CLAUDE.md or AGENTS.md alike) and is carried over
+# byte for byte. A file whose region end cannot be found (an older layout) is
+# regenerated whole, as it always was.
+_instr_write_wrapper() {
+  _wcd="$1"; _wcd_name="$2"; _wcd_template="$3"; _wcd_imports="$4"
+  _wcd_target="$_wcd/$_wcd_name"
+  _wcd_repos=$(awk '!seen[$0]++' "$_wcd/.clagentic-project" 2>/dev/null | tr '\n' ' ' || true)
 
-  _wcd_target="$_wcd/CLAUDE.md"
-  if [ -f "$_wcd_target" ] && ! grep -q 'managed-by: clagentic' "$_wcd_target" 2>/dev/null; then
-    if [ "${ENROLL_FORCE:-0}" = "1" ]; then
-      warn "overwriting existing non-clagentic CLAUDE.md in wrapper $_wcd (--force)"
-    else
-      warn "existing CLAUDE.md in wrapper $_wcd is not clagentic-managed — skipping (use --force to overwrite)"
-      return 0
+  # Content around the generated region is project-owned: capture it before
+  # the target is rewritten. Empty when the file is new or its region is not
+  # recognised (then the whole file is regenerated).
+  _wcd_scratch=$(mktemp -d "${TMPDIR:-/tmp}/clagentic-wrapper.XXXXXX") || return 1
+  _wcd_above="$_wcd_scratch/above"
+  _wcd_outside="$_wcd_scratch/outside"
+  _wcd_region="$_wcd_scratch/region"
+  _wcd_titled="$_wcd_scratch/titled"
+  : > "$_wcd_above"; : > "$_wcd_outside"
+  if [ -f "$_wcd_target" ]; then
+    if ! { _instr_region_above "$_wcd_target" > "$_wcd_above" \
+           && _instr_region_outside "$_wcd_target" > "$_wcd_outside"; }; then
+      : > "$_wcd_above"; : > "$_wcd_outside"
     fi
   fi
+  _instr_retitled "$_wcd_template" "$_wcd_name" > "$_wcd_titled"
 
   # Generate the file directly — multiline table substitution via sed is
   # fragile (newlines, special chars in paths). Read template line by line;
@@ -2156,9 +2396,199 @@ _stamp_wrapper_claude_md() {
           printf '%s\n' "$_tmpl_line"
           ;;
       esac
-    done < "$_wcd_template"
-  } > "$_wcd_target"
-  say "stamped wrapper CLAUDE.md: $_wcd_target" >&2
+    done < "$_wcd_titled"
+    if [ "$_wcd_name" = "CLAUDE.md" ]; then
+      _wcd_same=$(printf '%s\n' "$_wcd_imports" | grep -xF '@AGENTS.md' || true)
+      [ -z "$_wcd_same" ] || printf '\n@AGENTS.md\n'
+      _wcd_nested=$(printf '%s\n' "$_wcd_imports" | grep -vxF '@AGENTS.md' | sed '/^$/d' || true)
+      [ -z "$_wcd_nested" ] || printf '\n%s\n' "$_wcd_nested"
+    fi
+  } > "$_wcd_region"
+  cat "$_wcd_above" "$_wcd_region" "$_wcd_outside" > "$_wcd_target"
+  rm -f "$_wcd_above" "$_wcd_outside" "$_wcd_region" "$_wcd_titled"
+  rmdir "$_wcd_scratch" 2>/dev/null || true
+  say "stamped wrapper $_wcd_name: $_wcd_target" >&2
+}
+
+# _instr_write_notice FILE TEMPLATE [FULL]
+# Rewrites the notice block of FILE (CLAUDE.md or AGENTS.md) from TEMPLATE,
+# keeping project-owned content below the block. The template's heading names
+# CLAUDE.md, so it is rewritten to FILE's own name first; the stamp stays in
+# whichever file carries it. FULL=1 replaces the whole file instead (old
+# fat-format migration: its entire content was managed, and the block finder
+# would re-append the old rules as if they were project content).
+_instr_write_notice() {
+  _iwn_file="$1"; _iwn_template="$2"; _iwn_full="${3:-0}"
+  _iwn_tmp=$(mktemp "${TMPDIR:-/tmp}/clagentic-notice.XXXXXX") || return 1
+  _instr_retitled "$_iwn_template" "$(basename "$_iwn_file")" > "$_iwn_tmp"
+  if [ "$_iwn_full" = "1" ]; then
+    cp "$_iwn_tmp" "$_iwn_file"
+  else
+    _instr_notice_block "$_iwn_file" "$_iwn_tmp"
+  fi
+  _iwn_rc=$?
+  rm -f "$_iwn_tmp"
+  return "$_iwn_rc"
+}
+
+# _instr_sync DIR KIND MODE [LABEL]
+# The only writer of instruction files. Brings DIR to _instr_desired and sets
+# _INSTR_WRITTEN to the number of files it rewrote (not safe to call from a
+# subshell if the caller needs the count).
+#   MODE enroll    also creates the notice when nothing is stamped (CLAUDE.md
+#                  only, per "create" in _instr_desired) and says why it left a
+#                  project-owned file or a nested repo alone.
+#   MODE restamp   rewrites only the file(s) that already carry the marker,
+#                  never creates one; LABEL tags its log lines.
+# Only the generated region of a stamped file is replaced: the notice block of a
+# repo/nested file, the template render plus import lines of a wrapper file.
+# Content around it is carried over byte for byte. A project-owned CLAUDE.md or
+# AGENTS.md is never written, not even by enroll --force.
+_instr_sync() {
+  _is_dir="$1"; _is_kind="$2"; _is_mode="$3"; _is_label="${4:-}"
+  _INSTR_WRITTEN=0
+  if [ "$_is_kind" = "wrapper" ]; then
+    _is_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
+    _is_missing="CLAUDE.md.wrapper.template missing — skipping wrapper CLAUDE.md"
+  else
+    _is_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
+    _is_missing="CLAUDE.md.template missing — skipping enrollment notice stamp"
+  fi
+  if [ ! -f "$_is_template" ]; then
+    if [ "$_is_mode" = "enroll" ]; then
+      warn "$_is_missing"
+    fi
+    return 0
+  fi
+  _is_desired=$(_instr_desired "$_is_dir" "$_is_kind")
+  _is_stamped=$(printf '%s\n' "$_is_desired" | sed -n 's/^stamped //p')
+  _is_imports=$(printf '%s\n' "$_is_desired" | sed -n 's/^import //p')
+
+  for _is_n in $_is_stamped; do
+    _is_file="$_is_dir/$_is_n"
+    if [ "$_is_kind" = "wrapper" ]; then
+      _instr_write_wrapper "$_is_dir" "$_is_n" "$_is_template" "$_is_imports" || continue
+    elif grep -q 'clagentic-claude-md-version' "$_is_file" 2>/dev/null; then
+      _instr_write_notice "$_is_file" "$_is_template" 1
+    else
+      _instr_write_notice "$_is_file" "$_is_template"
+    fi
+    case "$_is_mode:$_is_kind" in
+      enroll:wrapper)  : ;;
+      enroll:*)        say "re-stamped $_is_n (preserved project-owned content): $_is_file" ;;
+      restamp:wrapper) say "re-stamped wrapper${_is_label}: $_is_file" >&2 ;;
+      *)               say "re-stamped${_is_label}: $_is_file" >&2 ;;
+    esac
+    _INSTR_WRITTEN=$((_INSTR_WRITTEN+1))
+  done
+
+  # A repo/nested CLAUDE.md carries its imports below the notice block, outside
+  # the region the block rewrite touches, so bring them in line separately.
+  if [ "$_is_kind" != "wrapper" ] && printf '%s\n' "$_is_stamped" | grep -qxF 'CLAUDE.md'; then
+    _is_findings=$(_instr_diff "$_is_dir" "$_is_kind")
+    printf '%s\n' "$_is_findings" | sed -n 's/^drift import-missing //p' | while IFS= read -r _is_l; do
+      printf '\n%s\n' "$_is_l" >> "$_is_dir/CLAUDE.md"
+    done
+    for _is_l in $(printf '%s\n' "$_is_findings" | sed -n 's/^drift import-extra //p'); do
+      _is_tmp=$(mktemp "${TMPDIR:-/tmp}/clagentic-import.XXXXXX") || return 1
+      grep -vxF -- "$_is_l" "$_is_dir/CLAUDE.md" > "$_is_tmp" || true
+      cp "$_is_tmp" "$_is_dir/CLAUDE.md"
+      rm -f "$_is_tmp"
+    done
+  fi
+
+  if [ -z "$_is_stamped" ] && [ "$_is_mode" = "enroll" ]; then
+    if [ "$_is_kind" = "nested" ]; then
+      # The wrapper notice already carries the rules and Claude Code loads it as
+      # an ancestor file, so the nested repo's own files stay untouched.
+      say "wrapper layout: not creating CLAUDE.md in $_is_dir (the wrapper notice applies)"
+    elif printf '%s\n' "$_is_desired" | grep -qxF 'create CLAUDE.md'; then
+      # A plain CLAUDE.md would shadow a project's AGENTS.md (Claude Code reads
+      # AGENTS.md only when no CLAUDE.md exists), so beside one the new file
+      # carries the @AGENTS.md import and the AGENTS.md stays untouched.
+      if [ "$_is_kind" = "wrapper" ]; then
+        if _instr_write_wrapper "$_is_dir" CLAUDE.md "$_is_template" "$_is_imports"; then
+          _INSTR_WRITTEN=1
+        fi
+      else
+        cp "$_is_template" "$_is_dir/CLAUDE.md"
+        if printf '%s\n' "$_is_imports" | grep -qxF '@AGENTS.md'; then
+          printf '\n@AGENTS.md\n' >> "$_is_dir/CLAUDE.md"
+          say "stamped CLAUDE.md (imports the project's AGENTS.md): $_is_dir/CLAUDE.md"
+        else
+          say "stamped CLAUDE.md: $_is_dir/CLAUDE.md"
+        fi
+        _INSTR_WRITTEN=1
+      fi
+    elif [ "$_is_kind" = "wrapper" ]; then
+      warn "existing CLAUDE.md in wrapper $_is_dir is not clagentic-managed — leaving it untouched. To have enroll stamp the wrapper notice, delete or rename that file and run enroll again"
+    elif [ "${ENROLL_FORCE:-0}" = "1" ]; then
+      warn "existing CLAUDE.md in $_is_dir is not clagentic-managed — --force does not overwrite it. To have enroll stamp the notice, delete or rename that file and run enroll again"
+    else
+      warn "existing CLAUDE.md in $_is_dir is not clagentic-managed — leaving it untouched"
+    fi
+  fi
+  return 0
+}
+
+# _instr_doctor_report DIR KIND LABEL
+# Doctor's view of DIR's instruction files: renders _instr_diff's findings as
+# OK / INFO / WARN lines prefixed with LABEL. Uses cmd_doctor's _ok.
+_instr_doctor_report() {
+  _idr_dir="$1"; _idr_kind="$2"; _idr_label="$3"
+  _idr_stamped=$(_instr_desired "$_idr_dir" "$_idr_kind" | sed -n 's/^stamped //p')
+  _idr_found=$(_instr_diff "$_idr_dir" "$_idr_kind")
+  if [ -z "$_idr_stamped" ]; then
+    case "$_idr_kind:$_idr_found" in
+      nested:"unstamped nested-owned")
+        _ok "$_idr_label: own CLAUDE.md/AGENTS.md is project-owned and left untouched (wrapper layout: the wrapper notice applies)" ;;
+      nested:"unstamped nested-absent")
+        _ok "$_idr_label: no CLAUDE.md by design (wrapper layout: the wrapper notice applies)" ;;
+      repo:"unstamped owned-claude")
+        printf '  WARN  %s: no enrollment notice (the existing CLAUDE.md has no clagentic marker and is project-owned: enroll never overwrites it; delete or rename it and run `clagentic-lite enroll` to have enroll write the notice into CLAUDE.md)\n' "$_idr_label" ;;
+      repo:"unstamped owned-agents")
+        printf '  WARN  %s: no enrollment notice (`clagentic-lite enroll` writes CLAUDE.md here with an @AGENTS.md import, leaving AGENTS.md untouched)\n' "$_idr_label" ;;
+      repo:"unstamped absent")
+        printf '  WARN  %s: no enrollment notice (`clagentic-lite enroll` writes CLAUDE.md here)\n' "$_idr_label" ;;
+    esac
+  else
+    for _idr_n in $_idr_stamped; do
+      if [ "$_idr_kind" = "wrapper" ]; then
+        _ok "wrapper notice: $_idr_dir/$_idr_n carries the enrollment stamp"
+        continue
+      fi
+      _idr_line=$(printf '%s\n' "$_idr_found" | awk -v n="$_idr_n" \
+        '$3 == n && ($2 == "notice-version" || $2 == "old-format" || $2 == "no-version") { print; exit }')
+      _idr_what=$(printf '%s\n' "$_idr_line" | awk '{ print $2 }')
+      _idr_ver=$(printf '%s\n' "$_idr_line" | awk '{ print $4 }')
+      case "$_idr_what" in
+        notice-version)
+          # Notice drift is low-risk — INFO not FAIL.
+          printf '  INFO  %s: %s notice version %s (current: %s) — run `clagentic-lite update` to refresh\n' \
+            "$_idr_label" "$_idr_n" "$_idr_ver" "$CLAUDE_NOTICE_VERSION" ;;
+        old-format)
+          printf '  WARN  %s: %s uses old format (clagentic-claude-md-version: %s) — run `clagentic-lite update` to migrate to thin notice\n' \
+            "$_idr_label" "$_idr_n" "$_idr_ver" ;;
+        no-version)
+          printf '  WARN  %s: %s has managed-by marker but no version tag — run `clagentic-lite update --restamp`\n' "$_idr_label" "$_idr_n" ;;
+        *)
+          _ok "$_idr_label: $_idr_n notice version $CLAUDE_NOTICE_VERSION OK" ;;
+      esac
+    done
+  fi
+  if printf '%s\n' "$_idr_found" | grep -qxF 'note agents-only'; then
+    printf '  INFO  %s: the enrollment notice is in AGENTS.md; Claude Code does not load AGENTS.md by default while CLAUDE.md exists in the same directory\n' "$_idr_label"
+  fi
+  if [ "$_idr_kind" = "nested" ]; then
+    # Claude Code skips a nested AGENTS.md while the wrapper has a CLAUDE.md, so
+    # the managed wrapper CLAUDE.md must import it.
+    _idr_wdir=$(_wrapper_dir_for "$_idr_dir" || true)
+    if [ -n "$_idr_wdir" ] \
+       && _instr_diff "$_idr_wdir" wrapper | grep -qxF "drift import-missing @${_idr_dir#"$_idr_wdir"/}/AGENTS.md"; then
+      printf '  WARN  %s: AGENTS.md is not imported by the wrapper CLAUDE.md, so Claude Code does not load it (run `clagentic-lite update --restamp`)\n' "$_idr_label"
+    fi
+  fi
+  return 0
 }
 
 # Stamp .claude/settings.json and symlink .claude/commands into a non-git
@@ -3036,8 +3466,10 @@ cmd_enroll() {
   # Default to $PWD if no paths given.
   [ -z "$_paths" ] && _paths="$PWD"
 
+  # Each path enrolls in its own subshell so no _enroll_one global survives
+  # into the next path.
   for _raw_path in $_paths; do
-    _enroll_one "$(ds_realpath "$_raw_path")"
+    ( _enroll_one "$(ds_realpath "$_raw_path")" )
   done
 }
 
@@ -3052,32 +3484,46 @@ cmd_enroll() {
 # patterns in .git/info/exclude and no CLAUDE.md of its own, because the
 # wrapper CLAUDE.md already carries the rules and Claude Code loads it as an
 # ancestor file. The pointer is written BEFORE _enroll_one runs for that reason.
-_register_wrapper_repo() {
+#
+# The body is a subshell on purpose: _enroll_one keeps all its state in
+# globals (POSIX sh has no locals) and this function re-enters it for the
+# nested repo, so without the subshell the inner call overwrites the outer
+# call's state (_ep_orig, _canon, loop variables) and a multi-repo "A" answer
+# resolves the wrapper to the first nested repo on every later iteration.
+_register_wrapper_repo() (
   _rwr_wrapper="$1"
   _rwr_repo="$2"
   printf '%s\n' "$_rwr_repo" >> "$_rwr_wrapper/.clagentic-project"
-  _stamp_wrapper_claude_md "$_rwr_wrapper" "$_rwr_repo"
+  _instr_sync "$_rwr_wrapper" wrapper enroll
   _stamp_wrapper_settings "$_rwr_wrapper"
   _enroll_one "$_rwr_repo"
+)
+
+# _wrapper_dir_for REPO
+# Prints the wrapper directory REPO is enrolled through, or returns 1 when
+# REPO is not wrapper-enrolled. Walks every ancestor, nearest first, and stops
+# at the first pointer found — the same walk ds_repo_root (platform.sh) uses,
+# so a repo at wrapper/group/repo is classified the way the rest of the tool
+# resolves it. Membership, not mere existence: an unrelated repo that happens
+# to sit beneath a pointer file is not wrapper-enrolled. Every site that needs
+# the wrapper dir or the yes/no answer goes through here, never dirname.
+_wrapper_dir_for() {
+  _wdf_d=$(dirname "$1")
+  while [ "$_wdf_d" != "/" ] && [ "$_wdf_d" != "." ]; do
+    if [ -f "$_wdf_d/.clagentic-project" ]; then
+      grep -qxF "$1" "$_wdf_d/.clagentic-project" 2>/dev/null || return 1
+      printf '%s\n' "$_wdf_d"
+      return 0
+    fi
+    _wdf_d=$(dirname "$_wdf_d")
+  done
+  return 1
 }
 
 # _repo_is_wrapper_enrolled REPO
-# True when a .clagentic-project pointer in an ancestor directory of REPO
-# lists REPO. Walks every ancestor, nearest first, and stops at the first
-# pointer found — the same walk ds_repo_root (platform.sh) uses, so a repo at
-# wrapper/group/repo is classified the way the rest of the tool resolves it.
-# Membership, not mere existence: an unrelated repo that happens to sit
-# beneath a pointer file is not wrapper-enrolled.
+# True when REPO is enrolled through a wrapper directory (see _wrapper_dir_for).
 _repo_is_wrapper_enrolled() {
-  _rwe_d=$(dirname "$1")
-  while [ "$_rwe_d" != "/" ] && [ "$_rwe_d" != "." ]; do
-    if [ -f "$_rwe_d/.clagentic-project" ]; then
-      grep -qxF "$1" "$_rwe_d/.clagentic-project" 2>/dev/null
-      return $?
-    fi
-    _rwe_d=$(dirname "$_rwe_d")
-  done
-  return 1
+  _wrapper_dir_for "$1" >/dev/null
 }
 
 # _repo_exclude_file REPO
@@ -3396,38 +3842,7 @@ _enroll_one() {
   # CLAUDE.md is NOT gitignored — it's a legitimate project file the user may
   # extend. The notice block is ~5 lines; user content below it is preserved on
   # restamp (see _restamp_repo_artifacts).
-  _claude_md_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
-  _claude_md_target="$_canon/CLAUDE.md"
-  if [ -f "$_claude_md_template" ]; then
-    if [ -f "$_claude_md_target" ]; then
-      if grep -q 'managed-by: clagentic' "$_claude_md_target" 2>/dev/null; then
-        # Already clagentic-managed — splice in the new notice block while
-        # preserving any project-owned content below the sentinel.  This is
-        # the same path update uses; a bare cp would destroy the user's block.
-        _restamp_notice_block "$_claude_md_target" "$_claude_md_template"
-        say "re-stamped CLAUDE.md (preserved project-owned content): $_claude_md_target"
-      else
-        # Not clagentic-managed: project-owned content. Never overwritten,
-        # not even with --force; the operator decides what happens to it.
-        if [ "${ENROLL_FORCE:-0}" = "1" ]; then
-          warn "existing CLAUDE.md in $_canon is not clagentic-managed — --force does not overwrite it. To have enroll stamp the notice, delete or rename that file and run enroll again"
-        else
-          warn "existing CLAUDE.md in $_canon is not clagentic-managed — leaving it untouched"
-        fi
-      fi
-    elif _repo_is_wrapper_enrolled "$_canon"; then
-      # Wrapper layout: the wrapper CLAUDE.md already carries the rules and
-      # Claude Code loads it as an ancestor file, so the nested repo's tracked
-      # tree stays untouched.
-      say "wrapper layout: not creating CLAUDE.md in $_canon (the wrapper CLAUDE.md applies)"
-    else
-      # No existing file — plain stamp.
-      cp "$_claude_md_template" "$_claude_md_target"
-      say "stamped CLAUDE.md: $_claude_md_target"
-    fi
-  else
-    warn "CLAUDE.md.template missing — skipping enrollment notice stamp"
-  fi
+  _instr_sync "$_canon" "$(_instr_kind_of "$_canon")" enroll
 
   # Stamp .clagentic/lite/builder-contract.md — full builder rules, agent table,
   # slash commands, hooks, and gate reference. Gitignored (local machine only).
@@ -3785,35 +4200,11 @@ cmd_doctor() {
         fi
       done
       # Check CLAUDE.md enrollment notice in enrolled repo.
-      _cm_file="$_rpath/CLAUDE.md"
-      if [ ! -f "$_cm_file" ]; then
-        if _repo_is_wrapper_enrolled "$_rpath"; then
-          _ok "$_rpath: no CLAUDE.md by design (wrapper layout: the wrapper CLAUDE.md applies)"
-        else
-          printf '  WARN  %s: CLAUDE.md missing (`clagentic-lite enroll --force` stamps the notice; it never overwrites an existing CLAUDE.md that lacks the clagentic marker)\n' "$_rpath"
-        fi
-      elif ! grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
-        printf '  WARN  %s: CLAUDE.md not clagentic-managed (manual CLAUDE.md?)\n' "$_rpath"
-      else
-        # Check for new thin-notice marker first; fall back to legacy marker.
-        _repo_notice_ver=$(claude_notice_version "$_cm_file")
-        _repo_old_ver=$(claude_md_version "$_cm_file")
-        if [ -n "$_repo_notice_ver" ]; then
-          if [ "$_repo_notice_ver" != "$CLAUDE_NOTICE_VERSION" ]; then
-            # Notice drift is low-risk — INFO not FAIL.
-            printf '  INFO  %s: CLAUDE.md notice version %s (current: %s) — run `clagentic-lite update` to refresh\n' \
-              "$_rpath" "$_repo_notice_ver" "$CLAUDE_NOTICE_VERSION"
-          else
-            _ok "$_rpath: CLAUDE.md notice version $CLAUDE_NOTICE_VERSION OK"
-          fi
-        elif [ -n "$_repo_old_ver" ]; then
-          # Old fat CLAUDE.md — warn; update will migrate to thin notice.
-          printf '  WARN  %s: CLAUDE.md uses old format (clagentic-claude-md-version: %s) — run `clagentic-lite update` to migrate to thin notice\n' \
-            "$_rpath" "$_repo_old_ver"
-        else
-          printf '  WARN  %s: CLAUDE.md has managed-by marker but no version tag — run `clagentic-lite update --restamp`\n' "$_rpath"
-        fi
-      fi
+      # The stamp is satisfied by the managed-by marker in either CLAUDE.md or
+      # AGENTS.md. In the wrapper layout the stamp belongs to the wrapper, so a
+      # nested repo's own instruction files are project-owned and not reported
+      # on unless clagentic manages one.
+      _instr_doctor_report "$_rpath" "$(_instr_kind_of "$_rpath")" "$_rpath"
       # Existing installs: earlier enrollments of a wrapper-enrolled repo wrote
       # harness lines into its tracked .gitignore. Never auto-removed (that
       # would be another unrequested tracked-file edit); just say it is possible.
@@ -3905,14 +4296,19 @@ cmd_doctor() {
   # 7. Wrapper .clagentic-project pointer files
   printf '\nwrapper .clagentic-project pointers:\n'
   _wrapper_found=0
+  _wrappers_seen=""
   if [ -f "$REGISTRY" ]; then
     while IFS= read -r _rpath; do
       [ -z "$_rpath" ] && continue
-      _parent=$(dirname "$_rpath")
+      _parent=$(_wrapper_dir_for "$_rpath") || continue
+      # Several registry repos share one wrapper; report each wrapper once.
+      printf '%s\n' "$_wrappers_seen" | grep -qxF "$_parent" && continue
+      _wrappers_seen="$_wrappers_seen
+$_parent"
       _ptr="$_parent/.clagentic-project"
-      [ -f "$_ptr" ] || continue
       _wrapper_found=1
       printf '  checking %s\n' "$_ptr"
+      _instr_doctor_report "$_parent" wrapper "$_parent"
       while IFS= read -r _ppath; do
         [ -z "$_ppath" ] && continue
         if [ ! -d "$_ppath" ]; then
@@ -4560,13 +4956,13 @@ cmd_rotate() {
       _rot_stale=$((_rot_stale+1))
     fi
 
-    # Wrapper .claude/settings.json, if this repo has a .clagentic-project
-    # parent — same credential, same rotation obligation, not counted as a
-    # SECOND registry member (it is derived from this one's parent dir, the
-    # same relationship cmd_doctor's own wrapper-pointer check (§7) uses).
-    _rot_wrapper_dir=$(dirname "$_rot_path")
-    _rot_wrapper_ptr="$_rot_wrapper_dir/.clagentic-project"
-    if [ -f "$_rot_wrapper_ptr" ] && [ -f "$_rot_wrapper_dir/.claude/settings.json" ]; then
+    # Wrapper .claude/settings.json, if this repo is enrolled through a wrapper
+    # (a .clagentic-project pointer at any ancestor level) — same credential,
+    # same rotation obligation, not counted as a SECOND registry member (it is
+    # derived from the repo's wrapper, the same relationship cmd_doctor's own
+    # wrapper-pointer check (§7) uses).
+    _rot_wrapper_dir=$(_wrapper_dir_for "$_rot_path" || true)
+    if [ -n "$_rot_wrapper_dir" ] && [ -f "$_rot_wrapper_dir/.claude/settings.json" ]; then
       if ENROLL_FORCE=1 _stamp_wrapper_settings "$_rot_wrapper_dir"; then
         say "rotated wrapper: $_rot_wrapper_dir/.claude/settings.json"
       else
@@ -4583,7 +4979,7 @@ cmd_rotate() {
 
 # ---------------------------------------------------------------- update
 
-# _restamp_notice_block FILE TEMPLATE
+# _instr_notice_block FILE TEMPLATE
 # Replace the clagentic-managed notice block at the top of FILE with the
 # contents of TEMPLATE, preserving any user content that follows it.
 #
@@ -4602,7 +4998,7 @@ cmd_rotate() {
 # It must not be changed. If the template grows, bump CLAUDE_NOTICE_VERSION and
 # add a new sentinel-based path; never change this constant.
 _RNB_V1_BLOCK_LINES=8
-_restamp_notice_block() {
+_instr_notice_block() {
   _rnb_file="$1"
   _rnb_template="$2"
   _rnb_total=$(wc -l < "$_rnb_file" 2>/dev/null || echo 0)
@@ -4675,30 +5071,13 @@ _restamp_repo_artifacts() {
   _ra_label="$2"
   _ra_count=0
 
-  # Re-stamp CLAUDE.md notice block only, preserving user content below.
-  # The committed repo CLAUDE.md is now a thin notice (~9 lines) that is true
-  # for any teammate regardless of whether clagentic-lite is installed.
-  #
-  # Old-style fat files (clagentic-claude-md-version marker, pre-5eb8dd6) are
-  # fully replaced — their entire content was managed, no user content follows
-  # the block. _restamp_notice_block would misidentify the fat block's own
-  # rules content (lines 9+) as user content and re-append it after the new
-  # thin template, producing an inconsistent committed file that tells
-  # non-clagentic contributors "these are binding rules" unconditionally.
-  _ra_cm="$_ra_path/CLAUDE.md"
-  if [ -f "$_ra_cm" ] && grep -q 'managed-by: clagentic' "$_ra_cm" 2>/dev/null; then
-    _ra_cm_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
-    if [ -f "$_ra_cm_template" ]; then
-      if grep -q 'clagentic-claude-md-version' "$_ra_cm" 2>/dev/null; then
-        # Old fat template — full replace; no user content to preserve.
-        cp "$_ra_cm_template" "$_ra_cm"
-      else
-        _restamp_notice_block "$_ra_cm" "$_ra_cm_template"
-      fi
-      say "re-stamped${_ra_label}: $_ra_path/CLAUDE.md" >&2
-      _ra_count=$((_ra_count+1))
-    fi
-  fi
+  # Re-stamp the instruction-file notice (CLAUDE.md or AGENTS.md, whichever
+  # carries the marker) through the one writer: only the generated region is
+  # replaced, user content below it is preserved, and no stamp is created or
+  # moved. The committed repo notice is a thin block that is true for any
+  # teammate regardless of whether clagentic-lite is installed.
+  _instr_sync "$_ra_path" "$(_instr_kind_of "$_ra_path")" restamp "$_ra_label"
+  _ra_count=$((_ra_count+_INSTR_WRITTEN))
 
   # Re-stamp .clagentic/lite/builder-contract.md — always a full restamp (gitignored,
   # no user content, local only).
@@ -4732,22 +5111,12 @@ _restamp_repo_artifacts() {
 
   # Re-stamp wrapper CLAUDE.md and .claude/settings.json if the parent dir has
   # a .clagentic-project pointer.
-  _ra_wrapper_dir=$(dirname "$_ra_path")
-  _ra_wrapper_ptr="$_ra_wrapper_dir/.clagentic-project"
-  _ra_wrapper_cm="$_ra_wrapper_dir/CLAUDE.md"
-  if [ -f "$_ra_wrapper_ptr" ]; then
-    # Re-stamp wrapper CLAUDE.md only when it is clagentic-managed.
-    if [ -f "$_ra_wrapper_cm" ] && grep -q 'managed-by: clagentic' "$_ra_wrapper_cm" 2>/dev/null; then
-      _ra_wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
-      if [ -f "$_ra_wcm_template" ]; then
-        # Re-build the project table from the pointer file.
-        _ra_wcm_repos=$(tr '\n' ' ' < "$_ra_wrapper_ptr" 2>/dev/null || true)
-        ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_ra_wrapper_dir" "$_ra_wcm_repos" && {
-          say "re-stamped wrapper${_ra_label}: $_ra_wrapper_cm" >&2
-          _ra_count=$((_ra_count+1))
-        }
-      fi
-    fi
+  _ra_wrapper_dir=$(_wrapper_dir_for "$_ra_path" || true)
+  if [ -n "$_ra_wrapper_dir" ]; then
+    # Re-stamp the wrapper notice only in the file(s) that are clagentic-managed;
+    # the project table is rebuilt from the pointer file.
+    _instr_sync "$_ra_wrapper_dir" wrapper restamp "$_ra_label"
+    _ra_count=$((_ra_count+_INSTR_WRITTEN))
     # Re-stamp wrapper .claude/settings.json whenever the pointer exists —
     # independent of whether wrapper CLAUDE.md is managed.  Wrappers enrolled
     # before wrapper CLAUDE.md stamping was introduced have no managed CLAUDE.md
@@ -5182,54 +5551,36 @@ cmd_update() {
       _cs_ver=$(claude_settings_version "$_cs_file")
       [ "$_cs_ver" != "$CLAUDE_SETTINGS_VERSION" ] && _need_restamp=1
     fi
-    _cm_file="$_rpath/CLAUDE.md"
-    if [ ! -f "$_cm_file" ]; then
-      # CLAUDE.md entirely absent — restamp unconditionally, except in the
-      # wrapper layout where its absence is by design.
-      _repo_is_wrapper_enrolled "$_rpath" || _need_restamp=1
-    elif ! grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
-      # managed-by marker stripped (user removed the notice). On a TTY, prompt
-      # before re-adding; on non-TTY, warn but do not auto-restamp (user may
-      # have intentionally replaced it). --restamp overrides and restores it.
-      if [ "$RESTAMP" -eq 1 ]; then
-        _need_restamp=1
-      elif [ -t 0 ]; then
-        printf '[clagentic-lite] WARN: %s/CLAUDE.md enrollment notice is missing or was removed.\n' "$_rpath" >&2
-        printf 'Re-add the enrollment notice? [y/N]: '
-        read -r _notice_reply || _notice_reply=""
-        case "$_notice_reply" in
-          y|Y|yes|YES) _need_restamp=1 ;;
-          *) warn "$_rpath: skipping CLAUDE.md notice re-add (run \`clagentic-lite update --restamp\` to restore)" ;;
-        esac
-      else
-        warn "$_rpath: CLAUDE.md enrollment notice missing — run \`clagentic-lite update --restamp\` to restore"
-      fi
-    else
-      # Support both old marker (clagentic-claude-md-version) and new notice
-      # marker (clagentic-notice-version) so the comparison works during transition.
-      _cm_notice_ver=$(claude_notice_version "$_cm_file")
-      _cm_old_ver=$(claude_md_version "$_cm_file")
-      if [ -n "$_cm_notice_ver" ]; then
-        # New-style notice file.
-        [ "$_cm_notice_ver" != "$CLAUDE_NOTICE_VERSION" ] && _need_restamp=1
-      elif [ -n "$_cm_old_ver" ]; then
-        # Old-style fat CLAUDE.md — always restamp to migrate to thin notice.
-        _need_restamp=1
-      fi
+    # The instruction files are judged by the comparer: any "drift" finding (a
+    # notice or import line that differs from the desired state, a notice at
+    # another version, an old fat format) needs a restamp. Nothing is said about
+    # a nested repo's own project-owned files.
+    _iu_findings=$(_instr_diff "$_rpath" "$(_instr_kind_of "$_rpath")")
+    if printf '%s\n' "$_iu_findings" | grep -q '^drift '; then
+      _need_restamp=1
     fi
+    case "$_iu_findings" in
+      "unstamped owned-claude")
+        # A project-owned CLAUDE.md without the marker. Neither update nor
+        # --restamp ever edits it, so no command here would add the notice; say
+        # what enroll would do instead, once per run, with no prompt.
+        warn "$_rpath: no enrollment notice — CLAUDE.md is project-owned and is never edited; to have enroll write the notice, delete or rename it and run \`clagentic-lite enroll\` (it writes CLAUDE.md)" ;;
+      "unstamped owned-agents"|"unstamped absent")
+        # No CLAUDE.md and no stamp — restamp the other artifacts as before.
+        _need_restamp=1 ;;
+    esac
     _contract_file="$_rpath/.clagentic/lite/builder-contract.md"
     if [ -f "$_contract_file" ] && grep -q 'managed-by: clagentic' "$_contract_file" 2>/dev/null; then
       _contract_ver=$(claude_contract_version "$_contract_file")
       [ "$_contract_ver" != "$CLAUDE_CONTRACT_VERSION" ] && _need_restamp=1
     fi
-    _vck_wrapper_dir=$(dirname "$_rpath")
-    _vck_wrapper_ptr="$_vck_wrapper_dir/.clagentic-project"
-    _vck_wrapper_cm="$_vck_wrapper_dir/CLAUDE.md"
-    if [ -f "$_vck_wrapper_ptr" ]; then
-      # Check wrapper CLAUDE.md version only when it is clagentic-managed.
-      if [ -f "$_vck_wrapper_cm" ] && grep -q 'managed-by: clagentic' "$_vck_wrapper_cm" 2>/dev/null; then
-        _wcm_ver=$(claude_wrapper_version "$_vck_wrapper_cm")
-        [ "$_wcm_ver" != "$CLAUDE_WRAPPER_VERSION" ] && _need_restamp=1
+    _vck_wrapper_dir=$(_wrapper_dir_for "$_rpath" || true)
+    if [ -n "$_vck_wrapper_dir" ]; then
+      # The wrapper notice version and its import lines (a repo that gained or
+      # lost a CLAUDE.md, or left the pointer, changes them; the version tags
+      # cannot see that) are checked only in clagentic-managed files.
+      if _instr_diff "$_vck_wrapper_dir" wrapper | grep -q '^drift '; then
+        _need_restamp=1
       fi
       # Check wrapper settings.json version independent of wrapper CLAUDE.md —
       # wrappers enrolled before wrapper CLAUDE.md stamping existed have no
@@ -5260,8 +5611,9 @@ cmd_update() {
     while IFS= read -r _rpath; do
       [ -z "$_rpath" ] && continue
       [ -d "$_rpath" ] || continue
-      [ -f "$_rpath/CLAUDE.md" ] && grep -q 'managed-by: clagentic' "$_rpath/CLAUDE.md" 2>/dev/null && \
+      if _instr_desired "$_rpath" "$(_instr_kind_of "$_rpath")" | grep -q '^stamped '; then
         _managed_count=$((_managed_count+1))
+      fi
     done < "$REGISTRY"
     if [ "$_managed_count" -gt 0 ]; then
       printf '[clagentic-lite] All %d enrolled repo(s) already at current artifact versions.\n' "$_managed_count"

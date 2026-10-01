@@ -61,7 +61,7 @@ PLATFORM_SH = os.path.join(TOOL_HOME, "scripts", "platform.sh")
 # these markers drift, the extraction assertion below fails loudly rather
 # than silently testing stale/missing code.
 _BLOCK_START_MARKER = "# ---------------------------------------------------------------- clagentic-lite plugin render (config-aware, single plugin)"
-_BLOCK_END_MARKER = "# Stamp a wrapper-flavored CLAUDE.md into a non-git wrapper directory."
+_BLOCK_END_MARKER = "# ---------------------------------------------------------------- instruction files"
 
 
 def _extract_render_functions():

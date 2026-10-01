@@ -82,11 +82,11 @@ class _Base(unittest.TestCase):
                               capture_output=True, text=True, timeout=120)
         return proc.returncode, proc.stdout, proc.stderr
 
-    def run_cli_tty(self, argv, cwd, answer=b"\n"):
+    def run_cli_tty(self, argv, cwd, answer=b"\n", **env_extra):
         """Run with a pty on stdin so the nested-repo (wrapper) prompt fires."""
         master, slave = pty.openpty()
         try:
-            proc = subprocess.Popen([self.cli] + argv, cwd=cwd, env=self._env(),
+            proc = subprocess.Popen([self.cli] + argv, cwd=cwd, env=self._env(**env_extra),
                                     stdin=slave, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True)
             os.close(slave)
