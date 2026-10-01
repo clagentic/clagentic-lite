@@ -2174,6 +2174,10 @@ _stamp_wrapper_claude_md() {
     if [ "$_wcd_import" -eq 1 ]; then
       printf '\n@AGENTS.md\n'
     fi
+    if [ "$_wcd_name" = "CLAUDE.md" ]; then
+      _wcd_nested=$(_wrapper_nested_imports "$_wcd")
+      [ -z "$_wcd_nested" ] || printf '\n%s\n' "$_wcd_nested"
+    fi
   } > "$_wcd_target"
   say "stamped wrapper $_wcd_name: $_wcd_target" >&2
 }
@@ -3119,6 +3123,39 @@ _stamped_files_in() {
   return 0
 }
 
+# _wrapper_nested_imports WRAPPER
+# Prints one "@<relative path>/AGENTS.md" import line per repo listed in
+# WRAPPER's .clagentic-project pointer that has an AGENTS.md and no CLAUDE.md
+# of its own. Claude Code skips a nested repo's AGENTS.md when a CLAUDE.md
+# exists in an ancestor directory, so the managed wrapper CLAUDE.md imports it
+# instead; the nested files are never touched. Output is deterministic and
+# deduplicated, so regenerating it on every stamp is idempotent.
+_wrapper_nested_imports() {
+  _wni_ptr="$1/.clagentic-project"
+  [ -f "$_wni_ptr" ] || return 0
+  while IFS= read -r _wni_repo; do
+    [ -n "$_wni_repo" ] || continue
+    case "$_wni_repo" in "$1"/*) ;; *) continue ;; esac
+    [ -f "$_wni_repo/AGENTS.md" ] || continue
+    [ -f "$_wni_repo/CLAUDE.md" ] && continue
+    printf '@%s/AGENTS.md\n' "${_wni_repo#"$1"/}"
+  done < "$_wni_ptr" | awk '!seen[$0]++'
+  return 0
+}
+
+# _wrapper_imports_drift WRAPPER
+# True when WRAPPER's clagentic-managed CLAUDE.md does not carry exactly the
+# nested-AGENTS.md import lines _wrapper_nested_imports would generate now
+# (a missing line, or a line for a repo that left the pointer or gained its
+# own CLAUDE.md). An unmanaged or absent wrapper CLAUDE.md is never drift:
+# it is not ours to rewrite.
+_wrapper_imports_drift() {
+  [ -f "$1/CLAUDE.md" ] && grep -q 'managed-by: clagentic' "$1/CLAUDE.md" 2>/dev/null || return 1
+  _wid_want=$(_wrapper_nested_imports "$1" | sort)
+  _wid_have=$(grep -E '^@.+/AGENTS\.md$' "$1/CLAUDE.md" 2>/dev/null | sort)
+  [ "$_wid_want" != "$_wid_have" ]
+}
+
 # _restamp_notice_in FILE TEMPLATE [FULL]
 # Rewrites the notice block of FILE (CLAUDE.md or AGENTS.md) from TEMPLATE,
 # keeping project-owned content below the block. The template's heading names
@@ -3908,6 +3945,15 @@ cmd_doctor() {
           fi
         done
         _repo_is_wrapper_enrolled "$_rpath" || _doctor_note_agents_only "$_rpath" "$_rpath"
+      fi
+      # Wrapper layout: Claude Code skips a nested AGENTS.md while the wrapper
+      # has a CLAUDE.md, so the managed wrapper CLAUDE.md must import it.
+      _dc_wdir=$(_wrapper_dir_for "$_rpath" || true)
+      if [ -n "$_dc_wdir" ] && [ -f "$_rpath/AGENTS.md" ] && [ ! -f "$_rpath/CLAUDE.md" ] \
+         && [ -f "$_dc_wdir/CLAUDE.md" ] && grep -q 'managed-by: clagentic' "$_dc_wdir/CLAUDE.md" 2>/dev/null; then
+        if ! grep -qxF "@${_rpath#"$_dc_wdir"/}/AGENTS.md" "$_dc_wdir/CLAUDE.md" 2>/dev/null; then
+          printf '  WARN  %s: AGENTS.md is not imported by the wrapper CLAUDE.md, so Claude Code does not load it (run `clagentic-lite update --restamp`)\n' "$_rpath"
+        fi
       fi
       # Existing installs: earlier enrollments of a wrapper-enrolled repo wrote
       # harness lines into its tracked .gitignore. Never auto-removed (that
@@ -5333,6 +5379,9 @@ cmd_update() {
       _vck_wrapper_sj="$_vck_wrapper_dir/.claude/settings.json"
       _wsj_ver=$(claude_wrapper_settings_version "$_vck_wrapper_sj")
       [ "$_wsj_ver" != "$CLAUDE_WRAPPER_SETTINGS_VERSION" ] && _need_restamp=1
+      # Nested AGENTS.md import lines drift when a repo gains/loses a CLAUDE.md
+      # or leaves the pointer; the version tags cannot see that.
+      _wrapper_imports_drift "$_vck_wrapper_dir" && _need_restamp=1
     fi
     if [ "$_need_restamp" -eq 1 ]; then
       _would_restamp=1

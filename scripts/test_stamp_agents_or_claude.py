@@ -320,6 +320,102 @@ class TestWrapperUnmanagedAgentsMd(_StampBase):
         self.assertEqual(_read(owned), PROJECT_OWNED)
 
 
+class TestWrapperImportsNestedAgentsMd(_StampBase):
+    """Claude Code skips a nested AGENTS.md while an ancestor has a CLAUDE.md
+    (observed on claude 2.1.284), so the managed wrapper CLAUDE.md imports it."""
+
+    def _wrapper_with_agents_only_repo(self, repo_rel="proj"):
+        self.wrapper = os.path.join(self.tmpdir, "wrapper")
+        self.nested = os.path.join(self.wrapper, repo_rel)
+        self.import_line = ("@%s/AGENTS.md" % repo_rel.replace(os.sep, "/")).encode()
+        os.makedirs(self.wrapper)
+        _init_repo(self.nested)
+        self.nested_agents = os.path.join(self.nested, "AGENTS.md")
+        _write(self.nested_agents, PROJECT_OWNED)
+        self.enroll_wrapper(self.wrapper)
+        self.wrapper_claude = os.path.join(self.wrapper, "CLAUDE.md")
+
+    def _import_lines(self):
+        return [l for l in _read(self.wrapper_claude).splitlines()
+                if l.startswith(b"@") and l.endswith(b"/AGENTS.md")]
+
+    def _assert_nested_untouched(self):
+        self.assertEqual(_read(self.nested_agents), PROJECT_OWNED)
+        self.assertFalse(os.path.exists(os.path.join(self.nested, "CLAUDE.md")))
+
+    def test_import_line_after_enroll_and_idempotent_restamp(self):
+        self._wrapper_with_agents_only_repo()
+        self.assertEqual(self._import_lines(), [self.import_line])
+        self._assert_nested_untouched()
+        for _ in range(2):
+            rc, out, err = self.update(self.nested, "--restamp")
+            self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self._import_lines(), [self.import_line])
+        self._assert_nested_untouched()
+
+    def test_two_levels_deep_uses_the_relative_path(self):
+        self._wrapper_with_agents_only_repo(os.path.join("group", "proj"))
+        self.assertEqual(self._import_lines(), [b"@group/proj/AGENTS.md"])
+        rc, out, err = self.update(self.nested, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self._import_lines(), [b"@group/proj/AGENTS.md"])
+
+    def test_repo_gaining_a_claude_md_loses_its_line(self):
+        self._wrapper_with_agents_only_repo()
+        self.assertEqual(self._import_lines(), [self.import_line])
+        own = os.path.join(self.nested, "CLAUDE.md")
+        _write(own, PROJECT_OWNED)
+        rc, out, err = self.update(self.nested)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self._import_lines(), [])
+        self.assertEqual(_read(own), PROJECT_OWNED)
+        self.assertEqual(_read(self.nested_agents), PROJECT_OWNED)
+
+    def test_repo_without_agents_md_gets_no_line(self):
+        wrapper = os.path.join(self.tmpdir, "wrapper")
+        os.makedirs(wrapper)
+        _init_repo(os.path.join(wrapper, "proj"))
+        self.enroll_wrapper(wrapper)
+        text = _read(os.path.join(wrapper, "CLAUDE.md"))
+        self.assertNotIn(b"/AGENTS.md", text)
+
+    def test_doctor_warns_until_restamp_fixes_it(self):
+        self._wrapper_with_agents_only_repo()
+        canonical = os.path.realpath(self.nested)
+        _write(self.wrapper_claude, b"\n".join(
+            l for l in _read(self.wrapper_claude).splitlines() if l != self.import_line) + b"\n")
+
+        _rc, out, _err = self.run_doctor(self.tmpdir, canonical)
+        warns = [l for l in self.lines_about(out, canonical) if "not imported" in l]
+        self.assertEqual(len(warns), 1, out)
+        self.assertIn("WARN", warns[0])
+        self.assertIn("update --restamp", warns[0])
+
+        rc, out, err = self.update(self.nested, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+        _rc, out, _err = self.run_doctor(self.tmpdir, canonical)
+        self.assertTrue(self.lines_about(out, canonical), out)
+        self.assertEqual([l for l in out.splitlines() if "not imported" in l], [], out)
+        self._assert_nested_untouched()
+
+    def test_plain_update_repairs_a_missing_line(self):
+        self._wrapper_with_agents_only_repo()
+        _write(self.wrapper_claude, b"\n".join(
+            l for l in _read(self.wrapper_claude).splitlines() if l != self.import_line) + b"\n")
+        rc, out, err = self.update(self.nested)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self._import_lines(), [self.import_line])
+
+    def test_unmanaged_wrapper_claude_md_is_never_edited_or_warned_about(self):
+        self._wrapper_with_agents_only_repo()
+        _write(self.wrapper_claude, PROJECT_OWNED)
+        rc, out, err = self.update(self.nested, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(_read(self.wrapper_claude), PROJECT_OWNED)
+        _rc, out, _err = self.run_doctor(self.tmpdir, os.path.realpath(self.nested))
+        self.assertNotIn("not imported", out)
+
+
 if __name__ == "__main__":
     import unittest
     unittest.main()
