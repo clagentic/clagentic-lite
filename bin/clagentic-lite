@@ -3121,8 +3121,10 @@ cmd_enroll() {
   # Default to $PWD if no paths given.
   [ -z "$_paths" ] && _paths="$PWD"
 
+  # Each path enrolls in its own subshell so no _enroll_one global survives
+  # into the next path.
   for _raw_path in $_paths; do
-    _enroll_one "$(ds_realpath "$_raw_path")"
+    ( _enroll_one "$(ds_realpath "$_raw_path")" )
   done
 }
 
@@ -3137,14 +3139,20 @@ cmd_enroll() {
 # patterns in .git/info/exclude and no CLAUDE.md of its own, because the
 # wrapper CLAUDE.md already carries the rules and Claude Code loads it as an
 # ancestor file. The pointer is written BEFORE _enroll_one runs for that reason.
-_register_wrapper_repo() {
+#
+# The body is a subshell on purpose: _enroll_one keeps all its state in
+# globals (POSIX sh has no locals) and this function re-enters it for the
+# nested repo, so without the subshell the inner call overwrites the outer
+# call's state (_ep_orig, _canon, loop variables) and a multi-repo "A" answer
+# resolves the wrapper to the first nested repo on every later iteration.
+_register_wrapper_repo() (
   _rwr_wrapper="$1"
   _rwr_repo="$2"
   printf '%s\n' "$_rwr_repo" >> "$_rwr_wrapper/.clagentic-project"
   _stamp_wrapper_claude_md "$_rwr_wrapper" "$_rwr_repo"
   _stamp_wrapper_settings "$_rwr_wrapper"
   _enroll_one "$_rwr_repo"
-}
+)
 
 # _wrapper_dir_for REPO
 # Prints the wrapper directory REPO is enrolled through, or returns 1 when
@@ -3215,10 +3223,31 @@ _wrapper_nested_imports() {
 # it is not ours to rewrite.
 _wrapper_imports_drift() {
   [ -f "$1/CLAUDE.md" ] && grep -q 'managed-by: clagentic' "$1/CLAUDE.md" 2>/dev/null || return 1
-  _wid_want=$(_wrapper_nested_imports "$1" | sort)
-  _wid_have=$(grep -E '^@.+/AGENTS\.md$' "$1/CLAUDE.md" 2>/dev/null | sort)
-  [ "$_wid_want" != "$_wid_have" ] && return 0
-  _same_dir_import_drift "$1"
+  _wid_want=$(
+    _same_dir_import_wanted "$1" && printf '@AGENTS.md\n'
+    _wrapper_nested_imports "$1"
+  )
+  _wid_want=$(printf '%s\n' "$_wid_want" | sort)
+  _wid_have=$(_wrapper_region_imports "$1/CLAUDE.md" | sort)
+  [ "$_wid_want" != "$_wid_have" ]
+}
+
+# _wrapper_region_imports FILE
+# Prints the generated "@...AGENTS.md" import lines inside the generated
+# region of a managed wrapper FILE: the blank-separated block right after the
+# template's closing fence (the same anchor _wrapper_outside_region uses). A
+# hand-written import elsewhere in the file is project-owned and never listed,
+# so it cannot read as drift that no restamp could ever clear.
+_wrapper_region_imports() {
+  awk '
+    state == 0 { if ($0 == "clagentic-lite show memory [N]") state = 1; next }
+    state == 1 { if ($0 == "```") state = 2; else state = 0; next }
+    state == 2 {
+      if ($0 ~ /^@.*AGENTS\.md$/) { print; next }
+      if ($0 == "") next
+      state = 3
+    }
+  ' "$1"
 }
 
 # _same_dir_import_wanted DIR

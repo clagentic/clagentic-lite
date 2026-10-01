@@ -17,6 +17,7 @@ under a temp HOME; nothing touches the live checkout.
 Run with: python3 -m unittest scripts.test_stamp_agents_or_claude -v
 """
 import os
+import shutil
 import subprocess
 
 from scripts.test_enroll_tracked_file_writes import _Base, _init_repo, _read, _write
@@ -610,6 +611,90 @@ class TestWrapperRestampKeepsProjectContent(_StampBase):
                             "CLAUDE.md.wrapper.template")
         lines = [l for l in _read(path).splitlines() if l.strip()]
         self.assertEqual(lines[-2:], [b"clagentic-lite show memory [N]", b"```"])
+
+
+class TestHandWrittenImportsOutsideTheRegion(_StampBase):
+    """Only the generated region's import lines are drift. A hand-written
+    @...AGENTS.md line elsewhere in a managed wrapper CLAUDE.md is project-owned:
+    it must not make every update restamp, because no restamp could clear it."""
+
+    def test_hand_written_imports_never_trigger_a_restamp(self):
+        wrapper = os.path.join(self.tmpdir, "wrapper")
+        nested = os.path.join(wrapper, "proj")
+        os.makedirs(wrapper)
+        _init_repo(nested)
+        _write(os.path.join(nested, "AGENTS.md"), PROJECT_OWNED)
+        self.enroll_wrapper(wrapper)
+        rc, out, err = self.update(nested, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+
+        claude = os.path.join(wrapper, "CLAUDE.md")
+        mine = b"\n## Mine\n\n@notes/AGENTS.md\n@AGENTS.md\n"
+        _write(claude, _read(claude) + mine)
+        before = _read(claude)
+
+        for attempt in range(2):
+            rc, out, err = self.update(nested)
+            self.assertEqual(rc, 0, out + err)
+            self.assertNotIn("stamped wrapper", out + err, "attempt %d" % attempt)
+            self.assertEqual(_read(claude), before)
+
+        # A real drift is still repaired, and the hand-written lines survive.
+        _write(claude, before.replace(b"@proj/AGENTS.md\n", b"", 1))
+        rc, out, err = self.update(nested)
+        self.assertEqual(rc, 0, out + err)
+        text = _read(claude)
+        self.assertEqual(text.count(b"@proj/AGENTS.md"), 1)
+        self.assertTrue(text.endswith(mine), text)
+
+
+class TestMultiRepoAnswerAllIsOrderIndependent(_StampBase):
+    """Answering "A" to the multi-repo prompt registers every nested repo
+    against the wrapper, whatever order find lists them in. _enroll_one keeps its
+    state in globals, so a re-entrant call used to leak the previous repo into the
+    next iteration: the wrapper resolved to the first nested repo, which then got
+    a CLAUDE.md and a wrong pointer."""
+
+    def _find_stub(self, order):
+        real = shutil.which("find")
+        stub_dir = os.path.join(self.tmpdir, "stub-" + order)
+        os.makedirs(stub_dir)
+        script = os.path.join(stub_dir, "find")
+        # Reorders only the nested-repo scan; every other find passes through.
+        _write(script, ("#!/bin/sh\n"
+                        "case \"$*\" in\n"
+                        "  *\"-name .git\"*) %s \"$@\" | sort %s ;;\n"
+                        "  *) exec %s \"$@\" ;;\n"
+                        "esac\n" % (real, "-r" if order == "reverse" else "", real)).encode())
+        os.chmod(script, 0o755)
+        return stub_dir
+
+    def _enroll_all(self, order):
+        wrapper = os.path.join(self.tmpdir, "wrapper-" + order)
+        repos = [os.path.join(wrapper, name) for name in ("alpha", "beta", "gamma")]
+        os.makedirs(wrapper)
+        for repo in repos:
+            _init_repo(repo)
+        path = self._find_stub(order) + os.pathsep + os.environ["PATH"]
+        rc, out, err = self.run_cli_tty(["enroll", wrapper], cwd=wrapper, answer=b"A\n", PATH=path)
+        self.assertEqual(rc, 0, out + err)
+        return wrapper, repos
+
+    def _check(self, order):
+        wrapper, repos = self._enroll_all(order)
+        pointer = _read(os.path.join(wrapper, ".clagentic-project")).decode().split()
+        self.assertEqual(sorted(pointer), sorted(os.path.realpath(r) for r in repos), order)
+        for repo in repos:
+            for stray in (".clagentic-project", "CLAUDE.md", "AGENTS.md"):
+                self.assertFalse(os.path.exists(os.path.join(repo, stray)),
+                                 "%s: %s got %s" % (order, repo, stray))
+        self.assertIn(MARKER, _read(os.path.join(wrapper, "CLAUDE.md")))
+
+    def test_find_order_forward(self):
+        self._check("forward")
+
+    def test_find_order_reverse(self):
+        self._check("reverse")
 
 
 if __name__ == "__main__":
