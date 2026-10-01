@@ -979,9 +979,9 @@ class TestReviewIngestFailsClosed(_FailureBase):
 
     def test_findings_read_failure_is_not_written_as_empty_findings(self):
         self._write_review(self.FORGED)
-        # The findings read is the jq call whose filter contains `.findings // []`
-        # (the same text in the strict and the lenient reader).
-        self._stub("jq", 'case "$*" in *\'.findings // []\'*) exit 1;; esac')
+        # The findings read is the jq call whose filter contains
+        # `has("findings")` (_extract_findings_json_strict).
+        self._stub("jq", 'case "$*" in *\'has("findings")\'*) exit 1;; esac')
         env, err = self._ingest(self._path(nojq=False))
         self._assert_failed_stub(env, err)
 
