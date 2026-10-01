@@ -179,9 +179,23 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 3. Refuses if already enrolled (use `--force` to re-enroll).
 4. Initializes `.clagentic/lite/audit.db` and `.clagentic/lite/memory.db` in that repo.
 5. Stamps `.git/hooks/pre-commit` and `.git/hooks/pre-push` from `share/hook-shims/*.template`, substituting `$CLAGENTIC_LITE_HOME` at stamp time. Refuses to overwrite non-clagentic hooks unless `--force`.
-6. Generates `.claude/settings.json` (absolute hook paths → `$CLAGENTIC_LITE_HOME`), symlinks `.claude/commands`, and adds `.claude/` to `.gitignore`. These are local-only artifacts. Role agents and commentary skills are installed globally via the `clagentic-lite` plugin at `init` time — no per-repo copies.
-7. Stamps `CLAUDE.md` at the repo root — activates the Builder contract and exposes agents for Claude Code auto-dispatch. Refuses to overwrite a non-clagentic `CLAUDE.md` unless `--force`.
+6. Generates `.claude/settings.json` (absolute hook paths → `$CLAGENTIC_LITE_HOME`), symlinks `.claude/commands`, and ignores `.claude/` and `.clagentic/lite/` (see "Which project files enroll and update write" below for where). These are local-only artifacts. Role agents and commentary skills are installed globally via the `clagentic-lite` plugin at `init` time — no per-repo copies.
+7. Stamps `CLAUDE.md` at the repo root when none exists — activates the Builder contract and exposes agents for Claude Code auto-dispatch. A `CLAUDE.md` without the `managed-by: clagentic` marker is project-owned and is never overwritten, not even with `--force`.
 8. Registers the repo path in `~/.local/state/clagentic/registry`.
+
+#### Which project files enroll and update write
+
+Everything else enroll and update write lives under `.git/` or `.clagentic/lite/` (and `.claude/`, which is ignored). The only files that can be tracked by your project are these two:
+
+| Layout | `.gitignore` | `CLAUDE.md` | Ignore patterns go to |
+|---|---|---|---|
+| Regular repo (default) | appended with `.claude/` and `.clagentic/lite/` if absent (created if missing); nothing else in it is touched | stamped when missing; the notice block is refreshed when the file is clagentic-managed; an unmanaged file is never touched | the repo's `.gitignore` |
+| Regular repo, `CLAGENTIC_IGNORE_TARGET=exclude` | never touched | same as above | `.git/info/exclude` |
+| Wrapper layout (enrolled through a wrapper directory) | never touched | not created (the wrapper `CLAUDE.md` already carries the rules and Claude Code loads it as an ancestor file); a clagentic-managed one keeps its notice refreshed | `.git/info/exclude` |
+
+`CLAGENTIC_IGNORE_TARGET` (`gitignore` or `exclude`, in the global config) overrides the per-layout default. To keep a project's tracked files untouched, set it to `exclude`, or enroll through the wrapper layout. A pattern already present in either `.gitignore` or `.git/info/exclude` counts as satisfied, so a pattern you moved to `info/exclude` is never added back to `.gitignore`. The exclude path is resolved with `git rev-parse --git-path`, so linked worktrees and submodules (where `.git` is a file) work. Governance files at the top of `.clagentic/` (`adversarial-acks.json`, `osv-ignore`, `accepted-risks.md`, `config`) stay trackable in every mode.
+
+Lines an earlier enrollment already added to a tracked `.gitignore` are not removed automatically; for a wrapper-enrolled repo `doctor` prints an INFO line saying they can be moved to `.git/info/exclude`. `update`'s one-time migration of old per-file `.clagentic/*` patterns removes only those exact legacy lines and keeps every other line, blank lines included.
 
 **A repo-local `.clagentic/config` does not apply on this very first `enroll` call** — the CLI will not execute a repo's own config before that repo is registered as enrolled. It takes effect starting with the next command you run against the repo (`doctor`, `update`, a re-`enroll`, or any hook that fires from your next commit). The global config (`~/.config/clagentic/lite/config`) is unaffected and applies at enroll time as normal.
 
@@ -197,9 +211,9 @@ If you installed an older version, your config may still be at `~/.config/clagen
 
 **Shared repo**: `CLAUDE.md` is committable as-is and is the only clagentic artifact that is meant to be shared. It contains no machine-specific paths. Teammates without clagentic-lite installed will see a normal project CLAUDE.md. Teammates with clagentic-lite installed will get full agent auto-dispatch.
 
-`.claude/` (hook wiring, command symlinks, `settings.json`) is **local-only** — it is added to `.gitignore` automatically at enroll time and is never committed. Each teammate who wants clagentic-lite active must run `clagentic-lite enroll` in the repo on their own machine. This is by design: hook paths are absolute and machine-specific; sharing them would break the harness on every machine but the original.
+`.claude/` (hook wiring, command symlinks, `settings.json`) is **local-only** — it is added to `.gitignore` (or `.git/info/exclude`, see above) automatically at enroll time and is never committed. Each teammate who wants clagentic-lite active must run `clagentic-lite enroll` in the repo on their own machine. This is by design: hook paths are absolute and machine-specific; sharing them would break the harness on every machine but the original.
 
-If you extend `CLAUDE.md` with project-specific rules, `clagentic-lite enroll --force` will refuse to overwrite until you remove the `managed-by: clagentic` marker.
+A `CLAUDE.md` that lacks the `managed-by: clagentic` marker is yours: `clagentic-lite enroll --force` leaves it byte-identical and says so. To have enroll stamp the notice instead, delete or rename the file and enroll again.
 
 ### Verify the install
 
