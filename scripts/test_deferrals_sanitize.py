@@ -138,9 +138,11 @@ class TestDeferralsSanitizeFailureOmitsDeferrals(unittest.TestCase):
         try:
             stub = os.path.join(tmpdir, "jq")
             with open(stub, "w") as f:
-                # Fail only the allowlist's reduce filter (the one carrying
-                # --argjson types); every other jq call is the real tool.
-                f.write(f"#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = types ] && exit 1; done\nexec '{shutil.which('jq')}' \"$@\"\n")
+                # Make only the allowlist's reduce filter (the one carrying
+                # --argjson types) produce empty output with status 0 -- a
+                # silent tool failure that `set -e` does not catch; every
+                # other jq call is the real tool.
+                f.write(f"#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = types ] && exit 0; done\nexec '{shutil.which('jq')}' \"$@\"\n")
             os.chmod(stub, 0o755)
             content = json.dumps([{
                 "id": "d1", "description": "ok",

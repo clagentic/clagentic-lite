@@ -881,8 +881,10 @@ class TestReviewIngestFailsClosed(_FailureBase):
 
     def test_allowlist_failure_leaves_a_degraded_stub_not_raw_findings(self):
         self._write_review(self.FORGED)
-        # Fail only the allowlist's reduce filter (the one carrying --argjson types).
-        self._stub("jq", 'for a in "$@"; do [ "$a" = types ] && exit 1; done')
+        # Only the allowlist's reduce filter (the one carrying --argjson types)
+        # produces empty output with status 0: a silent tool failure that
+        # `set -e` does not catch.
+        self._stub("jq", 'for a in "$@"; do [ "$a" = types ] && exit 0; done')
         env, err = self._ingest(self._path(nojq=False))
         self._assert_failed_stub(env, err)
         self._assert_payload_degraded()
@@ -896,7 +898,9 @@ class TestReviewIngestFailsClosed(_FailureBase):
 
     def test_findings_read_failure_is_not_written_as_empty_findings(self):
         self._write_review(self.FORGED)
-        self._stub("jq", 'case "$*" in *\'error("not an object")\'*) exit 1;; esac')
+        # The findings read is the jq call whose filter contains `.findings // []`
+        # (the same text in the strict and the lenient reader).
+        self._stub("jq", 'case "$*" in *\'.findings // []\'*) exit 1;; esac')
         env, err = self._ingest(self._path(nojq=False))
         self._assert_failed_stub(env, err)
 
