@@ -2103,14 +2103,15 @@ _stamp_wrapper_claude_md() {
     [ -n "$_wcd_name" ] || _wcd_name="CLAUDE.md"
   fi
   _wcd_target="$_wcd/$_wcd_name"
+  if [ -f "$_wcd_target" ] && ! grep -q 'managed-by: clagentic' "$_wcd_target" 2>/dev/null; then
+    warn "existing $_wcd_name in wrapper $_wcd is not clagentic-managed — leaving it untouched. To have enroll stamp the wrapper notice, delete or rename that file and run enroll again"
+    return 0
+  fi
+  # Decided from the filesystem on every stamp, never from the previous
+  # file, so the import appears when AGENTS.md is added and goes when it is
+  # deleted. Only a CLAUDE.md shadows a sibling AGENTS.md.
   _wcd_import=0
-  if [ -f "$_wcd_target" ]; then
-    if ! grep -q 'managed-by: clagentic' "$_wcd_target" 2>/dev/null; then
-      warn "existing $_wcd_name in wrapper $_wcd is not clagentic-managed — leaving it untouched. To have enroll stamp the wrapper notice, delete or rename that file and run enroll again"
-      return 0
-    fi
-    grep -qxF '@AGENTS.md' "$_wcd_target" 2>/dev/null && _wcd_import=1
-  elif [ -f "$_wcd/AGENTS.md" ]; then
+  if [ "$_wcd_name" = "CLAUDE.md" ] && [ -f "$_wcd/AGENTS.md" ]; then
     _wcd_import=1
   fi
 
@@ -3153,7 +3154,13 @@ _wrapper_imports_drift() {
   [ -f "$1/CLAUDE.md" ] && grep -q 'managed-by: clagentic' "$1/CLAUDE.md" 2>/dev/null || return 1
   _wid_want=$(_wrapper_nested_imports "$1" | sort)
   _wid_have=$(grep -E '^@.+/AGENTS\.md$' "$1/CLAUDE.md" 2>/dev/null | sort)
-  [ "$_wid_want" != "$_wid_have" ]
+  [ "$_wid_want" != "$_wid_have" ] && return 0
+  # The same-directory import tracks whether the wrapper has an AGENTS.md.
+  _wid_same=0
+  grep -qxF '@AGENTS.md' "$1/CLAUDE.md" 2>/dev/null && _wid_same=1
+  _wid_exp=0
+  [ -f "$1/AGENTS.md" ] && _wid_exp=1
+  [ "$_wid_same" != "$_wid_exp" ]
 }
 
 # _restamp_notice_in FILE TEMPLATE [FULL]

@@ -66,7 +66,10 @@ class TestWrapperNestedFilesAreProjectOwned(_StampBase):
 
         rc, out, err = self.update(nested)
         self.assertEqual(rc, 0, out + err)
-        for line in self.lines_about(out + err, nested):
+        # update may print either spelling of the path; match both so the loop
+        # cannot pass vacuously on a realpath/tmp mismatch.
+        for line in self.lines_about(out + err, nested) + self.lines_about(
+                out + err, os.path.realpath(nested)):
             self.assertNotIn("notice", line.lower(), line)
             self.assertNotIn("--restamp", line, line)
         self.assertNotIn("enrollment notice", out + err)
@@ -308,6 +311,38 @@ class TestWrapperUnmanagedAgentsMd(_StampBase):
         self.assertIn(b"clagentic-wrapper-version: v2", after)
         self.assertEqual(after.count(b"@AGENTS.md"), 1)
         self.assertEqual(_read(agents), PROJECT_OWNED)
+
+    def _enrolled_wrapper(self):
+        wrapper = os.path.join(self.tmpdir, "wrapper")
+        nested = os.path.join(wrapper, "proj")
+        os.makedirs(wrapper)
+        _init_repo(nested)
+        self.enroll_wrapper(wrapper)
+        return wrapper, nested
+
+    def test_import_added_when_agents_md_appears_later(self):
+        wrapper, nested = self._enrolled_wrapper()
+        claude = os.path.join(wrapper, "CLAUDE.md")
+        self.assertEqual(_read(claude).count(b"@AGENTS.md"), 0)
+        agents = os.path.join(wrapper, "AGENTS.md")
+        _write(agents, PROJECT_OWNED)
+        rc, out, err = self.update(nested)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(_read(claude).count(b"@AGENTS.md"), 1)
+        self.assertEqual(_read(agents), PROJECT_OWNED)
+
+    def test_import_dropped_when_agents_md_is_deleted(self):
+        wrapper, nested = self._enrolled_wrapper()
+        claude = os.path.join(wrapper, "CLAUDE.md")
+        agents = os.path.join(wrapper, "AGENTS.md")
+        _write(agents, PROJECT_OWNED)
+        rc, out, err = self.update(nested, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(_read(claude).count(b"@AGENTS.md"), 1)
+        os.remove(agents)
+        rc, out, err = self.update(nested)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(_read(claude).count(b"@AGENTS.md"), 0)
 
     def test_wrapper_force_never_overwrites_unmanaged_wrapper_claude_md(self):
         wrapper = os.path.join(self.tmpdir, "wrapper")
