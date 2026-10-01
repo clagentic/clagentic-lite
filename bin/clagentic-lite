@@ -2087,20 +2087,31 @@ _install_clagentic_lite_plugin() {
 # pre-commit/pre-push hooks are git-repo-rooted. Wrapper sessions must also
 # have .claude/settings.json stamped so lifecycle hooks fire correctly.
 # See _stamp_wrapper_settings for that wiring.
-# Skips if a non-clagentic CLAUDE.md already exists (unless ENROLL_FORCE=1).
+# The stamp goes into the wrapper file that already carries the managed-by
+# marker (CLAUDE.md or AGENTS.md; optional arg 3 names it explicitly), else a
+# new CLAUDE.md. A file without the marker is project-owned and never
+# overwritten, not even with ENROLL_FORCE=1. When a new CLAUDE.md is created
+# beside an unmanaged AGENTS.md, it carries an @AGENTS.md import so the
+# project's AGENTS.md keeps loading instead of being shadowed.
 _stamp_wrapper_claude_md() {
-  _wcd="$1"; _wcd_repos="$2"
+  _wcd="$1"; _wcd_repos="$2"; _wcd_name="${3:-}"
   _wcd_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
   [ -f "$_wcd_template" ] || { warn "CLAUDE.md.wrapper.template missing — skipping wrapper CLAUDE.md"; return 0; }
 
-  _wcd_target="$_wcd/CLAUDE.md"
-  if [ -f "$_wcd_target" ] && ! grep -q 'managed-by: clagentic' "$_wcd_target" 2>/dev/null; then
-    if [ "${ENROLL_FORCE:-0}" = "1" ]; then
-      warn "overwriting existing non-clagentic CLAUDE.md in wrapper $_wcd (--force)"
-    else
-      warn "existing CLAUDE.md in wrapper $_wcd is not clagentic-managed — skipping (use --force to overwrite)"
+  if [ -z "$_wcd_name" ]; then
+    _wcd_name=$(_stamped_files_in "$_wcd" | head -n 1)
+    [ -n "$_wcd_name" ] || _wcd_name="CLAUDE.md"
+  fi
+  _wcd_target="$_wcd/$_wcd_name"
+  _wcd_import=0
+  if [ -f "$_wcd_target" ]; then
+    if ! grep -q 'managed-by: clagentic' "$_wcd_target" 2>/dev/null; then
+      warn "existing $_wcd_name in wrapper $_wcd is not clagentic-managed — leaving it untouched. To have enroll stamp the wrapper notice, delete or rename that file and run enroll again"
       return 0
     fi
+    grep -qxF '@AGENTS.md' "$_wcd_target" 2>/dev/null && _wcd_import=1
+  elif [ -f "$_wcd/AGENTS.md" ]; then
+    _wcd_import=1
   fi
 
   # Generate the file directly — multiline table substitution via sed is
@@ -2109,6 +2120,9 @@ _stamp_wrapper_claude_md() {
   {
     while IFS= read -r _tmpl_line; do
       case "$_tmpl_line" in
+        '# CLAUDE.md')
+          printf '# %s\n' "$_wcd_name"
+          ;;
         *__WRAPPER_PROJECT_TABLE__*)
           # Include last-gate-run column when sqlite3 is available (best-effort).
           if command -v sqlite3 >/dev/null 2>&1; then
@@ -2157,8 +2171,11 @@ _stamp_wrapper_claude_md() {
           ;;
       esac
     done < "$_wcd_template"
+    if [ "$_wcd_import" -eq 1 ]; then
+      printf '\n@AGENTS.md\n'
+    fi
   } > "$_wcd_target"
-  say "stamped wrapper CLAUDE.md: $_wcd_target" >&2
+  say "stamped wrapper $_wcd_name: $_wcd_target" >&2
 }
 
 # Stamp .claude/settings.json and symlink .claude/commands into a non-git
@@ -3061,23 +3078,77 @@ _register_wrapper_repo() {
   _enroll_one "$_rwr_repo"
 }
 
-# _repo_is_wrapper_enrolled REPO
-# True when a .clagentic-project pointer in an ancestor directory of REPO
-# lists REPO. Walks every ancestor, nearest first, and stops at the first
-# pointer found — the same walk ds_repo_root (platform.sh) uses, so a repo at
-# wrapper/group/repo is classified the way the rest of the tool resolves it.
-# Membership, not mere existence: an unrelated repo that happens to sit
-# beneath a pointer file is not wrapper-enrolled.
-_repo_is_wrapper_enrolled() {
-  _rwe_d=$(dirname "$1")
-  while [ "$_rwe_d" != "/" ] && [ "$_rwe_d" != "." ]; do
-    if [ -f "$_rwe_d/.clagentic-project" ]; then
-      grep -qxF "$1" "$_rwe_d/.clagentic-project" 2>/dev/null
-      return $?
+# _wrapper_dir_for REPO
+# Prints the wrapper directory REPO is enrolled through, or returns 1 when
+# REPO is not wrapper-enrolled. Walks every ancestor, nearest first, and stops
+# at the first pointer found — the same walk ds_repo_root (platform.sh) uses,
+# so a repo at wrapper/group/repo is classified the way the rest of the tool
+# resolves it. Membership, not mere existence: an unrelated repo that happens
+# to sit beneath a pointer file is not wrapper-enrolled. Every site that needs
+# the wrapper dir or the yes/no answer goes through here, never dirname.
+_wrapper_dir_for() {
+  _wdf_d=$(dirname "$1")
+  while [ "$_wdf_d" != "/" ] && [ "$_wdf_d" != "." ]; do
+    if [ -f "$_wdf_d/.clagentic-project" ]; then
+      grep -qxF "$1" "$_wdf_d/.clagentic-project" 2>/dev/null || return 1
+      printf '%s\n' "$_wdf_d"
+      return 0
     fi
-    _rwe_d=$(dirname "$_rwe_d")
+    _wdf_d=$(dirname "$_wdf_d")
   done
   return 1
+}
+
+# _repo_is_wrapper_enrolled REPO
+# True when REPO is enrolled through a wrapper directory (see _wrapper_dir_for).
+_repo_is_wrapper_enrolled() {
+  _wrapper_dir_for "$1" >/dev/null
+}
+
+# _stamped_files_in DIR
+# Prints the basename of each instruction file in DIR (CLAUDE.md, then
+# AGENTS.md) that carries the managed-by marker, one per line. The enrollment
+# stamp is satisfied by either file; neither is required and the tool never
+# writes both.
+_stamped_files_in() {
+  for _sfi_n in CLAUDE.md AGENTS.md; do
+    if [ -f "$1/$_sfi_n" ] && grep -q 'managed-by: clagentic' "$1/$_sfi_n" 2>/dev/null; then
+      printf '%s\n' "$_sfi_n"
+    fi
+  done
+  return 0
+}
+
+# _restamp_notice_in FILE TEMPLATE [FULL]
+# Rewrites the notice block of FILE (CLAUDE.md or AGENTS.md) from TEMPLATE,
+# keeping project-owned content below the block. The template's heading names
+# CLAUDE.md, so it is rewritten to FILE's own name first; the stamp stays in
+# whichever file carries it and is never moved or duplicated. FULL=1 replaces
+# the whole file instead (old fat-format migration).
+_restamp_notice_in() {
+  _rni_file="$1"; _rni_template="$2"; _rni_full="${3:-0}"
+  _rni_name=$(basename "$_rni_file")
+  _rni_tmp=$(mktemp "${TMPDIR:-/tmp}/clagentic-notice.XXXXXX") || return 1
+  sed "1s/^# CLAUDE\\.md\$/# $_rni_name/" "$_rni_template" > "$_rni_tmp"
+  if [ "$_rni_full" = "1" ]; then
+    cp "$_rni_tmp" "$_rni_file"
+  else
+    _restamp_notice_block "$_rni_file" "$_rni_tmp"
+  fi
+  _rni_rc=$?
+  rm -f "$_rni_tmp"
+  return "$_rni_rc"
+}
+
+# _doctor_note_agents_only DIR LABEL
+# The stamp may sit in AGENTS.md, but Claude Code does not load AGENTS.md by
+# default while a CLAUDE.md exists beside it. Report that as INFO, once, when
+# the marker is in AGENTS.md only and a CLAUDE.md sits in the same directory.
+_doctor_note_agents_only() {
+  _dnao_stamped=$(_stamped_files_in "$1")
+  if [ "$_dnao_stamped" = "AGENTS.md" ] && [ -f "$1/CLAUDE.md" ]; then
+    printf '  INFO  %s: the enrollment notice is in AGENTS.md; Claude Code does not load AGENTS.md by default while CLAUDE.md exists in the same directory\n' "$2"
+  fi
 }
 
 # _repo_exclude_file REPO
@@ -3398,32 +3469,42 @@ _enroll_one() {
   # restamp (see _restamp_repo_artifacts).
   _claude_md_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
   _claude_md_target="$_canon/CLAUDE.md"
+  _claude_md_stamped=$(_stamped_files_in "$_canon")
   if [ -f "$_claude_md_template" ]; then
-    if [ -f "$_claude_md_target" ]; then
-      if grep -q 'managed-by: clagentic' "$_claude_md_target" 2>/dev/null; then
-        # Already clagentic-managed — splice in the new notice block while
-        # preserving any project-owned content below the sentinel.  This is
-        # the same path update uses; a bare cp would destroy the user's block.
-        _restamp_notice_block "$_claude_md_target" "$_claude_md_template"
-        say "re-stamped CLAUDE.md (preserved project-owned content): $_claude_md_target"
-      else
-        # Not clagentic-managed: project-owned content. Never overwritten,
-        # not even with --force; the operator decides what happens to it.
-        if [ "${ENROLL_FORCE:-0}" = "1" ]; then
-          warn "existing CLAUDE.md in $_canon is not clagentic-managed — --force does not overwrite it. To have enroll stamp the notice, delete or rename that file and run enroll again"
-        else
-          warn "existing CLAUDE.md in $_canon is not clagentic-managed — leaving it untouched"
-        fi
-      fi
+    if [ -n "$_claude_md_stamped" ]; then
+      # Already clagentic-managed (in CLAUDE.md, AGENTS.md, or both) — splice
+      # in the new notice block while preserving any project-owned content
+      # below the sentinel, in the file that carries the stamp. The same path
+      # update uses; a bare cp would destroy the user's block.
+      for _cms_name in $_claude_md_stamped; do
+        _restamp_notice_in "$_canon/$_cms_name" "$_claude_md_template"
+        say "re-stamped $_cms_name (preserved project-owned content): $_canon/$_cms_name"
+      done
     elif _repo_is_wrapper_enrolled "$_canon"; then
-      # Wrapper layout: the wrapper CLAUDE.md already carries the rules and
-      # Claude Code loads it as an ancestor file, so the nested repo's tracked
-      # tree stays untouched.
-      say "wrapper layout: not creating CLAUDE.md in $_canon (the wrapper CLAUDE.md applies)"
+      # Wrapper layout: the wrapper notice already carries the rules and
+      # Claude Code loads it as an ancestor file, so the nested repo's own
+      # CLAUDE.md/AGENTS.md (project-owned) and tracked tree stay untouched.
+      say "wrapper layout: not creating CLAUDE.md in $_canon (the wrapper notice applies)"
+    elif [ -f "$_claude_md_target" ]; then
+      # Not clagentic-managed: project-owned content. Never overwritten,
+      # not even with --force; the operator decides what happens to it.
+      if [ "${ENROLL_FORCE:-0}" = "1" ]; then
+        warn "existing CLAUDE.md in $_canon is not clagentic-managed — --force does not overwrite it. To have enroll stamp the notice, delete or rename that file and run enroll again"
+      else
+        warn "existing CLAUDE.md in $_canon is not clagentic-managed — leaving it untouched"
+      fi
     else
-      # No existing file — plain stamp.
+      # No CLAUDE.md and no stamp anywhere — plain stamp. A plain CLAUDE.md
+      # would shadow a project's AGENTS.md (Claude Code reads AGENTS.md only
+      # when no CLAUDE.md exists), so beside one the notice carries an
+      # @AGENTS.md import below the managed block, which restamp preserves.
       cp "$_claude_md_template" "$_claude_md_target"
-      say "stamped CLAUDE.md: $_claude_md_target"
+      if [ -f "$_canon/AGENTS.md" ]; then
+        printf '\n@AGENTS.md\n' >> "$_claude_md_target"
+        say "stamped CLAUDE.md (imports the project's AGENTS.md): $_claude_md_target"
+      else
+        say "stamped CLAUDE.md: $_claude_md_target"
+      fi
     fi
   else
     warn "CLAUDE.md.template missing — skipping enrollment notice stamp"
@@ -3785,34 +3866,44 @@ cmd_doctor() {
         fi
       done
       # Check CLAUDE.md enrollment notice in enrolled repo.
-      _cm_file="$_rpath/CLAUDE.md"
-      if [ ! -f "$_cm_file" ]; then
+      # The stamp is satisfied by the managed-by marker in either CLAUDE.md or
+      # AGENTS.md. In the wrapper layout the stamp belongs to the wrapper, so a
+      # nested repo's own instruction files are project-owned and not reported
+      # on unless clagentic manages one.
+      _cm_stamped=$(_stamped_files_in "$_rpath")
+      if [ -z "$_cm_stamped" ]; then
         if _repo_is_wrapper_enrolled "$_rpath"; then
-          _ok "$_rpath: no CLAUDE.md by design (wrapper layout: the wrapper CLAUDE.md applies)"
+          _ok "$_rpath: no CLAUDE.md by design (wrapper layout: the wrapper notice applies)"
+        elif [ -f "$_rpath/CLAUDE.md" ]; then
+          printf '  WARN  %s: no enrollment notice (the existing CLAUDE.md has no clagentic marker and is project-owned: enroll never overwrites it; delete or rename it and run `clagentic-lite enroll` to have enroll write the notice into CLAUDE.md)\n' "$_rpath"
+        elif [ -f "$_rpath/AGENTS.md" ]; then
+          printf '  WARN  %s: no enrollment notice (`clagentic-lite enroll` writes CLAUDE.md here with an @AGENTS.md import, leaving AGENTS.md untouched)\n' "$_rpath"
         else
-          printf '  WARN  %s: CLAUDE.md missing (`clagentic-lite enroll --force` stamps the notice; it never overwrites an existing CLAUDE.md that lacks the clagentic marker)\n' "$_rpath"
+          printf '  WARN  %s: no enrollment notice (`clagentic-lite enroll` writes CLAUDE.md here)\n' "$_rpath"
         fi
-      elif ! grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
-        printf '  WARN  %s: CLAUDE.md not clagentic-managed (manual CLAUDE.md?)\n' "$_rpath"
       else
-        # Check for new thin-notice marker first; fall back to legacy marker.
-        _repo_notice_ver=$(claude_notice_version "$_cm_file")
-        _repo_old_ver=$(claude_md_version "$_cm_file")
-        if [ -n "$_repo_notice_ver" ]; then
-          if [ "$_repo_notice_ver" != "$CLAUDE_NOTICE_VERSION" ]; then
-            # Notice drift is low-risk — INFO not FAIL.
-            printf '  INFO  %s: CLAUDE.md notice version %s (current: %s) — run `clagentic-lite update` to refresh\n' \
-              "$_rpath" "$_repo_notice_ver" "$CLAUDE_NOTICE_VERSION"
+        for _cm_name in $_cm_stamped; do
+          _cm_file="$_rpath/$_cm_name"
+          # Check for new thin-notice marker first; fall back to legacy marker.
+          _repo_notice_ver=$(claude_notice_version "$_cm_file")
+          _repo_old_ver=$(claude_md_version "$_cm_file")
+          if [ -n "$_repo_notice_ver" ]; then
+            if [ "$_repo_notice_ver" != "$CLAUDE_NOTICE_VERSION" ]; then
+              # Notice drift is low-risk — INFO not FAIL.
+              printf '  INFO  %s: %s notice version %s (current: %s) — run `clagentic-lite update` to refresh\n' \
+                "$_rpath" "$_cm_name" "$_repo_notice_ver" "$CLAUDE_NOTICE_VERSION"
+            else
+              _ok "$_rpath: $_cm_name notice version $CLAUDE_NOTICE_VERSION OK"
+            fi
+          elif [ -n "$_repo_old_ver" ]; then
+            # Old fat file — warn; update will migrate to thin notice.
+            printf '  WARN  %s: %s uses old format (clagentic-claude-md-version: %s) — run `clagentic-lite update` to migrate to thin notice\n' \
+              "$_rpath" "$_cm_name" "$_repo_old_ver"
           else
-            _ok "$_rpath: CLAUDE.md notice version $CLAUDE_NOTICE_VERSION OK"
+            printf '  WARN  %s: %s has managed-by marker but no version tag — run `clagentic-lite update --restamp`\n' "$_rpath" "$_cm_name"
           fi
-        elif [ -n "$_repo_old_ver" ]; then
-          # Old fat CLAUDE.md — warn; update will migrate to thin notice.
-          printf '  WARN  %s: CLAUDE.md uses old format (clagentic-claude-md-version: %s) — run `clagentic-lite update` to migrate to thin notice\n' \
-            "$_rpath" "$_repo_old_ver"
-        else
-          printf '  WARN  %s: CLAUDE.md has managed-by marker but no version tag — run `clagentic-lite update --restamp`\n' "$_rpath"
-        fi
+        done
+        _repo_is_wrapper_enrolled "$_rpath" || _doctor_note_agents_only "$_rpath" "$_rpath"
       fi
       # Existing installs: earlier enrollments of a wrapper-enrolled repo wrote
       # harness lines into its tracked .gitignore. Never auto-removed (that
@@ -3908,11 +3999,14 @@ cmd_doctor() {
   if [ -f "$REGISTRY" ]; then
     while IFS= read -r _rpath; do
       [ -z "$_rpath" ] && continue
-      _parent=$(dirname "$_rpath")
+      _parent=$(_wrapper_dir_for "$_rpath") || continue
       _ptr="$_parent/.clagentic-project"
-      [ -f "$_ptr" ] || continue
       _wrapper_found=1
       printf '  checking %s\n' "$_ptr"
+      for _wn_name in $(_stamped_files_in "$_parent"); do
+        _ok "wrapper notice: $_parent/$_wn_name carries the enrollment stamp"
+      done
+      _doctor_note_agents_only "$_parent" "$_parent"
       while IFS= read -r _ppath; do
         [ -z "$_ppath" ] && continue
         if [ ! -d "$_ppath" ]; then
@@ -4564,9 +4658,8 @@ cmd_rotate() {
     # parent — same credential, same rotation obligation, not counted as a
     # SECOND registry member (it is derived from this one's parent dir, the
     # same relationship cmd_doctor's own wrapper-pointer check (§7) uses).
-    _rot_wrapper_dir=$(dirname "$_rot_path")
-    _rot_wrapper_ptr="$_rot_wrapper_dir/.clagentic-project"
-    if [ -f "$_rot_wrapper_ptr" ] && [ -f "$_rot_wrapper_dir/.claude/settings.json" ]; then
+    _rot_wrapper_dir=$(_wrapper_dir_for "$_rot_path" || true)
+    if [ -n "$_rot_wrapper_dir" ] && [ -f "$_rot_wrapper_dir/.claude/settings.json" ]; then
       if ENROLL_FORCE=1 _stamp_wrapper_settings "$_rot_wrapper_dir"; then
         say "rotated wrapper: $_rot_wrapper_dir/.claude/settings.json"
       else
@@ -4685,20 +4778,22 @@ _restamp_repo_artifacts() {
   # rules content (lines 9+) as user content and re-append it after the new
   # thin template, producing an inconsistent committed file that tells
   # non-clagentic contributors "these are binding rules" unconditionally.
-  _ra_cm="$_ra_path/CLAUDE.md"
-  if [ -f "$_ra_cm" ] && grep -q 'managed-by: clagentic' "$_ra_cm" 2>/dev/null; then
-    _ra_cm_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
+  # The stamp stays in whichever file carries the marker (CLAUDE.md or
+  # AGENTS.md): never moved to the other file, never duplicated.
+  _ra_cm_template="$SHARE_DIR/hook-shims/CLAUDE.md.template"
+  for _ra_name in $(_stamped_files_in "$_ra_path"); do
+    _ra_cm="$_ra_path/$_ra_name"
     if [ -f "$_ra_cm_template" ]; then
       if grep -q 'clagentic-claude-md-version' "$_ra_cm" 2>/dev/null; then
         # Old fat template — full replace; no user content to preserve.
-        cp "$_ra_cm_template" "$_ra_cm"
+        _restamp_notice_in "$_ra_cm" "$_ra_cm_template" 1
       else
-        _restamp_notice_block "$_ra_cm" "$_ra_cm_template"
+        _restamp_notice_in "$_ra_cm" "$_ra_cm_template"
       fi
-      say "re-stamped${_ra_label}: $_ra_path/CLAUDE.md" >&2
+      say "re-stamped${_ra_label}: $_ra_cm" >&2
       _ra_count=$((_ra_count+1))
     fi
-  fi
+  done
 
   # Re-stamp .clagentic/lite/builder-contract.md — always a full restamp (gitignored,
   # no user content, local only).
@@ -4732,22 +4827,21 @@ _restamp_repo_artifacts() {
 
   # Re-stamp wrapper CLAUDE.md and .claude/settings.json if the parent dir has
   # a .clagentic-project pointer.
-  _ra_wrapper_dir=$(dirname "$_ra_path")
-  _ra_wrapper_ptr="$_ra_wrapper_dir/.clagentic-project"
-  _ra_wrapper_cm="$_ra_wrapper_dir/CLAUDE.md"
-  if [ -f "$_ra_wrapper_ptr" ]; then
-    # Re-stamp wrapper CLAUDE.md only when it is clagentic-managed.
-    if [ -f "$_ra_wrapper_cm" ] && grep -q 'managed-by: clagentic' "$_ra_wrapper_cm" 2>/dev/null; then
-      _ra_wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
+  _ra_wrapper_dir=$(_wrapper_dir_for "$_ra_path" || true)
+  if [ -n "$_ra_wrapper_dir" ]; then
+    _ra_wrapper_ptr="$_ra_wrapper_dir/.clagentic-project"
+    # Re-stamp the wrapper notice only in the file(s) that are clagentic-managed.
+    _ra_wcm_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
+    for _ra_wname in $(_stamped_files_in "$_ra_wrapper_dir"); do
       if [ -f "$_ra_wcm_template" ]; then
         # Re-build the project table from the pointer file.
         _ra_wcm_repos=$(tr '\n' ' ' < "$_ra_wrapper_ptr" 2>/dev/null || true)
-        ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_ra_wrapper_dir" "$_ra_wcm_repos" && {
-          say "re-stamped wrapper${_ra_label}: $_ra_wrapper_cm" >&2
+        ENROLL_FORCE=1 _stamp_wrapper_claude_md "$_ra_wrapper_dir" "$_ra_wcm_repos" "$_ra_wname" && {
+          say "re-stamped wrapper${_ra_label}: $_ra_wrapper_dir/$_ra_wname" >&2
           _ra_count=$((_ra_count+1))
         }
       fi
-    fi
+    done
     # Re-stamp wrapper .claude/settings.json whenever the pointer exists —
     # independent of whether wrapper CLAUDE.md is managed.  Wrappers enrolled
     # before wrapper CLAUDE.md stamping was introduced have no managed CLAUDE.md
@@ -5182,55 +5276,48 @@ cmd_update() {
       _cs_ver=$(claude_settings_version "$_cs_file")
       [ "$_cs_ver" != "$CLAUDE_SETTINGS_VERSION" ] && _need_restamp=1
     fi
-    _cm_file="$_rpath/CLAUDE.md"
-    if [ ! -f "$_cm_file" ]; then
-      # CLAUDE.md entirely absent — restamp unconditionally, except in the
-      # wrapper layout where its absence is by design.
-      _repo_is_wrapper_enrolled "$_rpath" || _need_restamp=1
-    elif ! grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
-      # managed-by marker stripped (user removed the notice). On a TTY, prompt
-      # before re-adding; on non-TTY, warn but do not auto-restamp (user may
-      # have intentionally replaced it). --restamp overrides and restores it.
-      if [ "$RESTAMP" -eq 1 ]; then
-        _need_restamp=1
-      elif [ -t 0 ]; then
-        printf '[clagentic-lite] WARN: %s/CLAUDE.md enrollment notice is missing or was removed.\n' "$_rpath" >&2
-        printf 'Re-add the enrollment notice? [y/N]: '
-        read -r _notice_reply || _notice_reply=""
-        case "$_notice_reply" in
-          y|Y|yes|YES) _need_restamp=1 ;;
-          *) warn "$_rpath: skipping CLAUDE.md notice re-add (run \`clagentic-lite update --restamp\` to restore)" ;;
-        esac
-      else
-        warn "$_rpath: CLAUDE.md enrollment notice missing — run \`clagentic-lite update --restamp\` to restore"
-      fi
+    # The enrollment stamp is satisfied by the marker in CLAUDE.md or AGENTS.md.
+    _cm_stamped=$(_stamped_files_in "$_rpath")
+    if [ -n "$_cm_stamped" ]; then
+      for _cm_name in $_cm_stamped; do
+        _cm_file="$_rpath/$_cm_name"
+        # Support both old marker (clagentic-claude-md-version) and new notice
+        # marker (clagentic-notice-version) so the comparison works during transition.
+        _cm_notice_ver=$(claude_notice_version "$_cm_file")
+        _cm_old_ver=$(claude_md_version "$_cm_file")
+        if [ -n "$_cm_notice_ver" ]; then
+          # New-style notice file.
+          [ "$_cm_notice_ver" != "$CLAUDE_NOTICE_VERSION" ] && _need_restamp=1
+        elif [ -n "$_cm_old_ver" ]; then
+          # Old-style fat file — always restamp to migrate to thin notice.
+          _need_restamp=1
+        fi
+      done
+    elif _repo_is_wrapper_enrolled "$_rpath"; then
+      # Wrapper layout: the stamp belongs to the wrapper and the nested repo's
+      # own CLAUDE.md/AGENTS.md is project-owned. Nothing to say about it.
+      :
+    elif [ -f "$_rpath/CLAUDE.md" ]; then
+      # A project-owned CLAUDE.md without the marker. Neither update nor
+      # --restamp ever edits it, so no command here would add the notice; say
+      # what enroll would do instead, once per run, with no prompt.
+      warn "$_rpath: no enrollment notice — CLAUDE.md is project-owned and is never edited; to have enroll write the notice, delete or rename it and run \`clagentic-lite enroll\` (it writes CLAUDE.md)"
     else
-      # Support both old marker (clagentic-claude-md-version) and new notice
-      # marker (clagentic-notice-version) so the comparison works during transition.
-      _cm_notice_ver=$(claude_notice_version "$_cm_file")
-      _cm_old_ver=$(claude_md_version "$_cm_file")
-      if [ -n "$_cm_notice_ver" ]; then
-        # New-style notice file.
-        [ "$_cm_notice_ver" != "$CLAUDE_NOTICE_VERSION" ] && _need_restamp=1
-      elif [ -n "$_cm_old_ver" ]; then
-        # Old-style fat CLAUDE.md — always restamp to migrate to thin notice.
-        _need_restamp=1
-      fi
+      # No CLAUDE.md and no stamp — restamp the other artifacts as before.
+      _need_restamp=1
     fi
     _contract_file="$_rpath/.clagentic/lite/builder-contract.md"
     if [ -f "$_contract_file" ] && grep -q 'managed-by: clagentic' "$_contract_file" 2>/dev/null; then
       _contract_ver=$(claude_contract_version "$_contract_file")
       [ "$_contract_ver" != "$CLAUDE_CONTRACT_VERSION" ] && _need_restamp=1
     fi
-    _vck_wrapper_dir=$(dirname "$_rpath")
-    _vck_wrapper_ptr="$_vck_wrapper_dir/.clagentic-project"
-    _vck_wrapper_cm="$_vck_wrapper_dir/CLAUDE.md"
-    if [ -f "$_vck_wrapper_ptr" ]; then
-      # Check wrapper CLAUDE.md version only when it is clagentic-managed.
-      if [ -f "$_vck_wrapper_cm" ] && grep -q 'managed-by: clagentic' "$_vck_wrapper_cm" 2>/dev/null; then
-        _wcm_ver=$(claude_wrapper_version "$_vck_wrapper_cm")
+    _vck_wrapper_dir=$(_wrapper_dir_for "$_rpath" || true)
+    if [ -n "$_vck_wrapper_dir" ]; then
+      # Check the wrapper notice version only in files that are clagentic-managed.
+      for _vck_wname in $(_stamped_files_in "$_vck_wrapper_dir"); do
+        _wcm_ver=$(claude_wrapper_version "$_vck_wrapper_dir/$_vck_wname")
         [ "$_wcm_ver" != "$CLAUDE_WRAPPER_VERSION" ] && _need_restamp=1
-      fi
+      done
       # Check wrapper settings.json version independent of wrapper CLAUDE.md —
       # wrappers enrolled before wrapper CLAUDE.md stamping existed have no
       # managed CLAUDE.md but still need hook wiring detected and restamped.
@@ -5260,8 +5347,7 @@ cmd_update() {
     while IFS= read -r _rpath; do
       [ -z "$_rpath" ] && continue
       [ -d "$_rpath" ] || continue
-      [ -f "$_rpath/CLAUDE.md" ] && grep -q 'managed-by: clagentic' "$_rpath/CLAUDE.md" 2>/dev/null && \
-        _managed_count=$((_managed_count+1))
+      [ -n "$(_stamped_files_in "$_rpath")" ] && _managed_count=$((_managed_count+1))
     done < "$REGISTRY"
     if [ "$_managed_count" -gt 0 ]; then
       printf '[clagentic-lite] All %d enrolled repo(s) already at current artifact versions.\n' "$_managed_count"

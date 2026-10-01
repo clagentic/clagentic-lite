@@ -274,8 +274,9 @@ Flags:
 - `clagentic-lite enroll /some/other/path` — enrolls a specific path instead
   (accepts multiple paths at once).
 - `clagentic-lite enroll --force` — re-stamps an already-enrolled repo, or
-  overwrites a pre-existing non-clagentic `CLAUDE.md`/`.claude/settings.json`
-  it would otherwise refuse to touch.
+  overwrites a pre-existing non-clagentic `.claude/settings.json` it would
+  otherwise refuse to touch. It never overwrites a `CLAUDE.md` or `AGENTS.md`
+  that lacks the clagentic marker.
 - `clagentic-lite enroll --self` — the ONLY way to enroll
   `$CLAGENTIC_LITE_HOME` itself (the tool's own checkout). Plain `enroll`
   refuses this on purpose — the tool does not gate itself by default.
@@ -293,8 +294,11 @@ Flags:
    (absolute paths) and is added to `.gitignore` automatically — never commit
    it, and each teammate must run their own `enroll`.
 4. `CLAUDE.md` at the repo root — a thin, committable notice that activates
-   the Builder contract for Claude Code sessions opened in this repo. Refuses
-   to overwrite a pre-existing non-clagentic `CLAUDE.md` unless `--force`.
+   the Builder contract for Claude Code sessions opened in this repo. The
+   stamp counts if the clagentic marker is in either `CLAUDE.md` or
+   `AGENTS.md`; enroll never writes both. A `CLAUDE.md` or `AGENTS.md`
+   without the marker is project-owned and is never overwritten, even with
+   `--force`.
 5. `.clagentic/lite/builder-contract.md` — the full rules/agents/gates
    reference injected at session start. Gitignored, local-only, regenerated
    automatically by `doctor`/`update` when stale — you do not hand-edit it.

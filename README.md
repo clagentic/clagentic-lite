@@ -180,18 +180,18 @@ That gives you the cross-CLI review, the dumb-thing-blocking hooks, session memo
 4. Initializes `.clagentic/lite/audit.db` and `.clagentic/lite/memory.db` in that repo.
 5. Stamps `.git/hooks/pre-commit` and `.git/hooks/pre-push` from `share/hook-shims/*.template`, substituting `$CLAGENTIC_LITE_HOME` at stamp time. Refuses to overwrite non-clagentic hooks unless `--force`.
 6. Generates `.claude/settings.json` (absolute hook paths → `$CLAGENTIC_LITE_HOME`), symlinks `.claude/commands`, and ignores `.claude/` and `.clagentic/lite/` (see "Which project files enroll and update write" below for where). These are local-only artifacts. Role agents and commentary skills are installed globally via the `clagentic-lite` plugin at `init` time — no per-repo copies.
-7. Stamps `CLAUDE.md` at the repo root when none exists — activates the Builder contract and exposes agents for Claude Code auto-dispatch. A `CLAUDE.md` without the `managed-by: clagentic` marker is project-owned and is never overwritten, not even with `--force`.
+7. Stamps `CLAUDE.md` at the repo root when no `CLAUDE.md` or `AGENTS.md` carries the stamp — activates the Builder contract and exposes agents for Claude Code auto-dispatch. The stamp is the `managed-by: clagentic` marker, and it counts in either file; enroll never requires or creates both. A `CLAUDE.md` or `AGENTS.md` without the marker is project-owned and is never overwritten, not even with `--force`. When the repo has an unmanaged `AGENTS.md` and no `CLAUDE.md`, the new `CLAUDE.md` ends with an `@AGENTS.md` import, because Claude Code reads `AGENTS.md` only when no `CLAUDE.md` exists and a plain `CLAUDE.md` would shadow it.
 8. Registers the repo path in `~/.local/state/clagentic/registry`.
 
 #### Which project files enroll and update write
 
 Everything else enroll and update write lives under `.git/` or `.clagentic/lite/` (and `.claude/`, which is ignored). The only files that can be tracked by your project are these two:
 
-| Layout | `.gitignore` | `CLAUDE.md` | Ignore patterns go to |
+| Layout | `.gitignore` | Where the stamp lives (`CLAUDE.md` or `AGENTS.md`) | Ignore patterns go to |
 |---|---|---|---|
-| Regular repo (default) | appended with `.claude/` and `.clagentic/lite/` if absent (created if missing); nothing else in it is touched | stamped when missing; the notice block is refreshed when the file is clagentic-managed; an unmanaged file is never touched | the repo's `.gitignore` |
+| Regular repo (default) | appended with `.claude/` and `.clagentic/lite/` if absent (created if missing); nothing else in it is touched | in the repo: `CLAUDE.md` is stamped when neither file carries the marker; the notice block is refreshed in whichever file carries it (never moved, never duplicated); an unmanaged `CLAUDE.md` or `AGENTS.md` is never touched | the repo's `.gitignore` |
 | Regular repo, `CLAGENTIC_IGNORE_TARGET=exclude` | never touched | same as above | `.git/info/exclude` |
-| Wrapper layout (enrolled through a wrapper directory) | never touched | not created (the wrapper `CLAUDE.md` already carries the rules and Claude Code loads it as an ancestor file); a clagentic-managed one keeps its notice refreshed | `.git/info/exclude` |
+| Wrapper layout (enrolled through a wrapper directory, at any depth) | never touched | in the wrapper: the wrapper `CLAUDE.md` (or the wrapper `AGENTS.md` when that carries the marker) holds the rules and Claude Code loads it as an ancestor file. The nested repo's own `CLAUDE.md`/`AGENTS.md` is project-owned: not created, not reported on by `update` or `doctor`; a clagentic-managed one keeps its notice refreshed | `.git/info/exclude` |
 
 `CLAGENTIC_IGNORE_TARGET` (`gitignore` or `exclude`, in the global config) overrides the per-layout default. To keep a project's tracked files untouched, set it to `exclude`, or enroll through the wrapper layout. A pattern already present in either `.gitignore` or `.git/info/exclude` counts as satisfied, so a pattern you moved to `info/exclude` is never added back to `.gitignore`. The exclude path is resolved with `git rev-parse --git-path`, so linked worktrees and submodules (where `.git` is a file) work. Governance files at the top of `.clagentic/` (`adversarial-acks.json`, `osv-ignore`, `accepted-risks.md`, `config`) stay trackable in every mode.
 
@@ -213,7 +213,7 @@ If you installed an older version, your config may still be at `~/.config/clagen
 
 `.claude/` (hook wiring, command symlinks, `settings.json`) is **local-only** — it is added to `.gitignore` (or `.git/info/exclude`, see above) automatically at enroll time and is never committed. Each teammate who wants clagentic-lite active must run `clagentic-lite enroll` in the repo on their own machine. This is by design: hook paths are absolute and machine-specific; sharing them would break the harness on every machine but the original.
 
-A `CLAUDE.md` that lacks the `managed-by: clagentic` marker is yours: `clagentic-lite enroll --force` leaves it byte-identical and says so. To have enroll stamp the notice instead, delete or rename the file and enroll again.
+A `CLAUDE.md` or `AGENTS.md` that lacks the `managed-by: clagentic` marker is yours: `enroll`, `enroll --force`, `update` and `update --restamp` leave it byte-identical. To have enroll stamp the notice instead, delete or rename the file and enroll again. `doctor` prints one INFO line when the stamp sits in an `AGENTS.md` that has a `CLAUDE.md` beside it: Claude Code does not load `AGENTS.md` by default while a `CLAUDE.md` exists in the same directory.
 
 ### Verify the install
 
