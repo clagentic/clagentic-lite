@@ -303,12 +303,17 @@ except Exception:
       # is no longer what makes suppression correct. See docs/GATES.md
       # "Reviewer-consulted deferrals" for the full schema and the
       # gate-code-vs-prompt-context split.
-      _drp_deferrals_allowlisted=$(_llm_json_array_allowlist_fields "$_drp_deferrals" \
-        id category file message description expires acknowledged_by scope file_sha256)
-      # Strict, fail-closed form: on failure the deferrals are omitted, never
-      # passed on raw (they reach the model and can suppress findings).
-      _drp_deferrals_clean=$(_llm_json_array_sanitize_fields_strict "$_drp_deferrals_allowlisted" \
-        id category file message description expires acknowledged_by scope file_sha256) || _drp_deferrals_failed=1
+      # Both steps fail closed (return 1, no output): on any failure the
+      # deferrals are omitted, never passed on raw or unreduced (they reach the
+      # model and can suppress findings).
+      _drp_deferrals_clean=""
+      if _drp_deferrals_allowlisted=$(_llm_json_array_allowlist_fields "$_drp_deferrals" \
+          id category file message description expires acknowledged_by scope file_sha256); then
+        _drp_deferrals_clean=$(_llm_json_array_sanitize_fields_strict "$_drp_deferrals_allowlisted" \
+          id category file message description expires acknowledged_by scope file_sha256) || _drp_deferrals_failed=1
+      else
+        _drp_deferrals_failed=1
+      fi
     else
       # Not a JSON array at all (malformed deferrals.json) -- the
       # allowlist/sanitize pipeline has nothing to decompose. Run the

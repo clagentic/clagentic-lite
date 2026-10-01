@@ -1126,14 +1126,14 @@ PYEOF
 # JSON array of objects and reduce EVERY object to ONLY the named fields,
 # DROPPING every other key entirely (lr-4f8316 second follow-up). This is
 # the schema-validation step that MUST run before
-# _llm_json_array_sanitize_fields (below) whenever the array's field set is
-# attacker-influenced, not code-controlled -- see that function's own
+# _llm_json_array_sanitize_fields_strict (below) whenever the array's field set
+# is attacker-influenced, not code-controlled -- see that function's own
 # "SAFE ONLY for callers with a closed, code-controlled field set" warning.
 #
 # WHY THIS IS A SEPARATE FUNCTION, NOT A CHANGE TO
-# _llm_json_array_sanitize_fields: the adversarial-findings caller
+# _llm_json_array_sanitize_fields_strict: the adversarial-findings caller
 # (_sanitize_adversarial_findings_json, gates.sh) depends on
-# _llm_json_array_sanitize_fields' CURRENT contract -- pass through every
+# that helper's CURRENT contract -- pass through every
 # field not named in the sanitize call (line/severity/reachable/tier/class
 # survive untouched). That caller is safe leaving those fields alone
 # because _parse_adversarial_findings constructs each finding from named
@@ -1144,7 +1144,7 @@ PYEOF
 # the SIX NAMED schema fields left every other key riding through
 # byte-identical: undefanged, unstripped, uncapped. Same helper, different
 # input model, and that difference is the whole bug (BOBBIE, lr-4f8316
-# third follow-up). Changing _llm_json_array_sanitize_fields to allowlist
+# third follow-up). Changing _llm_json_array_sanitize_fields_strict to allowlist
 # by default would silently break the adversarial-findings caller's
 # reliance on "unnamed fields pass through" -- so the fix is a NEW function
 # callers with an attacker-influenced field set call FIRST, not a change to
@@ -1183,35 +1183,31 @@ PYEOF
 # coerce" fail-closed default applies if one shows up before a suffix for it
 # is added here.
 #
-# Fail-open: a non-array or malformed JSON input, or the complete absence
-# of jq AND python3, returns the ORIGINAL input unchanged -- identical
-# fail-open posture to _llm_json_array_sanitize_fields, so the caller's own
-# fail-open contract (deferrals: absent/empty/malformed does not break
-# review) composes cleanly across both steps.
+# FAIL CLOSED: ANY failure returns 1 and prints NOTHING -- a non-array or
+# malformed input, an empty field list (a caller bug, never "keep nothing"), a
+# temp file that cannot be created, a jq or python3 error, an empty result, or
+# the absence of both JSON tools. It never prints the original input and never
+# a partial array. The input is attacker-influenced and this is the step that
+# strips its extra keys, so handing it back unreduced would let those keys reach
+# a prompt; a caller that cannot reduce the array must degrade (omit the source
+# or mark it unavailable), never use the input. Exit 0 prints the reduced array.
+#
+# The array travels on stdin (jq) or in a temp file (python3), never as an argv
+# string: exec of an argv string over MAX_ARG_STRLEN (~128 KiB) fails with
+# E2BIG, which used to return the input unreduced exactly when it was large.
 #
 # Args: JSON (a JSON array of objects), FIELD1..FIELDN (the CLOSED set of
 # field names this array's schema defines; each is a bare name for
 # string-only, or "name:number" to also accept a JSON number under that key).
-# stdout: the reduced JSON array (or the original JSON, on any failure).
+# stdout: the reduced JSON array (exit 0), nothing (exit 1).
 _llm_json_array_allowlist_fields() {
   _ljaaf_json="$1"
   shift
   _ljaaf_fields="$*"
-  if [ -z "$_ljaaf_fields" ]; then
-    # No fields named at all: every key would be dropped from every
-    # object. That is very likely a caller bug (an empty allowlist is
-    # never a real schema), not an intentional "keep nothing" -- fail open
-    # with the original input rather than silently emptying every object,
-    # matching this function's fail-open posture on every other error path.
-    printf '%s' "$_ljaaf_json"
-    return 0
-  fi
+  [ -n "$_ljaaf_fields" ] || return 1
 
   if command -v jq >/dev/null 2>&1; then
-    if ! printf '%s' "$_ljaaf_json" | jq -e '. | type == "array"' >/dev/null 2>&1; then
-      printf '%s' "$_ljaaf_json"
-      return 0
-    fi
+    printf '%s' "$_ljaaf_json" | jq -e '. | type == "array"' >/dev/null 2>&1 || return 1
     # Build a jq object mapping field-name -> its ONE declared jq type
     # ("string" by default; "number" when the caller suffixed ":number" --
     # a type declaration, not an added alternative), then apply a single
@@ -1229,22 +1225,29 @@ _llm_json_array_allowlist_fields() {
           _ljaaf_type="string"
           ;;
       esac
-      _ljaaf_types_json=$(printf '%s' "$_ljaaf_types_json" | jq -c --arg f "$_ljaaf_name" --arg t "$_ljaaf_type" '. + {($f): $t}' 2>/dev/null)
-      [ -n "$_ljaaf_types_json" ] || { printf '%s' "$_ljaaf_json"; return 0; }
+      _ljaaf_types_json=$(printf '%s' "$_ljaaf_types_json" | jq -c --arg f "$_ljaaf_name" --arg t "$_ljaaf_type" '. + {($f): $t}' 2>/dev/null) || return 1
+      [ -n "$_ljaaf_types_json" ] || return 1
     done
     _ljaaf_out=$(printf '%s' "$_ljaaf_json" | jq -c --argjson types "$_ljaaf_types_json" \
       '[.[] | (if type == "object" then with_entries(select(($types[.key] // null) as $t | $t != null and (.value | type) == $t)) else {} end)]' \
-      2>/dev/null)
-    [ -n "$_ljaaf_out" ] || { printf '%s' "$_ljaaf_json"; return 0; }
+      2>/dev/null) || return 1
+    [ -n "$_ljaaf_out" ] || return 1
     printf '%s' "$_ljaaf_out"
     return 0
   fi
 
   if command -v python3 >/dev/null 2>&1; then
-    _ljaaf_out=$(python3 - "$_ljaaf_json" $_ljaaf_fields <<'PYEOF'
+    _ljaaf_tmp=$(mktemp -t clagentic-llm-allowlist.XXXXXX 2>/dev/null) || return 1
+    [ -n "$_ljaaf_tmp" ] || return 1
+    if ! printf '%s' "$_ljaaf_json" > "$_ljaaf_tmp" 2>/dev/null; then
+      rm -f "$_ljaaf_tmp"
+      return 1
+    fi
+    _ljaaf_rc=0
+    _ljaaf_out=$(python3 - "$_ljaaf_tmp" $_ljaaf_fields <<'PYEOF' 2>/dev/null
 import json, sys
 
-raw = sys.argv[1]
+path = sys.argv[1]
 raw_fields = sys.argv[2:]
 
 # name -> its ONE declared python type set: (str,) by default, or
@@ -1263,12 +1266,12 @@ for f in raw_fields:
         allowed[name] = (str,)
 
 try:
-    arr = json.loads(raw)
-    if not isinstance(arr, list):
-        raise ValueError("not a list")
+    with open(path, "rb") as fh:
+        arr = json.loads(fh.read())
 except Exception:
-    print(raw)
-    sys.exit(0)
+    sys.exit(1)
+if not isinstance(arr, list):
+    sys.exit(1)
 
 reduced = []
 for item in arr:
@@ -1291,15 +1294,16 @@ for item in arr:
 
 print(json.dumps(reduced))
 PYEOF
-)
-    [ -n "$_ljaaf_out" ] || { printf '%s' "$_ljaaf_json"; return 0; }
+) || _ljaaf_rc=1
+    rm -f "$_ljaaf_tmp"
+    [ "$_ljaaf_rc" -eq 0 ] || return 1
+    [ -n "$_ljaaf_out" ] || return 1
     printf '%s' "$_ljaaf_out"
     return 0
   fi
 
-  # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open: same
-  # posture as _llm_json_array_sanitize_fields' own no-JSON-tool path.
-  printf '%s' "$_ljaaf_json"
+  # No JSON tool at all: the array cannot be decomposed, so it cannot be reduced.
+  return 1
 }
 
 # _llm_json_array_sanitize_fields_strict JSON FIELD1 [FIELD2 ...] — decompose

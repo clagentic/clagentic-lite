@@ -4232,6 +4232,27 @@ _extract_findings_json() {
   fi
 }
 
+# _extract_findings_json_strict FILE — like _extract_findings_json, but FAIL
+# CLOSED: a read, parse or tool failure (or no JSON tool at all) returns 1 with
+# no output, never "[]". A FILE with no .findings key is a genuine empty list
+# and prints "[]". Used where "[]" would be written over real findings.
+_extract_findings_json_strict() {
+  _efjs_file="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -c 'if type == "object" then (.findings // []) else error("not an object") end' "$_efjs_file" 2>/dev/null || return 1
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+if not isinstance(d, dict):
+    sys.exit(1)
+print(json.dumps(d.get("findings", [])))' "$_efjs_file" 2>/dev/null || return 1
+    return 0
+  fi
+  return 1
+}
+
 # _sanitize_review_findings_envelope FILE
 #
 # SECURITY (lr-66e598 follow-up, BOBBIE-caught). Reduces FILE's .findings
@@ -4295,15 +4316,19 @@ _extract_findings_json() {
 # updated docstring in platform.sh for the exact contract and why bool is
 # explicitly excluded from the numeric-accepted branch.
 #
-# CONSERVATIVE BIAS, matching every other on-disk-envelope helper in this
-# file: if FILE is missing, unparseable, has no .findings array, or
-# _llm_json_array_allowlist_fields' own fail-open path is hit (no jq/
-# python3), the function makes NO changes and returns 0 -- a strip failure
-# must never turn into "findings vanish" (that would be an over-suppression,
-# the exact failure direction docs/GATES.md:150 forbids) or "findings block
-# on a synthetic error" (severity_blockers' own sentinel-99 path already
-# owns fail-closed for genuinely unparseable JSON; this function's job is
-# narrower than that and must not duplicate or fight it).
+# FAIL CLOSED ON A STRIP FAILURE: a missing FILE is left alone (returns 0). If
+# FILE exists but its findings cannot be read (unparseable, not an object, a
+# tool failure) or the allowlist step or the write-back FAILS, the file still
+# holds the model's raw findings, forged internal fields included, or would
+# have them replaced by an empty list read as "no findings". Neither is left in
+# place: the file is replaced with the degraded-envelope shape the chunk
+# failure path already writes (`degraded: true`, empty findings) plus
+# `sanitize_failed: true`. review_is_degraded then routes it down the
+# INFRA_DEGRADED path, and _sanitize_review_for_prompt reads `sanitize_failed`
+# as "source unavailable" so the Merge Gate gets the unavailable marker and
+# review_degraded, not an empty findings list it could read as "no findings".
+# The replacement is a printf literal, so it needs no JSON tool (the thing that
+# may have failed).
 #
 # ISSUE_CLASS / CLASS_FIX (lr-3eb18c): two additional string fields, same
 # bare-name (string-only) allowlist shape as the original five -- every
@@ -4318,39 +4343,70 @@ _sanitize_review_findings_envelope() {
   _srfe_file="$1"
   [ -f "$_srfe_file" ] || return 0
 
-  _srfe_findings=$(_extract_findings_json "$_srfe_file")
-  [ -n "$_srfe_findings" ] || return 0
+  # Strict read: a tool error here must not become "[]", which the rewrite
+  # below would write over the model's findings as "no findings".
+  if ! _srfe_findings=$(_extract_findings_json_strict "$_srfe_file") || [ -z "$_srfe_findings" ]; then
+    _review_envelope_mark_sanitize_failed "$_srfe_file"
+    return 0
+  fi
 
-  _srfe_clean=$(_llm_json_array_allowlist_fields "$_srfe_findings" \
-    severity file "line:number" category message evidence suggestion \
-    issue_class class_fix)
-  [ -n "$_srfe_clean" ] || return 0
+  if ! _srfe_clean=$(_llm_json_array_allowlist_fields "$_srfe_findings" \
+      severity file "line:number" category message evidence suggestion \
+      issue_class class_fix) || [ -z "$_srfe_clean" ]; then
+    _review_envelope_mark_sanitize_failed "$_srfe_file"
+    return 0
+  fi
 
-  if command -v jq >/dev/null 2>&1; then
-    _srfe_tmp=$(mktemp -t clagentic-srfe-env.XXXXXX)
-    if jq --argjson nf "$_srfe_clean" '.findings = $nf' "$_srfe_file" > "$_srfe_tmp" 2>/dev/null; then
-      mv "$_srfe_tmp" "$_srfe_file"
-    else
-      rm -f "$_srfe_tmp"
-    fi
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 - "$_srfe_file" "$_srfe_clean" <<'PYEOF' 2>/dev/null
+  # The reduced array reaches the rewrite through a temp file, not argv: a
+  # string over MAX_ARG_STRLEN (~128 KiB) fails exec.
+  _srfe_clean_file=$(mktemp -t clagentic-srfe-clean.XXXXXX 2>/dev/null) || _srfe_clean_file=""
+  _srfe_tmp=$(mktemp -t clagentic-srfe-env.XXXXXX 2>/dev/null) || _srfe_tmp=""
+  _srfe_ok=0
+  if [ -n "$_srfe_clean_file" ] && [ -n "$_srfe_tmp" ] \
+      && printf '%s' "$_srfe_clean" > "$_srfe_clean_file" 2>/dev/null; then
+    if command -v jq >/dev/null 2>&1; then
+      if jq --slurpfile nf "$_srfe_clean_file" '.findings = $nf[0]' "$_srfe_file" > "$_srfe_tmp" 2>/dev/null \
+          && [ -s "$_srfe_tmp" ]; then
+        _srfe_ok=1
+      fi
+    elif command -v python3 >/dev/null 2>&1; then
+      if python3 - "$_srfe_file" "$_srfe_clean_file" "$_srfe_tmp" <<'PYEOF' 2>/dev/null
 import json, sys
-env_path, clean_json = sys.argv[1], sys.argv[2]
+env_path, clean_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     with open(env_path) as f:
         env = json.load(f)
-    clean = json.loads(clean_json)
+    with open(clean_path) as f:
+        clean = json.load(f)
     if not isinstance(clean, list):
         raise ValueError("not a list")
     env["findings"] = clean
-    with open(env_path, "w") as f:
+    with open(out_path, "w") as f:
         json.dump(env, f)
 except Exception:
     sys.exit(1)
 PYEOF
+      then
+        [ -s "$_srfe_tmp" ] && _srfe_ok=1
+      fi
+    fi
   fi
+  if [ "$_srfe_ok" -eq 1 ] && mv "$_srfe_tmp" "$_srfe_file" 2>/dev/null; then
+    rm -f "$_srfe_clean_file"
+    return 0
+  fi
+  rm -f "$_srfe_clean_file" "$_srfe_tmp"
+  _review_envelope_mark_sanitize_failed "$_srfe_file"
   return 0
+}
+
+# _review_envelope_mark_sanitize_failed FILE — replace FILE with the degraded
+# envelope that says its findings could not be reduced to the closed schema.
+# Used when the raw model findings are still in FILE and cannot be cleaned.
+# The write is a printf literal so it works with no JSON tool.
+_review_envelope_mark_sanitize_failed() {
+  printf '%s\n' '{"degraded": true, "sanitize_failed": true, "summary": "[clagentic-lite degraded] review findings could not be sanitized", "checked": [], "findings": []}' > "$1" 2>/dev/null || :
+  printf '[gates/review] review findings could not be reduced to the closed schema; marked the envelope degraded\n' 1>&2
 }
 
 # _invariant_feed_max_lines — line cap on invariants.json entries. Guards
@@ -6553,6 +6609,10 @@ _sanitize_review_for_prompt() {
   _srp_keep_keys="severity file line category message evidence suggestion issue_class class_fix _recurrence_demoted _recurrence_count _deferral_matched _deferral_id"
   if command -v jq >/dev/null 2>&1; then
     jq -e 'type == "object"' "$_srp_file" >/dev/null 2>&1 || return 1
+    # Ingest could not reduce the findings to the closed schema and replaced
+    # the file with a degraded stub (_review_envelope_mark_sanitize_failed):
+    # its empty findings list is not "no findings".
+    jq -e '.sanitize_failed != true' "$_srp_file" >/dev/null 2>&1 || return 1
     _srp_findings=$(jq -c --arg keys "$_srp_keep_keys" '
       ($keys | split(" ")) as $keep
       | (.findings // []) | if type == "array" then . else [] end
@@ -6592,7 +6652,9 @@ if not isinstance(d, dict):
     sys.exit(1)
 mode = sys.argv[2]
 if mode == "isobj":
-    sys.exit(0)
+    # A sanitize_failed stub (_review_envelope_mark_sanitize_failed) is a
+    # failure like a non-object: its empty findings list is not "no findings".
+    sys.exit(1 if d.get("sanitize_failed") is True else 0)
 if mode == "findings":
     v = d.get("findings")
     keep = sys.argv[3].split(" ")
