@@ -332,6 +332,87 @@ class TestSanitizeHelperLargeArrays(_Base):
                 self.assertEqual(out[0]["blob"], blob)
 
 
+class TestExtractFindingsStrictContract(_Base):
+    """_extract_findings_json_strict has one contract in both JSON-tool
+    branches: key absent -> [], key an array -> that array, key present as
+    anything else -> rc 1 with no output (the caller degrades). The jq branch
+    used `.findings // []`, which turned a present null into [] (read as a
+    clean review) while the python3 branch returned null."""
+
+    def _extract(self, raw_text, path_override=None):
+        path = os.path.join(self._tmpdir, "env.json")
+        with open(path, "w") as f:
+            f.write(raw_text)
+        script = f". '{GATES_SH}'\n_extract_findings_json_strict '{path}'\n"
+        env = os.environ.copy()
+        env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
+        env.update(source_env(gates=True))
+        if path_override is not None:
+            env["PATH"] = path_override
+        return subprocess.run(
+            ["sh", "-c", script, GATES_SH], capture_output=True, text=True,
+            env=env, cwd=os.path.join(TOOL_HOME, "scripts"),
+        )
+
+    def _branches(self):
+        return (("jq", None), ("python3", self._nojq_bin))
+
+    def test_absent_key_is_empty_list(self):
+        for label, override in self._branches():
+            with self.subTest(branch=label):
+                r = self._extract('{"summary": "s"}', override)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(json.loads(r.stdout), [])
+
+    def test_array_is_returned(self):
+        for label, override in self._branches():
+            with self.subTest(branch=label):
+                r = self._extract('{"findings": [{"message": "m"}]}', override)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(json.loads(r.stdout), [{"message": "m"}])
+
+    def test_present_non_array_fails_with_no_output(self):
+        for raw in ('{"findings": null}', '{"findings": {}}',
+                    '{"findings": "x"}', '{"findings": 3}'):
+            for label, override in self._branches():
+                with self.subTest(branch=label, raw=raw):
+                    r = self._extract(raw, override)
+                    self.assertEqual(r.returncode, 1, r.stdout)
+                    self.assertEqual(r.stdout, "")
+
+    def test_branches_agree_on_every_shape(self):
+        for raw in ('{"summary": "s"}', '{"findings": []}', '{"findings": null}',
+                    '{"findings": {}}', '[1]'):
+            jq_r, py_r = (self._extract(raw, o) for _, o in self._branches())
+            self.assertEqual((jq_r.returncode, jq_r.stdout),
+                             (py_r.returncode, py_r.stdout), raw)
+
+    def test_null_findings_envelope_is_marked_sanitize_failed_at_ingest(self):
+        """The ingest choke point must degrade a present-but-null findings key
+        (flag sanitize_failed, which the payload build reads as unavailable)
+        rather than rewrite it as a clean empty list."""
+        path = os.path.join(self._lite, "last-review.json")
+        for label, override in self._branches():
+            for raw in ('{"summary": "s", "findings": null}',
+                        '{"summary": "s", "findings": {}}'):
+                with self.subTest(branch=label, raw=raw):
+                    with open(path, "w") as f:
+                        f.write(raw)
+                    script = f". '{GATES_SH}'\n_sanitize_review_findings_envelope '{path}'\n"
+                    env = os.environ.copy()
+                    env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
+                    env.update(source_env(gates=True))
+                    if override is not None:
+                        env["PATH"] = override
+                    r = subprocess.run(
+                        ["sh", "-c", script, GATES_SH], capture_output=True,
+                        text=True, env=env, cwd=os.path.join(TOOL_HOME, "scripts"),
+                    )
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    with open(path) as f:
+                        self.assertIs(json.load(f).get("sanitize_failed"), True)
+
+
 class TestBranchParity(_Base):
     def test_new_fields_byte_identical_across_emitter_branches(self):
         self._write_review(HOSTILE_REVIEW)

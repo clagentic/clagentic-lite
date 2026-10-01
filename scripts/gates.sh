@@ -4234,12 +4234,17 @@ _extract_findings_json() {
 
 # _extract_findings_json_strict FILE — like _extract_findings_json, but FAIL
 # CLOSED: a read, parse or tool failure (or no JSON tool at all) returns 1 with
-# no output, never "[]". A FILE with no .findings key is a genuine empty list
-# and prints "[]". Used where "[]" would be written over real findings.
+# no output, never "[]". Both branches share one contract: an ABSENT .findings
+# key is a genuine empty list and prints "[]"; a present array prints that
+# array; a present non-array (null, object, string, number) returns 1, because
+# a present-but-null key must not be read as a clean review. Used where "[]"
+# would be written over real findings.
 _extract_findings_json_strict() {
   _efjs_file="$1"
   if command -v jq >/dev/null 2>&1; then
-    jq -c 'if type == "object" then (.findings // []) else error("not an object") end' "$_efjs_file" 2>/dev/null || return 1
+    jq -c 'if type != "object" then error("not an object")
+           elif has("findings") then (.findings | if type == "array" then . else error("findings not an array") end)
+           else [] end' "$_efjs_file" 2>/dev/null || return 1
     return 0
   fi
   if command -v python3 >/dev/null 2>&1; then
@@ -4247,7 +4252,10 @@ _extract_findings_json_strict() {
 d = json.load(open(sys.argv[1]))
 if not isinstance(d, dict):
     sys.exit(1)
-print(json.dumps(d.get("findings", [])))' "$_efjs_file" 2>/dev/null || return 1
+f = d["findings"] if "findings" in d else []
+if not isinstance(f, list):
+    sys.exit(1)
+print(json.dumps(f))' "$_efjs_file" 2>/dev/null || return 1
     return 0
   fi
   return 1
