@@ -286,8 +286,9 @@ class TestUnmanagedFilesNeverOverwritten(_StampBase):
         rc, _o, err = self.run_cli(["enroll", self.repo], cwd=self.repo)
         self.assertEqual(rc, 0, err)
         os.remove(os.path.join(self.repo, "CLAUDE.md"))
-        _rc, out, _err = self.run_doctor(self.tmpdir, self.repo)
-        lines = [l for l in self.lines_about(out, self.repo) if "no enrollment notice" in l]
+        canonical = os.path.realpath(self.repo)
+        _rc, out, _err = self.run_doctor(self.tmpdir, canonical)
+        lines = [l for l in self.lines_about(out, canonical) if "no enrollment notice" in l]
         self.assertEqual(len(lines), 1, out)
         self.assertIn("writes CLAUDE.md", lines[0])
 
@@ -501,6 +502,114 @@ class TestRepoLevelAgentsImportTracksAgentsMd(_StampBase):
         rc, _o, err = self.run_cli(["enroll", "--force", self.repo], cwd=self.repo)
         self.assertEqual(rc, 0, err)
         self.assertEqual(self._imports(), 0)
+
+
+ABOVE = b"# Team notes\n\nwritten above the stamp\n\n"
+BELOW = b"\n## Local notes\n\nwritten below the stamp\n"
+
+
+class TestWrapperRestampKeepsProjectContent(_StampBase):
+    """Only the generated region of a managed wrapper file is rewritten; content
+    above or below it survives every command that restamps, and the generated
+    import lines are replaced rather than duplicated."""
+
+    def _wrapper(self, stamp_file):
+        self.wrapper = os.path.join(self.tmpdir, "wrapper")
+        self.nested = os.path.join(self.wrapper, "proj")
+        os.makedirs(self.wrapper)
+        _init_repo(self.nested)
+        _write(os.path.join(self.nested, "AGENTS.md"), PROJECT_OWNED)
+        self.enroll_wrapper(self.wrapper)
+        self.stamped = os.path.join(self.wrapper, stamp_file)
+        claude = os.path.join(self.wrapper, "CLAUDE.md")
+        if stamp_file == "AGENTS.md":
+            body = _read(claude).replace(b"# CLAUDE.md\n", b"# AGENTS.md\n", 1)
+            _write(self.stamped, body)
+            os.remove(claude)
+        _write(self.stamped, ABOVE + _read(self.stamped) + BELOW)
+
+    def _assert_preserved(self, step):
+        body = _read(self.stamped)
+        self.assertTrue(body.startswith(ABOVE), step)
+        self.assertTrue(body.endswith(BELOW), step)
+        self.assertEqual(body.count(MARKER), 1, step)
+        self.assertEqual(body.count(b"@proj/AGENTS.md"),
+                         1 if self.stamped.endswith("CLAUDE.md") else 0, step)
+        self.assertEqual(body.count(b"## Enrolled projects"), 1, step)
+
+    def _stale(self):
+        _write(self.stamped, _read(self.stamped).replace(
+            b"clagentic-wrapper-version: v2", b"clagentic-wrapper-version: v1"))
+
+    def _check(self, stamp_file):
+        self._wrapper(stamp_file)
+        rc, out, err = self.update(self.nested, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+        self._assert_preserved("update --restamp")
+
+        self._stale()
+        rc, out, err = self.update(self.nested)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(b"clagentic-wrapper-version: v2", _read(self.stamped))
+        self._assert_preserved("update")
+
+        rc, out, err = self.run_cli_tty(["enroll", "--force", self.wrapper], cwd=self.wrapper)
+        self.assertEqual(rc, 0, out + err)
+        self._assert_preserved("enroll --force")
+
+        # A pointer change: a second repo joins the wrapper. The pointer is
+        # edited directly because enrolling several repos in one prompt
+        # depends on directory order.
+        other = os.path.join(self.wrapper, "other")
+        _init_repo(other)
+        with open(os.path.join(self.wrapper, ".clagentic-project"), "a") as ptr:
+            ptr.write(os.path.realpath(other) + "\n")
+        rc, out, err = self.update(self.nested, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+        self._assert_preserved("restamp after a pointer change")
+        self.assertIn(b"`other`", _read(self.stamped))
+        self.assertEqual(os.path.exists(os.path.join(self.wrapper, "CLAUDE.md")),
+                         stamp_file == "CLAUDE.md")
+
+    def test_claude_md(self):
+        self._check("CLAUDE.md")
+
+    def test_agents_md(self):
+        self._check("AGENTS.md")
+
+    def test_wrapper_agents_md_gets_no_nested_imports(self):
+        self._wrapper("AGENTS.md")
+        rc, out, err = self.update(self.nested, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn(b"@proj/AGENTS.md", _read(self.stamped))
+        self.assertFalse(os.path.exists(os.path.join(self.wrapper, "CLAUDE.md")))
+
+    def test_file_with_nothing_around_the_region_is_stable(self):
+        wrapper = os.path.join(self.tmpdir, "wrapper")
+        nested = os.path.join(wrapper, "proj")
+        os.makedirs(wrapper)
+        _init_repo(nested)
+        _write(os.path.join(wrapper, "AGENTS.md"), PROJECT_OWNED)
+        _write(os.path.join(nested, "AGENTS.md"), PROJECT_OWNED)
+        self.enroll_wrapper(wrapper)
+        claude = os.path.join(wrapper, "CLAUDE.md")
+        first = _read(claude)
+        self.assertTrue(first.endswith(b"\n@AGENTS.md\n\n@proj/AGENTS.md\n"), first)
+        # The table's status column changes once the nested hooks exist, so the
+        # snapshot is taken after one restamp.
+        rc, out, err = self.update(nested, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+        settled = _read(claude)
+        self.assertTrue(settled.endswith(b"\n@AGENTS.md\n\n@proj/AGENTS.md\n"), settled)
+        rc, out, err = self.update(nested, "--restamp")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(_read(claude), settled)
+
+    def test_template_tail_still_matches_the_region_anchor(self):
+        path = os.path.join(self.tool_home, "share", "hook-shims",
+                            "CLAUDE.md.wrapper.template")
+        lines = [l for l in _read(path).splitlines() if l.strip()]
+        self.assertEqual(lines[-2:], [b"clagentic-lite show memory [N]", b"```"])
 
 
 if __name__ == "__main__":

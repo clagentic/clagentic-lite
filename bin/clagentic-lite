@@ -2079,6 +2079,46 @@ _install_clagentic_lite_plugin() {
   fi
 }
 
+# _template_retitled TEMPLATE NAME
+# Prints TEMPLATE with its "# CLAUDE.md" heading renamed to "# NAME", so a stamp
+# living in AGENTS.md reads as AGENTS.md. Shared by the repo and wrapper stamps.
+_template_retitled() {
+  sed "1s/^# CLAUDE\\.md\$/# $2/" "$1"
+}
+
+# _wrapper_above_region FILE
+# Prints what precedes the generated region of a managed wrapper FILE. The
+# region starts at the template's heading, the line right above the managed-by
+# comment. Returns 1 when that comment is not found.
+_wrapper_above_region() {
+  awk '
+    /^<!-- managed-by: clagentic/ { found = 1; exit }
+    { if (have) print prev; prev = $0; have = 1 }
+    END { exit (!found) }
+  ' "$1"
+}
+
+# _wrapper_outside_region FILE
+# Prints what follows the generated region of a managed wrapper FILE, and
+# returns 1 when the region end is not found. The region ends at the closing
+# fence of the wrapper template's last code block (anchored on the template's
+# final command line), plus any blank-separated lines of the form
+# "@<path>AGENTS.md" the tool generated after it. Keep the anchor in step with
+# the template's tail (a test pins it).
+_wrapper_outside_region() {
+  awk '
+    state == 0 { if ($0 == "clagentic-lite show memory [N]") state = 1; next }
+    state == 1 { if ($0 == "```") state = 2; else state = 0; next }
+    state == 2 {
+      if ($0 ~ /^@.*AGENTS\.md$/) { pending = ""; next }
+      if ($0 == "") { pending = pending "\n"; next }
+      printf "%s", pending; pending = ""; print; state = 3; next
+    }
+    state == 3 { print }
+    END { if (state == 2) printf "%s", pending; exit (state < 2) }
+  ' "$1"
+}
+
 # Stamp a wrapper-flavored CLAUDE.md into a non-git wrapper directory.
 # Args: WRAPPER_DIR  ENROLLED_REPOS (space-separated absolute paths)
 # Note: Claude Code lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse,
@@ -2093,6 +2133,12 @@ _install_clagentic_lite_plugin() {
 # overwritten, not even with ENROLL_FORCE=1. When a new CLAUDE.md is created
 # beside an unmanaged AGENTS.md, it carries an @AGENTS.md import so the
 # project's AGENTS.md keeps loading instead of being shadowed.
+#
+# Only the generated region is rewritten: the template render plus the
+# generated @-import lines that follow it. Anything after the region is
+# project-owned content (in CLAUDE.md or AGENTS.md alike) and is carried over
+# byte for byte. A file whose region end cannot be found (an older layout) is
+# regenerated whole, as it always was.
 _stamp_wrapper_claude_md() {
   _wcd="$1"; _wcd_repos="$2"; _wcd_name="${3:-}"
   _wcd_template="$SHARE_DIR/hook-shims/CLAUDE.md.wrapper.template"
@@ -2115,15 +2161,29 @@ _stamp_wrapper_claude_md() {
     _wcd_import=1
   fi
 
+  # Content around the generated region is project-owned: capture it before
+  # the target is rewritten. Empty when the file is new or its region is not
+  # recognised (then the whole file is regenerated).
+  _wcd_scratch=$(mktemp -d "${TMPDIR:-/tmp}/clagentic-wrapper.XXXXXX") || return 1
+  _wcd_above="$_wcd_scratch/above"
+  _wcd_outside="$_wcd_scratch/outside"
+  _wcd_region="$_wcd_scratch/region"
+  _wcd_titled="$_wcd_scratch/titled"
+  : > "$_wcd_above"; : > "$_wcd_outside"
+  if [ -f "$_wcd_target" ]; then
+    if ! { _wrapper_above_region "$_wcd_target" > "$_wcd_above" \
+           && _wrapper_outside_region "$_wcd_target" > "$_wcd_outside"; }; then
+      : > "$_wcd_above"; : > "$_wcd_outside"
+    fi
+  fi
+  _template_retitled "$_wcd_template" "$_wcd_name" > "$_wcd_titled"
+
   # Generate the file directly — multiline table substitution via sed is
   # fragile (newlines, special chars in paths). Read template line by line;
   # replace the token line with the generated table.
   {
     while IFS= read -r _tmpl_line; do
       case "$_tmpl_line" in
-        '# CLAUDE.md')
-          printf '# %s\n' "$_wcd_name"
-          ;;
         *__WRAPPER_PROJECT_TABLE__*)
           # Include last-gate-run column when sqlite3 is available (best-effort).
           if command -v sqlite3 >/dev/null 2>&1; then
@@ -2171,7 +2231,7 @@ _stamp_wrapper_claude_md() {
           printf '%s\n' "$_tmpl_line"
           ;;
       esac
-    done < "$_wcd_template"
+    done < "$_wcd_titled"
     if [ "$_wcd_import" -eq 1 ]; then
       printf '\n@AGENTS.md\n'
     fi
@@ -2179,7 +2239,10 @@ _stamp_wrapper_claude_md() {
       _wcd_nested=$(_wrapper_nested_imports "$_wcd")
       [ -z "$_wcd_nested" ] || printf '\n%s\n' "$_wcd_nested"
     fi
-  } > "$_wcd_target"
+  } > "$_wcd_region"
+  cat "$_wcd_above" "$_wcd_region" "$_wcd_outside" > "$_wcd_target"
+  rm -f "$_wcd_above" "$_wcd_outside" "$_wcd_region" "$_wcd_titled"
+  rmdir "$_wcd_scratch" 2>/dev/null || true
   say "stamped wrapper $_wcd_name: $_wcd_target" >&2
 }
 
@@ -3207,7 +3270,7 @@ _restamp_notice_in() {
   _rni_file="$1"; _rni_template="$2"; _rni_full="${3:-0}"
   _rni_name=$(basename "$_rni_file")
   _rni_tmp=$(mktemp "${TMPDIR:-/tmp}/clagentic-notice.XXXXXX") || return 1
-  sed "1s/^# CLAUDE\\.md\$/# $_rni_name/" "$_rni_template" > "$_rni_tmp"
+  _template_retitled "$_rni_template" "$_rni_name" > "$_rni_tmp"
   if [ "$_rni_full" = "1" ]; then
     cp "$_rni_tmp" "$_rni_file"
   else
@@ -4751,10 +4814,11 @@ cmd_rotate() {
       _rot_stale=$((_rot_stale+1))
     fi
 
-    # Wrapper .claude/settings.json, if this repo has a .clagentic-project
-    # parent — same credential, same rotation obligation, not counted as a
-    # SECOND registry member (it is derived from this one's parent dir, the
-    # same relationship cmd_doctor's own wrapper-pointer check (§7) uses).
+    # Wrapper .claude/settings.json, if this repo is enrolled through a wrapper
+    # (a .clagentic-project pointer at any ancestor level) — same credential,
+    # same rotation obligation, not counted as a SECOND registry member (it is
+    # derived from the repo's wrapper, the same relationship cmd_doctor's own
+    # wrapper-pointer check (§7) uses).
     _rot_wrapper_dir=$(_wrapper_dir_for "$_rot_path" || true)
     if [ -n "$_rot_wrapper_dir" ] && [ -f "$_rot_wrapper_dir/.claude/settings.json" ]; then
       if ENROLL_FORCE=1 _stamp_wrapper_settings "$_rot_wrapper_dir"; then
