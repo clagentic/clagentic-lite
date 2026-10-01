@@ -302,7 +302,7 @@ CLAGENTIC_SECURITY_TOOLS="gitleaks semgrep osv-scanner"
 # _config_missing_keys helpers; neither depends on this constant. Bump on any
 # structural change to config.example's key set (add/remove/rename a key) —
 # content-only comment edits do not require a bump.
-CONFIG_SCHEMA_VERSION="v3"
+CONFIG_SCHEMA_VERSION="v4"
 
 say()  { printf '[clagentic-lite] %s\n' "$*"; }
 warn() { printf '[clagentic-lite] WARN: %s\n' "$*" 1>&2; }
@@ -3046,6 +3046,12 @@ cmd_enroll() {
 # Appends REPO_PATH to WRAPPER_DIR/.clagentic-project, stamps wrapper CLAUDE.md,
 # stamps wrapper .claude/settings.json so lifecycle hooks fire from wrapper CWD,
 # then enrolls the repo.
+#
+# The pointer written here is also what every later layout decision keys off
+# (_repo_is_wrapper_enrolled): a wrapper-enrolled repo gets its ignore
+# patterns in .git/info/exclude and no CLAUDE.md of its own, because the
+# wrapper CLAUDE.md already carries the rules and Claude Code loads it as an
+# ancestor file. The pointer is written BEFORE _enroll_one runs for that reason.
 _register_wrapper_repo() {
   _rwr_wrapper="$1"
   _rwr_repo="$2"
@@ -3053,6 +3059,98 @@ _register_wrapper_repo() {
   _stamp_wrapper_claude_md "$_rwr_wrapper" "$_rwr_repo"
   _stamp_wrapper_settings "$_rwr_wrapper"
   _enroll_one "$_rwr_repo"
+}
+
+# _repo_is_wrapper_enrolled REPO
+# True when REPO's parent directory holds a .clagentic-project pointer that
+# lists REPO. Membership, not mere existence: an unrelated repo that happens
+# to sit beside a pointer file is not wrapper-enrolled.
+_repo_is_wrapper_enrolled() {
+  _rwe_ptr="$(dirname "$1")/.clagentic-project"
+  [ -f "$_rwe_ptr" ] || return 1
+  grep -qxF "$1" "$_rwe_ptr" 2>/dev/null
+}
+
+# _repo_exclude_file REPO
+# Prints the absolute path of REPO's info/exclude. Asks git rather than
+# building REPO/.git/info/exclude by hand: in a linked worktree or a
+# submodule .git is a FILE, and info/exclude lives in the common/modules dir.
+# git prints the path relative to REPO when it is not absolute, so it is
+# resolved against REPO, never the process cwd.
+_repo_exclude_file() {
+  _ref_p=$(git -C "$1" rev-parse --git-path info/exclude 2>/dev/null) || return 1
+  [ -n "$_ref_p" ] || return 1
+  case "$_ref_p" in
+    /*) printf '%s\n' "$_ref_p" ;;
+    *)  printf '%s/%s\n' "$1" "$_ref_p" ;;
+  esac
+}
+
+# _ignore_target REPO
+# Prints "gitignore" or "exclude": where enroll/update write harness ignore
+# patterns for REPO. CLAGENTIC_IGNORE_TARGET wins when valid; unset means the
+# layout default (exclude for a wrapper-enrolled repo, gitignore otherwise).
+_ignore_target() {
+  case "${CLAGENTIC_IGNORE_TARGET:-}" in
+    gitignore|exclude) printf '%s\n' "$CLAGENTIC_IGNORE_TARGET"; return 0 ;;
+    '') : ;;
+    *) warn "CLAGENTIC_IGNORE_TARGET must be gitignore or exclude; ignoring invalid value and using the layout default" ;;
+  esac
+  if _repo_is_wrapper_enrolled "$1"; then
+    printf 'exclude\n'
+  else
+    printf 'gitignore\n'
+  fi
+}
+
+# _ignore_pattern_present REPO PATTERN
+# True when PATTERN is already a line of REPO's .gitignore or info/exclude.
+# Either location satisfies it, so a pattern an operator moved to
+# info/exclude is never re-added to the tracked .gitignore.
+_ignore_pattern_present() {
+  grep -qxF "$2" "$1/.gitignore" 2>/dev/null && return 0
+  _ipp_ex=$(_repo_exclude_file "$1") || return 1
+  grep -qxF "$2" "$_ipp_ex" 2>/dev/null
+}
+
+# _append_ignore_line FILE LINE
+# Appends LINE, first terminating an unterminated last line so the new
+# pattern is never glued onto the user's final one.
+_append_ignore_line() {
+  if [ -s "$1" ] && [ -n "$(tail -c 1 "$1" 2>/dev/null)" ]; then
+    printf '\n' >> "$1"
+  fi
+  printf '%s\n' "$2" >> "$1"
+}
+
+# _ensure_ignore_patterns REPO PATTERN...
+# Idempotently adds each PATTERN to the target chosen by _ignore_target.
+# Nothing else in the file is touched. Governance files at .clagentic/ top
+# level are never matched by these patterns (the blanket is .clagentic/lite/).
+_ensure_ignore_patterns() {
+  _eip_repo="$1"; shift
+  _eip_target=$(_ignore_target "$_eip_repo")
+  if [ "$_eip_target" = "exclude" ]; then
+    _eip_file=$(_repo_exclude_file "$_eip_repo") \
+      || { warn "cannot resolve info/exclude for $_eip_repo — not writing ignore patterns"; return 0; }
+    mkdir -p "$(dirname "$_eip_file")" \
+      || { warn "cannot create $(dirname "$_eip_file") — not writing ignore patterns"; return 0; }
+  else
+    _eip_file="$_eip_repo/.gitignore"
+  fi
+  for _eip_pat in "$@"; do
+    if _ignore_pattern_present "$_eip_repo" "$_eip_pat"; then
+      continue
+    fi
+    # A blanket .clagentic/ line already covers .clagentic/lite/; say so
+    # instead of adding a redundant line, since it also hides governance files.
+    if [ "$_eip_pat" = ".clagentic/lite/" ] && _ignore_pattern_present "$_eip_repo" ".clagentic/"; then
+      say "note: $_eip_repo ignores the blanket .clagentic/ — governance files (adversarial-acks.json, osv-ignore, accepted-risks.md) may be untrackable; consider replacing with .clagentic/lite/"
+      continue
+    fi
+    _append_ignore_line "$_eip_file" "$_eip_pat"
+    say "added $_eip_pat to $_eip_file"
+  done
 }
 
 _enroll_one() {
@@ -3299,15 +3397,20 @@ _enroll_one() {
         # the same path update uses; a bare cp would destroy the user's block.
         _restamp_notice_block "$_claude_md_target" "$_claude_md_template"
         say "re-stamped CLAUDE.md (preserved project-owned content): $_claude_md_target"
-      elif [ "${ENROLL_FORCE:-0}" = "1" ]; then
-        # Not clagentic-managed + --force: full overwrite.  No project-owned
-        # block to preserve (clagentic never wrote one here before).
-        warn "overwriting existing non-clagentic CLAUDE.md (--force)"
-        cp "$_claude_md_template" "$_claude_md_target"
-        say "stamped CLAUDE.md: $_claude_md_target"
       else
-        warn "existing CLAUDE.md in $_canon is not clagentic-managed — skipping (use --force to overwrite)"
+        # Not clagentic-managed: project-owned content. Never overwritten,
+        # not even with --force; the operator decides what happens to it.
+        if [ "${ENROLL_FORCE:-0}" = "1" ]; then
+          warn "existing CLAUDE.md in $_canon is not clagentic-managed — --force does not overwrite it. To have enroll stamp the notice, delete or rename that file and run enroll again"
+        else
+          warn "existing CLAUDE.md in $_canon is not clagentic-managed — leaving it untouched"
+        fi
       fi
+    elif _repo_is_wrapper_enrolled "$_canon"; then
+      # Wrapper layout: the wrapper CLAUDE.md already carries the rules and
+      # Claude Code loads it as an ancestor file, so the nested repo's tracked
+      # tree stays untouched.
+      say "wrapper layout: not creating CLAUDE.md in $_canon (the wrapper CLAUDE.md applies)"
     else
       # No existing file — plain stamp.
       cp "$_claude_md_template" "$_claude_md_target"
@@ -3334,34 +3437,13 @@ _enroll_one() {
     warn "builder-contract.template missing — skipping builder contract stamp"
   fi
 
-  # Add .claude/ to .gitignore (fully tool-generated, never committed).
-  # For .clagentic/, ignore the entire lite/ subdir (all ephemeral tool-state).
-  # Governance files (adversarial-acks.json, osv-ignore, accepted-risks.md, config)
-  # live at .clagentic/ top level and are unaffected by the .clagentic/lite/ blanket.
-  # Each pattern is idempotent: skipped if already present.
-  _gitignore="$_canon/.gitignore"
-  # Single blanket pattern for all ephemeral state under .clagentic/lite/.
-  _clagentic_ignores='.clagentic/lite/'
-  if [ ! -f "$_gitignore" ]; then
-    printf '.claude/\n' > "$_gitignore"
-    printf '%s\n' "$_clagentic_ignores" >> "$_gitignore"
-    say "created $_gitignore with .claude/ and .clagentic/lite/ patterns"
-  else
-    if ! grep -qxF '.claude/' "$_gitignore" 2>/dev/null; then
-      printf '.claude/\n' >> "$_gitignore"
-      say "added .claude/ to $_gitignore"
-    fi
-    # If a prior enrollment wrote the blanket .clagentic/ line, note it so the
-    # user knows governance files may be untrackable under that broad pattern.
-    if grep -qxF '.clagentic/' "$_gitignore" 2>/dev/null; then
-      say "note: $_gitignore has blanket .clagentic/ — governance files (adversarial-acks.json, osv-ignore, accepted-risks.md) may be untrackable; consider replacing with .clagentic/lite/"
-    else
-      if ! grep -qxF "$_clagentic_ignores" "$_gitignore" 2>/dev/null; then
-        printf '%s\n' "$_clagentic_ignores" >> "$_gitignore"
-        say "added .clagentic/lite/ to $_gitignore"
-      fi
-    fi
-  fi
+  # Ignore .claude/ (fully tool-generated) and the whole .clagentic/lite/
+  # subdir (all ephemeral tool-state). Governance files (adversarial-acks.json,
+  # osv-ignore, accepted-risks.md, config) live at .clagentic/ top level and
+  # are unaffected by the .clagentic/lite/ blanket. Where the patterns go
+  # (tracked .gitignore vs .git/info/exclude) and the idempotency rules are in
+  # _ensure_ignore_patterns / _ignore_target.
+  _ensure_ignore_patterns "$_canon" '.claude/' '.clagentic/lite/'
   # Migration warning: detect tracked .clagentic/lite/ files that should be ephemeral.
   # These cause perpetual dirty state and polluted commits.
   _tracked_ephemeral=""
@@ -3696,7 +3778,11 @@ cmd_doctor() {
       # Check CLAUDE.md enrollment notice in enrolled repo.
       _cm_file="$_rpath/CLAUDE.md"
       if [ ! -f "$_cm_file" ]; then
-        printf '  WARN  %s: CLAUDE.md missing (run `clagentic-lite enroll --force`)\n' "$_rpath"
+        if _repo_is_wrapper_enrolled "$_rpath"; then
+          _ok "$_rpath: no CLAUDE.md by design (wrapper layout: the wrapper CLAUDE.md applies)"
+        else
+          printf '  WARN  %s: CLAUDE.md missing (`clagentic-lite enroll --force` stamps the notice; it never overwrites an existing CLAUDE.md that lacks the clagentic marker)\n' "$_rpath"
+        fi
       elif ! grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
         printf '  WARN  %s: CLAUDE.md not clagentic-managed (manual CLAUDE.md?)\n' "$_rpath"
       else
@@ -3719,10 +3805,20 @@ cmd_doctor() {
           printf '  WARN  %s: CLAUDE.md has managed-by marker but no version tag — run `clagentic-lite update --restamp`\n' "$_rpath"
         fi
       fi
+      # Existing installs: earlier enrollments of a wrapper-enrolled repo wrote
+      # harness lines into its tracked .gitignore. Never auto-removed (that
+      # would be another unrequested tracked-file edit); just say it is possible.
+      if _repo_is_wrapper_enrolled "$_rpath"; then
+        for _gi_pat in '.claude/' '.clagentic/lite/'; do
+          if grep -qxF "$_gi_pat" "$_rpath/.gitignore" 2>/dev/null; then
+            printf '  INFO  %s: tracked .gitignore carries harness line %s — in the wrapper layout it can be moved to .git/info/exclude\n' "$_rpath" "$_gi_pat"
+          fi
+        done
+      fi
       # Check builder-contract.md (local, gitignored).
       _contract_file="$_rpath/.clagentic/lite/builder-contract.md"
       if [ ! -f "$_contract_file" ]; then
-        printf '  WARN  %s: .clagentic/lite/builder-contract.md missing — sessions lack full builder context (run `clagentic-lite enroll --force`)\n' "$_rpath"
+        printf '  WARN  %s: .clagentic/lite/builder-contract.md missing — sessions lack full builder context (run `clagentic-lite enroll --force`; it re-stamps clagentic files and never overwrites an unmanaged CLAUDE.md)\n' "$_rpath"
       elif ! grep -q 'managed-by: clagentic' "$_contract_file" 2>/dev/null; then
         printf '  WARN  %s: .clagentic/lite/builder-contract.md not clagentic-managed\n' "$_rpath"
       else
@@ -4845,22 +4941,33 @@ cmd_update() {
           [ -f "$_old_dot/$_ef" ] && mv "$_old_dot/$_ef" "$_new_dot/$_ef" && \
             say "migrated: $_mpath/.clagentic/$_ef -> .clagentic/lite/$_ef"
         done
-        # Update gitignore: replace old per-file patterns with single blanket.
-        # Skip if a blanket .clagentic/ line already covers .clagentic/lite/.
+        # Replace the old per-file .gitignore patterns with the single
+        # .clagentic/lite/ blanket. Only the exact legacy lines are removed;
+        # every other line (blank lines and comments included) is kept as is.
+        # The blanket goes where _ensure_ignore_patterns decides and is added
+        # only when neither .gitignore nor info/exclude already has it.
         _gi="$_mpath/.gitignore"
-        if [ -f "$_gi" ]; then
-          if grep -qxF '.clagentic/' "$_gi" 2>/dev/null; then
-            say "note: $_mpath/.gitignore has blanket .clagentic/ — already covers .clagentic/lite/"
-          else
-            _updated=$(grep -v "^\.clagentic/audit\.db$\|^\.clagentic/memory\.db$\|^\.clagentic/builder-contract\.md$\|^\.clagentic/last-review\.json$\|^\.clagentic/last-adversarial\.md$\|^\.clagentic/last-merge-gate\.json$\|^\.clagentic/gate-summary\.json$\|^\.clagentic/stop-summarize\.lock$\|^\.clagentic/report\.html$" "$_gi" 2>/dev/null || true)
-            if ! printf '%s\n' "$_updated" | grep -qxF '.clagentic/lite/'; then
-              { printf '%s\n' "$_updated" | grep -v '^$'; printf '.clagentic/lite/\n'; } > "$_gi"
-              say "updated .gitignore: replaced per-file patterns with .clagentic/lite/ blanket"
+        if [ -f "$_gi" ] && ! grep -qxF '.clagentic/' "$_gi" 2>/dev/null; then
+          _has_legacy=$(awk -v list="$_EPHEMERAL_FILES" '
+            BEGIN { n = split(list, a, " "); for (i = 1; i <= n; i++) legacy[".clagentic/" a[i]] = 1 }
+            ($0 in legacy) { found = 1 }
+            END { print found + 0 }
+          ' "$_gi")
+          if [ "$_has_legacy" = "1" ]; then
+            _gi_tmp=$(mktemp "${TMPDIR:-/tmp}/clagentic-gi.XXXXXX") || _gi_tmp=""
+            if [ -n "$_gi_tmp" ]; then
+              awk -v list="$_EPHEMERAL_FILES" '
+                BEGIN { n = split(list, a, " "); for (i = 1; i <= n; i++) legacy[".clagentic/" a[i]] = 1 }
+                !($0 in legacy) { print }
+              ' "$_gi" > "$_gi_tmp" && cat "$_gi_tmp" > "$_gi"
+              rm -f "$_gi_tmp"
+              say "updated .gitignore: removed legacy per-file .clagentic/ patterns"
             else
-              printf '%s\n' "$_updated" | grep -v '^$' > "$_gi"
+              warn "cannot create a temp file; leaving legacy patterns in $_gi"
             fi
           fi
         fi
+        _ensure_ignore_patterns "$_mpath" '.clagentic/lite/'
       fi
     done < "$REGISTRY"
   fi
@@ -5068,8 +5175,9 @@ cmd_update() {
     fi
     _cm_file="$_rpath/CLAUDE.md"
     if [ ! -f "$_cm_file" ]; then
-      # CLAUDE.md entirely absent — restamp unconditionally.
-      _need_restamp=1
+      # CLAUDE.md entirely absent — restamp unconditionally, except in the
+      # wrapper layout where its absence is by design.
+      _repo_is_wrapper_enrolled "$_rpath" || _need_restamp=1
     elif ! grep -q 'managed-by: clagentic' "$_cm_file" 2>/dev/null; then
       # managed-by marker stripped (user removed the notice). On a TTY, prompt
       # before re-adding; on non-TTY, warn but do not auto-restamp (user may

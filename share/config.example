@@ -474,6 +474,17 @@ CLAGENTIC_REPO_HOST=github
 # Default branch (assumed protected — writes blocked by pre-write-guard).
 CLAGENTIC_DEFAULT_BRANCH=main
 
+# ---------- enrollment ignore target ----------
+# Where `enroll` and `update` write the harness ignore patterns (.claude/ and
+# .clagentic/lite/) in an enrolled repo:
+#   gitignore  the repo's tracked .gitignore
+#   exclude    the repo's .git/info/exclude (local only; the tracked tree is
+#              left untouched)
+# Leave unset for the per-layout default: gitignore for a regular repo,
+# exclude for a repo enrolled through a wrapper directory. A pattern already
+# present in either file counts as satisfied and is never added to the other.
+# CLAGENTIC_IGNORE_TARGET=
+
 # ---------- security gate bypass controls ----------
 # These vars let you work around pre-existing issues without modifying harness
 # source code. Use config, not code edits. See docs/GATES.md for context.
