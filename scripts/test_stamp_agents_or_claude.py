@@ -53,6 +53,20 @@ class _StampBase(_Base):
     def lines_about(self, text, path):
         return [l for l in text.splitlines() if path in l]
 
+    def _find_stub(self, order):
+        real = shutil.which("find")
+        stub_dir = os.path.join(self.tmpdir, "stub-" + order)
+        os.makedirs(stub_dir)
+        script = os.path.join(stub_dir, "find")
+        # Reorders only the nested-repo scan; every other find passes through.
+        _write(script, ("#!/bin/sh\n"
+                        "case \"$*\" in\n"
+                        "  *\"-name .git\"*) %s \"$@\" | sort %s ;;\n"
+                        "  *) exec %s \"$@\" ;;\n"
+                        "esac\n" % (real, "-r" if order == "reverse" else "", real)).encode())
+        os.chmod(script, 0o755)
+        return stub_dir
+
 
 class TestWrapperNestedFilesAreProjectOwned(_StampBase):
     def _check(self, filename, repo_rel):
@@ -655,20 +669,6 @@ class TestMultiRepoAnswerAllIsOrderIndependent(_StampBase):
     next iteration: the wrapper resolved to the first nested repo, which then got
     a CLAUDE.md and a wrong pointer."""
 
-    def _find_stub(self, order):
-        real = shutil.which("find")
-        stub_dir = os.path.join(self.tmpdir, "stub-" + order)
-        os.makedirs(stub_dir)
-        script = os.path.join(stub_dir, "find")
-        # Reorders only the nested-repo scan; every other find passes through.
-        _write(script, ("#!/bin/sh\n"
-                        "case \"$*\" in\n"
-                        "  *\"-name .git\"*) %s \"$@\" | sort %s ;;\n"
-                        "  *) exec %s \"$@\" ;;\n"
-                        "esac\n" % (real, "-r" if order == "reverse" else "", real)).encode())
-        os.chmod(script, 0o755)
-        return stub_dir
-
     def _enroll_all(self, order):
         wrapper = os.path.join(self.tmpdir, "wrapper-" + order)
         repos = [os.path.join(wrapper, name) for name in ("alpha", "beta", "gamma")]
@@ -695,6 +695,48 @@ class TestMultiRepoAnswerAllIsOrderIndependent(_StampBase):
 
     def test_find_order_reverse(self):
         self._check("reverse")
+
+
+class TestEnrollStopsAtTheFirstFailure(_StampBase):
+    """Each path (and each nested repo of an "A" answer) enrolls in its own
+    subshell. The script runs under errexit, so a failing one must stop the run
+    with a nonzero status and leave every later one unenrolled, as it did when a
+    failure exited the whole script."""
+
+    def _registry(self):
+        path = os.path.join(self.home, ".local", "state", "clagentic", "registry")
+        return _read(path).decode().split() if os.path.exists(path) else []
+
+    def test_failing_first_path_stops_the_run(self):
+        not_a_repo = os.path.join(self.tmpdir, "plain-dir")
+        os.makedirs(not_a_repo)
+        later = [os.path.join(self.tmpdir, name) for name in ("repo-one", "repo-two")]
+        for repo in later:
+            _init_repo(repo)
+        rc, out, err = self.run_cli(["enroll", not_a_repo] + later, cwd=self.tmpdir)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn("not a git repository", out + err)
+        for repo in later:
+            self.assertNotIn(os.path.realpath(repo), self._registry(), out + err)
+
+    def test_failing_nested_repo_stops_the_all_loop(self):
+        # The tool's own checkout is refused by enroll, which gives a real
+        # failing nested repo. It is nested in this wrapper and sorts ahead of
+        # the others under the forward find order.
+        stub = self._find_stub("forward")
+        later = [os.path.join(self.tmpdir, name) for name in ("xa", "xb")]
+        for repo in later:
+            _init_repo(repo)
+        path = stub + os.pathsep + os.environ["PATH"]
+        rc, out, err = self.run_cli_tty(["enroll", self.tmpdir], cwd=self.tmpdir,
+                                        answer=b"A\n", PATH=path)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn("refusing to enroll", out + err)
+        for repo in later:
+            self.assertNotIn(os.path.realpath(repo), self._registry(), out + err)
+        pointer = _read(os.path.join(self.tmpdir, ".clagentic-project")).decode().split()
+        for repo in later:
+            self.assertNotIn(os.path.realpath(repo), pointer)
 
 
 if __name__ == "__main__":
