@@ -8111,6 +8111,32 @@ cmd_render_manifest() {
   fi
 }
 
+# _review_class_footer FILE -- prints one static hand-off line when at least
+# one finding names a non-isolated issue_class, nothing otherwise. The line is
+# fully static (count-agnostic wording, so no plural defect) and never carries
+# model-authored text, so no _llm_field_sanitize call is needed (GATES.md
+# review-finding table). The jq count is only a presence test. Display
+# only: severity_blockers() never reads issue_class/class_fix.
+#
+# _REVIEW_CLASS_NAMED_DEF is the single predicate for "this finding names a
+# non-isolated class": null, empty, and "none — isolated" all count as
+# isolated. Both the footer and cmd_render_review prepend it to their jq
+# programs so the two cannot drift apart.
+_REVIEW_CLASS_NAMED_DEF='def class_named: (.issue_class != null) and (.issue_class != "") and (.issue_class != "none — isolated");'
+
+_review_class_footer() {
+  # jq stderr is left attached and a failure returns nonzero: a silent
+  # return 0 here would report a successful render with the footer dropped.
+  _rcf_n=$(jq -r "$_REVIEW_CLASS_NAMED_DEF"'[(.findings // [])[] | select(class_named)] | length' "$1") || {
+    echo "review class footer: jq failed reading $1" 1>&2
+    return 1
+  }
+  case "$_rcf_n" in
+    ''|*[!0-9]*|0) return 0 ;;
+  esac
+  printf '\nFindings above name a class -- fix via class_fix across every site, not per-line\n'
+}
+
 cmd_render_review() {
   _gate_check_args render-review "" "FILE" "$@" || return 2
   FILE="${1:-$REPO_ROOT/.clagentic/lite/last-review.json}"
@@ -8136,7 +8162,7 @@ cmd_render_review() {
     # majority case and would otherwise drown out the findings that DO name
     # a real class). This is display only, mandatory-but-non-blocking per
     # severity_blockers' own comment above -- never gates /ship.
-    jq -r '"== clagentic-lite review ==\nsummary: " + .summary + "\nfindings: " + (.findings | length | tostring) + "\n",
+    jq -r "$_REVIEW_CLASS_NAMED_DEF"'"== clagentic-lite review ==\nsummary: " + .summary + "\nfindings: " + (.findings | length | tostring) + "\n",
            (.findings[] | "[" + .severity + "] " + .file + ":" + (.line|tostring) + " " + .message +
              (if ._recurrence_demoted == true
               then " (reported " + (._recurrence_count | tostring) + " rounds running — decide)"
@@ -8144,11 +8170,16 @@ cmd_render_review() {
              (if ._deferral_matched == true
               then " (matched deferral " + (._deferral_id // "?") + ")"
               else "" end) +
-             (if (.issue_class != null) and (.issue_class != "none — isolated")
+             (if class_named
               then "\n    class: " + .issue_class + (if (.class_fix != null) and (.class_fix != "") then " -> " + .class_fix else "" end)
               else "" end))' \
-      "$FILE"
+      "$FILE" || return 1
+    _review_class_footer "$FILE" || return 1
   else
+    # Raw JSON is the supported no-jq fallback; the footer needs jq to know
+    # whether any finding names a class, and parsing JSON in POSIX sh is not
+    # done here, so say so rather than silently dropping the handoff.
+    echo "review class footer: requires jq; read the raw issue_class/class_fix fields above directly" 1>&2
     cat "$FILE"
   fi
 }
