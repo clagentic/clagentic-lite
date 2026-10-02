@@ -8176,6 +8176,10 @@ cmd_render_review() {
       "$FILE" || return 1
     _review_class_footer "$FILE" || return 1
   else
+    # Raw JSON is the supported no-jq fallback; the footer needs jq to know
+    # whether any finding names a class, and parsing JSON in POSIX sh is not
+    # done here, so say so rather than silently dropping the handoff.
+    echo "review class footer: requires jq; read the raw issue_class/class_fix fields above directly" 1>&2
     cat "$FILE"
   fi
 }

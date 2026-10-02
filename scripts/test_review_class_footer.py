@@ -134,6 +134,47 @@ class TestFooterFailsVisibly(unittest.TestCase):
         self.assertNotEqual(r.stderr.strip(), "")
 
 
+def _path_without_jq(tmp):
+    """A PATH dir holding symlinks to every executable on the real PATH
+    except jq, so the sourced scripts keep their other tools."""
+    bindir = os.path.join(tmp, "nojq-bin")
+    os.mkdir(bindir)
+    seen = set()
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d or not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            src = os.path.join(d, name)
+            if name == "jq" or name in seen or not os.access(src, os.X_OK):
+                continue
+            seen.add(name)
+            os.symlink(src, os.path.join(bindir, name))
+    return bindir
+
+
+class TestRenderReviewWithoutJq(unittest.TestCase):
+    def test_no_jq_renders_raw_and_notes_footer_needs_jq(self):
+        with tempfile.TemporaryDirectory(prefix="clagentic-test-class-footer-") as d:
+            path = os.path.join(d, "review.json")
+            with open(path, "w") as f:
+                json.dump({"summary": "s", "findings": [_finding("some class")]}, f)
+            script = textwrap.dedent(f"""\
+                . '{PLATFORM_SH}'
+                ds_load_env 2>/dev/null || true
+                . '{GATES_SH}'
+                if command -v jq >/dev/null 2>&1; then echo JQ_PRESENT; exit 9; fi
+                cmd_render_review '{path}'
+            """)
+            env = os.environ.copy()
+            env.update(source_env(gates=True))
+            env["PATH"] = _path_without_jq(d)
+            r = _run_raw(script, env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("some class", r.stdout)
+        self.assertIn("requires jq", r.stderr)
+        self.assertIn("issue_class/class_fix", r.stderr)
+
+
 class TestSeverityBlockersUnchanged(unittest.TestCase):
     def test_class_fields_do_not_change_blocker_count(self):
         body = "severity_blockers '{path}' high"
