@@ -61,9 +61,20 @@ class TestReviewClassFooter(unittest.TestCase):
 
     def test_footer_absent_when_no_findings(self):
         r = _run_gates("_review_class_footer '{path}'", [])
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, "")
 
-    def test_footer_present_with_count_when_class_named(self):
+    def test_footer_and_render_agree_on_empty_string_class(self):
+        review = [_finding("", "some fix")]
+        footer = _run_gates("_review_class_footer '{path}'", review)
+        render = _run_gates("cmd_render_review '{path}'", review)
+        self.assertEqual(footer.returncode, 0, footer.stderr)
+        self.assertEqual(render.returncode, 0, render.stderr)
+        self.assertEqual(footer.stdout, "")
+        self.assertNotIn("class:", render.stdout)
+        self.assertNotIn("name a class", render.stdout)
+
+    def test_footer_present_when_class_named(self):
         r = _run_gates("_review_class_footer '{path}'", [
             _finding("unbounded external call"), _finding(ISOLATED), _finding("another class"),
         ])

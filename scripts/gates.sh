@@ -8117,8 +8117,15 @@ cmd_render_manifest() {
 # model-authored text, so no _llm_field_sanitize call is needed (GATES.md
 # review-finding table). The jq count is only a presence test. Display
 # only: severity_blockers() never reads issue_class/class_fix.
+#
+# _REVIEW_CLASS_NAMED_DEF is the single predicate for "this finding names a
+# non-isolated class": null, empty, and "none — isolated" all count as
+# isolated. Both the footer and cmd_render_review prepend it to their jq
+# programs so the two cannot drift apart.
+_REVIEW_CLASS_NAMED_DEF='def class_named: (.issue_class != null) and (.issue_class != "") and (.issue_class != "none — isolated");'
+
 _review_class_footer() {
-  _rcf_n=$(jq -r '[(.findings // [])[] | select((.issue_class != null) and (.issue_class != "") and (.issue_class != "none — isolated"))] | length' "$1" 2>/dev/null) || return 0
+  _rcf_n=$(jq -r "$_REVIEW_CLASS_NAMED_DEF"'[(.findings // [])[] | select(class_named)] | length' "$1" 2>/dev/null) || return 0
   case "$_rcf_n" in
     ''|*[!0-9]*|0) return 0 ;;
   esac
@@ -8150,7 +8157,7 @@ cmd_render_review() {
     # majority case and would otherwise drown out the findings that DO name
     # a real class). This is display only, mandatory-but-non-blocking per
     # severity_blockers' own comment above -- never gates /ship.
-    jq -r '"== clagentic-lite review ==\nsummary: " + .summary + "\nfindings: " + (.findings | length | tostring) + "\n",
+    jq -r "$_REVIEW_CLASS_NAMED_DEF"'"== clagentic-lite review ==\nsummary: " + .summary + "\nfindings: " + (.findings | length | tostring) + "\n",
            (.findings[] | "[" + .severity + "] " + .file + ":" + (.line|tostring) + " " + .message +
              (if ._recurrence_demoted == true
               then " (reported " + (._recurrence_count | tostring) + " rounds running — decide)"
@@ -8158,7 +8165,7 @@ cmd_render_review() {
              (if ._deferral_matched == true
               then " (matched deferral " + (._deferral_id // "?") + ")"
               else "" end) +
-             (if (.issue_class != null) and (.issue_class != "none — isolated")
+             (if class_named
               then "\n    class: " + .issue_class + (if (.class_fix != null) and (.class_fix != "") then " -> " + .class_fix else "" end)
               else "" end))' \
       "$FILE"
