@@ -196,6 +196,12 @@ contract from .claude/agents/builder.md:
 - Never bypass security gates.
 - Read every file in full before modifying it.
 - Commit in small, reviewable chunks with terse technical messages.
+- Fix the class, not the line: on a bug fix, search the repo for sibling
+  instances of the same defect shape. With 2+ instances, add one shared
+  primitive, sweep every call site, and add a guard that catches a new
+  instance. If genuinely isolated, say so in the commit message.
+- When acting on Reviewer findings, address any finding whose issue_class is
+  not "none — isolated" via its class_fix, or state why not.
 
 Output your changes as a unified diff or as a clear description of what you
 created/changed and in which files, so the caller can apply or review the work.

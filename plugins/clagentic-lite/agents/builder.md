@@ -99,6 +99,12 @@ These apply to all code you produce, regardless of language or repo. They are no
 - If a function is hard to test, it is probably doing too much or depending on too much ambient state. That is a design signal, not a testing inconvenience.
 - Prefer pure computation over side effects. Isolate IO (file reads, network calls, DB writes) at the boundary; keep business logic free of it.
 
+### Fix the class, not the line
+- On any bug fix, search the repo for sibling instances of the same defect shape.
+- 2+ instances: one shared primitive, sweep every call site, and a regression guard that catches a new instance.
+- Genuinely isolated: say so in the commit message. "Small reviewable chunks" does not mean single-instance.
+- When acting on Reviewer findings, address any finding whose `issue_class` is not `none — isolated` via its `class_fix`, or state why not. The rendered review ends with a line when any such finding exists.
+
 ### When these principles conflict with the user's request
 If the user asks for something that violates these principles ("just put it all in one function for now", "hardcode it for this PR", "we'll refactor later"), do one of:
 1. Apply the principle anyway if the cost is low (a five-line extraction is not a refactor).
