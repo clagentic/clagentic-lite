@@ -8112,16 +8112,17 @@ cmd_render_manifest() {
 }
 
 # _review_class_footer FILE -- prints one static hand-off line when at least
-# one finding names a non-isolated issue_class, nothing otherwise. The line
-# interpolates only a jq-computed integer, never model-authored text, so no
-# _llm_field_sanitize call is needed (GATES.md review-finding table). Display
+# one finding names a non-isolated issue_class, nothing otherwise. The line is
+# fully static (count-agnostic wording, so no plural defect) and never carries
+# model-authored text, so no _llm_field_sanitize call is needed (GATES.md
+# review-finding table). The jq count is only a presence test. Display
 # only: severity_blockers() never reads issue_class/class_fix.
 _review_class_footer() {
   _rcf_n=$(jq -r '[(.findings // [])[] | select((.issue_class != null) and (.issue_class != "") and (.issue_class != "none — isolated"))] | length' "$1" 2>/dev/null) || return 0
   case "$_rcf_n" in
     ''|*[!0-9]*|0) return 0 ;;
   esac
-  printf '\n%s findings name a class -- fix via class_fix across every site, not per-line\n' "$_rcf_n"
+  printf '\nFindings above name a class -- fix via class_fix across every site, not per-line\n'
 }
 
 cmd_render_review() {

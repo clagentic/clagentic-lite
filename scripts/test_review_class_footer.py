@@ -3,7 +3,7 @@ Builder-side consumer of the Reviewer's issue_class/class_fix.
 
 Covers the factored helpers only (no gate pipeline is executed):
   - _review_class_footer prints iff a finding names a non-isolated class
-  - the footer is static text plus an integer, never model-authored text
+  - the footer is static, count-agnostic text, never model-authored text
   - severity_blockers() is unchanged by issue_class/class_fix
   - builder.md and ds_build_prompt both carry the fix-the-class rule
 
@@ -68,7 +68,7 @@ class TestReviewClassFooter(unittest.TestCase):
             _finding("unbounded external call"), _finding(ISOLATED), _finding("another class"),
         ])
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("2 findings name a class", r.stdout)
+        self.assertIn("name a class", r.stdout)
         self.assertIn("class_fix", r.stdout)
 
     def test_footer_does_not_echo_model_text(self):
@@ -78,7 +78,7 @@ class TestReviewClassFooter(unittest.TestCase):
 
     def test_render_review_ends_with_footer_iff_class_named(self):
         named = _run_gates("cmd_render_review '{path}'", [_finding("some class")])
-        self.assertIn("1 findings name a class", named.stdout)
+        self.assertIn("name a class", named.stdout)
         isolated = _run_gates("cmd_render_review '{path}'", [_finding(ISOLATED, "n/a — isolated")])
         self.assertNotIn("name a class", isolated.stdout)
 
