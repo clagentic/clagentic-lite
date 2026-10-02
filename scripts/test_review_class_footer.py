@@ -34,6 +34,19 @@ def _finding(issue_class, class_fix="fix", severity="low"):
     }
 
 
+def _run_checked(script, env):
+    """Single subprocess entry point for this file: a crash must fail the test
+    loudly rather than pass vacuously on empty stdout."""
+    r = subprocess.run(
+        ["sh", "-c", script, GATES_SH], capture_output=True, text=True,
+        cwd=os.path.join(TOOL_HOME, "scripts"), env=env,
+    )
+    if r.returncode != 0:
+        raise AssertionError(
+            f"subprocess exited {r.returncode}; stderr: {r.stderr}")
+    return r
+
+
 def _run_gates(body, review):
     with tempfile.TemporaryDirectory(prefix="clagentic-test-class-footer-") as d:
         path = os.path.join(d, "review.json")
@@ -47,29 +60,22 @@ def _run_gates(body, review):
         """)
         env = os.environ.copy()
         env.update(source_env(gates=True))
-        return subprocess.run(
-            ["sh", "-c", script, GATES_SH], capture_output=True, text=True,
-            cwd=os.path.join(TOOL_HOME, "scripts"), env=env,
-        )
+        return _run_checked(script, env)
 
 
 class TestReviewClassFooter(unittest.TestCase):
     def test_footer_absent_when_all_isolated(self):
         r = _run_gates("_review_class_footer '{path}'", [_finding(ISOLATED, "n/a — isolated")])
-        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, "")
 
     def test_footer_absent_when_no_findings(self):
         r = _run_gates("_review_class_footer '{path}'", [])
-        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, "")
 
     def test_footer_and_render_agree_on_empty_string_class(self):
         review = [_finding("", "some fix")]
         footer = _run_gates("_review_class_footer '{path}'", review)
         render = _run_gates("cmd_render_review '{path}'", review)
-        self.assertEqual(footer.returncode, 0, footer.stderr)
-        self.assertEqual(render.returncode, 0, render.stderr)
         self.assertEqual(footer.stdout, "")
         self.assertNotIn("class:", render.stdout)
         self.assertNotIn("name a class", render.stdout)
@@ -78,7 +84,6 @@ class TestReviewClassFooter(unittest.TestCase):
         r = _run_gates("_review_class_footer '{path}'", [
             _finding("unbounded external call"), _finding(ISOLATED), _finding("another class"),
         ])
-        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("name a class", r.stdout)
         self.assertIn("class_fix", r.stdout)
 
@@ -116,9 +121,7 @@ class TestBuilderPromptSurfaces(unittest.TestCase):
         script = f". '{LLM_CLIENT_SH}'\nds_build_prompt\n"
         env = os.environ.copy()
         env.update(source_env(llm_client=True))
-        r = subprocess.run(["sh", "-c", script, LLM_CLIENT_SH], capture_output=True,
-                           text=True, cwd=os.path.join(TOOL_HOME, "scripts"), env=env)
-        self.assertEqual(r.returncode, 0, r.stderr)
+        r = _run_checked(script, env)
         self.assertIn("Fix the class, not the line", r.stdout)
         self.assertIn("class_fix", r.stdout)
 
