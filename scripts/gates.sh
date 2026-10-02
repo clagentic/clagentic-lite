@@ -8125,7 +8125,12 @@ cmd_render_manifest() {
 _REVIEW_CLASS_NAMED_DEF='def class_named: (.issue_class != null) and (.issue_class != "") and (.issue_class != "none — isolated");'
 
 _review_class_footer() {
-  _rcf_n=$(jq -r "$_REVIEW_CLASS_NAMED_DEF"'[(.findings // [])[] | select(class_named)] | length' "$1" 2>/dev/null) || return 0
+  # jq stderr is left attached and a failure returns nonzero: a silent
+  # return 0 here would report a successful render with the footer dropped.
+  _rcf_n=$(jq -r "$_REVIEW_CLASS_NAMED_DEF"'[(.findings // [])[] | select(class_named)] | length' "$1") || {
+    echo "review class footer: jq failed reading $1" 1>&2
+    return 1
+  }
   case "$_rcf_n" in
     ''|*[!0-9]*|0) return 0 ;;
   esac
@@ -8168,8 +8173,8 @@ cmd_render_review() {
              (if class_named
               then "\n    class: " + .issue_class + (if (.class_fix != null) and (.class_fix != "") then " -> " + .class_fix else "" end)
               else "" end))' \
-      "$FILE"
-    _review_class_footer "$FILE"
+      "$FILE" || return 1
+    _review_class_footer "$FILE" || return 1
   else
     cat "$FILE"
   fi

@@ -34,13 +34,17 @@ def _finding(issue_class, class_fix="fix", severity="low"):
     }
 
 
-def _run_checked(script, env):
-    """Single subprocess entry point for this file: a crash must fail the test
-    loudly rather than pass vacuously on empty stdout."""
-    r = subprocess.run(
+def _run_raw(script, env):
+    return subprocess.run(
         ["sh", "-c", script, GATES_SH], capture_output=True, text=True,
         cwd=os.path.join(TOOL_HOME, "scripts"), env=env,
     )
+
+
+def _run_checked(script, env):
+    """Entry point for expected-success runs: a crash must fail the test
+    loudly rather than pass vacuously on empty stdout."""
+    r = _run_raw(script, env)
     if r.returncode != 0:
         raise AssertionError(
             f"subprocess exited {r.returncode}; stderr: {r.stderr}")
@@ -97,6 +101,37 @@ class TestReviewClassFooter(unittest.TestCase):
         self.assertIn("name a class", named.stdout)
         isolated = _run_gates("cmd_render_review '{path}'", [_finding(ISOLATED, "n/a — isolated")])
         self.assertNotIn("name a class", isolated.stdout)
+
+
+def _run_gates_raw_file(body, content):
+    """Expected-failure counterpart of _run_gates: writes CONTENT verbatim
+    (e.g. malformed JSON) and returns the result without asserting success."""
+    with tempfile.TemporaryDirectory(prefix="clagentic-test-class-footer-") as d:
+        path = os.path.join(d, "review.json")
+        with open(path, "w") as f:
+            f.write(content)
+        script = textwrap.dedent(f"""\
+            . '{PLATFORM_SH}'
+            ds_load_env 2>/dev/null || true
+            . '{GATES_SH}'
+            {body.format(path=path)}
+        """)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
+        return _run_raw(script, env)
+
+
+class TestFooterFailsVisibly(unittest.TestCase):
+    def test_footer_malformed_json_exits_nonzero_with_stderr(self):
+        r = _run_gates_raw_file("_review_class_footer '{path}'", "{not json")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("review class footer", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_render_review_malformed_json_exits_nonzero(self):
+        r = _run_gates_raw_file("cmd_render_review '{path}'", "{not json")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotEqual(r.stderr.strip(), "")
 
 
 class TestSeverityBlockersUnchanged(unittest.TestCase):
