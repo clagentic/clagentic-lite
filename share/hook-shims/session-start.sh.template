@@ -1,7 +1,8 @@
 #!/bin/sh
 # clagentic-lite :: SessionStart hook
 # 1. Injects up to 3 recent session summaries from .clagentic/lite/memory.db as
-#    additionalContext so the session opens with recent decisions visible.
+#    hookSpecificOutput.additionalContext so the session opens with recent
+#    decisions visible.
 # 2. Checks whether the clagentic-lite tool itself is behind its upstream and,
 #    if so, appends a terse one-line update notice.  Rate-limited to one
 #    git fetch per 24 h via ~/.config/clagentic/lite/update-check.  Non-blocking —
@@ -9,7 +10,7 @@
 #
 # Non-blocking — any failure exits 0 silently.
 #
-# managed-by: clagentic · clagentic-hooks-version: v4
+# managed-by: clagentic · clagentic-hooks-version: v5
 # Source of truth: share/hook-shims/session-start.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/session-start.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -145,9 +146,13 @@ if [ "${CLAGENTIC_SKIP_UPDATE_ALERT:-0}" != "1" ] \
   fi
 fi
 
-# ---- 3. Emit combined additionalContext ------------------------------------
-# Build the context string from whichever parts are non-empty.
+# ---- 3. Emit combined context ----------------------------------------------
+# Build the RAW (unescaped, real-newline) context from whichever parts are
+# non-empty; ds_hook_emit_context escapes it and wraps it in the
+# hookSpecificOutput envelope Claude Code actually reads.
 
+NL='
+'
 CONTEXT=""
 
 if [ -n "$CONTRACT_CONTENT" ]; then
@@ -155,55 +160,43 @@ if [ -n "$CONTRACT_CONTENT" ]; then
 fi
 
 if [ -n "$RECENT" ]; then
-  _recall_block="CLAGENTIC RECALL · ${PWD##*/} · most recent session summaries:\n${RECENT}"
+  _recall_block="CLAGENTIC RECALL · ${PWD##*/} · most recent session summaries:${NL}${RECENT}"
   if [ -n "$CONTEXT" ]; then
-    CONTEXT="${CONTEXT}\n\n${_recall_block}"
+    CONTEXT="${CONTEXT}${NL}${NL}${_recall_block}"
   else
     CONTEXT="$_recall_block"
   fi
 fi
 
 if [ -n "$HANDOFF_CONTENT" ]; then
-  _handoff_block="CLAGENTIC HANDOFF · prior session state:\n${HANDOFF_CONTENT}"
+  _handoff_block="CLAGENTIC HANDOFF · prior session state:${NL}${HANDOFF_CONTENT}"
   if [ -n "$CONTEXT" ]; then
-    CONTEXT="${CONTEXT}\n\n${_handoff_block}"
+    CONTEXT="${CONTEXT}${NL}${NL}${_handoff_block}"
   else
     CONTEXT="$_handoff_block"
   fi
 fi
 
+SYSTEM_MSG=""
 if [ -n "$UPDATE_MSG" ]; then
+  # Two channels: systemMessage is a user-visible UI line that does not depend
+  # on the model mentioning it; the additionalContext instruction asks the
+  # model to relay it once, without acting on it.
+  SYSTEM_MSG="$UPDATE_MSG"
+  _update_ctx="UPDATE AVAILABLE · clagentic-lite is ${_BEHIND} commit(s) behind upstream. Tell the user once, briefly, at the start of your first reply, that clagentic-lite is ${_BEHIND} commit(s) behind and they can run 'clagentic-lite update'. Do not run it yourself. Do not repeat this notice."
   if [ -n "$CONTEXT" ]; then
-    CONTEXT="${CONTEXT}\n\n${UPDATE_MSG}"
+    CONTEXT="${CONTEXT}${NL}${NL}${_update_ctx}"
   else
-    CONTEXT="$UPDATE_MSG"
+    CONTEXT="$_update_ctx"
   fi
 fi
 
 [ -z "$CONTEXT" ] && exit 0
 
-# Escape the context string for safe embedding in a JSON string value via
-# ds_json_escape (scripts/platform.sh, lr-b82538 hoist) -- this shim's own
-# copy of the escaper was the reference implementation the hoist lifted
-# verbatim; it now calls the shared primitive instead of carrying its own
-# copy. platform.sh is already sourced above.
-if command -v ds_json_escape >/dev/null 2>&1; then
-  CONTEXT_JSON=$(ds_json_escape "$CONTEXT")
-else
-  # platform.sh failed to load (see the existence guard above): fail CLOSED
-  # by skipping injection rather than emitting CONTEXT raw and unescaped.
-  # CONTEXT can carry untrusted sqlite3 summary text (RECENT) and raw
-  # handoff.md content (HANDOFF_CONTENT); a quote/backslash/control byte in
-  # either produces broken JSON the host rejects -- BOBBIE/PEACHES review of
-  # PR #210, lr-b82538 fold-in. This mirrors the posture prompt-inject.sh
-  # .template already established at its own escaper-unavailable branch
-  # (fail closed, not fail open) -- non-blocking overall, the user simply
-  # sees no recall/handoff context for this turn.
-  exit 0
+# Fail closed (emit nothing, exit 0) if platform.sh failed to load or escaping
+# fails: CONTEXT can carry untrusted sqlite3 summary text and raw handoff.md
+# content, and an unescaped quote/control byte yields JSON the host rejects.
+if command -v ds_hook_emit_context >/dev/null 2>&1; then
+  ds_hook_emit_context SessionStart "$CONTEXT" "$SYSTEM_MSG" || true
 fi
-
-cat <<EOF
-{
-  "additionalContext": "${CONTEXT_JSON}"
-}
-EOF
+exit 0

@@ -12,7 +12,8 @@ behind its own origin remote (a real bare repo, real `git fetch`, real
 _stamp_claude_hooks in bin/clagentic-lite), then runs that MATERIALIZED
 script directly and asserts:
   1. stdout parses as JSON (the hook's own emitted envelope).
-  2. additionalContext contains "UPDATE AVAILABLE".
+  2. hookSpecificOutput.additionalContext contains "UPDATE AVAILABLE" and the
+     top-level systemMessage carries the user-visible notice.
   3. the behind-count in the message matches the real commit count.
 
 None of these tests set CLAGENTIC_SKIP_UPDATE_ALERT -- that is the entire
@@ -217,17 +218,25 @@ class TestUpdateAlertFiresWhenBehind(_BehindOriginFixtureBase):
             self.fail(
                 f"hook stdout did not parse as JSON: {exc}\nstdout={result.stdout!r}"
             )
-        self.assertIn("additionalContext", payload)
+        hso = payload["hookSpecificOutput"]
+        self.assertEqual(hso["hookEventName"], "SessionStart")
+        self.assertNotIn("additionalContext", payload)
         self.assertIn(
             "UPDATE AVAILABLE",
-            payload["additionalContext"],
+            hso["additionalContext"],
             f"expected the update notice in additionalContext; got: {payload!r}",
         )
         self.assertIn(
             "2 commit(s) behind",
-            payload["additionalContext"],
+            hso["additionalContext"],
             f"expected the real behind-count (2) in the notice; got: {payload!r}",
         )
+        self.assertIn("clagentic-lite update", hso["additionalContext"])
+        self.assertIn("Do not run it yourself", hso["additionalContext"])
+        # The user-visible channel must carry the notice independent of
+        # whether the model relays it.
+        self.assertIn("2 commit(s) behind", payload["systemMessage"])
+        self.assertIn("clagentic-lite update", payload["systemMessage"])
 
     def test_suppression_var_still_works_when_explicitly_set(self):
         """Sanity check the other direction: CLAGENTIC_SKIP_UPDATE_ALERT=1
@@ -269,14 +278,15 @@ class TestUpdateAlertAheadAndBehindTogether(_BehindOriginFixtureBase):
             msg=f"stdout={result.stdout!r} stderr={result.stderr!r}",
         )
         payload = json.loads(result.stdout)
+        ctx = payload["hookSpecificOutput"]["additionalContext"]
         self.assertIn(
             "UPDATE AVAILABLE",
-            payload.get("additionalContext", ""),
+            ctx,
             f"ahead-and-behind clone must still alert on the behind count; got: {payload!r}",
         )
         self.assertIn(
             "2 commit(s) behind",
-            payload["additionalContext"],
+            ctx,
             f"expected behind-count 2 despite local ahead-by-1; got: {payload!r}",
         )
 
@@ -296,7 +306,7 @@ class TestUpdateAlertAheadAndBehindTogether(_BehindOriginFixtureBase):
             payload = json.loads(combined_stdout)
             self.assertNotIn(
                 "UPDATE AVAILABLE",
-                payload.get("additionalContext", ""),
+                json.dumps(payload),
                 f"ahead-only (behind=0) clone must stay silent; got: {payload!r}",
             )
         # else: exit 0 with no stdout at all (CONTEXT empty) is also a pass --

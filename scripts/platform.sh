@@ -751,6 +751,40 @@ sys.stdout.write(encoded[1:-1])
   fi
 }
 
+# Emit a Claude Code hook-output envelope that injects context into the
+# session. Sole sanctioned emitter for every hook shim: Claude Code only
+# honors additionalContext nested under hookSpecificOutput (with a matching
+# hookEventName); a top-level additionalContext key is silently ignored, so the
+# context never reaches the model. systemMessage, by contrast, is a top-level
+# key that renders a user-visible line in the UI.
+#
+# Args: EVENT_NAME (SessionStart|UserPromptSubmit|PostToolUse)
+#       TEXT       (RAW, unescaped context; real newlines, not \n sequences)
+#       SYSTEM_MESSAGE (optional, RAW; user-visible line)
+# Stdout: one JSON object. Emits nothing and returns 1 when TEXT is empty, the
+#   event name is unsafe, or escaping is unavailable/fails -- fail CLOSED
+#   (hooks are non-blocking; dropping context beats emitting invalid JSON).
+ds_hook_emit_context() {
+  _hec_event="${1:-}"
+  _hec_text="${2:-}"
+  _hec_sysmsg="${3:-}"
+  case "$_hec_event" in
+    ''|*[!A-Za-z]*) return 1 ;;
+  esac
+  [ -n "$_hec_text" ] || return 1
+  command -v ds_json_escape >/dev/null 2>&1 || return 1
+  _hec_text_json=$(ds_json_escape "$_hec_text") || return 1
+  [ -n "$_hec_text_json" ] || return 1
+  _hec_sys_field=""
+  if [ -n "$_hec_sysmsg" ]; then
+    _hec_sys_json=$(ds_json_escape "$_hec_sysmsg") || return 1
+    [ -n "$_hec_sys_json" ] || return 1
+    _hec_sys_field="\"systemMessage\": \"${_hec_sys_json}\", "
+  fi
+  printf '{%s"hookSpecificOutput": {"hookEventName": "%s", "additionalContext": "%s"}}\n' \
+    "$_hec_sys_field" "$_hec_event" "$_hec_text_json"
+}
+
 # ---------------------------------------------------------------- tool detection
 #
 # ds_check_tool NAME HINT_LINUX HINT_DARWIN
