@@ -26,7 +26,8 @@ as-is (task lr-b82538, comment #1):
      -- the only shim with this env var).
   5. platform.sh unavailable: exit 0, no stdout (existing behavior).
   6. Regression guard: every shim template containing "additionalContext"
-     must also contain "_json_escape" or "ds_json_escape" -- a real test,
+     must route through "ds_hook_emit_context", which nests it under
+     hookSpecificOutput (the only shape Claude Code reads) -- a real test,
      not a comment, discovered via `git ls-files` against the TRACKED,
      SHIPPED set (never glob.glob() against the filesystem, and never a
      hardcoded site list), per AGENTS.md's "Sweeping-test discovery
@@ -140,8 +141,9 @@ class TestAcceptance1HostilePayloadParses(_RepoFixture):
             payload = json.loads(stdout)
         except json.JSONDecodeError as exc:
             self.fail(f"prompt-inject stdout did not parse as JSON: {exc}\nstdout={stdout!r}")
-        self.assertIn("additionalContext", payload)
-        self.assertIn("quotes", payload["additionalContext"])
+        self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
+        self.assertIn("quotes", payload["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("additionalContext", payload)
 
     def test_session_start_hostile_summary_parses(self):
         _seed_memory_db(self._tmp, HOSTILE_SUMMARY, tags="findme")
@@ -156,8 +158,9 @@ class TestAcceptance1HostilePayloadParses(_RepoFixture):
             payload = json.loads(stdout)
         except json.JSONDecodeError as exc:
             self.fail(f"session-start stdout did not parse as JSON: {exc}\nstdout={stdout!r}")
-        self.assertIn("additionalContext", payload)
-        self.assertIn("quotes", payload["additionalContext"])
+        self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        self.assertIn("quotes", payload["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("additionalContext", payload)
 
 
 class TestAcceptance2KeywordsJoinedOneLine(_RepoFixture):
@@ -178,7 +181,7 @@ class TestAcceptance2KeywordsJoinedOneLine(_RepoFixture):
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         stdout = result.stdout.decode()
         payload = json.loads(stdout)
-        ctx = payload["additionalContext"]
+        ctx = payload["hookSpecificOutput"]["additionalContext"]
         for kw in ("alpha", "bravo", "charlie", "delta", "echo"):
             self.assertIn(kw, ctx, f"expected keyword {kw!r} in additionalContext: {ctx!r}")
         # "on one line": the bracketed keyword list segment itself must not
@@ -567,7 +570,7 @@ class TestAcceptance6RegressionGuardSweep(unittest.TestCase):
             if "additionalContext" not in content:
                 continue
             emitters_found += 1
-            if "_json_escape" not in content and "ds_json_escape" not in content:
+            if "ds_hook_emit_context" not in content:
                 violations.append(os.path.basename(path))
         self.assertGreaterEqual(
             emitters_found, 3,
@@ -577,9 +580,63 @@ class TestAcceptance6RegressionGuardSweep(unittest.TestCase):
         )
         self.assertEqual(
             violations, [],
-            f"these shim templates emit additionalContext with no "
-            f"escaper call at all: {violations}",
+            f"these shim templates mention additionalContext but do not "
+            f"route through the shared ds_hook_emit_context emitter: {violations}",
         )
+
+    def test_no_shim_emits_top_level_additional_context(self):
+        """Claude Code ignores a top-level additionalContext key; it must be
+        nested under hookSpecificOutput. A hand-built JSON literal in any
+        shim reintroduces the defect, so no template may contain the quoted
+        key at all -- only ds_hook_emit_context (platform.sh) builds it."""
+        proc = subprocess.run(
+            ["git", "-C", TOOL_HOME, "ls-files", "-z", "share/hook-shims"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        templates = [
+            p for p in proc.stdout.split("\0") if p.endswith(".sh.template")
+        ]
+        self.assertGreaterEqual(len(templates), 6)
+        offenders = []
+        for rel in templates:
+            with open(os.path.join(TOOL_HOME, rel), encoding="utf-8") as f:
+                if '"additionalContext"' in f.read():
+                    offenders.append(rel)
+        self.assertEqual(
+            offenders, [],
+            f"shim templates hand-build an additionalContext JSON key "
+            f"instead of using ds_hook_emit_context: {offenders}",
+        )
+
+    def test_emitter_envelope_shape(self):
+        """ds_hook_emit_context builds the documented envelope, with
+        systemMessage only when supplied, and fails closed on empty text or
+        an unsafe event name."""
+        def emit(*args):
+            return subprocess.run(
+                ["/bin/sh", "-c",
+                 '. "$1"; shift; ds_hook_emit_context "$@"',
+                 "sh", os.path.join(TOOL_HOME, "scripts", "platform.sh"), *args],
+                capture_output=True, text=True, timeout=15,
+            )
+        ok = emit("SessionStart", 'a "q"\nline2')
+        self.assertEqual(ok.returncode, 0, msg=ok.stderr)
+        payload = json.loads(ok.stdout)
+        self.assertEqual(
+            payload,
+            {"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                    "additionalContext": 'a "q"\nline2'}},
+        )
+        with_sys = json.loads(emit("SessionStart", "ctx", "visible").stdout)
+        self.assertEqual(with_sys["systemMessage"], "visible")
+        self.assertEqual(
+            with_sys["hookSpecificOutput"]["additionalContext"], "ctx"
+        )
+        for bad_args in (("SessionStart", ""), ("", "x"), ("Bad Event", "x"),
+                         ('Evil"', "x")):
+            res = emit(*bad_args)
+            self.assertNotEqual(res.returncode, 0, bad_args)
+            self.assertEqual(res.stdout, "", bad_args)
 
     def test_guard_hooks_correctly_excluded_no_json_emission(self):
         """Non-goal check: the two guard hooks (pre-bash-guard,
@@ -618,7 +675,11 @@ class TestPromptInjectContentCarriesThroughPostToolNudge(unittest.TestCase):
             stdout = result.stdout.decode()
             self.assertTrue(stdout.strip())
             payload = json.loads(stdout)
-            self.assertIn("changes committed", payload["additionalContext"])
+            self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "PostToolUse")
+            self.assertIn(
+                "changes committed", payload["hookSpecificOutput"]["additionalContext"]
+            )
+            self.assertNotIn("additionalContext", payload)
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)

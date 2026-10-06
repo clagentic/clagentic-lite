@@ -20,7 +20,7 @@
 #    Opt-out: CLAGENTIC_DISABLE_AUTOSUMMARIZE=1
 #    Threshold: CLAGENTIC_AUTOSUMMARIZE_BYTES (default 32768)
 #
-# managed-by: clagentic · clagentic-hooks-version: v4
+# managed-by: clagentic · clagentic-hooks-version: v5
 # Source of truth: share/hook-shims/post-tool-nudge.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/post-tool-nudge.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -71,25 +71,10 @@ REPO_ROOT=$(ds_repo_root 2>/dev/null || true)
 AUDIT_DB=""
 [ -n "$REPO_ROOT" ] && AUDIT_DB="$REPO_ROOT/.clagentic/lite/audit.db"
 
-# JSON-escape a plain-text string for safe embedding in a JSON string value,
-# via ds_json_escape (scripts/platform.sh, lr-b82538 hoist -- replaces this
-# shim's own former local copy). platform.sh load is unconditional above
-# (`|| exit 0` on source failure), so ds_json_escape is defined here, but a
-# call to it can still fail at runtime (e.g. python3 present but its stdin
-# pipe breaks) -- fail CLOSED on that failure by emitting nothing rather than
-# the raw, unescaped value. The prior `|| printf '%s' "$1"` fallback fired on
-# ANY ds_json_escape failure, not merely unavailability, and could leak
-# attacker-influenceable summarized tool-result content (the auto-summarize
-# digest hint, section 3 below) into the JSON payload unescaped -- BOBBIE
-# review of PR #210, lr-b82538 fold-in. Every call site below only appends
-# its message when non-empty, so an empty return here silently drops that
-# one message segment rather than corrupting the whole payload; mirrors the
-# fail-closed posture prompt-inject.sh.template and session-start.sh
-# .template (this same fold-in) both use at their own escaper-unavailable
-# branches.
-_json_escape() {
-  ds_json_escape "$1" 2>/dev/null
-}
+# Message segments below are kept RAW (unescaped). ds_hook_emit_context
+# escapes the combined text once and fails closed (emits nothing) on any
+# escape failure, so attacker-influenceable content (the auto-summarize digest
+# hint) can never reach the JSON payload unescaped.
 
 # ---- section 1: context-budget monitor ----
 
@@ -164,7 +149,7 @@ if [ "${CLAGENTIC_DISABLE_BUDGET:-0}" != "1" ]; then
     _raw_msg=$(printf \
       'CLAGENTIC BUDGET \302\267 tool result: ~%s tokens (session total: ~%s tokens)%s%s' \
       "$RESULT_TOKENS" "$CUMULATIVE" "$RESULT_LABEL" "$SESSION_LABEL")
-    BUDGET_MSG=$(_json_escape "$_raw_msg")
+    BUDGET_MSG="$_raw_msg"
   fi
 fi
 
@@ -274,7 +259,7 @@ if [ "${CLAGENTIC_DISABLE_AUTOSUMMARIZE:-0}" != "1" ] && [ -n "$REPO_ROOT" ]; th
             _approx_tokens=$(( RESULT_BYTES / 4 ))
             _raw_autosummarize=$(printf 'CLAGENTIC AUTOSUMMARIZE \302\267 large result (~%s tokens) stored as digest: %s...' \
               "$_approx_tokens" "$_digest_hint")
-            AUTOSUMMARIZE_MSG=$(_json_escape "$_raw_autosummarize")
+            AUTOSUMMARIZE_MSG="$_raw_autosummarize"
           fi
         fi
       fi
@@ -282,16 +267,18 @@ if [ "${CLAGENTIC_DISABLE_AUTOSUMMARIZE:-0}" != "1" ] && [ -n "$REPO_ROOT" ]; th
   esac
 fi
 
-# ---- emit combined additionalContext ----
+# ---- emit combined context ----
 
-# Accumulate all non-empty message parts, separated by \n\n in the JSON string.
+# Accumulate all non-empty raw message parts, separated by a blank line.
+NL='
+'
 CONTEXT=""
 
 _append_context() {
   _part="$1"
   if [ -n "$_part" ]; then
     if [ -n "$CONTEXT" ]; then
-      CONTEXT="${CONTEXT}\\n\\n${_part}"
+      CONTEXT="${CONTEXT}${NL}${NL}${_part}"
     else
       CONTEXT="$_part"
     fi
@@ -300,14 +287,11 @@ _append_context() {
 
 _append_context "$BUDGET_MSG"
 _append_context "$AUTOSUMMARIZE_MSG"
-# GIT_MSG needs JSON-escaping (BUDGET_MSG and AUTOSUMMARIZE_MSG are pre-escaped).
-if [ -n "$GIT_MSG" ]; then
-  _append_context "$(_json_escape "$GIT_MSG")"
-fi
+_append_context "$GIT_MSG"
 
 # Exit silently when no section produced output.
 [ -z "$CONTEXT" ] && exit 0
 
-printf '{"additionalContext": "%s"}\n' "$CONTEXT"
+ds_hook_emit_context PostToolUse "$CONTEXT" || true
 
 exit 0
