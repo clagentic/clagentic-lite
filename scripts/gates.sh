@@ -2976,15 +2976,23 @@ _ledger_mark_recurrence() {
     return 0
   fi
 
+  # The findings travel by file: see _stage_payload_file.
+  _lmr_findings_file=$(_stage_payload_file clagentic-ledger-findings "$_lmr_findings_json") || {
+    printf '%s' "$_lmr_findings_json"
+    return 0
+  }
   _lmr_prior_entries=$(mktemp -t clagentic-ledger-prior.XXXXXX)
   if [ -f "$_lmr_ledger" ]; then
     ledger_entries_for_branch "$_lmr_ledger" "$_lmr_branch" > "$_lmr_prior_entries" 2>/dev/null
   fi
 
-  _lmr_out=$(python3 - "$_lmr_findings_json" "$_lmr_prior_entries" <<'PYEOF'
+  _lmr_out=$(python3 - "$_lmr_findings_file" "$_lmr_prior_entries" <<'PYEOF'
 import json, sys
 
-findings_json, prior_entries_path = sys.argv[1], sys.argv[2]
+findings_path, prior_entries_path = sys.argv[1], sys.argv[2]
+
+with open(findings_path) as fh:
+    findings_json = fh.read()
 
 try:
     findings = json.loads(findings_json)
@@ -3024,7 +3032,7 @@ for f in findings:
 print(json.dumps(findings))
 PYEOF
 )
-  rm -f "$_lmr_prior_entries"
+  rm -f "$_lmr_prior_entries" "$_lmr_findings_file"
   [ -n "$_lmr_out" ] && printf '%s' "$_lmr_out" || printf '%s' "$_lmr_findings_json"
   return 0
 }
@@ -3077,6 +3085,10 @@ _ledger_record_review_verdict() {
   [ -n "$_lrrv_findings" ] || _lrrv_findings='[]'
 
   _lrrv_line=""
+  # The findings list is unbounded, so it reaches jq/python3 by file, never as
+  # an exec argument (see _stage_payload_file). A staging failure drops the
+  # ledger entry like any other ledger write failure: fail-open.
+  _lrrv_findings_file=$(_stage_payload_file clagentic-ledger-verdict "$_lrrv_findings") || return 0
   if command -v jq >/dev/null 2>&1; then
     _lrrv_line=$(jq -nc \
       --arg ts "$_lrrv_ts" \
@@ -3085,15 +3097,16 @@ _ledger_record_review_verdict() {
       --arg base "$_lrrv_base_sha" \
       --arg head "$_lrrv_head_sha" \
       --arg verdict "$_lrrv_verdict" \
-      --argjson findings "$_lrrv_findings" \
+      --slurpfile findings "$_lrrv_findings_file" \
       --argjson config "$_lrrv_config" \
-      '{ts: $ts, branch: $branch, gate: $gate, base_sha: $base, head_sha: $head, verdict: $verdict, findings: $findings, config: $config}' 2>/dev/null)
+      '{ts: $ts, branch: $branch, gate: $gate, base_sha: $base, head_sha: $head, verdict: $verdict, findings: $findings[0], config: $config}' 2>/dev/null)
   elif command -v python3 >/dev/null 2>&1; then
-    _lrrv_line=$(python3 - "$_lrrv_ts" "$_lrrv_branch" "$_lrrv_gate" "$_lrrv_base_sha" "$_lrrv_head_sha" "$_lrrv_verdict" "$_lrrv_findings" "$_lrrv_config" <<'PYEOF'
+    _lrrv_line=$(python3 - "$_lrrv_ts" "$_lrrv_branch" "$_lrrv_gate" "$_lrrv_base_sha" "$_lrrv_head_sha" "$_lrrv_verdict" "$_lrrv_findings_file" "$_lrrv_config" <<'PYEOF'
 import json, sys
-ts, branch, gate, base, head, verdict, findings_json, config_json = sys.argv[1:9]
+ts, branch, gate, base, head, verdict, findings_path, config_json = sys.argv[1:9]
 try:
-    findings = json.loads(findings_json)
+    with open(findings_path) as fh:
+        findings = json.load(fh)
     if not isinstance(findings, list):
         findings = []
 except Exception:
@@ -3109,6 +3122,7 @@ print(json.dumps({
 PYEOF
 )
   fi
+  rm -f "$_lrrv_findings_file"
 
   [ -n "$_lrrv_line" ] || return 0
 
@@ -3223,8 +3237,7 @@ _render_review_verdict_lines() {
     # The findings travel through a file, not argv: one argv string is capped
     # at ~128 KiB by the kernel, so a large findings list made the exec fail
     # outright and the caller degrade to a false "no review recorded".
-    _rrvl_tmp=$(mktemp -t clagentic-review-findings.XXXXXX) || return 1
-    printf '%s' "$_rrvl_findings" > "$_rrvl_tmp"
+    _rrvl_tmp=$(_stage_payload_file clagentic-review-findings "$_rrvl_findings") || return 1
     python3 - "$_rrvl_head" "$_rrvl_tmp" <<'PYEOF'
 import json, sys
 
@@ -4119,8 +4132,12 @@ _cross_round_dedup() {
     _crd_tmp=$(mktemp -t clagentic-crd-env.XXXXXX)
     _crd_spliced=0
     if command -v jq >/dev/null 2>&1; then
-      _crd_deduped_json=$(cat "$_crd_deduped_findings")
-      if jq --argjson df "$_crd_deduped_json" '.findings = $df' "$_crd_envelope" > "$_crd_tmp" 2>/dev/null; then
+      # The deduped array is read from its file, not passed as an exec
+      # argument (see _stage_payload_file). An empty or non-array file is a
+      # failed splice, as it was when the value was parsed by --argjson.
+      if jq --slurpfile df "$_crd_deduped_findings" \
+          'if ($df | length) == 1 and ($df[0] | type) == "array" then .findings = $df[0] else error("deduped findings is not one array") end' \
+          "$_crd_envelope" > "$_crd_tmp" 2>/dev/null; then
         mv "$_crd_tmp" "$_crd_envelope"
         _crd_spliced=1
       else
@@ -4330,13 +4347,21 @@ _review_recurrence_demote() {
   # array is written directly to a temp file, not printed, so the two
   # results never interleave on one stream.
   _rrd_spliced_file=$(mktemp -t clagentic-rrd-spliced.XXXXXX)
-  _rrd_demoted_count=$(python3 - "$_rrd_findings" "$_rrd_bumped_tsv" "$_rrd_threshold" "$_rrd_spliced_file" <<'PYEOF'
+  # The findings reach python3 by file (see _stage_payload_file). A staging
+  # failure leaves the envelope untouched, the same conservative outcome as
+  # an unparseable findings list below.
+  _rrd_findings_file=$(_stage_payload_file clagentic-rrd-findings "$_rrd_findings") || {
+    rm -f "$_rrd_bumped_tsv" "$_rrd_spliced_file"
+    return 0
+  }
+  _rrd_demoted_count=$(python3 - "$_rrd_findings_file" "$_rrd_bumped_tsv" "$_rrd_threshold" "$_rrd_spliced_file" <<'PYEOF'
 import json, sys
 
-findings_json, tsv_path, threshold, out_path = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+findings_path, tsv_path, threshold, out_path = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 
 try:
-    findings = json.loads(findings_json)
+    with open(findings_path) as fh:
+        findings = json.load(fh)
     if not isinstance(findings, list):
         raise ValueError("not a list")
 except Exception:
@@ -4398,6 +4423,7 @@ except Exception:
 print(demoted)
 PYEOF
 )
+  rm -f "$_rrd_findings_file"
   case "$_rrd_demoted_count" in ''|*[!0-9]*) _rrd_demoted_count=0 ;; esac
 
   if [ -s "$_rrd_spliced_file" ]; then
@@ -4563,10 +4589,13 @@ _review_deferral_match() {
   # longer exists, or whose hash cannot be computed, yields no row for that
   # entry (fail-closed: absent row means no match is possible for it).
   _rdm_live_tsv=$(mktemp -t clagentic-rdm-live.XXXXXX)
+  # deferrals.json is operator-written and unbounded, so python3 reads it by
+  # path rather than receiving its text as an exec argument.
   _rdm_ids=$(python3 -c '
 import json, sys
 try:
-    d = json.loads(sys.argv[1])
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)
     if not isinstance(d, list):
         raise ValueError
 except Exception:
@@ -4595,7 +4624,7 @@ for e in d:
             and scope == "stable-contract"):
         continue
     print("\t".join([eid, fname, str(category), message, fsha]))
-' "$_rdm_deferrals" 2>/dev/null)
+' "$_rdm_dfile" 2>/dev/null)
 
   if [ -z "$_rdm_ids" ]; then
     rm -f "$_rdm_live_tsv"
@@ -4630,13 +4659,20 @@ for e in d:
   # own-the-field" discipline (lr-66e598 follow-up) — never leave whatever
   # the object already carried untouched.
   _rdm_spliced=$(mktemp -t clagentic-rdm-spliced.XXXXXX)
-  _rdm_matched_count=$(python3 - "$_rdm_findings" "$_rdm_live_tsv" "$_rdm_spliced" <<'PYEOF'
+  # The findings reach python3 by file (see _stage_payload_file); a staging
+  # failure leaves the envelope untouched, like an unparseable findings list.
+  _rdm_findings_file=$(_stage_payload_file clagentic-rdm-findings "$_rdm_findings") || {
+    rm -f "$_rdm_live_tsv" "$_rdm_spliced"
+    return 0
+  }
+  _rdm_matched_count=$(python3 - "$_rdm_findings_file" "$_rdm_live_tsv" "$_rdm_spliced" <<'PYEOF'
 import json, sys
 
-findings_json, tsv_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+findings_path, tsv_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
 
 try:
-    findings = json.loads(findings_json)
+    with open(findings_path) as fh:
+        findings = json.load(fh)
     if not isinstance(findings, list):
         raise ValueError("not a list")
 except Exception:
@@ -4686,6 +4722,7 @@ except Exception:
 print(matched)
 PYEOF
 )
+  rm -f "$_rdm_findings_file"
   case "$_rdm_matched_count" in ''|*[!0-9]*) _rdm_matched_count=0 ;; esac
 
   if [ -s "$_rdm_spliced" ]; then
@@ -6968,16 +7005,17 @@ EOF
     return 0
   fi
   if command -v python3 >/dev/null 2>&1; then
-    python3 -c '
+    # The array goes over stdin, not argv (see _stage_payload_file).
+    printf '%s' "$_faf_json" | python3 -c '
 import json, sys
-raw = sys.argv[1]
+raw = sys.stdin.read()
 try:
     pretty = json.dumps(json.loads(raw), indent=2)
 except Exception:
     pretty = raw
 block = "===BEGIN ADVERSARIAL FINDINGS DATA===\n" + pretty + "\n===END ADVERSARIAL FINDINGS DATA==="
 print(json.dumps(block))
-' "$_faf_json"
+'
     return 0
   fi
   printf '""'
@@ -7028,9 +7066,10 @@ EOF
     return 0
   fi
   if command -v python3 >/dev/null 2>&1; then
-    python3 -c '
+    # The object goes over stdin, not argv (see _stage_payload_file).
+    printf '%s' "$_fdg_json" | python3 -c '
 import json, sys
-raw = sys.argv[1]
+raw = sys.stdin.read()
 try:
     pretty = json.dumps(json.loads(raw), indent=2)
 except Exception:
@@ -7039,7 +7078,7 @@ except Exception:
 # blank line before EOF) -- see this function doc comment.
 block = "===BEGIN DETERMINISTIC GATES DATA===\n" + pretty + "\n===END DETERMINISTIC GATES DATA===\n"
 print(json.dumps(block))
-' "$_fdg_json"
+'
     return 0
   fi
   printf '""'
@@ -7260,12 +7299,17 @@ _sanitize_adversarial_report_for_prompt() {
   _llm_field_sanitize "$_sar_text" "$((_sar_len * 3))"
 }
 
-# _bgs_stage_payload_file PREFIX PAYLOAD — write PAYLOAD to a new temp file
-# and print its path. Returns 1 with no output (and no file left behind) when
-# the temp file cannot be created or fully written. build_gate_summary hands
-# large payloads to its python3 emitter by path because an argv string over
-# MAX_ARG_STRLEN (~128 KiB) fails exec.
-_bgs_stage_payload_file() {
+# _stage_payload_file PREFIX PAYLOAD — the one handoff primitive for any
+# JSON/text payload that has no fixed size bound. Writes PAYLOAD to a new temp
+# file and prints its path; the caller removes it. Returns 1 with no output
+# (and no file left behind) when the temp file cannot be created or fully
+# written. A payload must reach jq or python3 by path (jq --slurpfile /
+# --rawfile, python3 argv path) or on stdin, never as an exec argument: one
+# argv string over MAX_ARG_STRLEN (~128 KiB) fails exec with E2BIG. The shell
+# builtin printf writes the file, so the write itself has no such limit.
+# scripts/test_json_payload_handoff.py sweeps gates.sh and host-adapter.sh for
+# any other argv-passed payload.
+_stage_payload_file() {
   _bsp_path=$(mktemp -t "$1.XXXXXX" 2>/dev/null) || return 1
   [ -n "$_bsp_path" ] || return 1
   if ! printf '%s' "$2" > "$_bsp_path" 2>/dev/null; then
@@ -8370,7 +8414,7 @@ EOF
     trap '_bgs_cleanup_payload_tmp; exit 143' TERM
     trap '_bgs_cleanup_payload_tmp; exit 129' HUP
     if [ "$REVIEW_DEGRADED" != "true" ] && [ "$REVIEW_FENCED_PAYLOAD" != "null" ]; then
-      _bgs_review_tmp=$(_bgs_stage_payload_file clagentic-gate-review "$REVIEW_FENCED_PAYLOAD") || {
+      _bgs_review_tmp=$(_stage_payload_file clagentic-gate-review "$REVIEW_FENCED_PAYLOAD") || {
         _bgs_review_tmp=""
         REVIEW_DEGRADED=true
         REVIEW_FENCED_PAYLOAD=$_GATE_REVIEW_UNAVAILABLE_FENCED
@@ -8378,7 +8422,7 @@ EOF
       }
     fi
     if [ "$ADVERSARIAL_REPORT_DEGRADED" != "true" ] && [ "$ADVERSARIAL_FENCED_PAYLOAD" != "null" ]; then
-      _bgs_adv_tmp=$(_bgs_stage_payload_file clagentic-gate-adversarial "$ADVERSARIAL_FENCED_PAYLOAD") || {
+      _bgs_adv_tmp=$(_stage_payload_file clagentic-gate-adversarial "$ADVERSARIAL_FENCED_PAYLOAD") || {
         _bgs_adv_tmp=""
         ADVERSARIAL_REPORT_DEGRADED=true
         ADVERSARIAL_FENCED_PAYLOAD=$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED
