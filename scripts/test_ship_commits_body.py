@@ -124,12 +124,43 @@ def _sweep_for_pr_body_edits(root):
     hits = []
     for rel in tracked:
         with open(os.path.join(root, rel), encoding="utf-8") as f:
-            for n, line in enumerate(f, 1):
-                if line.strip().startswith("#"):
-                    continue
-                if re.search(r"\bpr\s+edit\b", line) or re.search(r"\bgh\s+api\b", line):
-                    hits.append((rel, n))
+            lines = f.read().splitlines()
+        for n, logical in _logical_lines(lines):
+            if _line_edits_pr_body(logical):
+                hits.append((rel, n))
     return tracked, hits
+
+
+def _logical_lines(lines):
+    """Yield (first_line_no, text) with backslash continuations joined and
+    comment lines dropped, so `... api path \\` + `-X PATCH` is one line."""
+    out, buf, start = [], "", 0
+    for n, raw in enumerate(lines, 1):
+        if not buf and raw.strip().startswith("#"):
+            continue
+        if not buf:
+            start = n
+        if raw.rstrip().endswith("\\"):
+            buf += raw.rstrip()[:-1] + " "
+            continue
+        out.append((start, buf + raw))
+        buf = ""
+    if buf:
+        out.append((start, buf))
+    return out
+
+
+_API_WORD = re.compile(r"\bapi\b")
+_WRITE_VERB = re.compile(r"(?i:\bPATCH\b|\bPUT\b)|(?:^|\s)-X\s*\w*|--method\b")
+
+
+def _line_edits_pr_body(line):
+    """True for any shape that could rewrite a PR body: `pr edit` through any
+    binary, a literal `gh api`, or an `api` subcommand through a variable- or
+    path-named binary combined with PATCH/PUT, -X or --method."""
+    if re.search(r"\bpr\s+edit\b", line) or re.search(r"\bgh\s+api\b", line):
+        return True
+    return bool(_API_WORD.search(line) and _WRITE_VERB.search(line))
 
 
 _FAKE_GH = textwrap.dedent('''\
@@ -150,22 +181,48 @@ _FAKE_GH = textwrap.dedent('''\
         with open(argv[argv.index("--body-file") + 1]) as f:
             return f.read()
 
+    OPEN_NUMBER, CLOSED_NUMBER = "7", "3"
+
+    def target_is_closed():
+        # A numeric ref addresses exactly one PR. A bare branch name is
+        # ambiguous when a closed and an open PR share it; the stub resolves
+        # it to the CLOSED one, the wrong-PR hazard being guarded against.
+        ref = argv[2]
+        if ref == CLOSED_NUMBER:
+            return True
+        if ref == OPEN_NUMBER:
+            return False
+        return bool(st.get("closed_pr"))
+
     rc = 0
     if argv[:2] == ["pr", "view"] and "--json" in argv:
         if st.get("read_fail"):
             sys.stderr.write("simulated read failure\\n")
             rc = 1
+        elif target_is_closed():
+            print(st.get("closed_body", ""))
+            for c in st.get("closed_comments", []):
+                print(c)
         else:
             print(st["body"])
             for c in st["comments"]:
                 print(c)
     elif argv[:2] == ["pr", "list"]:
-        # Open-PR lookup. A CLOSED/MERGED PR for the branch is not returned.
+        # Open-PR lookup honoring --state (default open), modelling one open
+        # PR (number 7, when "exists") and one closed PR (number 3, when
+        # "closed_pr") on the same branch.
         if st.get("list_fail"):
             sys.stderr.write("simulated transient host failure\\n")
             rc = 1
         else:
-            print(1 if st["exists"] else 0)
+            wanted = argv[argv.index("--state") + 1] if "--state" in argv else "open"
+            numbers = []
+            if st["exists"] and wanted in ("open", "all"):
+                numbers.append(OPEN_NUMBER)
+            if st.get("closed_pr") and wanted in ("closed", "all"):
+                numbers.append(CLOSED_NUMBER)
+            if numbers:
+                print(numbers[0])
     elif argv[:2] == ["pr", "view"]:
         # Bare view matches closed/merged PRs too, as the real CLI does.
         rc = 0 if (st["exists"] or st.get("closed_pr")) else 1
@@ -174,7 +231,8 @@ _FAKE_GH = textwrap.dedent('''\
         st["body"] = body_file() if "--body-file" in argv else ""
         st["created_bodies"].append(st["body"])
     elif argv[:2] == ["pr", "comment"]:
-        st["comments"].append(body_file())
+        key = "closed_comments" if target_is_closed() else "comments"
+        st.setdefault(key, []).append(body_file())
     save()
     sys.exit(rc)
 ''')
@@ -321,6 +379,35 @@ class TestPlaceholderOnlyWhenRangeUnavailable(unittest.TestCase):
         r = _call_build_ship_pr_body(e.repo, _git(["rev-parse", "HEAD"], e.repo))
         self.assertIn("No commits to list", r.stdout)
         self.assertEqual(MARKER_RE.findall(r.stdout), [])
+
+
+class TestCommitBodyCannotBecomeMarkdownStructure(unittest.TestCase):
+    HOSTILE = ["## X", "```", "injected after a fence", "````", "# Another", "---"]
+
+    def test_hostile_body_is_confined_to_a_fence_longer_than_any_backtick_run(self):
+        e = _Env(self)
+        _commit(e.repo, "h.txt", "hostile body", self.HOSTILE)
+        _commit(e.repo, "i.txt", "innocent follow-up", ["plain text"])
+        r = _call_build_ship_pr_body(e.repo, _git(["rev-parse", "HEAD"], e.repo))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        section = _section_one(r.stdout)
+        lines = section.split("\n")
+        fence_re = re.compile(r"^ {2}(`{3,})$")
+        fences = [(i, fence_re.match(l).group(1)) for i, l in enumerate(lines) if fence_re.match(l)]
+        open_i, open_f = fences[0]
+        self.assertGreater(len(open_f), 4, "fence must outrun the longest backtick run (4) in the body")
+        # The first line that can close the fence is the first one at least as
+        # long as the opener; the body's own 3- and 4-backtick lines cannot.
+        close_i = next(i for i, f in fences[1:] if len(f) >= len(open_f))
+        self.assertEqual(lines[close_i].strip(), open_f)
+        inside = lines[open_i + 1:close_i]
+        self.assertIn("  ```", inside)
+        self.assertIn("  # Another", inside)
+        self.assertIn("  ## X", inside)
+        self.assertIn("  injected after a fence", inside)
+        self.assertEqual([l for l in lines[:open_i] if l.startswith("#")], [])
+        self.assertIn("innocent follow-up", section)
+        self.assertIn(NEXT_HEADING, r.stdout)
 
 
 class TestBaseResolverStderrIsNotPartOfTheRef(unittest.TestCase):
@@ -500,6 +587,26 @@ class TestShipPrLookupStates(unittest.TestCase):
             self.assertIn(subject, st["created_bodies"][0])
         self.assertEqual(st["comments"], [])
 
+    def test_closed_and_open_pr_on_one_branch_read_and_comment_target_the_open_number(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        self.assertEqual(e.ship().returncode, 0)
+        # A stale CLOSED PR on the same branch, carrying a decoy marker that
+        # would mislead a wrong-PR read into listing the full range.
+        e.set_state(closed_pr=True, closed_body="old PR, no marker", closed_comments=[], calls=[])
+        _commit(e.repo, "f9.txt", "fix off-by-one in parser", ["Found while reviewing."])
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = e.calls()
+        for c in calls:
+            if c.startswith(("pr view", "pr comment")):
+                self.assertRegex(c, r"^pr (view|comment) 7\b", "must address the open PR by number: %r" % c)
+        st = e.state()
+        self.assertEqual(st["closed_comments"], [])
+        self.assertEqual(len(st["comments"]), 1)
+        self.assertIn("fix off-by-one in parser", st["comments"][0])
+        self.assertNotIn("add parser", st["comments"][0], "marker must come from the open PR, not the closed one")
+
     def test_create_after_unresolved_base_then_reship_lists_the_full_range(self):
         e = _Env(self, with_remote=False)
         _add_three_commits(e.repo)
@@ -591,6 +698,28 @@ class TestAdapterContractAdditions(unittest.TestCase):
         tracked, violations = _sweep_for_pr_body_edits(SCRIPTS_DIR)
         self.assertTrue(tracked)
         self.assertEqual(violations, [])
+
+    def test_sweep_catches_every_body_edit_shape(self):
+        shapes = [
+            'gh pr edit 1 --body x',
+            '"$GH" pr edit "$N" --body-file f',
+            'gh api repos/o/r/pulls/1 -X PATCH -f body=x',
+            '"$GH" api repos/o/r/pulls/1 -X PATCH -f body=x',
+            '$HOST_CLI api repos/o/r/pulls/1 --method PATCH',
+            '/usr/bin/ghx api -XPATCH repos/o/r/pulls/1',
+            '"$GH" api repos/o/r/pulls/1 \\\n  --method PATCH \\\n  -f body=x',
+        ]
+        for shape in shapes:
+            with self.subTest(shape=shape):
+                found = [n for n, text in _logical_lines(shape.split("\n")) if _line_edits_pr_body(text)]
+                self.assertTrue(found, "body-edit shape not caught: %r" % shape)
+
+    def test_sweep_does_not_flag_read_only_calls(self):
+        for ok in ['gh pr list --head b --state open', 'gh pr comment 7 --body-file f',
+                   'echo "the api is stable"', '# gh api -X PATCH in a comment']:
+            with self.subTest(line=ok):
+                found = [n for n, text in _logical_lines(ok.split("\n")) if _line_edits_pr_body(text)]
+                self.assertEqual(found, [])
 
     def test_sweep_sees_scripts_in_subdirectories(self):
         tmp = tempfile.mkdtemp(prefix="clagentic-test-sweep-")

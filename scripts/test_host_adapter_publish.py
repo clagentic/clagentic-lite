@@ -222,7 +222,7 @@ def _setup_fake_tool_home(fake_tool_home):
         os.symlink(real_share, fake_share)
 
 
-def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False):
+def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False, closed_pr=False):
     """A fake `gh` executable that intercepts exactly the subcommands
     scripts/host-adapter.sh's gh adapter uses: `pr view`, `pr create`,
     `pr comment`, `pr view --json comments --jq`. Records every invocation
@@ -235,6 +235,8 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False):
                         publish failure), everything else succeeds.
     pr_exists: when True, `pr view <branch>` (no --json) exits 0 (PR already
       open); when False it exits 1 (no PR yet, forcing `pr create`).
+    closed_pr: when True a CLOSED PR exists for the branch; it is returned
+      only for `pr list --state closed|all`, never for the default open lookup.
     """
     os.makedirs(bin_dir, exist_ok=True)
     gh_path = os.path.join(bin_dir, "gh")
@@ -247,6 +249,7 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False):
         bodies_dir = {bodies_dir!r}
         mode = {mode!r}
         pr_exists = {pr_exists!r}
+        closed_pr = {closed_pr!r}
 
         argv = sys.argv[1:]
         with open(calls_file, "a") as f:
@@ -256,8 +259,14 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False):
             print(json.dumps({{"comments": []}}))
             sys.exit(0)
         if argv[:2] == ["pr", "list"]:
-            # Open-PR lookup: only OPEN PRs are returned (--state open).
-            print(1 if pr_exists else 0)
+            # Honors --state (default open): the open PR is number 7, a
+            # closed PR for the same branch is number 3. Prints nothing when
+            # no PR matches, as the real CLI's jq filter would.
+            wanted = argv[argv.index("--state") + 1] if "--state" in argv else "open"
+            if pr_exists and wanted in ("open", "all"):
+                print(7)
+            elif closed_pr and wanted in ("closed", "all"):
+                print(3)
             sys.exit(0)
         if argv[:2] == ["pr", "view"]:
             sys.exit(0 if pr_exists else 1)
@@ -462,6 +471,47 @@ class TestHostAdapterContractDirect(unittest.TestCase):
         calls = _read_calls(self._calls)
         self.assertTrue(any(c.startswith("pr create") for c in calls))
 
+    def test_branch_with_only_a_closed_pr_goes_to_pr_create(self):
+        _make_fake_gh(self._bin, self._calls, pr_exists=False, closed_pr=True)
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_open_change_request main feat/example" % self._repo,
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = _read_calls(self._calls)
+        self.assertTrue(any(c.startswith("pr list") and "--state open" in c for c in calls))
+        self.assertTrue(any(c.startswith("pr create") for c in calls),
+                        "a closed PR is not an open one: the branch must get a new PR")
+
+    def test_post_comment_addresses_the_open_pr_by_number(self):
+        _make_fake_gh(self._bin, self._calls, pr_exists=True, closed_pr=True)
+        body_file = os.path.join(self._tmpdir, "body.txt")
+        with open(body_file, "w") as f:
+            f.write("hello\n")
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_post_comment '%s'" % (self._repo, body_file),
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        comment_calls = [c for c in _read_calls(self._calls) if c.startswith("pr comment")]
+        self.assertEqual(len(comment_calls), 1)
+        self.assertTrue(comment_calls[0].startswith("pr comment 7 "), comment_calls[0])
+
+    def test_post_comment_refuses_when_no_open_pr_exists(self):
+        _make_fake_gh(self._bin, self._calls, pr_exists=False, closed_pr=True)
+        body_file = os.path.join(self._tmpdir, "body.txt")
+        with open(body_file, "w") as f:
+            f.write("hello\n")
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_post_comment '%s'" % (self._repo, body_file),
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(any(c.startswith("pr comment") for c in _read_calls(self._calls)))
+
     def test_open_change_request_with_body_file_uses_fill_first_and_body_file(self):
         """lr-429b32: a BODY_FILE third arg must reach `gh pr create` as
         --body-file, and must NOT fall back to a bare --fill (which would
@@ -521,7 +571,7 @@ class TestHostAdapterContractDirect(unittest.TestCase):
                           "an existing PR must never trigger a create call, body file or not")
 
     def test_post_comment_posts_body_file_contents(self):
-        _make_fake_gh(self._bin, self._calls)
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
         body_file = os.path.join(self._tmpdir, "body.txt")
         with open(body_file, "w") as f:
             f.write("verdict: pass\nhead_sha: abc123\n")
@@ -536,7 +586,7 @@ class TestHostAdapterContractDirect(unittest.TestCase):
         self.assertTrue(any("--body-file" in c for c in calls))
 
     def test_read_comments_returns_json_lines(self):
-        _make_fake_gh(self._bin, self._calls)
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
         r = _run_review_merge_fn(
             "cd '%s' && host_adapter_read_comments" % self._repo,
             env_overrides={"REPO_ROOT": self._repo},
@@ -803,7 +853,7 @@ class TestPublishViaCmdReview(unittest.TestCase):
         head_sha = _git(["rev-parse", "HEAD"], cwd=self._project).stdout.strip()
         _stage_file(self._project, "feature.py", "print('hi')\n")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
-        _make_fake_gh(self._bin, self._calls)
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
         result = _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -836,7 +886,7 @@ class TestPublishViaCmdReview(unittest.TestCase):
         the marker surfaces in the published comment. Opting out here
         isolates that property from the unrelated dedup mechanism."""
         _init_git_repo_with_github_remote(self._project)
-        _make_fake_gh(self._bin, self._calls)
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
         dedup_off = {"CLAGENTIC_CROSS_ROUND_DEDUP": "0"}
 
         # Round 1: a finding that will recur.
@@ -875,7 +925,7 @@ class TestPublishViaCmdReview(unittest.TestCase):
         _init_git_repo_with_github_remote(self._project)
         _stage_file(self._project, "feature.py", "print('hi')\n")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
-        _make_fake_gh(self._bin, self._calls, mode="comment_fail")
+        _make_fake_gh(self._bin, self._calls, mode="comment_fail", pr_exists=True)
         result = _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
         self.assertEqual(result.returncode, 0,
                           "a publish failure must never flip cmd_review's own exit code: %s" % result.stderr)
@@ -892,7 +942,7 @@ class TestPublishViaCmdReview(unittest.TestCase):
         _init_git_repo_with_github_remote(self._project)
         _stage_file(self._project, "feature.py", "print('hi')\n")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
-        _make_fake_gh(self._bin, self._calls, mode="comment_fail")
+        _make_fake_gh(self._bin, self._calls, mode="comment_fail", pr_exists=True)
         _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
 
         db_path = os.path.join(self._project, ".clagentic", "lite", "audit.db")
@@ -909,7 +959,7 @@ class TestPublishViaCmdReview(unittest.TestCase):
         _init_git_repo_with_github_remote(self._project)
         _stage_file(self._project, "feature.py", "print('hi')\n")
         _make_stub_llm_client(self._tmpdir, [_envelope([_finding()])])
-        _make_fake_gh(self._bin, self._calls)
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
         result = _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
         self.assertEqual(result.returncode, 1, result.stderr)
 

@@ -71,6 +71,10 @@
 #                                       for its own hidden ship marker) --
 #                                       adapters transport, they never
 #                                       interpret.
+#   Per-PR reads and comments (read_comments, read_thread_text, post_comment)
+#   resolve the OPEN change request once, by number, and address it by that
+#   number -- never by bare branch name, which can match a closed or merged
+#   change request on the same branch. No open change request: non-zero.
 #   A change-request BODY is written ONLY by host_adapter_open_change_request
 #   at create. No adapter function may edit an existing body: later ships add
 #   comments (host_adapter_post_comment), never rewrite the body.
@@ -277,19 +281,28 @@ host_adapter_read_thread_text() {
 
 _HOST_ADAPTER_SHIP_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SHIP_TIMEOUT_SEC "${CLAGENTIC_SHIP_TIMEOUT_SEC:-}" 120)
 
-# _host_adapter_gh_open_pr_state BRANCH -- the ONE place that answers "is an
-# OPEN PR present for BRANCH". Exit 0 = open PR exists, 1 = none, 2 = the
-# host could not be asked (auth/network/timeout/unparseable). A bare
-# `gh pr view BRANCH` cannot be used for this: it also matches CLOSED and
-# MERGED PRs, so a reused branch name would read as already open, and it
-# cannot tell "no PR" from a failed call without parsing error text.
-_host_adapter_gh_open_pr_state() {
-  _hagops_out=$(run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr list --head "$1" --state open --json number --jq 'length' 2>/dev/null) || return 2
-  case "$_hagops_out" in
-    0) return 1 ;;
-    ""|*[!0-9]*) return 2 ;;
-    *) return 0 ;;
+# _host_adapter_gh_open_pr_number BRANCH -- the ONE place that answers "which
+# OPEN PR is there for BRANCH". Prints its number on stdout. Exit 0 = found,
+# 1 = none, 2 = the host could not be asked (auth/network/timeout/
+# unparseable). Bare `gh pr view|comment BRANCH` cannot be used for this or
+# for later per-PR calls: it also matches CLOSED and MERGED PRs, so with a
+# closed and an open PR on one branch name it can hit the wrong one, and it
+# cannot tell "no PR" from a failed call without parsing error text. Every
+# per-PR read/comment therefore addresses the PR by the number found here.
+_host_adapter_gh_open_pr_number() {
+  _hagopn_out=$(run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr list --head "$1" --state open --json number --jq '.[0].number // empty' 2>/dev/null) || return 2
+  case "$_hagopn_out" in
+    "") return 1 ;;
+    *[!0-9]*) return 2 ;;
+    *) printf '%s\n' "$_hagopn_out" ;;
   esac
+}
+
+# _host_adapter_gh_open_pr_state BRANCH -- exit-code-only view of the above.
+_host_adapter_gh_open_pr_state() {
+  _hagops_num=$(_host_adapter_gh_open_pr_number "$1") || return $?
+  [ -n "$_hagops_num" ] || return 2
+  return 0
 }
 
 _host_adapter_gh_open_change_request() {
@@ -333,7 +346,8 @@ _host_adapter_gh_post_comment() {
     _hagpc_branch=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
   fi
   [ -n "$_hagpc_branch" ] || return 1
-  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr comment "$_hagpc_branch" --body-file "$_hagpc_body_file"
+  _hagpc_num=$(_host_adapter_gh_open_pr_number "$_hagpc_branch") || return 1
+  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr comment "$_hagpc_num" --body-file "$_hagpc_body_file"
 }
 
 _host_adapter_gh_read_comments() {
@@ -343,7 +357,8 @@ _host_adapter_gh_read_comments() {
     _hagrc_branch=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
   fi
   [ -n "$_hagrc_branch" ] || return 1
-  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$_hagrc_branch" --json comments --jq '.comments[] | {body: .body}'
+  _hagrc_num=$(_host_adapter_gh_open_pr_number "$_hagrc_branch") || return 1
+  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$_hagrc_num" --json comments --jq '.comments[] | {body: .body}'
 }
 
 _host_adapter_gh_change_request_exists() {
@@ -355,5 +370,6 @@ _host_adapter_gh_change_request_exists() {
 # function passes straight through -- the caller treats that as "read
 # failed", never as "no content".
 _host_adapter_gh_read_thread_text() {
-  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$1" --json body,comments --jq '.body, (.comments[].body)'
+  _hagrtt_num=$(_host_adapter_gh_open_pr_number "$1") || return 1
+  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$_hagrtt_num" --json body,comments --jq '.body, (.comments[].body)'
 }

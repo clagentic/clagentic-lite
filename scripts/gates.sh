@@ -3341,10 +3341,13 @@ _ship_default_base_sha() {
 }
 
 # _ship_format_commit_entry SHA MAX_CHARS — one commit: subject line, then the
-# full body indented under it (so body text containing markdown headings
-# cannot split the PR body's own sections). A single commit whose body alone
-# exceeds MAX_CHARS is cut by whole lines with an explicit count, never
-# silently.
+# full body inside a fenced code block nested under the list item. A fence is
+# the only construct whose content cannot become markdown structure (indent
+# alone does not: CommonMark allows 0-3 leading spaces on an ATX heading), so
+# the fence is made longer than any backtick run in the body, which also means
+# the body cannot close it early. A single commit whose body alone exceeds
+# MAX_CHARS is cut by whole lines with an explicit count, never silently; the
+# notice sits after the closing fence so it renders as prose.
 _ship_format_commit_entry() {
   _sfce_sha="$1"
   _sfce_max="$2"
@@ -3353,10 +3356,18 @@ _ship_format_commit_entry() {
   _sfce_short=$(printf '%s' "$_sfce_sha" | cut -c1-7)
   printf '%s %s (`%s`)\n' '-' "$_sfce_subject" "$_sfce_short"
   [ -n "$_sfce_body" ] || return 0
-  # Slack covers the subject line and the truncation notice below.
-  _sfce_budget=$(( _sfce_max - ${#_sfce_subject} - 80 ))
+  _sfce_fence='```'
+  while :; do
+    case $_sfce_body in
+      *"$_sfce_fence"*) _sfce_fence="${_sfce_fence}\`" ;;
+      *) break ;;
+    esac
+  done
+  # Slack covers the subject line, both fence lines and the truncation notice.
+  _sfce_budget=$(( _sfce_max - ${#_sfce_subject} - 80 - 2 * ${#_sfce_fence} ))
   _sfce_used=0
   _sfce_skipped=0
+  printf '  %s\n' "$_sfce_fence"
   while IFS= read -r _sfce_line; do
     if [ "$_sfce_skipped" -eq 0 ] && [ $(( _sfce_used + ${#_sfce_line} + 3 )) -le "$_sfce_budget" ]; then
       if [ -n "$_sfce_line" ]; then
@@ -3371,6 +3382,7 @@ _ship_format_commit_entry() {
   done <<EOF
 $_sfce_body
 EOF
+  printf '  %s\n' "$_sfce_fence"
   if [ "$_sfce_skipped" -gt 0 ]; then
     printf '  [commit body truncated: %s more lines not shown]\n' "$_sfce_skipped"
   fi
