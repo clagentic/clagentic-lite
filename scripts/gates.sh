@@ -3445,7 +3445,10 @@ _publish_ship_delta_comment() {
     return 0
   fi
 
-  _psdc_thread=$(mktemp -t clagentic-ship-thread.XXXXXX)
+  if ! _psdc_thread=$(mktemp -t clagentic-ship-thread.XXXXXX); then
+    ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=tempfile-failed"
+    return 0
+  fi
   if ! host_adapter_read_thread_text "$_psdc_branch" > "$_psdc_thread" 2>/dev/null; then
     rm -f "$_psdc_thread"
     echo "[gates/ship] could not read the PR thread — no delta comment posted, ship outcome unaffected" 1>&2
@@ -3487,7 +3490,10 @@ _publish_ship_delta_comment() {
     return 0
   fi
 
-  _psdc_body_file=$(mktemp -t clagentic-ship-delta-comment.XXXXXX)
+  if ! _psdc_body_file=$(mktemp -t clagentic-ship-delta-comment.XXXXXX); then
+    ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=tempfile-failed"
+    return 0
+  fi
   {
     printf '**clagentic-lite ship: %s**\n\n' "$_psdc_title"
     [ -z "$_psdc_note" ] || printf '%s\n\n' "$_psdc_note"
