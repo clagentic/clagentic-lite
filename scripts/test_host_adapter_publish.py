@@ -233,6 +233,8 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False, closed_pr=Fal
       "ok"        -- every subcommand succeeds.
       "comment_fail" -- `pr comment` exits 1 (simulates an auth/network
                         publish failure), everything else succeeds.
+      "list_fail" -- `pr list` exits 1 (the open-PR lookup errors), everything
+                     else succeeds.
     pr_exists: when True, `pr view <branch>` (no --json) exits 0 (PR already
       open); when False it exits 1 (no PR yet, forcing `pr create`).
     closed_pr: when True a CLOSED PR exists for the branch; it is returned
@@ -258,6 +260,9 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False, closed_pr=Fal
         if argv[:2] == ["pr", "view"] and "--json" in argv:
             print(json.dumps({{"comments": []}}))
             sys.exit(0)
+        if argv[:2] == ["pr", "list"] and mode == "list_fail":
+            sys.stderr.write("simulated transient host failure\\n")
+            sys.exit(1)
         if argv[:2] == ["pr", "list"]:
             # Honors --state (default open): the open PR is number 7, a
             # closed PR for the same branch is number 3. Prints nothing when
@@ -470,6 +475,20 @@ class TestHostAdapterContractDirect(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = _read_calls(self._calls)
         self.assertTrue(any(c.startswith("pr create") for c in calls))
+
+    def test_open_change_request_refuses_to_create_when_open_pr_lookup_errors(self):
+        _make_fake_gh(self._bin, self._calls, mode="list_fail")
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_open_change_request main feat/example" % self._repo,
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertNotEqual(r.returncode, 0)
+        calls = _read_calls(self._calls)
+        self.assertTrue(any(c.startswith("pr list") for c in calls))
+        self.assertFalse(any(c.startswith("pr create") for c in calls),
+                         "a failed lookup must never fall through to a duplicate create")
+        self.assertFalse(any(c.startswith("pr comment") for c in calls))
 
     def test_branch_with_only_a_closed_pr_goes_to_pr_create(self):
         _make_fake_gh(self._bin, self._calls, pr_exists=False, closed_pr=True)

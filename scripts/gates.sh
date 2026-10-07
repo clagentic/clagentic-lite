@@ -3322,11 +3322,11 @@ _ship_default_base_sha() {
   # glued onto the ref and break merge-base.
   _sdbs_err=$(mktemp -t clagentic-ship-base-err.XXXXXX) || _sdbs_err=/dev/null
   if ! _sdbs_tip=$(_gate_resolve_fresh_default_branch_ref "$_sdbs_default" "$_sdbs_timeout" 2>"$_sdbs_err"); then
-    if [ -s "$_sdbs_err" ]; then
-      cat "$_sdbs_err"
-    else
-      echo "the default branch tip could not be resolved"
-    fi
+    # The reason this function prints can land in a public PR body, so it is
+    # a fixed string; the resolver's raw stderr (paths, hosts, git errors)
+    # stays on the local stderr only.
+    [ ! -s "$_sdbs_err" ] || cat "$_sdbs_err" 1>&2
+    echo "the default branch tip could not be resolved or proven current"
     [ "$_sdbs_err" = /dev/null ] || rm -f "$_sdbs_err"
     return 1
   fi
@@ -3394,7 +3394,8 @@ EOF
 # leaving headroom under the host body limit of 65536 for the other
 # sections). Commits that do not fit are counted in an explicit "N more
 # commits not shown" line. Exit: 0 listed >=1 commit, 3 range is empty,
-# 1 git could not enumerate the range.
+# 1 git could not enumerate the range. Ends with the shipped-head marker for
+# the last commit listed (see the emission point below).
 _ship_render_commit_list() {
   _srcl_base="$1"
   _srcl_head="$2"
@@ -3404,6 +3405,7 @@ _ship_render_commit_list() {
   _srcl_total=$(printf '%s\n' "$_srcl_shas" | wc -l | tr -d ' ')
   _srcl_shown=0
   _srcl_used=0
+  _srcl_last=""
   for _srcl_sha in $_srcl_shas; do
     _srcl_entry=$(_ship_format_commit_entry "$_srcl_sha" "$_srcl_max") || return 1
     # An entry is separated from the next by one blank line (+2 chars).
@@ -3413,11 +3415,18 @@ _ship_render_commit_list() {
     printf '%s\n\n' "$_srcl_entry"
     _srcl_used=$(( _srcl_used + ${#_srcl_entry} + 2 ))
     _srcl_shown=$(( _srcl_shown + 1 ))
+    _srcl_last="$_srcl_sha"
   done
   if [ "$_srcl_shown" -lt "$_srcl_total" ]; then
-    printf '_%s more commits not shown (list capped at %s characters; see the branch history for the rest)._\n' \
+    printf '_%s more commits not shown (list capped at %s characters; the next ship lists them)._\n' \
       "$(( _srcl_total - _srcl_shown ))" "$_srcl_max"
   fi
+  # The ONE marker-emission point for the body and delta-comment paths: it
+  # names the last commit actually listed, never one beyond a cap, so the
+  # commits left unshown are listed by the next re-ship instead of being
+  # anchored past.
+  printf '\n'
+  _ship_marker_line "$_srcl_last"
   return 0
 }
 
@@ -3524,8 +3533,7 @@ _publish_ship_delta_comment() {
   {
     printf '**clagentic-lite ship: %s**\n\n' "$_psdc_title"
     [ -z "$_psdc_note" ] || printf '%s\n\n' "$_psdc_note"
-    printf '%s\n\n' "$_psdc_list"
-    _ship_marker_line "$_psdc_head"
+    printf '%s\n' "$_psdc_list"
   } > "$_psdc_body_file"
 
   if host_adapter_post_comment "$_psdc_body_file"; then
@@ -3634,8 +3642,10 @@ except Exception:
   fi
 
   printf '## What changed and why\n\n'
-  _bspb_listed=1
-  _ship_render_commits_section "$_bspb_head" || _bspb_listed=0
+  # The shipped-head marker is emitted inside the commit list itself (last
+  # LISTED commit), and only when commits were listed -- a placeholder or a
+  # capped list never anchors past content the thread does not show.
+  _ship_render_commits_section "$_bspb_head" || true
   printf '\n'
   printf '## Review provenance\n\n%s\n\n' "$_bspb_review_section"
   printf '## Gate attestation\n\n%s\n\n' "$_bspb_manifest_section"
@@ -3643,13 +3653,6 @@ except Exception:
   printf '_Not recorded by tooling; fill in by hand, or state "none" if none were seriously considered._\n\n'
   printf '## Explicitly out of scope\n\n'
   printf '_Not recorded by tooling; fill in by hand, or state "none" if the change is fully self-contained._\n'
-  # No marker when section 1 is a placeholder: a later re-ship would anchor on
-  # it and list only newer commits, so the earlier ones would never appear
-  # anywhere. Without a marker the re-ship lists the full range instead.
-  if [ -n "$_bspb_head" ] && [ "$_bspb_listed" = "1" ]; then
-    printf '\n'
-    _ship_marker_line "$_bspb_head"
-  fi
 }
 
 # get_review_diff — prints the best available diff to stdout for use by

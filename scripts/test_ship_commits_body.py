@@ -351,7 +351,7 @@ class TestPlaceholderOnlyWhenRangeUnavailable(unittest.TestCase):
         r = _call_build_ship_pr_body(e.repo, _git(["rev-parse", "HEAD"], e.repo))
         section = _section_one(r.stdout)
         self.assertIn("Commit list unavailable", section)
-        self.assertIn("cannot establish a provably current baseline", section)
+        self.assertIn("the default branch tip could not be resolved or proven current", section)
 
     def test_empty_range_says_so(self):
         e = _Env(self)
@@ -435,6 +435,81 @@ class TestBaseResolverStderrIsNotPartOfTheRef(unittest.TestCase):
         self.assertNotIn("WARN", r.stdout)
         for subject, _ in THREE_COMMITS:
             self.assertIn(subject, section)
+
+
+class TestPublicReasonIsFixedString(unittest.TestCase):
+    def test_resolver_stderr_never_reaches_the_body(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        head = _git(["rev-parse", "HEAD"], e.repo)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
+        env["CLAGENTIC_PROJECT_ROOT"] = e.repo
+        script = textwrap.dedent("""\
+            . '%s'
+            _gate_resolve_fresh_default_branch_ref() {
+              echo "fatal: unable to access /home/secretuser/internal.example.org" 1>&2
+              return 1
+            }
+            _build_ship_pr_body 'feat/example' '%s'
+        """) % (GATES_SH, head)
+        r = subprocess.run(["sh", "-c", script, GATES_SH], capture_output=True, text=True,
+                           env=env, cwd=e.repo, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("the default branch tip could not be resolved or proven current", r.stdout)
+        self.assertNotIn("secretuser", r.stdout)
+        self.assertNotIn("internal.example.org", r.stdout)
+        self.assertIn("secretuser", r.stderr, "raw detail stays on the local stderr")
+
+
+class TestCappedListMarkerCoversOnlyListedCommits(unittest.TestCase):
+    CAP = {"CLAGENTIC_SHIP_COMMITS_MAX_CHARS": "1500"}
+
+    def _ship(self, e):
+        env = {"CLAGENTIC_SHIP_COMMITS_MAX_CHARS": self.CAP["CLAGENTIC_SHIP_COMMITS_MAX_CHARS"]}
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            return e.ship()
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def _listed(self, text):
+        return [int(n) for n in re.findall(r"^- commit number (\d+) \(", text, re.M)]
+
+    def test_capped_body_marker_is_last_listed_commit(self):
+        e = _Env(self)
+        shas = [_commit(e.repo, "f%d.txt" % i, "commit number %d" % i, ["x" * 300]) for i in range(10)]
+        r = _call_build_ship_pr_body(e.repo, shas[-1], self.CAP)
+        listed = self._listed(r.stdout)
+        self.assertLess(len(listed), 10)
+        self.assertEqual(MARKER_RE.findall(r.stdout), [shas[listed[-1]]])
+
+    def test_reships_page_through_the_unshown_commits_then_stop(self):
+        e = _Env(self)
+        for i in range(10):
+            _commit(e.repo, "f%d.txt" % i, "commit number %d" % i, ["x" * 300])
+        self.assertEqual(self._ship(e).returncode, 0)
+        seen = self._listed(e.state()["created_bodies"][0])
+        self.assertLess(len(seen), 10)
+        guard = 0
+        while len(seen) < 10 and guard < 12:
+            guard += 1
+            before = len(e.state()["comments"])
+            self.assertEqual(self._ship(e).returncode, 0)
+            comments = e.state()["comments"]
+            self.assertEqual(len(comments), before + 1, "each re-ship pages one more comment")
+            page = self._listed(comments[-1])
+            self.assertTrue(page)
+            self.assertEqual(page[0], seen[-1] + 1, "continues exactly after the last listed commit")
+            seen += page
+        self.assertEqual(seen, list(range(10)), "no commit is ever permanently unlisted")
+        self.assertEqual(self._ship(e).returncode, 0)
+        self.assertEqual(len(e.state()["comments"]), guard, "fully listed: a further re-ship posts nothing")
 
 
 class TestTruncation(unittest.TestCase):

@@ -861,7 +861,7 @@ The structural reason the two gates needed different treatment: the adversarial-
 
 **Sections 3/4 have no mechanical source and say so.** Trade-offs and out-of-scope have no data source in this codebase — adding one is out of scope (and would duplicate work AGENTS.md's non-goals list already reserves against). Each renders an explicit placeholder sentence directing the author to fill it in by hand, never a fabricated summary and never an empty heading with nothing under it — the same "never a confident-looking empty heading" rule the review-provenance section follows for its own no-verdict case.
 
-**Ship marker.** The body ends with a hidden HTML comment, `<!-- clagentic-lite:shipped-head=<sha> -->`, carrying the shipped head SHA. It is emitted only when section 1 actually listed commits: with a placeholder (range unresolved or empty) no marker is written, so a later re-ship lists the full range instead of anchoring past commits that were never listed. Every delta comment (below) carries one too. The marker is unsigned and forgeable by anyone who can comment; that is acceptable because it only selects which commits a later comment lists and never gates a merge or any gate.
+**Ship marker.** Section 1 ends with a hidden HTML comment, `<!-- clagentic-lite:shipped-head=<sha> -->`, naming the last commit actually listed (the shipped head when nothing was capped). It comes from one emission point, the end of `_ship_render_commit_list`, used by both the create body and every delta comment, so it can never name a commit beyond a cap: a capped list is continued by the next re-ship, which pages through the remainder one comment at a time. With a placeholder (range unresolved or empty) no marker is written, so a later re-ship lists the full range instead of anchoring past commits that were never listed. The placeholder reason is a fixed string; raw resolver/git stderr goes to the local stderr only, never into the public body. The marker is unsigned and forgeable by anyone who can comment; that is acceptable because it only selects which commits a later comment lists and never gates a merge or any gate.
 
 ### Re-ship to an already-open PR (delta comment)
 
@@ -873,7 +873,7 @@ A PR body is written only at create. When `cmd_ship` finds the PR already open (
 | Read OK, no marker (PR opened before this feature, or by hand) | Post the full default-branch..head list, stating why. |
 | Marker is not an ancestor of head (rebase / force-push) | Post the full list, stating history was rewritten. |
 | No new commits since the marker | Post nothing (`ship-delta-publish`/`pass`, `reason=no-new-commits`). |
-| New commits since the marker | Post one comment with exactly those commits and a fresh marker. |
+| New commits since the marker | Post one comment with exactly those commits (capped like the body) and a fresh marker naming the last commit it listed. |
 
 Publish failure never blocks ship — the same fallback contract as `_publish_review_verdict`. No adapter prints the existing one-line notice and is not a degraded state. The review-verdict comment stays a separate comment.
 
