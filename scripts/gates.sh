@@ -3263,6 +3263,248 @@ _build_review_verdict_comment_body() {
   printf '**clagentic-lite review verdict: %s**\n\n%s\n' "$_brvcb_verdict" "$_brvcb_body"
 }
 
+# ---------------------------------------------------------------- ship PR commits
+#
+# Commit-derived content for the PR body (section 1) and for the delta comment
+# a re-ship posts. clagentic-lite generates this text itself from git so tests
+# assert on content rather than on a host CLI's own body-fill semantics -- the
+# reverse (delegating to the host CLI's fill flag) is what silently dropped
+# commit text once already. Mechanical git reads only; every read routes
+# through `_git` behind _git_repo_root_is_scoped (INV-6).
+
+# Hidden HTML-comment marker carrying the shipped head SHA. Embedded in the
+# create-time PR body AND in every delta comment; a re-ship reads the PR
+# thread back and takes the newest marker as "what was last posted". The PR
+# thread is the authoritative record, so no local state file exists to
+# diverge across machines/clones/collaborators. The marker is unsigned and
+# forgeable by anyone who can comment; that is acceptable because it only
+# selects WHICH commits get listed -- it never gates a merge or a gate.
+_SHIP_MARKER_PREFIX='<!-- clagentic-lite:shipped-head='
+_SHIP_MARKER_SUFFIX=' -->'
+
+# _ship_marker_line SHA — print the marker line for SHA.
+_ship_marker_line() {
+  printf '%s%s%s\n' "$_SHIP_MARKER_PREFIX" "$1" "$_SHIP_MARKER_SUFFIX"
+}
+
+# _ship_marker_from_file FILE — print the SHA of the LAST marker in FILE
+# (body first, comments after, so last == newest), or nothing if none.
+_ship_marker_from_file() {
+  _smff_marker=$(grep -Eo "${_SHIP_MARKER_PREFIX}[0-9a-f]{40,64}${_SHIP_MARKER_SUFFIX}" "$1" 2>/dev/null | tail -n 1)
+  _smff_marker=${_smff_marker#"$_SHIP_MARKER_PREFIX"}
+  _smff_marker=${_smff_marker%"$_SHIP_MARKER_SUFFIX"}
+  printf '%s' "$_smff_marker"
+}
+
+# _ship_default_base_sha HEAD_SHA — print merge-base(origin/<default>, HEAD).
+# On failure prints the actual reason to stderr and returns 1, so a caller
+# can show it instead of a generic "unavailable". The default-branch tip comes
+# from _gate_resolve_fresh_default_branch_ref (the sanctioned, provably-current
+# resolution -- never a raw origin/<branch> name, which can resolve a stale
+# local tracking ref); when freshness cannot be proven the commit list says
+# so rather than guessing a possibly wrong range.
+_ship_default_base_sha() {
+  _sdbs_head="$1"
+  _sdbs_default="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+  if ! _git_repo_root_is_scoped; then
+    echo "REPO_ROOT is not itself a git repo" 1>&2
+    return 1
+  fi
+  if [ -z "$_sdbs_head" ]; then
+    echo "the shipped head commit could not be resolved" 1>&2
+    return 1
+  fi
+  _sdbs_timeout=$(ds_positive_int_or_default "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}" 30)
+  if ! _sdbs_tip=$(_gate_resolve_fresh_default_branch_ref "$_sdbs_default" "$_sdbs_timeout" 2>&1); then
+    printf '%s\n' "$_sdbs_tip" 1>&2
+    return 1
+  fi
+  _sdbs_base=$(_git merge-base "$_sdbs_tip" "$_sdbs_head" 2>/dev/null || echo "")
+  if [ -z "$_sdbs_base" ]; then
+    echo "no merge-base between the default branch tip and the shipped head" 1>&2
+    return 1
+  fi
+  printf '%s\n' "$_sdbs_base"
+}
+
+# _ship_format_commit_entry SHA MAX_CHARS — one commit: subject line, then the
+# full body indented under it (so body text containing markdown headings
+# cannot split the PR body's own sections). A single commit whose body alone
+# exceeds MAX_CHARS is cut by whole lines with an explicit count, never
+# silently.
+_ship_format_commit_entry() {
+  _sfce_sha="$1"
+  _sfce_max="$2"
+  _sfce_subject=$(_git log -1 --format=%s "$_sfce_sha" 2>/dev/null) || return 1
+  _sfce_body=$(_git log -1 --format=%b "$_sfce_sha" 2>/dev/null) || return 1
+  _sfce_short=$(printf '%s' "$_sfce_sha" | cut -c1-7)
+  printf '%s %s (`%s`)\n' '-' "$_sfce_subject" "$_sfce_short"
+  [ -n "$_sfce_body" ] || return 0
+  # Slack covers the subject line and the truncation notice below.
+  _sfce_budget=$(( _sfce_max - ${#_sfce_subject} - 80 ))
+  _sfce_used=0
+  _sfce_skipped=0
+  while IFS= read -r _sfce_line; do
+    if [ "$_sfce_skipped" -eq 0 ] && [ $(( _sfce_used + ${#_sfce_line} + 3 )) -le "$_sfce_budget" ]; then
+      if [ -n "$_sfce_line" ]; then
+        printf '  %s\n' "$_sfce_line"
+      else
+        printf '\n'
+      fi
+      _sfce_used=$(( _sfce_used + ${#_sfce_line} + 3 ))
+    else
+      _sfce_skipped=$(( _sfce_skipped + 1 ))
+    fi
+  done <<EOF
+$_sfce_body
+EOF
+  if [ "$_sfce_skipped" -gt 0 ]; then
+    printf '  [commit body truncated: %s more lines not shown]\n' "$_sfce_skipped"
+  fi
+  return 0
+}
+
+# _ship_render_commit_list BASE HEAD — every non-merge commit in BASE..HEAD,
+# oldest first, bounded by CLAGENTIC_SHIP_COMMITS_MAX_CHARS (default 40000,
+# leaving headroom under the host body limit of 65536 for the other
+# sections). Commits that do not fit are counted in an explicit "N more
+# commits not shown" line. Exit: 0 listed >=1 commit, 3 range is empty,
+# 1 git could not enumerate the range.
+_ship_render_commit_list() {
+  _srcl_base="$1"
+  _srcl_head="$2"
+  _srcl_max=$(ds_positive_int_or_default "${CLAGENTIC_SHIP_COMMITS_MAX_CHARS:-40000}" 40000)
+  _srcl_shas=$(_git rev-list --reverse --no-merges "${_srcl_base}..${_srcl_head}" 2>/dev/null) || return 1
+  [ -n "$_srcl_shas" ] || return 3
+  _srcl_total=$(printf '%s\n' "$_srcl_shas" | wc -l | tr -d ' ')
+  _srcl_shown=0
+  _srcl_used=0
+  for _srcl_sha in $_srcl_shas; do
+    _srcl_entry=$(_ship_format_commit_entry "$_srcl_sha" "$_srcl_max") || return 1
+    # An entry is separated from the next by one blank line (+2 chars).
+    if [ "$_srcl_shown" -gt 0 ] && [ $(( _srcl_used + ${#_srcl_entry} + 2 )) -gt "$_srcl_max" ]; then
+      break
+    fi
+    printf '%s\n\n' "$_srcl_entry"
+    _srcl_used=$(( _srcl_used + ${#_srcl_entry} + 2 ))
+    _srcl_shown=$(( _srcl_shown + 1 ))
+  done
+  if [ "$_srcl_shown" -lt "$_srcl_total" ]; then
+    printf '_%s more commits not shown (list capped at %s characters; see the branch history for the rest)._\n' \
+      "$(( _srcl_total - _srcl_shown ))" "$_srcl_max"
+  fi
+  return 0
+}
+
+# _ship_render_commits_section HEAD_SHA — body of PR section 1: the commits
+# between origin/<default> and HEAD_SHA. When the range cannot be resolved or
+# is genuinely empty, says exactly why; this is the ONLY case a placeholder
+# appears.
+_ship_render_commits_section() {
+  _srcs_head="$1"
+  if ! _srcs_base=$(_ship_default_base_sha "$_srcs_head" 2>&1); then
+    printf '_Commit list unavailable: %s. Fill in by hand before merging._\n' "$_srcs_base"
+    return 0
+  fi
+  _srcs_rc=0
+  _srcs_out=$(_ship_render_commit_list "$_srcs_base" "$_srcs_head") || _srcs_rc=$?
+  case "$_srcs_rc" in
+    0) printf '%s\n' "$_srcs_out" ;;
+    3) printf '_No commits to list: nothing between origin/%s and the shipped head (empty range)._\n' "${CLAGENTIC_DEFAULT_BRANCH:-main}" ;;
+    *) printf '_Commit list unavailable: git could not enumerate %s..%s. Fill in by hand before merging._\n' \
+         "$(printf '%s' "$_srcs_base" | cut -c1-7)" "$(printf '%s' "$_srcs_head" | cut -c1-7)" ;;
+  esac
+  return 0
+}
+
+# _publish_ship_delta_comment BRANCH HEAD_SHA
+#
+# Re-ship to an already-open PR: the PR body is NEVER edited (it is written
+# only at create); instead post ONE comment listing the commits added since
+# the last ship, anchored by the newest hidden marker found by reading the
+# PR thread (body + comments) back through the host adapter.
+#
+#   read FAILED (adapter/auth/network)  -> post nothing, audit-log it. A
+#       failed read is never treated as "no marker": that would spam the full
+#       list on every transient error.
+#   read OK, no marker                  -> full origin/<default>..HEAD list,
+#       saying why (PR opened before this feature, or by hand).
+#   marker not an ancestor of HEAD      -> full list, saying history was
+#       rewritten (rebase/force-push).
+#   no commits since the marker         -> post nothing.
+#
+# FALLBACK CONTRACT, same as _publish_review_verdict: a publish problem never
+# blocks ship and never changes its outcome; every non-post is audit-logged.
+_publish_ship_delta_comment() {
+  _psdc_branch="$1"
+  _psdc_head="$2"
+  _psdc_tag="branch=${_psdc_branch:-<none>} head=${_psdc_head:-<unresolved>}"
+
+  if [ -z "$_psdc_head" ] || ! _git_repo_root_is_scoped; then
+    ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=head-unresolved"
+    return 0
+  fi
+
+  _psdc_thread=$(mktemp -t clagentic-ship-thread.XXXXXX)
+  if ! host_adapter_read_thread_text "$_psdc_branch" > "$_psdc_thread" 2>/dev/null; then
+    rm -f "$_psdc_thread"
+    echo "[gates/ship] could not read the PR thread — no delta comment posted, ship outcome unaffected" 1>&2
+    ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=thread-read-failed"
+    return 0
+  fi
+  _psdc_marker=$(_ship_marker_from_file "$_psdc_thread")
+  rm -f "$_psdc_thread"
+
+  _psdc_from=""
+  _psdc_note=""
+  if [ -z "$_psdc_marker" ]; then
+    _psdc_note="No earlier ship marker was found on this PR (it was opened before commit tracking existed, or by hand), so every commit on the branch is listed."
+  elif _git rev-parse --verify -q "${_psdc_marker}^{commit}" >/dev/null 2>&1 \
+       && _git merge-base --is-ancestor "$_psdc_marker" "$_psdc_head" 2>/dev/null; then
+    _psdc_from="$_psdc_marker"
+  else
+    _psdc_note="History was rewritten since the last ship (the last shipped commit ${_psdc_marker} is not an ancestor of the current head), so every commit on the branch is listed."
+  fi
+
+  if [ -z "$_psdc_from" ]; then
+    if ! _psdc_from=$(_ship_default_base_sha "$_psdc_head" 2>&1); then
+      echo "[gates/ship] no delta comment posted: ${_psdc_from}" 1>&2
+      ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=base-unresolved"
+      return 0
+    fi
+    _psdc_title="all commits on this branch"
+  else
+    _psdc_title="commits added since the last ship"
+  fi
+
+  _psdc_rc=0
+  _psdc_list=$(_ship_render_commit_list "$_psdc_from" "$_psdc_head") || _psdc_rc=$?
+  if [ "$_psdc_rc" -eq 3 ]; then
+    ds_audit_log "ship-delta-publish" "pass" "${_psdc_tag} reason=no-new-commits"
+    return 0
+  elif [ "$_psdc_rc" -ne 0 ]; then
+    ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=commit-enumeration-failed"
+    return 0
+  fi
+
+  _psdc_body_file=$(mktemp -t clagentic-ship-delta-comment.XXXXXX)
+  {
+    printf '**clagentic-lite ship: %s**\n\n' "$_psdc_title"
+    [ -z "$_psdc_note" ] || printf '%s\n\n' "$_psdc_note"
+    printf '%s\n\n' "$_psdc_list"
+    _ship_marker_line "$_psdc_head"
+  } > "$_psdc_body_file"
+
+  if host_adapter_post_comment "$_psdc_body_file"; then
+    ds_audit_log "ship-delta-publish" "pass" "${_psdc_tag} reason=posted"
+  else
+    echo "[gates/ship] delta comment failed to post — ship outcome unaffected" 1>&2
+    ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=adapter-post-comment-failed"
+  fi
+  rm -f "$_psdc_body_file"
+  return 0
+}
+
 # _build_ship_pr_body BRANCH HEAD_SHA (lr-429b32) — renders the four-section
 # PR body cmd_ship hands to host_adapter_open_change_request, replacing the
 # adapter's prior commit-message-scrape default (which produced no review
@@ -3279,11 +3521,14 @@ _build_review_verdict_comment_body() {
 # _ledger_anchored_pass_at_head/ledger_latest_for_branch/
 # _render_review_verdict_lines (the SAME lookup cmd_merge_gate and
 # _publish_review_verdict already use) rather than re-deriving a verdict.
-# Sections 1/3/4 (what-changed, trade-offs, out-of-scope) have no mechanical
-# source in this codebase -- no commit-log/diff-summary synthesis exists
-# here (by design: AGENTS.md's non-goals list forbids adding one just for
-# this) -- so each renders an explicit placeholder naming that gap, never a
-# fabricated summary and never a bare empty heading.
+# Section 1 (what changed and why) is the branch's own commit messages
+# (subject + full body, oldest first), read mechanically from git by
+# _ship_render_commits_section -- no summarization, no LLM. Sections 3/4
+# (trade-offs, out-of-scope) have no mechanical source in this codebase, so
+# each renders an explicit placeholder naming that gap, never a fabricated
+# summary and never a bare empty heading. A hidden marker carrying the
+# shipped head SHA is appended so a later re-ship can tell which commits the
+# PR thread already lists (see _publish_ship_delta_comment).
 _build_ship_pr_body() {
   _bspb_branch="$1"
   _bspb_head="$2"
@@ -3356,13 +3601,18 @@ except Exception:
   fi
 
   printf '## What changed and why\n\n'
-  printf '_Not recorded by tooling -- clagentic-lite has no commit-log or diff summarizer; fill in by hand before merging._\n\n'
+  _ship_render_commits_section "$_bspb_head"
+  printf '\n'
   printf '## Review provenance\n\n%s\n\n' "$_bspb_review_section"
   printf '## Gate attestation\n\n%s\n\n' "$_bspb_manifest_section"
   printf '## Trade-offs taken and rejected\n\n'
   printf '_Not recorded by tooling; fill in by hand, or state "none" if none were seriously considered._\n\n'
   printf '## Explicitly out of scope\n\n'
   printf '_Not recorded by tooling; fill in by hand, or state "none" if the change is fully self-contained._\n'
+  if [ -n "$_bspb_head" ]; then
+    printf '\n'
+    _ship_marker_line "$_bspb_head"
+  fi
 }
 
 # get_review_diff — prints the best available diff to stdout for use by
@@ -8723,9 +8973,18 @@ cmd_ship() {
       rm -f "$_SHIP_BODY_FILE"
       _SHIP_BODY_FILE=""
     fi
+    # Asked BEFORE the open call because that call reuses an existing PR
+    # silently: a re-ship must add a delta comment, never touch the body.
+    _SHIP_PR_EXISTED=0
+    if host_adapter_change_request_exists "$BRANCH"; then
+      _SHIP_PR_EXISTED=1
+    fi
     host_adapter_open_change_request "$DEFAULT_BRANCH" "$BRANCH" "$_SHIP_BODY_FILE" || \
       echo "[gates/ship] host-adapter open-change-request failed or timed out after ${_SHIP_TIMEOUT}s — open the PR manually"
     [ -n "$_SHIP_BODY_FILE" ] && rm -f "$_SHIP_BODY_FILE"
+    if [ "$_SHIP_PR_EXISTED" = "1" ]; then
+      _publish_ship_delta_comment "$BRANCH" "$_SHIP_HEAD_SHA"
+    fi
   else
     REMOTE=$(_git remote get-url origin 2>/dev/null || echo "<remote>")
     echo "[gates/ship] no host adapter available — open a PR manually:"

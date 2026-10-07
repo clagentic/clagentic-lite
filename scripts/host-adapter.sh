@@ -4,7 +4,8 @@
 # HOST-NEUTRAL BY CONTRACT: gate logic (gates.sh, review-merge.sh) must never
 # name a git-hosting vendor directly. This file is the ONE place vendor
 # names/tools are allowed to appear -- every adapter implementation lives
-# here, behind three functions gate logic is permitted to call:
+# here, behind the functions below, which are all gate logic is permitted to
+# call:
 #
 #   host_adapter_available          -- exit 0 iff a usable adapter is
 #                                       discovered for REPO_ROOT's origin
@@ -42,6 +43,31 @@
 #                                       not required by the publish path
 #                                       below, provided for contract
 #                                       completeness per the task's item 1).
+#   host_adapter_change_request_exists BRANCH
+#                                    -- exit 0 iff a change request is already
+#                                       open for BRANCH, non-zero otherwise.
+#                                       Lets the caller distinguish "create"
+#                                       from "re-ship to an existing PR"
+#                                       before host_adapter_open_change_request
+#                                       (which reuses silently, exit 0 either
+#                                       way) runs. Takes the branch explicitly
+#                                       -- no repo-state git read here.
+#   host_adapter_read_thread_text BRANCH
+#                                    -- print the change request's body, then
+#                                       every comment body in chronological
+#                                       order, as plain text on stdout. Exit 0
+#                                       iff the host read SUCCEEDED (an empty
+#                                       thread is still success); non-zero on
+#                                       any adapter/auth/network failure, so a
+#                                       caller never mistakes a failed read for
+#                                       "no prior content". Read-only. The
+#                                       caller parses the text (gates.sh looks
+#                                       for its own hidden ship marker) --
+#                                       adapters transport, they never
+#                                       interpret.
+#   A change-request BODY is written ONLY by host_adapter_open_change_request
+#   at create. No adapter function may edit an existing body: later ships add
+#   comments (host_adapter_post_comment), never rewrite the body.
 #
 # DISCOVERY: adapter selection is config-first, remote-sniff second --
 # matches ds_check_tool's own "explicit override, then probe" idiom
@@ -59,9 +85,11 @@
 #      flow, publish is skipped with a one-line notice, and this is NOT a
 #      degraded state.
 #
-# ADDING A NEW HOST: implement three functions following the `gh` example
+# ADDING A NEW HOST: implement the five functions following the `gh` example
 # below (_host_adapter_gh_open_change_request /
-# _host_adapter_gh_post_comment / _host_adapter_gh_read_comments), add one
+# _host_adapter_gh_post_comment / _host_adapter_gh_read_comments /
+# _host_adapter_gh_change_request_exists /
+# _host_adapter_gh_read_thread_text), add one
 # recognition arm to _host_adapter_detect, and document the new adapter in
 # docs/GATES.md's adapter table -- no other file changes needed. Gate logic
 # (gates.sh, review-merge.sh) must never reference the new vendor by name.
@@ -209,6 +237,31 @@ host_adapter_read_comments() {
   esac
 }
 
+# host_adapter_change_request_exists BRANCH — exit 0 iff a change request is
+# already open for BRANCH.
+host_adapter_change_request_exists() {
+  _hacre_branch="$1"
+  [ -n "$_hacre_branch" ] || return 1
+  _host_adapter_detect || return 1
+  case "$_HOST_ADAPTER" in
+    gh) _host_adapter_gh_change_request_exists "$_hacre_branch" ;;
+    *)  return 1 ;;
+  esac
+}
+
+# host_adapter_read_thread_text BRANCH — print the change request's body and
+# then each comment body (chronological) to stdout. Exit status is the host
+# read's own: 0 = read succeeded, non-zero = it did not.
+host_adapter_read_thread_text() {
+  _hartt_branch="$1"
+  [ -n "$_hartt_branch" ] || return 1
+  _host_adapter_detect || return 1
+  case "$_HOST_ADAPTER" in
+    gh) _host_adapter_gh_read_thread_text "$_hartt_branch" ;;
+    *)  return 1 ;;
+  esac
+}
+
 # --------------------------------------------------------------- gh adapter
 #
 # The only adapter shipped by this task (per the task's own OUT OF SCOPE:
@@ -260,4 +313,16 @@ _host_adapter_gh_read_comments() {
   fi
   [ -n "$_hagrc_branch" ] || return 1
   run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$_hagrc_branch" --json comments --jq '.comments[] | {body: .body}'
+}
+
+_host_adapter_gh_change_request_exists() {
+  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$1" >/dev/null 2>&1
+}
+
+# Body first, then comments in the order the host returns them
+# (chronological). `gh` exits non-zero on auth/network failure, which this
+# function passes straight through -- the caller treats that as "read
+# failed", never as "no content".
+_host_adapter_gh_read_thread_text() {
+  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$1" --json body,comments --jq '.body, (.comments[].body)'
 }
