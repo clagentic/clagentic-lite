@@ -3163,18 +3163,39 @@ _publish_review_verdict() {
     return 0
   fi
 
+  _prv_tag="branch=${_prv_branch:-<none>} head=${_prv_head:-<unresolved>}"
   _prv_body_file=$(mktemp -t clagentic-review-verdict-comment.XXXXXX)
-  if ! _build_review_verdict_comment_body "$_prv_verdict" "$_prv_head" "$_prv_findings" > "$_prv_body_file" 2>/dev/null; then
+  _prv_limit=$(_ship_artifact_limit) || _prv_limit=""
+  _prv_body=$(_build_review_verdict_comment_body "$_prv_verdict" "$_prv_head" "$_prv_findings" 2>/dev/null) || _prv_body=""
+  if [ -z "$_prv_body" ] || [ -z "$_prv_limit" ]; then
     rm -f "$_prv_body_file"
-    ds_audit_log "review-publish" "block" "branch=${_prv_branch:-<none>} head=${_prv_head:-<unresolved>} reason=body-render-failed"
+    ds_audit_log "review-publish" "block" "${_prv_tag} reason=body-render-failed"
+    return 0
+  fi
+  # The comment is bounded like every other artifact handed to the adapter.
+  # The final newline of the file is part of the count, hence the -1.
+  _ship_bound_text $(( _prv_limit - 1 )) "$_prv_body" > "$_prv_body_file"
+
+  # One lookup, then every call addresses the change request by number: a
+  # bare branch name can match a closed or merged PR on the same branch.
+  _prv_find_rc=0
+  _prv_pr=$(host_adapter_find_open_change_request "$_prv_branch") || _prv_find_rc=$?
+  if [ "$_prv_find_rc" -ne 0 ]; then
+    echo "[gates/review] publish to host adapter failed — local ledger verdict stands, gate outcome unaffected" 1>&2
+    if [ "$_prv_find_rc" -eq 1 ]; then
+      ds_audit_log "review-publish" "block" "${_prv_tag} reason=no-open-change-request"
+    else
+      ds_audit_log "review-publish" "block" "${_prv_tag} reason=change-request-lookup-failed"
+    fi
+    rm -f "$_prv_body_file"
     return 0
   fi
 
-  if host_adapter_post_comment "$_prv_body_file"; then
-    ds_audit_log "review-publish" "pass" "branch=${_prv_branch:-<none>} head=${_prv_head:-<unresolved>} verdict=${_prv_verdict}"
+  if host_adapter_post_comment "$_prv_pr" "$_prv_body_file"; then
+    ds_audit_log "review-publish" "pass" "${_prv_tag} verdict=${_prv_verdict}"
   else
     echo "[gates/review] publish to host adapter failed — local ledger verdict stands, gate outcome unaffected" 1>&2
-    ds_audit_log "review-publish" "block" "branch=${_prv_branch:-<none>} head=${_prv_head:-<unresolved>} reason=adapter-post-comment-failed"
+    ds_audit_log "review-publish" "block" "${_prv_tag} reason=adapter-post-comment-failed"
   fi
   rm -f "$_prv_body_file"
   return 0
@@ -3199,10 +3220,20 @@ _render_review_verdict_lines() {
   _rrvl_findings="$2"
 
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$_rrvl_head" "$_rrvl_findings" <<'PYEOF'
+    # The findings travel through a file, not argv: one argv string is capped
+    # at ~128 KiB by the kernel, so a large findings list made the exec fail
+    # outright and the caller degrade to a false "no review recorded".
+    _rrvl_tmp=$(mktemp -t clagentic-review-findings.XXXXXX) || return 1
+    printf '%s' "$_rrvl_findings" > "$_rrvl_tmp"
+    python3 - "$_rrvl_head" "$_rrvl_tmp" <<'PYEOF'
 import json, sys
 
-head, findings_json = sys.argv[1:3]
+head, findings_path = sys.argv[1:3]
+try:
+    with open(findings_path) as fh:
+        findings_json = fh.read()
+except Exception:
+    findings_json = "[]"
 try:
     findings = json.loads(findings_json)
     if not isinstance(findings, list):
@@ -3240,7 +3271,9 @@ if recurring:
 
 print("\n".join(lines))
 PYEOF
-    return $?
+    _rrvl_rc=$?
+    rm -f "$_rrvl_tmp"
+    return "$_rrvl_rc"
   fi
 
   # No python3 -- jq alone cannot format multi-line prose cleanly enough for
@@ -3340,22 +3373,130 @@ _ship_default_base_sha() {
   printf '%s\n' "$_sdbs_base"
 }
 
+# ONE OWNER FOR "RENDERED ARTIFACT <= HOST HARD LIMIT". The limit itself is
+# the host adapter's (host_adapter_artifact_limit); this section owns the
+# budgeting. Every artifact gates ship hands the adapter (the PR body, the
+# re-ship delta comment, the review-verdict comment) is bounded by the
+# primitives below: variable-size parts are clipped or listed against a budget
+# computed from the limit, and a final whole-artifact guard re-checks the
+# assembled text before it is returned. No caller carries a limit of its own.
+
+# _ship_bytes TEXT — byte length of TEXT. Bytes are never fewer than the
+# characters the host counts, so measuring in bytes can only be conservative.
+_ship_bytes() {
+  printf '%s' "$1" | wc -c | tr -d ' '
+}
+
+# _ship_artifact_limit — the host's hard limit for one body/comment, from the
+# adapter. Non-zero when the adapter answers with anything but a positive
+# integer: a limit that is not known is never guessed.
+_ship_artifact_limit() {
+  _sal_limit=$(host_adapter_artifact_limit 2>/dev/null) || return 1
+  case "$_sal_limit" in
+    ""|*[!0-9]*|0) return 1 ;;
+  esac
+  printf '%s\n' "$_sal_limit"
+}
+
+# _ship_bound_text MAX TEXT — TEXT unchanged when it fits in MAX characters;
+# otherwise whole lines up to MAX minus the notice, then an explicit
+# "[truncated, N chars not shown]" line. A single line longer than the budget
+# is cut at the budget (by `cut -c`, so by bytes in a C locale: a multi-byte
+# character on the cut line may be split, which the host replaces rather than
+# rejects). Never silent.
+_ship_bound_text() {
+  _sbt_max="$1"
+  _sbt_text="$2"
+  if [ "${#_sbt_text}" -le "$_sbt_max" ]; then
+    printf '%s\n' "$_sbt_text"
+    return 0
+  fi
+  _sbt_budget=$(( _sbt_max - 80 ))
+  [ "$_sbt_budget" -gt 0 ] || _sbt_budget=0
+  _sbt_used=0
+  while IFS= read -r _sbt_line; do
+    _sbt_cost=$(( ${#_sbt_line} + 1 ))
+    if [ $(( _sbt_used + _sbt_cost )) -le "$_sbt_budget" ]; then
+      printf '%s\n' "$_sbt_line"
+      _sbt_used=$(( _sbt_used + _sbt_cost ))
+    else
+      if [ "$_sbt_used" -eq 0 ] && [ "$_sbt_budget" -gt 0 ]; then
+        printf '%s\n' "$(printf '%s' "$_sbt_line" | cut -c1-"$_sbt_budget")"
+        _sbt_used=$_sbt_budget
+      fi
+      break
+    fi
+  done <<EOF
+$_sbt_text
+EOF
+  printf '[truncated, %s chars not shown]\n' "$(( ${#_sbt_text} - _sbt_used ))"
+}
+
+# _ship_emit_within_limit ASSEMBLE_FN FIXED_CHARS — print the whole artifact
+# ASSEMBLE_FN builds, guaranteed no larger than the host limit. ASSEMBLE_FN is
+# called with the character budget left for the commit list (the limit minus
+# FIXED_CHARS, the caller's own fixed parts, and a slack for placeholder text)
+# and must print the complete artifact. The assembled result is measured and,
+# if it is over the limit anyway, the budget is cut by the excess and the
+# artifact reassembled; the last resort is a zero budget, where the list
+# degrades to an explicit placeholder. An artifact still over the limit then is
+# an error (return 1), never an over-limit result. ASSEMBLE_FN's own non-zero
+# status (3 empty range, 4 no budget, 1 enumeration failure) is passed through.
+_ship_emit_within_limit() {
+  _seil_fn="$1"
+  _seil_fixed="$2"
+  _seil_limit=$(_ship_artifact_limit) || return 1
+  _seil_budget=$(( _seil_limit - _seil_fixed - 512 ))
+  [ "$_seil_budget" -ge 0 ] || _seil_budget=0
+  _seil_try=0
+  while :; do
+    _seil_rc=0
+    _seil_out=$("$_seil_fn" "$_seil_budget") || _seil_rc=$?
+    [ "$_seil_rc" -eq 0 ] || return "$_seil_rc"
+    _seil_size=$(( $(_ship_bytes "$_seil_out") + 1 ))
+    if [ "$_seil_size" -le "$_seil_limit" ]; then
+      printf '%s\n' "$_seil_out"
+      return 0
+    fi
+    [ "$_seil_budget" -gt 0 ] || return 1
+    _seil_try=$(( _seil_try + 1 ))
+    if [ "$_seil_try" -ge 6 ]; then
+      _seil_budget=0
+    else
+      _seil_budget=$(( _seil_budget - (_seil_size - _seil_limit) - 64 ))
+      [ "$_seil_budget" -ge 0 ] || _seil_budget=0
+    fi
+  done
+}
+
+# Smallest character budget in which a commit entry is worth showing: the
+# entry's own framing (bullet, fences, truncation note) plus a few lines of
+# text. A first entry is truncated to the budget it has, so this only decides
+# when there is no point starting a list at all.
+_SHIP_ENTRY_MIN_CHARS=300
+
 # _ship_format_commit_entry SHA MAX_CHARS — one commit: subject line, then the
 # full body inside a fenced code block nested under the list item. A fence is
 # the only construct whose content cannot become markdown structure (indent
 # alone does not: CommonMark allows 0-3 leading spaces on an ATX heading), so
 # the fence is made longer than any backtick run in the body, which also means
-# the body cannot close it early. A single commit whose body alone exceeds
-# MAX_CHARS is cut by whole lines with an explicit count, never silently; the
-# notice sits after the closing fence so it renders as prose.
+# the body cannot close it early.
+#
+# The whole entry (bullet, subject, fences, body, notice) is at most MAX_CHARS.
+# When the commit message does not fit, the subject is clipped and the body is
+# cut by whole lines (a single over-long line is clipped), and an explicit
+# "[commit message truncated, N chars not shown]" notice follows the closing
+# fence so it renders as prose. Exit 0 when the message is shown whole, 10 when
+# anything was cut (the caller decides whether a cut entry may be listed),
+# 1 when git cannot read the commit.
 _ship_format_commit_entry() {
   _sfce_sha="$1"
   _sfce_max="$2"
   _sfce_subject=$(_git log -1 --format=%s "$_sfce_sha" 2>/dev/null) || return 1
   _sfce_body=$(_git log -1 --format=%b "$_sfce_sha" 2>/dev/null) || return 1
   _sfce_short=$(printf '%s' "$_sfce_sha" | cut -c1-7)
-  printf '%s %s (`%s`)\n' '-' "$_sfce_subject" "$_sfce_short"
-  [ -n "$_sfce_body" ] || return 0
+  _sfce_nl='
+'
   _sfce_fence='```'
   while :; do
     case $_sfce_body in
@@ -3363,55 +3504,108 @@ _ship_format_commit_entry() {
       *) break ;;
     esac
   done
-  # Slack covers the subject line, both fence lines and the truncation notice.
-  _sfce_budget=$(( _sfce_max - ${#_sfce_subject} - 80 - 2 * ${#_sfce_fence} ))
-  _sfce_used=0
-  _sfce_skipped=0
-  printf '  %s\n' "$_sfce_fence"
-  while IFS= read -r _sfce_line; do
-    if [ "$_sfce_skipped" -eq 0 ] && [ $(( _sfce_used + ${#_sfce_line} + 3 )) -le "$_sfce_budget" ]; then
-      if [ -n "$_sfce_line" ]; then
-        printf '  %s\n' "$_sfce_line"
-      else
-        printf '\n'
-      fi
-      _sfce_used=$(( _sfce_used + ${#_sfce_line} + 3 ))
-    else
-      _sfce_skipped=$(( _sfce_skipped + 1 ))
+  # Fixed framing: bullet line (15 + subject), two fence lines, slack.
+  _sfce_overhead=$(( 20 + 2 * (${#_sfce_fence} + 3) ))
+  _sfce_nlines=0
+  [ -z "$_sfce_body" ] || _sfce_nlines=$(printf '%s\n' "$_sfce_body" | wc -l | tr -d ' ')
+  _sfce_body_cost=$(( ${#_sfce_body} + 3 * _sfce_nlines + 1 ))
+  _sfce_subject_shown="$_sfce_subject"
+  if [ $(( ${#_sfce_subject} + _sfce_body_cost + _sfce_overhead )) -le "$_sfce_max" ]; then
+    _sfce_budget=$_sfce_body_cost
+  else
+    # Truncating: reserve the notice (at most ~55 chars) and split what is
+    # left between subject and body. A subject gets at most half so a giant
+    # subject cannot starve the body; with no body it gets it all.
+    _sfce_avail=$(( _sfce_max - _sfce_overhead - 72 ))
+    [ "$_sfce_avail" -ge 2 ] || _sfce_avail=2
+    _sfce_subject_cap=$(( _sfce_avail / 2 ))
+    [ -n "$_sfce_body" ] || _sfce_subject_cap=$_sfce_avail
+    if [ "${#_sfce_subject}" -gt "$_sfce_subject_cap" ]; then
+      _sfce_subject_shown=$(printf '%s' "$_sfce_subject" | cut -c1-"$_sfce_subject_cap")
     fi
-  done <<EOF
+    _sfce_budget=$(( _sfce_avail - ${#_sfce_subject_shown} ))
+  fi
+  _sfce_omitted=$(( ${#_sfce_subject} - ${#_sfce_subject_shown} ))
+  _sfce_acc=""
+  _sfce_used=0
+  _sfce_cut=0
+  if [ -n "$_sfce_body" ]; then
+    while IFS= read -r _sfce_line; do
+      _sfce_cost=$(( ${#_sfce_line} + 3 ))
+      if [ "$_sfce_cut" -eq 0 ] && [ $(( _sfce_used + _sfce_cost )) -le "$_sfce_budget" ]; then
+        if [ -n "$_sfce_line" ]; then
+          _sfce_acc="${_sfce_acc}  ${_sfce_line}${_sfce_nl}"
+        else
+          _sfce_acc="${_sfce_acc}${_sfce_nl}"
+        fi
+        _sfce_used=$(( _sfce_used + _sfce_cost ))
+      elif [ "$_sfce_cut" -eq 0 ] && [ "$_sfce_used" -eq 0 ] && [ "$_sfce_budget" -gt 3 ]; then
+        # The first line alone is over budget: keep its head.
+        _sfce_keep=$(( _sfce_budget - 3 ))
+        _sfce_head=$(printf '%s' "$_sfce_line" | cut -c1-"$_sfce_keep")
+        _sfce_acc="${_sfce_acc}  ${_sfce_head}${_sfce_nl}"
+        _sfce_omitted=$(( _sfce_omitted + ${#_sfce_line} - ${#_sfce_head} ))
+        _sfce_used=$_sfce_budget
+        _sfce_cut=1
+      else
+        _sfce_cut=1
+        _sfce_omitted=$(( _sfce_omitted + ${#_sfce_line} + 1 ))
+      fi
+    done <<EOF
 $_sfce_body
 EOF
-  printf '  %s\n' "$_sfce_fence"
-  if [ "$_sfce_skipped" -gt 0 ]; then
-    printf '  [commit body truncated: %s more lines not shown]\n' "$_sfce_skipped"
   fi
-  return 0
+  printf '%s %s (`%s`)\n' '-' "$_sfce_subject_shown" "$_sfce_short"
+  if [ -n "$_sfce_acc" ]; then
+    printf '  %s\n' "$_sfce_fence"
+    printf '%s' "$_sfce_acc"
+    printf '  %s\n' "$_sfce_fence"
+  fi
+  [ "$_sfce_omitted" -gt 0 ] || return 0
+  printf '  [commit message truncated, %s chars not shown]\n' "$_sfce_omitted"
+  return 10
 }
 
-# _ship_render_commit_list BASE HEAD — every non-merge commit in BASE..HEAD,
-# oldest first, bounded by CLAGENTIC_SHIP_COMMITS_MAX_CHARS (default 40000,
-# leaving headroom under the host body limit of 65536 for the other
-# sections). Commits that do not fit are counted in an explicit "N more
-# commits not shown" line. Exit: 0 listed >=1 commit, 3 range is empty,
-# 1 git could not enumerate the range. Ends with the shipped-head marker for
-# the last commit listed (see the emission point below).
+# _ship_render_commit_list BASE HEAD MAX_CHARS — every non-merge commit in
+# BASE..HEAD, oldest first, as one block of at most MAX_CHARS characters in
+# total (entries, the "N more commits not shown" line and the marker).
+# MAX_CHARS is the caller's budget under the host limit; CLAGENTIC_SHIP_COMMITS_MAX_CHARS
+# may lower it, never raise it. An entry that does not fit whole is deferred to
+# the next ship (the marker stops before it), except the first entry, which is
+# truncated to the room there is, so a single huge commit message can neither
+# overflow the artifact nor block the list. A truncated entry counts as listed.
+# Exit: 0 listed >=1 commit, 3 range is empty, 4 the budget leaves no room for
+# a single entry, 1 git could not enumerate the range. Ends with the
+# shipped-head marker for the last commit listed (see the emission point
+# below).
 _ship_render_commit_list() {
   _srcl_base="$1"
   _srcl_head="$2"
-  _srcl_max=$(ds_positive_int_or_warn CLAGENTIC_SHIP_COMMITS_MAX_CHARS "${CLAGENTIC_SHIP_COMMITS_MAX_CHARS:-}" 40000)
+  _srcl_cap="$3"
   _srcl_shas=$(_git rev-list --reverse --no-merges "${_srcl_base}..${_srcl_head}" 2>/dev/null) || return 1
   [ -n "$_srcl_shas" ] || return 3
+  [ "$_srcl_cap" -ge 1 ] || return 4
+  _srcl_max=$(ds_positive_int_or_warn CLAGENTIC_SHIP_COMMITS_MAX_CHARS "${CLAGENTIC_SHIP_COMMITS_MAX_CHARS:-}" "$_srcl_cap")
+  [ "$_srcl_max" -le "$_srcl_cap" ] || _srcl_max="$_srcl_cap"
+  # Room kept back for the not-shown line and the marker (SHA up to 64 hex).
+  _srcl_reserve=$(( ${#_SHIP_MARKER_PREFIX} + ${#_SHIP_MARKER_SUFFIX} + 64 + 2 + 130 ))
+  _srcl_ebudget=$(( _srcl_max - _srcl_reserve ))
+  [ "$_srcl_ebudget" -ge "$_SHIP_ENTRY_MIN_CHARS" ] || return 4
   _srcl_total=$(printf '%s\n' "$_srcl_shas" | wc -l | tr -d ' ')
   _srcl_shown=0
   _srcl_used=0
   _srcl_last=""
   for _srcl_sha in $_srcl_shas; do
-    _srcl_entry=$(_ship_format_commit_entry "$_srcl_sha" "$_srcl_max") || return 1
+    _srcl_room=$(( _srcl_ebudget - _srcl_used ))
     # An entry is separated from the next by one blank line (+2 chars).
-    if [ "$_srcl_shown" -gt 0 ] && [ $(( _srcl_used + ${#_srcl_entry} + 2 )) -gt "$_srcl_max" ]; then
-      break
-    fi
+    [ "$_srcl_shown" -eq 0 ] || _srcl_room=$(( _srcl_room - 2 ))
+    _srcl_rc=0
+    _srcl_entry=$(_ship_format_commit_entry "$_srcl_sha" "$_srcl_room") || _srcl_rc=$?
+    case "$_srcl_rc" in
+      0) ;;
+      10) [ "$_srcl_shown" -eq 0 ] || break ;;
+      *) return 1 ;;
+    esac
     printf '%s\n\n' "$_srcl_entry"
     _srcl_used=$(( _srcl_used + ${#_srcl_entry} + 2 ))
     _srcl_shown=$(( _srcl_shown + 1 ))
@@ -3430,35 +3624,49 @@ _ship_render_commit_list() {
   return 0
 }
 
-# _ship_render_commits_section HEAD_SHA — body of PR section 1: the commits
-# between origin/<default> and HEAD_SHA. When the range cannot be resolved or
-# is genuinely empty, says exactly why; this is the ONLY case a placeholder
-# appears. Exit 0 when commits were actually listed, 3 when a placeholder was
-# printed instead -- the caller must not record a shipped-head marker for a
-# head whose commits were never listed.
+# _ship_render_commits_section HEAD_SHA MAX_CHARS — body of PR section 1: the
+# commits between origin/<default> and HEAD_SHA, within MAX_CHARS. When the
+# range cannot be resolved, is genuinely empty, or the budget leaves no room,
+# says exactly why; this is the ONLY case a placeholder appears. Exit 0 when
+# commits were actually listed, 3 when a placeholder was printed instead -- the
+# caller must not record a shipped-head marker for a head whose commits were
+# never listed.
 _ship_render_commits_section() {
   _srcs_head="$1"
+  _srcs_cap="$2"
   if ! _srcs_base=$(_ship_default_base_sha "$_srcs_head"); then
     printf '_Commit list unavailable: %s. Fill in by hand before merging._\n' "$_srcs_base"
     return 3
   fi
   _srcs_rc=0
-  _srcs_out=$(_ship_render_commit_list "$_srcs_base" "$_srcs_head") || _srcs_rc=$?
+  _srcs_out=$(_ship_render_commit_list "$_srcs_base" "$_srcs_head" "$_srcs_cap") || _srcs_rc=$?
   case "$_srcs_rc" in
     0) printf '%s\n' "$_srcs_out"; return 0 ;;
     3) printf '_No commits to list: nothing between origin/%s and the shipped head (empty range)._\n' "${CLAGENTIC_DEFAULT_BRANCH:-main}" ;;
+    4) printf '_Commit list omitted: the host size limit leaves no room for it after the other sections._\n' ;;
     *) printf '_Commit list unavailable: git could not enumerate %s..%s. Fill in by hand before merging._\n' \
          "$(printf '%s' "$_srcs_base" | cut -c1-7)" "$(printf '%s' "$_srcs_head" | cut -c1-7)" ;;
   esac
   return 3
 }
 
-# _publish_ship_delta_comment BRANCH HEAD_SHA
+# _ship_delta_assemble BUDGET — the delta comment's whole text, for
+# _ship_emit_within_limit. Reads its parts from _SPD_* (set by
+# _publish_ship_delta_comment); non-zero statuses are the commit list's own.
+_ship_delta_assemble() {
+  _sda_list=$(_ship_render_commit_list "$_SPD_FROM" "$_SPD_HEAD" "$1") || return $?
+  printf '**clagentic-lite ship: %s**\n\n' "$_SPD_TITLE"
+  [ -z "$_SPD_NOTE" ] || printf '%s\n\n' "$_SPD_NOTE"
+  printf '%s\n' "$_sda_list"
+}
+
+# _publish_ship_delta_comment BRANCH HEAD_SHA PR_NUM
 #
-# Re-ship to an already-open PR: the PR body is NEVER edited (it is written
-# only at create); instead post ONE comment listing the commits added since
-# the last ship, anchored by the newest hidden marker found by reading the
-# PR thread (body + comments) back through the host adapter.
+# Re-ship to an already-open PR (PR_NUM, from host_adapter_open_change_request's
+# `reused <num>`): the PR body is NEVER edited (it is written only at create);
+# instead post ONE comment listing the commits added since the last ship,
+# anchored by the newest hidden marker found by reading the PR thread (body +
+# comments) back through the host adapter, by number.
 #
 #   read FAILED (adapter/auth/network)  -> post nothing, audit-log it. A
 #       failed read is never treated as "no marker": that would spam the full
@@ -3474,7 +3682,8 @@ _ship_render_commits_section() {
 _publish_ship_delta_comment() {
   _psdc_branch="$1"
   _psdc_head="$2"
-  _psdc_tag="branch=${_psdc_branch:-<none>} head=${_psdc_head:-<unresolved>}"
+  _psdc_pr="$3"
+  _psdc_tag="branch=${_psdc_branch:-<none>} head=${_psdc_head:-<unresolved>} pr=${_psdc_pr:-<none>}"
 
   if [ -z "$_psdc_head" ] || ! _git_repo_root_is_scoped; then
     ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=head-unresolved"
@@ -3485,7 +3694,7 @@ _publish_ship_delta_comment() {
     ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=tempfile-failed"
     return 0
   fi
-  if ! host_adapter_read_thread_text "$_psdc_branch" > "$_psdc_thread" 2>/dev/null; then
+  if ! host_adapter_read_thread_text "$_psdc_pr" > "$_psdc_thread" 2>/dev/null; then
     rm -f "$_psdc_thread"
     echo "[gates/ship] could not read the PR thread — no delta comment posted, ship outcome unaffected" 1>&2
     ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=thread-read-failed"
@@ -3516,27 +3725,31 @@ _publish_ship_delta_comment() {
     _psdc_title="commits added since the last ship"
   fi
 
-  _psdc_rc=0
-  _psdc_list=$(_ship_render_commit_list "$_psdc_from" "$_psdc_head") || _psdc_rc=$?
-  if [ "$_psdc_rc" -eq 3 ]; then
-    ds_audit_log "ship-delta-publish" "pass" "${_psdc_tag} reason=no-new-commits"
-    return 0
-  elif [ "$_psdc_rc" -ne 0 ]; then
-    ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=commit-enumeration-failed"
-    return 0
-  fi
-
+  _SPD_FROM="$_psdc_from"
+  _SPD_HEAD="$_psdc_head"
+  _SPD_TITLE="$_psdc_title"
+  _SPD_NOTE="$_psdc_note"
   if ! _psdc_body_file=$(mktemp -t clagentic-ship-delta-comment.XXXXXX); then
     ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=tempfile-failed"
     return 0
   fi
-  {
-    printf '**clagentic-lite ship: %s**\n\n' "$_psdc_title"
-    [ -z "$_psdc_note" ] || printf '%s\n\n' "$_psdc_note"
-    printf '%s\n' "$_psdc_list"
-  } > "$_psdc_body_file"
+  _psdc_rc=0
+  _ship_emit_within_limit _ship_delta_assemble $(( ${#_psdc_title} + ${#_psdc_note} + 16 )) > "$_psdc_body_file" || _psdc_rc=$?
+  if [ "$_psdc_rc" -eq 3 ]; then
+    rm -f "$_psdc_body_file"
+    ds_audit_log "ship-delta-publish" "pass" "${_psdc_tag} reason=no-new-commits"
+    return 0
+  elif [ "$_psdc_rc" -eq 4 ]; then
+    rm -f "$_psdc_body_file"
+    ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=size-budget-exhausted"
+    return 0
+  elif [ "$_psdc_rc" -ne 0 ]; then
+    rm -f "$_psdc_body_file"
+    ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=commit-enumeration-failed"
+    return 0
+  fi
 
-  if host_adapter_post_comment "$_psdc_body_file"; then
+  if host_adapter_post_comment "$_psdc_pr" "$_psdc_body_file"; then
     ds_audit_log "ship-delta-publish" "pass" "${_psdc_tag} reason=posted"
   else
     echo "[gates/ship] delta comment failed to post — ship outcome unaffected" 1>&2
@@ -3641,18 +3854,36 @@ except Exception:
     _bspb_manifest_section="no gate attestation manifest recorded for this run -- run \`clagentic-lite gates ship\` (the manifest is written unconditionally at the start of that command) if attestation is expected. A missing manifest is never inferred as a clean run."
   fi
 
+  # Every variable-size part is bounded against the host limit: the review
+  # and attestation sections here (an eighth of the limit each), the commit
+  # list by the budget _ship_emit_within_limit derives from what is left.
+  _bspb_limit=$(_ship_artifact_limit) || return 1
+  _bspb_section_cap=$(( _bspb_limit / 8 ))
+  _bspb_review_section=$(_ship_bound_text "$_bspb_section_cap" "$_bspb_review_section")
+  _bspb_manifest_section=$(_ship_bound_text "$_bspb_section_cap" "$_bspb_manifest_section")
+
+  _SPB_HEAD="$_bspb_head"
+  _SPB_TAIL=$(
+    printf '## Review provenance\n\n%s\n\n' "$_bspb_review_section"
+    printf '## Gate attestation\n\n%s\n\n' "$_bspb_manifest_section"
+    printf '## Trade-offs taken and rejected\n\n'
+    printf '_Not recorded by tooling; fill in by hand, or state "none" if none were seriously considered._\n\n'
+    printf '## Explicitly out of scope\n\n'
+    printf '_Not recorded by tooling; fill in by hand, or state "none" if the change is fully self-contained._\n'
+  )
+  _ship_emit_within_limit _ship_pr_body_assemble $(( ${#_SPB_TAIL} + 64 ))
+}
+
+# _ship_pr_body_assemble BUDGET — the PR body's whole text, for
+# _ship_emit_within_limit; BUDGET is the characters the commit list may use.
+# The shipped-head marker is emitted inside the commit list itself (last
+# LISTED commit), and only when commits were listed -- a placeholder or a
+# capped list never anchors past content the thread does not show.
+_ship_pr_body_assemble() {
   printf '## What changed and why\n\n'
-  # The shipped-head marker is emitted inside the commit list itself (last
-  # LISTED commit), and only when commits were listed -- a placeholder or a
-  # capped list never anchors past content the thread does not show.
-  _ship_render_commits_section "$_bspb_head" || true
+  _ship_render_commits_section "$_SPB_HEAD" "$1" || true
   printf '\n'
-  printf '## Review provenance\n\n%s\n\n' "$_bspb_review_section"
-  printf '## Gate attestation\n\n%s\n\n' "$_bspb_manifest_section"
-  printf '## Trade-offs taken and rejected\n\n'
-  printf '_Not recorded by tooling; fill in by hand, or state "none" if none were seriously considered._\n\n'
-  printf '## Explicitly out of scope\n\n'
-  printf '_Not recorded by tooling; fill in by hand, or state "none" if the change is fully self-contained._\n'
+  printf '%s\n' "$_SPB_TAIL"
 }
 
 # get_review_diff — prints the best available diff to stdout for use by
@@ -9013,25 +9244,38 @@ cmd_ship() {
       rm -f "$_SHIP_BODY_FILE"
       _SHIP_BODY_FILE=""
     fi
-    # Asked BEFORE the open call because that call reuses an existing PR
-    # silently: a re-ship must add a delta comment, never touch the body.
-    # Tri-state (0 open / 1 none / 2 unknown): a transient host failure must
-    # not read as "no PR", or a re-ship would skip its delta comment and a
-    # create could duplicate an open PR.
-    _SHIP_PR_STATE=0
-    host_adapter_change_request_exists "$BRANCH" || _SHIP_PR_STATE=$?
-    if [ "$_SHIP_PR_STATE" -ge 2 ]; then
-      [ -z "$_SHIP_BODY_FILE" ] || rm -f "$_SHIP_BODY_FILE"
-      echo "[gates/ship] could not determine whether a PR is already open for $BRANCH — no PR created, no comment posted (push result stands); retry or open the PR manually" 1>&2
-      ds_audit_log "ship-delta-publish" "block" "branch=${BRANCH:-<none>} head=${_SHIP_HEAD_SHA:-<unresolved>} reason=pr-existence-check-failed"
-    else
-      host_adapter_open_change_request "$DEFAULT_BRANCH" "$BRANCH" "$_SHIP_BODY_FILE" || \
-        echo "[gates/ship] host-adapter open-change-request failed or timed out after ${_SHIP_TIMEOUT}s — open the PR manually"
-      [ -z "$_SHIP_BODY_FILE" ] || rm -f "$_SHIP_BODY_FILE"
-      if [ "$_SHIP_PR_STATE" = "0" ]; then
-        _publish_ship_delta_comment "$BRANCH" "$_SHIP_HEAD_SHA"
-      fi
+    # host_adapter_open_change_request is the ONE owner of "which PR, created
+    # or reused": a single open-PR lookup, then `created <num>` or
+    # `reused <num>` on stdout. A created PR already carries section 1 and the
+    # marker in the body just rendered. A reused PR gets that body discarded
+    # (a PR body is written only at create) and a delta comment on that same
+    # number instead. Failure -- including a lookup that could not be
+    # answered, where it never creates blind -- creates and comments nothing;
+    # the push result stands.
+    _SHIP_OPEN_RC=0
+    _SHIP_OPEN_OUT=$(host_adapter_open_change_request "$DEFAULT_BRANCH" "$BRANCH" "$_SHIP_BODY_FILE") || _SHIP_OPEN_RC=$?
+    [ -z "$_SHIP_BODY_FILE" ] || rm -f "$_SHIP_BODY_FILE"
+    _SHIP_PR_OUTCOME=""
+    _SHIP_PR_NUM=""
+    if [ "$_SHIP_OPEN_RC" -eq 0 ]; then
+      case "$_SHIP_OPEN_OUT" in
+        created\ [0-9]*|reused\ [0-9]*)
+          _SHIP_PR_OUTCOME=${_SHIP_OPEN_OUT%% *}
+          _SHIP_PR_NUM=${_SHIP_OPEN_OUT#* }
+          ;;
+      esac
+      case "$_SHIP_PR_NUM" in
+        ""|*[!0-9]*) _SHIP_PR_OUTCOME="" ;;
+      esac
     fi
+    case "$_SHIP_PR_OUTCOME" in
+      created) ;;
+      reused) _publish_ship_delta_comment "$BRANCH" "$_SHIP_HEAD_SHA" "$_SHIP_PR_NUM" ;;
+      *)
+        echo "[gates/ship] host-adapter open-change-request failed or timed out after ${_SHIP_TIMEOUT}s — no PR created or commented on by this ship; open the PR manually (push result stands)" 1>&2
+        ds_audit_log "ship-delta-publish" "block" "branch=${BRANCH:-<none>} head=${_SHIP_HEAD_SHA:-<unresolved>} reason=open-change-request-failed"
+        ;;
+    esac
   else
     REMOTE=$(_git remote get-url origin 2>/dev/null || echo "<remote>")
     echo "[gates/ship] no host adapter available — open a PR manually:"

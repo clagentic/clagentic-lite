@@ -72,6 +72,20 @@ def _commit(repo, name, subject, body_lines=None):
     return _git(["rev-parse", "HEAD"], repo)
 
 
+def _empty_commit(repo, subject, body_lines=None):
+    """A commit with no tree change: cheap enough to make hundreds."""
+    # The message goes through a file: a multi-hundred-KB body would exceed the
+    # per-argument limit of a -m argument.
+    message = subject + ("\n\n" + "\n".join(body_lines) if body_lines else "") + "\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".msg", delete=False) as f:
+        f.write(message)
+    try:
+        _git(["commit", "-q", "--allow-empty", "-F", f.name], repo)
+    finally:
+        os.unlink(f.name)
+    return _git(["rev-parse", "HEAD"], repo)
+
+
 def _make_repo(tmp, with_remote=True):
     """A repo on feat/example, one seed commit on main. With a remote: a
     local bare origin that already has main, so origin/main resolves."""
@@ -226,10 +240,15 @@ _FAKE_GH = textwrap.dedent('''\
     elif argv[:2] == ["pr", "view"]:
         # Bare view matches closed/merged PRs too, as the real CLI does.
         rc = 0 if (st["exists"] or st.get("closed_pr")) else 1
+    elif argv[:2] == ["pr", "create"] and st.get("create_conflict"):
+        # Another actor opened the PR between our lookup and this create.
+        sys.stderr.write("a pull request for this branch already exists\\n")
+        rc = 1
     elif argv[:2] == ["pr", "create"]:
         st["exists"] = True
         st["body"] = body_file() if "--body-file" in argv else ""
         st["created_bodies"].append(st["body"])
+        print("https://github.com/example/example/pull/" + OPEN_NUMBER)
     elif argv[:2] == ["pr", "comment"]:
         key = "closed_comments" if target_is_closed() else "comments"
         st.setdefault(key, []).append(body_file())
@@ -253,7 +272,7 @@ class _Env:
         os.chmod(gh, stat.S_IRWXU)
         self.state_path = os.path.join(self.tmp, "gh-state.json")
         self.set_state(exists=False, body="", comments=[], calls=[], created_bodies=[],
-                       read_fail=False, list_fail=False, closed_pr=False)
+                       read_fail=False, list_fail=False, closed_pr=False, create_conflict=False)
 
     def set_state(self, **kw):
         st = self.state() if os.path.exists(self.state_path) else {}
@@ -512,6 +531,10 @@ class TestCappedListMarkerCoversOnlyListedCommits(unittest.TestCase):
         self.assertEqual(len(e.state()["comments"]), guard, "fully listed: a further re-ship posts nothing")
 
 
+HOST_LIMIT = 65536
+TRUNC_NOTE_RE = re.compile(r"\[commit message truncated, (\d+) chars not shown\]")
+
+
 class TestTruncation(unittest.TestCase):
     def test_oversize_range_is_bounded_with_explicit_count(self):
         e = _Env(self)
@@ -526,18 +549,181 @@ class TestTruncation(unittest.TestCase):
         self.assertIsNotNone(m, "truncation must be explicit, never silent")
         self.assertGreater(shown, 0)
         self.assertEqual(shown + int(m.group(1)), 10)
-        self.assertLessEqual(len(section), 1500 + 300)
+        self.assertLessEqual(len(section.strip()), 1500, "the configured cap bounds the whole list block")
         self.assertIn("commit number 0 (", section, "oldest commits are the ones kept")
 
-    def test_single_oversize_commit_body_is_cut_by_lines_with_count(self):
+    def test_single_oversize_commit_message_is_cut_with_explicit_count(self):
         e = _Env(self)
         _commit(e.repo, "big.txt", "huge commit", ["line %d %s" % (i, "y" * 40) for i in range(200)])
         head = _git(["rev-parse", "HEAD"], e.repo)
         r = _call_build_ship_pr_body(e.repo, head, {"CLAGENTIC_SHIP_COMMITS_MAX_CHARS": "1000"})
         section = _section_one(r.stdout)
         self.assertIn("huge commit", section)
-        self.assertRegex(section, r"\[commit body truncated: \d+ more lines not shown\]")
-        self.assertLessEqual(len(section), 1000 + 300)
+        self.assertRegex(section, TRUNC_NOTE_RE)
+        self.assertLessEqual(len(section.strip()), 1000)
+
+    def test_cap_below_one_entry_lists_nothing_and_says_why(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        head = _git(["rev-parse", "HEAD"], e.repo)
+        r = _call_build_ship_pr_body(e.repo, head, {"CLAGENTIC_SHIP_COMMITS_MAX_CHARS": "100"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Commit list omitted", _section_one(r.stdout))
+        self.assertEqual(MARKER_RE.findall(r.stdout), [], "an unlisted head must not be anchored")
+
+
+class TestWholeArtifactWithinHostLimit(unittest.TestCase):
+    """The host hard limit applies to the WHOLE body and the WHOLE comment,
+    not to the commit list alone: fixed headings, review provenance, the
+    attestation, placeholders and the marker all count."""
+
+    def _body(self, e, env_extra=None):
+        head = _git(["rev-parse", "HEAD"], e.repo)
+        r = _call_build_ship_pr_body(e.repo, head, env_extra)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLessEqual(len(r.stdout), HOST_LIMIT, "whole body over the host limit")
+        return head, r.stdout
+
+    def test_single_giant_commit_message(self):
+        e = _Env(self)
+        _empty_commit(e.repo, "giant", ["line %d %s" % (i, "z" * 50) for i in range(5000)])
+        head, body = self._body(e)
+        m = TRUNC_NOTE_RE.search(body)
+        self.assertIsNotNone(m, "a cut message must say so")
+        self.assertGreater(int(m.group(1)), 0)
+        self.assertIn("- giant (", body)
+        self.assertEqual(MARKER_RE.findall(body), [head], "a truncated entry counts as listed")
+
+    def test_giant_single_line_body(self):
+        e = _Env(self)
+        _empty_commit(e.repo, "one long line", ["q" * 120000])
+        head, body = self._body(e)
+        self.assertRegex(body, TRUNC_NOTE_RE)
+        self.assertEqual(MARKER_RE.findall(body), [head])
+
+    def test_giant_subject(self):
+        e = _Env(self)
+        _empty_commit(e.repo, "S" * 100000, ["a short body"])
+        head, body = self._body(e)
+        self.assertRegex(body, TRUNC_NOTE_RE)
+        self.assertIn("- SSSS", body)
+        self.assertEqual(MARKER_RE.findall(body), [head])
+
+    def test_many_commits(self):
+        e = _Env(self)
+        for i in range(300):
+            _empty_commit(e.repo, "commit number %d" % i, ["w" * 300])
+        head, body = self._body(e)
+        shown = len(re.findall(r"^- commit number \d+ \(", body, re.M))
+        m = re.search(r"_(\d+) more commits not shown", body)
+        self.assertIsNotNone(m)
+        self.assertEqual(shown + int(m.group(1)), 300)
+
+    def test_configured_cap_cannot_raise_the_budget_past_the_limit(self):
+        e = _Env(self)
+        for i in range(300):
+            _empty_commit(e.repo, "commit number %d" % i, ["w" * 300])
+        self._body(e, {"CLAGENTIC_SHIP_COMMITS_MAX_CHARS": "999999999"})
+
+    def test_oversized_review_provenance_is_bounded_and_commits_still_listed(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        head = _git(["rev-parse", "HEAD"], e.repo)
+        findings = [{"severity": "high", "file": "f%d.py" % i, "line": 1, "category": "x",
+                     "message": "m%d %s" % (i, "r" * 3000), "_ledger_recurring": True} for i in range(80)]
+        ledger_dir = os.path.join(e.repo, ".clagentic", "lite")
+        os.makedirs(ledger_dir, exist_ok=True)
+        with open(os.path.join(ledger_dir, "review-ledger.jsonl"), "w") as f:
+            f.write(json.dumps({"ts": "2026-08-18T00:00:00Z", "branch": "feat/example", "base_sha": "",
+                                "head_sha": head, "verdict": "block", "findings": findings,
+                                "config": {}}) + "\n")
+        _, body = self._body(e)
+        self.assertRegex(body, r"\[truncated, \d+ chars not shown\]")
+        for subject, _ in THREE_COMMITS:
+            self.assertIn(subject, body)
+        self.assertEqual(MARKER_RE.findall(body), [head])
+
+    def test_final_guard_shrinks_a_list_that_ignores_its_budget(self):
+        """Even a list renderer that overruns the budget it was given cannot
+        produce an over-limit body: the whole-artifact guard re-budgets."""
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        head = _git(["rev-parse", "HEAD"], e.repo)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
+        env["CLAGENTIC_PROJECT_ROOT"] = e.repo
+        script = textwrap.dedent("""\
+            . '%s'
+            _ship_render_commit_list() {
+              head -c "$(( $3 + 1000 ))" /dev/zero | tr '\\0' x
+              printf '\\n'
+              _ship_marker_line '%s'
+            }
+            _build_ship_pr_body 'feat/example' '%s'
+        """) % (GATES_SH, head, head)
+        r = subprocess.run(["sh", "-c", script, GATES_SH], capture_output=True, text=True,
+                           env=env, cwd=e.repo, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLessEqual(len(r.stdout), HOST_LIMIT)
+        self.assertIn(NEXT_HEADING, r.stdout)
+
+    def test_a_body_that_cannot_be_made_to_fit_is_never_emitted(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        head = _git(["rev-parse", "HEAD"], e.repo)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
+        env["CLAGENTIC_PROJECT_ROOT"] = e.repo
+        script = textwrap.dedent("""\
+            . '%s'
+            _ship_render_commit_list() { head -c 90000 /dev/zero | tr '\\0' x; }
+            _build_ship_pr_body 'feat/example' '%s'
+        """) % (GATES_SH, head)
+        r = subprocess.run(["sh", "-c", script, GATES_SH], capture_output=True, text=True,
+                           env=env, cwd=e.repo, timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+    def test_delta_comment_for_many_commits_is_within_the_limit(self):
+        e = _Env(self)
+        for i in range(300):
+            _empty_commit(e.repo, "commit number %d" % i, ["w" * 300])
+        e.set_state(exists=True, body="hand-written description, no marker")
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        comments = e.state()["comments"]
+        self.assertEqual(len(comments), 1)
+        self.assertLessEqual(len(comments[0]), HOST_LIMIT, "whole comment over the host limit")
+        self.assertRegex(comments[0], r"_\d+ more commits not shown")
+
+    def test_delta_comment_for_a_giant_message_is_within_the_limit(self):
+        e = _Env(self)
+        _empty_commit(e.repo, "G" * 100000, ["line %d %s" % (i, "z" * 50) for i in range(5000)])
+        head = _git(["rev-parse", "HEAD"], e.repo)
+        e.set_state(exists=True, body="hand-written description, no marker")
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        comments = e.state()["comments"]
+        self.assertEqual(len(comments), 1)
+        self.assertLessEqual(len(comments[0]), HOST_LIMIT)
+        self.assertRegex(comments[0], TRUNC_NOTE_RE)
+        self.assertEqual(MARKER_RE.findall(comments[0]), [head])
+
+    def test_giant_first_commit_is_truncated_and_the_rest_page_through_on_reship(self):
+        e = _Env(self)
+        _empty_commit(e.repo, "giant first", ["line %d %s" % (i, "z" * 50) for i in range(5000)])
+        _empty_commit(e.repo, "small second", ["tiny " * 120])
+        self.assertEqual(e.ship().returncode, 0)
+        created = e.state()["created_bodies"][0]
+        self.assertLessEqual(len(created), HOST_LIMIT)
+        self.assertIn("- giant first (", created)
+        self.assertEqual(e.ship().returncode, 0)
+        comments = e.state()["comments"]
+        self.assertEqual(len(comments), 1, "the unlisted commit gets its own comment")
+        self.assertIn("small second", comments[0])
+        self.assertNotIn("giant first", comments[0])
+        self.assertEqual(e.ship().returncode, 0)
+        self.assertEqual(len(e.state()["comments"]), 1, "nothing is left unlisted")
 
 
 class TestShipEndToEnd(unittest.TestCase):
@@ -676,6 +862,7 @@ class TestShipPrLookupStates(unittest.TestCase):
         for c in calls:
             if c.startswith(("pr view", "pr comment")):
                 self.assertRegex(c, r"^pr (view|comment) 7\b", "must address the open PR by number: %r" % c)
+        self.assertEqual(len([c for c in calls if c.startswith("pr list")]), 1, calls)
         st = e.state()
         self.assertEqual(st["closed_comments"], [])
         self.assertEqual(len(st["comments"]), 1)
@@ -714,7 +901,52 @@ class TestShipPrLookupStates(unittest.TestCase):
         self.assertEqual(e.state()["comments"], [])
         self.assertIn("could not determine whether a PR is already open", r.stderr)
         rows = e.audit_rows("ship-delta-publish")
-        self.assertTrue(any(o == "block" and "pr-existence-check-failed" in d for o, d in rows), rows)
+        self.assertTrue(any(o == "block" and "open-change-request-failed" in d for o, d in rows), rows)
+
+    def test_reused_pr_discards_the_body_and_comments_once_on_that_number(self):
+        """The outcome is decided once, at open time: an open PR is reused
+        (the rendered body is thrown away, never written), and the delta
+        comment goes to exactly that number after exactly one lookup."""
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        e.set_state(exists=True, body="existing body, no marker")
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = e.calls()
+        self.assertEqual(len([c for c in calls if c.startswith("pr list")]), 1, calls)
+        self.assertEqual([c for c in calls if c.startswith("pr create")], [])
+        for c in calls:
+            self.assertFalse(c.startswith("pr edit"), c)
+            self.assertFalse(c.startswith("api"), c)
+        comment_calls = [c for c in calls if c.startswith("pr comment")]
+        self.assertEqual(len(comment_calls), 1, calls)
+        self.assertTrue(comment_calls[0].startswith("pr comment 7 "), comment_calls[0])
+        self.assertEqual(e.state()["body"], "existing body, no marker")
+
+    def test_created_pr_makes_exactly_one_lookup_and_no_comment(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = e.calls()
+        self.assertEqual(len([c for c in calls if c.startswith("pr list")]), 1, calls)
+        self.assertEqual(len([c for c in calls if c.startswith("pr create")]), 1, calls)
+        self.assertEqual([c for c in calls if c.startswith("pr comment")], [])
+
+    def test_pr_opened_by_someone_else_after_the_lookup_is_never_edited_or_commented_on(self):
+        """The window between lookup and create is the only race left: the
+        create then fails, and nothing may be edited or commented as a
+        consequence (no second, preflight-style view to go stale)."""
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        e.set_state(create_conflict=True)
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, "ship's push result stands: " + r.stdout + r.stderr)
+        calls = e.calls()
+        self.assertEqual([c for c in calls if c.startswith(("pr comment", "pr edit"))], [])
+        self.assertEqual(e.state()["comments"], [])
+        rows = e.audit_rows("ship-delta-publish")
+        self.assertTrue(any(o == "block" and "open-change-request-failed" in d for o, d in rows), rows)
 
 
 class TestAdapterContractAdditions(unittest.TestCase):
@@ -731,31 +963,31 @@ class TestAdapterContractAdditions(unittest.TestCase):
         """) % (PLATFORM_SH, HOST_ADAPTER_SH, call)
         return subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env, timeout=60)
 
-    def test_exists_is_tri_state(self):
+    def test_open_outcome_is_created_or_reused_with_the_number(self):
         e = _Env(self)
-        call = "host_adapter_change_request_exists feat/example"
-        self.assertEqual(self._run(e, call).returncode, 1)
-        e.set_state(exists=True)
-        self.assertEqual(self._run(e, call).returncode, 0)
-        e.set_state(exists=True, list_fail=True)
-        self.assertEqual(self._run(e, call).returncode, 2)
+        r = self._run(e, "host_adapter_open_change_request main feat/example")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "created 7"), r.stderr)
+        r = self._run(e, "host_adapter_open_change_request main feat/example")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "reused 7"), r.stderr)
 
     def test_closed_pr_does_not_count_as_open(self):
         e = _Env(self)
         e.set_state(closed_pr=True)
-        self.assertEqual(self._run(e, "host_adapter_change_request_exists feat/example").returncode, 1)
+        r = self._run(e, "host_adapter_open_change_request main feat/example")
+        self.assertEqual(r.stdout.strip(), "created 7")
 
     def test_open_change_request_refuses_to_create_on_lookup_error(self):
         e = _Env(self)
         e.set_state(list_fail=True)
         r = self._run(e, "host_adapter_open_change_request main feat/example")
         self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "")
         self.assertEqual([c for c in e.calls() if c.startswith("pr create")], [])
 
     def test_read_thread_text_prints_body_then_comments(self):
         e = _Env(self)
         e.set_state(exists=True, body="the body", comments=["first comment", "second comment"])
-        r = self._run(e, "host_adapter_read_thread_text feat/example")
+        r = self._run(e, "host_adapter_read_thread_text 7")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.split(), "the body first comment second comment".split())
         self.assertLess(r.stdout.index("the body"), r.stdout.index("first comment"))
@@ -764,7 +996,15 @@ class TestAdapterContractAdditions(unittest.TestCase):
     def test_read_thread_text_failure_is_nonzero(self):
         e = _Env(self)
         e.set_state(exists=True, read_fail=True)
-        self.assertNotEqual(self._run(e, "host_adapter_read_thread_text feat/example").returncode, 0)
+        self.assertNotEqual(self._run(e, "host_adapter_read_thread_text 7").returncode, 0)
+
+    def test_read_thread_text_by_number_never_reads_the_closed_pr(self):
+        e = _Env(self)
+        e.set_state(exists=True, body="open body", comments=["open comment"], closed_pr=True,
+                    closed_body="closed body", closed_comments=["closed comment"])
+        r = self._run(e, "host_adapter_read_thread_text 7")
+        self.assertIn("open body", r.stdout)
+        self.assertNotIn("closed", r.stdout)
 
     def test_no_adapter_code_path_can_edit_a_pr_body(self):
         """Sweep over the tracked gate/adapter scripts: no body-edit verb

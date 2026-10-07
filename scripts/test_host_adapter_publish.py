@@ -285,6 +285,8 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False, closed_pr=Fal
                 dst = os.path.join(bodies_dir, "create-body-%d.txt" % len(open(calls_file).readlines()))
                 with open(src) as sf, open(dst, "w") as df:
                     df.write(sf.read())
+            # The real CLI ends its output with the new PR's URL.
+            print("https://github.com/example/example/pull/9")
             sys.exit(0)
         if argv[:2] == ["pr", "comment"]:
             # Persist the posted body BEFORE the caller's own cleanup can
@@ -460,6 +462,7 @@ class TestHostAdapterContractDirect(unittest.TestCase):
             path_prepend=self._bin,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "reused 7")
         calls = _read_calls(self._calls)
         self.assertTrue(any(c.startswith("pr list") and "--state open" in c for c in calls))
         self.assertFalse(any(c.startswith("pr create") for c in calls),
@@ -473,8 +476,12 @@ class TestHostAdapterContractDirect(unittest.TestCase):
             path_prepend=self._bin,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "created 9",
+                         "stdout is exactly one line: the outcome and the new PR's number")
         calls = _read_calls(self._calls)
         self.assertTrue(any(c.startswith("pr create") for c in calls))
+        self.assertEqual(len([c for c in calls if c.startswith("pr list")]), 1,
+                         "exactly one open-PR lookup per open call")
 
     def test_open_change_request_refuses_to_create_when_open_pr_lookup_errors(self):
         _make_fake_gh(self._bin, self._calls, mode="list_fail")
@@ -484,6 +491,7 @@ class TestHostAdapterContractDirect(unittest.TestCase):
             path_prepend=self._bin,
         )
         self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "", "no outcome line when the outcome is unknown")
         calls = _read_calls(self._calls)
         self.assertTrue(any(c.startswith("pr list") for c in calls))
         self.assertFalse(any(c.startswith("pr create") for c in calls),
@@ -498,38 +506,88 @@ class TestHostAdapterContractDirect(unittest.TestCase):
             path_prepend=self._bin,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "created 9")
         calls = _read_calls(self._calls)
         self.assertTrue(any(c.startswith("pr list") and "--state open" in c for c in calls))
         self.assertTrue(any(c.startswith("pr create") for c in calls),
                         "a closed PR is not an open one: the branch must get a new PR")
 
-    def test_post_comment_addresses_the_open_pr_by_number(self):
+    def test_open_change_request_fails_when_created_pr_number_is_unreadable(self):
+        """A create whose output carries no PR URL cannot report `created
+        <num>`; it must fail loudly, never print a made-up number."""
+        _make_fake_gh(self._bin, self._calls, pr_exists=False)
+        gh_path = os.path.join(self._bin, "gh")
+        with open(gh_path) as f:
+            script = f.read()
+        with open(gh_path, "w") as f:
+            f.write(script.replace('print("https://github.com/example/example/pull/9")', 'print("done")'))
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_open_change_request main feat/example" % self._repo,
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_find_open_change_request_is_tri_state_and_ignores_closed_prs(self):
+        call = "host_adapter_find_open_change_request feat/example"
+        _make_fake_gh(self._bin, self._calls, pr_exists=True, closed_pr=True)
+        r = _run_review_merge_fn(call, env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "7"), "the OPEN number, not the closed 3")
+        _make_fake_gh(self._bin, self._calls, pr_exists=False, closed_pr=True)
+        r = _run_review_merge_fn(call, env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
+        self.assertEqual((r.returncode, r.stdout.strip()), (1, ""))
+        _make_fake_gh(self._bin, self._calls, mode="list_fail")
+        r = _run_review_merge_fn(call, env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
+        self.assertEqual(r.returncode, 2)
+
+    def test_post_comment_addresses_the_given_pr_number_without_a_lookup(self):
         _make_fake_gh(self._bin, self._calls, pr_exists=True, closed_pr=True)
         body_file = os.path.join(self._tmpdir, "body.txt")
         with open(body_file, "w") as f:
             f.write("hello\n")
         r = _run_review_merge_fn(
-            "cd '%s' && host_adapter_post_comment '%s'" % (self._repo, body_file),
+            "cd '%s' && host_adapter_post_comment 7 '%s'" % (self._repo, body_file),
             env_overrides={"REPO_ROOT": self._repo},
             path_prepend=self._bin,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
-        comment_calls = [c for c in _read_calls(self._calls) if c.startswith("pr comment")]
+        calls = _read_calls(self._calls)
+        comment_calls = [c for c in calls if c.startswith("pr comment")]
         self.assertEqual(len(comment_calls), 1)
         self.assertTrue(comment_calls[0].startswith("pr comment 7 "), comment_calls[0])
+        self.assertEqual([c for c in calls if c.startswith("pr list")], [],
+                         "the number came from the caller's one lookup; the adapter must not look again")
 
-    def test_post_comment_refuses_when_no_open_pr_exists(self):
-        _make_fake_gh(self._bin, self._calls, pr_exists=False, closed_pr=True)
+    def test_per_pr_calls_refuse_a_branch_name_or_empty_target(self):
+        """The class guard: a branch name can match a closed PR, so every
+        per-PR function takes a number and fails closed on anything else."""
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
         body_file = os.path.join(self._tmpdir, "body.txt")
         with open(body_file, "w") as f:
             f.write("hello\n")
-        r = _run_review_merge_fn(
-            "cd '%s' && host_adapter_post_comment '%s'" % (self._repo, body_file),
-            env_overrides={"REPO_ROOT": self._repo},
-            path_prepend=self._bin,
-        )
-        self.assertNotEqual(r.returncode, 0)
-        self.assertFalse(any(c.startswith("pr comment") for c in _read_calls(self._calls)))
+        for call in ("host_adapter_post_comment feat/example '%s'" % body_file,
+                     "host_adapter_post_comment '' '%s'" % body_file,
+                     "host_adapter_read_thread_text feat/example",
+                     "host_adapter_read_comments feat/example",
+                     "host_adapter_read_comments"):
+            with self.subTest(call=call):
+                r = _run_review_merge_fn("cd '%s' && %s" % (self._repo, call),
+                                         env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
+                self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(_read_calls(self._calls), [], "no host call may be made for a non-number target")
+
+    def test_artifact_limit_is_owned_by_the_adapter(self):
+        _make_fake_gh(self._bin, self._calls)
+        r = _run_review_merge_fn("host_adapter_artifact_limit",
+                                 env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "65536"))
+        no_remote_repo = os.path.join(self._tmpdir, "no-remote-repo")
+        _init_git_repo_no_remote(no_remote_repo)
+        r = _run_review_merge_fn("host_adapter_artifact_limit",
+                                 env_overrides={"REPO_ROOT": no_remote_repo}, path_prepend=self._bin)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "65536"),
+                         "without an adapter the smallest shipped limit applies")
 
     def test_open_change_request_with_body_file_uses_fill_first_and_body_file(self):
         """lr-429b32: a BODY_FILE third arg must reach `gh pr create` as
@@ -595,7 +653,7 @@ class TestHostAdapterContractDirect(unittest.TestCase):
         with open(body_file, "w") as f:
             f.write("verdict: pass\nhead_sha: abc123\n")
         r = _run_review_merge_fn(
-            "cd '%s' && host_adapter_post_comment '%s'" % (self._repo, body_file),
+            "cd '%s' && host_adapter_post_comment 7 '%s'" % (self._repo, body_file),
             env_overrides={"REPO_ROOT": self._repo},
             path_prepend=self._bin,
         )
@@ -607,7 +665,7 @@ class TestHostAdapterContractDirect(unittest.TestCase):
     def test_read_comments_returns_json_lines(self):
         _make_fake_gh(self._bin, self._calls, pr_exists=True)
         r = _run_review_merge_fn(
-            "cd '%s' && host_adapter_read_comments" % self._repo,
+            "cd '%s' && host_adapter_read_comments 7" % self._repo,
             env_overrides={"REPO_ROOT": self._repo},
             path_prepend=self._bin,
         )
@@ -704,10 +762,12 @@ class TestHostAdapterRepoScopingSweep(unittest.TestCase):
             "ancestor repo's remote, when REPO_ROOT is not itself a git repo",
         )
 
-    def test_post_comment_does_not_target_an_ancestor_repos_branch(self):
-        """Same scenario, the publish path: post_comment must not resolve
-        (and therefore must not post to) a branch name read from the
-        ancestor repo instead of REPO_ROOT."""
+    def test_post_comment_reads_no_repo_state_so_it_cannot_target_an_ancestor_repo(self):
+        """The publish path used to read the current branch from REPO_ROOT,
+        which an ancestor repo could answer for. post_comment now takes the
+        change-request number from the caller and reads no repo state at all:
+        the posted target is exactly the number given, whatever repo
+        REPO_ROOT resolves to."""
         repo_root = _init_ancestor_repo_with_unrelated_subdir(
             self._tmpdir, "https://github.com/ancestor/wrong.git"
         )
@@ -716,16 +776,23 @@ class TestHostAdapterRepoScopingSweep(unittest.TestCase):
         with open(body_file, "w") as f:
             f.write("verdict: pass\n")
         r = _run_review_merge_fn(
-            "host_adapter_post_comment '%s'" % body_file,
-            env_overrides={"REPO_ROOT": repo_root},
+            "host_adapter_post_comment 7 '%s'" % body_file,
+            env_overrides={"REPO_ROOT": repo_root, "CLAGENTIC_REPO_HOST": "github"},
             path_prepend=self._bin,
         )
-        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.returncode, 0, r.stderr)
         calls = _read_calls(self._calls)
-        self.assertFalse(
-            any(c.startswith("pr comment") for c in calls),
-            "must never reach gh pr comment when REPO_ROOT is unscoped: %r" % calls,
-        )
+        self.assertEqual([c.split(" --body-file")[0] for c in calls], ["pr comment 7"], calls)
+
+    def test_no_adapter_function_reads_the_branch_or_head_for_a_pr_call(self):
+        """Class sweep: no branch- or HEAD-keyed repo read feeds a per-PR
+        call anywhere in host-adapter.sh (the only branch-keyed host call is
+        the one open-PR lookup, whose branch the caller passes in)."""
+        with open(HOST_ADAPTER_SH, encoding="utf-8") as f:
+            live = [l for l in f.read().splitlines() if not l.strip().startswith("#")]
+        offenders = [l for l in live if "--abbrev-ref" in l or "rev-parse HEAD" in l
+                     or "branch --show-current" in l]
+        self.assertEqual(offenders, [])
 
     def test_available_succeeds_when_repo_root_is_the_real_toplevel(self):
         """Negative control: the identical ancestor/subdir layout, but
@@ -972,6 +1039,35 @@ class TestPublishViaCmdReview(unittest.TestCase):
         conn.close()
         self.assertTrue(rows, "a review-publish audit row must exist")
         self.assertEqual(rows[0][1], "block", "the logged outcome must reflect the publish failure")
+
+    def test_review_comment_targets_the_open_pr_number_after_exactly_one_lookup(self):
+        """With a closed and an open PR on the branch, the verdict comment
+        goes to the open PR by number; the publisher resolves it with one
+        lookup, not one per call."""
+        _init_git_repo_with_github_remote(self._project)
+        _stage_file(self._project, "feature.py", "print('hi')\n")
+        _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
+        _make_fake_gh(self._bin, self._calls, pr_exists=True, closed_pr=True)
+        result = _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = _read_calls(self._calls)
+        self.assertEqual(len([c for c in calls if c.startswith("pr list")]), 1, calls)
+        comment_calls = [c for c in calls if c.startswith("pr comment")]
+        self.assertEqual(len(comment_calls), 1)
+        self.assertTrue(comment_calls[0].startswith("pr comment 7 "), comment_calls[0])
+
+    def test_review_without_an_open_pr_posts_nothing_and_audits_it(self):
+        _init_git_repo_with_github_remote(self._project)
+        _stage_file(self._project, "feature.py", "print('hi')\n")
+        _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
+        _make_fake_gh(self._bin, self._calls, pr_exists=False, closed_pr=True)
+        result = _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in _read_calls(self._calls) if c.startswith("pr comment")], [])
+        conn = sqlite3.connect(os.path.join(self._project, ".clagentic", "lite", "audit.db"))
+        rows = conn.execute("SELECT outcome, details FROM gate_runs WHERE gate='review-publish'").fetchall()
+        conn.close()
+        self.assertTrue(any(o == "block" and "no-open-change-request" in d for o, d in rows), rows)
 
     def test_block_verdict_also_publishes_one_comment(self):
         """Publish runs on a blocking verdict too, not only a passing one."""

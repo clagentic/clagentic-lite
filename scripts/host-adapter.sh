@@ -11,70 +11,76 @@
 #                                       discovered for REPO_ROOT's origin
 #                                       remote, exit 1 otherwise (fallback).
 #   host_adapter_open_change_request BASE HEAD [BODY_FILE]
-#                                    -- open (or find an existing) PR/MR for
-#                                       HEAD against BASE. BODY_FILE, when
-#                                       given, is a path to a file whose
-#                                       contents become the PR body on
-#                                       CREATE only (lr-429b32) -- an
-#                                       already-open PR is reused as-is, body
-#                                       unchanged, matching this function's
-#                                       existing find-or-open contract. The
-#                                       caller renders BODY_FILE's contents
-#                                       (gate side, e.g. gates.sh's
-#                                       _build_ship_pr_body) -- this file
-#                                       only transports it, never composes
-#                                       it, per the file-header contract
-#                                       above. Omitted BODY_FILE preserves
-#                                       the pre-lr-429b32 behavior exactly.
-#                                       Prints nothing of significance to
-#                                       stdout; status via exit code +
-#                                       stderr, same posture as the rest of
-#                                       gates.sh.
-#   host_adapter_post_comment BODY_FILE
+#                                    -- the SOLE decider of "which change
+#                                       request, created or reused". Looks up
+#                                       the OPEN change request for HEAD
+#                                       (closed and merged ones never count),
+#                                       reuses it if found, creates one if
+#                                       not. Prints exactly one line on
+#                                       stdout: `created <num>` or
+#                                       `reused <num>`; everything else goes
+#                                       to stderr. Exits non-zero, printing
+#                                       nothing on stdout, when the outcome
+#                                       cannot be determined (the lookup
+#                                       failed -- it never creates blind) or
+#                                       the create itself failed. BODY_FILE,
+#                                       when given, becomes the body on
+#                                       CREATE only (lr-429b32); a reused
+#                                       change request's body is never
+#                                       touched. The caller renders BODY_FILE
+#                                       (gate side, gates.sh's
+#                                       _build_ship_pr_body) -- this file only
+#                                       transports it. Omitted BODY_FILE
+#                                       preserves the pre-lr-429b32 behavior.
+#   host_adapter_find_open_change_request BRANCH
+#                                    -- print the number of the OPEN change
+#                                       request for BRANCH. TRI-STATE exit:
+#                                       0 found, 1 none, 2 could not be
+#                                       determined (adapter, auth, network).
+#                                       For callers that only need to address
+#                                       an existing change request (the
+#                                       review-verdict publisher); a caller
+#                                       that must choose create-vs-reuse uses
+#                                       open_change_request instead, which
+#                                       shares this lookup.
+#   host_adapter_post_comment PR_NUM BODY_FILE
 #                                    -- post BODY_FILE's contents as ONE
-#                                       comment on the change-request thread
-#                                       for the current branch. Exit 0 on
-#                                       success, non-zero otherwise.
-#   host_adapter_read_comments      -- print existing comment bodies for the
-#                                       current branch's change request, one
-#                                       JSON object per line (best-effort;
-#                                       used by callers that need to check
-#                                       for a prior comment before posting,
-#                                       not required by the publish path
-#                                       below, provided for contract
-#                                       completeness per the task's item 1).
-#   host_adapter_change_request_exists BRANCH
-#                                    -- TRI-STATE: exit 0 = an OPEN change
-#                                       request exists for BRANCH (closed and
-#                                       merged ones do not count), 1 = none,
-#                                       2 = could not be determined (adapter,
-#                                       auth, network). Lets the caller
-#                                       distinguish "create" from "re-ship to
-#                                       an existing PR" before
-#                                       host_adapter_open_change_request
-#                                       (which reuses silently, exit 0 either
-#                                       way) runs, and never mistake a failed
-#                                       lookup for "none". open_change_request
-#                                       itself uses the same lookup and refuses
-#                                       to create on 2. Takes the branch
-#                                       explicitly -- no repo-state git read.
-#   host_adapter_read_thread_text BRANCH
-#                                    -- print the change request's body, then
-#                                       every comment body in chronological
-#                                       order, as plain text on stdout. Exit 0
-#                                       iff the host read SUCCEEDED (an empty
-#                                       thread is still success); non-zero on
-#                                       any adapter/auth/network failure, so a
+#                                       comment on change request PR_NUM.
+#                                       Exit 0 on success, non-zero otherwise.
+#   host_adapter_read_comments PR_NUM
+#                                    -- print existing comment bodies for
+#                                       change request PR_NUM, one JSON object
+#                                       per line (best-effort; contract
+#                                       completeness, not required by the
+#                                       publish path).
+#   host_adapter_read_thread_text PR_NUM
+#                                    -- print change request PR_NUM's body,
+#                                       then every comment body in
+#                                       chronological order, as plain text on
+#                                       stdout. Exit 0 iff the host read
+#                                       SUCCEEDED (an empty thread is still
+#                                       success); non-zero on any
+#                                       adapter/auth/network failure, so a
 #                                       caller never mistakes a failed read for
 #                                       "no prior content". Read-only. The
 #                                       caller parses the text (gates.sh looks
 #                                       for its own hidden ship marker) --
 #                                       adapters transport, they never
 #                                       interpret.
-#   Per-PR reads and comments (read_comments, read_thread_text, post_comment)
-#   resolve the OPEN change request once, by number, and address it by that
-#   number -- never by bare branch name, which can match a closed or merged
-#   change request on the same branch. No open change request: non-zero.
+#   host_adapter_artifact_limit      -- print the host's hard character limit
+#                                       for ONE change-request body or ONE
+#                                       comment. Gate logic budgets every
+#                                       rendered artifact against this and
+#                                       never hardcodes a number of its own.
+#                                       Without a detected adapter it prints
+#                                       the smallest limit any shipped adapter
+#                                       has (_HOST_ADAPTER_DEFAULT_ARTIFACT_LIMIT)
+#                                       so an artifact rendered before/without
+#                                       an adapter is still safe to send.
+#   Per-PR reads and comments take the change-request NUMBER, never a branch
+#   name (a bare branch can match a closed or merged change request on the
+#   same branch) and never a repo-state read of their own: the number comes
+#   from the one lookup above, once per ship/publish.
 #   A change-request BODY is written ONLY by host_adapter_open_change_request
 #   at create. No adapter function may edit an existing body: later ships add
 #   comments (host_adapter_post_comment), never rewrite the body.
@@ -95,11 +101,11 @@
 #      flow, publish is skipped with a one-line notice, and this is NOT a
 #      degraded state.
 #
-# ADDING A NEW HOST: implement the five functions following the `gh` example
+# ADDING A NEW HOST: implement the six functions following the `gh` example
 # below (_host_adapter_gh_open_change_request /
 # _host_adapter_gh_post_comment / _host_adapter_gh_read_comments /
-# _host_adapter_gh_change_request_exists /
-# _host_adapter_gh_read_thread_text), add one
+# _host_adapter_gh_find_open_change_request /
+# _host_adapter_gh_read_thread_text / _host_adapter_gh_artifact_limit), add one
 # recognition arm to _host_adapter_detect, and document the new adapter in
 # docs/GATES.md's adapter table -- no other file changes needed. Gate logic
 # (gates.sh, review-merge.sh) must never reference the new vendor by name.
@@ -122,10 +128,12 @@
 # signals the mistake. In this file specifically, an unscoped
 # `git remote get-url origin` in _host_adapter_detect can make
 # host_adapter_available report success against the wrong repo's remote,
-# and an unscoped rev-parse in the gh adapter's comment paths can post a
-# review verdict's findings to the WRONG repository's change-request thread
-# -- wrong-repo disclosure of findings content, silently. Every repo-state
-# git call in this file must gate on this predicate first.
+# and the comment paths used to read the current branch the same way, which
+# could post a review verdict's findings to the WRONG repository's
+# change-request thread -- wrong-repo disclosure of findings content,
+# silently. The comment paths now take an explicit change-request number and
+# read no repo state at all; every remaining repo-state git call in this
+# file must gate on this predicate first.
 #
 # Why a local copy instead of calling gates.sh's version: host-adapter.sh is
 # sourced by gates.sh near the very top of that file, BEFORE REPO_ROOT is
@@ -208,10 +216,21 @@ host_adapter_available() {
   _host_adapter_detect
 }
 
-# host_adapter_open_change_request BASE HEAD [BODY_FILE] — open (or reuse) a
-# PR for HEAD against BASE. This is the refactored seam cmd_ship's PR-open
-# path now calls instead of invoking `gh` directly (item 2). BODY_FILE is
-# optional (lr-429b32) — see the file-header contract table above.
+# _host_adapter_is_number VALUE -- true iff VALUE is a non-empty run of digits.
+# Every per-PR call below addresses a change request by number; a branch name
+# or an empty string reaching one is a caller bug that must fail closed rather
+# than reach the host CLI, where a bare ref can match a closed or merged PR.
+_host_adapter_is_number() {
+  case "$1" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+# host_adapter_open_change_request BASE HEAD [BODY_FILE] -- the sole decider of
+# created-vs-reused. Prints `created <num>` or `reused <num>` on stdout, exits
+# non-zero (stdout empty) when that cannot be determined. See the file-header
+# contract above.
 host_adapter_open_change_request() {
   _haocr_base="$1"
   _haocr_head="$2"
@@ -223,52 +242,71 @@ host_adapter_open_change_request() {
   esac
 }
 
-# host_adapter_post_comment BODY_FILE — post one comment on the current
-# branch's change-request thread. Used by the review-verdict publish step
-# (item 3). Never called when no adapter is available -- callers check
-# host_adapter_available first per the fallback contract (item 4).
-host_adapter_post_comment() {
-  _hapc_body_file="$1"
-  _host_adapter_detect || return 1
-  case "$_HOST_ADAPTER" in
-    gh) _host_adapter_gh_post_comment "$_hapc_body_file" ;;
-    *)  return 1 ;;
-  esac
-}
-
-# host_adapter_read_comments — print existing comment bodies for the current
-# branch's change request, one JSON object per line. Contract-completeness
-# (item 1); not required by the publish path, which only ever appends.
-host_adapter_read_comments() {
-  _host_adapter_detect || return 1
-  case "$_HOST_ADAPTER" in
-    gh) _host_adapter_gh_read_comments ;;
-    *)  return 1 ;;
-  esac
-}
-
-# host_adapter_change_request_exists BRANCH — tri-state: exit 0 = an OPEN
-# change request exists for BRANCH, 1 = none, 2 = could not be determined.
-host_adapter_change_request_exists() {
-  _hacre_branch="$1"
-  [ -n "$_hacre_branch" ] || return 2
+# host_adapter_find_open_change_request BRANCH -- print the OPEN change
+# request's number. Tri-state exit: 0 found, 1 none, 2 undeterminable.
+host_adapter_find_open_change_request() {
+  _hafocr_branch="$1"
+  [ -n "$_hafocr_branch" ] || return 2
   _host_adapter_detect || return 2
   case "$_HOST_ADAPTER" in
-    gh) _host_adapter_gh_change_request_exists "$_hacre_branch" ;;
+    gh) _host_adapter_gh_find_open_change_request "$_hafocr_branch" ;;
     *)  return 2 ;;
   esac
 }
 
-# host_adapter_read_thread_text BRANCH — print the change request's body and
+# host_adapter_post_comment PR_NUM BODY_FILE -- post one comment on change
+# request PR_NUM. Never called when no adapter is available -- callers check
+# host_adapter_available first per the fallback contract (item 4).
+host_adapter_post_comment() {
+  _hapc_num="$1"
+  _hapc_body_file="${2:-}"
+  _host_adapter_is_number "$_hapc_num" || return 1
+  _host_adapter_detect || return 1
+  case "$_HOST_ADAPTER" in
+    gh) _host_adapter_gh_post_comment "$_hapc_num" "$_hapc_body_file" ;;
+    *)  return 1 ;;
+  esac
+}
+
+# host_adapter_read_comments PR_NUM -- print existing comment bodies for
+# change request PR_NUM, one JSON object per line. Contract-completeness
+# (item 1); not required by the publish path, which only ever appends.
+host_adapter_read_comments() {
+  _harc_num="${1:-}"
+  _host_adapter_is_number "$_harc_num" || return 1
+  _host_adapter_detect || return 1
+  case "$_HOST_ADAPTER" in
+    gh) _host_adapter_gh_read_comments "$_harc_num" ;;
+    *)  return 1 ;;
+  esac
+}
+
+# host_adapter_read_thread_text PR_NUM -- print the change request's body and
 # then each comment body (chronological) to stdout. Exit status is the host
 # read's own: 0 = read succeeded, non-zero = it did not.
 host_adapter_read_thread_text() {
-  _hartt_branch="$1"
-  [ -n "$_hartt_branch" ] || return 1
+  _hartt_num="${1:-}"
+  _host_adapter_is_number "$_hartt_num" || return 1
   _host_adapter_detect || return 1
   case "$_HOST_ADAPTER" in
-    gh) _host_adapter_gh_read_thread_text "$_hartt_branch" ;;
+    gh) _host_adapter_gh_read_thread_text "$_hartt_num" ;;
     *)  return 1 ;;
+  esac
+}
+
+# The smallest hard body/comment limit of any shipped adapter. Used when no
+# adapter is detected so an artifact is still rendered within a limit every
+# shipped host honors; it lives here, not in gate logic, so the number has one
+# owner.
+_HOST_ADAPTER_DEFAULT_ARTIFACT_LIMIT=65536
+
+# host_adapter_artifact_limit -- print the host's hard character limit for one
+# change-request body or one comment.
+host_adapter_artifact_limit() {
+  _host_adapter_detect >/dev/null 2>&1 || true
+  case "${_HOST_ADAPTER:-}" in
+    gh) _host_adapter_gh_artifact_limit ;;
+    *)  printf '%s\n' "$_HOST_ADAPTER_DEFAULT_ARTIFACT_LIMIT" ;;
   esac
 }
 
@@ -298,28 +336,34 @@ _host_adapter_gh_open_pr_number() {
   esac
 }
 
-# _host_adapter_gh_open_pr_state BRANCH -- exit-code-only view of the above.
-_host_adapter_gh_open_pr_state() {
-  _hagops_num=$(_host_adapter_gh_open_pr_number "$1") || return $?
-  [ -n "$_hagops_num" ] || return 2
-  return 0
+# GitHub rejects a pull-request body or a comment over 65536 characters.
+_host_adapter_gh_artifact_limit() {
+  printf '%s\n' 65536
 }
 
+_host_adapter_gh_find_open_change_request() {
+  _host_adapter_gh_open_pr_number "$1"
+}
+
+# Prints `created <num>` / `reused <num>` on stdout and nothing else there:
+# gh's own output is relayed to stderr so the one stdout line stays
+# machine-readable.
 _host_adapter_gh_open_change_request() {
   _hagocr_base="$1"
   _hagocr_head="$2"
   _hagocr_body_file="${3:-}"
   _hagocr_state=0
-  _host_adapter_gh_open_pr_state "$_hagocr_head" || _hagocr_state=$?
+  _hagocr_num=$(_host_adapter_gh_open_pr_number "$_hagocr_head") || _hagocr_state=$?
   case "$_hagocr_state" in
     0)
-      echo "[host-adapter/gh] PR already open for $_hagocr_head"
+      echo "[host-adapter/gh] PR #$_hagocr_num already open for $_hagocr_head" 1>&2
+      printf 'reused %s\n' "$_hagocr_num"
       return 0
       ;;
     1) ;;
     *)
       # Creating blind on a failed lookup could duplicate an open PR.
-      echo "[host-adapter/gh] could not determine whether a PR is open for $_hagocr_head -- not creating one" 1>&2
+      echo "[host-adapter/gh] could not determine whether a PR is already open for $_hagocr_head -- not creating one" 1>&2
       return 1
       ;;
   esac
@@ -327,42 +371,33 @@ _host_adapter_gh_open_change_request() {
   # scrape -- --fill supplies no review-provenance section at all, which is
   # the defect this task exists to close. --title still comes from --fill's
   # own commit-derived title; only the body is replaced.
+  _hagocr_rc=0
   if [ -n "$_hagocr_body_file" ] && [ -f "$_hagocr_body_file" ]; then
-    run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr create --fill-first --base "$_hagocr_base" --head "$_hagocr_head" --body-file "$_hagocr_body_file"
+    _hagocr_out=$(run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr create --fill-first --base "$_hagocr_base" --head "$_hagocr_head" --body-file "$_hagocr_body_file") || _hagocr_rc=$?
   else
-    run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr create --fill --base "$_hagocr_base" --head "$_hagocr_head"
+    _hagocr_out=$(run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr create --fill --base "$_hagocr_base" --head "$_hagocr_head") || _hagocr_rc=$?
   fi
+  [ -z "$_hagocr_out" ] || printf '%s\n' "$_hagocr_out" 1>&2
+  [ "$_hagocr_rc" -eq 0 ] || return "$_hagocr_rc"
+  # `gh pr create` ends its output with the new PR's URL. Reading the number
+  # from it keeps this call the only lookup: no second query to learn what
+  # was just created.
+  _hagocr_url=$(printf '%s\n' "$_hagocr_out" | tail -n 1)
+  _hagocr_num=${_hagocr_url##*/pull/}
+  if [ "$_hagocr_num" = "$_hagocr_url" ] || ! _host_adapter_is_number "$_hagocr_num"; then
+    echo "[host-adapter/gh] the PR was created but its number could not be read from gh's output" 1>&2
+    return 1
+  fi
+  printf 'created %s\n' "$_hagocr_num"
 }
 
 _host_adapter_gh_post_comment() {
-  _hagpc_body_file="$1"
-  [ -f "$_hagpc_body_file" ] || return 1
-  _hagpc_branch=""
-  # INV-6: refuse rather than resolve an ancestor repo's branch when
-  # REPO_ROOT is not itself the git repo `-C` would operate on -- an
-  # unscoped read here would post a review verdict's findings to the WRONG
-  # repository's change-request thread.
-  if command -v git >/dev/null 2>&1 && _host_adapter_repo_root_is_scoped; then
-    _hagpc_branch=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-  fi
-  [ -n "$_hagpc_branch" ] || return 1
-  _hagpc_num=$(_host_adapter_gh_open_pr_number "$_hagpc_branch") || return 1
-  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr comment "$_hagpc_num" --body-file "$_hagpc_body_file"
+  [ -f "$2" ] || return 1
+  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr comment "$1" --body-file "$2"
 }
 
 _host_adapter_gh_read_comments() {
-  _hagrc_branch=""
-  # INV-6: same scoping requirement as _host_adapter_gh_post_comment above.
-  if command -v git >/dev/null 2>&1 && _host_adapter_repo_root_is_scoped; then
-    _hagrc_branch=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-  fi
-  [ -n "$_hagrc_branch" ] || return 1
-  _hagrc_num=$(_host_adapter_gh_open_pr_number "$_hagrc_branch") || return 1
-  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$_hagrc_num" --json comments --jq '.comments[] | {body: .body}'
-}
-
-_host_adapter_gh_change_request_exists() {
-  _host_adapter_gh_open_pr_state "$1"
+  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$1" --json comments --jq '.comments[] | {body: .body}'
 }
 
 # Body first, then comments in the order the host returns them
@@ -370,6 +405,5 @@ _host_adapter_gh_change_request_exists() {
 # function passes straight through -- the caller treats that as "read
 # failed", never as "no content".
 _host_adapter_gh_read_thread_text() {
-  _hagrtt_num=$(_host_adapter_gh_open_pr_number "$1") || return 1
-  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$_hagrtt_num" --json body,comments --jq '.body, (.comments[].body)'
+  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$1" --json body,comments --jq '.body, (.comments[].body)'
 }

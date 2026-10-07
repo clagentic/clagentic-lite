@@ -400,9 +400,12 @@ CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 # Character cap on the commit list `gates ship` writes into a PR body ("What
 # changed and why") and into a re-ship delta comment. The list is every
 # non-merge commit, oldest first, subject plus full body; commits that do not
-# fit are counted in an explicit "N more commits not shown" line. Default 40000
-# leaves headroom under GitHub's 65536-character body limit for the other
-# sections. Non-numeric or zero falls back to the default with a WARN.
+# fit are counted in an explicit "N more commits not shown" line. Unset, the
+# list uses whatever room is left under the host's hard body/comment limit
+# after the other sections; this key can only LOWER that, never raise it past
+# the limit. A single commit message that does not fit is truncated with an
+# explicit note. Non-numeric or zero falls back to the unset behavior with a
+# WARN.
 # CLAGENTIC_SHIP_COMMITS_MAX_CHARS=40000
 #
 # Cap on structured findings kept in the adversarial sidecar the merge-gate
