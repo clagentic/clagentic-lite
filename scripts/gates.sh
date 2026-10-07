@@ -3297,8 +3297,10 @@ _ship_marker_from_file() {
 }
 
 # _ship_default_base_sha HEAD_SHA — print merge-base(origin/<default>, HEAD).
-# On failure prints the actual reason to stderr and returns 1, so a caller
-# can show it instead of a generic "unavailable". The default-branch tip comes
+# On failure prints the actual reason to STDOUT and returns 1 (stdout, not
+# stderr, so a config WARN on stderr can never be mistaken for the reason or
+# the SHA), letting a caller show it instead of a generic "unavailable". The
+# default-branch tip comes
 # from _gate_resolve_fresh_default_branch_ref (the sanctioned, provably-current
 # resolution -- never a raw origin/<branch> name, which can resolve a stale
 # local tracking ref); when freshness cannot be proven the commit list says
@@ -3307,21 +3309,21 @@ _ship_default_base_sha() {
   _sdbs_head="$1"
   _sdbs_default="${CLAGENTIC_DEFAULT_BRANCH:-main}"
   if ! _git_repo_root_is_scoped; then
-    echo "REPO_ROOT is not itself a git repo" 1>&2
+    echo "REPO_ROOT is not itself a git repo"
     return 1
   fi
   if [ -z "$_sdbs_head" ]; then
-    echo "the shipped head commit could not be resolved" 1>&2
+    echo "the shipped head commit could not be resolved"
     return 1
   fi
-  _sdbs_timeout=$(ds_positive_int_or_default "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-30}" 30)
+  _sdbs_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
   if ! _sdbs_tip=$(_gate_resolve_fresh_default_branch_ref "$_sdbs_default" "$_sdbs_timeout" 2>&1); then
-    printf '%s\n' "$_sdbs_tip" 1>&2
+    printf '%s\n' "$_sdbs_tip"
     return 1
   fi
   _sdbs_base=$(_git merge-base "$_sdbs_tip" "$_sdbs_head" 2>/dev/null || echo "")
   if [ -z "$_sdbs_base" ]; then
-    echo "no merge-base between the default branch tip and the shipped head" 1>&2
+    echo "no merge-base between the default branch tip and the shipped head"
     return 1
   fi
   printf '%s\n' "$_sdbs_base"
@@ -3373,7 +3375,7 @@ EOF
 _ship_render_commit_list() {
   _srcl_base="$1"
   _srcl_head="$2"
-  _srcl_max=$(ds_positive_int_or_default "${CLAGENTIC_SHIP_COMMITS_MAX_CHARS:-40000}" 40000)
+  _srcl_max=$(ds_positive_int_or_warn CLAGENTIC_SHIP_COMMITS_MAX_CHARS "${CLAGENTIC_SHIP_COMMITS_MAX_CHARS:-}" 40000)
   _srcl_shas=$(_git rev-list --reverse --no-merges "${_srcl_base}..${_srcl_head}" 2>/dev/null) || return 1
   [ -n "$_srcl_shas" ] || return 3
   _srcl_total=$(printf '%s\n' "$_srcl_shas" | wc -l | tr -d ' ')
@@ -3402,7 +3404,7 @@ _ship_render_commit_list() {
 # appears.
 _ship_render_commits_section() {
   _srcs_head="$1"
-  if ! _srcs_base=$(_ship_default_base_sha "$_srcs_head" 2>&1); then
+  if ! _srcs_base=$(_ship_default_base_sha "$_srcs_head"); then
     printf '_Commit list unavailable: %s. Fill in by hand before merging._\n' "$_srcs_base"
     return 0
   fi
@@ -3470,7 +3472,7 @@ _publish_ship_delta_comment() {
   fi
 
   if [ -z "$_psdc_from" ]; then
-    if ! _psdc_from=$(_ship_default_base_sha "$_psdc_head" 2>&1); then
+    if ! _psdc_from=$(_ship_default_base_sha "$_psdc_head"); then
       echo "[gates/ship] no delta comment posted: ${_psdc_from}" 1>&2
       ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=base-unresolved"
       return 0
