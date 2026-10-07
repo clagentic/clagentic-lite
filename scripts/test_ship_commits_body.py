@@ -115,6 +115,23 @@ def _section_one(body):
     return body[start:body.index(NEXT_HEADING)]
 
 
+def _sweep_for_pr_body_edits(root):
+    """Return (tracked shell paths, [(path, line_no)] body-edit hits). Paths
+    are repo-relative exactly as ls-files prints them and are opened under
+    root as-is, so a script in a subdirectory is read, not skipped."""
+    tracked = subprocess.run(["git", "-C", root, "ls-files", "*.sh"],
+                             capture_output=True, text=True, check=True, timeout=30).stdout.split()
+    hits = []
+    for rel in tracked:
+        with open(os.path.join(root, rel), encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                if line.strip().startswith("#"):
+                    continue
+                if re.search(r"\bpr\s+edit\b", line) or re.search(r"\bgh\s+api\b", line):
+                    hits.append((rel, n))
+    return tracked, hits
+
+
 _FAKE_GH = textwrap.dedent('''\
     #!/usr/bin/env python3
     import json, os, sys
@@ -142,8 +159,16 @@ _FAKE_GH = textwrap.dedent('''\
             print(st["body"])
             for c in st["comments"]:
                 print(c)
+    elif argv[:2] == ["pr", "list"]:
+        # Open-PR lookup. A CLOSED/MERGED PR for the branch is not returned.
+        if st.get("list_fail"):
+            sys.stderr.write("simulated transient host failure\\n")
+            rc = 1
+        else:
+            print(1 if st["exists"] else 0)
     elif argv[:2] == ["pr", "view"]:
-        rc = 0 if st["exists"] else 1
+        # Bare view matches closed/merged PRs too, as the real CLI does.
+        rc = 0 if (st["exists"] or st.get("closed_pr")) else 1
     elif argv[:2] == ["pr", "create"]:
         st["exists"] = True
         st["body"] = body_file() if "--body-file" in argv else ""
@@ -169,7 +194,8 @@ class _Env:
             f.write(_FAKE_GH)
         os.chmod(gh, stat.S_IRWXU)
         self.state_path = os.path.join(self.tmp, "gh-state.json")
-        self.set_state(exists=False, body="", comments=[], calls=[], created_bodies=[], read_fail=False)
+        self.set_state(exists=False, body="", comments=[], calls=[], created_bodies=[],
+                       read_fail=False, list_fail=False, closed_pr=False)
 
     def set_state(self, **kw):
         st = self.state() if os.path.exists(self.state_path) else {}
@@ -281,6 +307,47 @@ class TestPlaceholderOnlyWhenRangeUnavailable(unittest.TestCase):
         r = _call_build_ship_pr_body(e.repo, "")
         self.assertIn("the shipped head commit could not be resolved", _section_one(r.stdout))
         self.assertEqual(MARKER_RE.findall(r.stdout), [])
+
+    def test_no_marker_when_base_is_unresolved(self):
+        e = _Env(self, with_remote=False)
+        _add_three_commits(e.repo)
+        r = _call_build_ship_pr_body(e.repo, _git(["rev-parse", "HEAD"], e.repo))
+        self.assertIn("Commit list unavailable", r.stdout)
+        self.assertEqual(MARKER_RE.findall(r.stdout), [],
+                         "a marker for a head whose commits were never listed hides them from later ships")
+
+    def test_no_marker_when_range_is_empty(self):
+        e = _Env(self)
+        r = _call_build_ship_pr_body(e.repo, _git(["rev-parse", "HEAD"], e.repo))
+        self.assertIn("No commits to list", r.stdout)
+        self.assertEqual(MARKER_RE.findall(r.stdout), [])
+
+
+class TestBaseResolverStderrIsNotPartOfTheRef(unittest.TestCase):
+    def test_resolver_warning_on_stderr_still_yields_a_correct_commit_list(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        head = _git(["rev-parse", "HEAD"], e.repo)
+        main_tip = _git(["rev-parse", "main"], e.repo)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
+        env["CLAGENTIC_PROJECT_ROOT"] = e.repo
+        script = textwrap.dedent("""\
+            . '%s'
+            _gate_resolve_fresh_default_branch_ref() {
+              echo "WARN: something noisy on stderr" 1>&2
+              printf '%%s\\n' '%s'
+            }
+            _build_ship_pr_body 'feat/example' '%s'
+        """) % (GATES_SH, main_tip, head)
+        r = subprocess.run(["sh", "-c", script, GATES_SH], capture_output=True, text=True,
+                           env=env, cwd=e.repo, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        section = _section_one(r.stdout)
+        self.assertNotIn("Commit list unavailable", section)
+        self.assertNotIn("WARN", r.stdout)
+        for subject, _ in THREE_COMMITS:
+            self.assertIn(subject, section)
 
 
 class TestTruncation(unittest.TestCase):
@@ -420,6 +487,54 @@ class TestShipEndToEnd(unittest.TestCase):
         self.assertTrue(any(o == "block" and "thread-read-failed" in d for o, d in rows), rows)
 
 
+class TestShipPrLookupStates(unittest.TestCase):
+    def test_closed_pr_for_a_reused_branch_creates_a_new_pr_and_posts_no_comment(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        e.set_state(closed_pr=True)
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        st = e.state()
+        self.assertEqual(len(st["created_bodies"]), 1, e.calls())
+        for subject, _ in THREE_COMMITS:
+            self.assertIn(subject, st["created_bodies"][0])
+        self.assertEqual(st["comments"], [])
+
+    def test_create_after_unresolved_base_then_reship_lists_the_full_range(self):
+        e = _Env(self, with_remote=False)
+        _add_three_commits(e.repo)
+        self.assertEqual(e.ship().returncode, 0)
+        created = e.state()["created_bodies"]
+        self.assertEqual(len(created), 1)
+        self.assertIn("Commit list unavailable", created[0])
+        self.assertEqual(MARKER_RE.findall(created[0]), [])
+
+        bare = os.path.join(e.tmp, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", bare], check=True, timeout=60)
+        _git(["remote", "add", "origin", bare], e.repo)
+        _git(["push", "-q", "origin", "main"], e.repo)
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        comments = e.state()["comments"]
+        self.assertEqual(len(comments), 1, e.calls())
+        for subject, _ in THREE_COMMITS:
+            self.assertIn(subject, comments[0])
+
+    def test_transient_lookup_failure_creates_nothing_comments_nothing_and_is_audited(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        e.set_state(exists=True, body="whatever", list_fail=True)
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, "ship's push result stands: " + r.stdout + r.stderr)
+        calls = e.calls()
+        self.assertEqual([c for c in calls if c.startswith("pr create")], [])
+        self.assertEqual([c for c in calls if c.startswith("pr comment")], [])
+        self.assertEqual(e.state()["comments"], [])
+        self.assertIn("could not determine whether a PR is already open", r.stderr)
+        rows = e.audit_rows("ship-delta-publish")
+        self.assertTrue(any(o == "block" and "pr-existence-check-failed" in d for o, d in rows), rows)
+
+
 class TestAdapterContractAdditions(unittest.TestCase):
     def _run(self, e, call):
         env = os.environ.copy()
@@ -434,11 +549,26 @@ class TestAdapterContractAdditions(unittest.TestCase):
         """) % (PLATFORM_SH, HOST_ADAPTER_SH, call)
         return subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env, timeout=60)
 
-    def test_exists_reflects_the_host(self):
+    def test_exists_is_tri_state(self):
         e = _Env(self)
-        self.assertNotEqual(self._run(e, "host_adapter_change_request_exists feat/example").returncode, 0)
+        call = "host_adapter_change_request_exists feat/example"
+        self.assertEqual(self._run(e, call).returncode, 1)
         e.set_state(exists=True)
-        self.assertEqual(self._run(e, "host_adapter_change_request_exists feat/example").returncode, 0)
+        self.assertEqual(self._run(e, call).returncode, 0)
+        e.set_state(exists=True, list_fail=True)
+        self.assertEqual(self._run(e, call).returncode, 2)
+
+    def test_closed_pr_does_not_count_as_open(self):
+        e = _Env(self)
+        e.set_state(closed_pr=True)
+        self.assertEqual(self._run(e, "host_adapter_change_request_exists feat/example").returncode, 1)
+
+    def test_open_change_request_refuses_to_create_on_lookup_error(self):
+        e = _Env(self)
+        e.set_state(list_fail=True)
+        r = self._run(e, "host_adapter_open_change_request main feat/example")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual([c for c in e.calls() if c.startswith("pr create")], [])
 
     def test_read_thread_text_prints_body_then_comments(self):
         e = _Env(self)
@@ -458,16 +588,23 @@ class TestAdapterContractAdditions(unittest.TestCase):
         """Sweep over the tracked gate/adapter scripts: no body-edit verb
         exists anywhere, so the create-only invariant cannot be broken by a
         code path nobody wrote a test for."""
-        tracked = subprocess.run(["git", "-C", SCRIPTS_DIR, "ls-files", "*.sh"],
-                                 capture_output=True, text=True, check=True, timeout=30).stdout.split()
+        tracked, violations = _sweep_for_pr_body_edits(SCRIPTS_DIR)
         self.assertTrue(tracked)
-        for name in tracked:
-            with open(os.path.join(SCRIPTS_DIR, os.path.basename(name)), encoding="utf-8") as f:
-                for n, line in enumerate(f, 1):
-                    if line.strip().startswith("#"):
-                        continue
-                    self.assertNotRegex(line, r"\bpr\s+edit\b", "%s:%d" % (name, n))
-                    self.assertNotRegex(line, r"\bgh\s+api\b", "%s:%d" % (name, n))
+        self.assertEqual(violations, [])
+
+    def test_sweep_sees_scripts_in_subdirectories(self):
+        tmp = tempfile.mkdtemp(prefix="clagentic-test-sweep-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        subprocess.run(["git", "init", "-q", tmp], check=True, timeout=60)
+        os.makedirs(os.path.join(tmp, "sub"))
+        with open(os.path.join(tmp, "top.sh"), "w") as f:
+            f.write("echo ok\n")
+        with open(os.path.join(tmp, "sub", "nested.sh"), "w") as f:
+            f.write("gh pr edit 1 --body x\n")
+        _git(["add", "top.sh", "sub/nested.sh"], tmp)
+        tracked, violations = _sweep_for_pr_body_edits(tmp)
+        self.assertIn(os.path.join("sub", "nested.sh"), tracked)
+        self.assertEqual([v[0] for v in violations], [os.path.join("sub", "nested.sh")])
 
 
 if __name__ == "__main__":

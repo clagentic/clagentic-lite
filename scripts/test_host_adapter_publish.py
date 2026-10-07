@@ -77,7 +77,7 @@ _GIT_IDENTITY_ENV = {
 # word fragment.
 _VENDOR_TOKENS = [
     "github.com", "gitlab.com", "gitea.", "forgejo.",
-    "gh pr view", "gh pr create", "gh pr comment",
+    "gh pr view", "gh pr create", "gh pr comment", "gh pr list",
 ]
 
 # Gate-logic files the host-neutral AC applies to. scripts/host-adapter.sh
@@ -254,6 +254,10 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False):
 
         if argv[:2] == ["pr", "view"] and "--json" in argv:
             print(json.dumps({{"comments": []}}))
+            sys.exit(0)
+        if argv[:2] == ["pr", "list"]:
+            # Open-PR lookup: only OPEN PRs are returned (--state open).
+            print(1 if pr_exists else 0)
             sys.exit(0)
         if argv[:2] == ["pr", "view"]:
             sys.exit(0 if pr_exists else 1)
@@ -443,7 +447,7 @@ class TestHostAdapterContractDirect(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = _read_calls(self._calls)
-        self.assertTrue(any(c.startswith("pr view") for c in calls))
+        self.assertTrue(any(c.startswith("pr list") and "--state open" in c for c in calls))
         self.assertFalse(any(c.startswith("pr create") for c in calls),
                            "an existing PR must never trigger a second create call")
 

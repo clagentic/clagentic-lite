@@ -44,14 +44,20 @@
 #                                       below, provided for contract
 #                                       completeness per the task's item 1).
 #   host_adapter_change_request_exists BRANCH
-#                                    -- exit 0 iff a change request is already
-#                                       open for BRANCH, non-zero otherwise.
-#                                       Lets the caller distinguish "create"
-#                                       from "re-ship to an existing PR"
-#                                       before host_adapter_open_change_request
+#                                    -- TRI-STATE: exit 0 = an OPEN change
+#                                       request exists for BRANCH (closed and
+#                                       merged ones do not count), 1 = none,
+#                                       2 = could not be determined (adapter,
+#                                       auth, network). Lets the caller
+#                                       distinguish "create" from "re-ship to
+#                                       an existing PR" before
+#                                       host_adapter_open_change_request
 #                                       (which reuses silently, exit 0 either
-#                                       way) runs. Takes the branch explicitly
-#                                       -- no repo-state git read here.
+#                                       way) runs, and never mistake a failed
+#                                       lookup for "none". open_change_request
+#                                       itself uses the same lookup and refuses
+#                                       to create on 2. Takes the branch
+#                                       explicitly -- no repo-state git read.
 #   host_adapter_read_thread_text BRANCH
 #                                    -- print the change request's body, then
 #                                       every comment body in chronological
@@ -237,15 +243,15 @@ host_adapter_read_comments() {
   esac
 }
 
-# host_adapter_change_request_exists BRANCH — exit 0 iff a change request is
-# already open for BRANCH.
+# host_adapter_change_request_exists BRANCH — tri-state: exit 0 = an OPEN
+# change request exists for BRANCH, 1 = none, 2 = could not be determined.
 host_adapter_change_request_exists() {
   _hacre_branch="$1"
-  [ -n "$_hacre_branch" ] || return 1
-  _host_adapter_detect || return 1
+  [ -n "$_hacre_branch" ] || return 2
+  _host_adapter_detect || return 2
   case "$_HOST_ADAPTER" in
     gh) _host_adapter_gh_change_request_exists "$_hacre_branch" ;;
-    *)  return 1 ;;
+    *)  return 2 ;;
   esac
 }
 
@@ -271,14 +277,39 @@ host_adapter_read_thread_text() {
 
 _HOST_ADAPTER_SHIP_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SHIP_TIMEOUT_SEC "${CLAGENTIC_SHIP_TIMEOUT_SEC:-}" 120)
 
+# _host_adapter_gh_open_pr_state BRANCH -- the ONE place that answers "is an
+# OPEN PR present for BRANCH". Exit 0 = open PR exists, 1 = none, 2 = the
+# host could not be asked (auth/network/timeout/unparseable). A bare
+# `gh pr view BRANCH` cannot be used for this: it also matches CLOSED and
+# MERGED PRs, so a reused branch name would read as already open, and it
+# cannot tell "no PR" from a failed call without parsing error text.
+_host_adapter_gh_open_pr_state() {
+  _hagops_out=$(run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr list --head "$1" --state open --json number --jq 'length' 2>/dev/null) || return 2
+  case "$_hagops_out" in
+    0) return 1 ;;
+    ""|*[!0-9]*) return 2 ;;
+    *) return 0 ;;
+  esac
+}
+
 _host_adapter_gh_open_change_request() {
   _hagocr_base="$1"
   _hagocr_head="$2"
   _hagocr_body_file="${3:-}"
-  if run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$_hagocr_head" >/dev/null 2>&1; then
-    echo "[host-adapter/gh] PR already open for $_hagocr_head"
-    return 0
-  fi
+  _hagocr_state=0
+  _host_adapter_gh_open_pr_state "$_hagocr_head" || _hagocr_state=$?
+  case "$_hagocr_state" in
+    0)
+      echo "[host-adapter/gh] PR already open for $_hagocr_head"
+      return 0
+      ;;
+    1) ;;
+    *)
+      # Creating blind on a failed lookup could duplicate an open PR.
+      echo "[host-adapter/gh] could not determine whether a PR is open for $_hagocr_head -- not creating one" 1>&2
+      return 1
+      ;;
+  esac
   # A rendered body file (lr-429b32) wins over --fill's commit-message
   # scrape -- --fill supplies no review-provenance section at all, which is
   # the defect this task exists to close. --title still comes from --fill's
@@ -316,7 +347,7 @@ _host_adapter_gh_read_comments() {
 }
 
 _host_adapter_gh_change_request_exists() {
-  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$1" >/dev/null 2>&1
+  _host_adapter_gh_open_pr_state "$1"
 }
 
 # Body first, then comments in the order the host returns them

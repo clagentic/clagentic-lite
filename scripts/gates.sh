@@ -3317,10 +3317,21 @@ _ship_default_base_sha() {
     return 1
   fi
   _sdbs_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
-  if ! _sdbs_tip=$(_gate_resolve_fresh_default_branch_ref "$_sdbs_default" "$_sdbs_timeout" 2>&1); then
-    printf '%s\n' "$_sdbs_tip"
+  # stdout is the ref and nothing else; the resolver's stderr (its failure
+  # reason, or any warning on success) is kept apart so it can never be
+  # glued onto the ref and break merge-base.
+  _sdbs_err=$(mktemp -t clagentic-ship-base-err.XXXXXX) || _sdbs_err=/dev/null
+  if ! _sdbs_tip=$(_gate_resolve_fresh_default_branch_ref "$_sdbs_default" "$_sdbs_timeout" 2>"$_sdbs_err"); then
+    if [ -s "$_sdbs_err" ]; then
+      cat "$_sdbs_err"
+    else
+      echo "the default branch tip could not be resolved"
+    fi
+    [ "$_sdbs_err" = /dev/null ] || rm -f "$_sdbs_err"
     return 1
   fi
+  [ ! -s "$_sdbs_err" ] || cat "$_sdbs_err" 1>&2
+  [ "$_sdbs_err" = /dev/null ] || rm -f "$_sdbs_err"
   _sdbs_base=$(_git merge-base "$_sdbs_tip" "$_sdbs_head" 2>/dev/null || echo "")
   if [ -z "$_sdbs_base" ]; then
     echo "no merge-base between the default branch tip and the shipped head"
@@ -3401,22 +3412,24 @@ _ship_render_commit_list() {
 # _ship_render_commits_section HEAD_SHA — body of PR section 1: the commits
 # between origin/<default> and HEAD_SHA. When the range cannot be resolved or
 # is genuinely empty, says exactly why; this is the ONLY case a placeholder
-# appears.
+# appears. Exit 0 when commits were actually listed, 3 when a placeholder was
+# printed instead -- the caller must not record a shipped-head marker for a
+# head whose commits were never listed.
 _ship_render_commits_section() {
   _srcs_head="$1"
   if ! _srcs_base=$(_ship_default_base_sha "$_srcs_head"); then
     printf '_Commit list unavailable: %s. Fill in by hand before merging._\n' "$_srcs_base"
-    return 0
+    return 3
   fi
   _srcs_rc=0
   _srcs_out=$(_ship_render_commit_list "$_srcs_base" "$_srcs_head") || _srcs_rc=$?
   case "$_srcs_rc" in
-    0) printf '%s\n' "$_srcs_out" ;;
+    0) printf '%s\n' "$_srcs_out"; return 0 ;;
     3) printf '_No commits to list: nothing between origin/%s and the shipped head (empty range)._\n' "${CLAGENTIC_DEFAULT_BRANCH:-main}" ;;
     *) printf '_Commit list unavailable: git could not enumerate %s..%s. Fill in by hand before merging._\n' \
          "$(printf '%s' "$_srcs_base" | cut -c1-7)" "$(printf '%s' "$_srcs_head" | cut -c1-7)" ;;
   esac
-  return 0
+  return 3
 }
 
 # _publish_ship_delta_comment BRANCH HEAD_SHA
@@ -3609,7 +3622,8 @@ except Exception:
   fi
 
   printf '## What changed and why\n\n'
-  _ship_render_commits_section "$_bspb_head"
+  _bspb_listed=1
+  _ship_render_commits_section "$_bspb_head" || _bspb_listed=0
   printf '\n'
   printf '## Review provenance\n\n%s\n\n' "$_bspb_review_section"
   printf '## Gate attestation\n\n%s\n\n' "$_bspb_manifest_section"
@@ -3617,7 +3631,10 @@ except Exception:
   printf '_Not recorded by tooling; fill in by hand, or state "none" if none were seriously considered._\n\n'
   printf '## Explicitly out of scope\n\n'
   printf '_Not recorded by tooling; fill in by hand, or state "none" if the change is fully self-contained._\n'
-  if [ -n "$_bspb_head" ]; then
+  # No marker when section 1 is a placeholder: a later re-ship would anchor on
+  # it and list only newer commits, so the earlier ones would never appear
+  # anywhere. Without a marker the re-ship lists the full range instead.
+  if [ -n "$_bspb_head" ] && [ "$_bspb_listed" = "1" ]; then
     printf '\n'
     _ship_marker_line "$_bspb_head"
   fi
@@ -8983,15 +9000,22 @@ cmd_ship() {
     fi
     # Asked BEFORE the open call because that call reuses an existing PR
     # silently: a re-ship must add a delta comment, never touch the body.
-    _SHIP_PR_EXISTED=0
-    if host_adapter_change_request_exists "$BRANCH"; then
-      _SHIP_PR_EXISTED=1
-    fi
-    host_adapter_open_change_request "$DEFAULT_BRANCH" "$BRANCH" "$_SHIP_BODY_FILE" || \
-      echo "[gates/ship] host-adapter open-change-request failed or timed out after ${_SHIP_TIMEOUT}s — open the PR manually"
-    [ -n "$_SHIP_BODY_FILE" ] && rm -f "$_SHIP_BODY_FILE"
-    if [ "$_SHIP_PR_EXISTED" = "1" ]; then
-      _publish_ship_delta_comment "$BRANCH" "$_SHIP_HEAD_SHA"
+    # Tri-state (0 open / 1 none / 2 unknown): a transient host failure must
+    # not read as "no PR", or a re-ship would skip its delta comment and a
+    # create could duplicate an open PR.
+    _SHIP_PR_STATE=0
+    host_adapter_change_request_exists "$BRANCH" || _SHIP_PR_STATE=$?
+    if [ "$_SHIP_PR_STATE" -ge 2 ]; then
+      [ -z "$_SHIP_BODY_FILE" ] || rm -f "$_SHIP_BODY_FILE"
+      echo "[gates/ship] could not determine whether a PR is already open for $BRANCH — no PR created, no comment posted (push result stands); retry or open the PR manually" 1>&2
+      ds_audit_log "ship-delta-publish" "block" "branch=${BRANCH:-<none>} head=${_SHIP_HEAD_SHA:-<unresolved>} reason=pr-existence-check-failed"
+    else
+      host_adapter_open_change_request "$DEFAULT_BRANCH" "$BRANCH" "$_SHIP_BODY_FILE" || \
+        echo "[gates/ship] host-adapter open-change-request failed or timed out after ${_SHIP_TIMEOUT}s — open the PR manually"
+      [ -z "$_SHIP_BODY_FILE" ] || rm -f "$_SHIP_BODY_FILE"
+      if [ "$_SHIP_PR_STATE" = "0" ]; then
+        _publish_ship_delta_comment "$BRANCH" "$_SHIP_HEAD_SHA"
+      fi
     fi
   else
     REMOTE=$(_git remote get-url origin 2>/dev/null || echo "<remote>")
