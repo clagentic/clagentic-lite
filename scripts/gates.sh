@@ -3176,10 +3176,11 @@ _publish_review_verdict() {
   # The final newline of the file is part of the count, hence the -1.
   _ship_bound_text $(( _prv_limit - 1 )) "$_prv_body" > "$_prv_body_file"
 
-  # One lookup, then every call addresses the change request by number: a
-  # bare branch name can match a closed or merged PR on the same branch.
+  # One lookup of the open PR for (branch, default branch) -- the same helper
+  # ship uses -- then every call addresses it by number: a bare branch name
+  # can match a closed or merged PR on the same branch.
   _prv_find_rc=0
-  _prv_pr=$(host_adapter_find_open_change_request "$_prv_branch") || _prv_find_rc=$?
+  _prv_pr=$(host_adapter_find_open_change_request "$_prv_branch" "${CLAGENTIC_DEFAULT_BRANCH:-main}") || _prv_find_rc=$?
   if [ "$_prv_find_rc" -ne 0 ]; then
     echo "[gates/review] publish to host adapter failed — local ledger verdict stands, gate outcome unaffected" 1>&2
     if [ "$_prv_find_rc" -eq 1 ]; then
@@ -3577,14 +3578,13 @@ EOF
 # Oldest first, as one block of at most MAX_CHARS characters in
 # total (entries, the "N more commits not shown" line and the marker).
 # MAX_CHARS is the caller's budget under the host limit; CLAGENTIC_SHIP_COMMITS_MAX_CHARS
-# may lower it, never raise it. An entry that does not fit whole is deferred to
-# the next ship (the marker stops before it), except the first entry, which is
-# truncated to the room there is, so a single huge commit message can neither
-# overflow the artifact nor block the list. A truncated entry counts as listed.
+# may lower it, never raise it. An entry that does not fit whole is left out and
+# counted in the not-shown line (the PR's Commits tab has every commit), except
+# the first entry, which is truncated to the room there is, so a single huge
+# commit message can neither overflow the artifact nor block the list.
 # Exit: 0 listed >=1 commit, 3 range is empty, 4 the budget leaves no room for
 # a single entry, 1 git could not enumerate the range. Ends with the
-# shipped-head marker for the last commit listed (see the emission point
-# below).
+# shipped-head marker, always HEAD.
 _ship_render_commit_list() {
   _srcl_tip="$1"
   _srcl_head="$2"
@@ -3606,7 +3606,6 @@ _ship_render_commit_list() {
   _srcl_total=$(printf '%s\n' "$_srcl_shas" | wc -l | tr -d ' ')
   _srcl_shown=0
   _srcl_used=0
-  _srcl_last=""
   for _srcl_sha in $_srcl_shas; do
     _srcl_room=$(( _srcl_ebudget - _srcl_used ))
     # An entry is separated from the next by one blank line (+2 chars).
@@ -3621,26 +3620,14 @@ _ship_render_commit_list() {
     printf '%s\n\n' "$_srcl_entry"
     _srcl_used=$(( _srcl_used + ${#_srcl_entry} + 2 ))
     _srcl_shown=$(( _srcl_shown + 1 ))
-    _srcl_last="$_srcl_sha"
   done
   if [ "$_srcl_shown" -lt "$_srcl_total" ]; then
-    printf '_%s more commits not shown (list capped at %s characters; the next ship lists them)._\n' \
-      "$(( _srcl_total - _srcl_shown ))" "$_srcl_max"
+    printf "_%s more commits not shown -- see this PR's Commits tab._\n" "$(( _srcl_total - _srcl_shown ))"
   fi
-  # The ONE marker-emission point for the body and delta-comment paths: it
-  # names the last commit actually listed, never one beyond a cap, so the
-  # commits left unshown are listed by the next re-ship instead of being
-  # anchored past.
-  # When the whole range is listed the marker is HEAD itself. The last listed
-  # SHA is only right for a capped list: with a merged side branch the last
-  # --no-merges commit is not HEAD, and anchoring there would make an unchanged
-  # re-ship see "new" commits and alternate markers forever.
+  # The ONE marker-emission point for the body and delta-comment paths. It is
+  # always HEAD, because unshown commits are not listed by any later ship.
   printf '\n'
-  if [ "$_srcl_shown" -ge "$_srcl_total" ]; then
-    _ship_marker_line "$_srcl_head"
-  else
-    _ship_marker_line "$_srcl_last"
-  fi
+  _ship_marker_line "$_srcl_head"
   return 0
 }
 
@@ -3912,9 +3899,9 @@ except Exception:
 
 # _ship_pr_body_assemble BUDGET — the PR body's whole text, for
 # _ship_emit_within_limit; BUDGET is the characters the commit list may use.
-# The shipped-head marker is emitted inside the commit list itself (last
-# LISTED commit), and only when commits were listed -- a placeholder or a
-# capped list never anchors past content the thread does not show.
+# The shipped-head marker (HEAD) is emitted inside the commit list itself, and
+# only when commits were listed -- a placeholder never anchors a head whose
+# commits the thread does not show.
 _ship_pr_body_assemble() {
   printf '## What changed and why\n\n'
   _ship_render_commits_section "$_SPB_HEAD" "$1" || true

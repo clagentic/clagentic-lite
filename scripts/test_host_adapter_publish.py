@@ -543,7 +543,7 @@ class TestHostAdapterContractDirect(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "")
 
     def test_find_open_change_request_is_tri_state_and_ignores_closed_prs(self):
-        call = "host_adapter_find_open_change_request feat/example"
+        call = "host_adapter_find_open_change_request feat/example main"
         _make_fake_gh(self._bin, self._calls, pr_exists=True, closed_pr=True)
         r = _run_review_merge_fn(call, env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "7"), "the OPEN number, not the closed 3")
@@ -603,7 +603,7 @@ class TestHostAdapterContractDirect(unittest.TestCase):
             f.write("hello\n")
         wanted = os.path.realpath(self._repo)
         cases = (
-            ("host_adapter_find_open_change_request feat/example", True),
+            ("host_adapter_find_open_change_request feat/example main", True),
             ("host_adapter_open_change_request main feat/example '%s'" % body_file, False),
             ("host_adapter_open_change_request main feat/example", False),
             ("host_adapter_post_comment 7 '%s'" % body_file, True),
@@ -939,7 +939,7 @@ class TestHostAdapterRepoScopingSweep(unittest.TestCase):
             self._tmpdir, "https://github.com/ancestor/wrong.git"
         )
         _make_fake_gh(self._bin, self._calls, pr_exists=True)
-        for call in ("host_adapter_find_open_change_request feat/example",
+        for call in ("host_adapter_find_open_change_request feat/example main",
                      "host_adapter_open_change_request main feat/example",
                      "host_adapter_read_thread_text 7",
                      "host_adapter_read_comments 7"):

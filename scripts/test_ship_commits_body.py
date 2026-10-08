@@ -233,21 +233,26 @@ _FAKE_GH = textwrap.dedent('''\
             rc = 1
         else:
             wanted = argv[argv.index("--state") + 1] if "--state" in argv else "open"
-            numbers = []
             def flag(name):
                 return argv[argv.index(name) + 1] if name in argv else None
-            # The open PR's own head/base (when the test pins them) filter
-            # the lookup the way the real CLI's --head/--base do.
-            matches = all(
-                st.get(key) is None or flag(opt) is None or flag(opt) == st[key]
-                for key, opt in (("open_head", "--head"), ("open_base", "--base"))
-            )
-            if st["exists"] and matches and wanted in ("open", "all"):
-                numbers.append(OPEN_NUMBER)
+            # Every open PR carries its own head and base, and --head/--base
+            # filter on them the way the real CLI does. The main open PR is
+            # number 7 (head/base default to the ship's, overridable); more
+            # open PRs come from "extra_open" as {number, head, base}.
+            open_prs = []
+            if st["exists"]:
+                open_prs.append({"number": OPEN_NUMBER, "head": st.get("open_head", "feat/example"),
+                                 "base": st.get("open_base", "main")})
+            open_prs.extend(st.get("extra_open", []))
+            numbers = []
+            if wanted in ("open", "all"):
+                numbers += [p["number"] for p in open_prs
+                            if flag("--head") in (None, p["head"]) and flag("--base") in (None, p["base"])]
             if st.get("closed_pr") and wanted in ("closed", "all"):
                 numbers.append(CLOSED_NUMBER)
-            if numbers:
-                print(numbers[0])
+            # One number per line, as the adapter's jq prints them.
+            for n in numbers:
+                print(n)
     elif argv[:2] == ["pr", "view"]:
         # Bare view matches closed/merged PRs too, as the real CLI does.
         rc = 0 if (st["exists"] or st.get("closed_pr")) else 1
@@ -548,54 +553,26 @@ class TestPublicReasonIsFixedString(unittest.TestCase):
         self.assertIn("secretuser", r.stderr, "raw detail stays on the local stderr")
 
 
-class TestCappedListMarkerCoversOnlyListedCommits(unittest.TestCase):
+class TestCappedListSaysHowManyAreNotShown(unittest.TestCase):
     CAP = {"CLAGENTIC_SHIP_COMMITS_MAX_CHARS": "1500"}
-
-    def _ship(self, e):
-        env = {"CLAGENTIC_SHIP_COMMITS_MAX_CHARS": self.CAP["CLAGENTIC_SHIP_COMMITS_MAX_CHARS"]}
-        old = {k: os.environ.get(k) for k in env}
-        os.environ.update(env)
-        try:
-            return e.ship()
-        finally:
-            for k, v in old.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
 
     def _listed(self, text):
         return [int(n) for n in re.findall(r"^- commit number (\d+) \(", text, re.M)]
 
-    def test_capped_body_marker_is_last_listed_commit(self):
+    def test_capped_body_names_the_exact_count_not_shown_and_marks_head(self):
         e = _Env(self)
         shas = [_commit(e.repo, "f%d.txt" % i, "commit number %d" % i, ["x" * 300]) for i in range(10)]
         r = _call_build_ship_pr_body(e.repo, shas[-1], self.CAP)
         listed = self._listed(r.stdout)
-        self.assertLess(len(listed), 10)
-        self.assertEqual(MARKER_RE.findall(r.stdout), [shas[listed[-1]]])
+        self.assertTrue(0 < len(listed) < 10)
+        self.assertIn("_%d more commits not shown -- see this PR's Commits tab._" % (10 - len(listed)), r.stdout)
+        self.assertEqual(MARKER_RE.findall(r.stdout), [shas[-1]], "the marker is always HEAD")
 
-    def test_reships_page_through_the_unshown_commits_then_stop(self):
+    def test_uncapped_body_has_no_not_shown_line(self):
         e = _Env(self)
-        for i in range(10):
-            _commit(e.repo, "f%d.txt" % i, "commit number %d" % i, ["x" * 300])
-        self.assertEqual(self._ship(e).returncode, 0)
-        seen = self._listed(e.state()["created_bodies"][0])
-        self.assertLess(len(seen), 10)
-        guard = 0
-        while len(seen) < 10 and guard < 12:
-            guard += 1
-            before = len(e.state()["comments"])
-            self.assertEqual(self._ship(e).returncode, 0)
-            comments = e.state()["comments"]
-            self.assertEqual(len(comments), before + 1, "each re-ship pages one more comment")
-            page = self._listed(comments[-1])
-            self.assertTrue(page)
-            self.assertEqual(page[0], seen[-1] + 1, "continues exactly after the last listed commit")
-            seen += page
-        self.assertEqual(seen, list(range(10)), "no commit is ever permanently unlisted")
-        self.assertEqual(self._ship(e).returncode, 0)
-        self.assertEqual(len(e.state()["comments"]), guard, "fully listed: a further re-ship posts nothing")
+        _add_three_commits(e.repo)
+        r = _call_build_ship_pr_body(e.repo, _git(["rev-parse", "HEAD"], e.repo))
+        self.assertNotIn("not shown", r.stdout)
 
 
 HOST_LIMIT = 65536
@@ -776,7 +753,7 @@ class TestWholeArtifactWithinHostLimit(unittest.TestCase):
         self.assertRegex(comments[0], TRUNC_NOTE_RE)
         self.assertEqual(MARKER_RE.findall(comments[0]), [head])
 
-    def test_giant_first_commit_is_truncated_and_the_rest_page_through_on_reship(self):
+    def test_giant_first_commit_is_truncated_and_the_rest_are_counted_not_shown(self):
         e = _Env(self)
         _empty_commit(e.repo, "giant first", ["line %d %s" % (i, "z" * 50) for i in range(5000)])
         _empty_commit(e.repo, "small second", ["tiny " * 120])
@@ -784,13 +761,10 @@ class TestWholeArtifactWithinHostLimit(unittest.TestCase):
         created = e.state()["created_bodies"][0]
         self.assertLessEqual(len(created), HOST_LIMIT)
         self.assertIn("- giant first (", created)
+        self.assertNotIn("small second", created)
+        self.assertIn("1 more commits not shown -- see this PR's Commits tab.", created)
         self.assertEqual(e.ship().returncode, 0)
-        comments = e.state()["comments"]
-        self.assertEqual(len(comments), 1, "the unlisted commit gets its own comment")
-        self.assertIn("small second", comments[0])
-        self.assertNotIn("giant first", comments[0])
-        self.assertEqual(e.ship().returncode, 0)
-        self.assertEqual(len(e.state()["comments"]), 1, "nothing is left unlisted")
+        self.assertEqual(e.state()["comments"], [], "an unchanged re-ship never pages the rest in")
 
 
 class TestShipEndToEnd(unittest.TestCase):
@@ -882,6 +856,45 @@ class TestShipEndToEnd(unittest.TestCase):
             r = e.ship()
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertEqual(e.state()["comments"], [], "nothing new -> nothing posted")
+
+    def test_unchanged_reships_after_merging_the_default_branch_in_post_nothing(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        self.assertEqual(e.ship().returncode, 0)
+        _git(["checkout", "-q", "main"], e.repo)
+        _commit(e.repo, "up1.txt", "upstream change one")
+        _git(["push", "-q", "origin", "main"], e.repo)
+        _git(["checkout", "-q", "feat/example"], e.repo)
+        _git(["merge", "-q", "--no-ff", "-m", "merge main into feat/example", "main"], e.repo)
+        for _ in range(2):
+            r = e.ship()
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(e.state()["comments"], [], "a merge of main adds no branch commit")
+
+    def test_capped_reship_lists_exactly_the_new_commits(self):
+        e = _Env(self)
+        for i in range(10):
+            _commit(e.repo, "f%d.txt" % i, "commit number %d" % i, ["x" * 300])
+        old = os.environ.get("CLAGENTIC_SHIP_COMMITS_MAX_CHARS")
+        os.environ["CLAGENTIC_SHIP_COMMITS_MAX_CHARS"] = "1500"
+        try:
+            self.assertEqual(e.ship().returncode, 0)
+            self.assertIn("more commits not shown", e.state()["created_bodies"][0])
+            for i in (10, 11):
+                _commit(e.repo, "g%d.txt" % i, "fresh commit %d" % i)
+            new_head = _git(["rev-parse", "HEAD"], e.repo)
+            self.assertEqual(e.ship().returncode, 0)
+        finally:
+            if old is None:
+                os.environ.pop("CLAGENTIC_SHIP_COMMITS_MAX_CHARS", None)
+            else:
+                os.environ["CLAGENTIC_SHIP_COMMITS_MAX_CHARS"] = old
+        comments = e.state()["comments"]
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(re.findall(r"^- (fresh commit \d+) \(", comments[0], re.M),
+                         ["fresh commit 10", "fresh commit 11"])
+        self.assertNotIn("commit number", comments[0])
+        self.assertEqual(MARKER_RE.findall(comments[0]), [new_head])
 
     def test_ship_prints_the_pr_number_when_created_and_when_reused(self):
         e = _Env(self)
@@ -1097,6 +1110,74 @@ class TestShipPrLookupStates(unittest.TestCase):
         self.assertTrue(any(o == "block" and "open-change-request-failed" in d for o, d in rows), rows)
 
 
+    def test_two_open_prs_for_one_head_and_base_make_ship_create_and_comment_nothing(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        e.set_state(exists=True, extra_open=[{"number": "8", "head": "feat/example", "base": "main"}])
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, "ship's push result stands: " + r.stdout + r.stderr)
+        calls = e.calls()
+        self.assertEqual([c for c in calls if c.startswith(("pr create", "pr comment"))], [])
+        rows = e.audit_rows("ship-delta-publish")
+        self.assertTrue(any(o == "block" and "open-change-request-failed" in d for o, d in rows), rows)
+
+
+class TestReviewVerdictPublisherLookup(unittest.TestCase):
+    """The publisher finds its PR through the same (head, base) lookup as
+    ship, with the default branch as base."""
+
+    def _publish(self, e):
+        head = _git(["rev-parse", "HEAD"], e.repo)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
+        env.update({
+            "CLAGENTIC_PROJECT_ROOT": e.repo, "CLAGENTIC_REPO_HOST": "github",
+            "FAKE_GH_STATE": e.state_path,
+            "FAKE_GH_GUARD_DIR": os.path.dirname(os.path.abspath(__file__)),
+            "HOME": e.tmp, "PATH": e.bin + os.pathsep + env.get("PATH", ""),
+        })
+        script = ". '%s'\n_publish_review_verdict 'feat/example' pass '%s' '[]'\n" % (GATES_SH, head)
+        return subprocess.run(["sh", "-c", script, GATES_SH], capture_output=True, text=True,
+                              env=env, cwd=e.repo, timeout=60)
+
+    def _env_with_audit_db(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        self.assertEqual(e.ship().returncode, 0)
+        e.set_state(calls=[], comments=[])
+        return e
+
+    def test_comment_goes_to_the_open_pr_for_the_default_branch(self):
+        e = self._env_with_audit_db()
+        r = self._publish(e)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(e.state()["comments"]), 1)
+        lookups = [c for c in e.calls() if c.startswith("pr list")]
+        self.assertEqual(len(lookups), 1, lookups)
+        self.assertIn("--head feat/example --base main --state open", lookups[0])
+
+    def test_two_open_prs_for_one_head_against_other_bases_post_nothing(self):
+        e = self._env_with_audit_db()
+        e.set_state(exists=False, extra_open=[
+            {"number": "8", "head": "feat/example", "base": "develop"},
+            {"number": "9", "head": "feat/example", "base": "release"},
+        ])
+        r = self._publish(e)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([c for c in e.calls() if c.startswith("pr comment")], [])
+        rows = e.audit_rows("review-publish")
+        self.assertTrue(any(o == "block" and "no-open-change-request" in d for o, d in rows), rows)
+
+    def test_two_open_prs_for_the_default_base_are_an_error_and_post_nothing(self):
+        e = self._env_with_audit_db()
+        e.set_state(extra_open=[{"number": "8", "head": "feat/example", "base": "main"}])
+        r = self._publish(e)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([c for c in e.calls() if c.startswith("pr comment")], [])
+        rows = e.audit_rows("review-publish")
+        self.assertTrue(any(o == "block" and "change-request-lookup-failed" in d for o, d in rows), rows)
+
+
 class TestAdapterContractAdditions(unittest.TestCase):
     def _run(self, e, call):
         env = os.environ.copy()
@@ -1132,6 +1213,28 @@ class TestAdapterContractAdditions(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(r.stdout.strip(), "")
         self.assertEqual([c for c in e.calls() if c.startswith("pr create")], [])
+
+    def test_find_open_change_request_filters_on_head_and_base(self):
+        e = _Env(self)
+        e.set_state(exists=True, extra_open=[
+            {"number": "8", "head": "other/head", "base": "main"},
+            {"number": "9", "head": "feat/example", "base": "develop"},
+        ])
+        for head, base, want in (("feat/example", "main", (0, "7")),
+                                 ("feat/example", "develop", (0, "9")),
+                                 ("other/head", "main", (0, "8")),
+                                 ("feat/example", "release", (1, "")),
+                                 ("nobody/head", "main", (1, ""))):
+            with self.subTest(head=head, base=base):
+                r = self._run(e, "host_adapter_find_open_change_request %s %s" % (head, base))
+                self.assertEqual((r.returncode, r.stdout.strip()), want, r.stderr)
+
+    def test_find_open_change_request_needs_a_base_and_errors_on_several_matches(self):
+        e = _Env(self)
+        e.set_state(exists=True, extra_open=[{"number": "8", "head": "feat/example", "base": "main"}])
+        r = self._run(e, "host_adapter_find_open_change_request feat/example main")
+        self.assertEqual((r.returncode, r.stdout.strip()), (2, ""), "two open PRs for one (head, base) is an error")
+        self.assertEqual(self._run(e, "host_adapter_find_open_change_request feat/example").returncode, 2)
 
     def test_read_thread_text_prints_body_then_comments(self):
         e = _Env(self)

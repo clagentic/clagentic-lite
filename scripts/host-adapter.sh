@@ -32,17 +32,17 @@
 #                                       _build_ship_pr_body) -- this file only
 #                                       transports it. Omitted BODY_FILE
 #                                       preserves the pre-lr-429b32 behavior.
-#   host_adapter_find_open_change_request BRANCH
+#   host_adapter_find_open_change_request HEAD BASE
 #                                    -- print the number of the OPEN change
-#                                       request for BRANCH. TRI-STATE exit:
-#                                       0 found, 1 none, 2 could not be
-#                                       determined (adapter, auth, network).
-#                                       For callers that only need to address
-#                                       an existing change request (the
-#                                       review-verdict publisher); a caller
-#                                       that must choose create-vs-reuse uses
-#                                       open_change_request instead, which
-#                                       shares this lookup.
+#                                       request for (HEAD, BASE). TRI-STATE
+#                                       exit: 0 found, 1 none, 2 could not be
+#                                       determined (adapter, auth, network, or
+#                                       more than one match). For callers that
+#                                       only need to address an existing
+#                                       change request (the review-verdict
+#                                       publisher); open_change_request makes
+#                                       the same lookup, through the same
+#                                       helper, before choosing create-vs-reuse.
 #   host_adapter_post_comment PR_NUM BODY_FILE
 #                                    -- post BODY_FILE's contents as ONE
 #                                       comment on change request PR_NUM.
@@ -104,7 +104,7 @@
 # ADDING A NEW HOST: implement the six functions following the `gh` example
 # below (_host_adapter_gh_open_change_request /
 # _host_adapter_gh_post_comment / _host_adapter_gh_read_comments /
-# _host_adapter_gh_find_open_change_request /
+# _host_adapter_gh_open_pr_number /
 # _host_adapter_gh_read_thread_text / _host_adapter_gh_artifact_limit), add one
 # recognition arm to _host_adapter_detect, and document the new adapter in
 # docs/GATES.md's adapter table -- no other file changes needed. Gate logic
@@ -243,15 +243,17 @@ host_adapter_open_change_request() {
   esac
 }
 
-# host_adapter_find_open_change_request BRANCH -- print the OPEN change
-# request's number. Tri-state exit: 0 found, 1 none, 2 undeterminable.
+# host_adapter_find_open_change_request HEAD BASE -- print the OPEN change
+# request's number for (HEAD, BASE). Tri-state exit: 0 found, 1 none, 2
+# undeterminable (including more than one match).
 host_adapter_find_open_change_request() {
-  _hafocr_branch="$1"
-  [ -n "$_hafocr_branch" ] || return 2
+  _hafocr_head="${1:-}"
+  _hafocr_base="${2:-}"
+  [ -n "$_hafocr_head" ] && [ -n "$_hafocr_base" ] || return 2
   _host_adapter_detect || return 2
   _host_adapter_repo_root_is_scoped || return 2
   case "$_HOST_ADAPTER" in
-    gh) _host_adapter_gh_find_open_change_request "$_hafocr_branch" ;;
+    gh) _host_adapter_gh_open_pr_number "$_hafocr_head" "$_hafocr_base" ;;
     *)  return 2 ;;
   esac
 }
@@ -349,22 +351,20 @@ _host_adapter_gh_run() {
   )
 }
 
-# _host_adapter_gh_open_pr_number BRANCH [BASE] -- the ONE place that answers "which
-# OPEN PR is there for BRANCH". Prints its number on stdout. Exit 0 = found,
-# 1 = none, 2 = the host could not be asked (auth/network/timeout/
-# unparseable). Bare `gh pr view|comment BRANCH` cannot be used for this or
+# _host_adapter_gh_open_pr_number HEAD BASE -- the ONE place that answers "which
+# OPEN PR is there for (HEAD, BASE)". Prints its number on stdout. Exit 0 =
+# found, 1 = none, 2 = the host could not be asked (auth/network/timeout/
+# unparseable) or more than one PR matched. Bare `gh pr view|comment BRANCH` cannot be used for this or
 # for later per-PR calls: it also matches CLOSED and MERGED PRs, so with a
 # closed and an open PR on one branch name it can hit the wrong one, and it
 # cannot tell "no PR" from a failed call without parsing error text. Every
 # per-PR read/comment therefore addresses the PR by the number found here.
 _host_adapter_gh_open_pr_number() {
-  # An optional BASE narrows the match: a same-head PR against another base is a
-  # different change request and must not be reused by a ship targeting BASE.
-  if [ -n "${2:-}" ]; then
-    _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --base "$2" --state open --json number --jq '.[0].number // empty' 2>/dev/null) || return 2
-  else
-    _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --state open --json number --jq '.[0].number // empty' 2>/dev/null) || return 2
-  fi
+  # BASE is part of the identity: a same-head PR against another base is a
+  # different change request. More than one match is ambiguous, so it is an
+  # error (2), never a pick of the first.
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 2
+  _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --base "$2" --state open --json number --jq '.[].number' 2>/dev/null) || return 2
   case "$_hagopn_out" in
     "") return 1 ;;
     *[!0-9]*) return 2 ;;
@@ -375,10 +375,6 @@ _host_adapter_gh_open_pr_number() {
 # GitHub rejects a pull-request body or a comment over 65536 characters.
 _host_adapter_gh_artifact_limit() {
   printf '%s\n' 65536
-}
-
-_host_adapter_gh_find_open_change_request() {
-  _host_adapter_gh_open_pr_number "$1"
 }
 
 # Prints `created <num>` / `reused <num>` on stdout and nothing else there:
