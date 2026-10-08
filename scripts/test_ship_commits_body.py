@@ -781,6 +781,37 @@ class TestShipEndToEnd(unittest.TestCase):
         self.assertEqual([c for c in e.calls() if c.startswith("pr comment")], [])
         self.assertEqual(e.state()["comments"], [])
 
+    def test_reship_after_merging_the_default_branch_lists_only_branch_commits(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        self.assertEqual(e.ship().returncode, 0)
+
+        _git(["checkout", "-q", "main"], e.repo)
+        _commit(e.repo, "up1.txt", "upstream change one")
+        _commit(e.repo, "up2.txt", "upstream change two")
+        _git(["push", "-q", "origin", "main"], e.repo)
+        _git(["checkout", "-q", "feat/example"], e.repo)
+        _git(["merge", "-q", "--no-ff", "-m", "merge main into feat/example", "main"], e.repo)
+        _commit(e.repo, "f9.txt", "branch commit after the merge")
+        e.set_state(calls=[])
+
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        comments = e.state()["comments"]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("branch commit after the merge", comments[0])
+        self.assertNotIn("upstream change", comments[0], "upstream commits carried by the merge are not this branch's")
+
+    def test_ship_prints_the_pr_number_when_created_and_when_reused(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        created = e.ship()
+        self.assertEqual(created.returncode, 0, created.stdout + created.stderr)
+        self.assertIn("PR #7 created", created.stdout)
+        reused = e.ship()
+        self.assertEqual(reused.returncode, 0, reused.stdout + reused.stderr)
+        self.assertIn("PR #7 already open", reused.stdout)
+
     def test_third_ship_anchors_on_the_newest_marker_in_a_comment(self):
         e = _Env(self)
         _add_three_commits(e.repo)

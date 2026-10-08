@@ -3340,37 +3340,47 @@ _ship_marker_from_file() {
 # so rather than guessing a possibly wrong range.
 _ship_default_base_sha() {
   _sdbs_head="$1"
-  _sdbs_default="${CLAGENTIC_DEFAULT_BRANCH:-main}"
-  if ! _git_repo_root_is_scoped; then
-    echo "REPO_ROOT is not itself a git repo"
-    return 1
-  fi
   if [ -z "$_sdbs_head" ]; then
     echo "the shipped head commit could not be resolved"
     return 1
   fi
-  _sdbs_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
-  # stdout is the ref and nothing else; the resolver's stderr (its failure
-  # reason, or any warning on success) is kept apart so it can never be
-  # glued onto the ref and break merge-base.
-  _sdbs_err=$(mktemp -t clagentic-ship-base-err.XXXXXX) || _sdbs_err=/dev/null
-  if ! _sdbs_tip=$(_gate_resolve_fresh_default_branch_ref "$_sdbs_default" "$_sdbs_timeout" 2>"$_sdbs_err"); then
-    # The reason this function prints can land in a public PR body, so it is
-    # a fixed string; the resolver's raw stderr (paths, hosts, git errors)
-    # stays on the local stderr only.
-    [ ! -s "$_sdbs_err" ] || cat "$_sdbs_err" 1>&2
-    echo "the default branch tip could not be resolved or proven current"
-    [ "$_sdbs_err" = /dev/null ] || rm -f "$_sdbs_err"
+  if ! _sdbs_tip=$(_ship_default_tip_sha); then
+    printf '%s\n' "$_sdbs_tip"
     return 1
   fi
-  [ ! -s "$_sdbs_err" ] || cat "$_sdbs_err" 1>&2
-  [ "$_sdbs_err" = /dev/null ] || rm -f "$_sdbs_err"
   _sdbs_base=$(_git merge-base "$_sdbs_tip" "$_sdbs_head" 2>/dev/null || echo "")
   if [ -z "$_sdbs_base" ]; then
     echo "no merge-base between the default branch tip and the shipped head"
     return 1
   fi
   printf '%s\n' "$_sdbs_base"
+}
+
+# _ship_default_tip_sha — print the provably-current default-branch tip. Same
+# failure contract as _ship_default_base_sha (fixed reason on stdout, return 1).
+_ship_default_tip_sha() {
+  _sdts_default="${CLAGENTIC_DEFAULT_BRANCH:-main}"
+  if ! _git_repo_root_is_scoped; then
+    echo "REPO_ROOT is not itself a git repo"
+    return 1
+  fi
+  _sdts_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
+  # stdout is the ref and nothing else; the resolver's stderr (its failure
+  # reason, or any warning on success) is kept apart so it can never be
+  # glued onto the ref and break merge-base.
+  _sdts_err=$(mktemp -t clagentic-ship-base-err.XXXXXX) || _sdts_err=/dev/null
+  if ! _sdts_tip=$(_gate_resolve_fresh_default_branch_ref "$_sdts_default" "$_sdts_timeout" 2>"$_sdts_err"); then
+    # The reason this function prints can land in a public PR body, so it is
+    # a fixed string; the resolver's raw stderr (paths, hosts, git errors)
+    # stays on the local stderr only.
+    [ ! -s "$_sdts_err" ] || cat "$_sdts_err" 1>&2
+    echo "the default branch tip could not be resolved or proven current"
+    [ "$_sdts_err" = /dev/null ] || rm -f "$_sdts_err"
+    return 1
+  fi
+  [ ! -s "$_sdts_err" ] || cat "$_sdts_err" 1>&2
+  [ "$_sdts_err" = /dev/null ] || rm -f "$_sdts_err"
+  printf '%s\n' "$_sdts_tip"
 }
 
 # ONE OWNER FOR "RENDERED ARTIFACT <= HOST HARD LIMIT". The limit itself is
@@ -3582,7 +3592,14 @@ _ship_render_commit_list() {
   _srcl_base="$1"
   _srcl_head="$2"
   _srcl_cap="$3"
-  _srcl_shas=$(_git rev-list --reverse --no-merges "${_srcl_base}..${_srcl_head}" 2>/dev/null) || return 1
+  _srcl_excl="${4:-}"
+  # The optional 4th argument is a ref to exclude as well, so that a default
+  # branch merged into the branch never lists the upstream commits it carried.
+  if [ -n "$_srcl_excl" ]; then
+    _srcl_shas=$(_git rev-list --reverse --no-merges "$_srcl_head" "^${_srcl_base}" "^${_srcl_excl}" 2>/dev/null) || return 1
+  else
+    _srcl_shas=$(_git rev-list --reverse --no-merges "${_srcl_base}..${_srcl_head}" 2>/dev/null) || return 1
+  fi
   [ -n "$_srcl_shas" ] || return 3
   [ "$_srcl_cap" -ge 1 ] || return 4
   _srcl_max=$(ds_positive_int_or_warn CLAGENTIC_SHIP_COMMITS_MAX_CHARS "${CLAGENTIC_SHIP_COMMITS_MAX_CHARS:-}" "$_srcl_cap")
@@ -3654,7 +3671,7 @@ _ship_render_commits_section() {
 # _ship_emit_within_limit. Reads its parts from _SPD_* (set by
 # _publish_ship_delta_comment); non-zero statuses are the commit list's own.
 _ship_delta_assemble() {
-  _sda_list=$(_ship_render_commit_list "$_SPD_FROM" "$_SPD_HEAD" "$1") || return $?
+  _sda_list=$(_ship_render_commit_list "$_SPD_FROM" "$_SPD_HEAD" "$1" "$_SPD_EXCLUDE") || return $?
   printf '**clagentic-lite ship: %s**\n\n' "$_SPD_TITLE"
   [ -z "$_SPD_NOTE" ] || printf '%s\n\n' "$_SPD_NOTE"
   printf '%s\n' "$_sda_list"
@@ -3714,6 +3731,12 @@ _publish_ship_delta_comment() {
     _psdc_note="History was rewritten since the last ship (the last shipped commit ${_psdc_marker} is not an ancestor of the current head), so every commit on the branch is listed."
   fi
 
+  if ! _psdc_tip=$(_ship_default_tip_sha); then
+    echo "[gates/ship] no delta comment posted: ${_psdc_tip}" 1>&2
+    ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=base-unresolved"
+    return 0
+  fi
+
   if [ -z "$_psdc_from" ]; then
     if ! _psdc_from=$(_ship_default_base_sha "$_psdc_head"); then
       echo "[gates/ship] no delta comment posted: ${_psdc_from}" 1>&2
@@ -3726,6 +3749,7 @@ _publish_ship_delta_comment() {
   fi
 
   _SPD_FROM="$_psdc_from"
+  _SPD_EXCLUDE="$_psdc_tip"
   _SPD_HEAD="$_psdc_head"
   _SPD_TITLE="$_psdc_title"
   _SPD_NOTE="$_psdc_note"
@@ -9284,8 +9308,10 @@ cmd_ship() {
       esac
     fi
     case "$_SHIP_PR_OUTCOME" in
-      created) ;;
-      reused) _publish_ship_delta_comment "$BRANCH" "$_SHIP_HEAD_SHA" "$_SHIP_PR_NUM" ;;
+      created) echo "[gates/ship] PR #${_SHIP_PR_NUM} created" ;;
+      reused)
+        echo "[gates/ship] PR #${_SHIP_PR_NUM} already open"
+        _publish_ship_delta_comment "$BRANCH" "$_SHIP_HEAD_SHA" "$_SHIP_PR_NUM" ;;
       *)
         echo "[gates/ship] host-adapter open-change-request failed or timed out after ${_SHIP_TIMEOUT}s — no PR created or commented on by this ship; open the PR manually (push result stands)" 1>&2
         ds_audit_log "ship-delta-publish" "block" "branch=${BRANCH:-<none>} head=${_SHIP_HEAD_SHA:-<unresolved>} reason=open-change-request-failed"

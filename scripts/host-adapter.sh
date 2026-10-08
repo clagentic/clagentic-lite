@@ -236,6 +236,7 @@ host_adapter_open_change_request() {
   _haocr_head="$2"
   _haocr_body_file="${3:-}"
   _host_adapter_detect || return 1
+  _host_adapter_repo_root_is_scoped || return 1
   case "$_HOST_ADAPTER" in
     gh) _host_adapter_gh_open_change_request "$_haocr_base" "$_haocr_head" "$_haocr_body_file" ;;
     *)  return 1 ;;
@@ -248,6 +249,7 @@ host_adapter_find_open_change_request() {
   _hafocr_branch="$1"
   [ -n "$_hafocr_branch" ] || return 2
   _host_adapter_detect || return 2
+  _host_adapter_repo_root_is_scoped || return 2
   case "$_HOST_ADAPTER" in
     gh) _host_adapter_gh_find_open_change_request "$_hafocr_branch" ;;
     *)  return 2 ;;
@@ -262,6 +264,7 @@ host_adapter_post_comment() {
   _hapc_body_file="${2:-}"
   _host_adapter_is_number "$_hapc_num" || return 1
   _host_adapter_detect || return 1
+  _host_adapter_repo_root_is_scoped || return 1
   case "$_HOST_ADAPTER" in
     gh) _host_adapter_gh_post_comment "$_hapc_num" "$_hapc_body_file" ;;
     *)  return 1 ;;
@@ -275,6 +278,7 @@ host_adapter_read_comments() {
   _harc_num="${1:-}"
   _host_adapter_is_number "$_harc_num" || return 1
   _host_adapter_detect || return 1
+  _host_adapter_repo_root_is_scoped || return 1
   case "$_HOST_ADAPTER" in
     gh) _host_adapter_gh_read_comments "$_harc_num" ;;
     *)  return 1 ;;
@@ -288,6 +292,7 @@ host_adapter_read_thread_text() {
   _hartt_num="${1:-}"
   _host_adapter_is_number "$_hartt_num" || return 1
   _host_adapter_detect || return 1
+  _host_adapter_repo_root_is_scoped || return 1
   case "$_HOST_ADAPTER" in
     gh) _host_adapter_gh_read_thread_text "$_hartt_num" ;;
     *)  return 1 ;;

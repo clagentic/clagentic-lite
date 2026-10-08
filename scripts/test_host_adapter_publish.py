@@ -52,7 +52,12 @@ import stat
 import subprocess
 import tempfile
 import textwrap
+import sys
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import source_env  # noqa: E402
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
@@ -762,12 +767,11 @@ class TestHostAdapterRepoScopingSweep(unittest.TestCase):
             "ancestor repo's remote, when REPO_ROOT is not itself a git repo",
         )
 
-    def test_post_comment_reads_no_repo_state_so_it_cannot_target_an_ancestor_repo(self):
-        """The publish path used to read the current branch from REPO_ROOT,
-        which an ancestor repo could answer for. post_comment now takes the
-        change-request number from the caller and reads no repo state at all:
-        the posted target is exactly the number given, whatever repo
-        REPO_ROOT resolves to."""
+    def test_post_comment_does_not_target_an_ancestor_repos_branch(self):
+        """Same scenario, the publish path: post_comment must refuse, and
+        never reach gh, when REPO_ROOT is not itself the git repo. The
+        configured-host override skips remote sniffing, so the refusal here
+        is post_comment's own, not detection's."""
         repo_root = _init_ancestor_repo_with_unrelated_subdir(
             self._tmpdir, "https://github.com/ancestor/wrong.git"
         )
@@ -780,9 +784,55 @@ class TestHostAdapterRepoScopingSweep(unittest.TestCase):
             env_overrides={"REPO_ROOT": repo_root, "CLAGENTIC_REPO_HOST": "github"},
             path_prepend=self._bin,
         )
-        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotEqual(r.returncode, 0)
         calls = _read_calls(self._calls)
-        self.assertEqual([c.split(" --body-file")[0] for c in calls], ["pr comment 7"], calls)
+        self.assertFalse(
+            any(c.startswith("pr comment") for c in calls),
+            "must never reach gh pr comment when REPO_ROOT is unscoped: %r" % calls,
+        )
+
+    def test_every_gh_running_adapter_path_refuses_an_unscoped_repo_root(self):
+        """Lookup, create, thread read and comment read each refuse (and make
+        no gh call) when REPO_ROOT is a subdirectory of an unrelated repo, even
+        with the host configured so detection alone would not stop them."""
+        repo_root = _init_ancestor_repo_with_unrelated_subdir(
+            self._tmpdir, "https://github.com/ancestor/wrong.git"
+        )
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
+        for call in ("host_adapter_find_open_change_request feat/example",
+                     "host_adapter_open_change_request main feat/example",
+                     "host_adapter_read_thread_text 7",
+                     "host_adapter_read_comments 7"):
+            with self.subTest(call=call):
+                r = _run_review_merge_fn(
+                    call,
+                    env_overrides={"REPO_ROOT": repo_root, "CLAGENTIC_REPO_HOST": "github"},
+                    path_prepend=self._bin,
+                )
+                self.assertNotEqual(r.returncode, 0)
+                self.assertEqual(r.stdout.strip(), "")
+        self.assertEqual(_read_calls(self._calls), [], "no gh call may run against an unscoped repo")
+
+    def test_review_verdict_publisher_refuses_an_unscoped_repo_root(self):
+        """The review-verdict publisher runs the lookup and the comment
+        through the adapter; with REPO_ROOT inside an unrelated repo it must
+        post nothing and never reach gh, even with the host configured."""
+        repo_root = _init_ancestor_repo_with_unrelated_subdir(
+            self._tmpdir, "https://github.com/ancestor/wrong.git"
+        )
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
+        env.update({
+            "CLAGENTIC_PROJECT_ROOT": repo_root,
+            "CLAGENTIC_REPO_HOST": "github",
+            "PATH": self._bin + os.pathsep + env.get("PATH", ""),
+        })
+        script = ". '%s'\n_publish_review_verdict feat/example pass abc123 '[]'\n" % GATES_SH
+        r = subprocess.run(["sh", "-c", script, GATES_SH], capture_output=True, text=True,
+                           env=env, cwd=repo_root, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(_read_calls(self._calls), [], "no gh call may run against an unscoped repo")
 
     def test_no_adapter_function_reads_the_branch_or_head_for_a_pr_call(self):
         """Class sweep: no branch- or HEAD-keyed repo read feeds a per-PR
