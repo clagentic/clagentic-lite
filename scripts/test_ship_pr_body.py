@@ -13,9 +13,11 @@ SCOPE:
      verdict at the exact head_sha; a ledger entry for the branch at a
      DIFFERENT head_sha (stale, must say so); no usable ledger entry at all
      (never reviewed / no JSON tool / no ledger file).
-  3. Sections 1/3/4 have no mechanical source in this codebase and must say
+  3. Sections 3/4 have no mechanical source in this codebase and must say
      so explicitly -- never a fabricated summary, never a bare empty
-     heading.
+     heading. Section 1 is the branch's own commit text; its content and
+     placeholder-only-when-unavailable behavior are covered in
+     test_ship_commits_body.py.
   4. scripts/host-adapter.sh's gh adapter threading (BODY_FILE optional
      third arg) is covered separately in test_host_adapter_publish.py; this
      file is scoped to the gate-side render function only.
@@ -121,7 +123,7 @@ class TestBuildShipPrBody(unittest.TestCase):
         r = _call_build_ship_pr_body(self._repo, "feat/example", self._head)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("reviewer: none", r.stdout)
-        self.assertIn("no recorded review verdict", r.stdout)
+        self.assertIn("no readable review verdict recorded", r.stdout)
         self.assertNotIn("verdict: pass", r.stdout)
         self.assertNotIn("verdict: block", r.stdout)
 
@@ -188,13 +190,18 @@ class TestBuildShipPrBody(unittest.TestCase):
         self.assertNotIn("verdict: pass", r.stdout)
 
     def test_placeholder_sections_never_silently_empty(self):
-        """Sections 1/3/4 have no mechanical data source -- each must carry
+        """Sections 3/4 have no mechanical data source -- each must carry
         an explicit sentence naming that gap, never a heading with nothing
         under it (the degrade-honestly acceptance bar applies to every
-        section, not only review provenance)."""
+        section, not only review provenance). Section 1 uses a placeholder
+        only when the commit range is unavailable or empty, and never the
+        retired false claim that no commit-log reader exists."""
         r = _call_build_ship_pr_body(self._repo, "feat/example", self._head)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Not recorded by tooling", r.stdout)
+        self.assertNotIn("summarizer", r.stdout)
+        self.assertIn("Commit list unavailable", r.stdout,
+                      "this fixture has no remote, so the commit range is genuinely unresolvable")
         # Every required heading must be followed by non-whitespace content
         # before the next heading (or end of string) -- a mechanical proxy
         # for "never a bare empty heading."

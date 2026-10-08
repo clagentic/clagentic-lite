@@ -385,7 +385,8 @@ CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 # The git fetch + ls-remote freshness check that resolves the default-branch
 # ref for a gate's diff/file scope (see also CLAGENTIC_SAST_FETCH_TIMEOUT_SEC
 # and CLAGENTIC_SECRETS_FETCH_TIMEOUT_SEC above): review and adversarial diff
-# scope, the bleed gate's changed-file scope, and the merge-gate's payload.
+# scope, the ship PR body's commit range, the bleed gate's changed-file scope,
+# and the merge-gate's payload.
 # CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC=30
 # CLAGENTIC_BLEED_FETCH_TIMEOUT_SEC=30
 # CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC=30
@@ -395,6 +396,17 @@ CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 # CLAGENTIC_TOOL_VERSION_TIMEOUT_SEC=30
 # CLAGENTIC_TOOL_UPGRADE_TIMEOUT_SEC=300
 # CLAGENTIC_REMOTE_CHECK_TIMEOUT_SEC=20
+#
+# Character cap on the commit list `gates ship` writes into a PR body ("What
+# changed and why") and into a re-ship delta comment. The list is every
+# non-merge commit, oldest first, subject plus full body; commits that do not
+# fit are counted in an explicit "N more commits not shown" line. Unset, the
+# list uses whatever room is left under the host's hard body/comment limit
+# after the other sections; this key can only LOWER that, never raise it past
+# the limit. A single commit message that does not fit is truncated with an
+# explicit note. Non-numeric or zero falls back to the unset behavior with a
+# WARN.
+# CLAGENTIC_SHIP_COMMITS_MAX_CHARS=40000
 #
 # Cap on structured findings kept in the adversarial sidecar the merge-gate
 # reads. Lowest-severity findings are dropped first, and the dropped count is
@@ -428,7 +440,8 @@ CLAGENTIC_PLUGIN_TIMEOUT_SEC=30
 # Zero handling for the other numeric keys. Fall back to the default with a
 # WARN on zero or non-numeric: CLAGENTIC_MEMORY_MAX_ROWS,
 # CLAGENTIC_INVARIANT_FEED_MAX, CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS,
-# CLAGENTIC_REVIEW_CHUNK_BYTES, CLAGENTIC_REVIEWER_MAX_DIFF_KB. Zero is a real
+# CLAGENTIC_REVIEW_CHUNK_BYTES, CLAGENTIC_REVIEWER_MAX_DIFF_KB,
+# CLAGENTIC_SHIP_COMMITS_MAX_CHARS. Zero is a real
 # setting for: CLAGENTIC_LLM_TIMEOUT_MAX_SEC / CLAGENTIC_<ROLE>_TIMEOUT_MAX_SEC
 # (no cap), CLAGENTIC_LEDGER_MAX_PER_BRANCH (unlimited),
 # CLAGENTIC_SUMMARIZE_DEBOUNCE_SEC (no debounce), CLAGENTIC_RECALL_MIN_KEYWORDS

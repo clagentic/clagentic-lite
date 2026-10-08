@@ -46,13 +46,19 @@ Run with: python3 -m unittest scripts.test_host_adapter_publish -v
 """
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
 import subprocess
 import tempfile
 import textwrap
+import sys
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_source_helpers import source_env  # noqa: E402
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 GATES_SH = os.path.join(TOOL_HOME, "scripts", "gates.sh")
@@ -77,7 +83,7 @@ _GIT_IDENTITY_ENV = {
 # word fragment.
 _VENDOR_TOKENS = [
     "github.com", "gitlab.com", "gitea.", "forgejo.",
-    "gh pr view", "gh pr create", "gh pr comment",
+    "gh pr view", "gh pr create", "gh pr comment", "gh pr list",
 ]
 
 # Gate-logic files the host-neutral AC applies to. scripts/host-adapter.sh
@@ -222,7 +228,7 @@ def _setup_fake_tool_home(fake_tool_home):
         os.symlink(real_share, fake_share)
 
 
-def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False):
+def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False, closed_pr=False, cwd_file=None):
     """A fake `gh` executable that intercepts exactly the subcommands
     scripts/host-adapter.sh's gh adapter uses: `pr view`, `pr create`,
     `pr comment`, `pr view --json comments --jq`. Records every invocation
@@ -233,8 +239,12 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False):
       "ok"        -- every subcommand succeeds.
       "comment_fail" -- `pr comment` exits 1 (simulates an auth/network
                         publish failure), everything else succeeds.
+      "list_fail" -- `pr list` exits 1 (the open-PR lookup errors), everything
+                     else succeeds.
     pr_exists: when True, `pr view <branch>` (no --json) exits 0 (PR already
       open); when False it exits 1 (no PR yet, forcing `pr create`).
+    closed_pr: when True a CLOSED PR exists for the branch; it is returned
+      only for `pr list --state closed|all`, never for the default open lookup.
     """
     os.makedirs(bin_dir, exist_ok=True)
     gh_path = os.path.join(bin_dir, "gh")
@@ -247,13 +257,42 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False):
         bodies_dir = {bodies_dir!r}
         mode = {mode!r}
         pr_exists = {pr_exists!r}
+        closed_pr = {closed_pr!r}
+        cwd_file = {cwd_file!r}
 
         argv = sys.argv[1:]
+        sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})
+        import gh_stub_guard
+        gh_stub_guard.check(argv)
         with open(calls_file, "a") as f:
             f.write(" ".join(argv) + "\\n")
+        if cwd_file:
+            with open(cwd_file, "a") as f:
+                f.write(os.path.realpath(os.getcwd()) + "\\n")
 
         if argv[:2] == ["pr", "view"] and "--json" in argv:
             print(json.dumps({{"comments": []}}))
+            sys.exit(0)
+        if argv[:2] == ["pr", "list"] and mode == "list_fail":
+            sys.stderr.write("simulated transient host failure\\n")
+            sys.exit(1)
+        if argv[:2] == ["pr", "list"]:
+            # Honors --state (default open): the open PR is number 7, a
+            # closed PR for the same branch is number 3. Prints nothing when
+            # no PR matches, as the real CLI's jq filter would.
+            wanted = argv[argv.index("--state") + 1] if "--state" in argv else "open"
+            # Also honors --head and --base: the existing PR is on
+            # feat/example and targets main, so a missing or wrong --head, or
+            # a wrong --base, finds no PR and the test fails instead of
+            # passing vacuously.
+            head = argv[argv.index("--head") + 1] if "--head" in argv else None
+            base = argv[argv.index("--base") + 1] if "--base" in argv else None
+            if head != "feat/example" or (base is not None and base != "main"):
+                sys.exit(0)
+            if pr_exists and wanted in ("open", "all"):
+                print(7)
+            elif closed_pr and wanted in ("closed", "all"):
+                print(3)
             sys.exit(0)
         if argv[:2] == ["pr", "view"]:
             sys.exit(0 if pr_exists else 1)
@@ -267,6 +306,8 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False):
                 dst = os.path.join(bodies_dir, "create-body-%d.txt" % len(open(calls_file).readlines()))
                 with open(src) as sf, open(dst, "w") as df:
                     df.write(sf.read())
+            # The real CLI ends its output with the new PR's URL.
+            print("https://github.com/example/example/pull/9")
             sys.exit(0)
         if argv[:2] == ["pr", "comment"]:
             # Persist the posted body BEFORE the caller's own cleanup can
@@ -442,8 +483,9 @@ class TestHostAdapterContractDirect(unittest.TestCase):
             path_prepend=self._bin,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "reused 7")
         calls = _read_calls(self._calls)
-        self.assertTrue(any(c.startswith("pr view") for c in calls))
+        self.assertTrue(any(c.startswith("pr list") and "--state open" in c for c in calls))
         self.assertFalse(any(c.startswith("pr create") for c in calls),
                            "an existing PR must never trigger a second create call")
 
@@ -455,8 +497,190 @@ class TestHostAdapterContractDirect(unittest.TestCase):
             path_prepend=self._bin,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "created 9",
+                         "stdout is exactly one line: the outcome and the new PR's number")
         calls = _read_calls(self._calls)
         self.assertTrue(any(c.startswith("pr create") for c in calls))
+        self.assertEqual(len([c for c in calls if c.startswith("pr list")]), 1,
+                         "exactly one open-PR lookup per open call")
+
+    def test_open_change_request_refuses_to_create_when_open_pr_lookup_errors(self):
+        _make_fake_gh(self._bin, self._calls, mode="list_fail")
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_open_change_request main feat/example" % self._repo,
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "", "no outcome line when the outcome is unknown")
+        calls = _read_calls(self._calls)
+        self.assertTrue(any(c.startswith("pr list") for c in calls))
+        self.assertFalse(any(c.startswith("pr create") for c in calls),
+                         "a failed lookup must never fall through to a duplicate create")
+        self.assertFalse(any(c.startswith("pr comment") for c in calls))
+
+    def test_branch_with_only_a_closed_pr_goes_to_pr_create(self):
+        _make_fake_gh(self._bin, self._calls, pr_exists=False, closed_pr=True)
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_open_change_request main feat/example" % self._repo,
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "created 9")
+        calls = _read_calls(self._calls)
+        self.assertTrue(any(c.startswith("pr list") and "--state open" in c for c in calls))
+        self.assertTrue(any(c.startswith("pr create") for c in calls),
+                        "a closed PR is not an open one: the branch must get a new PR")
+
+    def test_open_change_request_fails_when_created_pr_number_is_unreadable(self):
+        """A create whose output carries no PR URL cannot report `created
+        <num>`; it must fail loudly, never print a made-up number."""
+        _make_fake_gh(self._bin, self._calls, pr_exists=False)
+        gh_path = os.path.join(self._bin, "gh")
+        with open(gh_path) as f:
+            script = f.read()
+        with open(gh_path, "w") as f:
+            f.write(script.replace('print("https://github.com/example/example/pull/9")', 'print("done")'))
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_open_change_request main feat/example" % self._repo,
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_find_open_change_request_is_tri_state_and_ignores_closed_prs(self):
+        call = "host_adapter_find_open_change_request feat/example main"
+        _make_fake_gh(self._bin, self._calls, pr_exists=True, closed_pr=True)
+        r = _run_review_merge_fn(call, env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "7"), "the OPEN number, not the closed 3")
+        _make_fake_gh(self._bin, self._calls, pr_exists=False, closed_pr=True)
+        r = _run_review_merge_fn(call, env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
+        self.assertEqual((r.returncode, r.stdout.strip()), (1, ""))
+        _make_fake_gh(self._bin, self._calls, mode="list_fail")
+        r = _run_review_merge_fn(call, env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
+        self.assertEqual(r.returncode, 2)
+
+    def test_post_comment_addresses_the_given_pr_number_without_a_lookup(self):
+        _make_fake_gh(self._bin, self._calls, pr_exists=True, closed_pr=True)
+        body_file = os.path.join(self._tmpdir, "body.txt")
+        with open(body_file, "w") as f:
+            f.write("hello\n")
+        r = _run_review_merge_fn(
+            "cd '%s' && host_adapter_post_comment 7 '%s'" % (self._repo, body_file),
+            env_overrides={"REPO_ROOT": self._repo},
+            path_prepend=self._bin,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = _read_calls(self._calls)
+        comment_calls = [c for c in calls if c.startswith("pr comment")]
+        self.assertEqual(len(comment_calls), 1)
+        self.assertTrue(comment_calls[0].startswith("pr comment 7 "), comment_calls[0])
+        self.assertEqual([c for c in calls if c.startswith("pr list")], [],
+                         "the number came from the caller's one lookup; the adapter must not look again")
+
+    def test_per_pr_calls_refuse_a_branch_name_or_empty_target(self):
+        """The class guard: a branch name can match a closed PR, so every
+        per-PR function takes a number and fails closed on anything else."""
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
+        body_file = os.path.join(self._tmpdir, "body.txt")
+        with open(body_file, "w") as f:
+            f.write("hello\n")
+        for call in ("host_adapter_post_comment feat/example '%s'" % body_file,
+                     "host_adapter_post_comment '' '%s'" % body_file,
+                     "host_adapter_read_thread_text feat/example",
+                     "host_adapter_read_comments feat/example",
+                     "host_adapter_read_comments"):
+            with self.subTest(call=call):
+                r = _run_review_merge_fn("cd '%s' && %s" % (self._repo, call),
+                                         env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
+                self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(_read_calls(self._calls), [], "no host call may be made for a non-number target")
+
+    def test_every_gh_call_runs_against_repo_root_not_the_process_cwd(self):
+        """gh infers its repository from the working directory. With the shell
+        sitting in an unrelated repo B (own remote) and REPO_ROOT naming A,
+        every gh call the adapter makes must run from A."""
+        other = os.path.join(self._tmpdir, "other-repo")
+        _init_git_repo_with_github_remote(other)
+        _git(["remote", "set-url", "origin", "https://github.com/other/other.git"], cwd=other)
+        cwd_log = os.path.join(self._tmpdir, "gh-cwds.txt")
+        body_file = os.path.join(self._tmpdir, "body.txt")
+        with open(body_file, "w") as f:
+            f.write("hello\n")
+        wanted = os.path.realpath(self._repo)
+        cases = (
+            ("host_adapter_find_open_change_request feat/example main", True),
+            ("host_adapter_open_change_request main feat/example '%s'" % body_file, False),
+            ("host_adapter_open_change_request main feat/example", False),
+            ("host_adapter_post_comment 7 '%s'" % body_file, True),
+            ("host_adapter_read_comments 7", True),
+            ("host_adapter_read_thread_text 7", True),
+        )
+        for call, pr_exists in cases:
+            with self.subTest(call=call):
+                if os.path.exists(cwd_log):
+                    os.remove(cwd_log)
+                _make_fake_gh(self._bin, self._calls, pr_exists=pr_exists, cwd_file=cwd_log)
+                r = _run_review_merge_fn(
+                    "cd '%s' && %s" % (other, call),
+                    env_overrides={"REPO_ROOT": self._repo},
+                    path_prepend=self._bin,
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+                with open(cwd_log) as f:
+                    cwds = [l for l in f.read().split("\n") if l]
+                self.assertTrue(cwds, "the call must reach gh")
+                self.assertEqual(set(cwds), {wanted}, "gh ran outside REPO_ROOT: %r" % cwds)
+
+    def test_gh_is_invoked_only_through_the_repo_root_helper(self):
+        """Class sweep: the one `gh` invocation in host-adapter.sh lives inside
+        _host_adapter_gh_run; every call site goes through that helper, so none
+        can fall back to the process cwd."""
+        with open(HOST_ADAPTER_SH, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        invocation = re.compile(r"(?:^|[\s;&|(`])gh(?=\s)")
+        hits = []
+        in_helper = False
+        for n, raw in enumerate(lines, 1):
+            s = raw.strip()
+            if s.startswith("#"):
+                continue
+            if s.startswith("_host_adapter_gh_run()"):
+                in_helper = True
+            elif in_helper and s == "}":
+                in_helper = False
+                continue
+            scrubbed = s.replace("command -v gh", "")
+            scrubbed = re.sub(r'"[^"]*\[host-adapter/gh\][^"]*"', "", scrubbed)
+            if invocation.search(scrubbed) and not in_helper:
+                hits.append((n, raw))
+        self.assertEqual(hits, [], "gh invoked outside _host_adapter_gh_run: %r" % hits)
+        # Non-vacuity: the helper itself is found and does invoke gh.
+        helper = [l for l in lines if invocation.search(l) and "run_bounded" in l]
+        self.assertEqual(len(helper), 1, helper)
+
+    def test_gh_helper_fails_closed_when_repo_root_is_unusable(self):
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
+        for root in ("", os.path.join(self._tmpdir, "missing")):
+            with self.subTest(root=root):
+                r = _run_review_merge_fn("_host_adapter_gh_run pr list",
+                                         env_overrides={"REPO_ROOT": root}, path_prepend=self._bin)
+                self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(_read_calls(self._calls), [])
+
+    def test_artifact_limit_is_owned_by_the_adapter(self):
+        _make_fake_gh(self._bin, self._calls)
+        r = _run_review_merge_fn("host_adapter_artifact_limit",
+                                 env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "65536"))
+        no_remote_repo = os.path.join(self._tmpdir, "no-remote-repo")
+        _init_git_repo_no_remote(no_remote_repo)
+        r = _run_review_merge_fn("host_adapter_artifact_limit",
+                                 env_overrides={"REPO_ROOT": no_remote_repo}, path_prepend=self._bin)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "65536"),
+                         "without an adapter the smallest shipped limit applies")
 
     def test_open_change_request_with_body_file_uses_fill_first_and_body_file(self):
         """lr-429b32: a BODY_FILE third arg must reach `gh pr create` as
@@ -499,6 +723,66 @@ class TestHostAdapterContractDirect(unittest.TestCase):
         self.assertIn("--fill", create_calls[0])
         self.assertNotIn("--body-file", create_calls[0])
 
+    def test_create_argv_tokens_are_exact_with_and_without_body_file(self):
+        """The exact tokens handed to `gh pr create`: a fused or misspelled
+        flag fails here even if the stub's allowlist were loosened."""
+        body_file = os.path.join(self._tmpdir, "pr-body.txt")
+        with open(body_file, "w") as f:
+            f.write("body\n")
+        cases = (
+            ("'%s'" % body_file,
+             "pr create --fill-first --base main --head feat/example --body-file %s" % body_file),
+            ("", "pr create --fill --base main --head feat/example"),
+        )
+        for arg, expected in cases:
+            with self.subTest(arg=arg):
+                if os.path.exists(self._calls):
+                    os.remove(self._calls)
+                _make_fake_gh(self._bin, self._calls, pr_exists=False)
+                r = _run_review_merge_fn(
+                    "cd '%s' && host_adapter_open_change_request main feat/example %s" % (self._repo, arg),
+                    env_overrides={"REPO_ROOT": self._repo},
+                    path_prepend=self._bin,
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+                creates = [c for c in _read_calls(self._calls) if c.startswith("pr create")]
+                self.assertEqual(creates, [expected])
+
+    def test_relative_body_file_survives_the_cwd_change_into_repo_root(self):
+        """gh runs from REPO_ROOT, so a body file given relative to the
+        caller's cwd must be made absolute first (create and comment paths)."""
+        elsewhere = os.path.join(self._tmpdir, "elsewhere")
+        os.makedirs(elsewhere)
+        with open(os.path.join(elsewhere, "rel-body.txt"), "w") as f:
+            f.write("relative body\n")
+        for call, pr_exists, read in (
+            ("host_adapter_open_change_request main feat/example rel-body.txt", False, _read_posted_create_bodies),
+            ("host_adapter_post_comment 7 rel-body.txt", True, _read_posted_bodies),
+        ):
+            with self.subTest(call=call):
+                shutil.rmtree(os.path.join(self._tmpdir, "posted-bodies"), ignore_errors=True)
+                _make_fake_gh(self._bin, self._calls, pr_exists=pr_exists)
+                r = _run_review_merge_fn(
+                    "cd '%s' && %s" % (elsewhere, call),
+                    env_overrides={"REPO_ROOT": self._repo},
+                    path_prepend=self._bin,
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(read(self._tmpdir), ["relative body\n"])
+
+    def test_stub_gh_rejects_flags_real_gh_does_not_accept(self):
+        _make_fake_gh(self._bin, self._calls)
+        gh = os.path.join(self._bin, "gh")
+        for argv in (["pr", "create", "--fill-first--base", "main"],
+                     ["pr", "list", "--bogus"],
+                     ["pr", "view", "7", "--body-file", "x"],
+                     ["pr", "comment", "7", "--fill"],
+                     ["pr", "edit", "7"]):
+            with self.subTest(argv=argv):
+                r = subprocess.run([gh] + argv, capture_output=True, text=True)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("fake gh", r.stderr)
+
     def test_open_change_request_reuses_existing_pr_ignoring_body_file(self):
         """An already-open PR is reused as-is per the contract -- a BODY_FILE
         argument must never trigger a second call to set/replace its body."""
@@ -517,12 +801,12 @@ class TestHostAdapterContractDirect(unittest.TestCase):
                           "an existing PR must never trigger a create call, body file or not")
 
     def test_post_comment_posts_body_file_contents(self):
-        _make_fake_gh(self._bin, self._calls)
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
         body_file = os.path.join(self._tmpdir, "body.txt")
         with open(body_file, "w") as f:
             f.write("verdict: pass\nhead_sha: abc123\n")
         r = _run_review_merge_fn(
-            "cd '%s' && host_adapter_post_comment '%s'" % (self._repo, body_file),
+            "cd '%s' && host_adapter_post_comment 7 '%s'" % (self._repo, body_file),
             env_overrides={"REPO_ROOT": self._repo},
             path_prepend=self._bin,
         )
@@ -532,9 +816,9 @@ class TestHostAdapterContractDirect(unittest.TestCase):
         self.assertTrue(any("--body-file" in c for c in calls))
 
     def test_read_comments_returns_json_lines(self):
-        _make_fake_gh(self._bin, self._calls)
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
         r = _run_review_merge_fn(
-            "cd '%s' && host_adapter_read_comments" % self._repo,
+            "cd '%s' && host_adapter_read_comments 7" % self._repo,
             env_overrides={"REPO_ROOT": self._repo},
             path_prepend=self._bin,
         )
@@ -632,9 +916,10 @@ class TestHostAdapterRepoScopingSweep(unittest.TestCase):
         )
 
     def test_post_comment_does_not_target_an_ancestor_repos_branch(self):
-        """Same scenario, the publish path: post_comment must not resolve
-        (and therefore must not post to) a branch name read from the
-        ancestor repo instead of REPO_ROOT."""
+        """Same scenario, the publish path: post_comment must refuse, and
+        never reach gh, when REPO_ROOT is not itself the git repo. The
+        configured-host override skips remote sniffing, so the refusal here
+        is post_comment's own, not detection's."""
         repo_root = _init_ancestor_repo_with_unrelated_subdir(
             self._tmpdir, "https://github.com/ancestor/wrong.git"
         )
@@ -643,8 +928,8 @@ class TestHostAdapterRepoScopingSweep(unittest.TestCase):
         with open(body_file, "w") as f:
             f.write("verdict: pass\n")
         r = _run_review_merge_fn(
-            "host_adapter_post_comment '%s'" % body_file,
-            env_overrides={"REPO_ROOT": repo_root},
+            "host_adapter_post_comment 7 '%s'" % body_file,
+            env_overrides={"REPO_ROOT": repo_root, "CLAGENTIC_REPO_HOST": "github"},
             path_prepend=self._bin,
         )
         self.assertNotEqual(r.returncode, 0)
@@ -653,6 +938,59 @@ class TestHostAdapterRepoScopingSweep(unittest.TestCase):
             any(c.startswith("pr comment") for c in calls),
             "must never reach gh pr comment when REPO_ROOT is unscoped: %r" % calls,
         )
+
+    def test_every_gh_running_adapter_path_refuses_an_unscoped_repo_root(self):
+        """Lookup, create, thread read and comment read each refuse (and make
+        no gh call) when REPO_ROOT is a subdirectory of an unrelated repo, even
+        with the host configured so detection alone would not stop them."""
+        repo_root = _init_ancestor_repo_with_unrelated_subdir(
+            self._tmpdir, "https://github.com/ancestor/wrong.git"
+        )
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
+        for call in ("host_adapter_find_open_change_request feat/example main",
+                     "host_adapter_open_change_request main feat/example",
+                     "host_adapter_read_thread_text 7",
+                     "host_adapter_read_comments 7"):
+            with self.subTest(call=call):
+                r = _run_review_merge_fn(
+                    call,
+                    env_overrides={"REPO_ROOT": repo_root, "CLAGENTIC_REPO_HOST": "github"},
+                    path_prepend=self._bin,
+                )
+                self.assertNotEqual(r.returncode, 0)
+                self.assertEqual(r.stdout.strip(), "")
+        self.assertEqual(_read_calls(self._calls), [], "no gh call may run against an unscoped repo")
+
+    def test_review_verdict_publisher_refuses_an_unscoped_repo_root(self):
+        """The review-verdict publisher runs the lookup and the comment
+        through the adapter; with REPO_ROOT inside an unrelated repo it must
+        post nothing and never reach gh, even with the host configured."""
+        repo_root = _init_ancestor_repo_with_unrelated_subdir(
+            self._tmpdir, "https://github.com/ancestor/wrong.git"
+        )
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
+        env.update({
+            "CLAGENTIC_PROJECT_ROOT": repo_root,
+            "CLAGENTIC_REPO_HOST": "github",
+            "PATH": self._bin + os.pathsep + env.get("PATH", ""),
+        })
+        script = ". '%s'\n_publish_review_verdict feat/example pass abc123 '[]'\n" % GATES_SH
+        r = subprocess.run(["sh", "-c", script, GATES_SH], capture_output=True, text=True,
+                           env=env, cwd=repo_root, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(_read_calls(self._calls), [], "no gh call may run against an unscoped repo")
+
+    def test_no_adapter_function_reads_the_branch_or_head_for_a_pr_call(self):
+        """Class sweep: no branch- or HEAD-keyed repo read feeds a per-PR
+        call anywhere in host-adapter.sh (the only branch-keyed host call is
+        the one open-PR lookup, whose branch the caller passes in)."""
+        with open(HOST_ADAPTER_SH, encoding="utf-8") as f:
+            live = [l for l in f.read().splitlines() if not l.strip().startswith("#")]
+        offenders = [l for l in live if "--abbrev-ref" in l or "rev-parse HEAD" in l
+                     or "branch --show-current" in l]
+        self.assertEqual(offenders, [])
 
     def test_available_succeeds_when_repo_root_is_the_real_toplevel(self):
         """Negative control: the identical ancestor/subdir layout, but
@@ -799,7 +1137,7 @@ class TestPublishViaCmdReview(unittest.TestCase):
         head_sha = _git(["rev-parse", "HEAD"], cwd=self._project).stdout.strip()
         _stage_file(self._project, "feature.py", "print('hi')\n")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
-        _make_fake_gh(self._bin, self._calls)
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
         result = _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -832,7 +1170,7 @@ class TestPublishViaCmdReview(unittest.TestCase):
         the marker surfaces in the published comment. Opting out here
         isolates that property from the unrelated dedup mechanism."""
         _init_git_repo_with_github_remote(self._project)
-        _make_fake_gh(self._bin, self._calls)
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
         dedup_off = {"CLAGENTIC_CROSS_ROUND_DEDUP": "0"}
 
         # Round 1: a finding that will recur.
@@ -871,7 +1209,7 @@ class TestPublishViaCmdReview(unittest.TestCase):
         _init_git_repo_with_github_remote(self._project)
         _stage_file(self._project, "feature.py", "print('hi')\n")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
-        _make_fake_gh(self._bin, self._calls, mode="comment_fail")
+        _make_fake_gh(self._bin, self._calls, mode="comment_fail", pr_exists=True)
         result = _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
         self.assertEqual(result.returncode, 0,
                           "a publish failure must never flip cmd_review's own exit code: %s" % result.stderr)
@@ -888,7 +1226,7 @@ class TestPublishViaCmdReview(unittest.TestCase):
         _init_git_repo_with_github_remote(self._project)
         _stage_file(self._project, "feature.py", "print('hi')\n")
         _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
-        _make_fake_gh(self._bin, self._calls, mode="comment_fail")
+        _make_fake_gh(self._bin, self._calls, mode="comment_fail", pr_exists=True)
         _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
 
         db_path = os.path.join(self._project, ".clagentic", "lite", "audit.db")
@@ -900,12 +1238,41 @@ class TestPublishViaCmdReview(unittest.TestCase):
         self.assertTrue(rows, "a review-publish audit row must exist")
         self.assertEqual(rows[0][1], "block", "the logged outcome must reflect the publish failure")
 
+    def test_review_comment_targets_the_open_pr_number_after_exactly_one_lookup(self):
+        """With a closed and an open PR on the branch, the verdict comment
+        goes to the open PR by number; the publisher resolves it with one
+        lookup, not one per call."""
+        _init_git_repo_with_github_remote(self._project)
+        _stage_file(self._project, "feature.py", "print('hi')\n")
+        _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
+        _make_fake_gh(self._bin, self._calls, pr_exists=True, closed_pr=True)
+        result = _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = _read_calls(self._calls)
+        self.assertEqual(len([c for c in calls if c.startswith("pr list")]), 1, calls)
+        comment_calls = [c for c in calls if c.startswith("pr comment")]
+        self.assertEqual(len(comment_calls), 1)
+        self.assertTrue(comment_calls[0].startswith("pr comment 7 "), comment_calls[0])
+
+    def test_review_without_an_open_pr_posts_nothing_and_audits_it(self):
+        _init_git_repo_with_github_remote(self._project)
+        _stage_file(self._project, "feature.py", "print('hi')\n")
+        _make_stub_llm_client(self._tmpdir, [_CLEAN_ENVELOPE])
+        _make_fake_gh(self._bin, self._calls, pr_exists=False, closed_pr=True)
+        result = _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in _read_calls(self._calls) if c.startswith("pr comment")], [])
+        conn = sqlite3.connect(os.path.join(self._project, ".clagentic", "lite", "audit.db"))
+        rows = conn.execute("SELECT outcome, details FROM gate_runs WHERE gate='review-publish'").fetchall()
+        conn.close()
+        self.assertTrue(any(o == "block" and "no-open-change-request" in d for o, d in rows), rows)
+
     def test_block_verdict_also_publishes_one_comment(self):
         """Publish runs on a blocking verdict too, not only a passing one."""
         _init_git_repo_with_github_remote(self._project)
         _stage_file(self._project, "feature.py", "print('hi')\n")
         _make_stub_llm_client(self._tmpdir, [_envelope([_finding()])])
-        _make_fake_gh(self._bin, self._calls)
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
         result = _run_review([], self._tmpdir, self._project, path_prepend=self._bin)
         self.assertEqual(result.returncode, 1, result.stderr)
 

@@ -202,9 +202,10 @@ class TestEveryExternalInvocationInHostAdapterShIsBounded(unittest.TestCase):
             if _INVOCATION_RE.search(stripped) and '--help' not in line and '--version' not in line:
                 found += 1
         self.assertGreaterEqual(
-            found, 2,
-            f"expected at least 2 real gh invocation sites in "
-            f"host-adapter.sh (pr view, pr create/comment); found {found}",
+            found, 1,
+            f"expected at least 1 real gh invocation site in "
+            f"host-adapter.sh (the single repo-root-bound helper every call "
+            f"goes through); found {found}",
         )
 
     def test_no_unbound_external_invocation_in_host_adapter_sh(self):
