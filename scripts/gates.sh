@@ -3421,7 +3421,18 @@ _ship_bound_text() {
     printf '%s\n' "$_sbt_text"
     return 0
   fi
-  _sbt_budget=$(( _sbt_max - 80 ))
+  # The notice counts inside MAX. Its length is fixed text plus the digits of
+  # the largest count it could name; when it alone does not fit it is omitted
+  # and the cut text takes the whole budget, so output never exceeds MAX.
+  _sbt_total="${#_sbt_text}"
+  _sbt_notice_len=$(( 31 + ${#_sbt_total} ))
+  _sbt_notice=1
+  if [ "$_sbt_max" -gt "$_sbt_notice_len" ]; then
+    _sbt_budget=$(( _sbt_max - _sbt_notice_len ))
+  else
+    _sbt_budget=$_sbt_max
+    _sbt_notice=0
+  fi
   [ "$_sbt_budget" -gt 0 ] || _sbt_budget=0
   _sbt_used=0
   while IFS= read -r _sbt_line; do
@@ -3430,8 +3441,9 @@ _ship_bound_text() {
       printf '%s\n' "$_sbt_line"
       _sbt_used=$(( _sbt_used + _sbt_cost ))
     else
-      if [ "$_sbt_used" -eq 0 ] && [ "$_sbt_budget" -gt 0 ]; then
-        printf '%s\n' "$(printf '%s' "$_sbt_line" | cut -c1-"$_sbt_budget")"
+      # The cut line carries its own newline, so it gets one char less.
+      if [ "$_sbt_used" -eq 0 ] && [ "$_sbt_budget" -gt 1 ]; then
+        printf '%s\n' "$(printf '%s' "$_sbt_line" | cut -c1-$(( _sbt_budget - 1 )))"
         _sbt_used=$_sbt_budget
       fi
       break
@@ -3439,6 +3451,7 @@ _ship_bound_text() {
   done <<EOF
 $_sbt_text
 EOF
+  [ "$_sbt_notice" -eq 1 ] || return 0
   printf '[truncated, %s chars not shown]\n' "$(( ${#_sbt_text} - _sbt_used ))"
 }
 
@@ -3636,8 +3649,16 @@ _ship_render_commit_list() {
   # names the last commit actually listed, never one beyond a cap, so the
   # commits left unshown are listed by the next re-ship instead of being
   # anchored past.
+  # When the whole range is listed the marker is HEAD itself. The last listed
+  # SHA is only right for a capped list: with a merged side branch the last
+  # --no-merges commit is not HEAD, and anchoring there would make an unchanged
+  # re-ship see "new" commits and alternate markers forever.
   printf '\n'
-  _ship_marker_line "$_srcl_last"
+  if [ "$_srcl_shown" -ge "$_srcl_total" ]; then
+    _ship_marker_line "$_srcl_head"
+  else
+    _ship_marker_line "$_srcl_last"
+  fi
   return 0
 }
 

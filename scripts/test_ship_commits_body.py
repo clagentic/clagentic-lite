@@ -234,7 +234,15 @@ _FAKE_GH = textwrap.dedent('''\
         else:
             wanted = argv[argv.index("--state") + 1] if "--state" in argv else "open"
             numbers = []
-            if st["exists"] and wanted in ("open", "all"):
+            def flag(name):
+                return argv[argv.index(name) + 1] if name in argv else None
+            # The open PR's own head/base (when the test pins them) filter
+            # the lookup the way the real CLI's --head/--base do.
+            matches = all(
+                st.get(key) is None or flag(opt) is None or flag(opt) == st[key]
+                for key, opt in (("open_head", "--head"), ("open_base", "--base"))
+            )
+            if st["exists"] and matches and wanted in ("open", "all"):
                 numbers.append(OPEN_NUMBER)
             if st.get("closed_pr") and wanted in ("closed", "all"):
                 numbers.append(CLOSED_NUMBER)
@@ -806,6 +814,20 @@ class TestShipEndToEnd(unittest.TestCase):
         self.assertIn("branch commit after the merge", comments[0])
         self.assertNotIn("upstream change", comments[0], "upstream commits carried by the merge are not this branch's")
 
+    def test_unchanged_reships_with_a_merged_side_branch_post_nothing(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        _git(["checkout", "-q", "-b", "side/a"], e.repo)
+        _commit(e.repo, "side.txt", "side branch commit A")
+        _git(["checkout", "-q", "feat/example"], e.repo)
+        _commit(e.repo, "f9.txt", "feature commit B")
+        _git(["merge", "-q", "--no-ff", "-m", "merge side/a", "side/a"], e.repo)
+        self.assertEqual(e.ship().returncode, 0)
+        for _ in range(2):
+            r = e.ship()
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(e.state()["comments"], [], "nothing new -> nothing posted")
+
     def test_ship_prints_the_pr_number_when_created_and_when_reused(self):
         e = _Env(self)
         _add_three_commits(e.repo)
@@ -870,7 +892,43 @@ class TestShipEndToEnd(unittest.TestCase):
         self.assertTrue(any(o == "block" and "thread-read-failed" in d for o, d in rows), rows)
 
 
+class TestShipBoundText(unittest.TestCase):
+    def _bound(self, limit, text):
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
+        script = ". '%s'\n_ship_bound_text %d \"$1\"\n" % (GATES_SH, limit)
+        return subprocess.run(["sh", "-c", script, GATES_SH, text], capture_output=True,
+                              text=True, env=env, timeout=60)
+
+    def test_notice_counts_inside_the_limit(self):
+        text = "\n".join("line %03d %s" % (i, "w" * 30) for i in range(40))
+        r = self._bound(300, text)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout, r"\[truncated, \d+ chars not shown\]")
+        self.assertLessEqual(len(r.stdout), 300)
+
+    def test_limit_smaller_than_the_notice_omits_it_and_stays_within_limit(self):
+        text = "\n".join("line %03d %s" % (i, "w" * 30) for i in range(40))
+        for limit in (10, 25, 31):
+            r = self._bound(limit, text)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("truncated", r.stdout)
+            self.assertLessEqual(len(r.stdout), limit, (limit, r.stdout))
+
+
 class TestShipPrLookupStates(unittest.TestCase):
+    def test_same_head_pr_against_another_base_is_not_reused(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        e.set_state(exists=True, open_head="feat/example", open_base="develop")
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        st = e.state()
+        self.assertEqual(len(st["created_bodies"]), 1, e.calls())
+        self.assertEqual(st["comments"], [])
+        lookups = [c for c in e.calls() if c.startswith("pr list")]
+        self.assertTrue(all("--base main" in c for c in lookups), lookups)
+
     def test_closed_pr_for_a_reused_branch_creates_a_new_pr_and_posts_no_comment(self):
         e = _Env(self)
         _add_three_commits(e.repo)

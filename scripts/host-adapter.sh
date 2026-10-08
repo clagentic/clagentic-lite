@@ -349,7 +349,7 @@ _host_adapter_gh_run() {
   )
 }
 
-# _host_adapter_gh_open_pr_number BRANCH -- the ONE place that answers "which
+# _host_adapter_gh_open_pr_number BRANCH [BASE] -- the ONE place that answers "which
 # OPEN PR is there for BRANCH". Prints its number on stdout. Exit 0 = found,
 # 1 = none, 2 = the host could not be asked (auth/network/timeout/
 # unparseable). Bare `gh pr view|comment BRANCH` cannot be used for this or
@@ -358,7 +358,13 @@ _host_adapter_gh_run() {
 # cannot tell "no PR" from a failed call without parsing error text. Every
 # per-PR read/comment therefore addresses the PR by the number found here.
 _host_adapter_gh_open_pr_number() {
-  _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --state open --json number --jq '.[0].number // empty' 2>/dev/null) || return 2
+  # An optional BASE narrows the match: a same-head PR against another base is a
+  # different change request and must not be reused by a ship targeting BASE.
+  if [ -n "${2:-}" ]; then
+    _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --base "$2" --state open --json number --jq '.[0].number // empty' 2>/dev/null) || return 2
+  else
+    _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --state open --json number --jq '.[0].number // empty' 2>/dev/null) || return 2
+  fi
   case "$_hagopn_out" in
     "") return 1 ;;
     *[!0-9]*) return 2 ;;
@@ -383,7 +389,7 @@ _host_adapter_gh_open_change_request() {
   _hagocr_head="$2"
   _hagocr_body_file="${3:-}"
   _hagocr_state=0
-  _hagocr_num=$(_host_adapter_gh_open_pr_number "$_hagocr_head") || _hagocr_state=$?
+  _hagocr_num=$(_host_adapter_gh_open_pr_number "$_hagocr_head" "$_hagocr_base") || _hagocr_state=$?
   case "$_hagocr_state" in
     0)
       echo "[host-adapter/gh] PR #$_hagocr_num already open for $_hagocr_head" 1>&2
