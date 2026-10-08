@@ -243,13 +243,13 @@ host_adapter_open_change_request() {
   esac
 }
 
-# host_adapter_find_open_change_request HEAD BASE -- print the OPEN change
-# request's number for (HEAD, BASE). Tri-state exit: 0 found, 1 none, 2
-# undeterminable (including more than one match).
+# host_adapter_find_open_change_request HEAD [BASE] -- print the OPEN change
+# request's number for HEAD, restricted to BASE when given. Tri-state exit: 0
+# found, 1 none, 2 undeterminable (including more than one match).
 host_adapter_find_open_change_request() {
   _hafocr_head="${1:-}"
   _hafocr_base="${2:-}"
-  [ -n "$_hafocr_head" ] && [ -n "$_hafocr_base" ] || return 2
+  [ -n "$_hafocr_head" ] || return 2
   _host_adapter_detect || return 2
   _host_adapter_repo_root_is_scoped || return 2
   case "$_HOST_ADAPTER" in
@@ -360,11 +360,16 @@ _host_adapter_gh_run() {
 # cannot tell "no PR" from a failed call without parsing error text. Every
 # per-PR read/comment therefore addresses the PR by the number found here.
 _host_adapter_gh_open_pr_number() {
-  # BASE is part of the identity: a same-head PR against another base is a
-  # different change request. More than one match is ambiguous, so it is an
-  # error (2), never a pick of the first.
-  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 2
-  _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --base "$2" --state open --json number --jq '.[].number' 2>/dev/null) || return 2
+  # BASE is optional. With it, a same-head PR against another base is a
+  # different change request (ship's identity). Without it the answer is
+  # head-only (the review publisher's). More than one match is ambiguous, so
+  # it is an error (2), never a pick of the first.
+  [ -n "${1:-}" ] || return 2
+  if [ -n "${2:-}" ]; then
+    _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --base "$2" --state open --json number --jq '.[].number' 2>/dev/null) || return 2
+  else
+    _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --state open --json number --jq '.[].number' 2>/dev/null) || return 2
+  fi
   case "$_hagopn_out" in
     "") return 1 ;;
     *[!0-9]*) return 2 ;;

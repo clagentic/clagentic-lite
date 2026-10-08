@@ -1123,8 +1123,8 @@ class TestShipPrLookupStates(unittest.TestCase):
 
 
 class TestReviewVerdictPublisherLookup(unittest.TestCase):
-    """The publisher finds its PR through the same (head, base) lookup as
-    ship, with the default branch as base."""
+    """The publisher finds its PR through the same lookup helper as ship, but
+    head-only: it passes no base."""
 
     def _publish(self, e):
         head = _git(["rev-parse", "HEAD"], e.repo)
@@ -1154,14 +1154,32 @@ class TestReviewVerdictPublisherLookup(unittest.TestCase):
         self.assertEqual(len(e.state()["comments"]), 1)
         lookups = [c for c in e.calls() if c.startswith("pr list")]
         self.assertEqual(len(lookups), 1, lookups)
-        self.assertIn("--head feat/example --base main --state open", lookups[0])
+        self.assertIn("--head feat/example --state open", lookups[0])
+        self.assertNotIn("--base", lookups[0])
 
-    def test_two_open_prs_for_one_head_against_other_bases_post_nothing(self):
+    def test_pr_with_a_non_default_base_gets_the_review_comment(self):
+        e = self._env_with_audit_db()
+        e.set_state(open_base="develop")
+        r = self._publish(e)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(e.state()["comments"]), 1)
+        self.assertEqual(len([c for c in e.calls() if c.startswith("pr comment 7 ")]), 1, e.calls())
+
+    def test_two_open_prs_for_one_head_post_nothing_and_audit_it(self):
         e = self._env_with_audit_db()
         e.set_state(exists=False, extra_open=[
             {"number": "8", "head": "feat/example", "base": "develop"},
             {"number": "9", "head": "feat/example", "base": "release"},
         ])
+        r = self._publish(e)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([c for c in e.calls() if c.startswith("pr comment")], [])
+        rows = e.audit_rows("review-publish")
+        self.assertTrue(any(o == "block" and "change-request-lookup-failed" in d for o, d in rows), rows)
+
+    def test_no_open_pr_for_the_head_posts_nothing(self):
+        e = self._env_with_audit_db()
+        e.set_state(exists=False)
         r = self._publish(e)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual([c for c in e.calls() if c.startswith("pr comment")], [])
@@ -1229,12 +1247,19 @@ class TestAdapterContractAdditions(unittest.TestCase):
                 r = self._run(e, "host_adapter_find_open_change_request %s %s" % (head, base))
                 self.assertEqual((r.returncode, r.stdout.strip()), want, r.stderr)
 
-    def test_find_open_change_request_needs_a_base_and_errors_on_several_matches(self):
+    def test_find_open_change_request_base_is_optional_and_several_matches_are_an_error(self):
         e = _Env(self)
-        e.set_state(exists=True, extra_open=[{"number": "8", "head": "feat/example", "base": "main"}])
+        e.set_state(exists=True, extra_open=[{"number": "8", "head": "feat/example", "base": "develop"},
+                                             {"number": "9", "head": "other/head", "base": "main"}])
         r = self._run(e, "host_adapter_find_open_change_request feat/example main")
-        self.assertEqual((r.returncode, r.stdout.strip()), (2, ""), "two open PRs for one (head, base) is an error")
-        self.assertEqual(self._run(e, "host_adapter_find_open_change_request feat/example").returncode, 2)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "7"))
+        r = self._run(e, "host_adapter_find_open_change_request feat/example develop")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "8"))
+        r = self._run(e, "host_adapter_find_open_change_request other/head")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "9"), "head-only lookup, no base")
+        r = self._run(e, "host_adapter_find_open_change_request feat/example")
+        self.assertEqual((r.returncode, r.stdout.strip()), (2, ""), "two open PRs for one head is an error")
+        self.assertEqual(self._run(e, "host_adapter_find_open_change_request").returncode, 2)
 
     def test_read_thread_text_prints_body_then_comments(self):
         e = _Env(self)

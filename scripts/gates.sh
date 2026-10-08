@@ -3176,11 +3176,12 @@ _publish_review_verdict() {
   # The final newline of the file is part of the count, hence the -1.
   _ship_bound_text $(( _prv_limit - 1 )) "$_prv_body" > "$_prv_body_file"
 
-  # One lookup of the open PR for (branch, default branch) -- the same helper
-  # ship uses -- then every call addresses it by number: a bare branch name
-  # can match a closed or merged PR on the same branch.
+  # One head-only lookup (no base: a PR targeting a non-default base keeps its
+  # review comment) -- the same helper ship uses -- then every call addresses
+  # the PR by number: a bare branch name can match a closed or merged PR.
+  # Zero or several open PRs for the head post nothing.
   _prv_find_rc=0
-  _prv_pr=$(host_adapter_find_open_change_request "$_prv_branch" "${CLAGENTIC_DEFAULT_BRANCH:-main}") || _prv_find_rc=$?
+  _prv_pr=$(host_adapter_find_open_change_request "$_prv_branch") || _prv_find_rc=$?
   if [ "$_prv_find_rc" -ne 0 ]; then
     echo "[gates/review] publish to host adapter failed — local ledger verdict stands, gate outcome unaffected" 1>&2
     if [ "$_prv_find_rc" -eq 1 ]; then
