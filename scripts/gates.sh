@@ -3167,14 +3167,24 @@ _publish_review_verdict() {
   _prv_body_file=$(mktemp -t clagentic-review-verdict-comment.XXXXXX)
   _prv_limit=$(_ship_artifact_limit) || _prv_limit=""
   _prv_body=$(_build_review_verdict_comment_body "$_prv_verdict" "$_prv_head" "$_prv_findings" 2>/dev/null) || _prv_body=""
-  if [ -z "$_prv_body" ] || [ -z "$_prv_limit" ]; then
+  if [ -z "$_prv_limit" ]; then
+    rm -f "$_prv_body_file"
+    ds_audit_log "review-publish" "block" "${_prv_tag} reason=artifact-limit-unknown"
+    return 0
+  fi
+  if [ -z "$_prv_body" ]; then
     rm -f "$_prv_body_file"
     ds_audit_log "review-publish" "block" "${_prv_tag} reason=body-render-failed"
     return 0
   fi
   # The comment is bounded like every other artifact handed to the adapter.
-  # The final newline of the file is part of the count, hence the -1.
-  _ship_bound_text $(( _prv_limit - 1 )) "$_prv_body" > "$_prv_body_file"
+  # The final newline of the file is part of the count, hence the -1. A failed
+  # write could leave a partial file, which must never be posted.
+  if ! _ship_bound_text $(( _prv_limit - 1 )) "$_prv_body" > "$_prv_body_file"; then
+    rm -f "$_prv_body_file"
+    ds_audit_log "review-publish" "block" "${_prv_tag} reason=body-write-failed"
+    return 0
+  fi
 
   # One head-only lookup (no base: a PR targeting a non-default base keeps its
   # review comment) -- the same helper ship uses -- then every call addresses
@@ -3497,6 +3507,10 @@ _ship_format_commit_entry() {
   _sfce_max="$2"
   _sfce_subject=$(_git log -1 --format=%s "$_sfce_sha" 2>/dev/null) || return 1
   _sfce_body=$(_git log -1 --format=%b "$_sfce_sha" 2>/dev/null) || return 1
+  # The subject sits in the list item as live Markdown, outside the body's
+  # fence: an unclosed "<!--" would hide every later commit. A backslash-escaped
+  # "<" is literal text, so no subject can open a tag or a comment.
+  _sfce_subject=$(printf '%s' "$_sfce_subject" | sed 's/</\\</g') || return 1
   _sfce_short=$(printf '%s' "$_sfce_sha" | cut -c1-7)
   _sfce_nl='
 '
@@ -3905,7 +3919,15 @@ except Exception:
 # commits the thread does not show.
 _ship_pr_body_assemble() {
   printf '## What changed and why\n\n'
-  _ship_render_commits_section "$_SPB_HEAD" "$1" || true
+  # Status 3 is the section's own "placeholder printed" answer. Any other
+  # status, or no text at all, is a renderer failure: say so with a fixed
+  # reason rather than leave the heading bare.
+  _spba_rc=0
+  _spba_section=$(_ship_render_commits_section "$_SPB_HEAD" "$1") || _spba_rc=$?
+  if { [ "$_spba_rc" -ne 0 ] && [ "$_spba_rc" -ne 3 ]; } || [ -z "$_spba_section" ]; then
+    _spba_section="_Commit list unavailable: the commit list could not be rendered. Fill in by hand before merging._"
+  fi
+  printf '%s\n' "$_spba_section"
   printf '\n'
   printf '%s\n' "$_SPB_TAIL"
 }
@@ -9303,7 +9325,7 @@ cmd_ship() {
         echo "[gates/ship] PR #${_SHIP_PR_NUM} already open"
         _publish_ship_delta_comment "$BRANCH" "$_SHIP_HEAD_SHA" "$_SHIP_PR_NUM" ;;
       *)
-        echo "[gates/ship] host-adapter open-change-request failed or timed out after ${_SHIP_TIMEOUT}s — no PR created or commented on by this ship; open the PR manually (push result stands)" 1>&2
+        echo "[gates/ship] host-adapter open-change-request did not complete (it failed, timed out after ${_SHIP_TIMEOUT}s, or created a PR whose number could not be read) — nothing was commented on; check the host before opening a PR by hand (push result stands)" 1>&2
         ds_audit_log "ship-delta-publish" "block" "branch=${BRANCH:-<none>} head=${_SHIP_HEAD_SHA:-<unresolved>} reason=open-change-request-failed"
         ;;
     esac

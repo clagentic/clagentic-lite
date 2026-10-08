@@ -305,7 +305,11 @@ host_adapter_read_thread_text() {
 # adapter is detected so an artifact is still rendered within a limit every
 # shipped host honors; it lives here, not in gate logic, so the number has one
 # owner.
-_HOST_ADAPTER_DEFAULT_ARTIFACT_LIMIT=65536
+#
+# GitHub rejects a pull-request body or a comment over 65536 characters, and is
+# the only adapter shipped, so its limit is the default.
+_HOST_ADAPTER_GH_ARTIFACT_LIMIT=65536
+_HOST_ADAPTER_DEFAULT_ARTIFACT_LIMIT=$_HOST_ADAPTER_GH_ARTIFACT_LIMIT
 
 # host_adapter_artifact_limit -- print the host's hard character limit for one
 # change-request body or one comment.
@@ -377,9 +381,8 @@ _host_adapter_gh_open_pr_number() {
   esac
 }
 
-# GitHub rejects a pull-request body or a comment over 65536 characters.
 _host_adapter_gh_artifact_limit() {
-  printf '%s\n' 65536
+  printf '%s\n' "$_HOST_ADAPTER_GH_ARTIFACT_LIMIT"
 }
 
 # Prints `created <num>` / `reused <num>` on stdout and nothing else there:

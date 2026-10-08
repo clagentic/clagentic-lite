@@ -340,9 +340,10 @@ class TestBuildShipPrBodyCarriesCommits(unittest.TestCase):
             pos = section.index(subject)
             self.assertGreater(pos, last, "commits must be listed oldest first")
             last = pos
-            for line in body:
-                if line:
-                    self.assertIn(line, section)
+            # The whole body, blank lines included, so a lost paragraph
+            # boundary fails.
+            whole = "\n".join(("  " + l) if l else "" for l in body)
+            self.assertIn(whole + "\n", section)
 
     def test_false_summarizer_claim_is_gone(self):
         e = _Env(self)
@@ -499,6 +500,55 @@ class TestCommitBodyCannotBecomeMarkdownStructure(unittest.TestCase):
         self.assertEqual([l for l in lines[:open_i] if l.startswith("#")], [])
         self.assertIn("innocent follow-up", section)
         self.assertIn(NEXT_HEADING, r.stdout)
+
+
+class TestSubjectCannotHideLaterCommits(unittest.TestCase):
+    def test_html_comment_and_heading_markup_in_a_subject_is_escaped(self):
+        e = _Env(self)
+        _commit(e.repo, "a.txt", "open <!-- never closed")
+        _commit(e.repo, "b.txt", "# heading <b>bold")
+        _commit(e.repo, "c.txt", "later commit stays visible")
+        r = _call_build_ship_pr_body(e.repo, _git(["rev-parse", "HEAD"], e.repo))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        section = _section_one(r.stdout)
+        listed = section[:section.index("<!-- clagentic-lite:shipped-head")]
+        self.assertNotRegex(listed, r"(?<!\\)<")
+        self.assertIn("open \\<!-- never closed", section)
+        self.assertIn("- # heading \\<b>bold (", section)
+        self.assertIn("later commit stays visible", section)
+        self.assertEqual(MARKER_RE.findall(r.stdout), [_git(["rev-parse", "HEAD"], e.repo)])
+
+
+class TestRendererFailureNeverLeavesABareHeading(unittest.TestCase):
+    def _body_with_section_stub(self, e, stub):
+        env = os.environ.copy()
+        env.update(source_env(gates=True))
+        env["CLAGENTIC_PROJECT_ROOT"] = e.repo
+        head = _git(["rev-parse", "HEAD"], e.repo)
+        script = ". '%s'\n%s\n_build_ship_pr_body 'feat/example' '%s'\n" % (GATES_SH, stub, head)
+        return subprocess.run(["sh", "-c", script, GATES_SH], capture_output=True, text=True,
+                              env=env, cwd=e.repo, timeout=60)
+
+    def test_failing_section_renderer_yields_the_placeholder(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        r = self._body_with_section_stub(e, "_ship_render_commits_section() { return 1; }")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        section = _section_one(r.stdout)
+        self.assertIn("Commit list unavailable: the commit list could not be rendered", section)
+        self.assertEqual(MARKER_RE.findall(r.stdout), [])
+
+    def test_silent_section_renderer_yields_the_placeholder(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        r = self._body_with_section_stub(e, "_ship_render_commits_section() { return 0; }")
+        self.assertIn("Commit list unavailable", _section_one(r.stdout))
+
+    def test_failing_enumeration_is_never_blank(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        r = self._body_with_section_stub(e, "_git() { return 1; }")
+        self.assertTrue(_section_one(r.stdout).strip(), "section must never be blank")
 
 
 class TestBaseResolverStderrIsNotPartOfTheRef(unittest.TestCase):
@@ -1013,8 +1063,8 @@ class TestShipPrLookupStates(unittest.TestCase):
         e = _Env(self)
         _add_three_commits(e.repo)
         self.assertEqual(e.ship().returncode, 0)
-        # A stale CLOSED PR on the same branch, carrying a decoy marker that
-        # would mislead a wrong-PR read into listing the full range.
+        # A stale CLOSED PR on the same branch whose thread carries no marker:
+        # a wrong-PR read would find none and list the full range.
         e.set_state(closed_pr=True, closed_body="old PR, no marker", closed_comments=[], calls=[])
         _commit(e.repo, "f9.txt", "fix off-by-one in parser", ["Found while reviewing."])
         r = e.ship()
