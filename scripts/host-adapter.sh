@@ -324,6 +324,22 @@ host_adapter_artifact_limit() {
 
 _HOST_ADAPTER_SHIP_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SHIP_TIMEOUT_SEC "${CLAGENTIC_SHIP_TIMEOUT_SEC:-}" 120)
 
+# _host_adapter_gh_run ARGS... -- the ONLY place `gh` is invoked. gh infers the
+# repository it acts on from the process's working directory, so a bare call
+# from a shell sitting in some other git repo would query or mutate THAT repo
+# even though the INV-6 scope check passed for REPO_ROOT. Running it from
+# REPO_ROOT (in a subshell, leaving the caller's cwd alone) binds every call to
+# the repository the scope check approved. Fails closed when REPO_ROOT cannot be
+# entered. Path arguments (a body file) must be absolute for the same reason.
+# scripts/test_host_adapter_publish.py's sweep fails on any other `gh` call.
+_host_adapter_gh_run() {
+  [ -n "${REPO_ROOT:-}" ] || return 1
+  (
+    cd "$REPO_ROOT" 2>/dev/null || exit 1
+    run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh "$@"
+  )
+}
+
 # _host_adapter_gh_open_pr_number BRANCH -- the ONE place that answers "which
 # OPEN PR is there for BRANCH". Prints its number on stdout. Exit 0 = found,
 # 1 = none, 2 = the host could not be asked (auth/network/timeout/
@@ -333,7 +349,7 @@ _HOST_ADAPTER_SHIP_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SHIP_TIMEOUT_SEC 
 # cannot tell "no PR" from a failed call without parsing error text. Every
 # per-PR read/comment therefore addresses the PR by the number found here.
 _host_adapter_gh_open_pr_number() {
-  _hagopn_out=$(run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr list --head "$1" --state open --json number --jq '.[0].number // empty' 2>/dev/null) || return 2
+  _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --state open --json number --jq '.[0].number // empty' 2>/dev/null) || return 2
   case "$_hagopn_out" in
     "") return 1 ;;
     *[!0-9]*) return 2 ;;
@@ -378,9 +394,9 @@ _host_adapter_gh_open_change_request() {
   # own commit-derived title; only the body is replaced.
   _hagocr_rc=0
   if [ -n "$_hagocr_body_file" ] && [ -f "$_hagocr_body_file" ]; then
-    _hagocr_out=$(run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr create --fill-first --base "$_hagocr_base" --head "$_hagocr_head" --body-file "$_hagocr_body_file") || _hagocr_rc=$?
+    _hagocr_out=$(_host_adapter_gh_run pr create --fill-first--base "$_hagocr_base" --head "$_hagocr_head" --body-file "$_hagocr_body_file") || _hagocr_rc=$?
   else
-    _hagocr_out=$(run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr create --fill --base "$_hagocr_base" --head "$_hagocr_head") || _hagocr_rc=$?
+    _hagocr_out=$(_host_adapter_gh_run pr create --fill --base "$_hagocr_base" --head "$_hagocr_head") || _hagocr_rc=$?
   fi
   [ -z "$_hagocr_out" ] || printf '%s\n' "$_hagocr_out" 1>&2
   [ "$_hagocr_rc" -eq 0 ] || return "$_hagocr_rc"
@@ -398,11 +414,11 @@ _host_adapter_gh_open_change_request() {
 
 _host_adapter_gh_post_comment() {
   [ -f "$2" ] || return 1
-  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr comment "$1" --body-file "$2"
+  _host_adapter_gh_run pr comment "$1" --body-file "$2"
 }
 
 _host_adapter_gh_read_comments() {
-  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$1" --json comments --jq '.comments[] | {body: .body}'
+  _host_adapter_gh_run pr view "$1" --json comments --jq '.comments[] | {body: .body}'
 }
 
 # Body first, then comments in the order the host returns them
@@ -410,5 +426,5 @@ _host_adapter_gh_read_comments() {
 # function passes straight through -- the caller treats that as "read
 # failed", never as "no content".
 _host_adapter_gh_read_thread_text() {
-  run_bounded "$_HOST_ADAPTER_SHIP_TIMEOUT" -- gh pr view "$1" --json body,comments --jq '.body, (.comments[].body)'
+  _host_adapter_gh_run pr view "$1" --json body,comments --jq '.body, (.comments[].body)'
 }

@@ -46,6 +46,7 @@ Run with: python3 -m unittest scripts.test_host_adapter_publish -v
 """
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -227,7 +228,7 @@ def _setup_fake_tool_home(fake_tool_home):
         os.symlink(real_share, fake_share)
 
 
-def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False, closed_pr=False):
+def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False, closed_pr=False, cwd_file=None):
     """A fake `gh` executable that intercepts exactly the subcommands
     scripts/host-adapter.sh's gh adapter uses: `pr view`, `pr create`,
     `pr comment`, `pr view --json comments --jq`. Records every invocation
@@ -257,10 +258,14 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False, closed_pr=Fal
         mode = {mode!r}
         pr_exists = {pr_exists!r}
         closed_pr = {closed_pr!r}
+        cwd_file = {cwd_file!r}
 
         argv = sys.argv[1:]
         with open(calls_file, "a") as f:
             f.write(" ".join(argv) + "\\n")
+        if cwd_file:
+            with open(cwd_file, "a") as f:
+                f.write(os.path.realpath(os.getcwd()) + "\\n")
 
         if argv[:2] == ["pr", "view"] and "--json" in argv:
             print(json.dumps({{"comments": []}}))
@@ -581,6 +586,78 @@ class TestHostAdapterContractDirect(unittest.TestCase):
                                          env_overrides={"REPO_ROOT": self._repo}, path_prepend=self._bin)
                 self.assertNotEqual(r.returncode, 0)
         self.assertEqual(_read_calls(self._calls), [], "no host call may be made for a non-number target")
+
+    def test_every_gh_call_runs_against_repo_root_not_the_process_cwd(self):
+        """gh infers its repository from the working directory. With the shell
+        sitting in an unrelated repo B (own remote) and REPO_ROOT naming A,
+        every gh call the adapter makes must run from A."""
+        other = os.path.join(self._tmpdir, "other-repo")
+        _init_git_repo_with_github_remote(other)
+        _git(["remote", "set-url", "origin", "https://github.com/other/other.git"], cwd=other)
+        cwd_log = os.path.join(self._tmpdir, "gh-cwds.txt")
+        body_file = os.path.join(self._tmpdir, "body.txt")
+        with open(body_file, "w") as f:
+            f.write("hello\n")
+        wanted = os.path.realpath(self._repo)
+        cases = (
+            ("host_adapter_find_open_change_request feat/example", True),
+            ("host_adapter_open_change_request main feat/example '%s'" % body_file, False),
+            ("host_adapter_open_change_request main feat/example", False),
+            ("host_adapter_post_comment 7 '%s'" % body_file, True),
+            ("host_adapter_read_comments 7", True),
+            ("host_adapter_read_thread_text 7", True),
+        )
+        for call, pr_exists in cases:
+            with self.subTest(call=call):
+                if os.path.exists(cwd_log):
+                    os.remove(cwd_log)
+                _make_fake_gh(self._bin, self._calls, pr_exists=pr_exists, cwd_file=cwd_log)
+                r = _run_review_merge_fn(
+                    "cd '%s' && %s" % (other, call),
+                    env_overrides={"REPO_ROOT": self._repo},
+                    path_prepend=self._bin,
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+                with open(cwd_log) as f:
+                    cwds = [l for l in f.read().split("\n") if l]
+                self.assertTrue(cwds, "the call must reach gh")
+                self.assertEqual(set(cwds), {wanted}, "gh ran outside REPO_ROOT: %r" % cwds)
+
+    def test_gh_is_invoked_only_through_the_repo_root_helper(self):
+        """Class sweep: the one `gh` invocation in host-adapter.sh lives inside
+        _host_adapter_gh_run; every call site goes through that helper, so none
+        can fall back to the process cwd."""
+        with open(HOST_ADAPTER_SH, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        invocation = re.compile(r"(?:^|[\s;&|(`])gh(?=\s)")
+        hits = []
+        in_helper = False
+        for n, raw in enumerate(lines, 1):
+            s = raw.strip()
+            if s.startswith("#"):
+                continue
+            if s.startswith("_host_adapter_gh_run()"):
+                in_helper = True
+            elif in_helper and s == "}":
+                in_helper = False
+                continue
+            scrubbed = s.replace("command -v gh", "")
+            scrubbed = re.sub(r'"[^"]*\[host-adapter/gh\][^"]*"', "", scrubbed)
+            if invocation.search(scrubbed) and not in_helper:
+                hits.append((n, raw))
+        self.assertEqual(hits, [], "gh invoked outside _host_adapter_gh_run: %r" % hits)
+        # Non-vacuity: the helper itself is found and does invoke gh.
+        helper = [l for l in lines if invocation.search(l) and "run_bounded" in l]
+        self.assertEqual(len(helper), 1, helper)
+
+    def test_gh_helper_fails_closed_when_repo_root_is_unusable(self):
+        _make_fake_gh(self._bin, self._calls, pr_exists=True)
+        for root in ("", os.path.join(self._tmpdir, "missing")):
+            with self.subTest(root=root):
+                r = _run_review_merge_fn("_host_adapter_gh_run pr list",
+                                         env_overrides={"REPO_ROOT": root}, path_prepend=self._bin)
+                self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(_read_calls(self._calls), [])
 
     def test_artifact_limit_is_owned_by_the_adapter(self):
         _make_fake_gh(self._bin, self._calls)
