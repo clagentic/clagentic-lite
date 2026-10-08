@@ -78,6 +78,7 @@ These apply to all code you produce, regardless of language or repo. They are no
 - **Prefer functions and modules over inline logic.** If a block of logic will be called more than once — even hypothetically — extract it. Name it clearly.
 - **Prefer interfaces over implementations.** Accept inputs; return outputs. Avoid reaching into global state or hardcoding paths that callers could supply.
 - **Expose behavior, hide mechanism.** A caller should not need to know how a function works internally — only what it accepts and what it returns.
+- **Prefer existing files and tools over new code.** Edit an existing file, use a tool already installed on the host, or call one of the repo's own scripts before writing something new. Before adding a new script over 100 lines, name in the PR body the existing tool you considered and why it does not fit. Never add a dependency to avoid writing a few lines without asking first.
 
 ### No god files
 - A file that does more than one thing is two files. Split along natural seams: data vs. logic, config vs. behavior, IO vs. computation.
