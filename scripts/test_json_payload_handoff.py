@@ -125,11 +125,14 @@ class TestShipBodyReviewSection(_Base):
         self.assertNotIn("no recorded review verdict", res.stdout)
         self.assertNotIn("Findings: none", res.stdout)
 
-    def test_unparseable_entry_says_the_record_could_not_be_read(self):
+    def test_unparseable_ledger_line_is_reported_as_no_readable_verdict(self):
+        """A ledger line that is not JSON yields no entry at all, so the body
+        takes the no-readable-verdict path, not the unreadable-findings one."""
         res = self._body('{"head_sha":"HEADSHA","verdict":"pass","findings":[{"severity"')
         self.assertIn("reviewer: none -- no readable review verdict recorded for this branch.",
                       res.stdout, res.stderr[-500:])
         self.assertNotIn("Findings: none", res.stdout)
+        self.assertNotIn("could not be read", res.stdout)
 
     def test_readable_empty_findings_are_reported_as_none(self):
         ok = ('{"ts":"t","branch":"main","gate":"review","base_sha":"b",'

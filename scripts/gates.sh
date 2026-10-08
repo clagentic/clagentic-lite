@@ -3488,16 +3488,16 @@ _ship_emit_within_limit() {
 # when there is no point starting a list at all.
 _SHIP_ENTRY_MIN_CHARS=300
 
-# _ship_format_commit_entry SHA MAX_CHARS — one commit: subject line, then the
-# full body inside a fenced code block nested under the list item. A fence is
-# the only construct whose content cannot become markdown structure (indent
-# alone does not: CommonMark allows 0-3 leading spaces on an ATX heading), so
-# the fence is made longer than any backtick run in the body, which also means
-# the body cannot close it early.
+# _ship_format_commit_entry SHA MAX_CHARS — one commit: a short-SHA bullet, then
+# the full message (subject first, then body) inside one fenced code block
+# nested under the list item. A fence is the only construct whose content
+# cannot become markdown structure (indent alone does not: CommonMark allows
+# 0-3 leading spaces on an ATX heading), so the fence is made longer than any
+# backtick run in the message, which also means it cannot close the fence early.
 #
-# The whole entry (bullet, subject, fences, body, notice) is at most MAX_CHARS.
-# When the commit message does not fit, the subject is clipped and the body is
-# cut by whole lines (a single over-long line is clipped), and an explicit
+# The whole entry (bullet, fences, message, notice) is at most MAX_CHARS.
+# When the commit message does not fit, it is cut by whole lines (a single
+# over-long line is clipped), and an explicit
 # "[commit message truncated, N chars not shown]" notice follows the closing
 # fence so it renders as prose. Exit 0 when the message is shown whole, 10 when
 # anything was cut (the caller decides whether a cut entry may be listed),
@@ -3507,10 +3507,15 @@ _ship_format_commit_entry() {
   _sfce_max="$2"
   _sfce_subject=$(_git log -1 --format=%s "$_sfce_sha" 2>/dev/null) || return 1
   _sfce_body=$(_git log -1 --format=%b "$_sfce_sha" 2>/dev/null) || return 1
-  # The subject sits in the list item as live Markdown, outside the body's
-  # fence: an unclosed "<!--" would hide every later commit. A backslash-escaped
-  # "<" is literal text, so no subject can open a tag or a comment.
-  _sfce_subject=$(printf '%s' "$_sfce_subject" | sed 's/</\\</g') || return 1
+  # Subject and body share one fenced block (subject as its first line): the
+  # subject is untrusted text too, and inside a fence nothing in it, such as an
+  # unclosed "<!--", can become markup, so no escaping code is needed.
+  if [ -n "$_sfce_body" ]; then
+    _sfce_body="${_sfce_subject}
+${_sfce_body}"
+  else
+    _sfce_body="$_sfce_subject"
+  fi
   _sfce_short=$(printf '%s' "$_sfce_sha" | cut -c1-7)
   _sfce_nl='
 '
@@ -3521,28 +3526,20 @@ _ship_format_commit_entry() {
       *) break ;;
     esac
   done
-  # Fixed framing: bullet line (15 + subject), two fence lines, slack.
+  # Fixed framing: bullet line, two fence lines, slack.
   _sfce_overhead=$(( 20 + 2 * (${#_sfce_fence} + 3) ))
   _sfce_nlines=0
   [ -z "$_sfce_body" ] || _sfce_nlines=$(printf '%s\n' "$_sfce_body" | wc -l | tr -d ' ')
   _sfce_body_cost=$(( ${#_sfce_body} + 3 * _sfce_nlines + 1 ))
-  _sfce_subject_shown="$_sfce_subject"
-  if [ $(( ${#_sfce_subject} + _sfce_body_cost + _sfce_overhead )) -le "$_sfce_max" ]; then
+  if [ $(( _sfce_body_cost + _sfce_overhead )) -le "$_sfce_max" ]; then
     _sfce_budget=$_sfce_body_cost
   else
-    # Truncating: reserve the notice (at most ~55 chars) and split what is
-    # left between subject and body. A subject gets at most half so a giant
-    # subject cannot starve the body; with no body it gets it all.
+    # Truncating: reserve the notice (at most ~55 chars) from what is left.
     _sfce_avail=$(( _sfce_max - _sfce_overhead - 72 ))
     [ "$_sfce_avail" -ge 2 ] || _sfce_avail=2
-    _sfce_subject_cap=$(( _sfce_avail / 2 ))
-    [ -n "$_sfce_body" ] || _sfce_subject_cap=$_sfce_avail
-    if [ "${#_sfce_subject}" -gt "$_sfce_subject_cap" ]; then
-      _sfce_subject_shown=$(printf '%s' "$_sfce_subject" | cut -c1-"$_sfce_subject_cap")
-    fi
-    _sfce_budget=$(( _sfce_avail - ${#_sfce_subject_shown} ))
+    _sfce_budget=$_sfce_avail
   fi
-  _sfce_omitted=$(( ${#_sfce_subject} - ${#_sfce_subject_shown} ))
+  _sfce_omitted=0
   _sfce_acc=""
   _sfce_used=0
   _sfce_cut=0
@@ -3572,7 +3569,7 @@ _ship_format_commit_entry() {
 $_sfce_body
 EOF
   fi
-  printf '%s %s (`%s`)\n' '-' "$_sfce_subject_shown" "$_sfce_short"
+  printf '%s `%s`\n' '-' "$_sfce_short"
   if [ -n "$_sfce_acc" ]; then
     printf '  %s\n' "$_sfce_fence"
     printf '%s' "$_sfce_acc"
@@ -3897,8 +3894,18 @@ except Exception:
   # list by the budget _ship_emit_within_limit derives from what is left.
   _bspb_limit=$(_ship_artifact_limit) || return 1
   _bspb_section_cap=$(( _bspb_limit / 8 ))
-  _bspb_review_section=$(_ship_bound_text "$_bspb_section_cap" "$_bspb_review_section")
-  _bspb_manifest_section=$(_ship_bound_text "$_bspb_section_cap" "$_bspb_manifest_section")
+  # A bounding failure degrades to the section's fixed placeholder, never a
+  # bare heading.
+  _bspb_bounded=$(_ship_bound_text "$_bspb_section_cap" "$_bspb_review_section") || _bspb_bounded=""
+  if [ -z "$_bspb_bounded" ]; then
+    _bspb_bounded="reviewer: review section could not be rendered. Run \`clagentic-lite gates review\` and fill in by hand before merging."
+  fi
+  _bspb_review_section="$_bspb_bounded"
+  _bspb_bounded=$(_ship_bound_text "$_bspb_section_cap" "$_bspb_manifest_section") || _bspb_bounded=""
+  if [ -z "$_bspb_bounded" ]; then
+    _bspb_bounded="gate attestation could not be rendered. A missing attestation is never inferred as a clean run."
+  fi
+  _bspb_manifest_section="$_bspb_bounded"
 
   _SPB_HEAD="$_bspb_head"
   _SPB_TAIL=$(

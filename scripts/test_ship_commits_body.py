@@ -503,19 +503,32 @@ class TestCommitBodyCannotBecomeMarkdownStructure(unittest.TestCase):
 
 
 class TestSubjectCannotHideLaterCommits(unittest.TestCase):
-    def test_html_comment_and_heading_markup_in_a_subject_is_escaped(self):
+    SUBJECTS = ["open <!-- never closed", "\\<!-- already backslashed", "## X heading",
+                "tick ` and ``` runs", "later commit stays visible"]
+
+    def test_subject_markup_is_confined_to_the_commit_fence(self):
         e = _Env(self)
-        _commit(e.repo, "a.txt", "open <!-- never closed")
-        _commit(e.repo, "b.txt", "# heading <b>bold")
-        _commit(e.repo, "c.txt", "later commit stays visible")
+        for i, subject in enumerate(self.SUBJECTS):
+            _commit(e.repo, "s%d.txt" % i, subject, ["body of %d" % i])
         r = _call_build_ship_pr_body(e.repo, _git(["rev-parse", "HEAD"], e.repo))
         self.assertEqual(r.returncode, 0, r.stderr)
         section = _section_one(r.stdout)
-        listed = section[:section.index("<!-- clagentic-lite:shipped-head")]
-        self.assertNotRegex(listed, r"(?<!\\)<")
-        self.assertIn("open \\<!-- never closed", section)
-        self.assertIn("- # heading \\<b>bold (", section)
-        self.assertIn("later commit stays visible", section)
+        lines = section.split("\n")
+        fence_re = re.compile(r"^ {2}(`{3,})$")
+        in_fence, opener, seen = False, "", []
+        for line in lines:
+            m = fence_re.match(line)
+            if not in_fence and m:
+                in_fence, opener = True, m.group(1)
+            elif in_fence and m and len(m.group(1)) >= len(opener):
+                in_fence = False
+            elif in_fence:
+                seen.append(line)
+            elif line.strip():
+                self.assertRegex(line, r"^- `[0-9a-f]{7}`$|^\s*<!-- clagentic-lite:shipped-head=", line)
+        for subject in self.SUBJECTS:
+            self.assertIn("  " + subject, seen)
+        self.assertFalse(in_fence, "every fence is closed")
         self.assertEqual(MARKER_RE.findall(r.stdout), [_git(["rev-parse", "HEAD"], e.repo)])
 
 
@@ -543,6 +556,17 @@ class TestRendererFailureNeverLeavesABareHeading(unittest.TestCase):
         _add_three_commits(e.repo)
         r = self._body_with_section_stub(e, "_ship_render_commits_section() { return 0; }")
         self.assertIn("Commit list unavailable", _section_one(r.stdout))
+
+    def test_failing_bounder_yields_fixed_placeholders_not_bare_headings(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        r = self._body_with_section_stub(e, "_ship_bound_text() { return 1; }")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        body = r.stdout
+        review = body[body.index("## Review provenance"):body.index("## Gate attestation")]
+        attest = body[body.index("## Gate attestation"):body.index("## Trade-offs")]
+        self.assertIn("review section could not be rendered", review)
+        self.assertIn("gate attestation could not be rendered", attest)
 
     def test_failing_enumeration_is_never_blank(self):
         e = _Env(self)
@@ -603,34 +627,13 @@ class TestPublicReasonIsFixedString(unittest.TestCase):
         self.assertIn("secretuser", r.stderr, "raw detail stays on the local stderr")
 
 
-class TestCappedListSaysHowManyAreNotShown(unittest.TestCase):
-    CAP = {"CLAGENTIC_SHIP_COMMITS_MAX_CHARS": "1500"}
-
-    def _listed(self, text):
-        return [int(n) for n in re.findall(r"^- commit number (\d+) \(", text, re.M)]
-
-    def test_capped_body_names_the_exact_count_not_shown_and_marks_head(self):
-        e = _Env(self)
-        shas = [_commit(e.repo, "f%d.txt" % i, "commit number %d" % i, ["x" * 300]) for i in range(10)]
-        r = _call_build_ship_pr_body(e.repo, shas[-1], self.CAP)
-        listed = self._listed(r.stdout)
-        self.assertTrue(0 < len(listed) < 10)
-        self.assertIn("_%d more commits not shown -- see this PR's Commits tab._" % (10 - len(listed)), r.stdout)
-        self.assertEqual(MARKER_RE.findall(r.stdout), [shas[-1]], "the marker is always HEAD")
-
-    def test_uncapped_body_has_no_not_shown_line(self):
-        e = _Env(self)
-        _add_three_commits(e.repo)
-        r = _call_build_ship_pr_body(e.repo, _git(["rev-parse", "HEAD"], e.repo))
-        self.assertNotIn("not shown", r.stdout)
-
-
 HOST_LIMIT = 65536
 TRUNC_NOTE_RE = re.compile(r"\[commit message truncated, (\d+) chars not shown\]")
+LISTED_SUBJECT_RE = r"^  commit number \d+$"
 
 
 class TestTruncation(unittest.TestCase):
-    def test_oversize_range_is_bounded_with_explicit_count(self):
+    def test_oversize_range_is_bounded_with_explicit_count_and_marks_head(self):
         e = _Env(self)
         for i in range(10):
             _commit(e.repo, "f%d.txt" % i, "commit number %d" % i, ["x" * 300])
@@ -638,13 +641,20 @@ class TestTruncation(unittest.TestCase):
         r = _call_build_ship_pr_body(e.repo, head, {"CLAGENTIC_SHIP_COMMITS_MAX_CHARS": "1500"})
         self.assertEqual(r.returncode, 0, r.stderr)
         section = _section_one(r.stdout)
-        shown = len(re.findall(r"^- commit number \d+ \(", section, re.M))
-        m = re.search(r"_(\d+) more commits not shown", section)
+        shown = len(re.findall(LISTED_SUBJECT_RE, section, re.M))
+        m = re.search(r"_(\d+) more commits not shown -- see this PR's Commits tab\._", section)
         self.assertIsNotNone(m, "truncation must be explicit, never silent")
-        self.assertGreater(shown, 0)
+        self.assertTrue(0 < shown < 10)
         self.assertEqual(shown + int(m.group(1)), 10)
         self.assertLessEqual(len(section.strip()), 1500, "the configured cap bounds the whole list block")
-        self.assertIn("commit number 0 (", section, "oldest commits are the ones kept")
+        self.assertIn("  commit number 0\n", section, "oldest commits are the ones kept")
+        self.assertEqual(MARKER_RE.findall(r.stdout), [head], "the marker is always HEAD")
+
+    def test_uncapped_body_has_no_not_shown_line(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        r = _call_build_ship_pr_body(e.repo, _git(["rev-parse", "HEAD"], e.repo))
+        self.assertNotIn("not shown", r.stdout)
 
     def test_single_oversize_commit_message_is_cut_with_explicit_count(self):
         e = _Env(self)
@@ -685,7 +695,7 @@ class TestWholeArtifactWithinHostLimit(unittest.TestCase):
         m = TRUNC_NOTE_RE.search(body)
         self.assertIsNotNone(m, "a cut message must say so")
         self.assertGreater(int(m.group(1)), 0)
-        self.assertIn("- giant (", body)
+        self.assertIn("  giant\n", body)
         self.assertEqual(MARKER_RE.findall(body), [head], "a truncated entry counts as listed")
 
     def test_giant_single_line_body(self):
@@ -700,7 +710,7 @@ class TestWholeArtifactWithinHostLimit(unittest.TestCase):
         _empty_commit(e.repo, "S" * 100000, ["a short body"])
         head, body = self._body(e)
         self.assertRegex(body, TRUNC_NOTE_RE)
-        self.assertIn("- SSSS", body)
+        self.assertIn("  SSSS", body)
         self.assertEqual(MARKER_RE.findall(body), [head])
 
     def test_many_commits(self):
@@ -708,7 +718,7 @@ class TestWholeArtifactWithinHostLimit(unittest.TestCase):
         for i in range(300):
             _empty_commit(e.repo, "commit number %d" % i, ["w" * 300])
         head, body = self._body(e)
-        shown = len(re.findall(r"^- commit number \d+ \(", body, re.M))
+        shown = len(re.findall(LISTED_SUBJECT_RE, body, re.M))
         m = re.search(r"_(\d+) more commits not shown", body)
         self.assertIsNotNone(m)
         self.assertEqual(shown + int(m.group(1)), 300)
@@ -810,7 +820,7 @@ class TestWholeArtifactWithinHostLimit(unittest.TestCase):
         self.assertEqual(e.ship().returncode, 0)
         created = e.state()["created_bodies"][0]
         self.assertLessEqual(len(created), HOST_LIMIT)
-        self.assertIn("- giant first (", created)
+        self.assertIn("  giant first\n", created)
         self.assertNotIn("small second", created)
         self.assertIn("1 more commits not shown -- see this PR's Commits tab.", created)
         self.assertEqual(e.ship().returncode, 0)
@@ -941,7 +951,7 @@ class TestShipEndToEnd(unittest.TestCase):
                 os.environ["CLAGENTIC_SHIP_COMMITS_MAX_CHARS"] = old
         comments = e.state()["comments"]
         self.assertEqual(len(comments), 1)
-        self.assertEqual(re.findall(r"^- (fresh commit \d+) \(", comments[0], re.M),
+        self.assertEqual(re.findall(r"^  (fresh commit \d+)$", comments[0], re.M),
                          ["fresh commit 10", "fresh commit 11"])
         self.assertNotIn("commit number", comments[0])
         self.assertEqual(MARKER_RE.findall(comments[0]), [new_head])

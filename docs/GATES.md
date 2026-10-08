@@ -807,7 +807,7 @@ The structural reason the two gates needed different treatment: the adversarial-
 
 **Host-neutral by contract.** `scripts/gates.sh` and `scripts/review-merge.sh` (gate logic) never name a git-hosting vendor, CLI, or API directly. `scripts/host-adapter.sh` is the one file that is allowed to — every vendor-specific detail (which CLI, which subcommands, which flags) lives there and only there. `scripts/test_host_adapter_publish.py`'s `TestHostNeutralGrep` pins this as an enforced property: it greps `gates.sh` and `review-merge.sh` for vendor host tokens (`github.com`, `gitlab.com`, `gitea.`, `forgejo.`, and the `gh pr ...` CLI invocation shape) and fails if any appear outside `scripts/host-adapter.sh`.
 
-**The contract — eight functions, all in `scripts/host-adapter.sh`:**
+**The contract — seven functions, all in `scripts/host-adapter.sh`:**
 
 | Function | Contract |
 |---|---|

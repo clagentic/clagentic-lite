@@ -126,14 +126,11 @@
 # resolve that unrelated ANCESTOR repo instead of the intended one: a
 # wrong-repo result, not a git error, so nothing about the call itself
 # signals the mistake. In this file specifically, an unscoped
-# `git remote get-url origin` in _host_adapter_detect can make
-# host_adapter_available report success against the wrong repo's remote,
-# and the comment paths used to read the current branch the same way, which
-# could post a review verdict's findings to the WRONG repository's
-# change-request thread -- wrong-repo disclosure of findings content,
-# silently. The comment paths now take an explicit change-request number and
-# read no repo state at all; every remaining repo-state git call in this
-# file must gate on this predicate first.
+# `git remote get-url origin` in _host_adapter_detect would make
+# host_adapter_available report success against the wrong repo's remote. The
+# comment paths take an explicit change-request number and read no repo
+# state, so findings can never be posted to another repository's thread;
+# every repo-state git call in this file must gate on this predicate first.
 #
 # Why a local copy instead of calling gates.sh's version: host-adapter.sh is
 # sourced by gates.sh near the very top of that file, BEFORE REPO_ROOT is
