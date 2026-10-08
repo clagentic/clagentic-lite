@@ -3864,7 +3864,7 @@ except Exception:
     # JSON tool available to read the ledger, or ledger absent) -- this is
     # lr-964f7f's motivating failure mode inverted: never imply a review
     # posture the tool cannot back with a recorded verdict.
-    _bspb_review_section="reviewer: none -- no recorded review verdict for this branch. Run \`clagentic-lite gates review\` (or \`gates ship\`, which runs it) before merging if cross-vendor review is expected."
+    _bspb_review_section="reviewer: none -- no readable review verdict recorded for this branch. Run \`clagentic-lite gates review\` (or \`gates ship\`, which runs it) before merging if cross-vendor review is expected."
   fi
 
   # Gate attestation section (lr-37a9c8): renders from

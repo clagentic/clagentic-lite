@@ -123,7 +123,7 @@ class TestBuildShipPrBody(unittest.TestCase):
         r = _call_build_ship_pr_body(self._repo, "feat/example", self._head)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("reviewer: none", r.stdout)
-        self.assertIn("no recorded review verdict", r.stdout)
+        self.assertIn("no readable review verdict recorded", r.stdout)
         self.assertNotIn("verdict: pass", r.stdout)
         self.assertNotIn("verdict: block", r.stdout)
 

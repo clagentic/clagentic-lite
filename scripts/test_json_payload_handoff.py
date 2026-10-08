@@ -127,7 +127,9 @@ class TestShipBodyReviewSection(_Base):
 
     def test_unparseable_entry_says_the_record_could_not_be_read(self):
         res = self._body('{"head_sha":"HEADSHA","verdict":"pass","findings":[{"severity"')
-        self.assertNotIn("Findings: none", res.stdout, res.stderr[-500:])
+        self.assertIn("reviewer: none -- no readable review verdict recorded for this branch.",
+                      res.stdout, res.stderr[-500:])
+        self.assertNotIn("Findings: none", res.stdout)
 
     def test_readable_empty_findings_are_reported_as_none(self):
         ok = ('{"ts":"t","branch":"main","gate":"review","base_sha":"b",'

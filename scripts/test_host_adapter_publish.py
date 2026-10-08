@@ -281,6 +281,14 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False, closed_pr=Fal
             # closed PR for the same branch is number 3. Prints nothing when
             # no PR matches, as the real CLI's jq filter would.
             wanted = argv[argv.index("--state") + 1] if "--state" in argv else "open"
+            # Also honors --head and --base: the existing PR is on
+            # feat/example and targets main, so a missing or wrong --head, or
+            # a wrong --base, finds no PR and the test fails instead of
+            # passing vacuously.
+            head = argv[argv.index("--head") + 1] if "--head" in argv else None
+            base = argv[argv.index("--base") + 1] if "--base" in argv else None
+            if head != "feat/example" or (base is not None and base != "main"):
+                sys.exit(0)
             if pr_exists and wanted in ("open", "all"):
                 print(7)
             elif closed_pr and wanted in ("closed", "all"):
