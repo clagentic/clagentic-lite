@@ -366,6 +366,61 @@ class TestBuildShipPrBodyCarriesCommits(unittest.TestCase):
         self.assertNotIn("Merge branch side", section)
 
 
+def _criss_cross(repo):
+    """main and feat/example each merge the other's side, so their tips have two
+    merge-bases (a and b). Then main gains an upstream commit and feat gains a
+    branch commit. Returns the feat head."""
+    _git(["checkout", "-q", "-b", "side-a", "main"], repo)
+    _commit(repo, "a.txt", "upstream commit a")
+    _git(["checkout", "-q", "feat/example"], repo)
+    _commit(repo, "b.txt", "branch commit b")
+    _git(["checkout", "-q", "-b", "side-b"], repo)
+    _git(["checkout", "-q", "main"], repo)
+    _git(["merge", "-q", "--no-ff", "-m", "main takes b", "side-b"], repo)
+    _git(["merge", "-q", "--no-ff", "-m", "main takes a", "side-a"], repo)
+    _commit(repo, "u1.txt", "upstream commit u1")
+    _git(["push", "-q", "origin", "main"], repo)
+    _git(["checkout", "-q", "feat/example"], repo)
+    _git(["merge", "-q", "--no-ff", "-m", "feat takes a", "side-a"], repo)
+    return _git(["rev-parse", "HEAD"], repo)
+
+
+class TestOneRangePrimitiveForBodyAndDelta(unittest.TestCase):
+    def test_body_after_merging_the_default_tip_lists_only_branch_commits(self):
+        e = _Env(self)
+        _commit(e.repo, "f0.txt", "branch commit before merge")
+        _git(["checkout", "-q", "main"], e.repo)
+        _commit(e.repo, "up1.txt", "upstream change one")
+        _git(["push", "-q", "origin", "main"], e.repo)
+        _git(["checkout", "-q", "feat/example"], e.repo)
+        _git(["merge", "-q", "--no-ff", "-m", "merge main into feat", "main"], e.repo)
+        _commit(e.repo, "f1.txt", "branch commit after merge")
+        r = _call_build_ship_pr_body(e.repo, _git(["rev-parse", "HEAD"], e.repo))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        section = _section_one(r.stdout)
+        self.assertIn("branch commit before merge", section)
+        self.assertIn("branch commit after merge", section)
+        self.assertNotIn("upstream change one", section)
+
+    def test_criss_cross_merge_lists_no_upstream_commit_in_body_or_delta(self):
+        e = _Env(self)
+        head = _criss_cross(e.repo)
+        self.assertEqual(len(_git(["merge-base", "--all", "origin/main", head], e.repo).split()), 2)
+        r = _call_build_ship_pr_body(e.repo, head)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        section = _section_one(r.stdout)
+        self.assertNotIn("upstream commit", section)
+
+        self.assertEqual(e.ship().returncode, 0)
+        _commit(e.repo, "f9.txt", "branch commit after criss-cross")
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        comments = e.state()["comments"]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("branch commit after criss-cross", comments[0])
+        self.assertNotIn("upstream commit", comments[0])
+
+
 class TestPlaceholderOnlyWhenRangeUnavailable(unittest.TestCase):
     PLACEHOLDER_MARKERS = ("Commit list unavailable", "No commits to list")
 

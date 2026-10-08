@@ -3329,35 +3329,13 @@ _ship_marker_from_file() {
   printf '%s' "$_smff_marker"
 }
 
-# _ship_default_base_sha HEAD_SHA — print merge-base(origin/<default>, HEAD).
-# On failure prints the actual reason to STDOUT and returns 1 (stdout, not
+# _ship_default_tip_sha — print the provably-current default-branch tip, from
+# _gate_resolve_fresh_default_branch_ref (the sanctioned resolution -- never a
+# raw origin/<branch> name, which can resolve a stale local tracking ref). On
+# failure prints the actual reason to STDOUT and returns 1 (stdout, not
 # stderr, so a config WARN on stderr can never be mistaken for the reason or
-# the SHA), letting a caller show it instead of a generic "unavailable". The
-# default-branch tip comes
-# from _gate_resolve_fresh_default_branch_ref (the sanctioned, provably-current
-# resolution -- never a raw origin/<branch> name, which can resolve a stale
-# local tracking ref); when freshness cannot be proven the commit list says
-# so rather than guessing a possibly wrong range.
-_ship_default_base_sha() {
-  _sdbs_head="$1"
-  if [ -z "$_sdbs_head" ]; then
-    echo "the shipped head commit could not be resolved"
-    return 1
-  fi
-  if ! _sdbs_tip=$(_ship_default_tip_sha); then
-    printf '%s\n' "$_sdbs_tip"
-    return 1
-  fi
-  _sdbs_base=$(_git merge-base "$_sdbs_tip" "$_sdbs_head" 2>/dev/null || echo "")
-  if [ -z "$_sdbs_base" ]; then
-    echo "no merge-base between the default branch tip and the shipped head"
-    return 1
-  fi
-  printf '%s\n' "$_sdbs_base"
-}
-
-# _ship_default_tip_sha — print the provably-current default-branch tip. Same
-# failure contract as _ship_default_base_sha (fixed reason on stdout, return 1).
+# the SHA); when freshness cannot be proven the commit list says so rather
+# than guessing a possibly wrong range.
 _ship_default_tip_sha() {
   _sdts_default="${CLAGENTIC_DEFAULT_BRANCH:-main}"
   if ! _git_repo_root_is_scoped; then
@@ -3589,8 +3567,14 @@ EOF
   return 10
 }
 
-# _ship_render_commit_list BASE HEAD MAX_CHARS — every non-merge commit in
-# BASE..HEAD, oldest first, as one block of at most MAX_CHARS characters in
+# _ship_render_commit_list TIP HEAD MAX_CHARS [MARKER] — THE one range
+# primitive for "this branch's commits", used by both the create-time body and
+# the delta comment: every non-merge commit reachable from HEAD and from
+# neither the provably-current default-branch TIP nor (when given) MARKER, the
+# last shipped head. Exclusion by reachability, not a merge-base range, keeps
+# the result the same however many merge-bases exist (a default branch merged
+# into the branch, criss-cross merges): upstream commits are never listed.
+# Oldest first, as one block of at most MAX_CHARS characters in
 # total (entries, the "N more commits not shown" line and the marker).
 # MAX_CHARS is the caller's budget under the host limit; CLAGENTIC_SHIP_COMMITS_MAX_CHARS
 # may lower it, never raise it. An entry that does not fit whole is deferred to
@@ -3602,16 +3586,14 @@ EOF
 # shipped-head marker for the last commit listed (see the emission point
 # below).
 _ship_render_commit_list() {
-  _srcl_base="$1"
+  _srcl_tip="$1"
   _srcl_head="$2"
   _srcl_cap="$3"
-  _srcl_excl="${4:-}"
-  # The optional 4th argument is a ref to exclude as well, so that a default
-  # branch merged into the branch never lists the upstream commits it carried.
-  if [ -n "$_srcl_excl" ]; then
-    _srcl_shas=$(_git rev-list --reverse --no-merges "$_srcl_head" "^${_srcl_base}" "^${_srcl_excl}" 2>/dev/null) || return 1
+  _srcl_marker="${4:-}"
+  if [ -n "$_srcl_marker" ]; then
+    _srcl_shas=$(_git rev-list --reverse --no-merges "$_srcl_head" "^${_srcl_tip}" "^${_srcl_marker}" 2>/dev/null) || return 1
   else
-    _srcl_shas=$(_git rev-list --reverse --no-merges "${_srcl_base}..${_srcl_head}" 2>/dev/null) || return 1
+    _srcl_shas=$(_git rev-list --reverse --no-merges "$_srcl_head" "^${_srcl_tip}" 2>/dev/null) || return 1
   fi
   [ -n "$_srcl_shas" ] || return 3
   [ "$_srcl_cap" -ge 1 ] || return 4
@@ -3672,18 +3654,22 @@ _ship_render_commit_list() {
 _ship_render_commits_section() {
   _srcs_head="$1"
   _srcs_cap="$2"
-  if ! _srcs_base=$(_ship_default_base_sha "$_srcs_head"); then
-    printf '_Commit list unavailable: %s. Fill in by hand before merging._\n' "$_srcs_base"
+  if [ -z "$_srcs_head" ]; then
+    printf '_Commit list unavailable: %s. Fill in by hand before merging._\n' "the shipped head commit could not be resolved"
+    return 3
+  fi
+  if ! _srcs_tip=$(_ship_default_tip_sha); then
+    printf '_Commit list unavailable: %s. Fill in by hand before merging._\n' "$_srcs_tip"
     return 3
   fi
   _srcs_rc=0
-  _srcs_out=$(_ship_render_commit_list "$_srcs_base" "$_srcs_head" "$_srcs_cap") || _srcs_rc=$?
+  _srcs_out=$(_ship_render_commit_list "$_srcs_tip" "$_srcs_head" "$_srcs_cap") || _srcs_rc=$?
   case "$_srcs_rc" in
     0) printf '%s\n' "$_srcs_out"; return 0 ;;
     3) printf '_No commits to list: nothing between origin/%s and the shipped head (empty range)._\n' "${CLAGENTIC_DEFAULT_BRANCH:-main}" ;;
     4) printf '_Commit list omitted: the host size limit leaves no room for it after the other sections._\n' ;;
-    *) printf '_Commit list unavailable: git could not enumerate %s..%s. Fill in by hand before merging._\n' \
-         "$(printf '%s' "$_srcs_base" | cut -c1-7)" "$(printf '%s' "$_srcs_head" | cut -c1-7)" ;;
+    *) printf '_Commit list unavailable: git could not enumerate the commits of %s. Fill in by hand before merging._\n' \
+         "$(printf '%s' "$_srcs_head" | cut -c1-7)" ;;
   esac
   return 3
 }
@@ -3692,7 +3678,7 @@ _ship_render_commits_section() {
 # _ship_emit_within_limit. Reads its parts from _SPD_* (set by
 # _publish_ship_delta_comment); non-zero statuses are the commit list's own.
 _ship_delta_assemble() {
-  _sda_list=$(_ship_render_commit_list "$_SPD_FROM" "$_SPD_HEAD" "$1" "$_SPD_EXCLUDE") || return $?
+  _sda_list=$(_ship_render_commit_list "$_SPD_TIP" "$_SPD_HEAD" "$1" "$_SPD_MARKER") || return $?
   printf '**clagentic-lite ship: %s**\n\n' "$_SPD_TITLE"
   [ -z "$_SPD_NOTE" ] || printf '%s\n\n' "$_SPD_NOTE"
   printf '%s\n' "$_sda_list"
@@ -3759,18 +3745,13 @@ _publish_ship_delta_comment() {
   fi
 
   if [ -z "$_psdc_from" ]; then
-    if ! _psdc_from=$(_ship_default_base_sha "$_psdc_head"); then
-      echo "[gates/ship] no delta comment posted: ${_psdc_from}" 1>&2
-      ds_audit_log "ship-delta-publish" "block" "${_psdc_tag} reason=base-unresolved"
-      return 0
-    fi
     _psdc_title="all commits on this branch"
   else
     _psdc_title="commits added since the last ship"
   fi
 
-  _SPD_FROM="$_psdc_from"
-  _SPD_EXCLUDE="$_psdc_tip"
+  _SPD_MARKER="$_psdc_from"
+  _SPD_TIP="$_psdc_tip"
   _SPD_HEAD="$_psdc_head"
   _SPD_TITLE="$_psdc_title"
   _SPD_NOTE="$_psdc_note"
