@@ -183,6 +183,9 @@ _FAKE_GH = textwrap.dedent('''\
 
     state_path = os.environ["FAKE_GH_STATE"]
     argv = sys.argv[1:]
+    sys.path.insert(0, os.environ["FAKE_GH_GUARD_DIR"])
+    import gh_stub_guard
+    gh_stub_guard.check(argv)
     with open(state_path) as f:
         st = json.load(f)
     st["calls"].append(argv)
@@ -291,6 +294,7 @@ class _Env:
             "CLAGENTIC_GATES": "none",
             "CLAGENTIC_REPO_HOST": "github",
             "FAKE_GH_STATE": self.state_path,
+            "FAKE_GH_GUARD_DIR": os.path.dirname(os.path.abspath(__file__)),
             "HOME": self.tmp,
             "PATH": self.bin + os.pathsep + env.get("PATH", ""),
         })
@@ -984,6 +988,7 @@ class TestAdapterContractAdditions(unittest.TestCase):
     def _run(self, e, call):
         env = os.environ.copy()
         env.update({"REPO_ROOT": e.repo, "FAKE_GH_STATE": e.state_path,
+                    "FAKE_GH_GUARD_DIR": os.path.dirname(os.path.abspath(__file__)),
                     "CLAGENTIC_REPO_HOST": "github",
                     "PATH": e.bin + os.pathsep + env.get("PATH", "")})
         script = textwrap.dedent("""\

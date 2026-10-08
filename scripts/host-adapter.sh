@@ -324,6 +324,15 @@ host_adapter_artifact_limit() {
 
 _HOST_ADAPTER_SHIP_TIMEOUT=$(ds_positive_int_or_warn CLAGENTIC_SHIP_TIMEOUT_SEC "${CLAGENTIC_SHIP_TIMEOUT_SEC:-}" 120)
 
+# _host_adapter_abs_path PATH -- print PATH as an absolute path, resolved against
+# the caller's cwd. Must run BEFORE _host_adapter_gh_run changes directory.
+_host_adapter_abs_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *)  printf '%s/%s\n' "$(pwd)" "$1" ;;
+  esac
+}
+
 # _host_adapter_gh_run ARGS... -- the ONLY place `gh` is invoked. gh infers the
 # repository it acts on from the process's working directory, so a bare call
 # from a shell sitting in some other git repo would query or mutate THAT repo
@@ -394,7 +403,8 @@ _host_adapter_gh_open_change_request() {
   # own commit-derived title; only the body is replaced.
   _hagocr_rc=0
   if [ -n "$_hagocr_body_file" ] && [ -f "$_hagocr_body_file" ]; then
-    _hagocr_out=$(_host_adapter_gh_run pr create --fill-first--base "$_hagocr_base" --head "$_hagocr_head" --body-file "$_hagocr_body_file") || _hagocr_rc=$?
+    _hagocr_body_file=$(_host_adapter_abs_path "$_hagocr_body_file")
+    _hagocr_out=$(_host_adapter_gh_run pr create --fill-first --base "$_hagocr_base" --head "$_hagocr_head" --body-file "$_hagocr_body_file") || _hagocr_rc=$?
   else
     _hagocr_out=$(_host_adapter_gh_run pr create --fill --base "$_hagocr_base" --head "$_hagocr_head") || _hagocr_rc=$?
   fi
@@ -414,7 +424,8 @@ _host_adapter_gh_open_change_request() {
 
 _host_adapter_gh_post_comment() {
   [ -f "$2" ] || return 1
-  _host_adapter_gh_run pr comment "$1" --body-file "$2"
+  _hagpc_body_file=$(_host_adapter_abs_path "$2")
+  _host_adapter_gh_run pr comment "$1" --body-file "$_hagpc_body_file"
 }
 
 _host_adapter_gh_read_comments() {

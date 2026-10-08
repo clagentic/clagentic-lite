@@ -261,6 +261,9 @@ def _make_fake_gh(bin_dir, calls_file, mode="ok", pr_exists=False, closed_pr=Fal
         cwd_file = {cwd_file!r}
 
         argv = sys.argv[1:]
+        sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})
+        import gh_stub_guard
+        gh_stub_guard.check(argv)
         with open(calls_file, "a") as f:
             f.write(" ".join(argv) + "\\n")
         if cwd_file:
@@ -711,6 +714,66 @@ class TestHostAdapterContractDirect(unittest.TestCase):
         self.assertEqual(len(create_calls), 1)
         self.assertIn("--fill", create_calls[0])
         self.assertNotIn("--body-file", create_calls[0])
+
+    def test_create_argv_tokens_are_exact_with_and_without_body_file(self):
+        """The exact tokens handed to `gh pr create`: a fused or misspelled
+        flag fails here even if the stub's allowlist were loosened."""
+        body_file = os.path.join(self._tmpdir, "pr-body.txt")
+        with open(body_file, "w") as f:
+            f.write("body\n")
+        cases = (
+            ("'%s'" % body_file,
+             "pr create --fill-first --base main --head feat/example --body-file %s" % body_file),
+            ("", "pr create --fill --base main --head feat/example"),
+        )
+        for arg, expected in cases:
+            with self.subTest(arg=arg):
+                if os.path.exists(self._calls):
+                    os.remove(self._calls)
+                _make_fake_gh(self._bin, self._calls, pr_exists=False)
+                r = _run_review_merge_fn(
+                    "cd '%s' && host_adapter_open_change_request main feat/example %s" % (self._repo, arg),
+                    env_overrides={"REPO_ROOT": self._repo},
+                    path_prepend=self._bin,
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+                creates = [c for c in _read_calls(self._calls) if c.startswith("pr create")]
+                self.assertEqual(creates, [expected])
+
+    def test_relative_body_file_survives_the_cwd_change_into_repo_root(self):
+        """gh runs from REPO_ROOT, so a body file given relative to the
+        caller's cwd must be made absolute first (create and comment paths)."""
+        elsewhere = os.path.join(self._tmpdir, "elsewhere")
+        os.makedirs(elsewhere)
+        with open(os.path.join(elsewhere, "rel-body.txt"), "w") as f:
+            f.write("relative body\n")
+        for call, pr_exists, read in (
+            ("host_adapter_open_change_request main feat/example rel-body.txt", False, _read_posted_create_bodies),
+            ("host_adapter_post_comment 7 rel-body.txt", True, _read_posted_bodies),
+        ):
+            with self.subTest(call=call):
+                shutil.rmtree(os.path.join(self._tmpdir, "posted-bodies"), ignore_errors=True)
+                _make_fake_gh(self._bin, self._calls, pr_exists=pr_exists)
+                r = _run_review_merge_fn(
+                    "cd '%s' && %s" % (elsewhere, call),
+                    env_overrides={"REPO_ROOT": self._repo},
+                    path_prepend=self._bin,
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(read(self._tmpdir), ["relative body\n"])
+
+    def test_stub_gh_rejects_flags_real_gh_does_not_accept(self):
+        _make_fake_gh(self._bin, self._calls)
+        gh = os.path.join(self._bin, "gh")
+        for argv in (["pr", "create", "--fill-first--base", "main"],
+                     ["pr", "list", "--bogus"],
+                     ["pr", "view", "7", "--body-file", "x"],
+                     ["pr", "comment", "7", "--fill"],
+                     ["pr", "edit", "7"]):
+            with self.subTest(argv=argv):
+                r = subprocess.run([gh] + argv, capture_output=True, text=True)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("fake gh", r.stderr)
 
     def test_open_change_request_reuses_existing_pr_ignoring_body_file(self):
         """An already-open PR is reused as-is per the contract -- a BODY_FILE
