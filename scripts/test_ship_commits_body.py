@@ -244,10 +244,16 @@ _FAKE_GH = textwrap.dedent('''\
                 open_prs.append({"number": OPEN_NUMBER, "head": st.get("open_head", "feat/example"),
                                  "base": st.get("open_base", "main")})
             open_prs.extend(st.get("extra_open", []))
+            # A fork PR ("cross": true) shares the head branch NAME; it is
+            # dropped only when the caller asked for isCrossRepository in
+            # --json and filters on it in --jq, as the real CLI would.
+            drops_cross = "isCrossRepository" in (flag("--json") or "") and \\
+                "isCrossRepository == false" in (flag("--jq") or "")
             numbers = []
             if wanted in ("open", "all"):
                 numbers += [p["number"] for p in open_prs
-                            if flag("--head") in (None, p["head"]) and flag("--base") in (None, p["base"])]
+                            if flag("--head") in (None, p["head"]) and flag("--base") in (None, p["base"])
+                            and not (drops_cross and p.get("cross"))]
             if st.get("closed_pr") and wanted in ("closed", "all"):
                 numbers.append(CLOSED_NUMBER)
             # One number per line, as the adapter's jq prints them.
@@ -1182,6 +1188,30 @@ class TestShipPrLookupStates(unittest.TestCase):
         self.assertTrue(any(o == "block" and "open-change-request-failed" in d for o, d in rows), rows)
 
 
+    def test_same_named_fork_pr_is_never_reused_by_ship(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        e.set_state(exists=False, extra_open=[
+            {"number": "8", "head": "feat/example", "base": "main", "cross": True}])
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = e.calls()
+        self.assertEqual(len([c for c in calls if c.startswith("pr create")]), 1, calls)
+        self.assertEqual([c for c in calls if c.startswith("pr comment 8")], [])
+
+    def test_own_pr_is_still_found_next_to_a_same_named_fork_pr(self):
+        e = _Env(self)
+        _add_three_commits(e.repo)
+        e.set_state(exists=True, extra_open=[
+            {"number": "8", "head": "feat/example", "base": "main", "cross": True}])
+        r = e.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = e.calls()
+        self.assertEqual([c for c in calls if c.startswith("pr create")], [], calls)
+        self.assertEqual([c for c in calls if c.startswith("pr comment 8")], [])
+        self.assertTrue(any(c.startswith("pr comment 7 ") for c in calls), calls)
+
+
 class TestReviewVerdictPublisherLookup(unittest.TestCase):
     """The publisher finds its PR through the same lookup helper as ship, but
     head-only: it passes no base."""
@@ -1236,6 +1266,23 @@ class TestReviewVerdictPublisherLookup(unittest.TestCase):
         self.assertEqual([c for c in e.calls() if c.startswith("pr comment")], [])
         rows = e.audit_rows("review-publish")
         self.assertTrue(any(o == "block" and "change-request-lookup-failed" in d for o, d in rows), rows)
+
+    def test_same_named_fork_pr_never_receives_a_review_comment(self):
+        e = self._env_with_audit_db()
+        e.set_state(exists=False, extra_open=[
+            {"number": "8", "head": "feat/example", "base": "main", "cross": True}])
+        r = self._publish(e)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([c for c in e.calls() if c.startswith("pr comment")], [])
+
+    def test_own_pr_gets_the_review_comment_despite_a_fork_pr(self):
+        e = self._env_with_audit_db()
+        e.set_state(extra_open=[
+            {"number": "8", "head": "feat/example", "base": "main", "cross": True}])
+        r = self._publish(e)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len([c for c in e.calls() if c.startswith("pr comment 7 ")]), 1, e.calls())
+        self.assertEqual([c for c in e.calls() if c.startswith("pr comment 8")], [])
 
     def test_no_open_pr_for_the_head_posts_nothing(self):
         e = self._env_with_audit_db()

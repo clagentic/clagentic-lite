@@ -366,10 +366,12 @@ _host_adapter_gh_open_pr_number() {
   # head-only (the review publisher's). More than one match is ambiguous, so
   # it is an error (2), never a pick of the first.
   [ -n "${1:-}" ] || return 2
+  # `--head` matches the head branch NAME only, so a fork PR that happens to use
+  # the same branch name would match too. Only same-repo PRs are ours.
   if [ -n "${2:-}" ]; then
-    _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --base "$2" --state open --json number --jq '.[].number' 2>/dev/null) || return 2
+    _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --base "$2" --state open --json number,isCrossRepository --jq '.[] | select(.isCrossRepository == false) | .number' 2>/dev/null) || return 2
   else
-    _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --state open --json number --jq '.[].number' 2>/dev/null) || return 2
+    _hagopn_out=$(_host_adapter_gh_run pr list --head "$1" --state open --json number,isCrossRepository --jq '.[] | select(.isCrossRepository == false) | .number' 2>/dev/null) || return 2
   fi
   case "$_hagopn_out" in
     "") return 1 ;;
