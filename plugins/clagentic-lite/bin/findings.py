@@ -93,6 +93,7 @@ _CSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 _OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)")
 _ESC_RE = re.compile(r"\x1b.")
 _HUNK_RE = re.compile(r"\+(\d+)")
+_HUNK_COUNTS_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _FILE_LINE_RE = re.compile(r"^(.+):(\d+)$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ADVERSARIAL_HEADER_RE = re.compile(
@@ -446,15 +447,44 @@ class DiffIndex(object):
         except OSError:
             return
         current, number = "", 0
+        # Inside a hunk the declared line counts say where it ends, so an added
+        # line whose content begins with '++ ' (shown as '+++ ...') is never
+        # mistaken for the next file's header. Numbers advance on context and
+        # '+' lines and not on '-' lines: they are new-file line numbers.
+        old_left = new_left = 0
         for line in text.split("\n"):
+            if old_left > 0 or new_left > 0:
+                lead = line[:1]
+                if lead == "+":
+                    number += 1
+                    new_left -= 1
+                    self.by_file.setdefault(current, []).append((number, line))
+                    continue
+                if lead == "-":
+                    old_left -= 1
+                    continue
+                if lead in (" ", ""):
+                    number += 1
+                    old_left -= 1
+                    new_left -= 1
+                    continue
+                if lead == "\\":
+                    continue
+                old_left = new_left = 0
             if line.startswith("+++ "):
                 current = line[4:]
                 if current.startswith("b/"):
                     current = current[2:]
                 number = 0
             elif line.startswith("@@ "):
-                hunk = _HUNK_RE.search(line)
-                number = int(hunk.group(1)) - 1 if hunk else 0
+                counted = _HUNK_COUNTS_RE.match(line)
+                if counted:
+                    number = int(counted.group(3)) - 1
+                    old_left = int(counted.group(2) or 1)
+                    new_left = int(counted.group(4) or 1)
+                else:
+                    hunk = _HUNK_RE.search(line)
+                    number = int(hunk.group(1)) - 1 if hunk else 0
             elif line.startswith("+"):
                 number += 1
                 self.by_file.setdefault(current, []).append((number, line))
@@ -568,8 +598,9 @@ def append_key_file(path, keys):
         with open(path, "a", encoding="utf-8") as handle:
             for key in keys:
                 handle.write(key + "\n")
-    except OSError:
-        pass
+    except OSError as exc:
+        warn("[findings] could not record seen keys in %s: %s; later rounds will not "
+             "see this round's findings" % (path, exc))
 
 
 def tsv_clean(value):
@@ -616,8 +647,8 @@ def bump_counts(counts_path, keys):
         result.append(prior + 1)
     try:
         write_file_atomic(counts_path, dumps(counts))
-    except OSError:
-        pass
+    except OSError as exc:
+        warn("[findings] could not persist round counts to %s: %s" % (counts_path, exc))
     return result
 
 
@@ -743,6 +774,13 @@ def recurrence_demote(env_path, diff_path, counts_path, threshold):
     return demoted
 
 
+def row_unsafe(*fields):
+    """True when any field holds a tab, CR or LF. Such an entry cannot be
+    carried in the row format deferral entries have always matched through, so
+    it has never matched; matching and lint both ask this one question."""
+    return any(c in field for field in fields for c in "\t\n\r")
+
+
 def _live_deferrals(deferrals, root):
     """Deferral entries eligible for mechanical matching whose file still has
     the content hash recorded at grant time. Anything doubtful is left out,
@@ -761,9 +799,7 @@ def _live_deferrals(deferrals, root):
                     and message and entry.get("scope") == "stable-contract")
         if not eligible:
             continue
-        # Tab and newline cannot be carried in the row format these entries
-        # have always matched through; such an entry has never matched.
-        if any(c in field for field in (did, fname, category, message) for c in "\t\n\r"):
+        if row_unsafe(did, fname, category, message):
             continue
         try:
             with open(root + "/" + fname, "rb") as handle:
@@ -895,6 +931,14 @@ def lint_deferrals(path):
                 "named file changing since this deferral was granted (lapse-on-edit). "
                 "Compute it from the SAME file this entry names: "
                 "sha256sum <file> | cut -d' ' -f1".format(where))
+        text_fields = [value for value in (eid, fname, message) if isinstance(value, str)]
+        text_fields.append(str(entry.get("category", "")))
+        if row_unsafe(*text_fields):
+            problems.append(
+                "{}: scope is \"stable-contract\" but id, file, category or message contains "
+                "a tab, CR or LF -- such an entry is never mechanically matched (the gate "
+                "drops it), so it would silently fail to defer anything. Remove the control "
+                "characters.".format(where))
     if problems:
         lines = ["[gates/deferrals-lint] {} problem(s) in {}:".format(len(problems), path)]
         lines.extend("  - " + p for p in problems)
@@ -928,8 +972,19 @@ def count_blockers(path, threshold_name):
         return FAIL_CLOSED_BLOCKERS
 
 
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def terminal_text(value, limit=None):
+    """Model-authored text made safe to print on a terminal: every control
+    byte (escape sequences, newlines that could forge a second finding line)
+    becomes a space. The one helper every renderer uses for such text."""
+    text = _CONTROL_RE.sub(" ", "" if value is None else str(value))
+    return text if limit is None else text[:limit]
+
+
 def _clean_listing(value):
-    return re.sub(r"[\x00-\x1f\x7f]", " ", "" if value is None else str(value))[:300]
+    return terminal_text(value, 300)
 
 
 def blocking_findings_listing(document_text, threshold_name):
@@ -951,8 +1006,11 @@ def blocking_findings_listing(document_text, threshold_name):
             if not isinstance(finding, dict):
                 return None
             if counts_toward_verdict(finding, threshold):
+                line = finding.get("line") or 0
+                if not isinstance(line, (int, float)) or isinstance(line, bool):
+                    line = _clean_listing(line)
                 listing.append({"file": _clean_listing(finding.get("file")),
-                                "line": finding.get("line") or 0,
+                                "line": line,
                                 "severity": _clean_listing(finding.get("severity")),
                                 "message": _clean_listing(finding.get("message"))})
         return listing
@@ -1050,11 +1108,51 @@ def ledger_append(path, line, max_per_branch):
     """Append one JSON line, then drop the oldest entries of the same branch
     past MAX_PER_BRANCH (0 disables). The ledger exists to show churn, so its
     own storage must not grow without bound. Never raises: a lost entry
-    degrades recurrence visibility and nothing else."""
+    degrades recurrence visibility and nothing else.
+
+    The append and the trim run under one exclusive lock on a sibling lock
+    file (the ledger itself is replaced by rename, so it cannot carry the
+    lock), which keeps a concurrent gate's append from being lost between the
+    trim's read and its replace. Where flock is unavailable the lock is
+    skipped with a warning and the old unlocked behavior applies."""
     try:
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return
+    lock = _ledger_lock(path)
+    try:
+        _ledger_append_locked(path, line, max_per_branch)
+    finally:
+        if lock is not None:
+            lock.close()
+
+
+def _ledger_lock(path):
+    """An open, exclusively flock-ed handle on PATH's lock file, or None."""
+    try:
+        import fcntl
+    except ImportError:
+        warn("[findings] flock unavailable; ledger trim is not protected against a "
+             "concurrent append")
+        return None
+    try:
+        handle = open(path + ".lock", "a", encoding="utf-8")
+    except OSError as exc:
+        warn("[findings] could not lock the ledger (%s); a concurrent append may be lost" % exc)
+        return None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+    except OSError as exc:
+        handle.close()
+        warn("[findings] could not lock the ledger (%s); a concurrent append may be lost" % exc)
+        return None
+    return handle
+
+
+def _ledger_append_locked(path, line, max_per_branch):
+    try:
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(line.replace("\n", "") + "\n")
     except OSError:
@@ -1122,6 +1220,11 @@ def _jq_text(value):
     raise TypeError("cannot concatenate %s" % type(value).__name__)
 
 
+def _shown(value):
+    """_jq_text for text that reaches a terminal."""
+    return terminal_text(_jq_text(value))
+
+
 def _jq_tostring(value):
     if isinstance(value, str):
         return value
@@ -1142,29 +1245,29 @@ def render_review(path):
     document = load_json_file(path)
     findings = document.get("findings")
     count = len(findings) if findings is not None else 0
-    lines = ["== clagentic-lite review ==\nsummary: " + _jq_text(document.get("summary"))
+    lines = ["== clagentic-lite review ==\nsummary: " + _shown(document.get("summary"))
              + "\nfindings: " + str(count) + "\n"]
     code = 0
     try:
         if findings is None:
             raise TypeError("cannot iterate over null")
         for finding in findings:
-            text = ("[" + _jq_text(finding.get("severity")) + "] " + _jq_text(finding.get("file"))
-                    + ":" + _jq_tostring(finding.get("line")) + " "
-                    + _jq_text(finding.get("message")))
+            text = ("[" + _shown(finding.get("severity")) + "] " + _shown(finding.get("file"))
+                    + ":" + terminal_text(_jq_tostring(finding.get("line"))) + " "
+                    + _shown(finding.get("message")))
             if finding.get("_recurrence_demoted") is True:
-                text += (" (reported " + _jq_tostring(finding.get("_recurrence_count"))
+                text += (" (reported " + terminal_text(_jq_tostring(finding.get("_recurrence_count")))
                          + " rounds running — decide)")
             if finding.get("_deferral_matched") is True:
                 deferral_id = finding.get("_deferral_id")
-                text += " (matched deferral " + (deferral_id if deferral_id else "?") + ")"
+                text += " (matched deferral " + (_shown(deferral_id) if deferral_id else "?") + ")"
             if finding.get("_seen_before") is True:
                 text += " (reported in a prior run; still counted)"
             if _class_named(finding):
-                text += "\n    class: " + _jq_text(finding.get("issue_class"))
+                text += "\n    class: " + _shown(finding.get("issue_class"))
                 fix = finding.get("class_fix")
                 if fix is not None and fix != "":
-                    text += " -> " + _jq_text(fix)
+                    text += " -> " + _shown(fix)
             lines.append(text)
     except (TypeError, AttributeError):
         code = 1
@@ -1193,7 +1296,7 @@ def render_verdict_lines(head, findings_text):
     for finding in findings:
         if not isinstance(finding, dict):
             continue
-        severity = str(finding.get("severity", "unknown"))
+        severity = terminal_text(finding.get("severity", "unknown"))
         by_severity[severity] = by_severity.get(severity, 0) + 1
         if finding.get("_ledger_recurring"):
             recurring.append(finding)
@@ -1208,9 +1311,9 @@ def render_verdict_lines(head, findings_text):
         lines.append("")
         lines.append("Recurring from a prior round (%d):" % len(recurring))
         for finding in recurring:
-            lines.append("- [%s] %s: %s" % (finding.get("severity", "unknown"),
-                                            finding.get("file", "?"),
-                                            finding.get("message", "")))
+            lines.append("- [%s] %s: %s" % (terminal_text(finding.get("severity", "unknown")),
+                                            terminal_text(finding.get("file", "?")),
+                                            terminal_text(finding.get("message", ""))))
     return 0, "\n".join(lines) + "\n"
 
 
@@ -1318,8 +1421,10 @@ def stale_report(summary_path):
     entries = []
     for item in listing:
         if isinstance(item, dict):
-            entries.append((str(item.get("file", "")), str(item.get("line", "")),
-                            str(item.get("severity", "")), str(item.get("message", ""))))
+            entries.append((terminal_text(item.get("file", "")),
+                            terminal_text(item.get("line", "")),
+                            terminal_text(item.get("severity", "")),
+                            terminal_text(item.get("message", ""))))
     text, audit = [], []
     if blocked:
         short = head[:12]
@@ -1418,13 +1523,29 @@ def build_gate_summary(opts):
                                       + json.dumps(deterministic_gates, indent=2)
                                       + DETGATES_FENCE_END)
     findings = []
+    sidecar_degraded = False
     if opts.adf:
         try:
             loaded = load_json_file(opts.adf)
+        except (OSError, ValueError) as exc:
+            warn("[findings] adversarial findings sidecar %s is unreadable: %s" % (opts.adf, exc))
+            sidecar_degraded = True
+        else:
             if isinstance(loaded, list):
                 findings = loaded
-        except (OSError, ValueError):
-            findings = []
+            else:
+                warn("[findings] adversarial findings sidecar %s is not a JSON array" % opts.adf)
+                sidecar_degraded = True
+    # A sidecar that cannot be read as a list must not read as "no findings"
+    # with zero blockers: the whole adversarial source is degraded, exactly as
+    # when cmd_adversarial itself recorded findings_degraded. A missing report
+    # has no sidecar to trust or distrust.
+    if sidecar_degraded and not _flag(opts.adversarial_missing):
+        opts.adf_degraded = "true"
+        adversarial_report_degraded = True
+        if opts.adversarial_unavailable:
+            adversarial_fenced = json.loads(opts.adversarial_unavailable)
+        findings = []
     dicts = [f for f in findings if isinstance(f, dict)]
     blocking = sum(1 for f in dicts if f.get("tier") == "blocking")
     advisory = sum(1 for f in dicts if f.get("tier") == "advisory")
@@ -1827,9 +1948,12 @@ def cmd_render_fence_findings(args):
 
 def cmd_render_json_field(args):
     try:
-        _print(json_string_field(read_stdin_text(), args.key))
-    except (ValueError, AttributeError):
-        pass
+        value = json_string_field(read_stdin_text(), args.key)
+    except (ValueError, AttributeError) as exc:
+        # Malformed JSON is a failure; an absent key is an empty value and exit 0.
+        warn("[findings] json-field: input is not a JSON object: %s" % exc)
+        return 1
+    _print(value)
     return 0
 
 

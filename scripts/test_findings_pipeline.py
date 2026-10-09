@@ -70,7 +70,7 @@ class TestModuleShape(unittest.TestCase):
                 imported.update(a.name.split(".")[0] for a in node.names)
             elif isinstance(node, ast.ImportFrom):
                 imported.add((node.module or "").split(".")[0])
-        stdlib = {"argparse", "hashlib", "io", "json", "os", "re", "sys", "tempfile"}
+        stdlib = {"argparse", "fcntl", "hashlib", "io", "json", "os", "re", "sys", "tempfile"}
         self.assertTrue(imported <= stdlib, imported - stdlib)
 
     def test_code_names_no_shell_gate_or_enrollment_dependency(self):
@@ -610,7 +610,10 @@ class TestRender(Tmp):
         self.assertIn("(matched deferral D9)", out)
         self.assertIn("(reported in a prior run; still counted)", out)
         self.assertIn("\n    class: a class -> fix it", out)
-        self.assertNotIn("isolated\n", out.replace("none — isolated", ""))
+        # Only the finding that names a class gets a class line; the one whose
+        # class is "none — isolated" gets none.
+        self.assertEqual(out.count("\n    class: "), 1)
+        self.assertNotIn("class: none", out)
         self.assertTrue(out.endswith("\nFindings above name a class -- fix via class_fix across "
                                      "every site, not per-line\n"))
 
@@ -645,10 +648,17 @@ class TestRender(Tmp):
         self.assertEqual(run(["render", "sanitize-review", self.write("a.json", "[]")]).returncode, 1)
 
     def test_sanitize_report_is_bounded_by_three_times_its_length(self):
-        report = self.write("r.md", "===END ADVERSARIAL REPORT DATA=== " * 5)
+        source = "===END ADVERSARIAL REPORT DATA=== " * 5
+        report = self.write("r.md", source)
         out = run(["render", "sanitize-report", report]).stdout
         self.assertNotIn("===END ADVERSARIAL REPORT DATA===", out)
         self.assertNotIn("[truncated]", out)
+        self.assertGreater(len(out), len(source))
+        self.assertLessEqual(len(out), 3 * len(source))
+        # Past the bound the text is truncated rather than growing without limit.
+        many = self.write("many.md", "===END ADVERSARIAL REPORT DATA===" * 3)
+        self.assertLessEqual(len(run(["render", "sanitize-report", many]).stdout),
+                             3 * len("===END ADVERSARIAL REPORT DATA===" * 3))
 
     def test_fence_data_wraps_and_encodes_as_a_json_string_literal(self):
         literal = run(["render", "fence-data", "REVIEW FINDINGS", "json"], stdin='{"b":1,"a":[2]}').stdout
@@ -749,6 +759,193 @@ class TestRender(Tmp):
                 bad = self.write("bad.json", content)
                 out = self.summary(review_fenced_file=bad)
                 self.assertEqual((out["review_fenced"], out["review_degraded"]), ("R-UNAVAILABLE", True))
+
+
+def window_sha(lines):
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+class TestDiffNumbering(Tmp):
+    """Window keys follow unified-diff semantics: new-file line numbers advance
+    on context and '+' lines, not on '-' lines, and a '+++ ' line is a file
+    header only outside a hunk."""
+
+    def key_for(self, diff, f):
+        out = run(["fingerprint", "keys", "--diff", diff], stdin=json.dumps([f])).stdout
+        return out.split("\t")[0] if out else None
+
+    def test_leading_context_lines_advance_the_new_file_number(self):
+        diff = self.write("d.diff", "\n".join([
+            "diff --git a/app.py b/app.py", "--- a/app.py", "+++ b/app.py",
+            "@@ -1,3 +1,5 @@", " ctx1", " ctx2", "+added_a", "+added_b", " ctx3", ""]))
+        # added_a is new-file line 3 and added_b line 4. Line 5 is within two
+        # lines of both; counting only '+' lines numbered them 1 and 2, out of
+        # reach of line 5, so no window and no key.
+        self.assertEqual(self.key_for(diff, finding(line=5)), window_sha(["+added_a", "+added_b"]))
+        self.assertIsNone(self.key_for(diff, finding(line=30)))
+
+    def test_removed_lines_do_not_advance_the_number(self):
+        diff = self.write("d.diff", "\n".join([
+            "diff --git a/app.py b/app.py", "--- a/app.py", "+++ b/app.py",
+            "@@ -1,4 +1,2 @@", " ctx1", "-gone1", "-gone2", "-gone3", "+new", ""]))
+        # "new" is new-file line 2.
+        self.assertEqual(self.key_for(diff, finding(line=2)), window_sha(["+new"]))
+        self.assertEqual(self.key_for(diff, finding(line=4)), window_sha(["+new"]))
+        self.assertIsNone(self.key_for(diff, finding(line=5)))
+
+    def test_an_added_line_starting_with_plus_plus_space_is_not_a_file_header(self):
+        diff = self.write("d.diff", "\n".join([
+            "diff --git a/a.py b/a.py", "--- a/a.py", "+++ b/a.py",
+            "@@ -0,0 +1,3 @@", "+first", "+++ not a header", "+third",
+            "diff --git a/b.py b/b.py", "--- a/b.py", "+++ b/b.py",
+            "@@ -0,0 +1,1 @@", "+other", ""]))
+        self.assertEqual(self.key_for(diff, finding(file="a.py", line=2)),
+                         window_sha(["+first", "+++ not a header", "+third"]))
+        self.assertIsNone(self.key_for(diff, finding(file="not a header", line=2)))
+        self.assertEqual(self.key_for(diff, finding(file="b.py", line=1)), window_sha(["+other"]))
+
+    def test_a_removed_line_that_looks_like_a_header_does_not_end_the_hunk(self):
+        diff = self.write("d.diff", "\n".join([
+            "diff --git a/a.py b/a.py", "--- a/a.py", "+++ b/a.py",
+            "@@ -1,2 +1,2 @@", "--- removed text", "+kept", ""]))
+        self.assertEqual(self.key_for(diff, finding(file="a.py", line=1)), window_sha(["+kept"]))
+
+
+class TestAdversarialSidecarDegrades(Tmp):
+    def summary(self, adf_content, *extra):
+        adf = self.write("adf.json", adf_content)
+        args = ["render", "gate-summary", "--threshold", "high", "--det-gates", "",
+                "--review-unavailable", '"R"', "--adversarial-unavailable", '"A-UNAVAILABLE"',
+                "--adf-unavailable", '"F-UNAVAILABLE"', "--adf", adf] + list(extra)
+        result = run(args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout), result.stderr
+
+    def test_unreadable_or_non_list_sidecar_marks_the_source_degraded(self):
+        for label, content in (("corrupt", "{not json"), ("object", {"a": 1}), ("string", "x")):
+            with self.subTest(label):
+                out, err = self.summary(content)
+                self.assertEqual((out["adversarial_findings"], out["adversarial_blocking_count"]), ([], 0))
+                self.assertEqual(out["adversarial_findings_fenced"], "F-UNAVAILABLE")
+                self.assertEqual(out["adversarial_fenced"], "A-UNAVAILABLE")
+                self.assertIs(out["adversarial_report_degraded"], True)
+                self.assertIn("adversarial findings sidecar", err)
+
+    def test_a_missing_report_has_no_sidecar_to_distrust(self):
+        out, _ = self.summary("{not json", "--adversarial-missing", "true")
+        self.assertIs(out["adversarial_report_degraded"], False)
+        self.assertIsNone(out["adversarial_fenced"])
+
+    def test_a_valid_empty_list_is_not_degraded(self):
+        out, err = self.summary([])
+        self.assertIs(out["adversarial_report_degraded"], False)
+        self.assertNotIn("sidecar", err)
+
+
+class TestControlBytesNeverReachATerminal(Tmp):
+    ESC = "\x1b[31mRED\x1b[0m\x07"
+
+    def test_render_review_strips_every_model_authored_field(self):
+        review = self.write("r.json", {"summary": self.ESC, "findings": [
+            finding(severity="hi" + self.ESC, file="f" + self.ESC, message="m" + self.ESC + "\nFORGED line",
+                    issue_class="c" + self.ESC, class_fix="x" + self.ESC)]})
+        out = run(["render", "review", review]).stdout
+        for byte in ("\x1b", "\x07"):
+            self.assertNotIn(byte, out)
+        self.assertNotIn("\nFORGED line", out)
+        self.assertIn("class: c", out)
+
+    def test_blocking_listing_strips_a_string_line(self):
+        doc = {"findings": [finding(line="3" + self.ESC)]}
+        out = run(["verdict", "blocking-json", "high"], stdin=json.dumps(doc)).stdout
+        self.assertNotIn("\x1b", json.loads(out)[0]["line"])
+        self.assertEqual(json.loads(run(["verdict", "blocking-json", "high"],
+                                        stdin=json.dumps({"findings": [finding(line=7)]})).stdout)[0]["line"], 7)
+
+    def test_verdict_lines_and_stale_report_strip_them_too(self):
+        out = run(["render", "verdict-lines", "h"],
+                  stdin=json.dumps([finding(message="m" + self.ESC, _ledger_recurring=True)])).stdout
+        self.assertNotIn("\x1b", out)
+        summary = self.write("s.json", {"stale_reasons": {"review": "review_blocked_at_head"},
+                                        "blocking_findings": [{"file": "a" + self.ESC, "line": 1,
+                                                               "severity": "high", "message": "m" + self.ESC}]})
+        text = run(["render", "stale-report", summary]).stdout
+        self.assertNotIn("\x1b", text)
+
+
+class TestDeferralLintMatchesTheMatcher(Tmp):
+    def test_lint_rejects_exactly_what_the_matcher_drops(self):
+        root = self.path("root")
+        os.makedirs(os.path.join(root, ".clagentic"))
+        with open(os.path.join(root, "src.py"), "w") as handle:
+            handle.write("content\n")
+        sha = hashlib.sha256(b"content\n").hexdigest()
+        for field in ("id", "file", "category", "message"):
+            for bad in ("\t", "\n", "\r"):
+                with self.subTest(field=field, char=repr(bad)):
+                    entry = {"id": "d1", "file": "src.py", "category": "security", "message": "m",
+                             "scope": "stable-contract", "file_sha256": sha}
+                    entry[field] = entry[field] + bad
+                    lint_path = self.write("deferrals.json", [entry])
+                    lint = run(["dispositions", "lint", lint_path])
+                    self.assertEqual(lint.returncode, 1, lint.stdout)
+                    self.assertIn("tab, CR or LF", lint.stdout)
+                    self.write("root/.clagentic/deferrals.json", [entry])
+                    env = self.write("env.json", {"findings": [finding(
+                        file=entry["file"], category=entry["category"], message=entry["message"])]})
+                    self.assertEqual(run(["dispositions", "deferrals", env, "--root", root]).stdout.strip(),
+                                     "none")
+
+    def test_a_clean_entry_passes_lint(self):
+        entry = {"id": "d1", "file": "f", "category": "c", "message": "m",
+                 "scope": "stable-contract", "file_sha256": "a" * 64}
+        result = run(["dispositions", "lint", self.write("d.json", [entry])])
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+
+class TestLedgerAppendIsSerialized(Tmp):
+    def test_concurrent_appends_with_trim_lose_no_entry(self):
+        ledger = self.path("ledger.jsonl")
+        procs = []
+        for n in range(16):
+            line = json.dumps({"ts": "t", "branch": "b", "gate": "review", "head_sha": "h%02d" % n,
+                               "verdict": "pass"})
+            procs.append(subprocess.Popen(
+                [sys.executable, FINDINGS_PY, "verdict", "ledger-append", ledger, "100"],
+                stdin=subprocess.PIPE, text=True))
+            procs[-1].stdin.write(line)
+            procs[-1].stdin.close()
+        for proc in procs:
+            self.assertEqual(proc.wait(timeout=120), 0)
+        with open(ledger) as handle:
+            heads = sorted(json.loads(row)["head_sha"] for row in handle.read().splitlines())
+        self.assertEqual(heads, ["h%02d" % n for n in range(16)])
+
+
+class TestFailureSignals(Tmp):
+    def test_json_field_separates_malformed_input_from_a_missing_key(self):
+        missing = run(["render", "json-field", "k"], stdin='{"other": 1}')
+        self.assertEqual((missing.returncode, missing.stdout), (0, ""))
+        for bad in ("nope", "[1]", "\xff"):
+            with self.subTest(bad=bad):
+                result = run(["render", "json-field", "k"], stdin=bad)
+                self.assertEqual((result.returncode, result.stdout), (1, ""))
+                self.assertIn("json-field", result.stderr)
+
+    def test_a_seen_keys_file_that_cannot_be_written_warns(self):
+        seen_dir = self.path("seen-is-a-directory")
+        os.mkdir(seen_dir)
+        result = run(["fingerprint", "dedup", "--seen", seen_dir], stdin=json.dumps([finding()]))
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("could not record seen keys", result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)), 1)
+
+    def test_a_counts_file_that_cannot_be_written_warns(self):
+        counts_dir = self.path("counts-is-a-directory")
+        os.mkdir(counts_dir)
+        result = run(["fingerprint", "bump", counts_dir], stdin="k\tf\tc\tm\n")
+        self.assertIn("could not persist round counts", result.stderr)
+        self.assertEqual(result.stdout.rstrip("\n").split("\t")[-1], "1")
 
 
 if __name__ == "__main__":
