@@ -153,7 +153,7 @@ def _path_without_jq(tmp):
 
 
 class TestRenderReviewWithoutJq(unittest.TestCase):
-    def test_no_jq_renders_raw_and_notes_footer_needs_jq(self):
+    def test_no_jq_still_renders_the_findings_and_the_footer(self):
         with tempfile.TemporaryDirectory(prefix="clagentic-test-class-footer-") as d:
             path = os.path.join(d, "review.json")
             with open(path, "w") as f:
@@ -167,12 +167,14 @@ class TestRenderReviewWithoutJq(unittest.TestCase):
             """)
             env = os.environ.copy()
             env.update(source_env(gates=True))
+            env["CLAGENTIC_PROJECT_ROOT"] = d
             env["PATH"] = _path_without_jq(d)
             r = _run_raw(script, env)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("some class", r.stdout)
-        self.assertIn("requires jq", r.stderr)
-        self.assertIn("issue_class/class_fix", r.stderr)
+        self.assertIn("== clagentic-lite review ==", r.stdout)
+        self.assertIn("class: some class -> fix", r.stdout)
+        self.assertIn("name a class", r.stdout)
+        self.assertNotIn("requires jq", r.stderr)
 
 
 class TestSeverityBlockersUnchanged(unittest.TestCase):

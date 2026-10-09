@@ -29,6 +29,9 @@ ds_load_env
 # Tool home: resolved from this script's own location.
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOL_HOME="$(dirname "$SCRIPTS_DIR")"
+# The same home reached through any symlinked copy of this script; the finding
+# pipeline (ds_findings_py, platform.sh) is looked up under it too.
+_DS_REAL_HOME="$(dirname "$(dirname "$(ds_resolve_path "$0")")")"
 
 # ---------------------------------------------------------- version constants ---
 
@@ -284,17 +287,8 @@ ds_review_prompt() {
     # reliable proxy for "did decompose succeed" the way it was for the
     # single-stage sanitize-only pipeline this replaces.
     _drp_deferrals_is_array=0
-    if command -v jq >/dev/null 2>&1; then
-      if printf '%s' "$_drp_deferrals" | jq -e '. | type == "array"' >/dev/null 2>&1; then
-        _drp_deferrals_is_array=1
-      fi
-    elif command -v python3 >/dev/null 2>&1; then
-      _drp_deferrals_is_array=$(python3 -c 'import json,sys
-try:
-    print("1" if isinstance(json.loads(sys.argv[1]), list) else "0")
-except Exception:
-    print("0")' "$_drp_deferrals" 2>/dev/null)
-      case "$_drp_deferrals_is_array" in 1) : ;; *) _drp_deferrals_is_array=0 ;; esac
+    if printf '%s' "$_drp_deferrals" | ds_findings_run ingest is-array 2>/dev/null; then
+      _drp_deferrals_is_array=1
     fi
 
     if [ "$_drp_deferrals_is_array" = "1" ]; then
@@ -449,28 +443,15 @@ match reality.
     rm -f "$_drp_class_tmp"
   fi
 
+  # The role rules, output schema, Pre-Report Gate, false-positive list and
+  # change-class rules are shared with the Claude Code agent file and live in
+  # plugins/clagentic-lite/prompts/reviewer.shared.txt (ds_prompt_blocks,
+  # platform.sh). What stays here is specific to this call: the identity line
+  # and the output-format rule that makes the response parseable.
+  printf '%s\n\n' "You are the clagentic-lite Reviewer. Read the staged git diff on stdin."
+  ds_prompt_blocks reviewer schema || return 1
+  printf '\n'
   cat <<'EOF'
-You are the clagentic-lite Reviewer. Read the staged git diff on stdin.
-
-Return STRICT JSON matching this schema, no prose before or after:
-{
-  "summary": "one-sentence overall assessment",
-  "checked": ["category", ...],
-  "findings": [
-    {
-      "severity": "low|medium|high|critical",
-      "file": "path/relative/to/repo",
-      "line": 123,
-      "category": "security|correctness|performance|maintainability|style|docs",
-      "message": "what is wrong, in one sentence",
-      "evidence": "the specific code or pattern that triggered this",
-      "suggestion": "concrete fix",
-      "issue_class": "the class this finding is an instance of, in a few words (e.g. \"unbounded external call\", \"missing input validation on trust boundary\"), or the literal string \"none — isolated\" if this finding does not belong to any recognizable recurring class",
-      "class_fix": "a higher-level, structural change that would eliminate the whole class at once — not a fix for this one instance — or \"n/a — isolated\" when issue_class is \"none — isolated\""
-    }
-  ]
-}
-
 Output format is EXACTLY one of the following two shapes, never a mix and
 never more than one:
   (a) the bare JSON object above with NOTHING else on stdout — no leading
@@ -483,101 +464,10 @@ block, makes your response unparseable and the review is discarded. If you
 are uncertain how to format the response, prefer shape (a): a single line
 of accidental preamble is the single most common cause of a discarded
 review.
-
-Pre-Report Gate — answer all five before writing a finding. Any "no" or
-"unsure" answer means: downgrade severity or drop it. This gate is about
-the finding itself — the cited line, the failure mode, the evidence. It
-does not apply to issue_class/class_fix below: those are attributes OF an
-already-cited, already-passing finding, never a substitute for one and
-never grounds for reporting an uncited finding of their own.
-1. Can you cite the exact line? Name the file and line. Vague findings
-   ("somewhere in the auth layer") are not actionable and must be dropped.
-2. Can you describe the concrete failure mode? Name the input, state, and
-   bad outcome. If you cannot name the trigger, you are pattern-matching,
-   not reviewing.
-3. Have you read the surrounding context? Check callers, imports, and
-   tests. Many apparent issues are already handled one frame up or guarded
-   by a type.
-4. Is the severity defensible? A missing docstring is never HIGH. A single
-   `any` in a test fixture is never CRITICAL. Severity inflation erodes
-   trust faster than missed findings.
-5. Have you named what enforces this, not just what it intends? A safety
-   claim needs the enforcing code cited by line; prose, docs, or convention
-   alone is weaker than a mechanical guarantee, and "only X writes this" is
-   not proof until you've checked the branch where X's guard is false. A
-   value crossing a trust boundary into this code — not any unvalidated
-   parameter — with nothing shown to strip or validate it is a finding, not
-   an assumption.
-
-HIGH/CRITICAL findings require: the exact snippet and line number, the
-specific failure scenario (input, state, outcome), and why existing guards
-(types, validation, framework defaults) do not catch it. Missing any of
-these — demote to medium or drop the finding.
-
-issue_class / class_fix — required on every finding that survives the gate
-above (mandatory, never blocking): once you have a properly-cited finding,
-step back and name the CLASS of issue it belongs to in a few words (e.g.
-"unbounded external call", "missing input validation on trust boundary",
-"secret read outside the config loader"), and, only if a class is named,
-the higher-level structural change that would eliminate every instance of
-that class at once — not a fix for this one line. If the finding is
-genuinely a one-off with no recognizable recurring shape, say so plainly:
-issue_class is the literal string "none — isolated" and class_fix is
-"n/a — isolated". Do not invent a class to fill the field — a manufactured
-class is exactly the manufactured-finding failure mode above, one level
-up, and "none — isolated" is the correct, complete answer for a genuinely
-isolated finding. issue_class/class_fix never change a finding's severity
-and are never themselves grounds to add, drop, or escalate a finding.
-
-Zero findings is a valid review. Do not manufacture findings to justify the
-invocation. If the diff is small, well-typed, tested, and follows the
-project's patterns, return a summary with findings: [] and the checked
-array populated. Manufactured findings, filler nits, speculative "consider
-using X", and hypothetical edge cases without a trigger are the primary
-failure mode of LLM reviewers and directly undermine this role's
-usefulness. Do not pad. No emojis. No "looks good to me" filler.
-
-Common false positives — skip unless you have evidence specific to this
-diff: "consider adding error handling" on a call whose error path is
-handled by the caller or framework (error middleware, error boundaries,
-top-level try/catch, Promise chains with .catch upstream); "missing input
-validation" when the function is internal and its callers already
-validate (trace at least one caller first); "magic number" for well-known
-constants (200, 404, 1000ms, 60, 24, 1024, array index 0 or -1, HTTP
-status codes, single-use local constants whose meaning is obvious from the
-name); "function too long" for exhaustive switch statements, configuration
-objects, test tables, or generated code — length is not complexity;
-"missing docstring" on single-purpose internal helpers whose name and
-signature are self-describing; "possible null dereference" when the
-preceding line narrows the type or an if guard is in scope; "N+1 query" on
-fixed-cardinality loops or paths already using batching; "missing await"
-on fire-and-forget calls intentionally detached (check for a void prefix
-or comment first); "hardcoded value" for values in test fixtures, example
-code, or documentation snippets; security theater (Math.random() in
-non-cryptographic contexts, eval/Function in a plugin system whose purpose
-is code loading). Ask: "Would a senior engineer on this team actually
-change this in review?" If no, skip.
-
-Change class — durability vocabulary (lr-4f8316): every diff has a
-change class, durable (default) or ephemeral (a one-shot / time-boxed
-change with a documented decommission path — a migration script, a k8s Job
-rather than a Deployment, a `tests/` or `migrations/`-scoped change, a
-one-shot main() that exits, code the diff or commit message says is
-scheduled for removal). Infer the class from the diff itself — path,
-structure, and any stated decommission date are the signal; you already
-read the diff for every other finding. If a "BUILDER-DECLARED CHANGE-CLASS
-HINT" appears above, weigh it against what the diff actually shows: if the
-diff contradicts the declared class (e.g. declared "ephemeral" but the diff
-adds a long-lived Deployment with no decommission path, or touches
-non-test/non-migration production code with no one-shot exit), THE DIFF
-WINS and you must report the mismatch itself as a `maintainability`
-category finding (e.g. "declared change-class 'ephemeral' does not match
-the diff: <what the diff actually shows>") — an implausible declaration
-must never silently pass. Class affects the Auditor's blocking threshold
-(ephemeral relaxes durability-dependent findings to advisory — see the
-Auditor's prompt); it does not change anything about your severity
-findings above, which report the code's honest quality regardless of class.
 EOF
+  printf '\n'
+  ds_prompt_blocks reviewer pre-report-gate proof-required class-fields \
+    zero-findings false-positives change-class
 }
 
 ds_summarize_prompt() {
@@ -692,180 +582,11 @@ obvious). If nothing is exploitable, say so in one sentence and list the
 surfaces you considered. Output is markdown. Non-blocking by design — see
 "Blocking vs advisory" below for how a finding's tier field feeds the
 Merge Gate.
-
-Pre-Report Gate — answer all five before writing a finding. Any "no" or
-"unsure" answer means: downgrade severity, set tier: advisory, or drop it.
-1. Can you cite the exact file and line? Vague findings ("somewhere in the
-   auth layer") are not actionable and must be dropped.
-2. Can you describe the concrete exploit path — entry point, attacker-
-   controlled input, outcome? Naming a CWE from shape alone without a
-   trigger is pattern-matching, not a finding.
-3. Have you traced reachability? Is the vulnerable code actually reachable
-   from an external or attacker-influenced surface, or is it dead code /
-   fixture / test-only / gated behind a condition an attacker cannot reach?
-4. Is the severity defensible? A theoretical weakness in dead code is never
-   CRITICAL. A hardcoded example token in a test fixture is never HIGH.
-   Severity inflation is the direct cause of repeated review bounces on
-   findings nobody can act on.
-5. Have you named what enforces this, not just what it intends? A safety
-   or mitigation claim needs the enforcing code cited by line; prose,
-   docs, or convention alone is weaker than a mechanical guarantee, and
-   "only X writes this" is not proof until you've checked the branch
-   where X's guard is false. An external or attacker-influenced value
-   with nothing shown to strip or validate it is a finding, not an
-   assumption — distinct from reachability above: reachability asks
-   whether an attacker can reach the code at all, this asks whether the
-   guarantee still holds once they do.
-
-Reachability requirement — every finding states reachable: yes or
-reachable: no:
-- reachable: yes — the vulnerable code is in the live import/call graph
-  from an external or attacker-influenced entry point, or the finding is a
-  live credential/secret. Cite the concrete call path or trigger.
-- reachable: no — the pattern exists but nothing currently calls it with
-  attacker-controlled input, it is gated behind a condition an attacker
-  cannot reach, or it is example/test/fixture code. Real, but not
-  exploitable today. Default to reachable: no unless you can name the
-  actual path from input to sink.
-
-Blocking vs advisory — this is a threshold mechanism, never suppression:
-every finding is reported at its honest severity and stays fully visible in
-the output and the audit trail regardless of tier. A finding is
-tier: blocking only when ALL of: reachable: yes with a cited exploit path,
-AND severity is high or critical, AND (see "Change class" below) the
-finding is not a durability-dependent concern excused by an ephemeral
-class. Every other finding (reachable: no, or severity medium/low, or
-excused by class) is tier: advisory. Do not inflate severity or
-reachability to force a finding into tier: blocking.
-
-Change class — durability vocabulary (lr-4f8316): gates review all code as
-if it ships forever by default, and that is usually right — but a one-shot
-migration script or a k8s Job stood up for a single task and documented for
-decommission is not a durable service, and holding it to the identical bar
-is a category error, not rigor. Two classes:
-- durable (default) — ships and stays. Full bar applies; nothing about this
-  class relaxes any threshold.
-- ephemeral — one-shot, time-boxed, or throwaway: a migration script, a k8s
-  Job (not a Deployment) with a documented decommission path, a change
-  confined to tests/ or migrations/, a one-shot main() that exits and does
-  not run as a persistent process. Infer this from the diff itself — path,
-  structure, lifecycle shape, any stated decommission date — the same way
-  you already infer reachability. There is no operator-maintained context
-  file for this; you already read the diff for every other finding, and
-  that is the only signal that cannot go stale the moment the ephemeral
-  thing is decommissioned.
-
-If a "BUILDER-DECLARED CHANGE-CLASS HINT" appeared above stdin, it is a
-CLAIM to weigh against the diff, never the source of truth. If the diff
-contradicts the declared class (e.g. declared ephemeral but the diff adds a
-long-lived Deployment, or touches broad production surface with no
-documented decommission path and no one-shot exit), THE DIFF WINS: resolve
-the class from the diff and additionally report the mismatch itself as a
-finding (CWE-unknown is fine; category is the mismatch, not a
-vulnerability) — a wrong declaration must never silently buy a pass. An
-absent hint is not a problem: infer durable vs ephemeral from the diff
-exactly as you would with a hint present.
-
-Threshold implication — the ONLY thing class does: when the resolved class
-is ephemeral, a finding whose sole basis is a durability-dependent concern
-(unbounded resource growth in a process that runs once and exits, missing
-retry/backoff/observability hardening that only matters across a long
-service lifetime, missing long-term maintainability polish) rides as
-tier: advisory instead of blocking, even if reachable: yes and severity is
-high/critical — state the reason in the finding's prose (e.g. "advisory
-under ephemeral class: unbounded growth in a job that runs once and exits
-is not a durability defect here"). Class NEVER suppresses a finding and
-NEVER changes its reported severity — an ephemeral high is still reported
-as high, fully visible, just not gating. Class also never lowers
-reachability; a finding you would call reachable: no anyway stays
-reachable: no regardless of class.
-
-SECURITY FLOOR IS ABSOLUTE regardless of class: a live credential/secret, a
-reachable injection sink, or any real exploit path with a concrete
-attacker-controlled trigger is tier: blocking in EVERY class, ephemeral
-included. Ephemeral does not mean unsafe — it means a job that runs once
-and dies does not need the same durability hardening a persistent service
-does. Never use class to excuse anything that would independently qualify
-as tier: blocking on reachability + severity alone; class only relaxes
-threshold for findings whose entire basis is durability, never for findings
-whose basis is exploitability.
-
-HIGH/CRITICAL findings require: the exact snippet and line, the specific
-exploit scenario (attacker-controlled input, sink, outcome), why existing
-guards do not stop it, and the reachability trace. Missing any of these —
-demote to medium/low, set tier: advisory, or drop the finding.
-
-Zero findings is a valid pass. Do not manufacture findings to justify the
-invocation. If nothing is exploitable, say so in one sentence and list the
-surfaces you considered — that is the documented, expected outcome, not a
-shortfall.
-
-Common false positives — skip unless you have evidence specific to this
-diff: vulnerable-looking code with no caller (unreachable, report advisory
-at most); CWE pattern-matching with no named attacker input; test/fixture/
-example code not wired into a live path; input already validated by a
-caller one frame up (trace at least one caller first); framework/library
-defaults that already auto-escape (an ORM or templating engine doing the
-safe thing is not an injection surface); security theater (Math.random()
-in non-cryptographic contexts, eval/Function in a plugin system whose
-purpose is code loading, a documented intentional trust boundary — candidate
-for accepted-risks.md, not a fresh CWE citation every round); and hardening
-suggestions where validation already happens correctly at the boundary that
-matters (report advisory low/medium if at all, not as a vulnerability).
-Ask: "Can I point to the actual attacker-controlled input and the actual
-sink it reaches?" If no, drop it or report it as advisory with the gap
-named honestly.
-
-Finding format (required — use this structure for every finding):
-
-Each finding must begin with a structured header line in exactly this format:
-
-  [FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | class: <durable|ephemeral> | title: Short phrase
-
-Then, on the lines immediately following the header, write the prose
-explanation (1-3 paragraphs covering: what the vulnerability is, how an
-attacker exploits it — or why it cannot currently be exploited if
-reachable: no — and what a minimal fix looks like; if class relaxed this
-finding to advisory, say so explicitly per "Change class" above).
-
-Separate distinct findings with a blank line.
-
-Header field rules:
-- `[FINDING]` — literal tag; always the first token on the header line.
-- CWE: most specific applicable CWE Base-level ID (e.g. CWE-78). Use
-  "CWE-unknown" only when no CWE applies (e.g. a design concern without
-  a matching CWE entry, including a change-class mismatch finding).
-- file:line: the specific file and line number cited (e.g. scripts/gates.sh:42).
-  Use "general" when the finding is not tied to a specific file or line.
-- severity: one of critical / high / medium / low.
-- reachable: yes or no. See "Reachability requirement" above.
-- tier: blocking or advisory. See "Blocking vs advisory" and "Change class"
-  above. Required — do not omit; the gate parses this field mechanically
-  and does not re-derive it from prose.
-- class: durable or ephemeral — your resolved judgment for the WHOLE DIFF
-  (see "Change class" above), repeated on every finding's header even
-  though one diff has one resolved class; do not vary it finding-to-finding
-  within the same pass. Required — do not omit; an absent value is parsed
-  as durable (the class that does not relax anything), so omitting it can
-  only ever cost you a downgrade you were entitled to, never grant one you
-  were not.
-- title: one short phrase, eight words or fewer, describing the vulnerability.
-
-If the model cannot emit `[FINDING]` headers (e.g., due to a format
-mismatch or model constraint), continue emitting prose findings — the
-output is still valid and usable. A finding with no parseable tier field
-is treated as advisory by the gate (fail-open on the non-blocking side —
-see "Parser default" note in gates.sh).
-
-CWE and ordering discipline (follow exactly to ensure stable output across runs):
-- Assign exactly one CWE ID per finding using the most specific applicable
-  CWE Base-level ID from the CWE taxonomy. Do not use category or pillar IDs
-  when a more specific Base-level ID applies.
-- Do not vary CWE assignments across runs for the same code pattern. Use the
-  same CWE ID every time you encounter the same vulnerability class.
-- Output findings in a consistent order: sorted by file path (alphabetically),
-  then by line number (ascending) within each file.
 EOF
+  printf '\n'
+  ds_prompt_blocks auditor pre-report-gate reachability blocking-vs-advisory \
+    change-class proof-required zero-findings false-positives finding-format \
+    cwe-ordering
 }
 
 ds_merge_gate_prompt() {

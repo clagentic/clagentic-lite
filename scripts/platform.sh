@@ -976,6 +976,133 @@ ds_pending_reset() {
 # impossible for the next round-trip path, rather than merely fixing this
 # one instance.
 
+# ds_findings_py — print the path of the standalone finding pipeline
+# (plugins/clagentic-lite/bin/findings.py), or return 1 when it cannot be
+# found. A sourced POSIX sh file cannot learn its own path, so the lookup
+# tries, in order: the tool home the sourcing script resolved (TOOL_HOME, and
+# _DS_REAL_HOME for a script reached through a symlinked copy);
+# CLAGENTIC_LITE_HOME; then a walk up from $PWD, which is what finds it for a
+# file sourced directly from inside a checkout.
+ds_findings_py() {
+  _dfp_rel="plugins/clagentic-lite/bin/findings.py"
+  for _dfp_home in "${TOOL_HOME:-}" "${_DS_REAL_HOME:-}" "${CLAGENTIC_LITE_HOME:-}"; do
+    if [ -n "$_dfp_home" ] && [ -f "$_dfp_home/$_dfp_rel" ]; then
+      printf '%s' "$_dfp_home/$_dfp_rel"
+      return 0
+    fi
+  done
+  _dfp_dir="$PWD"
+  while :; do
+    if [ -f "$_dfp_dir/$_dfp_rel" ]; then
+      printf '%s' "$_dfp_dir/$_dfp_rel"
+      return 0
+    fi
+    [ "$_dfp_dir" = "/" ] && break
+    _dfp_dir=$(dirname "$_dfp_dir")
+  done
+  return 1
+}
+
+# ds_findings_run STAGE OP [ARGS...] — run the finding pipeline. python3 is
+# REQUIRED for every finding decision; without it (or without the pipeline
+# file) this prints one loud line and returns 1, and every caller treats a
+# nonzero status as its existing fail-closed answer (severity_blockers prints
+# its 99 sentinel, the ledger reads report no anchored verdict). stdin and
+# stdout pass through, so payloads of any size stay off argv.
+ds_findings_run() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '[clagentic-lite] python3 is required for the finding pipeline and was not found on PATH (install python3: apt install python3 | brew install python3); failing closed.\n' 1>&2
+    return 1
+  fi
+  _dfr_py=$(ds_findings_py) || {
+    printf '[clagentic-lite] finding pipeline plugins/clagentic-lite/bin/findings.py not found (reinstall: clagentic-lite update); failing closed.\n' 1>&2
+    return 1
+  }
+  python3 "$_dfr_py" "$@"
+}
+
+# ----------------------------------------------- shared role-prompt sources ----
+#
+# The Reviewer and Auditor instruction text exists in ONE place per role,
+# plugins/clagentic-lite/prompts/<role>.shared.txt, and both surfaces are
+# generated from it: the gate path (ds_review_prompt / ds_adversarial_prompt,
+# llm-client.sh) reads it at call time, and the Claude Code agent files
+# (plugins/clagentic-lite/agents/*.md, templates carrying {{shared:ROLE:BLOCK}}
+# marker lines) are expanded from it by the enroll/update render. Surface-
+# specific text (the gate's injected fences and output-format rule, the
+# interactive Auditor's scanner allowlist) stays in each surface. A source file
+# is a sequence of blocks, each opened by a line "@@@ NAME".
+
+# ds_prompt_source ROLE — print the path of ROLE's shared prompt source, or
+# return 1. Looked up under the same homes as ds_findings_py (minus the
+# working-directory walk: a prompt must come from the install, not from
+# whatever repository the caller happens to be in).
+ds_prompt_source() {
+  _dps_rel="plugins/clagentic-lite/prompts/$1.shared.txt"
+  for _dps_home in "${TOOL_HOME:-}" "${_DS_REAL_HOME:-}" "${CLAGENTIC_LITE_HOME:-}"; do
+    if [ -n "$_dps_home" ] && [ -f "$_dps_home/$_dps_rel" ]; then
+      printf '%s' "$_dps_home/$_dps_rel"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ds_prompt_block ROLE BLOCK — print one block of ROLE's shared prompt source
+# (no marker line, no trailing blank). Returns 1 with a message on stderr when
+# the source or the block is missing: a role prompt must never be sent half
+# built, so callers let the failure propagate.
+ds_prompt_block() {
+  _dpb_file=$(ds_prompt_source "$1") || {
+    printf '[clagentic-lite] shared prompt source for role %s not found (reinstall: clagentic-lite update)\n' "$1" 1>&2
+    return 1
+  }
+  awk -v want="$2" '
+    /^@@@ / { active = ($2 == want); if (active) found = 1; next }
+    active { print }
+    END { exit (found ? 0 : 3) }
+  ' "$_dpb_file" || {
+    printf '[clagentic-lite] block %s missing from the shared prompt source for role %s\n' "$2" "$1" 1>&2
+    return 1
+  }
+}
+
+# ds_prompt_blocks ROLE BLOCK... — the named blocks in order, one blank line
+# between consecutive blocks, which is how the role prompts have always been
+# paragraphed.
+ds_prompt_blocks() {
+  _dpbs_role="$1"
+  shift
+  _dpbs_first=1
+  for _dpbs_name in "$@"; do
+    [ "$_dpbs_first" = "1" ] || printf '\n'
+    _dpbs_first=0
+    ds_prompt_block "$_dpbs_role" "$_dpbs_name" || return 1
+  done
+}
+
+# ds_prompt_expand_template FILE — print FILE with every line of the form
+# {{shared:ROLE:BLOCK}} replaced by that block of ROLE's shared prompt source.
+# Every other line passes through unchanged. Returns 1 (and stops) if a marker
+# names a source or block that does not exist, so a render never writes an
+# agent file with a hole in it.
+ds_prompt_expand_template() {
+  _dpet_open='{{shared:'
+  _dpet_close='}}'
+  while IFS= read -r _dpet_line || [ -n "$_dpet_line" ]; do
+    case "$_dpet_line" in
+      "$_dpet_open"*:*"$_dpet_close")
+        _dpet_ref=${_dpet_line#"$_dpet_open"}
+        _dpet_ref=${_dpet_ref%"$_dpet_close"}
+        ds_prompt_block "${_dpet_ref%%:*}" "${_dpet_ref#*:}" || return 1
+        ;;
+      *)
+        printf '%s\n' "$_dpet_line"
+        ;;
+    esac
+  done < "$1"
+}
+
 # _invariant_feed_max_field_chars — per-field length cap applied at the write
 # boundary (see _llm_field_sanitize). Configurable via
 # CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS (default 500 — generous for a
@@ -1071,88 +1198,12 @@ _llm_field_sanitize() {
   case "$_lfs_max" in ''|*[!0-9]*) _lfs_max=$(_invariant_feed_max_field_chars) ;; esac
 
   if command -v python3 >/dev/null 2>&1; then
-    # Text goes through a temp file, NOT stdin: `python3 -` already reads the
-    # script itself from stdin (the heredoc below), so piping the untrusted
-    # text into the same stdin would either be silently discarded or
-    # interleaved with the script depending on shell/buffering — the data
-    # channel and the script channel must be different file descriptors.
-    # A failed mktemp/write returns nonzero with NO output rather than running
-    # the sanitizer over an empty or truncated temp file: every caller that
-    # feeds a prompt must see the failure, not an empty "sanitized" string.
-    _lfs_tmp=$(mktemp -t clagentic-llm-sanitize.XXXXXX 2>/dev/null) || return 1
-    [ -n "$_lfs_tmp" ] || return 1
-    if ! printf '%s' "$_lfs_text" > "$_lfs_tmp" 2>/dev/null; then
-      rm -f "$_lfs_tmp"
-      return 1
-    fi
-    python3 - "$_lfs_tmp" "$_lfs_max" <<'PYEOF'
-import re
-import sys
-
-path, max_chars = sys.argv[1], int(sys.argv[2])
-with open(path) as f:
-    text = f.read()
-
-# Strip ANSI/terminal escape sequences (CSI, OSC, and bare ESC-prefixed
-# sequences) before the general control-char strip below, so a multi-byte
-# escape sequence does not leave stray printable fragments behind.
-text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)   # CSI: ESC [ ... letter
-text = re.sub(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)', '', text)  # OSC: ESC ] ... BEL/ST
-text = re.sub(r'\x1b.', '', text)                   # any remaining ESC + one byte
-
-# Strip remaining control/non-printable bytes, preserving tab and newline.
-text = ''.join(ch for ch in text if ch in ('\t', '\n') or 0x20 <= ord(ch) != 0x7f)
-
-# Defang forged delimiter labels: a hostile finding message (or, as of
-# lr-4f8316, a hostile commit-message change-class trailer, or a hostile
-# deferrals.json entry, or as of lr-92d931 a hostile deterministic-gate
-# details string) could contain the literal string "INVARIANTS:" or
-# "DEFERRED FINDINGS:" -- or any of the fenced data-block marker sets this
-# codebase uses (===BEGIN/END INVARIANTS DATA===, the invariant-feed fence
-# in ds_adversarial_prompt; ===BEGIN/END ADVERSARIAL FINDINGS DATA===, the
-# merge-gate fence in ds_merge_gate_prompt; ===BEGIN/END CHANGE-CLASS HINT
-# DATA===, the change-class hint fence in both ds_review_prompt and
-# ds_adversarial_prompt; ===BEGIN/END DEFERRED FINDINGS DATA===, the
-# deferrals fence in ds_review_prompt; ===BEGIN/END DETERMINISTIC GATES
-# DATA===, the deterministic-gates fence in ds_merge_gate_prompt (lr-92d931)
-# -- all llm-client.sh) -- to try to spoof a fresh data-block boundary once
-# re-injected into a future prompt. Insert a zero-width-safe space so the
-# string is still legible to a human but no longer byte-identical to the
-# real delimiter. All fence sets are defanged unconditionally here (not
-# gated by which caller invoked this function) since a single planted
-# payload could round-trip through any path.
-for label in ("INVARIANTS:", "DEFERRED FINDINGS:", "END INVARIANTS",
-              "END DEFERRED FINDINGS",
-              "===BEGIN INVARIANTS DATA===", "===END INVARIANTS DATA===",
-              "===BEGIN ADVERSARIAL FINDINGS DATA===",
-              "===END ADVERSARIAL FINDINGS DATA===",
-              "===BEGIN CHANGE-CLASS HINT DATA===",
-              "===END CHANGE-CLASS HINT DATA===",
-              "===BEGIN DEFERRED FINDINGS DATA===",
-              "===END DEFERRED FINDINGS DATA===",
-              "===BEGIN DETERMINISTIC GATES DATA===",
-              "===END DETERMINISTIC GATES DATA===",
-              "===BEGIN REVIEW FINDINGS DATA===",
-              "===END REVIEW FINDINGS DATA===",
-              "===BEGIN ADVERSARIAL REPORT DATA===",
-              "===END ADVERSARIAL REPORT DATA==="):
-    pattern = re.compile(re.escape(label), re.IGNORECASE)
-    text = pattern.sub(lambda m: ' '.join(m.group(0)), text)
-
-# Truncate so the FINAL string (content + suffix) fits within max_chars --
-# slicing to max_chars and then appending the suffix would let the suffix
-# push the total length past the configured cap (PEACHES, lr-cda4b9
-# follow-up).
-suffix = "...[truncated]"
-if len(text) > max_chars:
-    keep = max(max_chars - len(suffix), 0)
-    text = text[:keep] + suffix
-
-sys.stdout.write(text)
-PYEOF
-    _lfs_status=$?
-    rm -f "$_lfs_tmp"
-    return $_lfs_status
+    # The sanitizer itself lives in the finding pipeline (findings.py), the
+    # one implementation of it. A failure returns nonzero with NO output:
+    # every caller that feeds a prompt must see the failure, not an empty
+    # "sanitized" string. printf is a builtin, so the text never rides argv.
+    printf '%s' "$_lfs_text" | ds_findings_run ingest sanitize-text --max "$_lfs_max"
+    return $?
   fi
 
   # No python3: best-effort POSIX fallback. tr strips the bulk of control
@@ -1174,188 +1225,19 @@ PYEOF
     | cut -c "1-${_lfs_max}"
 }
 
-# _llm_json_array_allowlist_fields JSON FIELD1 [FIELD2 ...] — decompose a
-# JSON array of objects and reduce EVERY object to ONLY the named fields,
-# DROPPING every other key entirely (lr-4f8316 second follow-up). This is
-# the schema-validation step that MUST run before
-# _llm_json_array_sanitize_fields_strict (below) whenever the array's field set
-# is attacker-influenced, not code-controlled -- see that function's own
-# "SAFE ONLY for callers with a closed, code-controlled field set" warning.
-#
-# WHY THIS IS A SEPARATE FUNCTION, NOT A CHANGE TO
-# _llm_json_array_sanitize_fields_strict: the adversarial-findings caller
-# (_sanitize_adversarial_findings_json, gates.sh) depends on
-# that helper's CURRENT contract -- pass through every
-# field not named in the sanitize call (line/severity/reachable/tier/class
-# survive untouched). That caller is safe leaving those fields alone
-# because _parse_adversarial_findings constructs each finding from named
-# regex capture groups: an attacker cannot introduce an arbitrary key at
-# all, the field set is fixed by the parser's own code. Deferrals reads an
-# arbitrary JSON object off disk -- an attacker who can write
-# .clagentic/deferrals.json can add any key they like, and sanitizing only
-# the SIX NAMED schema fields left every other key riding through
-# byte-identical: undefanged, unstripped, uncapped. Same helper, different
-# input model, and that difference is the whole bug (BOBBIE, lr-4f8316
-# third follow-up). Changing _llm_json_array_sanitize_fields_strict to allowlist
-# by default would silently break the adversarial-findings caller's
-# reliance on "unnamed fields pass through" -- so the fix is a NEW function
-# callers with an attacker-influenced field set call FIRST, not a change to
-# the existing one.
-#
-# Also coerces every RETAINED value to a plain string, dropping (not
-# stringifying) any field whose value is not a JSON string -- an object,
-# array, number, bool, or null. The deferrals schema (docs/GATES.md
-# "Reviewer-consulted deferrals") defines every field as free-form text;
-# a legitimate field holding a nested object/array has no defined meaning
-# either, and passing one through as an embedded JSON blob (even under a
-# real field name) would smuggle attacker content one level deep, past a
-# sanitizer that only inspects the field it was told to look at as a flat
-# string. Dropping is correct here, matching the "unknown key -> drop, not
-# merely sanitize" posture for the field set itself: there is no defined
-# meaning to forward in any form.
-#
-# TYPED FIELDS (lr-66e598 follow-up): a bare field name (e.g. "file") keeps
-# ONLY a string value under that key, exactly as above and as every existing
-# caller (deferrals) already relies on. Appending ":number" to a field name
-# (e.g. "line:number") CHANGES that ONE field's accepted type to a plain
-# JSON number INSTEAD OF a string -- not in addition to it. This is a type
-# declaration, not a widening: the field's schema type is either string
-# (bare name) or number (":number" suffix), never both, so a value of the
-# wrong type for that field's declared type is dropped, never coerced and
-# never accepted under the other type. This exists because the
-# review-findings schema (docs/GATES.md, `ds_review_prompt` in
-# llm-client.sh) legitimately defines `line` as a number, and the base
-# string-only contract would silently corrupt that schema's own `line`
-# value (breaking finding_content_keys' `.line` lookup and
-# cmd_render_review's rendered line number) -- adding a type declaration to
-# this one field, rather than a second allowlist function, is what "reuse
-# the existing helper" means when a caller's own schema needs a non-string
-# field. No other type is accepted (no ":bool", no ":object"); this
-# codebase's schemas have not needed one yet, and the same "drop, never
-# coerce" fail-closed default applies if one shows up before a suffix for it
-# is added here.
-#
-# FAIL CLOSED: ANY failure returns 1 and prints NOTHING -- a non-array or
-# malformed input, an empty field list (a caller bug, never "keep nothing"), a
-# temp file that cannot be created, a jq or python3 error, an empty result, or
-# the absence of both JSON tools. It never prints the original input and never
-# a partial array. The input is attacker-influenced and this is the step that
-# strips its extra keys, so handing it back unreduced would let those keys reach
-# a prompt; a caller that cannot reduce the array must degrade (omit the source
-# or mark it unavailable), never use the input. Exit 0 prints the reduced array.
-#
-# The array travels on stdin (jq) or in a temp file (python3), never as an argv
-# string: exec of an argv string over MAX_ARG_STRLEN (~128 KiB) fails with
-# E2BIG, which used to return the input unreduced exactly when it was large.
-#
-# Args: JSON (a JSON array of objects), FIELD1..FIELDN (the CLOSED set of
-# field names this array's schema defines; each is a bare name for
-# string-only, or "name:number" to also accept a JSON number under that key).
-# stdout: the reduced JSON array (exit 0), nothing (exit 1).
+# _llm_json_array_allowlist_fields JSON FIELD1 [FIELD2 ...] — reduce every
+# object of a JSON array to ONLY the named fields, dropping every other key
+# and every value of the wrong declared type ("name" declares a string,
+# "name:number" a number). Must run before _llm_json_array_sanitize_fields_strict
+# whenever the array's field set is attacker-influenced. FAIL CLOSED: any
+# failure (non-array, empty field list, no python3) returns 1 with no output,
+# never the input. The array travels on stdin, never argv. The logic lives in
+# the finding pipeline (findings.py ingest allowlist).
 _llm_json_array_allowlist_fields() {
   _ljaaf_json="$1"
   shift
-  _ljaaf_fields="$*"
-  [ -n "$_ljaaf_fields" ] || return 1
-
-  if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$_ljaaf_json" | jq -e '. | type == "array"' >/dev/null 2>&1 || return 1
-    # Build a jq object mapping field-name -> its ONE declared jq type
-    # ("string" by default; "number" when the caller suffixed ":number" --
-    # a type declaration, not an added alternative), then apply a single
-    # filter: for each object, keep only entries whose key is in the
-    # allowlist AND whose value's jq type equals that key's declared type.
-    _ljaaf_types_json="{}"
-    for _ljaaf_field in $_ljaaf_fields; do
-      case "$_ljaaf_field" in
-        *:number)
-          _ljaaf_name="${_ljaaf_field%:number}"
-          _ljaaf_type="number"
-          ;;
-        *)
-          _ljaaf_name="$_ljaaf_field"
-          _ljaaf_type="string"
-          ;;
-      esac
-      _ljaaf_types_json=$(printf '%s' "$_ljaaf_types_json" | jq -c --arg f "$_ljaaf_name" --arg t "$_ljaaf_type" '. + {($f): $t}' 2>/dev/null) || return 1
-      [ -n "$_ljaaf_types_json" ] || return 1
-    done
-    _ljaaf_out=$(printf '%s' "$_ljaaf_json" | jq -c --argjson types "$_ljaaf_types_json" \
-      '[.[] | (if type == "object" then with_entries(select(($types[.key] // null) as $t | $t != null and (.value | type) == $t)) else {} end)]' \
-      2>/dev/null) || return 1
-    [ -n "$_ljaaf_out" ] || return 1
-    printf '%s' "$_ljaaf_out"
-    return 0
-  fi
-
-  if command -v python3 >/dev/null 2>&1; then
-    _ljaaf_tmp=$(mktemp -t clagentic-llm-allowlist.XXXXXX 2>/dev/null) || return 1
-    [ -n "$_ljaaf_tmp" ] || return 1
-    if ! printf '%s' "$_ljaaf_json" > "$_ljaaf_tmp" 2>/dev/null; then
-      rm -f "$_ljaaf_tmp"
-      return 1
-    fi
-    _ljaaf_rc=0
-    _ljaaf_out=$(python3 - "$_ljaaf_tmp" $_ljaaf_fields <<'PYEOF' 2>/dev/null
-import json, sys
-
-path = sys.argv[1]
-raw_fields = sys.argv[2:]
-
-# name -> its ONE declared python type set: (str,) by default, or
-# (int, float) if the caller suffixed ":number" -- a type DECLARATION, not
-# an added alternative, mirroring the jq branch's single-type-per-field
-# contract. bool is deliberately excluded from the numeric type set even
-# though Python's bool is an int subclass -- a JSON true/false must never
-# silently pass a numeric field check.
-allowed = {}
-for f in raw_fields:
-    if f.endswith(":number"):
-        name = f[: -len(":number")]
-        allowed[name] = (int, float)
-    else:
-        name = f
-        allowed[name] = (str,)
-
-try:
-    with open(path, "rb") as fh:
-        arr = json.loads(fh.read())
-except Exception:
-    sys.exit(1)
-if not isinstance(arr, list):
-    sys.exit(1)
-
-reduced = []
-for item in arr:
-    if not isinstance(item, dict):
-        reduced.append({})
-        continue
-    out = {}
-    for k, v in item.items():
-        types = allowed.get(k)
-        if types is None:
-            continue
-        # Reject bool explicitly even when the field's declared type is
-        # (int, float) -- isinstance(True, int) is True in Python, which
-        # would otherwise let a JSON boolean masquerade as a numeric value.
-        if isinstance(v, bool):
-            continue
-        if isinstance(v, types):
-            out[k] = v
-    reduced.append(out)
-
-print(json.dumps(reduced))
-PYEOF
-) || _ljaaf_rc=1
-    rm -f "$_ljaaf_tmp"
-    [ "$_ljaaf_rc" -eq 0 ] || return 1
-    [ -n "$_ljaaf_out" ] || return 1
-    printf '%s' "$_ljaaf_out"
-    return 0
-  fi
-
-  # No JSON tool at all: the array cannot be decomposed, so it cannot be reduced.
-  return 1
+  [ -n "$*" ] || return 1
+  printf '%s' "$_ljaaf_json" | ds_findings_run ingest allowlist "$@"
 }
 
 # _llm_json_array_sanitize_fields_strict JSON FIELD1 [FIELD2 ...] — decompose
@@ -1368,12 +1250,10 @@ PYEOF
 # function rather than growing a parallel loop.
 #
 # FAIL CLOSED, and there is deliberately no fail-open sibling: any failure
-# (no JSON tool, input not an array, a temp file that cannot be created, a
-# JSON tool error on any item or field, an empty intermediate result) returns
-# 1 and prints NOTHING. It never prints the original input and never a partial
-# array, so a caller cannot mistake a failure for "sanitized" or for "no
-# entries"; each caller decides its own degraded behavior. Exit 0 prints the
-# sanitized array.
+# (no python3, input not an array, a non-object element) returns 1 and prints
+# NOTHING. It never prints the original input and never a partial array, so a
+# caller cannot mistake a failure for "sanitized" or for "no entries"; each
+# caller decides its own degraded behavior. Exit 0 prints the sanitized array.
 #
 # Fields not named in FIELD... pass through UNCHANGED, undefanged, uncapped
 # -- this function sanitizes exactly the fields it is told to and nothing
@@ -1384,149 +1264,13 @@ PYEOF
 # _llm_json_array_allowlist_fields (above) FIRST.
 #
 # Args: JSON (a JSON array of objects, as a single string), FIELD1..FIELDN.
-# stdout: the sanitized JSON array (exit 0), nothing (exit 1).
+# stdout: the sanitized JSON array (exit 0), nothing (exit 1). The work is
+# findings.py ingest sanitize-fields; the array rides stdin, never argv.
 _llm_json_array_sanitize_fields_strict() {
   _ljass_json="$1"
   shift
-  _ljass_fields="$*"
-  [ -n "$_ljass_fields" ] || return 1
-  if command -v jq >/dev/null 2>&1; then
-    _llm_json_array_sanitize_fields_jq "$_ljass_json" $_ljass_fields
-    return $?
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    _llm_json_array_sanitize_fields_py "$_ljass_json" $_ljass_fields
-    return $?
-  fi
-  return 1
-}
-
-# _llm_json_array_sanitize_fields_jq JSON FIELD... — jq implementation of the
-# strict helper above; same fail-closed contract.
-_llm_json_array_sanitize_fields_jq() {
-  _ljasj_json="$1"
-  shift
-  _ljasj_fields="$*"
-  # Type check FIRST, not just "length parses as a number" -- jq's `length`
-  # returns a number for strings/objects too (e.g. a JSON string scalar's
-  # character count), which would otherwise pass the numeric guard below and
-  # then index a non-array into garbage/empty results. A non-array input is a
-  # failure, never an empty array: an empty array is indistinguishable from
-  # "genuinely no entries".
-  printf '%s' "$_ljasj_json" | jq -e '. | type == "array"' >/dev/null 2>&1 || return 1
-  _ljasj_count=$(printf '%s' "$_ljasj_json" | jq 'length' 2>/dev/null) || return 1
-  case "$_ljasj_count" in ''|*[!0-9]*) return 1 ;; esac
-  _ljasj_out="[]"
-  _ljasj_i=0
-  while [ "$_ljasj_i" -lt "$_ljasj_count" ]; do
-    _ljasj_item=$(printf '%s' "$_ljasj_json" | jq -c ".[$_ljasj_i]" 2>/dev/null) || return 1
-    [ -n "$_ljasj_item" ] || return 1
-    for _ljasj_field in $_ljasj_fields; do
-      _ljasj_raw=$(printf '%s' "$_ljasj_item" | jq -r --arg f "$_ljasj_field" '.[$f] // ""' 2>/dev/null) || return 1
-      _ljasj_clean=$(_llm_field_sanitize "$_ljasj_raw") || return 1
-      _ljasj_item=$(printf '%s' "$_ljasj_item" | jq -c --arg f "$_ljasj_field" --arg v "$_ljasj_clean" \
-        'if has($f) then .[$f] = $v else . end' 2>/dev/null) || return 1
-      [ -n "$_ljasj_item" ] || return 1
-    done
-    # Accumulator and item travel on stdin (slurped), not --argjson: an argv
-    # string over MAX_ARG_STRLEN (~128 KiB) fails exec.
-    _ljasj_out=$(printf '%s\n%s' "$_ljasj_out" "$_ljasj_item" | jq -c -s '.[0] + [.[1]]' 2>/dev/null) || return 1
-    [ -n "$_ljasj_out" ] || return 1
-    _ljasj_i=$((_ljasj_i + 1))
-  done
-  printf '%s' "$_ljasj_out"
-}
-
-# _llm_json_array_sanitize_fields_py JSON FIELD1 [FIELD2 ...] — python3
-# implementation of the strict helper, same fail-closed contract. Nothing of
-# unbounded size is carried as an argv string: the array and each cleaned
-# value go through temp files and the per-item and accumulator JSON through
-# stdin, because exec of an argv string over MAX_ARG_STRLEN (~128 KiB) fails
-# with E2BIG. The old argv-carried form failed its own "is this an array"
-# check on a large array and returned the ORIGINAL, unsanitized input -- a
-# silent bypass of the sanitizer exactly when the payload is big. The temp
-# files are created here and removed on every exit; the work is in
-# _llm_json_array_sanitize_fields_py_run so cleanup is written once.
-_llm_json_array_sanitize_fields_py() {
-  _ljasp_json="$1"
-  shift
-  _ljasp_fields="$*"
-  _ljasp_arr=$(mktemp -t clagentic-llm-arrsan-a.XXXXXX 2>/dev/null) || _ljasp_arr=""
-  _ljasp_itf=$(mktemp -t clagentic-llm-arrsan-i.XXXXXX 2>/dev/null) || _ljasp_itf=""
-  _ljasp_val=$(mktemp -t clagentic-llm-arrsan-v.XXXXXX 2>/dev/null) || _ljasp_val=""
-  _ljasp_rc=1
-  if [ -n "$_ljasp_arr" ] && [ -n "$_ljasp_itf" ] && [ -n "$_ljasp_val" ]; then
-    if _ljasp_result=$(_llm_json_array_sanitize_fields_py_run "$_ljasp_arr" "$_ljasp_itf" "$_ljasp_val" "$_ljasp_json" $_ljasp_fields); then
-      _ljasp_rc=0
-    fi
-  fi
-  rm -f "$_ljasp_arr" "$_ljasp_itf" "$_ljasp_val"
-  [ "$_ljasp_rc" -eq 0 ] || return 1
-  printf '%s' "$_ljasp_result"
-}
-
-# _llm_json_array_sanitize_fields_py_run ARR_FILE ITEM_FILE VALUE_FILE JSON
-# FIELD... — the python3 decompose/sanitize/rebuild loop. Every step is
-# checked: any tool error or empty intermediate result returns 1 with no
-# output, never the input and never a partial array.
-_llm_json_array_sanitize_fields_py_run() {
-  _ljapr_arr="$1"
-  _ljapr_itf="$2"
-  _ljapr_val="$3"
-  _ljapr_json="$4"
-  shift 4
-  _ljapr_fields="$*"
-  printf '%s' "$_ljapr_json" > "$_ljapr_arr" || return 1
-  # "valid JSON but not an array" is a failure, distinct from a genuine empty
-  # array (count 0).
-  _ljapr_is_array=$(python3 -c 'import json,sys
-try:
-    with open(sys.argv[1], "rb") as f:
-        d = json.loads(f.read())
-    print("1" if isinstance(d, list) else "0")
-except Exception:
-    print("0")' "$_ljapr_arr" 2>/dev/null) || return 1
-  [ "$_ljapr_is_array" = "1" ] || return 1
-  _ljapr_count=$(python3 -c 'import json,sys
-with open(sys.argv[1], "rb") as f:
-    print(len(json.loads(f.read())))' "$_ljapr_arr" 2>/dev/null) || return 1
-  case "$_ljapr_count" in ''|*[!0-9]*) return 1 ;; esac
-  _ljapr_out="[]"
-  _ljapr_i=0
-  while [ "$_ljapr_i" -lt "$_ljapr_count" ]; do
-    _ljapr_item=$(python3 -c 'import json,sys
-with open(sys.argv[1], "rb") as f:
-    d = json.loads(f.read())
-print(json.dumps(d[int(sys.argv[2])]))' "$_ljapr_arr" "$_ljapr_i" 2>/dev/null) || return 1
-    [ -n "$_ljapr_item" ] || return 1
-    for _ljapr_field in $_ljapr_fields; do
-      _ljapr_raw=$(printf '%s' "$_ljapr_item" | python3 -c 'import json,sys
-d = json.loads(sys.stdin.buffer.read())
-v = d.get(sys.argv[1], "")
-print(v if isinstance(v, str) else "")' "$_ljapr_field" 2>/dev/null) || return 1
-      _ljapr_clean=$(_llm_field_sanitize "$_ljapr_raw") || return 1
-      printf '%s' "$_ljapr_clean" > "$_ljapr_val" || return 1
-      _ljapr_item=$(printf '%s' "$_ljapr_item" | python3 -c '
-import json, sys
-item = json.loads(sys.stdin.buffer.read())
-field = sys.argv[1]
-if field in item:
-    with open(sys.argv[2], "rb") as f:
-        item[field] = f.read().decode("utf-8", "surrogateescape")
-print(json.dumps(item))
-' "$_ljapr_field" "$_ljapr_val" 2>/dev/null) || return 1
-      [ -n "$_ljapr_item" ] || return 1
-    done
-    printf '%s' "$_ljapr_item" > "$_ljapr_itf" || return 1
-    _ljapr_out=$(printf '%s' "$_ljapr_out" | python3 -c 'import json,sys
-arr = json.loads(sys.stdin.buffer.read())
-with open(sys.argv[1], "rb") as f:
-    arr.append(json.loads(f.read()))
-print(json.dumps(arr))' "$_ljapr_itf" 2>/dev/null) || return 1
-    [ -n "$_ljapr_out" ] || return 1
-    _ljapr_i=$((_ljapr_i + 1))
-  done
-  printf '%s' "$_ljapr_out"
+  [ -n "$*" ] || return 1
+  printf '%s' "$_ljass_json" | ds_findings_run ingest sanitize-fields "$@"
 }
 
 # _adversarial_findings_sort_blocking_first JSON — reorder a JSON array of
@@ -1564,70 +1308,16 @@ print(json.dumps(arr))' "$_ljapr_itf" 2>/dev/null) || return 1
 # ever drop the LEAST-severe, non-blocking tail of the array, never a
 # blocking finding while a less-severe one survives.
 #
-# Fail-open, matching every other JSON-tool-dependent helper in this
-# codebase: a non-array, malformed JSON, or the complete absence of jq AND
-# python3 returns the ORIGINAL input unchanged.
+# Fail-open: a non-array, malformed JSON, or a missing python3 returns the
+# ORIGINAL input unchanged. The ordering logic is findings.py ingest
+# adversarial-sort.
 #
 # Args: JSON (a JSON array of adversarial-finding objects, as a single
 # string). stdout: the same objects, reordered (or the original JSON
 # unchanged, on any failure).
 _adversarial_findings_sort_blocking_first() {
   _afsbf_json="$1"
-
-  if command -v jq >/dev/null 2>&1; then
-    if ! printf '%s' "$_afsbf_json" | jq -e '. | type == "array"' >/dev/null 2>&1; then
-      printf '%s' "$_afsbf_json"
-      return 0
-    fi
-    _afsbf_out=$(printf '%s' "$_afsbf_json" | jq -c '
-      def tier_rank: if .tier == "blocking" then 1 else 0 end;
-      def sev_rank:
-        if .severity == "critical" then 4
-        elif .severity == "high" then 3
-        elif .severity == "medium" then 2
-        elif .severity == "low" then 1
-        else 0 end;
-      to_entries
-      | sort_by([-(.value | tier_rank), -(.value | sev_rank), .key])
-      | map(.value)
-    ' 2>/dev/null)
-    [ -n "$_afsbf_out" ] || { printf '%s' "$_afsbf_json"; return 0; }
-    printf '%s' "$_afsbf_out"
-    return 0
-  fi
-
-  if command -v python3 >/dev/null 2>&1; then
-    _afsbf_out=$(python3 -c '
-import json, sys
-raw = sys.argv[1]
-sev_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-try:
-    arr = json.loads(raw)
-    if not isinstance(arr, list):
-        raise ValueError("not a list")
-except Exception:
-    print(raw)
-    sys.exit(0)
-
-def key(pair):
-    idx, item = pair
-    tier_rank = 1 if isinstance(item, dict) and item.get("tier") == "blocking" else 0
-    sr = sev_rank.get(item.get("severity") if isinstance(item, dict) else None, 0)
-    # Negate for descending order; idx (ascending) preserves original
-    # relative order within an identical (tier_rank, sr) bucket (stable).
-    return (-tier_rank, -sr, idx)
-
-ordered = [item for _, item in sorted(enumerate(arr), key=key)]
-print(json.dumps(ordered))
-' "$_afsbf_json" 2>/dev/null)
-    [ -n "$_afsbf_out" ] || { printf '%s' "$_afsbf_json"; return 0; }
-    printf '%s' "$_afsbf_out"
-    return 0
-  fi
-
-  # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open,
-  # matching every other JSON-tool-dependent helper in this codebase.
-  printf '%s' "$_afsbf_json"
+  printf '%s' "$_afsbf_json" | ds_findings_run ingest adversarial-sort || printf '%s' "$_afsbf_json"
 }
 
 # _llm_json_array_cap JSON MAX — truncate a JSON array of objects to the
@@ -1670,38 +1360,7 @@ _llm_json_array_cap() {
   # 0 is not "no findings": it falls back to 200 like any other invalid value.
   _ljac_max=$(ds_positive_int_or_default "$_ljac_max" 200)
 
-  if command -v jq >/dev/null 2>&1; then
-    if ! printf '%s' "$_ljac_json" | jq -e '. | type == "array"' >/dev/null 2>&1; then
-      printf '%s' "$_ljac_json"
-      return 0
-    fi
-    _ljac_out=$(printf '%s' "$_ljac_json" | jq -c --argjson max "$_ljac_max" '.[0:$max]' 2>/dev/null)
-    [ -n "$_ljac_out" ] || { printf '%s' "$_ljac_json"; return 0; }
-    printf '%s' "$_ljac_out"
-    return 0
-  fi
-
-  if command -v python3 >/dev/null 2>&1; then
-    _ljac_out=$(python3 -c '
-import json, sys
-raw, max_n = sys.argv[1], int(sys.argv[2])
-try:
-    arr = json.loads(raw)
-    if not isinstance(arr, list):
-        raise ValueError("not a list")
-except Exception:
-    print(raw)
-    sys.exit(0)
-print(json.dumps(arr[:max_n]))
-' "$_ljac_json" "$_ljac_max" 2>/dev/null)
-    [ -n "$_ljac_out" ] || { printf '%s' "$_ljac_json"; return 0; }
-    printf '%s' "$_ljac_out"
-    return 0
-  fi
-
-  # No JSON tool at all -- cannot safely decompose/rebuild. Fail-open,
-  # matching every other JSON-tool-dependent helper in this codebase.
-  printf '%s' "$_ljac_json"
+  printf '%s' "$_ljac_json" | ds_findings_run ingest cap --max "$_ljac_max" || printf '%s' "$_ljac_json"
 }
 
 # ---------------------------------------------------------------- router URL classification (lr-02f048)

@@ -14,6 +14,7 @@ throwaway `sh`; bin/clagentic-lite's own subcommands are never executed.
 Run with: python3 -m unittest scripts.test_agent_model_keys -v
 """
 import os
+import re
 import unittest
 from unittest import mock
 
@@ -21,6 +22,9 @@ from scripts.test_unified_plugin_render import (
     AGENTS_SRC,
     _RenderTestBase,
 )
+
+PROMPTS_SRC = os.path.join(os.path.dirname(AGENTS_SRC), "prompts")
+_SHARED_MARKER = re.compile(r"^\{\{shared:([a-z]+):([a-z-]+)\}\}$")
 
 # (env prefix, agent file)
 ROLES = (
@@ -43,9 +47,33 @@ DOCTOR = (
 )
 
 
+def _shared_block_lines(role, name):
+    """Lines of one block of plugins/clagentic-lite/prompts/<role>.shared.txt,
+    parsed independently of the shell expander the render uses."""
+    lines, active = [], False
+    with open(os.path.join(PROMPTS_SRC, f"{role}.shared.txt")) as f:
+        for line in f.read().splitlines(keepends=True):
+            if line.startswith("@@@ "):
+                active = line[4:].strip() == name
+            elif active:
+                lines.append(line)
+    assert lines, f"no block {name!r} in the {role} shared prompt source"
+    return lines
+
+
 def _source_lines(agent):
+    """The checked-in agent file with each {{shared:ROLE:BLOCK}} line replaced
+    by that block, which is what the render is specified to produce before it
+    places the model line."""
+    expanded = []
     with open(os.path.join(AGENTS_SRC, f"{agent}.md")) as f:
-        return f.read().splitlines(keepends=True)
+        for line in f.read().splitlines(keepends=True):
+            marker = _SHARED_MARKER.match(line.rstrip("\n"))
+            if marker:
+                expanded.extend(_shared_block_lines(*marker.groups()))
+            else:
+                expanded.append(line)
+    return expanded
 
 
 def _frontmatter(lines):
@@ -78,6 +106,8 @@ class _AgentModelBase(_RenderTestBase):
 
 class TestRenderPinnedModel(_AgentModelBase):
     def test_unset_is_byte_identical_to_checked_in_files(self):
+        # "Checked-in" means the template with its shared blocks expanded; the
+        # three roles without markers are byte-identical to the file itself.
         self._render()
         for _, agent in ROLES:
             self.assertEqual(self._rendered_lines(agent), _source_lines(agent), msg=agent)

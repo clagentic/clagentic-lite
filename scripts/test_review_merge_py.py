@@ -1,109 +1,36 @@
 """
-Python unit tests for the Python-path logic in review-merge.sh.
+Python-level tests for the dedup and key logic behind review-merge.sh.
 
-Tests the exact same code that _dedup_findings_py and the
-merge_envelopes python phase use — extracted verbatim so the
-tests exercise real behaviour, not re-implementations.
+These used to exercise verbatim copies of the python heredocs embedded in
+review-merge.sh. That logic now lives once, in the finding pipeline
+(plugins/clagentic-lite/bin/findings.py), so the tests load the real module and
+call it directly: what they prove is the shipped behaviour, not a copy of it.
 
 Run with: python3 -m unittest scripts/test_review_merge_py.py -v
 """
-import hashlib
-import json
+import importlib.util
 import os
-import sys
 import tempfile
 import unittest
 
-
-# ── Verbatim copies of functions from _dedup_findings_py heredoc ──────────
-
-def find_context_window(diff_file, fname, target_line):
-    """Extract +-lines around target_line for a given file from a unified diff."""
-    import re
-    result = []
-    cur_file = ""
-    diff_line = 0
-    try:
-        with open(diff_file) as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if line.startswith("+++ "):
-                    cur_file = line[4:]
-                    if cur_file.startswith("b/"):
-                        cur_file = cur_file[2:]
-                    diff_line = 0
-                elif line.startswith("@@ "):
-                    m = re.search(r'\+(\d+)', line)
-                    diff_line = int(m.group(1)) - 1 if m else 0
-                elif line.startswith("+") and cur_file == fname:
-                    diff_line += 1
-                    if abs(diff_line - target_line) <= 2:
-                        result.append(line)
-    except Exception:
-        pass
-    return result
+_TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_PIPELINE_PATH = os.path.join(_TOOL_HOME, "plugins", "clagentic-lite", "bin", "findings.py")
+_spec = importlib.util.spec_from_file_location("findings_pipeline_under_test", _PIPELINE_PATH)
+pipeline = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(pipeline)
 
 
 def compute_key(f, strategy, diff_file=""):
-    try:
-        if strategy == "content-hash" and diff_file and os.path.isfile(diff_file):
-            fname = f.get("file", "")
-            line  = int(f.get("line", 0) or 0)
-            ctx = find_context_window(diff_file, fname, line)
-            if ctx:
-                return hashlib.sha256("\n".join(ctx).encode()).hexdigest()
-        # Use `or 0` to match jq's `// 0` — null/absent line becomes "0", not "".
-        raw = "{}:{}:{}:{}".format(
-            f.get("file", ""),
-            str(f.get("line") or 0),
-            f.get("category", ""),
-            str(f.get("message", "")).lower()
-        )
-        return hashlib.sha256(raw.encode()).hexdigest()
-    except Exception:
-        return None
+    return pipeline.finding_key(f, strategy, diff_file)
 
 
 def dedup_findings_py(findings, strategy="location", seen=None, diff_file=""):
-    """Pure-Python dedup matching the heredoc in _dedup_findings_py."""
-    severity_rank = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-    if seen is None:
-        seen = {}
-    new_keys = {}
-    deduped = []
-    key_to_pos = {}
-
-    for f in findings:
-        key = compute_key(f, strategy, diff_file)
-        if key is None:
-            deduped.append(f)
-            continue
-
-        sev = str(f.get("severity", "")).lower()
-        r = severity_rank.get(sev, 0)
-
-        if key in seen:
-            if key in key_to_pos:
-                pos = key_to_pos[key]
-                old_sev = str(deduped[pos].get("severity", "")).lower()
-                old_r = severity_rank.get(old_sev, 0)
-                if r > old_r:
-                    deduped[pos] = f
-            continue
-
-        if key not in key_to_pos:
-            key_to_pos[key] = len(deduped)
-            deduped.append(f)
-            new_keys[key] = True
-        else:
-            pos = key_to_pos[key]
-            old_sev = str(deduped[pos].get("severity", "")).lower()
-            old_r = severity_rank.get(old_sev, 0)
-            if r > old_r:
-                deduped[pos] = f
-
-    seen.update(new_keys)
-    return deduped, seen
+    """The pipeline's drop-mode dedup, in the (result, seen) shape these
+    tests have always asserted against."""
+    seen = dict(seen or {})
+    kept, new_keys = pipeline.dedup_findings(findings, strategy, set(seen), diff_file, False)
+    seen.update({key: True for key in new_keys})
+    return kept, seen
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────
@@ -130,14 +57,13 @@ class TestDedupFindingsPy(unittest.TestCase):
         self.assertEqual(len(result), 2)
 
     def test_issue_class_and_class_fix_survive_dedup_untouched(self):
-        """lr-3eb18c: dedup_findings_py (like the sh/jq merge path) is pure
-        object pass-through keyed on file/line/category/message -- it must
-        never inspect, require, or drop issue_class/class_fix. Two distinct
-        findings, each carrying the new fields, must both survive dedup with
-        those fields byte-identical -- proving the per-chunk merge path
-        carries the mandatory field through without any code change of its
-        own (the fields flow because this function never allowlists,
-        unlike _sanitize_review_findings_envelope upstream of it)."""
+        """dedup is pure object pass-through keyed on file/line/category/
+        message -- it must never inspect, require, or drop issue_class/
+        class_fix. Two distinct findings, each carrying the fields, must both
+        survive dedup with those fields byte-identical -- proving the per-chunk
+        merge path carries the mandatory field through without any code of its
+        own (the fields flow because dedup never allowlists, unlike the review
+        ingest step upstream of it)."""
         findings = [
             {"severity": "high", "file": "a.py", "line": 1, "category": "sec",
              "message": "xss", "issue_class": "unbounded external call",
@@ -155,35 +81,16 @@ class TestDedupFindingsPy(unittest.TestCase):
         self.assertEqual(by_file["b.py"]["class_fix"], "n/a — isolated")
 
     def test_conservative_retain_on_none_key(self):
-        """Finding that raises key computation should be retained (never dropped)."""
-        # Simulate a finding with None-producing key: we pass a bad dict that
-        # would cause compute_key to raise internally. In practice this path
-        # triggers when compute_key returns None.
-        findings = [{"severity": "high", "file": "x.py", "line": 1, "category": "c", "message": "m"}]
-        # Monkey-patch compute_key to return None for this test only.
-        #
-        # ORDER-DEPENDENCY FIX (lr-7047bf fold-in, same class as
-        # test_freshness_helper_sweep.py): a hardcoded `import scripts.
-        # test_review_merge_py as me` can resolve to a DIFFERENT module
-        # object than the one this TestCase and dedup_findings_py actually
-        # run in, under `unittest discover` (no scripts/__init__.py in this
-        # repo, so discovery imports this file as a bare top-level module
-        # while the dotted import creates a second, independent object). A
-        # patch applied to the wrong object's `compute_key` attribute is a
-        # silent no-op -- dedup_findings_py's internal call still resolves
-        # the REAL compute_key via its own module's globals, so this test
-        # would pass for the wrong reason (the real compute_key never
-        # raising) rather than proving the conservative-retain path.
-        # Resolving via sys.modules[self.__class__.__module__] always
-        # targets the module this test is actually executing in.
-        me = sys.modules[self.__class__.__module__]
-        orig = me.compute_key
-        me.compute_key = lambda f, s, d="": None
-        try:
-            result, _ = dedup_findings_py(findings, strategy="location")
-            self.assertEqual(len(result), 1, "finding with uncomputable key must be conservatively retained")
-        finally:
-            me.compute_key = orig
+        """A finding whose key cannot be computed is retained, never dropped."""
+        findings = [
+            {"severity": "high", "file": "x.py", "line": 1, "category": "c", "message": "m"},
+            "not a finding object",
+            {"severity": "high", "file": "x.py", "line": "not-a-number", "category": "c", "message": "m"},
+        ]
+        self.assertIsNone(compute_key(findings[1], "location"))
+        result, _ = dedup_findings_py(findings, strategy="content-hash",
+                                      diff_file=__file__)
+        self.assertEqual(len(result), 3, "findings with an uncomputable key must be conservatively retained")
 
     def test_cross_run_dedup_via_seen(self):
         """Finding already in seen dict is excluded on second pass."""
@@ -233,30 +140,24 @@ class TestDedupFindingsPy(unittest.TestCase):
         self.assertEqual(len(result), 1)
 
     def test_invalid_json_passthrough(self):
-        """compute_key handles missing fields gracefully (no exception propagation)."""
+        """The key handles missing fields gracefully (no exception propagation)."""
         # Empty-dict findings: no file/line/category/message -> location key is still computed.
         findings = [{}]
         result, _ = dedup_findings_py(findings, strategy="location")
         self.assertEqual(len(result), 1)  # retained (key computed from empty strings)
 
     def test_null_line_matches_absent_line_key(self):
-        """Regression: lr-000c — null line and absent line must produce the same key.
+        """Regression: null line and absent line must produce the same key.
 
-        jq uses `(.line // 0)` which collapses both null and absent to integer 0,
-        then stringifies to "0".  The python path must match: `str(f.get("line") or 0)`
-        likewise yields "0" for both None and missing.  A prior bug used
-        `f.get("line", "")` which yielded "" instead, causing key mismatch between
-        jq and python paths and breaking cross-round dedup.
+        The location key collapses both null and absent to the integer 0 and
+        stringifies it to "0". A prior bug used `f.get("line", "")`, which
+        yielded "" instead and broke cross-round dedup.
         """
-        # See test_conservative_retain_on_none_key's comment above for why
-        # this resolves the module dynamically rather than via a hardcoded
-        # dotted import (lr-7047bf fold-in, order-dependency fix).
-        me = sys.modules[self.__class__.__module__]
-        key_null   = me.compute_key({"file": "f.py", "line": None,   "category": "c", "message": "m"}, "location")
-        key_absent = me.compute_key({"file": "f.py",                  "category": "c", "message": "m"}, "location")
-        key_zero   = me.compute_key({"file": "f.py", "line": 0,      "category": "c", "message": "m"}, "location")
+        key_null   = compute_key({"file": "f.py", "line": None,   "category": "c", "message": "m"}, "location")
+        key_absent = compute_key({"file": "f.py",                  "category": "c", "message": "m"}, "location")
+        key_zero   = compute_key({"file": "f.py", "line": 0,      "category": "c", "message": "m"}, "location")
         self.assertEqual(key_null, key_absent, "null line and absent line must hash identically")
-        self.assertEqual(key_null, key_zero,   "null line and 0 line must hash identically (matches jq // 0)")
+        self.assertEqual(key_null, key_zero,   "null line and 0 line must hash identically")
 
 
 class TestSplitDiffLogic(unittest.TestCase):
@@ -326,40 +227,24 @@ class TestSplitDiffLogic(unittest.TestCase):
         )
 
 
-class TestMergeEnvelopesPyDelegation(unittest.TestCase):
-    """Verify the python merge path no longer contains inline dedup logic."""
+class TestReviewMergeHoldsNoFindingLogic(unittest.TestCase):
+    """review-merge.sh is wrappers only: merge, dedup, key derivation and the
+    ledger all delegate to the finding pipeline."""
 
-    def test_no_inline_dedup_in_merge_py(self):
-        """_merge_envelopes_py must NOT contain inline severity_rank dedup logic."""
-        rm_path = os.path.join(
-            os.path.dirname(__file__), "review-merge.sh"
-        )
-        with open(rm_path) as f:
-            content = f.read()
+    def setUp(self):
+        with open(os.path.join(os.path.dirname(__file__), "review-merge.sh")) as f:
+            self.content = f.read()
 
-        # Find the _merge_envelopes_py function body.
-        start = content.find("_merge_envelopes_py()")
-        end   = content.find("\n_merge_envelopes_jq()", start) if "_merge_envelopes_jq" in content[start:] else len(content)
-        # Actually, jq version is defined first; py version comes after jq.
-        # Re-find: _merge_envelopes_py is defined after _merge_envelopes_jq.
-        start_py = content.find("_merge_envelopes_py()")
-        if start_py == -1:
-            self.fail("_merge_envelopes_py() not found in review-merge.sh")
+    def test_merge_and_dedup_delegate_to_the_pipeline(self):
+        for call in ("ingest merge", "fingerprint dedup", "fingerprint keys", "fingerprint bump",
+                     "verdict ledger-append", "verdict ledger-entries"):
+            self.assertIn("ds_findings_run " + call, self.content)
 
-        # The function must call dedup_findings, not implement it inline.
-        # Check that the CLEANUP 1 fix applied: "dedup_findings" appears after the py fn start.
-        fn_body = content[start_py:start_py + 4000]
-        self.assertIn(
-            "dedup_findings",
-            fn_body,
-            "_merge_envelopes_py must delegate to dedup_findings (CLEANUP 1)"
-        )
-        # And must NOT contain the old inline severity_rank dict definition.
-        self.assertNotIn(
-            '"low": 1, "medium": 2, "high": 3, "critical": 4',
-            fn_body,
-            "_merge_envelopes_py must not contain inline severity_rank (CLEANUP 1: remove inline dedup)"
-        )
+    def test_no_inline_severity_table_or_json_tooling(self):
+        self.assertNotIn('"low": 1, "medium": 2, "high": 3, "critical": 4', self.content)
+        self.assertNotIn("srank[", self.content)
+        for tool in ("jq ", "json.load", "hashlib"):
+            self.assertNotIn(tool, self.content)
 
 
 if __name__ == "__main__":

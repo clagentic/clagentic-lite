@@ -23,6 +23,7 @@ Every script that uses `sed`, `date`, `stat`, or a timeout sources `scripts/plat
 | `mktemp -d -t` | template optional | template required | always provide template |
 | `timeout` | GNU coreutils default | not installed by default; `brew install coreutils` provides `gtimeout` | `$DS_TIMEOUT_CMD` (detects `timeout`, falls back to `gtimeout`; if neither exists, resolves to `ds_timeout_missing`, which FAILS CLOSED — refuses to run the wrapped command unbounded and returns exit 99 with an install hint, rather than silently running without a bound. See AGENTS.md Invariants, INV-1a.) |
 | JSON parsing in hooks | `jq` or `python3` | `jq` or `python3` (python3 ships on modern macOS) | `ds_json_field` helper in `scripts/platform.sh`. **Required** — hooks fail closed without either. |
+| Finding decisions (review, adversarial, ledger, merge-gate summary) | `python3` | `python3` (ships on macOS) | `plugins/clagentic-lite/bin/findings.py`, stdlib only, called through `ds_findings_run` in `scripts/platform.sh`. **Required** — gate commands fail closed without it; `doctor` and `init` report it missing. |
 | `realpath` | available everywhere | not on macOS by default | shimmed via `python3 os.path.realpath` in `pre-write-guard.sh` for the W-002 normalization check |
 
 ## Bash version

@@ -98,7 +98,9 @@ This checkout does not ship a tracked, live `.claude/hooks/*.sh` + `.claude/sett
 | `share/hook-shims/{session-start,prompt-inject,pre-bash-guard,pre-write-guard,post-tool-nudge,stop-summarize}.sh.template` | source of truth for the six Claude Code lifecycle hook scripts (lr-57db23, INV-7). Materialized into `$CLAGENTIC_LITE_HOME/.claude/hooks/` at `init`/`update` via `__CLAGENTIC_LITE_HOME__` substitution (`_stamp_claude_hooks`) — the one copy every enrolled repo's `.claude/settings.json` calls back into by absolute path |
 | `.claude-plugin/marketplace.json` | plugin marketplace manifest — declares the `clagentic-lite` plugin (checked-in source; the actual install source is the rendered copy, see "Single-plugin config-aware render" below) |
 | `plugins/clagentic-lite/.claude-plugin/plugin.json` | per-plugin manifest; version bumped by maintainer PRs that change agent or skill files — never by `clagentic-lite update` |
-| `plugins/clagentic-lite/agents/{builder,reviewer,auditor,merge-gate,troubleshooter}.md` | role contracts — read-only input to `_render_clagentic_lite_plugin_dir` (lr-1b5a31). Never installed directly; rendered into `$CLAGENTIC_LITE_HOME/.clagentic/rendered-plugin/` first — see "Single-plugin config-aware render" below |
+| `plugins/clagentic-lite/agents/{builder,reviewer,auditor,merge-gate,troubleshooter}.md` | role contracts — read-only input to `_render_clagentic_lite_plugin_dir` (lr-1b5a31). Never installed directly; rendered into `$CLAGENTIC_LITE_HOME/.clagentic/rendered-plugin/` first — see "Single-plugin config-aware render" below. `reviewer.md` and `auditor.md` are templates: their `{{shared:ROLE:BLOCK}}` lines are expanded from `plugins/clagentic-lite/prompts/<role>.shared.txt` |
+| `plugins/clagentic-lite/prompts/{reviewer,auditor}.shared.txt` | the one source of each role's shared instruction text; both the gate prompt (`ds_review_prompt`/`ds_adversarial_prompt`) and the rendered agent file are generated from it — edit shared wording only here (`docs/GATES.md` "Single-sourced role prompts") |
+| `plugins/clagentic-lite/bin/findings.py` | the finding pipeline: every finding decision (ingest, fingerprint, dispositions, verdict, render) in one stdlib-only file with no dependency on the shell gates; `python3` is required for it (`docs/GATES.md` "The finding pipeline") |
 | `plugins/clagentic-lite/skills/infosec-rt/SKILL.md` | infosec red-team commentary skill — installed globally via the plugin |
 | `plugins/clagentic-lite/skills/eng-consult/SKILL.md` | engineering consulting panel skill — installed globally via the plugin |
 | `.claude/commands/recall.md` | `/recall` slash command — different from the hooks above: this file IS the source of truth at this path, symlinked directly into enrolled repos, no template/materialization step |
@@ -111,7 +113,7 @@ This checkout does not ship a tracked, live `.claude/hooks/*.sh` + `.claude/sett
 | `scripts/memory.sh` | SQLite session memory CRUD |
 | `scripts/llm-client.sh` | role-aware LLM wrapper with model_chain fallback: the gate/CLI model path |
 | `scripts/gates.sh` | gate orchestrator + digest + ship + merge-gate |
-| `scripts/review-merge.sh`, `scripts/host-adapter.sh` | sourced by `gates.sh`: diff chunking / cross-round finding tracking, and the one file allowed to name a git host |
+| `scripts/review-merge.sh`, `scripts/host-adapter.sh` | sourced by `gates.sh`: diff chunking plus thin wrappers over the finding pipeline (`merge_envelopes`, `dedup_findings`, the ledger), and the one file allowed to name a git host |
 | `scripts/smoke.sh` | non-interactive end-to-end (local sanity check) |
 | `docs/` | DESIGN, GATES, ROUTER (clagentic-router integration, operator-facing), DEMO-SCRIPT, PORTABILITY, LLM-USAGE (checklist for an LLM/agent setting up or operating clagentic-lite on a user's behalf) |
 | `examples/{python,node,go}/` | demo projects with planted issues |

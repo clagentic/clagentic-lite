@@ -1,34 +1,37 @@
 #!/bin/sh
 # clagentic-lite :: review-merge helper
 #
-# Sourced (not executed) by gates.sh. Provides four pure POSIX-sh functions
-# for diff chunking, per-chunk envelope merging, and cross-round key tracking:
+# Sourced (not executed) by gates.sh. Diff chunking in POSIX sh, plus thin
+# wrappers over the finding pipeline (plugins/clagentic-lite/bin/findings.py)
+# for per-chunk envelope merging, cross-round key tracking and the review
+# ledger. Every finding decision lives in findings.py; nothing here parses or
+# ranks a finding.
 #
 #   split_diff   DIFF_FILE CHUNK_DIR CHUNK_BYTES
 #   merge_envelopes ENVELOPE_DIR DEDUP_KEY_STRATEGY
-#   dedup_findings  KEY_STRATEGY SEEN_FILE [DIFF_FILE]  (reads stdin, writes stdout)
+#   dedup_findings  KEY_STRATEGY SEEN_FILE [DIFF_FILE [MODE]]  (reads stdin, writes stdout)
 #   finding_content_keys DIFF_FILE  (reads stdin JSON findings array, writes stdout
 #                                    TSV: key<TAB>file<TAB>category<TAB>message)
+#   finding_recurrence_bump COUNTS_FILE
+#   ledger_append / ledger_entries_for_branch / ledger_latest_for_branch
 #
 # Dependencies:
-#   Required: git, awk, sed (via platform.sh shims), wc
+#   Required: git, awk, sed (via platform.sh shims), wc, python3 (every JSON
+#             operation; see ds_findings_run in platform.sh, which fails closed
+#             and says so when python3 is missing)
 #   Optional: sha256sum or shasum (soft; identity fallback when both absent)
-#   Optional: jq or python3 (soft; degraded-envelope if both absent — same pattern
-#             as ds_json_field / build_gate_summary in platform.sh / gates.sh)
 #
-# This module sources platform.sh for ds_json_field, ds_file_size, and the
-# DS_TIMEOUT_CMD pattern. It does NOT source memory.sh or llm-client.sh, and
-# does NOT call ds_audit_log (audit stays in gates.sh).
+# This module needs platform.sh sourced first (ds_findings_run, ds_file_size).
+# It does NOT source memory.sh or llm-client.sh, and does NOT call
+# ds_audit_log (audit stays in gates.sh).
 
 # ---------------------------------------------------------------- sha256 shim --
 #
 # Probed once at source time. Priority: sha256sum (GNU coreutils) ->
 # shasum -a 256 (BSD/macOS) -> identity fallback (cat, returns input unchanged).
-# The identity fallback means dedup key = the raw input; dedup still works
-# locally but is sensitive to whitespace changes. clagentic-lite doctor warns when
-# neither sha256 tool is present.
-#
-# Shim pattern mirrors DS_TIMEOUT_CMD from platform.sh.
+# The identity fallback means a state-identity hash is the raw input; it still
+# distinguishes states but is sensitive to whitespace. clagentic-lite doctor
+# warns when neither sha256 tool is present.
 #
 # _rm_sha256 STDIN -> prints hex digest on stdout.
 if command -v sha256sum >/dev/null 2>&1; then
@@ -247,1126 +250,102 @@ ${_sd_hcontent}"
 # merge_envelopes ENVELOPE_DIR DEDUP_KEY_STRATEGY
 #
 # Merges envelope-NNN.json files (lexicographic order) from ENVELOPE_DIR into
-# one canonical envelope. Fields:
-#   summary       = concatenation of non-degraded summaries, separated by " | "
-#   checked       = unique union of all checked arrays
-#   findings      = union of all findings arrays, passed through dedup_findings
-#   degraded      = true if ANY envelope has degraded=true
-#   chunked       = true
-#   chunks        = N (total count)
-#   chunks_degraded = count of degraded envelopes
-#
-# Note: does NOT add the _clagentic_diff_sha stamp (gates.sh does that once
-# on the final merged envelope, same as cmd_review does on a single-chunk result).
+# one canonical envelope: summaries of non-degraded chunks joined with " | ",
+# the union of checked arrays, findings deduplicated within the run (higher
+# severity wins), degraded=true if ANY chunk is degraded or unreadable, plus
+# chunked/chunks/chunks_degraded. Does NOT add the _clagentic_diff_sha stamp
+# (gates.sh does that once on the final merged envelope).
 #
 # stdout: merged JSON
 # exit 0: ok
-# exit 1: no valid envelopes found
+# exit 1: no valid envelopes found, or the finding pipeline is unavailable
 merge_envelopes() {
   _me_dir="$1"
   _me_strategy="${2:-location}"
-
-  _me_seen_file=$(mktemp -t clagentic-me-seen.XXXXXX)
-
-  if command -v jq >/dev/null 2>&1; then
-    _merge_envelopes_jq "$_me_dir" "$_me_strategy" "$_me_seen_file"
-    _me_rc=$?
-  elif command -v python3 >/dev/null 2>&1; then
-    _merge_envelopes_py "$_me_dir" "$_me_strategy" "$_me_seen_file"
-    _me_rc=$?
-  else
-    # No JSON tool — emit a degraded envelope.
-    printf '{"degraded":true,"chunked":true,"chunks":0,"chunks_degraded":0,"summary":"[clagentic-lite degraded] no JSON tool (jq/python3) available for merge_envelopes","checked":[],"findings":[]}\n'
-    rm -f "$_me_seen_file"
+  _me_rc=0
+  _me_out=$(ds_findings_run ingest merge "$_me_dir" --strategy "$_me_strategy") || _me_rc=$?
+  if [ -z "$_me_out" ]; then
+    printf '{"degraded":true,"chunked":true,"chunks":0,"chunks_degraded":0,"summary":"[clagentic-lite degraded] python3 (the finding pipeline) unavailable for merge_envelopes","checked":[],"findings":[]}\n'
     return 1
   fi
-
-  rm -f "$_me_seen_file"
-  return $_me_rc
-}
-
-_merge_envelopes_jq() {
-  _mej_dir="$1"
-  _mej_strategy="$2"
-  _mej_seen="$3"
-
-  # Collect envelope files in lexicographic order.
-  _mej_files=""
-  _mej_count=0
-  _mej_degraded_count=0
-  _mej_summaries=""
-  _mej_checked='[]'
-  _mej_all_findings='[]'
-  _mej_any_degraded="false"
-
-  for _mej_f in "$_mej_dir"/envelope-*.json; do
-    [ -f "$_mej_f" ] || continue
-    _mej_count=$((_mej_count + 1))
-
-    # Check if degraded.
-    _mej_is_deg=$(jq -r '.degraded // false' "$_mej_f" 2>/dev/null)
-    if [ "$_mej_is_deg" = "true" ]; then
-      _mej_degraded_count=$((_mej_degraded_count + 1))
-      _mej_any_degraded="true"
-    else
-      # Accumulate non-degraded summary.
-      _mej_s=$(jq -r '.summary // ""' "$_mej_f" 2>/dev/null)
-      if [ -n "$_mej_s" ]; then
-        if [ -z "$_mej_summaries" ]; then
-          _mej_summaries="$_mej_s"
-        else
-          _mej_summaries="${_mej_summaries} | ${_mej_s}"
-        fi
-      fi
-    fi
-
-    # Union checked arrays.
-    _mej_fc=$(jq -c '.checked // []' "$_mej_f" 2>/dev/null)
-    _mej_checked=$(printf '%s\n%s\n' "$_mej_checked" "$_mej_fc" \
-      | jq -sc 'add | unique' 2>/dev/null || printf '%s' "$_mej_checked")
-
-    # Accumulate findings.
-    _mej_ff=$(jq -c '.findings // []' "$_mej_f" 2>/dev/null)
-    _mej_all_findings=$(printf '%s\n%s\n' "$_mej_all_findings" "$_mej_ff" \
-      | jq -sc 'add' 2>/dev/null || printf '%s' "$_mej_all_findings")
-  done
-
-  if [ "$_mej_count" -eq 0 ]; then
-    printf '{"degraded":true,"chunked":true,"chunks":0,"chunks_degraded":0,"summary":"[clagentic-lite] no valid envelopes found","checked":[],"findings":[]}\n'
-    return 1
-  fi
-
-  # Dedup findings.
-  _mej_deduped=$(printf '%s' "$_mej_all_findings" \
-    | dedup_findings "$_mej_strategy" "$_mej_seen")
-
-  # Escape summary for JSON embedding.
-  _mej_summary_json=$(printf '%s' "$_mej_summaries" | jq -Rs '.' 2>/dev/null)
-  [ -z "$_mej_summary_json" ] && _mej_summary_json='""'
-
-  printf '{"summary":%s,"checked":%s,"findings":%s,"degraded":%s,"chunked":true,"chunks":%d,"chunks_degraded":%d}\n' \
-    "$_mej_summary_json" \
-    "$_mej_checked" \
-    "$_mej_deduped" \
-    "$_mej_any_degraded" \
-    "$_mej_count" \
-    "$_mej_degraded_count"
-  return 0
-}
-
-_merge_envelopes_py() {
-  _mep_dir="$1"
-  _mep_strategy="$2"
-  _mep_seen="$3"
-
-  # Phase 1: python aggregates envelopes (no inline dedup — dedup_findings owns that).
-  # Emits a JSON object with raw (undeduped) findings plus aggregated metadata.
-  # Phase 2: shell pipes raw findings through dedup_findings (same path as jq branch).
-  # Phase 3: python splices deduped findings back into the result envelope.
-
-  _mep_raw=$(mktemp -t clagentic-me-raw.XXXXXX)
-  _mep_dedup_in=$(mktemp -t clagentic-me-din.XXXXXX)
-  _mep_dedup_out=$(mktemp -t clagentic-me-dout.XXXXXX)
-  _mep_final_rc=0
-
-  python3 - "$_mep_dir" > "$_mep_raw" <<'PYEOF'
-import json, os, sys
-
-env_dir = sys.argv[1]
-
-files = sorted(
-    f for f in os.listdir(env_dir)
-    if f.startswith("envelope-") and f.endswith(".json")
-)
-
-if not files:
-    print(json.dumps({
-        "_no_envelopes": True, "degraded": True, "chunked": True,
-        "chunks": 0, "chunks_degraded": 0,
-        "summary": "[clagentic-lite] no valid envelopes found",
-        "checked": [], "findings": []
-    }))
-    sys.exit(1)
-
-total = len(files)
-degraded_count = 0
-any_degraded = False
-summaries = []
-checked_set = []
-all_findings = []
-
-for fname in files:
-    fpath = os.path.join(env_dir, fname)
-    try:
-        with open(fpath) as f:
-            env = json.load(f)
-    except Exception:
-        degraded_count += 1
-        any_degraded = True
-        continue
-
-    if env.get("degraded"):
-        degraded_count += 1
-        any_degraded = True
-    else:
-        s = env.get("summary", "")
-        if s:
-            summaries.append(s)
-
-    for c in env.get("checked", []):
-        if c not in checked_set:
-            checked_set.append(c)
-
-    all_findings.extend(env.get("findings", []))
-
-result = {
-    "summary": " | ".join(summaries),
-    "checked": checked_set,
-    "findings": all_findings,   # raw; will be replaced by dedup_findings output
-    "degraded": any_degraded,
-    "chunked": True,
-    "chunks": total,
-    "chunks_degraded": degraded_count
-}
-print(json.dumps(result))
-PYEOF
-  _mep_py1_rc=$?
-
-  if [ "$_mep_py1_rc" -ne 0 ]; then
-    cat "$_mep_raw"
-    rm -f "$_mep_raw" "$_mep_dedup_in" "$_mep_dedup_out"
-    return "$_mep_py1_rc"
-  fi
-
-  # Extract raw findings array and pass through dedup_findings.
-  python3 -c "import json,sys; d=json.load(open('$_mep_raw')); print(json.dumps(d.get('findings',[])))" \
-    > "$_mep_dedup_in" 2>/dev/null
-  dedup_findings "$_mep_strategy" "$_mep_seen" < "$_mep_dedup_in" > "$_mep_dedup_out"
-
-  # Splice deduped findings back into the envelope.
-  python3 - "$_mep_raw" "$_mep_dedup_out" <<'PYEOF2'
-import json, sys
-
-raw_path   = sys.argv[1]
-dedup_path = sys.argv[2]
-
-with open(raw_path) as f:
-    envelope = json.load(f)
-
-try:
-    with open(dedup_path) as f:
-        deduped = json.load(f)
-    if not isinstance(deduped, list):
-        raise ValueError("not a list")
-except Exception:
-    # Conservative: keep raw findings if dedup output is unreadable.
-    deduped = envelope.get("findings", [])
-
-envelope["findings"] = deduped
-print(json.dumps(envelope))
-PYEOF2
-  _mep_final_rc=$?
-
-  rm -f "$_mep_raw" "$_mep_dedup_in" "$_mep_dedup_out"
-  return $_mep_final_rc
+  printf '%s\n' "$_me_out"
+  return "$_me_rc"
 }
 
 # ------------------------------------------------------------- dedup_findings --
 #
-# dedup_findings KEY_STRATEGY SEEN_FILE [DIFF_FILE]
+# dedup_findings KEY_STRATEGY SEEN_FILE [DIFF_FILE [MODE]]
 #
 # stdin:  JSON array of findings (the reviewer schema)
 # stdout: deduplicated JSON array (higher severity wins on collision)
 # exit 0: always (conservative: never suppress on parse error)
 #
-# KEY_STRATEGY:
-#   "location"     sha256(file:line:category:lower(message))
-#                  Used for WITHIN-RUN dedup (this task, lr-093c).
-#   "content-hash" sha256 of a 5-line +-line context window around the
-#                  finding from DIFF_FILE. Reserved for lr-34d2 cross-round
-#                  dedup. DIFF_FILE required when strategy="content-hash".
+# KEY_STRATEGY: "location" (sha256 of file:line:category:lower(message), for
+# WITHIN-RUN dedup) or "content-hash" (sha256 of a 5-line +-line context window
+# around the finding from DIFF_FILE; falls back to the location key when there
+# is no window). SEEN_FILE holds previously-seen keys, one per line; new keys
+# are appended in place.
 #
-# SEEN_FILE: path to a file of previously-seen keys (one per line). New keys
-# are appended in place. May be empty or non-existent on first call.
-#
-# SEEN_MODE (4th arg, default "drop"):
-#   "drop"     a finding whose key is already in SEEN_FILE is removed from the
-#              output. Only safe for a caller that does not feed the result to
-#              a verdict (adversarial seed-keys, merge_envelopes' scratch file).
-#   "annotate" a finding whose key is already in SEEN_FILE stays in the output
-#              with `_seen_before: true` and `_seen_key: <key>`. Within-run
-#              collapsing (same key twice in one input, higher severity wins)
-#              is unchanged. This is the mode every verdict-bearing caller
-#              must use: a key is a link hint, never an identity to drop a
-#              blocking finding on, or a re-run at the same HEAD would pass
-#              by forgetting what the first run found.
-#
-# Severity rank: low=1, medium=2, high=3, critical=4 (matches gates.sh).
-# Conservative retain: if a key CANNOT be computed (parse error, missing tool,
-# strategy=content-hash with no diff_file), the finding is KEPT, never dropped.
+# MODE: "drop" removes a finding whose key is already in SEEN_FILE and is only
+# safe where the result never feeds a verdict. "annotate" keeps it with
+# _seen_before/_seen_key; every verdict-bearing caller must use it.
 dedup_findings() {
   _df_strategy="$1"
   _df_seen="$2"
   _df_difffile="${3:-}"
   _df_mode="${4:-drop}"
-
-  if command -v jq >/dev/null 2>&1; then
-    _dedup_findings_jq "$_df_strategy" "$_df_seen" "$_df_difffile" "$_df_mode"
-  elif command -v python3 >/dev/null 2>&1; then
-    _dedup_findings_py "$_df_strategy" "$_df_seen" "$_df_difffile" "$_df_mode"
-  else
-    # No JSON tool — passthrough (conservative: retain all).
-    cat
-  fi
-}
-
-_dedup_findings_jq() {
-  _dfj_strategy="$1"
-  _dfj_seen="$2"
-  _dfj_difffile="${3:-}"
-  _dfj_annotate=0
-  [ "${4:-drop}" = "annotate" ] && _dfj_annotate=1
-
-  # Read stdin into a temp file so we can both parse it and re-read it if needed.
-  _dfj_in=$(mktemp -t clagentic-df-in.XXXXXX)
-  cat > "$_dfj_in"
-
-  # Validate that we have a JSON array; if not, passthrough (conservative).
-  if ! jq -e '. | type == "array"' "$_dfj_in" >/dev/null 2>&1; then
-    cat "$_dfj_in"
-    rm -f "$_dfj_in"
-    return 0
-  fi
-
-  # Build a set of already-seen keys.
-  # jq cannot access files outside its filter, so we pass the seen keys as
-  # a $ARGS or --argjson. We read the seen file in shell and pass as a JSON
-  # array string.
-  _dfj_seen_arr="[]"
-  if [ -f "$_dfj_seen" ]; then
-    _dfj_seen_arr=$(awk 'NF{printf "%s\"%s\"", (NR>1?",":""), $0} END{printf ""}' "$_dfj_seen")
-    _dfj_seen_arr="[${_dfj_seen_arr}]"
-  fi
-
-  # For content-hash strategy with a valid diff file, extract the context
-  # lines for each finding and compute the hash. Without a diff file, fall
-  # back to location key (conservative: keeps findings).
-  _dfj_use_content=0
-  if [ "$_dfj_strategy" = "content-hash" ] && [ -n "$_dfj_difffile" ] && [ -f "$_dfj_difffile" ]; then
-    _dfj_use_content=1
-  fi
-
-  # Compute keys for each finding via jq. Strategy=location uses a pure-jq
-  # sha256 workaround via @base64 + external sha256sum call piped per-finding.
-  # Because jq cannot call external tools, we implement the key computation
-  # in a shell loop reading findings one by one.
-  #
-  # The loop:
-  #   1. Extract each finding as a JSON object.
-  #   2. Compute the key.
-  #   3. Build a parallel key array.
-  # Then dedup using the key array + seen set + severity-wins rule.
-
-  _dfj_count=$(jq 'length' "$_dfj_in" 2>/dev/null)
-  case "$_dfj_count" in
-    ''|*[!0-9]*) _dfj_count=0 ;;
-  esac
-
-  _dfj_keys_file=$(mktemp -t clagentic-df-keys.XXXXXX)
-  _dfj_idx=0
-  while [ "$_dfj_idx" -lt "$_dfj_count" ]; do
-    _dfj_finding=$(jq -c ".[$_dfj_idx]" "$_dfj_in" 2>/dev/null)
-    _dfj_key=""
-    if [ "$_dfj_use_content" = "1" ]; then
-      # content-hash: sha256 of 5-line +-line context window.
-      _dfj_file=$(printf '%s' "$_dfj_finding" | jq -r '.file // ""' 2>/dev/null)
-      _dfj_line=$(printf '%s' "$_dfj_finding" | jq -r '.line // 0' 2>/dev/null)
-      # Extract the window from the diff file using awk.
-      #
-      # PORTABILITY FIX (lr-63359e): the hunk-header line-number parse below
-      # used to read `match($0, /\+([0-9]+)/, arr)` -- the 3-arg match() form
-      # with a capture-array is a gawk extension, not POSIX awk. On mawk
-      # (the Debian/Ubuntu `awk` alternative default), this errors at runtime,
-      # so `_dfj_context` was always empty and every content-hash key silently
-      # fell back to the location key -- the content-hash strategy has never
-      # actually worked on a mawk host. Discovered while building the
-      # invariant-feed writer (lr-63359e), which needs `dedup_findings`
-      # content-hash keys and the new finding_content_keys() (this file) to
-      # agree on the SAME key for the SAME finding -- they must draw from one
-      # key space for the writer's resolve signal to be meaningful. The
-      # replacement below is plain POSIX awk (split()-free even: field access
-      # + sub()), portable across gawk/mawk/BSD awk.
-      _dfj_context=$(awk -v fname="$_dfj_file" -v target="$_dfj_line" '
-        /^\+\+\+ / {
-          cur_file = substr($0, 5)
-          # Strip a/ b/ prefix from git unified diffs.
-          sub(/^b\//, "", cur_file)
-          diff_line = 0
-        }
-        /^@@ / {
-          # Field 3 of "@@ -a,b +c,d @@" is "+c,d" (or "+c" with no comma).
-          plus = $3
-          sub(/^\+/, "", plus)
-          sub(/,.*/, "", plus)
-          diff_line = plus + 0 - 1
-        }
-        /^\+/ && cur_file == fname {
-          diff_line++
-          if (diff_line >= target - 2 && diff_line <= target + 2) {
-            print
-          }
-        }
-      ' "$_dfj_difffile" 2>/dev/null)
-      if [ -n "$_dfj_context" ]; then
-        _dfj_key=$(printf '%s' "$_dfj_context" | _rm_sha256)
-      fi
-    fi
-    if [ -z "$_dfj_key" ]; then
-      # location key (primary path for strategy=location; fallback for content-hash).
-      # Surface jq errors to stderr — silent failures hide broken filters.
-      _dfj_raw=$(printf '%s' "$_dfj_finding" \
-        | jq -r '[(.file // ""), ((.line // 0) | tostring), (.category // ""), ((.message // "") | ascii_downcase)] | join(":")' 2>&1)
-      _dfj_jq_rc=$?
-      if [ "$_dfj_jq_rc" -ne 0 ]; then
-        printf '[review-merge/dedup_findings] jq key-extraction failed (idx=%d): %s\n' "$_dfj_idx" "$_dfj_raw" 1>&2
-        _dfj_key=""
-      elif [ -n "$_dfj_raw" ]; then
-        _dfj_key=$(printf '%s' "$_dfj_raw" | _rm_sha256)
-      else
-        # Empty output despite rc=0 — conservative retain.
-        _dfj_key=""
-      fi
-    fi
-    printf '%s\n' "$_dfj_key" >> "$_dfj_keys_file"
-    _dfj_idx=$((_dfj_idx + 1))
-  done
-
-  # Now perform dedup: build a combined input for awk (idx, key, severity per line).
-  _dfj_combined=$(mktemp -t clagentic-df-comb.XXXXXX)
-  _dfj_idx=0
-  while IFS= read -r _dfj_k; do
-    _dfj_sev=$(jq -r ".[$_dfj_idx].severity // \"\"" "$_dfj_in" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    printf '%d\t%s\t%s\n' "$_dfj_idx" "$_dfj_k" "$_dfj_sev" >> "$_dfj_combined"
-    _dfj_idx=$((_dfj_idx + 1))
-  done < "$_dfj_keys_file"
-
-  # awk: process combined file, track winner per key.
-  # Output: one index per line (the winning index for each key), in insertion order.
-  _dfj_winners=$(awk -v seen_file="$_dfj_seen" -v annotate="$_dfj_annotate" '
-    BEGIN {
-      while ((getline line < seen_file) > 0) {
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-        if (line != "") preseen[line] = 1
-      }
-      close(seen_file)
-      srank["low"]      = 1
-      srank["medium"]   = 2
-      srank["high"]     = 3
-      srank["critical"] = 4
-      n = 0
-    }
-    {
-      idx = $1; key = $2; sev = $3
-      # Empty key: conservative retain.
-      if (key == "") {
-        retain[n] = idx; retain_key[n] = ""; n++
-        next
-      }
-      r = (sev in srank) ? srank[sev] : 0
-      if ((key in preseen) && annotate != 1) {
-        # Already seen in a prior run: check if we need to update a retained winner.
-        if (key in winner_idx) {
-          old_r = (winner_sev[key] in srank) ? srank[winner_sev[key]] : 0
-          if (r > old_r) { winner_sev[key] = sev; winner_idx[key] = idx }
-        }
-        # Do not emit a new entry (already deduplicated by prior run).
-        next
-      }
-      # annotate mode: a prior-run key is kept and flagged, then handled by
-      # the ordinary within-run winner logic below.
-      if (key in preseen) seenflag[key] = 1
-      if (!(key in winner_idx)) {
-        # First time we see this key in this run.
-        winner_idx[key] = idx; winner_sev[key] = sev
-        order[n] = key; n++
-      } else {
-        old_r = (winner_sev[key] in srank) ? srank[winner_sev[key]] : 0
-        if (r > old_r) { winner_sev[key] = sev; winner_idx[key] = idx }
-      }
-    }
-    END {
-      # Print winning indices in order.
-      # retain[i] is set for no-key findings (conservative retain);
-      # order[i] is set for keyed findings (winner tracking).
-      # Both arrays share the same index n — only one is set per slot.
-      # Annotate mode prints "idx<TAB>seenflag<TAB>key" so the caller can
-      # mark prior-run findings; drop mode keeps the bare index.
-      for (i = 0; i < n; i++) {
-        if (i in retain) {
-          if (annotate == 1) print retain[i] "\t0\t"; else print retain[i]
-        } else {
-          k2 = order[i]
-          if (k2 in winner_idx) {
-            if (annotate == 1) print winner_idx[k2] "\t" ((k2 in seenflag) ? 1 : 0) "\t" k2
-            else print winner_idx[k2]
-          }
-        }
-      }
-    }
-  ' "$_dfj_combined")
-
-  # Collect new keys to append to the seen file.
-  _dfj_new_keys=$(awk -v seen_file="$_dfj_seen" '
-    BEGIN {
-      while ((getline line < seen_file) > 0) {
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-        if (line != "") preseen[line] = 1
-      }
-      close(seen_file)
-    }
-    {
-      key = $2
-      if (key != "" && !(key in preseen)) { new_keys[key] = 1 }
-    }
-    END { for (k in new_keys) print k }
-  ' "$_dfj_combined")
-
-  # Append new keys to seen file.
-  if [ -n "$_dfj_new_keys" ]; then
-    printf '%s\n' "$_dfj_new_keys" >> "$_dfj_seen"
-  fi
-
-  # Build the output JSON array from the winning indices.
-  if [ -z "$_dfj_winners" ]; then
-    printf '[]\n'
-  elif [ "$_dfj_annotate" = "1" ]; then
-    _dfj_jq_indices=$(printf '%s\n' "$_dfj_winners" \
-      | awk -F'\t' 'NF{printf "%s%s", (NR>1?",":""), $1} END{printf ""}')
-    _dfj_flags=$(printf '%s\n' "$_dfj_winners" \
-      | awk -F'\t' 'NF{printf "%s%s", (NR>1?",":""), ($2 == 1 ? 1 : 0)} END{printf ""}')
-    # Keys travel through jq's own string encoder, never spliced into JSON text
-    # by the shell: the identity-fallback sha shim makes a key raw content.
-    _dfj_keys_json=$(printf '%s\n' "$_dfj_winners" | awk -F'\t' 'NF{print $3}' \
-      | jq -Rsc 'split("\n")[:-1]' 2>/dev/null)
-    [ -n "$_dfj_keys_json" ] || _dfj_keys_json='[]'
-    jq -c --argjson fl "[$_dfj_flags]" --argjson ks "$_dfj_keys_json" \
-      "[.[$_dfj_jq_indices]] | to_entries | map(if \$fl[.key] == 1 then .value + {_seen_before: true, _seen_key: \$ks[.key]} else .value end)" \
-      "$_dfj_in" 2>/dev/null \
-      || cat "$_dfj_in"  # conservative fallback: passthrough on jq error
-  else
-    # Convert newline-separated indices to a jq index list.
-    _dfj_jq_indices=$(printf '%s\n' "$_dfj_winners" \
-      | awk 'NF{printf "%s%s", (NR>1?",":""), $0} END{printf ""}')
-    jq -c "[.[$_dfj_jq_indices]]" "$_dfj_in" 2>/dev/null \
-      || cat "$_dfj_in"  # conservative fallback: passthrough on jq error
-  fi
-
-  rm -f "$_dfj_in" "$_dfj_keys_file" "$_dfj_combined"
-  return 0
-}
-
-_dedup_findings_py() {
-  _dfp_strategy="$1"
-  _dfp_seen="$2"
-  _dfp_difffile="${3:-}"
-  _dfp_mode="${4:-drop}"
-
-  # The findings arrive on stdin, but `python3 -` reads its own script from
-  # stdin (the heredoc below): reading findings from sys.stdin there got EOF,
-  # so this path printed nothing for every input and callers fell back to
-  # "retain all". Stage them in a file the script opens by path instead.
-  _dfp_in=$(mktemp -t clagentic-dfp-in.XXXXXX)
-  cat > "$_dfp_in"
-
-  python3 - "$_dfp_strategy" "$_dfp_seen" "$_dfp_difffile" "$_dfp_mode" "$_dfp_in" <<'PYEOF'
-import json, sys, hashlib, os
-
-strategy  = sys.argv[1]
-seen_file = sys.argv[2]
-diff_file = sys.argv[3] if len(sys.argv) > 3 else ""
-annotate  = (sys.argv[4] == "annotate") if len(sys.argv) > 4 else False
-
-severity_rank = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-
-def find_context_window(diff_file, fname, target_line):
-    """Extract +-lines around target_line for a given file from a unified diff."""
-    result = []
-    cur_file = ""
-    diff_line = 0
-    try:
-        with open(diff_file) as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if line.startswith("+++ "):
-                    cur_file = line[4:]
-                    # Strip b/ prefix from git unified diffs.
-                    if cur_file.startswith("b/"):
-                        cur_file = cur_file[2:]
-                    diff_line = 0
-                elif line.startswith("@@ "):
-                    import re
-                    m = re.search(r'\+(\d+)', line)
-                    diff_line = int(m.group(1)) - 1 if m else 0
-                elif line.startswith("+") and cur_file == fname:
-                    diff_line += 1
-                    if abs(diff_line - target_line) <= 2:
-                        result.append(line)
-    except Exception:
-        pass
-    return result
-
-def compute_key(f, strategy, diff_file):
-    try:
-        if strategy == "content-hash" and diff_file and os.path.isfile(diff_file):
-            fname = f.get("file", "")
-            line  = int(f.get("line", 0) or 0)
-            ctx = find_context_window(diff_file, fname, line)
-            if ctx:
-                return hashlib.sha256("\n".join(ctx).encode()).hexdigest()
-        # location key (primary or fallback).
-        # Use `or 0` to match jq's `// 0` — null/absent line becomes "0", not "".
-        raw = "{}:{}:{}:{}".format(
-            f.get("file", ""),
-            str(f.get("line") or 0),
-            f.get("category", ""),
-            str(f.get("message", "")).lower()
-        )
-        return hashlib.sha256(raw.encode()).hexdigest()
-    except Exception:
-        return None
-
-# Read the staged findings.
-with open(sys.argv[5]) as inf:
-    raw_input_text = inf.read()
-try:
-    findings = json.loads(raw_input_text)
-    if not isinstance(findings, list):
-        raise ValueError("not a list")
-except Exception:
-    # Conservative: passthrough raw.
-    sys.stdout.write(raw_input_text)
-    sys.exit(0)
-
-# Load seen keys.
-seen = {}
-try:
-    with open(seen_file) as sf:
-        for line in sf:
-            k = line.strip()
-            if k:
-                seen[k] = True
-except Exception:
-    pass
-
-# Dedup: key -> (index_in_output, severity_rank).
-new_keys = {}
-deduped = []   # list of findings to output
-key_to_pos = {}  # key -> index in deduped
-
-for f in findings:
-    key = compute_key(f, strategy, diff_file)
-    if key is None:
-        # Conservative: retain without dedup.
-        deduped.append(f)
-        continue
-
-    sev = str(f.get("severity", "")).lower()
-    r = severity_rank.get(sev, 0)
-
-    if key in seen and not annotate:
-        # Already seen in a prior run: skip (already deduped).
-        # But check if this is a higher-severity version of an existing winner.
-        if key in key_to_pos:
-            pos = key_to_pos[key]
-            old_sev = str(deduped[pos].get("severity", "")).lower()
-            old_r = severity_rank.get(old_sev, 0)
-            if r > old_r:
-                deduped[pos] = f
-        continue
-
-    if key not in key_to_pos:
-        key_to_pos[key] = len(deduped)
-        deduped.append(f)
-        if key not in seen:
-            new_keys[key] = True
-    else:
-        pos = key_to_pos[key]
-        old_sev = str(deduped[pos].get("severity", "")).lower()
-        old_r = severity_rank.get(old_sev, 0)
-        if r > old_r:
-            deduped[pos] = f
-
-# annotate mode: flag every surviving finding whose key a prior run recorded.
-# Done after winner selection so the marker lands on the finding actually kept.
-if annotate:
-    for key, pos in key_to_pos.items():
-        if key in seen and isinstance(deduped[pos], dict):
-            deduped[pos] = dict(deduped[pos], _seen_before=True, _seen_key=key)
-
-# Append new keys to seen file.
-try:
-    with open(seen_file, "a") as sf:
-        for k in new_keys:
-            sf.write(k + "\n")
-except Exception:
-    pass
-
-print(json.dumps(deduped))
-PYEOF
-  _dfp_rc=$?
-  rm -f "$_dfp_in"
-  return $_dfp_rc
+  ds_findings_run fingerprint dedup --strategy "$_df_strategy" --seen "$_df_seen" \
+    --diff "$_df_difffile" --mode "$_df_mode" || cat
 }
 
 # ------------------------------------------------------------ finding_content_keys --
 #
 # finding_content_keys DIFF_FILE
 #
-# stdin:  JSON array of findings (reviewer schema: file/line/category/message,
-#         or the same shape produced by loose-parsing adversarial [FINDING]
-#         markdown headers)
-# stdout: one TSV row per finding that yields a non-empty content-hash key:
+# stdin:  JSON array of findings
+# stdout: one TSV row per finding that yields a content-hash key:
 #         key<TAB>file<TAB>category<TAB>message
-#         Findings whose key cannot be computed (no diff window, no sha256
-#         tool, missing file/line) are silently omitted — conservative in the
-#         other direction from dedup_findings: a key we cannot compute is a
-#         key we cannot use as an invariant-writer resolve signal, so it is
-#         dropped from THIS output only. It has no effect on dedup_findings'
-#         own conservative-retain behavior, which this function does not touch.
-#
-# Uses the IDENTICAL content-hash key algorithm as dedup_findings' content-hash
-# strategy (5-line +-context window around file:line in DIFF_FILE) so keys
-# computed here are directly comparable against keys already persisted in a
-# dedup_findings SEEN_FILE (e.g. review-seen-keys) -- this is the reuse point:
-# the invariant-writer resolve signal is "a key present in a prior seen-keys
-# snapshot but absent from this round's finding_content_keys output", not a
-# second, independently-derived notion of sameness.
+# A key that cannot be computed (no diff window, missing file/line) is omitted
+# from this output only; it has no effect on dedup_findings' own retain rule.
+# The key is the SAME one dedup_findings' content-hash strategy computes, so a
+# key here is directly comparable to one persisted in a SEEN_FILE.
 finding_content_keys() {
-  _fck_difffile="$1"
-
-  # Read stdin into a temp file up front, before dispatching to either JSON
-  # tool. This is REQUIRED, not a style choice: `python3 - ARGS <<'PYEOF'`
-  # feeds the heredoc itself as the interpreter's stdin, so a script that
-  # both reads piped findings AND uses `python3 - <<'PYEOF'` would have its
-  # findings silently replaced by the heredoc's own source text. Passing a
-  # filename argument instead of relying on inherited stdin sidesteps that
-  # clash entirely.
-  _fck_in=$(mktemp -t clagentic-fck-in.XXXXXX)
-  cat > "$_fck_in"
-
-  if command -v jq >/dev/null 2>&1; then
-    # jq path: reuse the same shell-loop-plus-awk-context-window technique
-    # dedup_findings' jq branch uses, restricted to key + metadata emission
-    # (no severity-wins merge logic needed here -- this is a read-only key
-    # derivation, not a dedup pass).
-    if ! jq -e '. | type == "array"' "$_fck_in" >/dev/null 2>&1; then
-      rm -f "$_fck_in"
-      return 0
-    fi
-    _fck_count=$(jq 'length' "$_fck_in" 2>/dev/null)
-    case "$_fck_count" in ''|*[!0-9]*) _fck_count=0 ;; esac
-    _fck_idx=0
-    while [ "$_fck_idx" -lt "$_fck_count" ]; do
-      _fck_finding=$(jq -c ".[$_fck_idx]" "$_fck_in" 2>/dev/null)
-      _fck_file=$(printf '%s' "$_fck_finding" | jq -r '.file // ""' 2>/dev/null)
-      _fck_line=$(printf '%s' "$_fck_finding" | jq -r '.line // 0' 2>/dev/null)
-      _fck_category=$(printf '%s' "$_fck_finding" | jq -r '.category // ""' 2>/dev/null)
-      _fck_message=$(printf '%s' "$_fck_finding" | jq -r '.message // ""' 2>/dev/null)
-      _fck_context=""
-      if [ -f "$_fck_difffile" ]; then
-        # POSIX-portable hunk-header line-number parse: the 3-arg match($0, re,
-        # arr) form used elsewhere in this file (dedup_findings' jq branch) is
-        # a gawk extension unavailable on mawk (this project's portability
-        # baseline targets GNU/BSD awk per docs/PORTABILITY.md, but mawk is the
-        # Debian/Ubuntu default `awk` alternative and a real deployment target).
-        # split()+substr() on the "@@ -a,b +c,d @@" line is plain POSIX awk.
-        _fck_context=$(awk -v fname="$_fck_file" -v target="$_fck_line" '
-          /^\+\+\+ / {
-            cur_file = substr($0, 5)
-            sub(/^b\//, "", cur_file)
-            diff_line = 0
-          }
-          /^@@ / {
-            # Field 3 of "@@ -a,b +c,d @@" is "+c,d" (or "+c" with no comma).
-            plus = $3
-            sub(/^\+/, "", plus)
-            sub(/,.*/, "", plus)
-            diff_line = plus + 0 - 1
-          }
-          /^\+/ && cur_file == fname {
-            diff_line++
-            if (diff_line >= target - 2 && diff_line <= target + 2) {
-              print
-            }
-          }
-        ' "$_fck_difffile" 2>/dev/null)
-      fi
-      if [ -n "$_fck_context" ]; then
-        _fck_key=$(printf '%s' "$_fck_context" | _rm_sha256)
-        if [ -n "$_fck_key" ]; then
-          _fck_clean_file=$(printf '%s' "$_fck_file" | tr '\t\n\r' '   ')
-          _fck_clean_cat=$(printf '%s' "$_fck_category" | tr '\t\n\r' '   ')
-          _fck_clean_msg=$(printf '%s' "$_fck_message" | tr '\t\n\r' '   ')
-          printf '%s\t%s\t%s\t%s\n' "$_fck_key" "$_fck_clean_file" "$_fck_clean_cat" "$_fck_clean_msg"
-        fi
-      fi
-      _fck_idx=$((_fck_idx + 1))
-    done
-    rm -f "$_fck_in"
-    return 0
-  elif command -v python3 >/dev/null 2>&1; then
-    # python3 path: pass the findings file as an ARGV path, never as inherited
-    # stdin -- see the comment above _fck_in for why.
-    python3 - "$_fck_in" "$_fck_difffile" <<'PYEOF'
-import json, sys, hashlib, os
-
-findings_file = sys.argv[1]
-diff_file = sys.argv[2] if len(sys.argv) > 2 else ""
-
-def find_context_window(diff_file, fname, target_line):
-    result = []
-    cur_file = ""
-    diff_line = 0
-    try:
-        with open(diff_file) as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if line.startswith("+++ "):
-                    cur_file = line[4:]
-                    if cur_file.startswith("b/"):
-                        cur_file = cur_file[2:]
-                    diff_line = 0
-                elif line.startswith("@@ "):
-                    import re
-                    m = re.search(r'\+(\d+)', line)
-                    diff_line = int(m.group(1)) - 1 if m else 0
-                elif line.startswith("+") and cur_file == fname:
-                    diff_line += 1
-                    if abs(diff_line - target_line) <= 2:
-                        result.append(line)
-    except Exception:
-        pass
-    return result
-
-try:
-    with open(findings_file) as f:
-        findings = json.load(f)
-    if not isinstance(findings, list):
-        findings = []
-except Exception:
-    findings = []
-
-have_diff = bool(diff_file) and os.path.isfile(diff_file)
-
-for f in findings:
-    try:
-        fname = f.get("file", "") or ""
-        line = int(f.get("line", 0) or 0)
-        category = f.get("category", "") or ""
-        message = f.get("message", "") or ""
-        key = ""
-        if have_diff:
-            ctx = find_context_window(diff_file, fname, line)
-            if ctx:
-                key = hashlib.sha256("\n".join(ctx).encode()).hexdigest()
-        if key:
-            # Tabs/newlines cannot appear in a TSV field; strip defensively.
-            def clean(s):
-                return str(s).replace("\t", " ").replace("\n", " ").replace("\r", " ")
-            print("{}\t{}\t{}\t{}".format(clean(key), clean(fname), clean(category), clean(message)))
-    except Exception:
-        continue
-PYEOF
-    rm -f "$_fck_in"
-    return 0
-  fi
-  # No jq, no python3: no JSON tool available. Emit nothing -- the caller
-  # (invariant writer) treats empty output as "no resolve signal this round,"
-  # which is the same fail-open posture as the rest of the invariant-feed.
-  rm -f "$_fck_in"
-  return 0
+  ds_findings_run fingerprint keys --diff "$1" || return 0
 }
 
 # ------------------------------------------------------- finding_recurrence_bump --
 #
 # finding_recurrence_bump COUNTS_FILE
 #
-# stdin:  TSV, one row per finding, SAME shape finding_content_keys emits:
-#         key<TAB>file<TAB>category<TAB>message
-# stdout: the SAME TSV, with a 5th column appended: the UPDATED recurrence
-#         count for that key (an integer >= 1) after this call increments it.
-#
-# COUNTS_FILE: a JSON object mapping content-hash key -> integer count,
-# persisted across rounds (e.g. .clagentic/lite/review-recurrence.json).
-# Created fresh (as "{}") if absent, empty, or unparseable -- same fail-open
-# posture as every other on-disk gate-state file in this codebase (seen-keys,
-# invariants.json). A key not yet present starts at count 1 on its first
-# call here (this call itself counts as the first occurrence), not 0 --
-# "recurrence count" means "rounds this content has been reported in,
-# including this one."
-#
-# Conservative bias, matching dedup_findings/finding_content_keys exactly:
-#   - A row with an empty key (first TSV field) is passed through with
-#     column 5 = 1 and is NOT written to COUNTS_FILE -- an empty key has no
-#     stable identity to count occurrences of, so it is treated as always-
-#     fresh, never eligible for demotion. Mirrors dedup_findings' own
-#     "empty key -> conservative retain" rule.
-#   - If COUNTS_FILE cannot be written back (no jq/python3, or a write
-#     failure), the function still emits every input row with column 5 = 1
-#     (fail-open: "never seen before" is the safe default for a demotion
-#     decision -- undercounting recurrence can only ever under-demote,
-#     never wrongly hide a finding).
-#   - This function does not decide demotion or read CLAGENTIC_* thresholds
-#     -- it only maintains the count. The caller (gates.sh) compares the
-#     returned count against the configured threshold.
-#
-# Untrusted-on-read: COUNTS_FILE is derived state (this codebase's own
-# content-hash keys and integer counts, never LLM-authored free text), but
-# is still read back from disk on every call. A non-object JSON value, a
-# non-integer count under a key, or a corrupt file are all treated as "no
-# prior count for that key" (defaults to 0 before incrementing) rather than
-# aborting -- fail-open, matching the rest of this file's on-disk-state
-# handling.
+# stdin:  TSV, one row per finding, the shape finding_content_keys emits
+# stdout: the SAME TSV with a 5th column appended: the updated recurrence count
+#         for that key (an integer >= 1). COUNTS_FILE is a JSON object mapping
+#         key -> count, persisted across rounds. A row with an empty key gets
+#         count 1 and is not persisted; an unreadable COUNTS_FILE reads as
+#         empty, so a count can only be undercounted, which can only under-demote.
 finding_recurrence_bump() {
-  _frb_counts_file="$1"
-
-  _frb_in=$(mktemp -t clagentic-frb-in.XXXXXX)
-  cat > "$_frb_in"
-
-  if command -v jq >/dev/null 2>&1; then
-    _frb_current='{}'
-    if [ -f "$_frb_counts_file" ] && jq -e '. | type == "object"' "$_frb_counts_file" >/dev/null 2>&1; then
-      _frb_current=$(cat "$_frb_counts_file")
-    fi
-    while IFS= read -r _frb_row; do
-      [ -z "$_frb_row" ] && continue
-      _frb_key=$(printf '%s' "$_frb_row" | cut -f1)
-      if [ -z "$_frb_key" ]; then
-        printf '%s\t1\n' "$_frb_row" >> "$_frb_in.annotated"
-        continue
-      fi
-      # Read-then-increment: a non-integer or absent value under this key
-      # defaults to 0 before incrementing (fail-open on a corrupt/foreign
-      # entry -- treated as "first time seen," never aborts).
-      _frb_prior=$(printf '%s' "$_frb_current" | jq -r --arg k "$_frb_key" \
-        '.[$k] | if type == "number" then . else 0 end' 2>/dev/null)
-      case "$_frb_prior" in ''|*[!0-9]*) _frb_prior=0 ;; esac
-      _frb_new=$((_frb_prior + 1))
-      _frb_current=$(printf '%s' "$_frb_current" | jq -c --arg k "$_frb_key" --argjson v "$_frb_new" \
-        '.[$k] = $v' 2>/dev/null)
-      [ -n "$_frb_current" ] || _frb_current='{}'
-      printf '%s\t%d\n' "$_frb_row" "$_frb_new" >> "$_frb_in.annotated"
-    done < "$_frb_in"
-    if [ -f "$_frb_in.annotated" ]; then
-      cat "$_frb_in.annotated"
-      rm -f "$_frb_in.annotated"
-    fi
-    # Best-effort persist. A write failure here means the NEXT call starts
-    # from the pre-this-call counts (undercounts, never overcounts) --
-    # fail-open in the direction that can only ever under-demote.
-    printf '%s' "$_frb_current" > "$_frb_counts_file" 2>/dev/null || true
-    rm -f "$_frb_in"
-    return 0
-  fi
-
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$_frb_counts_file" "$_frb_in" <<'PYEOF'
-import json, sys
-
-counts_path, rows_path = sys.argv[1], sys.argv[2]
-
-counts = {}
-try:
-    with open(counts_path) as f:
-        loaded = json.load(f)
-    if isinstance(loaded, dict):
-        counts = loaded
-except Exception:
-    counts = {}
-
-out_lines = []
-try:
-    with open(rows_path) as f:
-        rows = f.read().split("\n")
-except Exception:
-    rows = []
-
-for row in rows:
-    if not row:
-        continue
-    fields = row.split("\t")
-    key = fields[0] if fields else ""
-    if not key:
-        out_lines.append(row + "\t1")
-        continue
-    prior = counts.get(key, 0)
-    if not isinstance(prior, int):
-        prior = 0
-    new = prior + 1
-    counts[key] = new
-    out_lines.append(row + "\t{}".format(new))
-
-sys.stdout.write("\n".join(out_lines))
-if out_lines:
-    sys.stdout.write("\n")
-
-try:
-    with open(counts_path, "w") as f:
-        json.dump(counts, f)
-except Exception:
-    pass
-PYEOF
-    rm -f "$_frb_in"
-    return 0
-  fi
-
-  # No JSON tool: fail-open passthrough. Every row gets count=1 (never seen
-  # before is always a safe default for a demotion decision -- it can only
-  # ever under-demote, never wrongly hide a finding), and COUNTS_FILE is
-  # left untouched.
-  while IFS= read -r _frb_row; do
-    [ -z "$_frb_row" ] && continue
-    printf '%s\t1\n' "$_frb_row"
-  done < "$_frb_in"
-  rm -f "$_frb_in"
-  return 0
+  ds_findings_run fingerprint bump "$1"
 }
 
 # ------------------------------------------------------------- ledger_append --
 #
 # ledger_append LEDGER_FILE JSON_LINE MAX_PER_BRANCH
 #
-# Appends ONE JSON object (already-serialized, single line, no trailing
-# newline required) to LEDGER_FILE in JSON-Lines format (one JSON value per
-# line) and creates the file (and its parent directory) if absent. This is
-# the sole writer for the review ledger (lr-01ae73) -- gates.sh's cmd_review
-# is the only caller.
+# Appends ONE JSON object (single line) to LEDGER_FILE in JSON-Lines format,
+# creating the file and its parent directory if absent. Append-only except for
+# the per-branch cap: when MAX_PER_BRANCH is a positive integer, the OLDEST
+# entries of the same branch past that count are dropped; other branches are
+# never touched. 0 or non-numeric disables the cap.
 #
-# APPEND-ONLY BY DESIGN: unlike review-seen-keys/review-recurrence.json
-# (which persist only the LATEST rolled-up state), the ledger's whole point
-# is that prior entries are retained so finding recurrence across rounds is
-# visible after the fact -- this function only ever adds a line, never
-# rewrites or removes one, except for the per-branch cap below.
-#
-# PER-BRANCH CAP (MAX_PER_BRANCH, default unlimited when 0/absent): the
-# ledger exists to catch review churn, so its own storage must not become
-# the thing that grows without bound on a long-lived branch with many
-# rounds -- same "the feature that watches for unbounded growth must not
-# itself grow unboundedly" posture _invariant_feed_append (gates.sh) already
-# established. When capping, the OLDEST entries for THIS SAME BRANCH are
-# dropped first; entries for other branches are never touched by a
-# branch-scoped cap. A MAX_PER_BRANCH of 0 (or non-numeric) disables
-# capping entirely -- capping is opt-in via CLAGENTIC_LEDGER_MAX_PER_BRANCH,
-# gates.sh.
-#
-# stdin: none. stdout: none. stderr: diagnostics only.
 # exit 0: always -- a ledger write failure must never abort the review gate
-# itself (fail-open, matching every other on-disk gate-state writer in this
-# codebase: a lost ledger entry only degrades recurrence visibility and
-# forces a fresh full-range review next round, it never silently reports a
-# false pass).
+# itself (a lost entry only forces a fresh full-range review next round, it
+# never reports a false pass).
 ledger_append() {
   _la_file="$1"
   _la_line="$2"
   _la_max="${3:-0}"
-
   case "$_la_max" in ''|*[!0-9]*) _la_max=0 ;; esac
-
-  _la_dir=$(dirname "$_la_file")
-  mkdir -p "$_la_dir" 2>/dev/null || true
-
-  # Single-line contract: LEDGER_FILE is JSON-Lines, so JSON_LINE must never
-  # itself contain an embedded newline (a well-formed single-line JSON
-  # serialization never does). Strip defensively rather than trust the
-  # caller -- a stray newline would silently split one logical entry into
-  # two lines, corrupting the JSONL contract for every future reader.
-  printf '%s' "$_la_line" | tr -d '\n' >> "$_la_file" 2>/dev/null
-  printf '\n' >> "$_la_file" 2>/dev/null
-
-  if [ "$_la_max" -gt 0 ] 2>/dev/null; then
-    _la_branch=""
-    if command -v jq >/dev/null 2>&1; then
-      _la_branch=$(printf '%s' "$_la_line" | jq -r '.branch // ""' 2>/dev/null)
-    elif command -v python3 >/dev/null 2>&1; then
-      _la_branch=$(printf '%s' "$_la_line" | python3 -c 'import json,sys
-try:
-    print(json.load(sys.stdin).get("branch",""))
-except Exception:
-    print("")' 2>/dev/null)
-    fi
-    if [ -n "$_la_branch" ]; then
-      # REAL JSON PARSE, not a raw substring match on `"branch":"<value>"`
-      # text: that heuristic is brittle against separator differences
-      # between JSON encoders (jq -c emits no space after `:`; plain
-      # python json.dumps() emits `"branch": "<value>"` WITH a space),
-      # silently under-counting matches and disabling the cap on any line
-      # this module's own python3 fallback wrote. python3 does the count
-      # and the rewrite together, in one pass over the file, whenever
-      # available -- preferred here (ahead of jq) specifically because a
-      # single pass has no TOCTOU between separately reading a count and
-      # reading the file again to rewrite it.
-      _la_tmp=$(mktemp -t clagentic-ledger-cap.XXXXXX)
-      if command -v python3 >/dev/null 2>&1; then
-        python3 -c 'import json, sys
-
-branch, max_n, out_path = sys.argv[2], int(sys.argv[3]), sys.argv[4]
-
-def is_branch_match(raw):
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        return False
-    return isinstance(obj, dict) and obj.get("branch") == branch
-
-with open(sys.argv[1]) as f:
-    lines = [line.rstrip("\n") for line in f if line.strip()]
-
-match_count = sum(1 for raw in lines if is_branch_match(raw))
-drop = match_count - max_n if match_count > max_n else 0
-
-out, seen = [], 0
-for raw in lines:
-    if is_branch_match(raw):
-        seen += 1
-        if seen <= drop:
-            continue
-    out.append(raw)
-
-with open(out_path, "w") as f:
-    for raw in out:
-        f.write(raw + "\n")
-' "$_la_file" "$_la_branch" "$_la_max" "$_la_tmp" 2>/dev/null
-      else
-        # jq-only fallback (no python3 on PATH). jq CAN express "drop the
-        # first N matches, keep every other line verbatim and in order" in
-        # a single filter: foreach over the input stream, tracking a
-        # running per-branch match counter in the state accumulator, and
-        # emitting a line only when it is NOT a to-be-dropped match.
-        _la_branch_count=$(jq -c --arg b "$_la_branch" 'select(.branch == $b)' "$_la_file" 2>/dev/null | wc -l | tr -d '[:space:]')
-        case "$_la_branch_count" in ''|*[!0-9]*) _la_branch_count=0 ;; esac
-        if [ "$_la_branch_count" -gt "$_la_max" ]; then
-          _la_drop=$((_la_branch_count - _la_max))
-          jq -c --arg b "$_la_branch" --argjson drop "$_la_drop" -s '
-            reduce .[] as $entry
-              ([0, []];
-                if $entry.branch == $b then
-                  (.[0] + 1) as $seen
-                  | if $seen <= $drop then [$seen, .[1]] else [$seen, .[1] + [$entry]] end
-                else
-                  [.[0], .[1] + [$entry]]
-                end)
-            | .[1][]
-          ' "$_la_file" > "$_la_tmp" 2>/dev/null
-        fi
-      fi
-      if [ -s "$_la_tmp" ]; then
-        mv "$_la_tmp" "$_la_file"
-      else
-        rm -f "$_la_tmp"
-      fi
-    fi
-  fi
-
+  printf '%s' "$_la_line" | ds_findings_run verdict ledger-append "$_la_file" "$_la_max" || :
   return 0
 }
 
@@ -1374,53 +353,14 @@ with open(out_path, "w") as f:
 #
 # ledger_entries_for_branch LEDGER_FILE BRANCH
 #
-# stdout: every JSONL line in LEDGER_FILE belonging to BRANCH, oldest first
-# (original file order -- ledger_append only ever appends, so file order IS
-# chronological order), one JSON object per line, unparsed (callers that
-# need structured access read a specific field via jq/python3 themselves).
-# Absent/empty LEDGER_FILE or no matching lines: no output, exit 0.
-#
-# Uses a real JSON parse (not the awk substring heuristic ledger_append's
-# capping uses internally) so a branch name that happens to be a substring
-# of another branch name (e.g. "foo" vs "foo-bar") is never confused --
-# correctness-relevant reads always go through this function or
-# ledger_latest_for_branch, never the awk heuristic.
+# stdout: every JSONL entry in LEDGER_FILE belonging to BRANCH, oldest first,
+# one compact JSON object per line. Branch names are compared whole, never as
+# substrings. Absent/empty LEDGER_FILE or no matching lines: no output, exit 0.
 ledger_entries_for_branch() {
   _lefb_file="$1"
   _lefb_branch="$2"
   [ -f "$_lefb_file" ] || return 0
-
-  if command -v jq >/dev/null 2>&1; then
-    jq -c --arg b "$_lefb_branch" 'select(.branch == $b)' "$_lefb_file" 2>/dev/null
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c '
-import json, sys
-branch = sys.argv[2]
-try:
-    with open(sys.argv[1]) as f:
-        lines = f.readlines()
-except Exception:
-    sys.exit(0)
-for line in lines:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        obj = json.loads(line)
-    except Exception:
-        continue
-    if obj.get("branch") == branch:
-        print(json.dumps(obj))
-' "$_lefb_file" "$_lefb_branch" 2>/dev/null
-    return 0
-  fi
-  # No JSON tool: cannot safely parse JSONL -- no output (conservative: a
-  # caller treats "no entries" the same as "ledger unreadable," which is the
-  # correct fail-open direction for recurrence marking, and the safe
-  # fail-CLOSED direction for "is there an anchored verdict at HEAD" checks
-  # that require a positive match to proceed).
+  ds_findings_run verdict ledger-entries "$_lefb_file" "$_lefb_branch" || :
   return 0
 }
 
@@ -1428,10 +368,7 @@ for line in lines:
 #
 # ledger_latest_for_branch LEDGER_FILE BRANCH
 #
-# stdout: the single most recent (last-appended) JSONL entry for BRANCH, or
-# nothing if none exists / LEDGER_FILE is absent / no JSON tool available.
-# Thin convenience wrapper over ledger_entries_for_branch — same fail-open-
-# on-missing-tool, fail-safe-on-no-match posture.
+# stdout: the single most recent (last-appended) entry for BRANCH, or nothing.
 ledger_latest_for_branch() {
   _llfb_file="$1"
   _llfb_branch="$2"

@@ -1,9 +1,9 @@
 """
 Direct tests of severity_blockers() (scripts/gates.sh) for severities that are
 not strings. A number, boolean or object cannot be ranked, so it must count as
-blocking on BOTH implementation branches (jq present, and python3-only with jq
-hidden from PATH). A null or missing severity keeps its original behavior:
-rank 0, not blocking.
+blocking. A null or missing severity keeps its original behavior: rank 0, not
+blocking. The count comes from the one python3 implementation in the finding
+pipeline; with python3 absent the function fails closed.
 """
 import json
 import os
@@ -32,7 +32,7 @@ class TestSeverityBlockersMalformedSeverity(unittest.TestCase):
         for s in self._shadows:
             shutil.rmtree(s, ignore_errors=True)
 
-    def _run(self, findings, hide_jq):
+    def _run(self, findings, hide_tool=None):
         review_path = os.path.join(self._tmpdir, "review.json")
         with open(review_path, "w") as f:
             json.dump({"summary": "x", "findings": findings}, f)
@@ -44,8 +44,9 @@ class TestSeverityBlockersMalformedSeverity(unittest.TestCase):
         """)
         env = os.environ.copy()
         env.update(source_env(gates=True))
-        if hide_jq:
-            shadow = path_without("jq")
+        env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
+        if hide_tool:
+            shadow = path_without(hide_tool)
             self._shadows.append(shadow)
             env["PATH"] = shadow
         r = subprocess.run(
@@ -56,47 +57,35 @@ class TestSeverityBlockersMalformedSeverity(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.strip()
 
-    def _both(self, findings):
-        return {
-            "jq": self._run(findings, hide_jq=False),
-            "python3": self._run(findings, hide_jq=True),
-        }
-
-    def test_branch_selection_is_real(self):
-        if shutil.which("jq") is None:
-            self.skipTest("jq not installed; the jq branch cannot be exercised")
-        shadow = path_without("jq")
-        self._shadows.append(shadow)
-        self.assertFalse(os.path.exists(os.path.join(shadow, "jq")))
-
     def test_numeric_severity_blocks(self):
-        for branch, out in self._both([_finding(severity=3)]).items():
-            self.assertEqual(out, "1", branch)
+        self.assertEqual(self._run([_finding(severity=3)]), "1")
 
     def test_boolean_severity_blocks(self):
         for sev in (True, False):
-            for branch, out in self._both([_finding(severity=sev)]).items():
-                self.assertEqual(out, "1", f"{branch} severity={sev}")
+            self.assertEqual(self._run([_finding(severity=sev)]), "1", f"severity={sev}")
 
     def test_object_severity_blocks(self):
-        for branch, out in self._both([_finding(severity={"level": "low"})]).items():
-            self.assertEqual(out, "1", branch)
+        self.assertEqual(self._run([_finding(severity={"level": "low"})]), "1")
 
     def test_null_severity_does_not_block(self):
-        for branch, out in self._both([_finding(severity=None)]).items():
-            self.assertEqual(out, "0", branch)
+        self.assertEqual(self._run([_finding(severity=None)]), "0")
 
     def test_missing_severity_does_not_block(self):
-        for branch, out in self._both([_finding()]).items():
-            self.assertEqual(out, "0", branch)
+        self.assertEqual(self._run([_finding()]), "0")
 
     def test_malformed_severity_still_honors_exclusions(self):
         findings = [
             _finding(severity=3, _deferral_matched=True),
             _finding(severity=True, _recurrence_demoted=True),
         ]
-        for branch, out in self._both(findings).items():
-            self.assertEqual(out, "0", branch)
+        self.assertEqual(self._run(findings), "0")
+
+    def test_result_does_not_depend_on_jq_being_installed(self):
+        findings = [_finding(severity=3), _finding(severity="HIGH"), _finding(severity="low")]
+        self.assertEqual(self._run(findings, hide_tool="jq"), "2")
+
+    def test_missing_python3_fails_closed_with_the_sentinel(self):
+        self.assertEqual(self._run([_finding(severity="low")], hide_tool="python3"), "99")
 
 
 if __name__ == "__main__":

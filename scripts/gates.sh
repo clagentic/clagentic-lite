@@ -52,6 +52,9 @@ set -e
 # This is the install tree ($CLAGENTIC_LITE_HOME), not the enrolled project root.
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOL_HOME="$(dirname "$SCRIPTS_DIR")"
+# The same home reached through any symlinked copy of this script; the finding
+# pipeline (ds_findings_py, platform.sh) is looked up under it too.
+_DS_REAL_HOME="$(dirname "$(dirname "$(ds_resolve_path "$0")")")"
 
 # Project root resolution: CLAGENTIC_PROJECT_ROOT env var wins, then git
 # show-toplevel of cwd. The env var is the override path used when gates.sh
@@ -2824,98 +2827,31 @@ _review_run_provenance_fields() {
 # taking its result unfiltered would let a later-written adversarial entry
 # shadow an earlier, still-valid review pass (or vice versa) purely because
 # of write order, not because either gate's own anchor actually changed.
-# Filters via ledger_entries_for_branch (oldest-first) and keeps the LAST
-# match for GATE, mirroring _ledger_latest_passing_head_for_branch's own
-# filter-then-take-last pattern below rather than re-deriving a third scan
-# primitive.
-#
-# NO DEFAULT ON READ (PEACHES, PR #199 review, amos.code-craft.10): a
-# legacy ledger entry written before the `gate` field existed has NO gate
-# key at all. Defaulting a MISSING field to "review" here would make every
-# pre-schema entry a valid passing anchor for a "review" lookup forever,
-# and — worse, the actual failure shape reported — collapses the very
-# discriminator this predicate exists to enforce, since a reader that
-# silently assumes "review" is exactly the same fail-toward-LESS-coverage
-# shape as the defect this task fixes. Back-compat comes from the CALLER
-# always passing an explicit GATE (every call site in this file does), not
-# from the reader guessing one for an entry that never recorded it. An
-# entry whose `gate` is absent/null/an unexpected type simply does not
-# match ANY explicit GATE query — it falls out of consideration here, and
-# the caller (get_review_diff) falls through to full-range review exactly
-# as it already does for "no prior passing verdict."
+# The predicate itself is findings.py verdict ledger-pass; the latest-entry
+# scan keeps the legacy-entry rule: an entry with no `gate` field matches no
+# GATE, so back-compat comes from the CALLER always passing an explicit GATE,
+# never from the reader guessing "review" for an entry that never recorded one.
 _ledger_anchored_pass_at_head() {
-  _laph_file="$1"
-  _laph_branch="$2"
   _laph_head="$3"
-  _laph_gate="${4:-review}"
   [ -n "$_laph_head" ] || return 1
-
-  _laph_latest=$(_ledger_latest_gate_entry "$_laph_file" "$_laph_branch" "$_laph_gate") || return 1
-  [ -n "$_laph_latest" ] || return 1
-
-  _laph_entry_head=$(_ledger_entry_field "$_laph_latest" head_sha) || return 1
-  _laph_entry_verdict=$(_ledger_entry_field "$_laph_latest" verdict) || return 1
-
-  [ -n "$_laph_entry_head" ] || return 1
-  [ "$_laph_entry_head" = "$_laph_head" ] || return 1
-  [ "$_laph_entry_verdict" = "pass" ]
+  ds_findings_run verdict ledger-pass "$1" "$2" "$_laph_head" "${4:-review}" || return 1
 }
 
 # _ledger_latest_gate_entry LEDGER_FILE BRANCH GATE — print the most recent
 # ledger entry (one JSON line) for BRANCH written by GATE, nothing if there is
-# none. Returns 1 when no JSON tool exists. Sole implementation of the
-# "latest entry for this gate" scan; _ledger_anchored_pass_at_head and
-# _ledger_head_verdict_state both read through it so the pass check and the
-# refusal-reason classification can never disagree about which entry is latest.
+# none. Returns 1 when the finding pipeline is unavailable. Sole implementation
+# of the "latest entry for this gate" scan; _ledger_anchored_pass_at_head and
+# _ledger_head_verdict_state both read through the same one in findings.py so
+# the pass check and the refusal-reason classification can never disagree
+# about which entry is latest.
 _ledger_latest_gate_entry() {
-  _llge_file="$1"
-  _llge_branch="$2"
-  _llge_gate="$3"
-  if command -v jq >/dev/null 2>&1; then
-    ledger_entries_for_branch "$_llge_file" "$_llge_branch" \
-      | jq -c --arg g "$_llge_gate" 'select(.gate == $g)' 2>/dev/null | tail -n 1
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    ledger_entries_for_branch "$_llge_file" "$_llge_branch" | python3 -c '
-import json, sys
-gate = sys.argv[1]
-best = ""
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        entry = json.loads(line)
-    except Exception:
-        continue
-    if entry.get("gate") == gate:
-        best = line
-if best:
-    print(best)
-' "$_llge_gate" 2>/dev/null
-    return 0
-  fi
-  return 1
+  ds_findings_run verdict ledger-latest "$1" "$2" "$3"
 }
 
 # _ledger_entry_field ENTRY_JSON FIELD — print FIELD of one ledger entry as a
-# string ("" when absent). Returns 1 when no JSON tool exists.
+# string ("" when absent). Returns 1 when the finding pipeline is unavailable.
 _ledger_entry_field() {
-  if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$1" | jq -r --arg f "$2" '.[$f] // "" | tostring' 2>/dev/null
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$1" | python3 -c 'import json,sys
-try:
-    v = json.load(sys.stdin).get(sys.argv[1], "")
-    print("" if v is None else v)
-except Exception:
-    print("")' "$2" 2>/dev/null
-    return 0
-  fi
-  return 1
+  printf '%s' "$1" | ds_findings_run verdict ledger-field "$2"
 }
 
 # _ledger_head_verdict_state LEDGER_FILE BRANCH HEAD_SHA GATE
@@ -2934,31 +2870,8 @@ except Exception:
 # Kept as a classifier beside the predicate rather than folded into it: the
 # predicate's boolean contract has many callers and must not grow output.
 _ledger_head_verdict_state() {
-  _lhvs_file="$1"
-  _lhvs_branch="$2"
-  _lhvs_head="$3"
-  _lhvs_gate="${4:-review}"
-
-  if _ledger_anchored_pass_at_head "$_lhvs_file" "$_lhvs_branch" "$_lhvs_head" "$_lhvs_gate"; then
-    printf 'pass'
-    return 0
-  fi
-  _lhvs_latest=$(_ledger_latest_gate_entry "$_lhvs_file" "$_lhvs_branch" "$_lhvs_gate") || _lhvs_latest=""
-  if [ -z "$_lhvs_latest" ]; then
-    printf 'missing_stamp'
-    return 0
-  fi
-  _lhvs_entry_head=$(_ledger_entry_field "$_lhvs_latest" head_sha) || _lhvs_entry_head=""
-  _lhvs_entry_verdict=$(_ledger_entry_field "$_lhvs_latest" verdict) || _lhvs_entry_verdict=""
-  if [ -z "$_lhvs_entry_head" ]; then
-    printf 'missing_stamp'
-  elif [ "$_lhvs_entry_head" != "$_lhvs_head" ]; then
-    printf 'sha_mismatch'
-  elif [ "$_lhvs_entry_verdict" = "block" ]; then
-    printf 'review_blocked_at_head'
-  else
-    printf 'missing_stamp'
-  fi
+  # An unavailable pipeline reads as no usable entry, the fail-closed answer.
+  ds_findings_run verdict ledger-state "$1" "$2" "$3" "${4:-review}" || printf 'missing_stamp'
   return 0
 }
 
@@ -3014,39 +2927,12 @@ _ledger_head_verdict_state() {
 # produced this bug (see lr-542a43 task description).
 _ledger_latest_passing_head_for_branch() {
   _llphfb_file="$1"
-  _llphfb_branch="$2"
-  _llphfb_gate="${3:-review}"
-
   [ -f "$_llphfb_file" ] || return 0
-
-  if command -v jq >/dev/null 2>&1; then
-    ledger_entries_for_branch "$_llphfb_file" "$_llphfb_branch" \
-      | jq -rs --arg g "$_llphfb_gate" '[.[] | select(.verdict == "pass" and (.head_sha // "") != "" and .gate == $g)] | last | .head_sha // empty' 2>/dev/null
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    ledger_entries_for_branch "$_llphfb_file" "$_llphfb_branch" | python3 -c '
-import json, sys
-gate = sys.argv[1]
-best = ""
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        entry = json.loads(line)
-    except Exception:
-        continue
-    if entry.get("verdict") == "pass" and entry.get("head_sha") and entry.get("gate") == gate:
-        best = entry["head_sha"]
-if best:
-    print(best)
-' "$_llphfb_gate" 2>/dev/null
-    return 0
-  fi
-  # No JSON tool: no output -- caller (get_review_diff) treats empty the
-  # same as "no prior passing verdict," which falls through to full-range
-  # review (fail toward MORE coverage, never a silent narrower diff).
+  # Without the finding pipeline there is no output: the caller
+  # (get_review_diff) treats empty as "no prior passing verdict," which falls
+  # through to full-range review (fail toward MORE coverage, never a silent
+  # narrower diff).
+  ds_findings_run verdict ledger-pass-head "$_llphfb_file" "$2" "${3:-review}" || :
   return 0
 }
 
@@ -3082,64 +2968,13 @@ if best:
 # severity, only whether the informational annotation is present).
 _ledger_mark_recurrence() {
   _lmr_findings_json="$1"
-  _lmr_diff="$2"
   _lmr_ledger="$3"
   _lmr_branch="$4"
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$_lmr_findings_json"
-    return 0
-  fi
-
-  _lmr_prior_entries=$(mktemp -t clagentic-ledger-prior.XXXXXX)
-  if [ -f "$_lmr_ledger" ]; then
-    ledger_entries_for_branch "$_lmr_ledger" "$_lmr_branch" > "$_lmr_prior_entries" 2>/dev/null
-  fi
-
-  _lmr_out=$(python3 - "$_lmr_findings_json" "$_lmr_prior_entries" <<'PYEOF'
-import json, sys
-
-findings_json, prior_entries_path = sys.argv[1], sys.argv[2]
-
-try:
-    findings = json.loads(findings_json)
-    if not isinstance(findings, list):
-        raise ValueError
-except Exception:
-    print(findings_json)
-    sys.exit(0)
-
-def triple(f):
-    return (str(f.get("file", "")), str(f.get("category", "")), str(f.get("message", "")))
-
-prior_triples = set()
-try:
-    with open(prior_entries_path) as pf:
-        for line in pf:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except Exception:
-                continue
-            for prior_f in entry.get("findings", []):
-                if isinstance(prior_f, dict):
-                    prior_triples.add(triple(prior_f))
-except Exception:
-    pass
-
-# OWN THE FIELD for every finding this loop touches (explicit, definite
-# value), same posture as _review_recurrence_demote's own splice —
-# never leave whatever the object already carried untouched.
-for f in findings:
-    if isinstance(f, dict):
-        f["_ledger_recurring"] = triple(f) in prior_triples
-
-print(json.dumps(findings))
-PYEOF
-)
-  rm -f "$_lmr_prior_entries"
+  # The diff argument ($2) is accepted for the existing call shape; the
+  # (file, category, message) match key does not read it.
+  _lmr_out=$(printf '%s' "$_lmr_findings_json" \
+    | ds_findings_run dispositions ledger-recurrence --ledger "$_lmr_ledger" --branch "$_lmr_branch") || _lmr_out=""
   [ -n "$_lmr_out" ] && printf '%s' "$_lmr_out" || printf '%s' "$_lmr_findings_json"
   return 0
 }
@@ -3196,39 +3031,11 @@ _ledger_record_review_verdict() {
   _lrrv_findings=$(_ledger_mark_recurrence "$_lrrv_findings" "$_lrrv_diff" "$_lrrv_ledger" "$_lrrv_branch")
   [ -n "$_lrrv_findings" ] || _lrrv_findings='[]'
 
-  _lrrv_line=""
-  if command -v jq >/dev/null 2>&1; then
-    _lrrv_line=$(jq -nc \
-      --arg ts "$_lrrv_ts" \
-      --arg branch "$_lrrv_branch" \
-      --arg gate "$_lrrv_gate" \
-      --arg base "$_lrrv_base_sha" \
-      --arg head "$_lrrv_head_sha" \
-      --arg verdict "$_lrrv_verdict" \
-      --argjson findings "$_lrrv_findings" \
-      --argjson config "$_lrrv_config" \
-      '{ts: $ts, branch: $branch, gate: $gate, base_sha: $base, head_sha: $head, verdict: $verdict, findings: $findings, config: $config}' 2>/dev/null)
-  elif command -v python3 >/dev/null 2>&1; then
-    _lrrv_line=$(python3 - "$_lrrv_ts" "$_lrrv_branch" "$_lrrv_gate" "$_lrrv_base_sha" "$_lrrv_head_sha" "$_lrrv_verdict" "$_lrrv_findings" "$_lrrv_config" <<'PYEOF'
-import json, sys
-ts, branch, gate, base, head, verdict, findings_json, config_json = sys.argv[1:9]
-try:
-    findings = json.loads(findings_json)
-    if not isinstance(findings, list):
-        findings = []
-except Exception:
-    findings = []
-try:
-    config = json.loads(config_json)
-except Exception:
-    config = {}
-print(json.dumps({
-    "ts": ts, "branch": branch, "gate": gate, "base_sha": base, "head_sha": head,
-    "verdict": verdict, "findings": findings, "config": config,
-}))
-PYEOF
-)
-  fi
+  # The findings ride stdin: a ledger entry can carry a list larger than one
+  # argv string may be.
+  _lrrv_line=$(printf '%s' "$_lrrv_findings" | ds_findings_run verdict ledger-entry \
+    --ts "$_lrrv_ts" --branch "$_lrrv_branch" --gate "$_lrrv_gate" --base "$_lrrv_base_sha" \
+    --head "$_lrrv_head_sha" --verdict "$_lrrv_verdict" --config "$_lrrv_config") || _lrrv_line=""
 
   [ -n "$_lrrv_line" ] || return 0
 
@@ -3352,70 +3159,12 @@ _publish_review_verdict() {
 # caller must tell either failure apart from an empty list, which prints
 # "Findings: none".
 _render_review_verdict_lines() {
-  _rrvl_head="$1"
-  _rrvl_findings="$2"
-
-  if command -v python3 >/dev/null 2>&1; then
-    # The findings travel through a file, not argv: one argv string is capped
-    # at ~128 KiB by the kernel, so a large findings list made the exec fail
-    # outright and the caller degrade to a false "no review recorded".
-    _rrvl_tmp=$(_stage_payload_file clagentic-review-findings "$_rrvl_findings") || return 1
-    python3 - "$_rrvl_head" "$_rrvl_tmp" <<'PYEOF'
-import json, sys
-
-head, findings_path = sys.argv[1:3]
-# Exit 2 (no output) when the findings cannot be read or are not an array:
-# "Findings: none" is a claim about the review, so it is only ever printed
-# for a list that was actually read and is empty.
-try:
-    with open(findings_path) as fh:
-        findings = json.load(fh)
-except (OSError, ValueError):
-    sys.exit(2)
-if not isinstance(findings, list):
-    sys.exit(2)
-
-by_severity = {}
-recurring = []
-for f in findings:
-    if not isinstance(f, dict):
-        continue
-    sev = str(f.get("severity", "unknown"))
-    by_severity[sev] = by_severity.get(sev, 0) + 1
-    if f.get("_ledger_recurring"):
-        recurring.append(f)
-
-lines = []
-lines.append("head_sha: `%s`" % (head or "<unresolved>"))
-lines.append("")
-if findings:
-    lines.append("Findings: %d total (%s)" % (
-        len(findings),
-        ", ".join("%s: %d" % (k, v) for k, v in sorted(by_severity.items())),
-    ))
-else:
-    lines.append("Findings: none")
-if recurring:
-    lines.append("")
-    lines.append("Recurring from a prior round (%d):" % len(recurring))
-    for f in recurring:
-        lines.append("- [%s] %s: %s" % (
-            f.get("severity", "unknown"), f.get("file", "?"), f.get("message", ""),
-        ))
-
-print("\n".join(lines))
-PYEOF
-    _rrvl_rc=$?
-    rm -f "$_rrvl_tmp"
-    return "$_rrvl_rc"
-  fi
-
-  # No python3 -- jq alone cannot format multi-line prose cleanly enough for
-  # a readable body, so this path fails closed (no partial/garbled output)
-  # rather than emitting something malformed. host_adapter_available having
-  # returned true is not itself gated on python3, so this is a real, distinct
-  # degraded case, logged by the caller.
-  return 1
+  # The findings ride stdin, not argv: one argv string is capped at ~128 KiB
+  # by the kernel, so a large findings list made the exec fail outright and
+  # the caller degrade to a false "no review recorded". The renderer returns
+  # 2 with no output for unreadable findings; an unavailable pipeline returns
+  # 1 the same way, so the caller degrades honestly and logs it.
+  printf '%s' "$2" | ds_findings_run render verdict-lines "$1"
 }
 
 # _build_review_verdict_comment_body VERDICT HEAD_SHA FINDINGS_JSON — renders
@@ -3939,33 +3688,13 @@ _build_ship_pr_body() {
   # A review record that exists but cannot be read is reported as exactly
   # that, never as "no review recorded": the two are different facts.
   _bspb_unreadable="reviewer: a review record exists for this branch but could not be read -- treat review as not yet run for this head."
-  if [ -n "$_bspb_head" ] && { command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; }; then
+  if [ -n "$_bspb_head" ] && command -v python3 >/dev/null 2>&1; then
     _bspb_latest=$(ledger_latest_for_branch "$_bspb_ledger" "$_bspb_branch")
     if [ -n "$_bspb_latest" ]; then
-      _bspb_entry_head=""
-      _bspb_entry_verdict=""
-      _bspb_entry_findings="[]"
-      if command -v jq >/dev/null 2>&1; then
-        _bspb_entry_head=$(printf '%s' "$_bspb_latest" | jq -r '.head_sha // ""' 2>/dev/null)
-        _bspb_entry_verdict=$(printf '%s' "$_bspb_latest" | jq -r '.verdict // ""' 2>/dev/null)
-        _bspb_entry_findings=$(printf '%s' "$_bspb_latest" | jq -c '.findings // []' 2>/dev/null)
-      elif command -v python3 >/dev/null 2>&1; then
-        _bspb_entry_head=$(printf '%s' "$_bspb_latest" | python3 -c 'import json,sys
-try:
-    print(json.load(sys.stdin).get("head_sha",""))
-except Exception:
-    print("")' 2>/dev/null)
-        _bspb_entry_verdict=$(printf '%s' "$_bspb_latest" | python3 -c 'import json,sys
-try:
-    print(json.load(sys.stdin).get("verdict",""))
-except Exception:
-    print("")' 2>/dev/null)
-        _bspb_entry_findings=$(printf '%s' "$_bspb_latest" | python3 -c 'import json,sys
-try:
-    print(json.dumps(json.load(sys.stdin).get("findings",[])))
-except Exception:
-    sys.exit(1)' 2>/dev/null)
-      fi
+      _bspb_entry_head=$(_ledger_entry_field "$_bspb_latest" head_sha) || _bspb_entry_head=""
+      _bspb_entry_verdict=$(_ledger_entry_field "$_bspb_latest" verdict) || _bspb_entry_verdict=""
+      _bspb_entry_findings=$(printf '%s' "$_bspb_latest" | ds_findings_run verdict ledger-field findings --json-default '[]') \
+        || _bspb_entry_findings=""
 
       if [ -z "$_bspb_entry_findings" ]; then
         # The entry's findings could not be read: an empty value here is an
@@ -4267,114 +3996,41 @@ _cross_round_dedup() {
   _crd_diff="$2"
   _crd_seen="$3"
 
-  # Absent seen-file: no prior keys; dedup_findings will populate it from this run.
-  # This is the correct first-run behavior — no-op suppression, but keys are seeded.
-
-  # Snapshot the count before dedup to compute suppression delta.
-  _crd_before=0
-  if command -v jq >/dev/null 2>&1; then
-    _crd_before=$(jq -r '.findings | length // 0' "$_crd_envelope" 2>/dev/null || echo 0)
-  elif command -v python3 >/dev/null 2>&1; then
-    _crd_before=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("findings",[])))' \
-      "$_crd_envelope" 2>/dev/null || echo 0)
-  fi
-  case "$_crd_before" in ''|*[!0-9]*) _crd_before=0 ;; esac
-
-  # Extract findings, pipe through dedup_findings, splice result back.
-  _crd_raw_findings=$(mktemp -t clagentic-crd-raw.XXXXXX)
-  _crd_deduped_findings=$(mktemp -t clagentic-crd-dedup.XXXXXX)
-  _crd_ok=0
-
-  if command -v jq >/dev/null 2>&1; then
-    jq -c '.findings // []' "$_crd_envelope" > "$_crd_raw_findings" 2>/dev/null && _crd_ok=1
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("findings",[])))' \
-      "$_crd_envelope" > "$_crd_raw_findings" 2>/dev/null && _crd_ok=1
-  fi
-
-  if [ "$_crd_ok" = "1" ]; then
-    # dedup_findings appends new keys to _crd_seen in-place and writes the
-    # annotated array to stdout (annotate mode: prior-run findings are kept).
-    dedup_findings "content-hash" "$_crd_seen" "$_crd_diff" annotate \
-      < "$_crd_raw_findings" > "$_crd_deduped_findings" 2>/dev/null || _crd_ok=0
-  fi
-
-  if [ "$_crd_ok" = "1" ]; then
-    # Splice the deduped findings array back into the envelope JSON.
-    _crd_tmp=$(mktemp -t clagentic-crd-env.XXXXXX)
-    _crd_spliced=0
-    if command -v jq >/dev/null 2>&1; then
-      _crd_deduped_json=$(cat "$_crd_deduped_findings")
-      if jq --argjson df "$_crd_deduped_json" '.findings = $df' "$_crd_envelope" > "$_crd_tmp" 2>/dev/null; then
-        mv "$_crd_tmp" "$_crd_envelope"
-        _crd_spliced=1
-      else
-        rm -f "$_crd_tmp"
-      fi
-    elif command -v python3 >/dev/null 2>&1; then
-      if python3 - "$_crd_envelope" "$_crd_deduped_findings" "$_crd_tmp" <<'PYEOF' 2>/dev/null
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        env = json.load(f)
-    with open(sys.argv[2]) as f:
-        deduped = json.load(f)
-    if not isinstance(deduped, list):
-        raise ValueError("not a list")
-    env["findings"] = deduped
-    with open(sys.argv[3], "w") as f:
-        json.dump(env, f)
-except Exception:
-    sys.exit(1)
-PYEOF
-      then
-        mv "$_crd_tmp" "$_crd_envelope"
-        _crd_spliced=1
-      else
-        rm -f "$_crd_tmp"
-      fi
-    fi
-
-    if [ "$_crd_spliced" = "1" ]; then
-      # Compute suppression count and surface to operator.
-      _crd_after=0
-      if command -v jq >/dev/null 2>&1; then
-        _crd_after=$(jq -r '.findings | length // 0' "$_crd_envelope" 2>/dev/null || echo 0)
-      elif command -v python3 >/dev/null 2>&1; then
-        _crd_after=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("findings",[])))' \
-          "$_crd_envelope" 2>/dev/null || echo 0)
-      fi
-      case "$_crd_after" in ''|*[!0-9]*) _crd_after=0 ;; esac
+  # Absent seen-file: no prior keys; the pipeline populates it from this run.
+  # The stage prints "BEFORE AFTER SEEN" counts on success; its exit status
+  # says which step failed (10 key computation, 11 splice) and the original
+  # findings are retained either way.
+  _crd_rc=0
+  _crd_counts=$(ds_findings_run dispositions cross-round "$_crd_envelope" \
+    --diff "$_crd_diff" --seen "$_crd_seen") || _crd_rc=$?
+  case "$_crd_rc" in
+    0)
+      set -- $_crd_counts
+      _crd_before="$1"
+      _crd_after="$2"
+      _crd_seen_n="$3"
       # Within-run collapses (same key twice in one response) are the only
       # reduction left; prior-run findings are counted separately as seen.
       _crd_suppressed=$((_crd_before - _crd_after))
       [ "$_crd_suppressed" -lt 0 ] && _crd_suppressed=0
-      _crd_seen_n=0
-      if command -v jq >/dev/null 2>&1; then
-        _crd_seen_n=$(jq -r '[(.findings // [])[] | select(._seen_before == true)] | length' "$_crd_envelope" 2>/dev/null || echo 0)
-      elif command -v python3 >/dev/null 2>&1; then
-        _crd_seen_n=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for f in d.get("findings",[]) if isinstance(f,dict) and f.get("_seen_before") is True))' \
-          "$_crd_envelope" 2>/dev/null || echo 0)
-      fi
-      case "$_crd_seen_n" in ''|*[!0-9]*) _crd_seen_n=0 ;; esac
       if [ "$_crd_seen_n" -gt 0 ]; then
         printf '[dedup] %d finding(s) seen in prior run(s) kept and still counted toward the verdict\n' \
           "$_crd_seen_n" 1>&2
       fi
       ds_audit_log "review-dedup" "pass" \
         "collapsed:${_crd_suppressed}/total:${_crd_before} seen_before:${_crd_seen_n} mode:annotate"
-    else
+      ;;
+    11)
       # Conservative: splice failed, retain original findings.
       printf '[gates/review] cross-round dedup: splice failed — retaining all findings (conservative)\n' 1>&2
       cmd_log_run review warn "cross-round dedup: splice failed; original findings retained"
-    fi
-  else
-    # Conservative: extraction or dedup failed, retain original findings.
-    printf '[gates/review] cross-round dedup: key computation failed — retaining all findings (conservative)\n' 1>&2
-    cmd_log_run review warn "cross-round dedup: key computation failed; original findings retained"
-  fi
-
-  rm -f "$_crd_raw_findings" "$_crd_deduped_findings"
+      ;;
+    *)
+      # Conservative: extraction or dedup failed, retain original findings.
+      printf '[gates/review] cross-round dedup: key computation failed — retaining all findings (conservative)\n' 1>&2
+      cmd_log_run review warn "cross-round dedup: key computation failed; original findings retained"
+      ;;
+  esac
 }
 
 # _review_recurrence_threshold — round count at which a recurring finding is
@@ -4466,187 +4122,30 @@ _review_recurrence_demote() {
   _rrd_diff="$2"
   _rrd_counts="$3"
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    # The splice step (matching bumped TSV rows back to finding objects and
-    # rewriting the array) needs a real JSON encoder/decoder pair operating
-    # on the same data structure; python3 is used for that regardless of
-    # whether jq is also present (only jq's FINAL `.findings = $nf` merge
-    # differs between the two branches below). No python3 at all — full
-    # passthrough, matching dedup_findings' own posture on missing tools.
-    return 0
-  fi
+  # Without the finding pipeline this is a full passthrough: the envelope
+  # stays unannotated, which only ever leaves a finding blocking.
+  command -v python3 >/dev/null 2>&1 || return 0
 
   _rrd_threshold=$(_review_recurrence_threshold)
 
-  _rrd_findings=$(_extract_findings_json "$_rrd_envelope")
-  [ -n "$_rrd_findings" ] || _rrd_findings='[]'
-
-  # Compute content-hash keys for this round's SURVIVING findings and bump
-  # their persisted round-counts. finding_content_keys emits one TSV row
-  # PER FINDING WITH A COMPUTABLE KEY ONLY (uncomputable-key findings are
-  # silently omitted from its output by design — see its own doc comment) —
-  # so downstream matching is done BY VALUE (file/category/message), never
-  # by array position, which would misalign the moment any finding in this
-  # round lacks a computable key.
+  # The stage keys this round's SURVIVING findings by content, bumps their
+  # persisted round counts and splices _recurrence_count/_recurrence_demoted
+  # into every finding by (file, category, message) value. It prints "none"
+  # when no finding had a computable key (envelope left untouched) and
+  # "demoted=N" otherwise.
   #
-  # SEEN-BEFORE FINDINGS ARE NOT BUMPED. _cross_round_dedup now keeps a
-  # finding an earlier run recorded (annotated _seen_before) instead of
-  # dropping it, so it reaches this function on every re-run. Counting each
-  # re-run as another "round" would demote it to advisory on the second
-  # identical run, which is the same verdict-by-repetition hole the dedup
-  # change closes. Recurrence therefore counts only findings dedup treated as
-  # new, exactly the population it saw when dedup dropped the rest.
-  _rrd_keyed_tsv=$(mktemp -t clagentic-rrd-keyed.XXXXXX)
-  _rrd_unseen=$(printf '%s' "$_rrd_findings" | python3 -c '
-import json, sys
-try:
-    items = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-print(json.dumps([f for f in items if not (isinstance(f, dict) and f.get("_seen_before") is True)]))
-' 2>/dev/null) || _rrd_unseen='[]'
-  [ -n "$_rrd_unseen" ] || _rrd_unseen='[]'
-  printf '%s' "$_rrd_unseen" | finding_content_keys "$_rrd_diff" > "$_rrd_keyed_tsv" 2>/dev/null
-
-  if [ ! -s "$_rrd_keyed_tsv" ]; then
-    # No finding in this round had a computable key (empty diff window, no
-    # sha256 tool, or genuinely zero findings) — nothing to bump or demote.
-    # Conservative: leave ENVELOPE_FILE untouched.
-    rm -f "$_rrd_keyed_tsv"
-    return 0
-  fi
-
-  _rrd_bumped_tsv=$(mktemp -t clagentic-rrd-bumped.XXXXXX)
-  finding_recurrence_bump "$_rrd_counts" < "$_rrd_keyed_tsv" > "$_rrd_bumped_tsv" 2>/dev/null
-  rm -f "$_rrd_keyed_tsv"
-
-  if [ ! -s "$_rrd_bumped_tsv" ]; then
-    rm -f "$_rrd_bumped_tsv"
-    return 0
-  fi
-
-  # Splice _recurrence_count/_recurrence_demoted into every finding matched
-  # BY VALUE (file/category/message triple) against the bumped TSV — the
-  # content-hash key itself has no independent meaning to a splice step
-  # outside review-merge.sh's own derivation, and a finding object does not
-  # carry its own key, so matching on the triple that identifies a finding
-  # row in finding_content_keys' TSV output is the natural join key here. A
-  # genuine triple collision between two DISTINCT findings in the same round
-  # would only ever mis-share a recurrence count between them — no worse
-  # than dedup_findings' own "location" strategy already treats an identical
-  # file/line/category/message as one finding by design.
-  #
-  # Emits the demoted-count on its own final line (stdout) so the caller can
-  # log it to the audit trail without a second read of ENVELOPE_FILE — this
-  # is the ONLY output contract of the python step; the spliced findings
-  # array is written directly to a temp file, not printed, so the two
-  # results never interleave on one stream.
-  _rrd_spliced_file=$(mktemp -t clagentic-rrd-spliced.XXXXXX)
-  _rrd_demoted_count=$(python3 - "$_rrd_findings" "$_rrd_bumped_tsv" "$_rrd_threshold" "$_rrd_spliced_file" <<'PYEOF'
-import json, sys
-
-findings_json, tsv_path, threshold, out_path = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-
-try:
-    findings = json.loads(findings_json)
-    if not isinstance(findings, list):
-        raise ValueError("not a list")
-except Exception:
-    print(0)
-    sys.exit(0)
-
-counts_by_triple = {}
-try:
-    with open(tsv_path) as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) < 5:
-                continue
-            fname, category, message, count_s = parts[1], parts[2], parts[3], parts[4]
-            try:
-                count = int(count_s)
-            except ValueError:
-                continue
-            counts_by_triple[(fname, category, message)] = count
-except Exception:
-    print(0)
-    sys.exit(0)
-
-demoted = 0
-for f in findings:
-    if not isinstance(f, dict):
-        continue
-    # OWN THE FIELD, DO NOT MERELY OVERWRITE-ON-MATCH (BOBBIE, lr-66e598
-    # follow-up): every finding this loop touches gets an EXPLICIT,
-    # definite _recurrence_demoted/_recurrence_count this function itself
-    # decided -- never a value left over from whatever the object already
-    # carried (in-band ingest is stripped upstream by
-    # _sanitize_review_findings_envelope, but this is the second,
-    # independent layer: even if that upstream strip were ever bypassed,
-    # skipped, or a future refactor moved this call before it, an
-    # unmatched finding still gets a definite False here, not a `continue`
-    # that leaves whatever pre-existing value untouched).
-    triple = (str(f.get("file", "")), str(f.get("category", "")), str(f.get("message", "")))
-    count = counts_by_triple.get(triple)
-    if count is None:
-        f["_recurrence_count"] = 0
-        f["_recurrence_demoted"] = False
-        continue
-    f["_recurrence_count"] = count
-    f["_recurrence_demoted"] = bool(count >= threshold)
-    if count >= threshold:
-        demoted += 1
-
-try:
-    with open(out_path, "w") as f:
-        json.dump(findings, f)
-except Exception:
-    print(0)
-    sys.exit(0)
-
-print(demoted)
-PYEOF
-)
+  # SEEN-BEFORE FINDINGS ARE NOT BUMPED. _cross_round_dedup keeps a finding an
+  # earlier run recorded (annotated _seen_before) instead of dropping it, so
+  # it reaches this stage on every re-run. Counting each re-run as another
+  # "round" would demote it to advisory on the second identical run, the same
+  # verdict-by-repetition hole the dedup change closes.
+  _rrd_result=$(ds_findings_run dispositions recurrence "$_rrd_envelope" \
+    --diff "$_rrd_diff" --counts "$_rrd_counts" --threshold "$_rrd_threshold") || return 0
+  case "$_rrd_result" in
+    demoted=*) _rrd_demoted_count="${_rrd_result#demoted=}" ;;
+    *) return 0 ;;
+  esac
   case "$_rrd_demoted_count" in ''|*[!0-9]*) _rrd_demoted_count=0 ;; esac
-
-  if [ -s "$_rrd_spliced_file" ]; then
-    if command -v jq >/dev/null 2>&1; then
-      _rrd_tmp=$(mktemp -t clagentic-rrd-env.XXXXXX)
-      if jq --slurpfile nf "$_rrd_spliced_file" '.findings = $nf[0]' "$_rrd_envelope" > "$_rrd_tmp" 2>/dev/null; then
-        mv "$_rrd_tmp" "$_rrd_envelope"
-      else
-        rm -f "$_rrd_tmp"
-      fi
-    else
-      # No jq: python3-only merge-back, same "read envelope, replace
-      # .findings, write back" shape as the jq branch above.
-      _rrd_tmp=$(mktemp -t clagentic-rrd-env.XXXXXX)
-      if python3 - "$_rrd_envelope" "$_rrd_spliced_file" "$_rrd_tmp" <<'PYEOF2' 2>/dev/null
-import json, sys
-env_path, spliced_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    with open(env_path) as f:
-        env = json.load(f)
-    with open(spliced_path) as f:
-        spliced = json.load(f)
-    if not isinstance(spliced, list):
-        raise ValueError("not a list")
-    env["findings"] = spliced
-    with open(out_path, "w") as f:
-        json.dump(env, f)
-except Exception:
-    sys.exit(1)
-PYEOF2
-      then
-        mv "$_rrd_tmp" "$_rrd_envelope"
-      else
-        rm -f "$_rrd_tmp"
-      fi
-    fi
-  fi
 
   if [ "$_rrd_demoted_count" -gt 0 ]; then
     printf '[recurrence] %d finding(s) demoted to advisory (reported >= %d rounds running)\n' \
@@ -4654,8 +4153,6 @@ PYEOF2
   fi
   ds_audit_log "review-recurrence" "pass" \
     "demoted:${_rrd_demoted_count} threshold:${_rrd_threshold}"
-
-  rm -f "$_rrd_bumped_tsv" "$_rrd_spliced_file"
   return 0
 }
 
@@ -4751,188 +4248,19 @@ PYEOF2
 _review_deferral_match() {
   _rdm_envelope="$1"
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    # Splicing _deferral_matched/_deferral_id into finding objects needs a
-    # real JSON encoder/decoder, matching _review_recurrence_demote's own
-    # python3-only posture. No python3 — full passthrough.
-    return 0
-  fi
+  # No finding pipeline: full passthrough, which leaves every finding blocking.
+  command -v python3 >/dev/null 2>&1 || return 0
 
-  _rdm_dfile="$REPO_ROOT/.clagentic/deferrals.json"
-  [ -f "$_rdm_dfile" ] || return 0
-
-  _rdm_deferrals=$(cat "$_rdm_dfile" 2>/dev/null) || return 0
-  [ -n "$_rdm_deferrals" ] || return 0
-
-  _rdm_findings=$(_extract_findings_json "$_rdm_envelope")
-  [ -n "$_rdm_findings" ] || return 0
-
-  # Build one TSV row per LIVE deferral entry: id<TAB>file<TAB>category<TAB>message
-  # A deferral is LIVE only when file_sha256 matches the named file's
-  # CURRENT on-disk content hash — computed here, in shell, via the same
-  # _rm_sha256 shim finding_content_keys uses (review-merge.sh; gates.sh
-  # sources that file, so the shim is already in scope). A file that no
-  # longer exists, or whose hash cannot be computed, yields no row for that
-  # entry (fail-closed: absent row means no match is possible for it).
-  _rdm_live_tsv=$(mktemp -t clagentic-rdm-live.XXXXXX)
-  _rdm_ids=$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.argv[1])
-    if not isinstance(d, list):
-        raise ValueError
-except Exception:
-    sys.exit(0)
-for e in d:
-    if not isinstance(e, dict):
-        continue
-    eid = e.get("id")
-    scope = e.get("scope")
-    fname = e.get("file")
-    fsha = e.get("file_sha256")
-    category = e.get("category", "")
-    message = e.get("message")
-    # Fail-closed schema check: id/scope/file/file_sha256/message are all
-    # required for a deferral to be eligible for MECHANICAL matching (the
-    # original six lr-c567 fields — category/description/expires/
-    # acknowledged_by — remain valid for the prompt-side path regardless;
-    # this is an ADDITIONAL, stricter gate for the gate-code path only). A
-    # deferral missing any of these is still injected into the prompt for
-    # the model to weigh (unchanged lr-c567 behavior) but is never
-    # mechanically matched here.
-    if not (isinstance(eid, str) and eid
-            and isinstance(fname, str) and fname
-            and isinstance(fsha, str) and fsha
-            and isinstance(message, str) and message
-            and scope == "stable-contract"):
-        continue
-    print("\t".join([eid, fname, str(category), message, fsha]))
-' "$_rdm_deferrals" 2>/dev/null)
-
-  if [ -z "$_rdm_ids" ]; then
-    rm -f "$_rdm_live_tsv"
-    return 0
-  fi
-
-  printf '%s\n' "$_rdm_ids" | while IFS="$(printf '\t')" read -r _rdm_id _rdm_file _rdm_cat _rdm_msg _rdm_want_sha; do
-    [ -n "$_rdm_id" ] || continue
-    _rdm_target="$REPO_ROOT/$_rdm_file"
-    [ -f "$_rdm_target" ] || continue
-    _rdm_actual_sha=$(_rm_sha256 < "$_rdm_target" 2>/dev/null)
-    [ -n "$_rdm_actual_sha" ] || continue
-    if [ "$_rdm_actual_sha" = "$_rdm_want_sha" ]; then
-      printf '%s\t%s\t%s\t%s\n' "$_rdm_id" "$_rdm_file" "$_rdm_cat" "$_rdm_msg" >> "$_rdm_live_tsv"
-    fi
-  done
-
-  if [ ! -s "$_rdm_live_tsv" ]; then
-    rm -f "$_rdm_live_tsv"
-    return 0
-  fi
-
-  # Splice: for every finding whose (file, category, message) triple
-  # matches EXACTLY ONE live deferral row, set _deferral_matched: true and
-  # _deferral_id: <id>. A triple matching MORE THAN ONE live row is
-  # AMBIGUOUS and is left unmatched — fail-closed, per "preserve when
-  # uncertain": two deferral entries independently claiming the same
-  # finding is a data-quality problem in deferrals.json, not something this
-  # function should silently resolve by picking one. OWN THE FIELD for
-  # every finding this loop touches (explicit False on no/ambiguous match),
-  # mirroring _review_recurrence_demote's own "overwrite-on-match is not
-  # own-the-field" discipline (lr-66e598 follow-up) — never leave whatever
-  # the object already carried untouched.
-  _rdm_spliced=$(mktemp -t clagentic-rdm-spliced.XXXXXX)
-  _rdm_matched_count=$(python3 - "$_rdm_findings" "$_rdm_live_tsv" "$_rdm_spliced" <<'PYEOF'
-import json, sys
-
-findings_json, tsv_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
-
-try:
-    findings = json.loads(findings_json)
-    if not isinstance(findings, list):
-        raise ValueError("not a list")
-except Exception:
-    print(0)
-    sys.exit(0)
-
-# triple -> list of ids (collect ALL matches per triple so a triple with
-# more than one live row is detectable and treated as ambiguous below).
-ids_by_triple = {}
-try:
-    with open(tsv_path) as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) < 4:
-                continue
-            did, fname, category, message = parts[0], parts[1], parts[2], parts[3]
-            ids_by_triple.setdefault((fname, category, message), []).append(did)
-except Exception:
-    print(0)
-    sys.exit(0)
-
-matched = 0
-for f in findings:
-    if not isinstance(f, dict):
-        continue
-    triple = (str(f.get("file", "")), str(f.get("category", "")), str(f.get("message", "")))
-    candidates = ids_by_triple.get(triple, [])
-    if len(candidates) == 1:
-        f["_deferral_matched"] = True
-        f["_deferral_id"] = candidates[0]
-        matched += 1
-    else:
-        # Zero matches, or more than one (ambiguous) -- fail closed either
-        # way: explicit False, no id field, finding stays blocking-eligible.
-        f["_deferral_matched"] = False
-
-try:
-    with open(out_path, "w") as f:
-        json.dump(findings, f)
-except Exception:
-    print(0)
-    sys.exit(0)
-
-print(matched)
-PYEOF
-)
+  # The stage prints "none" when there is nothing to match against (no file,
+  # no eligible live entry) and "matched=N" otherwise. Every case that
+  # cannot be decided stays blocking: a malformed or ambiguous entry never
+  # suppresses a finding.
+  _rdm_result=$(ds_findings_run dispositions deferrals "$_rdm_envelope" --root "$REPO_ROOT") || return 0
+  case "$_rdm_result" in
+    matched=*) _rdm_matched_count="${_rdm_result#matched=}" ;;
+    *) return 0 ;;
+  esac
   case "$_rdm_matched_count" in ''|*[!0-9]*) _rdm_matched_count=0 ;; esac
-
-  if [ -s "$_rdm_spliced" ]; then
-    if command -v jq >/dev/null 2>&1; then
-      _rdm_tmp=$(mktemp -t clagentic-rdm-env.XXXXXX)
-      if jq --slurpfile nf "$_rdm_spliced" '.findings = $nf[0]' "$_rdm_envelope" > "$_rdm_tmp" 2>/dev/null; then
-        mv "$_rdm_tmp" "$_rdm_envelope"
-      else
-        rm -f "$_rdm_tmp"
-      fi
-    else
-      _rdm_tmp=$(mktemp -t clagentic-rdm-env.XXXXXX)
-      if python3 - "$_rdm_envelope" "$_rdm_spliced" "$_rdm_tmp" <<'PYEOF2' 2>/dev/null
-import json, sys
-env_path, spliced_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    with open(env_path) as f:
-        env = json.load(f)
-    with open(spliced_path) as f:
-        spliced = json.load(f)
-    if not isinstance(spliced, list):
-        raise ValueError("not a list")
-    env["findings"] = spliced
-    with open(out_path, "w") as f:
-        json.dump(env, f)
-except Exception:
-    sys.exit(1)
-PYEOF2
-      then
-        mv "$_rdm_tmp" "$_rdm_envelope"
-      else
-        rm -f "$_rdm_tmp"
-      fi
-    fi
-  fi
 
   if [ "$_rdm_matched_count" -gt 0 ]; then
     printf '[deferral] %d finding(s) matched a live operator deferral (threshold, not suppression — see clagentic-lite render-review)\n' \
@@ -4940,8 +4268,6 @@ PYEOF2
   fi
   ds_audit_log "review-deferral-match" "pass" \
     "matched:${_rdm_matched_count}"
-
-  rm -f "$_rdm_live_tsv" "$_rdm_spliced"
   return 0
 }
 
@@ -4954,15 +4280,7 @@ PYEOF2
 # expectation that FILE has already been sanitized by
 # _sanitize_review_findings_envelope (below) BEFORE any of them ever see it.
 _extract_findings_json() {
-  _efj_file="$1"
-  if command -v jq >/dev/null 2>&1; then
-    jq -c '.findings // []' "$_efj_file" 2>/dev/null || printf '[]'
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("findings",[])))' \
-      "$_efj_file" 2>/dev/null || printf '[]'
-  else
-    printf '[]'
-  fi
+  ds_findings_run ingest findings "$1" 2>/dev/null || printf '[]'
 }
 
 # _extract_findings_json_strict FILE — like _extract_findings_json, but FAIL
@@ -4973,25 +4291,7 @@ _extract_findings_json() {
 # a present-but-null key must not be read as a clean review. Used where "[]"
 # would be written over real findings.
 _extract_findings_json_strict() {
-  _efjs_file="$1"
-  if command -v jq >/dev/null 2>&1; then
-    jq -c 'if type != "object" then error("not an object")
-           elif has("findings") then (.findings | if type == "array" then . else error("findings not an array") end)
-           else [] end' "$_efjs_file" 2>/dev/null || return 1
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json, sys
-d = json.load(open(sys.argv[1]))
-if not isinstance(d, dict):
-    sys.exit(1)
-f = d["findings"] if "findings" in d else []
-if not isinstance(f, list):
-    sys.exit(1)
-print(json.dumps(f))' "$_efjs_file" 2>/dev/null || return 1
-    return 0
-  fi
-  return 1
+  ds_findings_run ingest findings "$1" --strict 2>/dev/null || return 1
 }
 
 # _sanitize_review_findings_envelope FILE
@@ -5083,61 +4383,13 @@ print(json.dumps(f))' "$_efjs_file" 2>/dev/null || return 1
 _sanitize_review_findings_envelope() {
   _srfe_file="$1"
   [ -f "$_srfe_file" ] || return 0
-
-  # Strict read: a tool error here must not become "[]", which the rewrite
-  # below would write over the model's findings as "no findings".
-  if ! _srfe_findings=$(_extract_findings_json_strict "$_srfe_file") || [ -z "$_srfe_findings" ]; then
+  # The pipeline reduces the file in place, or replaces it with the degraded
+  # stub on any failure. If the pipeline itself cannot run, the file still
+  # holds the model's raw findings, so the stub is written here too, with a
+  # printf literal that needs no tool.
+  if ! ds_findings_run ingest review-envelope "$_srfe_file"; then
     _review_envelope_mark_sanitize_failed "$_srfe_file"
-    return 0
   fi
-
-  if ! _srfe_clean=$(_llm_json_array_allowlist_fields "$_srfe_findings" \
-      severity file "line:number" category message evidence suggestion \
-      issue_class class_fix) || [ -z "$_srfe_clean" ]; then
-    _review_envelope_mark_sanitize_failed "$_srfe_file"
-    return 0
-  fi
-
-  # The reduced array reaches the rewrite through a temp file, not argv: a
-  # string over MAX_ARG_STRLEN (~128 KiB) fails exec.
-  _srfe_clean_file=$(mktemp -t clagentic-srfe-clean.XXXXXX 2>/dev/null) || _srfe_clean_file=""
-  _srfe_tmp=$(mktemp -t clagentic-srfe-env.XXXXXX 2>/dev/null) || _srfe_tmp=""
-  _srfe_ok=0
-  if [ -n "$_srfe_clean_file" ] && [ -n "$_srfe_tmp" ] \
-      && printf '%s' "$_srfe_clean" > "$_srfe_clean_file" 2>/dev/null; then
-    if command -v jq >/dev/null 2>&1; then
-      if jq --slurpfile nf "$_srfe_clean_file" '.findings = $nf[0]' "$_srfe_file" > "$_srfe_tmp" 2>/dev/null \
-          && [ -s "$_srfe_tmp" ]; then
-        _srfe_ok=1
-      fi
-    elif command -v python3 >/dev/null 2>&1; then
-      if python3 - "$_srfe_file" "$_srfe_clean_file" "$_srfe_tmp" <<'PYEOF' 2>/dev/null
-import json, sys
-env_path, clean_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    with open(env_path) as f:
-        env = json.load(f)
-    with open(clean_path) as f:
-        clean = json.load(f)
-    if not isinstance(clean, list):
-        raise ValueError("not a list")
-    env["findings"] = clean
-    with open(out_path, "w") as f:
-        json.dump(env, f)
-except Exception:
-    sys.exit(1)
-PYEOF
-      then
-        [ -s "$_srfe_tmp" ] && _srfe_ok=1
-      fi
-    fi
-  fi
-  if [ "$_srfe_ok" -eq 1 ] && mv "$_srfe_tmp" "$_srfe_file" 2>/dev/null; then
-    rm -f "$_srfe_clean_file"
-    return 0
-  fi
-  rm -f "$_srfe_clean_file" "$_srfe_tmp"
-  _review_envelope_mark_sanitize_failed "$_srfe_file"
   return 0
 }
 
@@ -5238,31 +4490,8 @@ with open(path, "w") as f:
     f.write("\n")
 PYEOF
     return $?
-  elif command -v jq >/dev/null 2>&1; then
-    _ifa_tmp=$(mktemp -t clagentic-inv-append.XXXXXX)
-    _ifa_current='[]'
-    if [ -f "$_ifa_file" ] && jq -e '. | type == "array"' "$_ifa_file" >/dev/null 2>&1; then
-      _ifa_current=$(cat "$_ifa_file")
-    fi
-    # Dedupe check via jq: does an entry with this (file, statement) already exist?
-    _ifa_dup=$(printf '%s' "$_ifa_current" | jq --arg f "$_ifa_srcfile" --arg s "$_ifa_statement" \
-      'any(.[]; .file == $f and .statement == $s)' 2>/dev/null)
-    if [ "$_ifa_dup" = "true" ]; then
-      return 0
-    fi
-    printf '%s' "$_ifa_current" | jq --arg id "$_ifa_id" --arg cat "$_ifa_category" \
-      --arg f "$_ifa_srcfile" --arg s "$_ifa_statement" --argjson max "$(_invariant_feed_max_lines)" \
-      '. + [{"id": $id, "category": $cat, "file": $f, "statement": $s}] | if length > $max then .[-$max:] else . end' \
-      > "$_ifa_tmp" 2>/dev/null
-    if [ -s "$_ifa_tmp" ]; then
-      mv "$_ifa_tmp" "$_ifa_file"
-    else
-      rm -f "$_ifa_tmp"
-      return 1
-    fi
-    return 0
   fi
-  # No JSON tool — cannot safely append (writing raw text risks corrupting
+  # No python3 — cannot safely append (writing raw text risks corrupting
   # the JSON array). Fail silently; the invariant-feed remains empty/stale,
   # which is the same fail-open posture as ds_adversarial_prompt reading it.
   return 0
@@ -6188,183 +5417,12 @@ _llm_degraded_remediation_lines() {
 # what "the security floor" is mechanically defined as (and is NOT) given
 # the fields this parser actually has.
 _parse_adversarial_findings() {
-  _paf_file="$1"
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$_paf_file" <<'PYEOF'
-import json, re, sys
-
-path = sys.argv[1]
-findings = []
-_paf_read_failed = False
-# CWE and file:line are mandatory leading fields. severity is mandatory.
-# reachable/tier/class are optional (may be absent entirely, in any order
-# relative to each other, as long as all precede title when present) so a
-# model still emitting an older header keeps parsing. title remains the
-# final field, capturing to end-of-line.
-#
-# `class` (lr-4f8316) is the Auditor's own resolved change-class judgment
-# for the diff this finding lives in -- durable|ephemeral, see
-# ds_adversarial_prompt for the vocabulary and threshold implications. It is
-# a per-finding field (like reachable/tier) purely so it rides the same
-# parse loop and sanitize path; in practice one diff has one resolved class,
-# so every finding from the same adversarial pass carries the same value.
-header_re = re.compile(
-    r'^\[FINDING\]\s*([^|]+)\|\s*([^|]+)\|\s*severity:\s*([^|]+?)\s*'
-    r'(?:\|\s*reachable:\s*([^|]+?)\s*)?'
-    r'(?:\|\s*tier:\s*([^|]+?)\s*)?'
-    r'(?:\|\s*class:\s*([^|]+?)\s*)?'
-    r'\|\s*title:\s*(.+)$'
-)
-# FAIL LOUD ON A GENUINE READ FAILURE (BOBBIE, lr-33958f PR-C fold-in
-# review, Class 2.7): an unreadable/unparseable adversarial markdown file
-# used to fall back to lines = [] here, which then yields the SAME
-# zero-findings JSON array a genuinely clean audit produces --
-# INDISTINGUISHABLE from a clean pass. This is the identical fail-open
-# class BOBBIE blocked on twice in PR-B (lr-7047bf): a failure signalled by
-# writing empty data rather than returning status. The distinction that
-# matters: $path is $OUT, written moments earlier in cmd_adversarial by the
-# same shell invocation (gates.sh) that is about to call this parser, so a
-# read failure here means something is wrong with the filesystem/permissions
-# between that write and this read, NOT "the auditor legitimately found
-# nothing" (which instead produces a readable file with zero [FINDING]
-# headers -- an ordinary, valid outcome that must NOT hit this branch).
-# SIGNAL ON THE RETURN CHANNEL, not via stdout content: print nothing to
-# stdout and exit 1, so the caller (cmd_adversarial, gates.sh) can tell
-# "read failed" (nonzero exit, empty stdout) apart from "clean audit"
-# (exit 0, stdout "[]") mechanically, rather than the two being the exact
-# same bytes on stdout.
-try:
-    with open(path) as f:
-        lines = f.readlines()
-except Exception as e:
-    print(f"_parse_adversarial_findings: could not read {path}: {e}", file=sys.stderr)
-    sys.exit(1)
-
-for line in lines:
-    line = line.rstrip("\n")
-    m = header_re.match(line.strip())
-    if not m:
-        continue
-    cwe = m.group(1).strip()
-    fileline = m.group(2).strip()
-    severity_raw = m.group(3).strip().lower()
-    reachable_raw = (m.group(4) or "").strip().lower()
-    tier_raw = (m.group(5) or "").strip().lower()
-    class_raw = (m.group(6) or "").strip().lower()
-    title = m.group(7).strip()
-    # FILE:LINE EXTRACTION -- LOCATE AND VALIDATE, NOT SPLIT-AND-HOPE
-    # (BOBBIE, lr-33958f PR-C fold-in review, Class 2.5): the prior form
-    # (`if ":" in fileline: fname, _, lineno = fileline.rpartition(":")`)
-    # was unanchored and permissive -- ANY colon anywhere in fileline routed
-    # it down the "has a line number" branch, including a path that
-    # legitimately contains a colon with no trailing digits (rpartition then
-    # falls back to (fileline, 0) via the ValueError catch, which happens to
-    # be safe here, but only by accident of the fallback, not by validating
-    # the shape up front). Mirrors _llm_unwrap_json_envelope's own INV-2
-    # discipline: LOCATE the expected shape with an anchored pattern, then
-    # only accept it once it has actually been confirmed to match, rather
-    # than probing for a substring and coercing whatever falls out.
-    #
-    # file_line_re anchors the ENTIRE fileline string end-to-end: everything
-    # up to the LAST colon is the file (greedy `.+`, so a path containing an
-    # earlier colon, e.g. a drive letter, is still captured whole), and
-    # everything after that last colon must be ONE OR MORE DIGITS with
-    # nothing else trailing -- not "starts with digits", not "contains
-    # digits somewhere". Any other shape (no colon at all, e.g. "general";
-    # a colon with non-numeric trailing text; a colon with an empty
-    # trailing segment) is REJECTED by the regex not matching at all, and
-    # falls back to (fileline, 0) explicitly -- the same conservative
-    # default the prior code used for "no colon", now also covering every
-    # colon-bearing shape that isn't genuinely file:line.
-    file_line_re = re.compile(r'^(.+):(\d+)$')
-    m_fl = file_line_re.match(fileline)
-    if m_fl:
-        fname = m_fl.group(1)
-        lineno = int(m_fl.group(2))
-    else:
-        fname, lineno = fileline, 0
-    # severity is a closed set, same as reachable/tier/class below -- enum-check
-    # and force-correct rather than pass the raw captured text through.
-    # Before this (lr-e2b975 follow-up), severity was free text bounded only
-    # by the next "|" in the header line: model- or attacker-authored text
-    # in the severity position reached the JSON sidecar and the merge-gate
-    # prompt's fenced block completely unvalidated -- the identical
-    # fence-escape shape _llm_field_sanitize closes for message/file/
-    # category, just left open on this one field. "unknown" is the sentinel
-    # for an unparseable/unrecognized value: distinguishable from a real
-    # severity in review/audit output rather than silently coercing to a
-    # specific level. severity_blockers() (this file) ranks "unknown" the
-    # same as any other unrecognized string (rank 0, below "low") when this
-    # feeds a caller that ranks severities, so an unparseable severity can
-    # never inflate itself into a blocking rank.
-    severity = severity_raw if severity_raw in ("low", "medium", "high", "critical") else "unknown"
-    reachable = reachable_raw if reachable_raw in ("yes", "no") else "no"
-    # tier defaults to advisory when absent/unparseable (fail-open, see
-    # docstring above) and is force-corrected to advisory when the model's
-    # own reachable field says "no" -- reachability is the mechanical
-    # precondition for blocking, not a judgment call the tier field alone
-    # can override.
-    if tier_raw in ("blocking", "advisory"):
-        tier = tier_raw
-    else:
-        tier = "advisory"
-    if reachable != "yes":
-        tier = "advisory"
-    # class (lr-4f8316): closed set durable|ephemeral, absent/unparseable
-    # defaults to "durable" -- fail-closed on the SAME axis severity/
-    # reachable/tier fail-open on (never-under-block), because durable is
-    # the class that does NOT relax the blocking threshold. A parser gap in
-    # this field can therefore only ever leave the full bar in place, never
-    # silently grant a downgrade.
-    change_class = class_raw if class_raw in ("durable", "ephemeral") else "durable"
-    # SECURITY FLOOR CLAMP (lr-4f8316 follow-up, MECHANICAL, mirrors the
-    # reachability clamp immediately above -- same function, same posture,
-    # legible as a pair): before this fix, whether an ephemeral-classed,
-    # reachable, high/critical finding stayed tier:blocking was ENTIRELY
-    # LLM self-restraint -- the parser recorded the declared class but never
-    # independently verified the Auditor actually honored "the security
-    # floor is absolute regardless of class" from its own prompt. Docs and
-    # the prompt asserted that floor as absolute; nothing in code enforced
-    # it. That is the identical failure shape lr-e2b975 fixed for severity:
-    # a documented safety property with no corresponding mechanical check.
-    #
-    # The floor as documented (live credentials, reachable injection sinks,
-    # real exploit paths) is not fully expressible from the fields available
-    # to this parser -- there is no structured "is this a credential" or
-    # "is this a real exploit path" signal, only file/line/category/message/
-    # severity/reachable/tier/class. The mechanically enforceable subset of
-    # that intent, translated into the fields actually available: reachable
-    # (a cited concrete exploit path/trigger, per the Auditor's own
-    # Pre-Report Gate) AND severity high/critical (the Auditor's own
-    # judgment that this is a live, serious exposure) together are the
-    # closed-form proxy for "this is the kind of finding the floor
-    # protects." class can never downgrade a finding meeting that bar,
-    # regardless of what tier the model wrote. This does NOT independently
-    # verify "is a live credential" or "is a real exploit path" beyond what
-    # reachable+severity already encode -- those are represented via the
-    # Auditor's severity/reachable judgment, not via a separate mechanical
-    # signal this parser has no field to check. If that distinction matters
-    # to a future reader: reachable+high/critical is the enforced floor;
-    # "live credential" / "real exploit path" specifically is prompt-level
-    # instruction to the Auditor for HOW to set reachable/severity, not a
-    # second mechanical predicate over different fields.
-    if reachable == "yes" and severity in ("high", "critical"):
-        tier = "blocking"
-    findings.append({
-        "file": fname,
-        "line": lineno,
-        "category": cwe,
-        "message": title,
-        "severity": severity,
-        "reachable": reachable,
-        "tier": tier,
-        "class": change_class,
-    })
-print(json.dumps(findings))
-PYEOF
-  else
-    printf '[]'
-  fi
+  # A genuine read failure is signalled on the return channel (nonzero, no
+  # stdout), never as an empty array: a readable file with zero [FINDING]
+  # headers is an ordinary clean audit and prints "[]" with status 0, and the
+  # two must not be the same bytes. Without python3 the parse cannot run at
+  # all, which is the same failure, so it is signalled the same way.
+  ds_findings_run ingest adversarial-parse "$1"
 }
 
 # _sanitize_adversarial_findings_json JSON_ARRAY
@@ -6680,22 +5738,8 @@ cmd_adversarial() {
   # normal run, same "absent == 0" fail-open posture as every other
   # optional gate-plumbing file in this codebase).
   _adv_findings_dropped_count=0
-  if command -v jq >/dev/null 2>&1; then
-    _adv_findings_total_before_cap=$(printf '%s' "$_adv_findings_json_sorted" | jq 'length' 2>/dev/null || echo 0)
-    _adv_findings_total_after_cap=$(printf '%s' "$_adv_findings_json" | jq 'length' 2>/dev/null || echo 0)
-  elif command -v python3 >/dev/null 2>&1; then
-    _adv_findings_total_before_cap=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d) if isinstance(d, list) else 0)' <<EOF2 2>/dev/null || echo 0
-$_adv_findings_json_sorted
-EOF2
-)
-    _adv_findings_total_after_cap=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d) if isinstance(d, list) else 0)' <<EOF3 2>/dev/null || echo 0
-$_adv_findings_json
-EOF3
-)
-  else
-    _adv_findings_total_before_cap=0
-    _adv_findings_total_after_cap=0
-  fi
+  _adv_findings_total_before_cap=$(printf '%s' "$_adv_findings_json_sorted" | ds_findings_run ingest length 2>/dev/null || echo 0)
+  _adv_findings_total_after_cap=$(printf '%s' "$_adv_findings_json" | ds_findings_run ingest length 2>/dev/null || echo 0)
   case "$_adv_findings_total_before_cap" in ''|*[!0-9]*) _adv_findings_total_before_cap=0 ;; esac
   case "$_adv_findings_total_after_cap" in ''|*[!0-9]*) _adv_findings_total_after_cap=0 ;; esac
   if [ "$_adv_findings_total_before_cap" -gt "$_adv_findings_total_after_cap" ]; then
@@ -6843,113 +5887,22 @@ _mg_summary_stale_flag() {
 # reason fields (older envelope, no JSON tool) reads as sha_mismatch, the one
 # cause the old single message described.
 _mg_stale_report() {
-  _msr_file="$1"
+  # The classification and wording live in the finding pipeline (findings.py
+  # render stale-report), which prints PRIMARY, TEXT and AUDIT separated by the
+  # ASCII unit separator (the free text never contains one: control bytes are
+  # stripped from every finding field before it is listed).
   _msr_us=$(printf '\037')
-  _msr_rows=""
-  if command -v jq >/dev/null 2>&1; then
-    _msr_rows=$(jq -r '
-      "P\u001f\(.stale_reason // "")\u001f\u001f",
-      "H\u001f\(.current_sha // "")\u001f\u001f",
-      ((.stale_reasons // {}) | to_entries[] | "R\u001f\(.key)\u001f\(.value)\u001f"),
-      (if .blocking_findings == null then "U\u001f\u001f\u001f" else empty end),
-      ((.blocking_findings // [])[] | "F\u001f\(.file)\u001f\(.line)\u001f\(.severity)\u001f\(.message)")
-    ' "$_msr_file" 2>/dev/null) || _msr_rows=""
-  elif command -v python3 >/dev/null 2>&1; then
-    _msr_rows=$(python3 -c '
-import json, sys
-us = "\x1f"
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(0)
-print(us.join(["P", str(d.get("stale_reason") or ""), "", ""]))
-print(us.join(["H", str(d.get("current_sha") or ""), "", ""]))
-for k, v in (d.get("stale_reasons") or {}).items():
-    print(us.join(["R", str(k), str(v), ""]))
-if d.get("blocking_findings") is None:
-    print(us.join(["U", "", "", ""]))
-for f in d.get("blocking_findings") or []:
-    print(us.join(["F", str(f.get("file", "")), str(f.get("line", "")), str(f.get("severity", "")), str(f.get("message", ""))]))
-' "$_msr_file" 2>/dev/null) || _msr_rows=""
-  fi
-
-  _msr_primary=""
-  _msr_head=""
-  _msr_g_sha=""
-  _msr_g_stamp=""
-  _msr_g_head=""
-  _msr_blocked=0
-  _msr_nf=0
-  _msr_unlisted=0
-  _msr_flist=""
-  _msr_fshort=""
-  while IFS="$_msr_us" read -r _msr_t _msr_a _msr_b _msr_c _msr_d; do
-    case "$_msr_t" in
-      P) _msr_primary="$_msr_a" ;;
-      H) _msr_head="$_msr_a" ;;
-      R)
-        case "$_msr_b" in
-          sha_mismatch) _msr_g_sha="${_msr_g_sha:+$_msr_g_sha, }$_msr_a" ;;
-          missing_stamp) _msr_g_stamp="${_msr_g_stamp:+$_msr_g_stamp, }$_msr_a" ;;
-          empty_head) _msr_g_head="${_msr_g_head:+$_msr_g_head, }$_msr_a" ;;
-          review_blocked_at_head) _msr_blocked=1 ;;
-        esac
-        ;;
-      U) _msr_unlisted=1 ;;
-      F)
-        _msr_nf=$((_msr_nf + 1))
-        _msr_flist="${_msr_flist:+$_msr_flist; }${_msr_a}:${_msr_b} [${_msr_c}] ${_msr_d}"
-        _msr_fshort="${_msr_fshort:+$_msr_fshort, }${_msr_a}:${_msr_b}"
-        ;;
-    esac
-  done <<EOF
-$_msr_rows
-EOF
-
-  # No per-gate reasons at all: legacy single-cause wording.
-  if [ -z "$_msr_g_sha$_msr_g_stamp$_msr_g_head" ] && [ "$_msr_blocked" -eq 0 ]; then
-    _msr_g_sha="review, adversarial"
-  fi
-
-  _MG_STALE_TEXT=""
-  _MG_STALE_AUDIT=""
-  if [ "$_msr_blocked" -eq 1 ]; then
-    _msr_short_head=$(printf '%.12s' "$_msr_head")
-    if [ "$_msr_unlisted" -eq 1 ]; then
-      _MG_STALE_TEXT="the review at HEAD ${_msr_short_head} has unresolved blocking findings; blocking findings could not be listed; see last-review.json. Running the review again at the same commit does not clear them."
-      _MG_STALE_AUDIT="review blocked at HEAD [review_blocked_at_head]: blocking findings could not be listed"
-    elif [ "$_msr_nf" -gt 0 ]; then
-      _MG_STALE_TEXT="the review at HEAD ${_msr_short_head} has unresolved blocking findings (${_msr_nf}): ${_msr_flist}. Fix them (or record a deferral in .clagentic/deferrals.json) and commit; running the review again at the same commit does not clear them."
-      _MG_STALE_AUDIT="review blocked at HEAD [review_blocked_at_head]: ${_msr_nf} unresolved blocking finding(s): ${_msr_fshort}"
-    else
-      _MG_STALE_TEXT="the review at HEAD ${_msr_short_head} recorded a blocking verdict but no blocking findings are on record (an infra-degraded run records one); see 'clagentic-lite gates digest' for the cause."
-      _MG_STALE_AUDIT="review blocked at HEAD [review_blocked_at_head]: no blocking findings on record (degraded run?)"
-    fi
-  fi
-  if [ -n "$_msr_g_sha" ]; then
-    _MG_STALE_TEXT="${_MG_STALE_TEXT:+$_MG_STALE_TEXT }stale gate payload (SHA mismatch): ${_msr_g_sha} was produced for a different commit than HEAD — re-run clagentic-lite gates review and gates adversarial first."
-    _MG_STALE_AUDIT="${_MG_STALE_AUDIT:+$_MG_STALE_AUDIT | }stale payload [sha_mismatch]: ${_msr_g_sha} — re-run review + adversarial (SHA mismatch)"
-  fi
-  if [ -n "$_msr_g_stamp" ]; then
-    _MG_STALE_TEXT="${_MG_STALE_TEXT:+$_MG_STALE_TEXT }stale gate payload (no SHA stamp or no passing verdict recorded for HEAD): ${_msr_g_stamp} — re-run clagentic-lite gates review and gates adversarial first."
-    _MG_STALE_AUDIT="${_MG_STALE_AUDIT:+$_MG_STALE_AUDIT | }stale payload [missing_stamp]: ${_msr_g_stamp} — no SHA stamp or passing verdict at HEAD, re-run review + adversarial"
-  fi
-  if [ -n "$_msr_g_head" ]; then
-    _MG_STALE_TEXT="${_MG_STALE_TEXT:+$_MG_STALE_TEXT }stale gate payload: HEAD could not be resolved in this git repository, so no gate output can be matched to it."
-    _MG_STALE_AUDIT="${_MG_STALE_AUDIT:+$_MG_STALE_AUDIT | }stale payload [empty_head]: HEAD unresolved"
-  fi
-
-  if [ "$_msr_blocked" -eq 1 ]; then
-    _MG_STALE_PRIMARY="review_blocked_at_head"
-  elif [ -n "$_msr_primary" ]; then
-    _MG_STALE_PRIMARY="$_msr_primary"
-  elif [ -n "$_msr_g_sha" ]; then
-    _MG_STALE_PRIMARY="sha_mismatch"
-  elif [ -n "$_msr_g_stamp" ]; then
+  _msr_out=$(ds_findings_run render stale-report "$1") || _msr_out=""
+  if [ -z "$_msr_out" ]; then
+    # Pipeline unavailable: refuse with the one reason that is always true.
     _MG_STALE_PRIMARY="missing_stamp"
-  else
-    _MG_STALE_PRIMARY="empty_head"
+    _MG_STALE_TEXT="the finding pipeline (python3) is unavailable, so the stale gate payload could not be classified; re-run clagentic-lite gates review and gates adversarial first."
+    _MG_STALE_AUDIT="stale payload [missing_stamp]: finding pipeline unavailable"
+    return 0
   fi
+  IFS="$_msr_us" read -r _MG_STALE_PRIMARY _MG_STALE_TEXT _MG_STALE_AUDIT <<EOF
+$_msr_out
+EOF
 }
 
 # _mg_refuse_stale SUMMARY_FILE OUT_FILE GATE_NAME
@@ -7107,7 +6060,7 @@ except Exception:
   # exact case it flags is the case those tools are absent). A plain
   # substring grep needs no JSON tool at all.
   if grep -qF '"gate_summary_degraded": true' "$IN" 2>/dev/null; then
-    printf '{"decision": "refuse", "reason": "gate summary could not be built (no jq or python3 available) — install one or the other to run the merge gate"}\n' > "$OUT"
+    printf '{"decision": "refuse", "reason": "gate summary could not be built (python3 not available) — install python3 to run the merge gate"}\n' > "$OUT"
     cmd_log_run "$_mg_gate_name" block "gate-summary degraded — no JSON tool available to build it"
     cat "$OUT"
     if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
@@ -7252,13 +6205,9 @@ print("; ".join(parts))
 
 # Severity helpers — POSIX ordering: low < medium < high < critical.
 severity_rank() {
-  case "$1" in
-    low)      echo 1 ;;
-    medium)   echo 2 ;;
-    high)     echo 3 ;;
-    critical) echo 4 ;;
-    *)        echo 0 ;;
-  esac
+  # The one ranking table lives in findings.py; an unavailable pipeline ranks
+  # the name 0 (unknown), which every caller reads as 'use the default'.
+  ds_findings_run verdict rank "$1" 2>/dev/null || echo 0
 }
 
 # ISSUE_CLASS / CLASS_FIX (lr-3eb18c): deliberately NOT read anywhere in
@@ -7267,81 +6216,19 @@ severity_rank() {
 # an unresolved class escalation must never become a new way to gate /ship.
 # Do not add either field to this function's selection logic.
 severity_blockers() {
-  FILE="$1"; THRESHOLD="$2"
-  TR=$(severity_rank "$THRESHOLD")
-  [ "$TR" -eq 0 ] && TR=3   # default to 'high' on unknown threshold
-  # Parse-failure policy: ALWAYS fail closed. The sentinel value 99 trips
-  # the caller's `> 0` block check unambiguously. Three branches that
-  # could fail (jq parse, python3 parse, no validator at all) all return
-  # 99 — there is no path where an unparseable review counts as "clean."
-  # A non-string, non-null severity (a number, say) cannot be ranked and counts
-  # as blocking in both branches; the jq branch used to error out to the 99
-  # sentinel while the python3 branch ranked it 0 and let it pass.
-  # Severity strings are normalized case-insensitively. LLM models routinely
-  # return "HIGH" or "CRITICAL" uppercase — without normalization these rank
-  # 0 (unknown) and blocking findings silently pass.
-  #
-  # _recurrence_demoted exclusion (lr-66e598): a finding _review_recurrence_demote
-  # annotated with _recurrence_demoted: true is excluded from this count —
-  # this IS the mechanism that makes recurrence demotion a threshold change
-  # rather than suppression: the finding stays in .findings (still counted,
-  # still rendered by cmd_render_review, still in the audit trail) with its
-  # honest severity untouched; it simply no longer contributes to whether
-  # /ship blocks. A finding without the annotation (feature off, or key
-  # uncomputable that round) is counted exactly as before — the exclusion is
-  # additive and only ever REDUCES the blocker count, never increases it.
-  #
-  # _deferral_matched exclusion (lr-2ebc41): identical mechanism, second
-  # source. A finding _review_deferral_match annotated with
-  # _deferral_matched: true matched a LIVE (file-hash-verified) operator
-  # deferral and is likewise excluded from this count — see that function's
-  # doc comment for the full match-key/lapse/fail-closed rationale. Composes
-  # additively with the recurrence exclusion above (a finding can be
-  # excluded by either, neither, or in principle both; either annotation
-  # alone is sufficient).
-  if command -v jq >/dev/null 2>&1; then
-    R=$(jq -r --argjson tr "$TR" '
-      def rank(s):
-        if s == null then 0
-        elif (s | type) != "string" then 4
-        else (s | ascii_downcase) as $s
-        | if $s == "critical" then 4
-        elif $s == "high" then 3
-        elif $s == "medium" then 2
-        elif $s == "low" then 1
-        else 0 end end;
-      [(.findings // [])[] | select(rank(.severity) >= $tr and (._recurrence_demoted // false) != true and (._deferral_matched // false) != true)] | length
-    ' "$FILE" 2>/dev/null)
-    if [ -z "$R" ]; then echo 99; else echo "$R"; fi
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 - "$FILE" "$TR" <<'PY'
-import json, sys
-ranks = {"low":1,"medium":2,"high":3,"critical":4}
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    print(99); sys.exit(0)
-tr = int(sys.argv[2])
-def rank(sev):
-    if sev is None:
-        return 0
-    if not isinstance(sev, str):
-        return 4
-    return ranks.get(sev.lower(), 0)
-print(sum(
-    1 for f in d.get("findings", [])
-    if rank(f.get("severity")) >= tr
-    and f.get("_recurrence_demoted") is not True
-    and f.get("_deferral_matched") is not True
-))
-PY
-  else
-    # No validator at all — fail closed. Sentinel 99 makes the audit-row
-    # message ("99 finding(s) at >= high") visibly unusual so users know
-    # this is "blocked because the gate couldn't read the review" rather
-    # than a model that legitimately found 99 issues.
-    echo 99
-  fi
+  # Parse-failure policy: ALWAYS fail closed. The sentinel value 99 trips the
+  # caller's `> 0` block check unambiguously, and makes the audit-row message
+  # ("99 finding(s) at >= high") visibly unusual, so users know this is
+  # "blocked because the gate couldn't read the review" rather than a model
+  # that legitimately found 99 issues. The count itself, the severity ranking
+  # (a non-string severity cannot be ranked and counts as blocking; strings
+  # are matched case-insensitively), the unknown-threshold default of 'high'
+  # and the _recurrence_demoted / _deferral_matched exclusions (thresholds,
+  # not suppression: the finding stays in .findings with its honest severity)
+  # all live in findings.py verdict blockers. A missing python3 is the same
+  # unreadable-review case.
+  _sb_out=$(ds_findings_run verdict blockers "$1" "$2") || _sb_out=""
+  if [ -z "$_sb_out" ]; then echo 99; else echo "$_sb_out"; fi
 }
 
 # _blocking_findings_json THRESHOLD — read a JSON object with a .findings array
@@ -7358,56 +6245,10 @@ PY
 # (rank 4): the same fail-closed reading severity_blockers applies, which keeps
 # the list equal to the set that blocked.
 _blocking_findings_json() {
-  _bfj_tr=$(severity_rank "$1")
-  [ "$_bfj_tr" -eq 0 ] && _bfj_tr=3
-  if command -v jq >/dev/null 2>&1; then
-    jq -c --argjson tr "$_bfj_tr" '
-      def rank(s):
-        if s == null then 0
-        elif (s | type) != "string" then 4
-        else (s | ascii_downcase) as $s
-        | if $s == "critical" then 4
-        elif $s == "high" then 3
-        elif $s == "medium" then 2
-        elif $s == "low" then 1
-        else 0 end end;
-      def clean: (. // "" | tostring | gsub("[\u0001-\u001f\u007f]"; " ") | .[0:300]);
-      [(.findings // [])[]
-        | select(rank(.severity) >= $tr and (._recurrence_demoted // false) != true and (._deferral_matched // false) != true)
-        | {file: (.file | clean), line: (.line // 0), severity: (.severity | clean), message: (.message | clean)}]
-    ' 2>/dev/null || printf 'null'
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c '
-import json, re, sys
-ranks = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-tr = int(sys.argv[1])
-def clean(v):
-    return re.sub(r"[\x00-\x1f\x7f]", " ", "" if v is None else str(v))[:300]
-def rank(sev):
-    if sev is None:
-        return 0
-    if not isinstance(sev, str):
-        return 4
-    return ranks.get(sev.lower(), 0)
-try:
-    d = json.load(sys.stdin)
-    out = [
-        {"file": clean(f.get("file")), "line": f.get("line") or 0,
-         "severity": clean(f.get("severity")), "message": clean(f.get("message"))}
-        for f in d.get("findings", []) if isinstance(f, dict)
-        and rank(f.get("severity")) >= tr
-        and f.get("_recurrence_demoted") is not True
-        and f.get("_deferral_matched") is not True
-    ]
-    print(json.dumps(out))
-except Exception:
-    print("null")
-' "$_bfj_tr" 2>/dev/null || printf 'null'
-    return 0
-  fi
-  printf 'null'
+  _bfj_out=$(ds_findings_run verdict blocking-json "$1" 2>/dev/null) || _bfj_out=""
+  [ -n "$_bfj_out" ] || _bfj_out="null"
+  printf '%s' "$_bfj_out"
+  return 0
 }
 
 # _fence_adversarial_findings JSON_ARRAY — render an (already sanitized)
@@ -7421,29 +6262,8 @@ except Exception:
 # sidecar is ever written) — this function only renders and fences, it does
 # not sanitize a second time.
 _fence_adversarial_findings() {
-  _faf_json="$1"
-  if command -v jq >/dev/null 2>&1; then
-    jq -Rs '.' <<EOF
-===BEGIN ADVERSARIAL FINDINGS DATA===
-$(printf '%s' "$_faf_json" | jq '.' 2>/dev/null || printf '%s' "$_faf_json")
-===END ADVERSARIAL FINDINGS DATA===
-EOF
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c '
-import json, sys
-raw = sys.argv[1]
-try:
-    pretty = json.dumps(json.loads(raw), indent=2)
-except Exception:
-    pretty = raw
-block = "===BEGIN ADVERSARIAL FINDINGS DATA===\n" + pretty + "\n===END ADVERSARIAL FINDINGS DATA==="
-print(json.dumps(block))
-' "$_faf_json"
-    return 0
-  fi
-  printf '""'
+  # An unavailable pipeline renders an empty string literal, as before.
+  printf '%s' "$1" | ds_findings_run render fence-findings || printf '""'
 }
 
 # _fence_deterministic_gates JSON_OBJECT — render an (already sanitized)
@@ -7522,37 +6342,13 @@ print(json.dumps(block))
 # the two paths cannot diverge on the fence wording or trailing newline. A
 # fixed "\n" follows the closing marker in both.
 _fence_data_block() {
-  _fdb_label="$1"
-  _fdb_kind="$2"
-  _fdb_text="$3"
-  _fdb_body="$_fdb_text"
-  if [ "$_fdb_kind" = "json" ]; then
-    # The pretty-print step rewrites TEXT, which is already sanitized, so a
-    # failure here falls back to that same sanitized text. The fallback is
-    # never reached with unsanitized content.
-    if command -v jq >/dev/null 2>&1; then
-      _fdb_body=$(printf '%s' "$_fdb_text" | jq -S '.' 2>/dev/null) || _fdb_body="$_fdb_text"
-    elif command -v python3 >/dev/null 2>&1; then
-      # TEXT goes over stdin, never argv: a single argv string over the
-      # kernel's MAX_ARG_STRLEN (~128 KiB) fails exec with E2BIG.
-      _fdb_body=$(printf '%s' "$_fdb_text" | python3 -c '
-import json, sys
-print(json.dumps(json.loads(sys.stdin.read()), indent=2, sort_keys=True, ensure_ascii=False))
-' 2>/dev/null) || _fdb_body="$_fdb_text"
-    fi
-  fi
-  # No encoder, or an encoder failure, is a failure (return 1, no output),
-  # never an empty string literal a caller could read as "empty content".
-  if command -v jq >/dev/null 2>&1; then
-    printf '===BEGIN %s DATA===\n%s\n===END %s DATA===\n' "$_fdb_label" "$_fdb_body" "$_fdb_label" | jq -Rs '.'
-    return $?
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    printf '===BEGIN %s DATA===\n%s\n===END %s DATA===\n' "$_fdb_label" "$_fdb_body" "$_fdb_label" \
-      | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read(), ensure_ascii=False))'
-    return $?
-  fi
-  return 1
+  # TEXT goes over stdin, never argv: a single argv string over the kernel's
+  # MAX_ARG_STRLEN (~128 KiB) fails exec with E2BIG. The pretty-print step
+  # rewrites TEXT, which is already sanitized, so a failure there falls back to
+  # that same sanitized text. An unavailable encoder is a failure (return 1, no
+  # output), never an empty string literal a caller could read as "empty
+  # content".
+  printf '%s' "$3" | ds_findings_run render fence-data "$1" "$2"
 }
 
 # Fixed, pre-encoded replacements for review_fenced / adversarial_fenced when
@@ -7590,116 +6386,16 @@ _GATE_ADVERSARIAL_FINDINGS_UNAVAILABLE_FENCED='"===BEGIN ADVERSARIAL FINDINGS DA
 # Sanitized ONCE here and handed to both build_gate_summary emitter branches,
 # so they cannot diverge.
 _sanitize_review_for_prompt() {
-  _srp_file="$1"
-  if [ ! -f "$_srp_file" ]; then
-    printf 'null'
-    return 0
-  fi
-  _srp_fields="severity file category message evidence suggestion issue_class class_fix _deferral_id"
-  # Keys a finding may carry into the payload: the closed review schema, the
-  # repo-written annotations (not free text), and nothing else.
-  _srp_keep_keys="severity file line category message evidence suggestion issue_class class_fix _recurrence_demoted _recurrence_count _deferral_matched _deferral_id"
-  if command -v jq >/dev/null 2>&1; then
-    jq -e 'type == "object"' "$_srp_file" >/dev/null 2>&1 || return 1
-    # Ingest could not reduce the findings to the closed schema and replaced
-    # the file with a degraded stub (_review_envelope_mark_sanitize_failed):
-    # its empty findings list is not "no findings".
-    jq -e '.sanitize_failed != true' "$_srp_file" >/dev/null 2>&1 || return 1
-    _srp_findings=$(jq -c --arg keys "$_srp_keep_keys" '
-      ($keys | split(" ")) as $keep
-      | (.findings // []) | if type == "array" then . else [] end
-      | [.[] | if type == "object" then with_entries(select(.key as $k | $keep | index($k))) else {} end]
-    ' "$_srp_file" 2>/dev/null) || return 1
-    [ -n "$_srp_findings" ] || return 1
-    _srp_findings=$(_llm_json_array_sanitize_fields_strict "$_srp_findings" $_srp_fields) || return 1
-    [ -n "$_srp_findings" ] || return 1
-    _srp_raw=$(jq -r '.summary // "" | if type == "string" then . else "" end' "$_srp_file" 2>/dev/null) || return 1
-    _srp_summary=$(_llm_field_sanitize "$_srp_raw") || return 1
-    _srp_raw=$(jq -r '._clagentic_diff_sha // "" | if type == "string" then . else "" end' "$_srp_file" 2>/dev/null) || return 1
-    _srp_sha=$(_llm_field_sanitize "$_srp_raw") || return 1
-    # Findings arrive on stdin and the review file via --slurpfile, not
-    # --argjson: argv strings over MAX_ARG_STRLEN (~128 KiB) fail exec.
-    _srp_out=$(printf '%s' "$_srp_findings" | jq -c --slurpfile rv "$_srp_file" --arg s "$_srp_summary" --arg sha "$_srp_sha" '
-      . as $f
-      | $rv[0]
-      | (if (.summary | type) == "string" then {summary: $s} else {} end)
-        + {findings: $f}
-        + (if (._clagentic_diff_sha | type) == "string" then {_clagentic_diff_sha: $sha} else {} end)
-    ' 2>/dev/null) || return 1
-    [ -n "$_srp_out" ] || return 1
-    printf '%s' "$_srp_out"
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    # One getter for every piece of the envelope; MODE picks the piece. Exit
-    # 1 from "isobj" means "not a JSON object", a failure (same as jq above).
-    _srp_get='
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        d = json.load(f)
-except Exception:
-    sys.exit(1)
-if not isinstance(d, dict):
-    sys.exit(1)
-mode = sys.argv[2]
-if mode == "isobj":
-    # A sanitize_failed stub (_review_envelope_mark_sanitize_failed) is a
-    # failure like a non-object: its empty findings list is not "no findings".
-    sys.exit(1 if d.get("sanitize_failed") is True else 0)
-if mode == "findings":
-    v = d.get("findings")
-    keep = sys.argv[3].split(" ")
-    print(json.dumps([
-        {k: x[k] for k in x if k in keep} if isinstance(x, dict) else {}
-        for x in (v if isinstance(v, list) else [])
-    ]))
-elif mode in ("summary", "sha"):
-    v = d.get("summary" if mode == "summary" else "_clagentic_diff_sha")
-    sys.stdout.write(v if isinstance(v, str) else "")
-elif mode in ("has_summary", "has_sha"):
-    v = d.get("summary" if mode == "has_summary" else "_clagentic_diff_sha")
-    print("1" if isinstance(v, str) else "0")
-'
-    python3 -c "$_srp_get" "$_srp_file" isobj 2>/dev/null || return 1
-    _srp_findings=$(python3 -c "$_srp_get" "$_srp_file" findings "$_srp_keep_keys" 2>/dev/null) || return 1
-    [ -n "$_srp_findings" ] || return 1
-    _srp_findings=$(_llm_json_array_sanitize_fields_strict "$_srp_findings" $_srp_fields) || return 1
-    [ -n "$_srp_findings" ] || return 1
-    _srp_raw=$(python3 -c "$_srp_get" "$_srp_file" summary 2>/dev/null) || return 1
-    _srp_summary=$(_llm_field_sanitize "$_srp_raw") || return 1
-    _srp_raw=$(python3 -c "$_srp_get" "$_srp_file" sha 2>/dev/null) || return 1
-    _srp_sha=$(_llm_field_sanitize "$_srp_raw") || return 1
-    _srp_has_summary=$(python3 -c "$_srp_get" "$_srp_file" has_summary 2>/dev/null) || return 1
-    _srp_has_sha=$(python3 -c "$_srp_get" "$_srp_file" has_sha 2>/dev/null) || return 1
-    _srp_out=$(printf '%s' "$_srp_findings" | python3 -c '
-import json, sys
-out = {}
-if sys.argv[3] == "1":
-    out["summary"] = sys.argv[1]
-out["findings"] = json.loads(sys.stdin.read())
-if sys.argv[4] == "1":
-    out["_clagentic_diff_sha"] = sys.argv[2]
-print(json.dumps(out, separators=(",", ":"), ensure_ascii=False))
-' "$_srp_summary" "$_srp_sha" "$_srp_has_summary" "$_srp_has_sha" 2>/dev/null) || return 1
-    [ -n "$_srp_out" ] || return 1
-    printf '%s' "$_srp_out"
-    return 0
-  fi
-  # No JSON tool: the file cannot be parsed or sanitized at all.
-  return 1
+  # The reduction, sanitizing and fail-closed rules live in findings.py render
+  # sanitize-review: 'null' for an absent file, status 1 with no output for
+  # one that exists but cannot be fully extracted and sanitized.
+  ds_findings_run render sanitize-review "$1"
 }
 
 # _json_string_field JSON_OBJECT KEY — print the string value at KEY ("" when
-# absent or not a string, or when no JSON tool exists).
+# absent or not a string, or when the finding pipeline is unavailable).
 _json_string_field() {
-  if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // "" | if type == "string" then . else "" end' 2>/dev/null
-  elif command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$1" | python3 -c 'import json, sys
-v = json.loads(sys.stdin.read()).get(sys.argv[1])
-sys.stdout.write(v if isinstance(v, str) else "")' "$2" 2>/dev/null
-  fi
+  printf '%s' "$1" | ds_findings_run render json-field "$2" 2>/dev/null
   return 0
 }
 
@@ -7716,11 +6412,7 @@ sys.stdout.write(v if isinstance(v, str) else "")' "$2" 2>/dev/null
 # FAIL CLOSED: a read, length or sanitize failure returns 1 with no output,
 # never the unsanitized report and never an empty string.
 _sanitize_adversarial_report_for_prompt() {
-  _sar_file="$1"
-  _sar_len=$(wc -c < "$_sar_file" | tr -d ' ') || return 1
-  case "$_sar_len" in ''|*[!0-9]*) return 1 ;; 0) _sar_len=1 ;; esac
-  _sar_text=$(cat "$_sar_file") || return 1
-  _llm_field_sanitize "$_sar_text" "$((_sar_len * 3))"
+  ds_findings_run render sanitize-report "$1"
 }
 
 # _stage_payload_file PREFIX PAYLOAD — the one handoff primitive for any
@@ -8499,7 +7191,7 @@ build_gate_summary() {
       # to approve (gate_summary_degraded routes to a refuse decision, see
       # cmd_merge_gate), it just reports the more specific cause.
       if [ "$STALE_PAYLOAD" != "true" ]; then
-        if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+        if ! command -v python3 >/dev/null 2>&1; then
           : # no-json-tool exemption: defer to the canonical gate_summary_degraded path
         else
           _mg_ledger=$(_review_ledger_path)
@@ -8719,125 +7411,12 @@ build_gate_summary() {
     ADVERSARIAL_FENCED_PAYLOAD=$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED
   fi
 
-  # Prefer jq; fall back to python3; finally degrade to a minimal envelope
-  # (degraded: no fenced content can be built without a JSON encoder).
-  if command -v jq >/dev/null 2>&1; then
-    ADF_PAYLOAD='[]'
-    ACKS_PAYLOAD='[]'
-    AR_PAYLOAD='""'
-    [ -f "$ADF" ] && ADF_PAYLOAD=$(jq -c '. // []' "$ADF" 2>/dev/null || echo '[]')
-    [ -f "$ACKS_FILE" ] && ACKS_PAYLOAD=$(jq -c . "$ACKS_FILE" 2>/dev/null || echo '[]')
-    [ -f "$AR_FILE" ] && AR_PAYLOAD=$(jq -Rs . < "$AR_FILE")
-    # Mechanical counts (lr-e2b975): the merge-gate does not have to re-derive
-    # the blocking/advisory split from prose — it's computed here from the
-    # same structured sidecar, identical in spirit to severity_blockers()
-    # counting review findings mechanically rather than asking the LLM.
-    ADV_BLOCKING_COUNT=$(printf '%s' "$ADF_PAYLOAD" | jq '[.[] | select(.tier == "blocking")] | length' 2>/dev/null || echo 0)
-    ADV_ADVISORY_COUNT=$(printf '%s' "$ADF_PAYLOAD" | jq '[.[] | select(.tier == "advisory")] | length' 2>/dev/null || echo 0)
-    case "$ADV_BLOCKING_COUNT" in ''|*[!0-9]*) ADV_BLOCKING_COUNT=0 ;; esac
-    case "$ADV_ADVISORY_COUNT" in ''|*[!0-9]*) ADV_ADVISORY_COUNT=0 ;; esac
-    # Resolved change class (lr-4f8316): the Auditor states its own class
-    # judgment per finding (see _parse_adversarial_findings); one diff has
-    # one resolved class in practice, so "any finding says ephemeral" is the
-    # mechanical resolution rule -- a single ephemeral-classified finding
-    # means the Auditor read the diff as ephemeral overall. null when there
-    # are no findings at all (nothing to resolve; the merge-gate and audit
-    # trail should not fabricate a class for a clean pass).
-    RESOLVED_CHANGE_CLASS='null'
-    ADF_LEN=$(printf '%s' "$ADF_PAYLOAD" | jq 'length' 2>/dev/null || echo 0)
-    case "$ADF_LEN" in ''|*[!0-9]*) ADF_LEN=0 ;; esac
-    if [ "$ADF_LEN" -gt 0 ]; then
-      if printf '%s' "$ADF_PAYLOAD" | jq -e 'any(.[]; .class == "ephemeral")' >/dev/null 2>&1; then
-        RESOLVED_CHANGE_CLASS='"ephemeral"'
-      else
-        RESOLVED_CHANGE_CLASS='"durable"'
-      fi
-    fi
-    # Mechanical proxy for "downgraded because of class" (lr-4f8316): a
-    # finding that met the blocking-eligible bar on reachability+severity
-    # (reachable:yes, severity high/critical -- the same two conditions
-    # "Blocking vs advisory" requires) but still rode as tier:advisory,
-    # while class:ephemeral. Since the lr-4f8316 follow-up's mechanical
-    # security-floor clamp (_parse_adversarial_findings, this file) forces
-    # tier:blocking to ALWAYS apply for exactly this shape (reachable:yes +
-    # severity high/critical), regardless of class, a finding produced by
-    # the real parser can never actually match this select() -- this count
-    # is computed independently by reading whatever JSON is on disk in
-    # last-adversarial-findings.json, as a defense-in-depth cross-check
-    # that should always read 0 for any sidecar the real parser wrote. A
-    # nonzero value here is itself a signal worth investigating: either the
-    # sidecar was populated by something other than
-    # _parse_adversarial_findings, or the clamp has regressed. Recorded in
-    # the audit trail so a human can see how many findings the class
-    # shifted, not just what the resolved class was.
-    ADV_DOWNGRADED_BY_CLASS_COUNT=$(printf '%s' "$ADF_PAYLOAD" | jq \
-      '[.[] | select(.class == "ephemeral" and .tier == "advisory" and .reachable == "yes" and (.severity == "high" or .severity == "critical"))] | length' \
-      2>/dev/null || echo 0)
-    case "$ADV_DOWNGRADED_BY_CLASS_COUNT" in ''|*[!0-9]*) ADV_DOWNGRADED_BY_CLASS_COUNT=0 ;; esac
-    # DROPPED-COUNT VISIBILITY (BOBBIE, lr-33958f PR-C fold-in review): how
-    # many findings cmd_adversarial's count cap actually dropped, read back
-    # from its sidecar (see the write site's own comment). Absent/
-    # unparseable defaults to 0 -- fail-open, matching every other optional
-    # gate-plumbing file this function reads.
-    ADV_DROPPED_COUNT=0
-    if [ -f "$ADF_META" ]; then
-      ADV_DROPPED_COUNT=$(jq -r '.dropped_count // 0' "$ADF_META" 2>/dev/null || echo 0)
-    fi
-    case "$ADV_DROPPED_COUNT" in ''|*[!0-9]*) ADV_DROPPED_COUNT=0 ;; esac
-    # Fenced, explicit-data-block rendering of the (already sanitized)
-    # adversarial findings, mirroring the invariant-feed's
-    # ===BEGIN/END INVARIANTS DATA=== treatment (lr-e2b975, matches
-    # lr-cda4b9). adversarial_findings above is the machine-readable JSON
-    # array a caller may want to inspect programmatically; this string field
-    # is the SAME (sanitized) content wrapped in the fence
-    # ds_merge_gate_prompt instructs the model to treat as data, not
-    # instructions — belt-and-suspenders alongside the stdin/system-prompt
-    # channel separation the wrapper already provides.
-    ADF_FENCED_PAYLOAD=$(_fence_adversarial_findings "$ADF_PAYLOAD")
-    if [ "$ADF_FINDINGS_DEGRADED" = "true" ]; then
-      ADF_PAYLOAD='[]'
-      ADF_FENCED_PAYLOAD=$_GATE_ADVERSARIAL_FINDINGS_UNAVAILABLE_FENCED
-    fi
-    # INFORMATIONAL ONLY (lr-367a21): see _read_deterministic_gates's doc
-    # comment. Never gates a decision -- read failure degrades to nulls +
-    # audit_db_unavailable, never a block.
-    DETERMINISTIC_GATES_PAYLOAD=$(_read_deterministic_gates)
-    # Fenced, explicit-data-block rendering (lr-92d931), mirroring
-    # adversarial_findings_fenced immediately above. deterministic_gates.
-    # details is already sanitized (_read_deterministic_gates ->
-    # _llm_field_sanitize); this only renders and fences the whole object,
-    # same convention, same reasoning: every external-text payload field
-    # reaching the Merge Gate prompt is both sanitized and fenced.
-    DETERMINISTIC_GATES_FENCED_PAYLOAD=$(_fence_deterministic_gates "$DETERMINISTIC_GATES_PAYLOAD")
-    # An empty stamp makes --recheck refuse (missing SHA), the safe direction.
-    REVIEW_SHA_JSON=$(printf '%s' "$REVIEW_SHA_VALUE" | jq -Rs '.') || REVIEW_SHA_JSON='""'
-    cat <<EOF
-{
-  "review_fenced": $REVIEW_FENCED_PAYLOAD,
-  "review_sha": $REVIEW_SHA_JSON,
-  "review_degraded": $REVIEW_DEGRADED,
-  "adversarial_fenced": $ADVERSARIAL_FENCED_PAYLOAD,
-  "adversarial_report_degraded": $ADVERSARIAL_REPORT_DEGRADED,
-  "adversarial_missing": $ADVERSARIAL_MISSING,
-  "adversarial_degraded": $ADVERSARIAL_DEGRADED,
-  "adversarial_findings": $ADF_PAYLOAD,
-  "adversarial_findings_fenced": $ADF_FENCED_PAYLOAD,
-  "adversarial_blocking_count": $ADV_BLOCKING_COUNT,
-  "adversarial_advisory_count": $ADV_ADVISORY_COUNT,
-  "resolved_change_class": $RESOLVED_CHANGE_CLASS,
-  "adversarial_downgraded_by_class_count": $ADV_DOWNGRADED_BY_CLASS_COUNT,
-  "adversarial_findings_dropped_count": $ADV_DROPPED_COUNT,
-  "adversarial_acks": $ACKS_PAYLOAD,
-  "accepted_risks": $AR_PAYLOAD,
-  "introduces_ack_file": $INTRODUCES_ACK_FILE,
-  "threshold": "$THRESHOLD",
-  "deterministic_gates": $DETERMINISTIC_GATES_PAYLOAD,
-  "deterministic_gates_fenced": $DETERMINISTIC_GATES_FENCED_PAYLOAD
-}
-EOF
-    return 0
-  fi
-
+  # The payload is assembled by the finding pipeline (render gate-summary):
+  # the mechanical blocking/advisory counts, the resolved change class, the
+  # class-downgrade cross-check and the dropped-count are all computed there
+  # from the structured sidecar, so the merge gate never re-derives them from
+  # prose. Without python3 no fenced content can be built and the minimal
+  # degraded envelope at the end of this function is emitted instead.
   if command -v python3 >/dev/null 2>&1; then
     ADF_ARG=""
     ADF_META_ARG=""
@@ -8847,27 +7426,21 @@ EOF
     [ -f "$ADF_META" ] && ADF_META_ARG="$ADF_META"
     [ -f "$ACKS_FILE" ] && ACKS_ARG="$ACKS_FILE"
     [ -f "$AR_FILE" ] && AR_ARG="$AR_FILE"
-    # INFORMATIONAL ONLY (lr-367a21): computed in sh (same helper the jq
-    # branch above calls) and handed in pre-built, rather than re-querying
-    # audit.db inside the python heredoc -- one read site, one degrade
-    # posture, for both emitter branches. See _read_deterministic_gates's
-    # doc comment.
+    # INFORMATIONAL ONLY (lr-367a21): computed in sh and handed in pre-built,
+    # rather than re-querying audit.db inside the pipeline. See
+    # _read_deterministic_gates's doc comment.
     DETERMINISTIC_GATES_PAYLOAD=$(_read_deterministic_gates)
-    # Fenced, explicit-data-block rendering (lr-92d931) -- same sh helper
-    # (_fence_deterministic_gates) the jq branch above calls, handed in
-    # pre-built for the identical reason DETERMINISTIC_GATES_PAYLOAD is:
-    # one render site, one fence text, for both emitter branches -- they
-    # cannot diverge on the fence wording either.
+    # Fenced, explicit-data-block rendering (lr-92d931), handed in pre-built
+    # for the same reason DETERMINISTIC_GATES_PAYLOAD is.
     DETERMINISTIC_GATES_FENCED_PAYLOAD=$(_fence_deterministic_gates "$DETERMINISTIC_GATES_PAYLOAD")
-    # review_fenced/adversarial_fenced arrive as the same pre-built JSON
-    # string literals (or null) the jq branch splices in, for the same
-    # reason: one sanitize+fence site for both emitter branches. They are
+    # review_fenced/adversarial_fenced arrive as pre-built JSON string
+    # literals (or null) from the sanitize+fence helpers above. They are
     # handed over as temp-file paths, not argv strings: the adversarial report
     # is unbounded, and one argv string over MAX_ARG_STRLEN (~128 KiB) fails
     # exec with E2BIG, which would drop the Merge Gate's adversarial basis.
     # A source that is null, or already degraded, needs no file. A source
     # whose temp file cannot be created or written is marked degraded here
-    # (marker + flag), never passed on as an empty path the python side would
+    # (marker + flag), never passed on as an empty path the pipeline would
     # read as None. The trap removes both files on error and signal paths.
     # The whole stage+emit runs in a subshell so its EXIT/INT/TERM/HUP traps
     # are the subshell's own: the caller's traps (cmd_ship's cmd_deps osv
@@ -8894,182 +7467,18 @@ EOF
         ADVERSARIAL_FENCED_PAYLOAD=$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED
       }
     fi
-    python3 - "$THRESHOLD" "$INTRODUCES_ACK_FILE" "$ADVERSARIAL_MISSING" "$ACKS_ARG" "$AR_ARG" "$ADF_ARG" "$ADVERSARIAL_DEGRADED" "$ADF_META_ARG" "$DETERMINISTIC_GATES_PAYLOAD" "$DETERMINISTIC_GATES_FENCED_PAYLOAD" "$_bgs_review_tmp" "$_bgs_adv_tmp" "$REVIEW_SHA_VALUE" "$_GATE_REVIEW_UNAVAILABLE_FENCED" "$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED" "$REVIEW_DEGRADED" "$ADVERSARIAL_REPORT_DEGRADED" "$ADF_FINDINGS_DEGRADED" "$_GATE_ADVERSARIAL_FINDINGS_UNAVAILABLE_FENCED" <<'PY'
-import json, sys
-threshold           = sys.argv[1]
-introduces_ack      = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
-adversarial_missing = sys.argv[3].lower() == "true" if len(sys.argv) > 3 else False
-acks_path           = sys.argv[4] if len(sys.argv) > 4 else ""
-ar_path             = sys.argv[5] if len(sys.argv) > 5 else ""
-adf_path            = sys.argv[6] if len(sys.argv) > 6 else ""
-adversarial_degraded = sys.argv[7].lower() == "true" if len(sys.argv) > 7 else False
-adf_meta_path       = sys.argv[8] if len(sys.argv) > 8 else ""
-deterministic_gates_fenced_arg = sys.argv[10] if len(sys.argv) > 10 else ""
-# Pre-built by the sh helpers (_sanitize_review_for_prompt/_fence_data_block,
-# _sanitize_adversarial_report_for_prompt): JSON string literals, or the
-# literal null when the source file is absent (handed over as no path at
-# all). A source the sh side already marked degraded, or whose file cannot be
-# read back or decoded to a string here, becomes the fixed "source
-# unavailable" marker literal (argv 14/15) plus degraded=True -- never None
-# and never an empty string a caller could read as "no findings". Degrade,
-# never block: no path here raises.
-def _load_fenced(path, unavailable_literal, degraded_in):
-    marker = json.loads(unavailable_literal)
-    if degraded_in:
-        return marker, True
-    if not path:
-        return None, False
-    try:
-        with open(path) as f:
-            value = json.loads(f.read())
-    except Exception:
-        return marker, True
-    if value is None or (isinstance(value, str) and value):
-        return value, False
-    return marker, True
-_review_degraded_in = sys.argv[16].lower() == "true" if len(sys.argv) > 16 else False
-_adv_degraded_in    = sys.argv[17].lower() == "true" if len(sys.argv) > 17 else False
-review_fenced, review_degraded = _load_fenced(
-    sys.argv[11] if len(sys.argv) > 11 else "", sys.argv[14] if len(sys.argv) > 14 else '""', _review_degraded_in)
-adversarial_fenced, adversarial_report_degraded = _load_fenced(
-    sys.argv[12] if len(sys.argv) > 12 else "", sys.argv[15] if len(sys.argv) > 15 else '""', _adv_degraded_in)
-review_sha         = sys.argv[13] if len(sys.argv) > 13 else ""
-# Pre-built by _read_deterministic_gates (sh) -- fail-open to an
-# audit-db-unavailable envelope if this somehow arrives empty/unparseable
-# (defense in depth; the sh helper always emits valid JSON on this path).
-# deterministic_gates_fenced (lr-92d931) tracks the SAME fallback: if the
-# raw object couldn't be parsed, the fenced text handed in from sh (rendered
-# from that same unparseable/empty argv[9]) cannot be trusted to describe
-# the fallback dict either, so it is re-derived from the fallback dict
-# itself rather than trusting the pre-rendered argv[10] in this one branch
-# -- the two emitter branches must not diverge on what "deterministic_gates
-# was unreadable" looks like.
-# Trailing "\n" before the closing marker matches _fence_deterministic_gates'
-# own jq heredoc shape (jq -Rs slurps the heredoc verbatim, blank line before
-# EOF included) -- kept identical here so this fallback-only construction
-# cannot diverge from the sh helper's real output by a stray/missing newline.
-_DETGATES_FENCE_BEGIN = "===BEGIN DETERMINISTIC GATES DATA===\n"
-_DETGATES_FENCE_END = "\n===END DETERMINISTIC GATES DATA===\n"
-try:
-    if len(sys.argv) > 9 and sys.argv[9]:
-        deterministic_gates = json.loads(sys.argv[9])
-        # _fence_deterministic_gates (sh) emits a JSON STRING LITERAL
-        # (quoted) on stdout -- the same contract _fence_adversarial_findings
-        # uses, which the jq branch above splices directly into a JSON
-        # template as-is. This python branch assigns the value into a
-        # Python dict that json.dumps() will re-encode below, so the
-        # argument must be DECODED to a plain string here first -- passing
-        # the still-JSON-encoded argv value through unchanged would nest an
-        # extra layer of quoting/escaping around the fence text.
-        deterministic_gates_fenced = json.loads(deterministic_gates_fenced_arg)
-    else:
-        raise ValueError("empty deterministic_gates payload")
-except Exception:
-    deterministic_gates = {"secrets": None, "deps": None, "sast": None, "audit_db_unavailable": True}
-    deterministic_gates_fenced = (
-        _DETGATES_FENCE_BEGIN + json.dumps(deterministic_gates, indent=2) + _DETGATES_FENCE_END
-    )
-adv_findings = []
-if adf_path:
-    try:
-        with open(adf_path) as f:
-            loaded = json.load(f)
-        if isinstance(loaded, list):
-            adv_findings = loaded
-    except Exception:
-        adv_findings = []
-adv_blocking_count = sum(1 for f in adv_findings if isinstance(f, dict) and f.get("tier") == "blocking")
-adv_advisory_count = sum(1 for f in adv_findings if isinstance(f, dict) and f.get("tier") == "advisory")
-# Resolved change class + downgrade count (lr-4f8316) -- same rules as the
-# jq branch above: resolved class is "ephemeral" if any finding declares
-# class:ephemeral, else "durable" if there is at least one finding, else
-# null (nothing to resolve on a clean pass). The downgrade count is a
-# mechanical proxy -- reachable:yes + severity high/critical + tier:advisory
-# + class:ephemeral -- for "this finding met the blocking bar and rode as
-# advisory under an ephemeral class"; see the jq branch's comment for why
-# this cannot double as a claim that class was necessarily the deciding
-# factor (a security-floor override produces the same never-advisory
-# outcome regardless of class, so it never reaches this shape either way).
-resolved_change_class = None
-if adv_findings:
-    resolved_change_class = "ephemeral" if any(
-        isinstance(f, dict) and f.get("class") == "ephemeral" for f in adv_findings
-    ) else "durable"
-adv_downgraded_by_class_count = sum(
-    1 for f in adv_findings
-    if isinstance(f, dict)
-    and f.get("class") == "ephemeral"
-    and f.get("tier") == "advisory"
-    and f.get("reachable") == "yes"
-    and f.get("severity") in ("high", "critical")
-)
-# DROPPED-COUNT VISIBILITY (BOBBIE, lr-33958f PR-C fold-in review): mirrors
-# the jq branch's read of the same sidecar -- see build_gate_summary's
-# ADF_META comment and the write site's own comment (cmd_adversarial) for
-# the full rationale. Absent/unparseable defaults to 0 (fail-open).
-adv_dropped_count = 0
-if adf_meta_path:
-    try:
-        with open(adf_meta_path) as f:
-            adf_meta = json.load(f)
-        v = adf_meta.get("dropped_count", 0)
-        adv_dropped_count = v if isinstance(v, int) else 0
-    except Exception:
-        adv_dropped_count = 0
-# Fenced, explicit-data-block rendering (lr-e2b975) -- same
-# ===BEGIN/END ADVERSARIAL FINDINGS DATA=== fence the jq branch above emits
-# via _fence_adversarial_findings, mirroring ds_adversarial_prompt's
-# ===BEGIN/END INVARIANTS DATA=== treatment (lr-cda4b9). adv_findings here
-# is already sanitized (cmd_adversarial calls
-# _sanitize_adversarial_findings_json before ever writing the sidecar this
-# was read from) -- this only renders and fences, no second sanitize pass.
-adv_findings_fenced = (
-    "===BEGIN ADVERSARIAL FINDINGS DATA===\n"
-    + json.dumps(adv_findings, indent=2)
-    + "\n===END ADVERSARIAL FINDINGS DATA==="
-)
-# The structured findings could not be sanitized: never render the (empty)
-# sidecar as "no findings" -- same marker the jq branch splices in.
-if (sys.argv[18].lower() == "true" if len(sys.argv) > 18 else False):
-    adv_findings = []
-    adv_findings_fenced = json.loads(sys.argv[19])
-acks = []
-if acks_path:
-    try:
-        with open(acks_path) as f:
-            acks = json.load(f)
-    except Exception:
-        acks = []
-ar = ""
-if ar_path:
-    try:
-        with open(ar_path) as f:
-            ar = f.read()
-    except Exception:
-        ar = ""
-print(json.dumps({
-    "review_fenced": review_fenced,
-    "review_sha": review_sha,
-    "review_degraded": review_degraded,
-    "adversarial_fenced": adversarial_fenced,
-    "adversarial_report_degraded": adversarial_report_degraded,
-    "adversarial_missing": adversarial_missing,
-    "adversarial_degraded": adversarial_degraded,
-    "adversarial_findings": adv_findings,
-    "adversarial_findings_fenced": adv_findings_fenced,
-    "adversarial_blocking_count": adv_blocking_count,
-    "adversarial_advisory_count": adv_advisory_count,
-    "resolved_change_class": resolved_change_class,
-    "adversarial_downgraded_by_class_count": adv_downgraded_by_class_count,
-    "adversarial_findings_dropped_count": adv_dropped_count,
-    "adversarial_acks": acks,
-    "accepted_risks": ar,
-    "deterministic_gates": deterministic_gates,
-    "deterministic_gates_fenced": deterministic_gates_fenced,
-    "introduces_ack_file": introduces_ack,
-    "threshold": threshold,
-}))
-PY
+    ds_findings_run render gate-summary \
+      --threshold "$THRESHOLD" --introduces-ack "$INTRODUCES_ACK_FILE" \
+      --adversarial-missing "$ADVERSARIAL_MISSING" --adversarial-degraded "$ADVERSARIAL_DEGRADED" \
+      --acks "$ACKS_ARG" --accepted-risks "$AR_ARG" --adf "$ADF_ARG" --adf-meta "$ADF_META_ARG" \
+      --det-gates "$DETERMINISTIC_GATES_PAYLOAD" --det-gates-fenced "$DETERMINISTIC_GATES_FENCED_PAYLOAD" \
+      --review-fenced-file "$_bgs_review_tmp" --adversarial-fenced-file "$_bgs_adv_tmp" \
+      --review-sha "$REVIEW_SHA_VALUE" --review-degraded "$REVIEW_DEGRADED" \
+      --adversarial-report-degraded "$ADVERSARIAL_REPORT_DEGRADED" \
+      --adf-degraded "$ADF_FINDINGS_DEGRADED" \
+      --review-unavailable "$_GATE_REVIEW_UNAVAILABLE_FENCED" \
+      --adversarial-unavailable "$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED" \
+      --adf-unavailable "$_GATE_ADVERSARIAL_FINDINGS_UNAVAILABLE_FENCED"
     )
     return 0
   fi
@@ -9146,76 +7555,33 @@ cmd_render_manifest() {
 # one finding names a non-isolated issue_class, nothing otherwise. The line is
 # fully static (count-agnostic wording, so no plural defect) and never carries
 # model-authored text, so no _llm_field_sanitize call is needed (GATES.md
-# review-finding table). The jq count is only a presence test. Display
-# only: severity_blockers() never reads issue_class/class_fix.
+# review-finding table). The count is only a presence test. Display only:
+# severity_blockers() never reads issue_class/class_fix.
 #
-# _REVIEW_CLASS_NAMED_DEF is the single predicate for "this finding names a
-# non-isolated class": null, empty, and "none — isolated" all count as
-# isolated. Both the footer and cmd_render_review prepend it to their jq
-# programs so the two cannot drift apart.
-_REVIEW_CLASS_NAMED_DEF='def class_named: (.issue_class != null) and (.issue_class != "") and (.issue_class != "none — isolated");'
-
+# The single predicate for "this finding names a non-isolated class" (null,
+# empty, and "none — isolated" all count as isolated) lives in findings.py,
+# shared by the footer and cmd_render_review so the two cannot drift apart.
 _review_class_footer() {
-  # jq stderr is left attached and a failure returns nonzero: a silent
-  # return 0 here would report a successful render with the footer dropped.
-  _rcf_n=$(jq -r "$_REVIEW_CLASS_NAMED_DEF"'[(.findings // [])[] | select(class_named)] | length' "$1") || {
-    echo "review class footer: jq failed reading $1" 1>&2
-    return 1
-  }
-  case "$_rcf_n" in
-    ''|*[!0-9]*|0) return 0 ;;
-  esac
-  printf '\nFindings above name a class -- fix via class_fix across every site, not per-line\n'
+  # A failure returns nonzero with a message: a silent return 0 here would
+  # report a successful render with the footer dropped.
+  ds_findings_run render class-footer "$1" || return 1
 }
 
 cmd_render_review() {
   _gate_check_args render-review "" "FILE" "$@" || return 2
   FILE="${1:-$REPO_ROOT/.clagentic/lite/last-review.json}"
   [ -f "$FILE" ] || { echo "no review file at $FILE" 1>&2; return 1; }
-  if command -v jq >/dev/null 2>&1; then
-    # A recurrence-demoted finding (lr-66e598: _review_recurrence_demote,
-    # gates.sh) gets a "reported N rounds running — decide" suffix so the
-    # operator sees WHY a finding that looks blocking-severity did not gate
-    # /ship, rather than the demotion being silent. Task constraint (c):
-    # "surface the recurrence count in the rendered review output ... so a
-    # repeated bounce is legible to the operator." A deferral-matched
-    # finding (lr-2ebc41: _review_deferral_match, gates.sh) gets an
-    # analogous "matched deferral <id>" suffix instead, naming which
-    # .clagentic/deferrals.json entry excluded it — same "threshold, not
-    # suppression, must be legible" posture. Findings without either
-    # annotation (feature off, no match, or first report) render exactly as
-    # before — this is purely additive text on the same line.
-    #
-    # issue_class/class_fix (lr-3eb18c): rendered as a second, indented line
-    # under the finding so the class-level answer is visible without adding
-    # noise to findings that are genuinely isolated ("none — isolated" is
-    # suppressed from this line entirely -- it is the expected, honest
-    # majority case and would otherwise drown out the findings that DO name
-    # a real class). This is display only, mandatory-but-non-blocking per
-    # severity_blockers' own comment above -- never gates /ship.
-    jq -r "$_REVIEW_CLASS_NAMED_DEF"'"== clagentic-lite review ==\nsummary: " + .summary + "\nfindings: " + (.findings | length | tostring) + "\n",
-           (.findings[] | "[" + .severity + "] " + .file + ":" + (.line|tostring) + " " + .message +
-             (if ._recurrence_demoted == true
-              then " (reported " + (._recurrence_count | tostring) + " rounds running — decide)"
-              else "" end) +
-             (if ._deferral_matched == true
-              then " (matched deferral " + (._deferral_id // "?") + ")"
-              else "" end) +
-             (if ._seen_before == true
-              then " (reported in a prior run; still counted)"
-              else "" end) +
-             (if class_named
-              then "\n    class: " + .issue_class + (if (.class_fix != null) and (.class_fix != "") then " -> " + .class_fix else "" end)
-              else "" end))' \
-      "$FILE" || return 1
-    _review_class_footer "$FILE" || return 1
-  else
-    # Raw JSON is the supported no-jq fallback; the footer needs jq to know
-    # whether any finding names a class, and parsing JSON in POSIX sh is not
-    # done here, so say so rather than silently dropping the handoff.
-    echo "review class footer: requires jq; read the raw issue_class/class_fix fields above directly" 1>&2
-    cat "$FILE"
-  fi
+  # A recurrence-demoted finding gets a "reported N rounds running — decide"
+  # suffix so the operator sees WHY a finding that looks blocking-severity did
+  # not gate /ship, rather than the demotion being silent; a deferral-matched
+  # finding gets a "matched deferral <id>" suffix naming which
+  # .clagentic/deferrals.json entry excluded it; a finding seen in a prior run
+  # says it is still counted. issue_class/class_fix render as a second,
+  # indented line, suppressed for "none — isolated" (the honest majority case
+  # would otherwise drown out the findings that DO name a class). Display
+  # only: it never gates /ship. The rendering lives in findings.py render
+  # review.
+  ds_findings_run render review "$FILE" || return 1
 }
 
 # cmd_deferrals_lint [FILE] (lr-2ebc41)
@@ -9261,93 +7627,9 @@ cmd_deferrals_lint() {
     return 0
   fi
 
-  python3 - "$_cdl_file" <<'PYEOF'
-import json, re, sys
-
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        raw = f.read()
-except Exception as e:
-    print("[gates/deferrals-lint] cannot read {}: {}".format(path, e))
-    sys.exit(1)
-
-if not raw.strip():
-    sys.exit(0)
-
-try:
-    data = json.loads(raw)
-except Exception as e:
-    print("[gates/deferrals-lint] {} is not valid JSON: {}".format(path, e))
-    print("[gates/deferrals-lint] the reviewer prompt will still receive it (fail-open, sanitized as opaque text), but NO entry in it can be gate-code-matched until this is fixed")
-    sys.exit(1)
-
-if not isinstance(data, list):
-    print("[gates/deferrals-lint] {} must be a JSON array of deferral objects, got {}".format(path, type(data).__name__))
-    sys.exit(1)
-
-sha_re = re.compile(r'^[0-9a-f]{64}$')
-problems = []
-for i, e in enumerate(data):
-    where = "entry {}".format(i)
-    if not isinstance(e, dict):
-        problems.append("{}: not a JSON object".format(where))
-        continue
-    eid = e.get("id")
-    if isinstance(eid, str) and eid:
-        where = "entry {} (id={!r})".format(i, eid)
-    else:
-        problems.append("{}: missing or empty required field 'id'".format(where))
-
-    # 'file' and 'message' are lr-c567's own optional fields -- an entry
-    # with neither is still a valid, unrestricted, prompt-context-only
-    # deferral (e.g. a category-wide hint with no specific file). They only
-    # become REQUIRED when this entry claims gate-code eligibility via
-    # scope=="stable-contract" below, since gate-code matching keys on
-    # (file, category, message) verbatim and cannot identify a target
-    # without them.
-    scope = e.get("scope")
-    if scope is None:
-        # No scope declared at all -- valid, prompt-context-only entry.
-        # lr-c567 behavior, fully unrestricted. Not an error.
-        continue
-    if scope != "stable-contract":
-        problems.append(
-            "{}: scope={!r} is not a supported gate-code scope (only \"stable-contract\" is). "
-            "REFUSED LOUDLY per design: a conditional or scope-boundary acceptance whose validity "
-            "depends on code OUTSIDE this file (e.g. reset logic living elsewhere) is not safely "
-            "matchable by a single-file content hash -- see docs/GATES.md 'Reviewer-consulted "
-            "deferrals' for why this class is deliberately unsupported rather than silently "
-            "mis-honored. Either remove the 'scope' field (valid prompt-context-only deferral, "
-            "weighed by the model each round, never mechanically matched) or, if this acceptance's "
-            "rationale genuinely depends only on the named file's own content, set scope to "
-            "\"stable-contract\" and provide file/message/file_sha256.".format(where, scope)
-        )
-        continue
-
-    fname = e.get("file")
-    if not (isinstance(fname, str) and fname):
-        problems.append("{}: scope is \"stable-contract\" but 'file' is missing or empty -- required to identify what gate code should re-hash".format(where))
-    message = e.get("message")
-    if not (isinstance(message, str) and message):
-        problems.append("{}: scope is \"stable-contract\" but 'message' is missing or empty -- gate-code matching keys on (file, category, message) verbatim against the Reviewer's own finding text; without it this entry can never be mechanically matched".format(where))
-    fsha = e.get("file_sha256")
-    if not (isinstance(fsha, str) and sha_re.match(fsha)):
-        problems.append(
-            "{}: scope is \"stable-contract\" but file_sha256 is missing or not a 64-hex-char "
-            "sha256 digest -- required for gate-code matching to detect the named file changing "
-            "since this deferral was granted (lapse-on-edit). Compute it from the SAME file this "
-            "entry names: sha256sum <file> | cut -d' ' -f1".format(where)
-        )
-
-if problems:
-    print("[gates/deferrals-lint] {} problem(s) in {}:".format(len(problems), path))
-    for p in problems:
-        print("  - " + p)
-    sys.exit(1)
-
-print("[gates/deferrals-lint] {} entries, no problems".format(len(data)))
-PYEOF
+  # The schema check is findings.py dispositions lint; its problems print on
+  # stdout, one line each, and a nonzero status means the file is not clean.
+  ds_findings_run dispositions lint "$_cdl_file"
   return $?
 }
 
