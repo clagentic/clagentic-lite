@@ -201,13 +201,17 @@ class TestReviewRerunStillBlocks(unittest.TestCase):
         self.assertIn("mode:annotate", rows[0][0])
 
     def test_repeated_runs_do_not_demote_via_recurrence(self):
-        """A seen finding must not be counted as another recurrence round, or
-        the second identical run would demote it to advisory and pass."""
+        """Repetition is information, never an exemption: the finding keeps
+        blocking however many times it is reported, and a seen finding is not
+        counted as another round."""
         _stage_identical_recreation(self._project, 1)
         for _ in range(4):
             r = _run_review(self._tmp, self._project)
             self.assertEqual(r.returncode, 1, r.stderr)
-        self.assertNotIn(True, [f.get("_recurrence_demoted") for f in self._last_review()["findings"]])
+        findings = self._last_review()["findings"]
+        self.assertNotIn(True, [f.get("_recurrence_demoted") for f in findings])
+        self.assertEqual(findings[0].get("_recurrence_count", 0), 0,
+                         "a seen-before finding is not counted again")
 
     def test_changed_context_is_a_new_finding_and_still_blocks(self):
         _stage_identical_recreation(self._project, 1)

@@ -73,12 +73,19 @@ class TestSeverityBlockersMalformedSeverity(unittest.TestCase):
     def test_missing_severity_does_not_block(self):
         self.assertEqual(self._run([_finding()]), "0")
 
-    def test_malformed_severity_still_honors_exclusions(self):
+    def test_malformed_severity_cannot_be_excused_by_an_annotation(self):
+        # The old exemption annotations are gone: a finding that carries one
+        # (a model can write anything) counts like any other.
         findings = [
             _finding(severity=3, _deferral_matched=True),
             _finding(severity=True, _recurrence_demoted=True),
         ]
-        self.assertEqual(self._run(findings), "0")
+        self.assertEqual(self._run(findings), "2")
+
+    def test_names_that_are_not_ranks_block_and_known_names_are_stripped(self):
+        findings = [_finding(severity="blocker"), _finding(severity="crit"),
+                    _finding(severity="high "), _finding(severity="HIGH"), _finding(severity="low")]
+        self.assertEqual(self._run(findings), "4")
 
     def test_result_does_not_depend_on_jq_being_installed(self):
         findings = [_finding(severity=3), _finding(severity="HIGH"), _finding(severity="low")]

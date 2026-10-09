@@ -72,7 +72,6 @@ ZERO_IS_MEANINGFUL = {
     "CLAGENTIC_RESULT_TOKEN_WARN": "0 = warn on every result",
     "CLAGENTIC_SESSION_TOKEN_WARN": "0 = warn on every result",
     "CLAGENTIC_AUTOSUMMARIZE_BYTES": "0 = summarize every result",
-    "CLAGENTIC_RECURRENCE_THRESHOLD": "floored at 2 in code",
 }
 
 _NUMERIC_SUFFIX = re.compile(

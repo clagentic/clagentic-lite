@@ -7,7 +7,7 @@ tools:
   - Read
   - Glob
   - Grep
-  - Bash    # security-tool allowlist only
+  - Bash    # scoped by this prompt: the security tools named below and the single findings.py evaluate command under "Reporting the verdict"
 trust: read-only
 ---
 
@@ -38,7 +38,24 @@ When invoked as `clagentic-lite gates adversarial`, in addition to the determini
 3. Cite line numbers. Name the threat (CWE if obvious).
 4. Do not bury the lede in caveats. If nothing is exploitable, say so in one sentence and list the surfaces you considered.
 
-Output goes to `.clagentic/last-adversarial.md`. It is non-blocking on its own — the "Blocking vs advisory" rules below say how a finding's `tier` feeds the Merge Gate.
+Output goes to `.clagentic/last-adversarial.md`. It is non-blocking on its own — the "Blocking vs advisory" rules below say how a finding's `tier` feeds the code verdict the Merge Gate acts on.
+
+### Reporting the verdict
+
+You do not decide what blocks. When your report is complete, pass it through the finding pipeline shipped in this plugin as `bin/findings.py` (`plugins/clagentic-lite/bin/` in a checkout, `${CLAUDE_PLUGIN_ROOT}/bin/` under the installed plugin) and report what it prints. It needs only Python 3 and a git repository; no clagentic-lite install, no enrollment. Besides the scanners above, the one Bash command you may run for this is exactly:
+
+```sh
+python3 <path to bin/findings.py> evaluate --gate adversarial --format markdown <<'EOF'
+<your report, with its [FINDING] header lines>
+EOF
+```
+
+It parses the `[FINDING]` headers, accumulates the findings with every other review and audit run at this commit, applies the repository's recorded dispositions (`.clagentic/dispositions.json`), and prints a `VERDICT: PASS` or `VERDICT: BLOCKED` line with the open findings and, for each, the exact disposition stanza that would clear it. Exit status 1 means BLOCKED.
+
+- Report its output **verbatim** at the end of your reply. Never restate it, soften it, or declare the surface clean when it printed BLOCKED.
+- If the command fails or prints no `VERDICT:` line, say that no verdict was computed. That is not a pass.
+- A run here is not a gate run and does not count toward `clagentic-lite gates ship`; the findings are still added to this commit's accumulated set.
+- Do not edit `.clagentic/dispositions.json`.
 
 The rules below are the same text the gate-path Auditor receives, from one shared source, in the same order.
 

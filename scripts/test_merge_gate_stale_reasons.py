@@ -230,18 +230,28 @@ class TestReviewBlockedAtHead(_Base):
         self.assertEqual(self._refusal()["stale_reason"], "review_blocked_at_head")
         self.assertIn("[review_blocked_at_head]", self._audit_details("merge-gate recheck"))
 
-    def test_findings_excluded_by_deferral_are_not_listed(self):
-        """The list is the set that blocked: same predicate as severity_blockers."""
-        self._block_review_at_head()
+    def _annotate_ledger_finding(self, **fields):
         ledger = os.path.join(self._lite, "review-ledger.jsonl")
         with open(ledger) as f:
             entry = json.loads(f.read().strip().splitlines()[-1])
-        entry["findings"][0]["_deferral_matched"] = True
+        entry["findings"][0].update(fields)
         with open(ledger, "w") as f:
             f.write(json.dumps(entry) + "\n")
         self._merge_gate()
         with open(os.path.join(self._lite, "gate-summary.json")) as f:
-            self.assertEqual(json.load(f)["blocking_findings"], [])
+            return json.load(f)["blocking_findings"]
+
+    def test_findings_cleared_by_a_disposition_are_not_listed(self):
+        """The list is the set that blocked: a finding the review's verdict
+        recorded as cleared by a disposition did not block."""
+        self._block_review_at_head()
+        listed = self._annotate_ledger_finding(disposition={"status": "cleared", "id": "d1"})
+        self.assertEqual(listed, [])
+
+    def test_the_old_exemption_annotation_no_longer_excludes_a_finding(self):
+        self._block_review_at_head()
+        listed = self._annotate_ledger_finding(_deferral_matched=True)
+        self.assertEqual(len(listed), 1)
 
 
 class TestMalformedFindingsStillNamed(_Base):

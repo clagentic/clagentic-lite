@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "seed-fixture-credential",
+      "gates": ["review"],
+      "match": {
+        "path_glob": "scripts/seed-demo.sh",
+        "category": "security",
+        "message": "hardcoded credential in seed-demo.sh"
+      },
+      "kind": "by_design",
+      "rationale": "Planted demo credential for the local fixture database; it is never deployed.",
+      "by": "maintainer",
+      "at": "2026-10-09",
+      "expires": "2027-04-09"
+    },
+    {
+      "id": "admin-endpoint-behind-gateway",
+      "gates": ["adversarial"],
+      "match": {
+        "path_glob": "src/admin/**",
+        "category": "CWE-306",
+        "fingerprint_hint": "0123456789abcdef"
+      },
+      "kind": "mitigated",
+      "rationale": "The admin listener binds to the private interface only and is reachable solely through the authenticating gateway.",
+      "control": "API gateway mTLS policy admin-internal-only (deploy/gateway/admin.yaml)",
+      "by": "maintainer",
+      "at": "2026-10-09"
+    },
+    {
+      "id": "generated-client-false-positive",
+      "gates": ["review", "adversarial"],
+      "match": {
+        "path_glob": "**/generated/*.py",
+        "category": "maintainability"
+      },
+      "kind": "false_positive",
+      "rationale": "Generated code, regenerated on every build; the finding describes the generator template, not hand-written logic.",
+      "by": "maintainer",
+      "at": "2026-10-09"
+    }
+  ]
+}

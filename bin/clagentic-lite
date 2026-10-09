@@ -275,7 +275,7 @@ PLUGIN_RENDER_VERSION="v3"
 # path (enrolled repos never receive their own copy of these scripts).
 # Bump on any content change to any hook template so `clagentic-lite update`
 # re-stamps existing installs.
-CLAUDE_HOOKS_VERSION="v5"
+CLAUDE_HOOKS_VERSION="v6"
 
 # Single source of truth for which hook scripts are stamped into
 # $CLAGENTIC_LITE_HOME/.claude/hooks/. Space-separated POSIX-sh string (no
@@ -302,7 +302,7 @@ CLAGENTIC_SECURITY_TOOLS="gitleaks semgrep osv-scanner"
 # _config_missing_keys helpers; neither depends on this constant. Bump on any
 # structural change to config.example's key set (add/remove/rename a key) —
 # content-only comment edits do not require a bump.
-CONFIG_SCHEMA_VERSION="v5"
+CONFIG_SCHEMA_VERSION="v6"
 
 say()  { printf '[clagentic-lite] %s\n' "$*"; }
 warn() { printf '[clagentic-lite] WARN: %s\n' "$*" 1>&2; }
@@ -3636,7 +3636,7 @@ _ensure_ignore_patterns() {
     # A blanket .clagentic/ line already covers .clagentic/lite/; say so
     # instead of adding a redundant line, since it also hides governance files.
     if [ "$_eip_pat" = ".clagentic/lite/" ] && _ignore_pattern_present "$_eip_repo" ".clagentic/"; then
-      say "note: $_eip_repo ignores the blanket .clagentic/ — governance files (adversarial-acks.json, osv-ignore, accepted-risks.md) may be untrackable; consider replacing with .clagentic/lite/"
+      say "note: $_eip_repo ignores the blanket .clagentic/ — governance files (dispositions.json, osv-ignore) may be untrackable; consider replacing with .clagentic/lite/"
       continue
     fi
     _append_ignore_line "$_eip_file" "$_eip_pat"
@@ -3898,9 +3898,12 @@ _enroll_one() {
   fi
 
   # Ignore .claude/ (fully tool-generated) and the whole .clagentic/lite/
-  # subdir (all ephemeral tool-state). Governance files (adversarial-acks.json,
-  # osv-ignore, accepted-risks.md, config) live at .clagentic/ top level and
-  # are unaffected by the .clagentic/lite/ blanket. Where the patterns go
+  # subdir (all ephemeral tool-state; the findings accumulation state is
+  # .clagentic/lite/findings-state.json). Governance files (dispositions.json,
+  # osv-ignore, config, and the legacy adversarial-acks.json / accepted-risks.md)
+  # live at .clagentic/ top level, are TRACKED, and are unaffected by the
+  # .clagentic/lite/ blanket: enroll and update never create, stamp or ignore
+  # dispositions.json. Where the patterns go
   # (tracked .gitignore vs .git/info/exclude) and the idempotency rules are in
   # _ensure_ignore_patterns / _ignore_target.
   _ensure_ignore_patterns "$_canon" '.claude/' '.clagentic/lite/'
@@ -4006,8 +4009,9 @@ cmd_unenroll() {
   # Note: .clagentic/lite/ contains audit.db, memory.db, and builder-contract.md —
   # all local machine state (gitignored). The --purge flag removes this data.
   # Without --purge, .clagentic/lite/ is left in place (data is preserved).
-  # Governance files at .clagentic/ top level (adversarial-acks.json, osv-ignore,
-  # accepted-risks.md, config) are never removed by unenroll.
+  # Governance files at .clagentic/ top level (dispositions.json, osv-ignore,
+  # config, and the legacy adversarial-acks.json / accepted-risks.md) are
+  # never removed by unenroll.
   if [ "$UNENROLL_PURGE" -eq 1 ]; then
     _dot="$_canon/.clagentic/lite"
     if [ -d "$_dot" ]; then

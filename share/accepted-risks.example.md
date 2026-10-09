@@ -1,13 +1,17 @@
 # Accepted Risks
 
-This file documents architectural risk decisions for this project. The merge-gate reads
-this file and uses it to classify adversarial findings that describe inherent product
-behavior as acknowledged rather than refused.
+> **DEPRECATED.** `.clagentic/accepted-risks.md` no longer clears anything. The merge
+> gate used to hand this freetext to a model and let it decide which findings it covered;
+> whether a finding blocks is now decided in code, from `.clagentic/dispositions.json`
+> (example: `share/dispositions.example.json`). The file is still read for one more
+> release only to warn that it has no effect. Record each risk below as an entry there
+> (`kind: accepted_risk` or `by_design`; a reachable high-severity finding needs
+> `kind: mitigated` naming its control). The text below is kept as a writing guide for
+> the `rationale` field.
 
-Place this file at `.clagentic/accepted-risks.md` in the enrolled repo root. It is read
-at merge-gate time and injected into the gate-summary payload as the `accepted_risks`
-field. Commit it deliberately — its presence in version history is part of the audit
-trail.
+This file documents architectural risk decisions for this project.
+
+Commit it deliberately — its presence in version history is part of the audit trail.
 
 **Trust model:** this file is repo-controlled. It is a workflow convenience for trusted
 internal contributors, not a security control. A contributor can add a behavior change

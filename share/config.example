@@ -519,70 +519,32 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # stale payload to the merge-gate LLM.
 # CLAGENTIC_ALLOW_STALE_PAYLOAD=1
 
-# ---------- reviewer-consulted deferrals ----------
-# File: .clagentic/deferrals.json in the enrolled repo (gitignored — already
-# under .clagentic/ which gates.sh gitignores, so no extra config needed).
+# ---------- dispositions (what the operator accepted) ----------
+# File: .clagentic/dispositions.json in the repository — COMMITTED, not
+# gitignored (it is reviewed policy, like .clagentic/semgrep-exclude). One
+# file records every operator decision about a class of findings; the gate
+# code applies it, a model never does. An example with every field is
+# share/dispositions.example.json. No config key is involved: the feature is
+# active whenever the file exists.
 #
-# When present, every deferral object is first reduced to ONLY the nine
-# documented schema fields below — any other key is DROPPED entirely, not
-# forwarded in any form (see _llm_json_array_allowlist_fields in
-# scripts/platform.sh) — then each surviving field is sanitized (control
-# bytes stripped, forged fence-label markers defanged — see
-# _llm_json_array_sanitize_fields, same file) and injected, fenced as data,
-# into the reviewer system prompt before the diff is reviewed.
+# An entry clears a finding when its gates, match (path glob, category,
+# optional fingerprint_hint / message) and kind agree, it has not expired, and
+# the guardrails hold:
+#   - an entry added or changed in the change being gated does not clear that
+#     change's findings (the gate says how many it would have cleared);
+#   - a reachable, high-impact finding (the security floor) is cleared by a
+#     fix, or by kind "mitigated" naming the external control, never by
+#     by_design / false_positive / accepted_risk;
+#   - rationale, by and at are required; an invalid entry is ignored, loudly.
+# The Builder role is blocked from writing the file (pre-write-guard W-007).
 #
-# lr-2ebc41: an entry with scope "stable-contract" and a valid file_sha256
-# is ALSO mechanically re-checked in gate code (severity_blockers(),
-# scripts/gates.sh) after the reviewer responds — matching on (file,
-# category, message) and requiring the named file's current content hash to
-# still equal file_sha256. That check does not depend on the model's
-# compliance: it excludes a matching finding from the block count whether or
-# not the model itself also chose to honor the deferral. An entry WITHOUT
-# scope "stable-contract" behaves exactly as before lr-2ebc41 — suppression
-# happens inside model reasoning only, the gate does not post-filter it.
-# Treat this file as untrusted, external text even though it is
-# operator-facing: gitignored means untracked and unreviewed, not
-# write-restricted, and an attacker who can write this file could otherwise
-# smuggle an arbitrary extra key (or a non-string value under a real key
-# name) past a sanitizer that only inspects the fields it is told to look at.
+# Lint it:           clagentic-lite gates dispositions-lint
+# Migrate old files: python3 plugins/clagentic-lite/bin/findings.py dispositions migrate --root . --write
 #
-# Fail-open (prompt path): if the file is absent, empty, or unreadable, the
-# review proceeds as if no deferrals exist. Fail-closed (gate-code path,
-# lr-2ebc41): anything ambiguous, malformed, or unhashable about a
-# stable-contract entry retains the finding as blocking rather than
-# suppressing it — see docs/GATES.md "Gate-code deferral enforcement".
-#
-# Schema (JSON array):
-# [
-#   {
-#     "id": "def-001",              # stable identifier (required)
-#     "category": "sql",            # finding category this applies to (optional)
-#     "file": "scripts/seed.sh",    # exact path this applies to (required for gate-code matching)
-#     "message": "...",             # the Reviewer finding's own message, VERBATIM (required for gate-code matching — the match key)
-#     "description": "...",         # human-readable reason (required)
-#     "expires": "2026-12-31",      # ISO date — LLM reasons about expiry; gate does not parse (optional)
-#     "acknowledged_by": "you",     # who approved the deferral (optional)
-#     "scope": "stable-contract",   # ONLY supported value for gate-code matching; omit for prompt-context-only (optional)
-#     "file_sha256": "abc123..."    # sha256 of `file`'s content at grant time; required when scope is set (optional otherwise)
-#   }
-# ]
-#
-# The `expires` field is passed verbatim to the LLM. The gate does not compute
-# or enforce expiry dates — the LLM reasons about whether the deferral is still
-# valid given its expiry and the diff under review. `expires` is unrelated to
-# the gate-code lapse mechanism, which is `file_sha256` freshness only.
-#
-# Lint an existing file (refuses loudly on a malformed stable-contract entry):
-#   clagentic-lite gates deferrals-lint
-#
-# Deferrals vs. accepted-risks.md:
-#   accepted-risks.md  — architectural risk decisions; read by the merge-gate
-#                        (Gate 6); deterministic gate plumbing post-filters.
-#   deferrals.json     — operator guidance injected into the reviewer prompt
-#                        (Gate 3); LLM-judgment-only unless scope is
-#                        "stable-contract", in which case gate code also
-#                        mechanically enforces it (lr-2ebc41).
-# No new env var is needed — the feature is always active when the file exists.
+# The old .clagentic/deferrals.json, .clagentic/adversarial-acks.json and
+# .clagentic/accepted-risks.md are still read for one more release, converted
+# to the same entries, with a deprecation warning. deferrals.json is also still
+# shown to the Reviewer as prompt context (nothing there is applied in code).
 
 # ---------- cross-round finding dedup ----------
 # Default-on: suppress findings already reported in a prior review round when the
@@ -593,36 +555,15 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # Set =0 to opt out and see all findings on every round.
 # CLAGENTIC_CROSS_ROUND_DEDUP=1
 
-# ---------- cross-round finding recurrence demotion ----------
-# Second use of the same content-hash key space as cross-round dedup, above
-# (finding_content_keys, scripts/review-merge.sh): instead of only testing
-# "have we seen this key before" (dedup's boolean membership check), this
-# tracks HOW MANY rounds a finding's key has been reported in. Persisted
-# counts: .clagentic/lite/review-recurrence.json (gitignored, key -> integer
-# count, same directory convention as review-seen-keys and invariants.json).
-#
-# A finding that recurs at or above the configured threshold (default 2 --
-# "reported before AND reported again") is DEMOTED to advisory: it is
-# excluded from severity_blockers()' block count but stays fully visible in
-# the review findings array, cmd_render_review's terminal output ("reported
-# N rounds running — decide"), and the audit trail (gate='review-recurrence'
-# row with demoted:N threshold:T). This is a THRESHOLD change, never
-# suppression — nothing is hidden or dropped, only whether it can gate `gates ship`
-# on its own.
-#
-# Runs only when CLAGENTIC_CROSS_ROUND_DEDUP=1 (the same flag gates both —
-# recurrence tracking depends on the same per-round content-hash-keying pass
-# dedup already performs on the diff). `gates review --reset-dedup` clears
-# BOTH review-seen-keys AND review-recurrence.json, so a reset means "treat
-# every finding as fresh" in both senses (not suppressed AND not
-# recurrence-demoted).
-#
-# Conservative bias, same posture as cross-round dedup: a finding whose
-# content-hash key cannot be computed (empty key, no diff window, no sha256
-# tool) is retained and never demoted; a splice failure or missing JSON tool
-# leaves the review output untouched (full passthrough).
-#
-# CLAGENTIC_RECURRENCE_THRESHOLD=2
+# ---------- cross-round finding recurrence count ----------
+# Second use of the same content-hash key space as cross-round dedup, above:
+# instead of only testing "have we seen this key before", this counts HOW MANY
+# rounds a finding's key has been reported in (.clagentic/lite/review-recurrence.json,
+# gitignored). The count is information only: render-review shows "reported N
+# rounds running". It never changes whether a finding blocks. A finding stays
+# open until it is fixed or a disposition clears it; repetition used to demote
+# it to advisory, and no longer does. Runs only when CLAGENTIC_CROSS_ROUND_DEDUP=1.
+# `gates review --reset-dedup` clears both the seen-keys and the counts.
 
 # ---------- review ledger (lr-01ae73) ----------
 # Append-only, per-branch history of every `gates.sh review` verdict:
@@ -648,7 +589,7 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # When present AND CLAGENTIC_ADVERSARIAL_INVARIANTS=1, the file is injected
 # verbatim into the adversarial (Auditor) system prompt before the diff is
 # analyzed, with an instruction to verify the diff against each invariant —
-# the inverse of the reviewer deferrals injection above ("must still hold and
+# the inverse of the reviewer's deferred-findings context ("must still hold and
 # be re-checked" instead of "already reviewed, do not re-report"). This gives
 # the adversarial pass forward-invariant memory across rounds: findings
 # resolved in an earlier round become invariants the Auditor actively checks

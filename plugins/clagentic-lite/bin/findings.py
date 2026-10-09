@@ -19,35 +19,44 @@ Usage: findings.py STAGE OP [ARGS]
   fingerprint   dedup --strategy S --seen FILE [--diff FILE] [--mode drop|annotate]
                 keys --diff FILE | bump COUNTS_FILE
   dispositions  cross-round FILE --diff FILE --seen FILE
-                recurrence FILE --diff FILE --counts FILE --threshold N
-                deferrals FILE --root DIR [--deferrals FILE]
-                ledger-recurrence --ledger FILE --branch NAME | lint FILE
+                recurrence FILE --diff FILE --counts FILE
+                ledger-recurrence --ledger FILE --branch NAME
+                lint [FILE] [--root DIR] | migrate --root DIR [--write]
   verdict       blockers FILE THRESHOLD | blocking-json THRESHOLD | rank NAME
                 ledger-entries|ledger-latest|ledger-field|ledger-state|ledger-pass|
                 ledger-pass-head|ledger-append|ledger-entry
   render        review FILE | verdict-lines HEAD | sanitize-review FILE
                 sanitize-report FILE | fence-data LABEL KIND | fence-findings
                 json-field KEY | stale-report FILE | gate-summary OPTIONS
+  evaluate      [--gate review|adversarial|merge-gate] [--format json|markdown]
+                [--no-input] [--root DIR] [--head SHA] [--base REF] [--json]
+                the code verdict: unified findings on stdin, dispositions and
+                guardrails, per-HEAD accumulation; exits 1 when BLOCKED
 
 Findings and other payloads of unbounded size arrive on stdin or as file
 paths, never as argv: one argv string over the kernel's MAX_ARG_STRLEN fails
-exec. Exit status is the contract: 0 ok, 1 refused or failed closed, 2 unreadable
-input where the caller must tell that apart from empty, 70 an internal crash.
+exec. Exit status is the contract: 0 ok, 1 refused or failed closed (for
+evaluate: BLOCKED), 2 unreadable or refused input where the caller must tell
+that apart from empty or BLOCKED, 70 an internal crash.
 """
 import argparse
+import datetime
 import hashlib
 import io
 import json
 import os
+import posixpath
 import re
+import subprocess
 import sys
 import tempfile
 
 CRASH_STATUS = 70
 SEVERITY_RANKS = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 DEFAULT_THRESHOLD_RANK = 3
-# A severity that is present but not a string cannot be ranked; it counts as
-# blocking so a malformed value can never slip under the threshold.
+# A severity that is present but is not a known rank name (a non-string, or a
+# string like 'blocker' or 'crit') cannot be ranked; it counts as blocking so a
+# malformed value can never slip under the threshold.
 UNRANKABLE_RANK = 4
 FAIL_CLOSED_BLOCKERS = 99
 CLASS_ISOLATED = "none — isolated"
@@ -64,12 +73,11 @@ REVIEW_FINDING_FIELDS = (
 # gate-written annotations, which are not free text).
 PROMPT_REVIEW_TEXT_FIELDS = (
     "severity", "file", "category", "message", "evidence", "suggestion",
-    "issue_class", "class_fix", "_deferral_id",
+    "issue_class", "class_fix",
 )
 PROMPT_REVIEW_KEEP_KEYS = (
     "severity", "file", "line", "category", "message", "evidence", "suggestion",
-    "issue_class", "class_fix", "_recurrence_demoted", "_recurrence_count",
-    "_deferral_matched", "_deferral_id",
+    "issue_class", "class_fix", "_recurrence_count",
 )
 
 SANITIZE_FAILED_ENVELOPE = (
@@ -88,8 +96,17 @@ _FENCE_LABELS = (
     "===BEGIN DETERMINISTIC GATES DATA===", "===END DETERMINISTIC GATES DATA===",
     "===BEGIN REVIEW FINDINGS DATA===", "===END REVIEW FINDINGS DATA===",
     "===BEGIN ADVERSARIAL REPORT DATA===", "===END ADVERSARIAL REPORT DATA===",
+    "===BEGIN CODE VERDICT DATA===", "===END CODE VERDICT DATA===",
 )
 _FENCE_PATTERNS = [re.compile(re.escape(label), re.IGNORECASE) for label in _FENCE_LABELS]
+# Characters that never belong in text a person or a model reads as a finding:
+# C0 controls, DEL, the C1 block (U+009B is a one-byte CSI on some terminals)
+# and the bidirectional overrides and isolates that reorder what a reader sees.
+# The one definition both text sanitizers below derive from.
+_C1_AND_BIDI = ("\x7f-\x9f" + chr(0x202A) + "-" + chr(0x202E) + chr(0x2066) + "-" + chr(0x2069))
+# Prompt text keeps tab and newline; terminal text keeps neither.
+_UNSAFE_RE = re.compile("[\x00-\x08\x0b-\x1f" + _C1_AND_BIDI + "]")
+_CONTROL_RE = re.compile("[\x00-\x1f" + _C1_AND_BIDI + "]")
 _CSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 _OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)")
 _ESC_RE = re.compile(r"\x1b.")
@@ -183,15 +200,27 @@ def max_field_chars():
 
 # ------------------------------------------------------------------- severity
 
+def canonical_severity(severity):
+    """A severity string reduced to a known rank name, or None when it is not
+    one. Whitespace and case are normalized because models routinely return
+    'HIGH' or 'high '; nothing else is guessed at ('crit' is not 'critical')."""
+    if not isinstance(severity, str):
+        return None
+    name = severity.strip().lower()
+    return name if name in SEVERITY_RANKS else None
+
+
 def severity_rank(severity):
-    """The one severity ranking. None is rank 0; a non-string value cannot be
-    ranked and counts as blocking; a string is matched case-insensitively
-    because models routinely return 'HIGH'."""
+    """The one severity ranking. None is rank 0 (the field is absent). Anything
+    present that is not a known rank name once stripped and lowercased, whether
+    a non-string or a string like 'blocker', cannot be ranked and counts as
+    blocking."""
     if severity is None:
         return 0
-    if not isinstance(severity, str):
+    name = canonical_severity(severity)
+    if name is None:
         return UNRANKABLE_RANK
-    return SEVERITY_RANKS.get(severity.lower(), 0)
+    return SEVERITY_RANKS[name]
 
 
 def threshold_rank(name):
@@ -200,12 +229,10 @@ def threshold_rank(name):
 
 
 def counts_toward_verdict(finding, threshold):
-    """A finding blocks when it meets the threshold and no gate-written
-    annotation excuses it. The annotations are thresholds, not suppression:
-    the finding stays visible with its honest severity."""
-    return (severity_rank(finding.get("severity")) >= threshold
-            and finding.get("_recurrence_demoted") is not True
-            and finding.get("_deferral_matched") is not True)
+    """A review finding blocks when its severity meets the threshold. Whether a
+    disposition clears it is decided later, by the verdict; no field a finding
+    carries can excuse it, so a model cannot write its own exemption."""
+    return severity_rank(finding.get("severity")) >= threshold
 
 
 def triple(finding):
@@ -219,14 +246,15 @@ def triple(finding):
 
 def sanitize_text(text, limit=None):
     """Neutralize text before it is written to a file or interpolated into a
-    prompt a later model reads: strip terminal escapes and control bytes (tab
-    and newline stay), defang every fence label, cap the length."""
+    prompt a later model reads: strip terminal escapes, control bytes, C1
+    controls and bidirectional overrides (tab and newline stay), defang every
+    fence label, cap the length."""
     if limit is None:
         limit = max_field_chars()
     text = _CSI_RE.sub("", text)
     text = _OSC_RE.sub("", text)
     text = _ESC_RE.sub("", text)
-    text = "".join(ch for ch in text if ch in ("\t", "\n") or 0x20 <= ord(ch) != 0x7F)
+    text = _UNSAFE_RE.sub("", text)
     for pattern in _FENCE_PATTERNS:
         text = pattern.sub(lambda m: " ".join(m.group(0)), text)
     if len(text) > limit:
@@ -313,9 +341,7 @@ def extract_findings(path):
     if not isinstance(document, dict):
         return []
     value = document.get("findings")
-    if value is None or value is False:
-        return []
-    return value
+    return value if isinstance(value, list) else []
 
 
 def extract_findings_strict(path):
@@ -343,20 +369,31 @@ def splice_findings(path, findings):
 def mark_review_sanitize_failed(path):
     """Replace PATH with the degraded stub that says its findings could not be
     reduced to the closed schema. The raw findings are still in PATH and must
-    not survive, and an empty list must not read as 'no findings'."""
+    not survive, and an empty list must not read as 'no findings'. Returns
+    False when the stub could not be written: the raw findings may then still
+    be in PATH, and the caller must not let the run go on with them."""
     try:
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(SANITIZE_FAILED_ENVELOPE)
     except OSError as exc:
         warn("[findings] could not rewrite %s: %s" % (path, exc))
+        try:
+            os.unlink(path)
+        except OSError as unlink_exc:
+            warn("[findings] could not remove %s either: %s; it may still hold raw "
+                 "unsanitized findings" % (path, unlink_exc))
+        return False
     warn("[gates/review] review findings could not be reduced to the closed schema; "
          "marked the envelope degraded")
+    return True
 
 
 def ingest_review_envelope(path):
     """Reduce an envelope's findings to the closed review schema in place. This
     is the choke point: a model must not be able to forge a gate-owned
-    annotation (_recurrence_demoted and friends) in its own response."""
+    annotation in its own response. Exit 1 when the envelope could neither be
+    reduced nor replaced by the degraded stub: raw findings are never left as
+    the answer."""
     if not os.path.isfile(path):
         return 0
     try:
@@ -364,7 +401,7 @@ def ingest_review_envelope(path):
         clean = allowlist_fields(findings, REVIEW_FINDING_FIELDS)
         splice_findings(path, clean)
     except (OSError, ValueError, KeyError):
-        mark_review_sanitize_failed(path)
+        return 0 if mark_review_sanitize_failed(path) else 1
     return 0
 
 
@@ -377,12 +414,17 @@ def parse_adversarial_findings(path):
     model nor an injected diff can move a finding across the blocking line."""
     try:
         with open(path, encoding="utf-8") as handle:
-            lines = handle.read().split("\n")
+            text = handle.read()
     except (OSError, ValueError) as exc:
         warn("_parse_adversarial_findings: could not read %s: %s" % (path, exc))
         raise
+    return parse_adversarial_text(text)
+
+
+def parse_adversarial_text(text):
+    """The findings in the Auditor's markdown, one per [FINDING] header line."""
     findings = []
-    for line in lines:
+    for line in text.split("\n"):
         match = _ADVERSARIAL_HEADER_RE.match(line.strip())
         if not match:
             continue
@@ -627,18 +669,28 @@ def content_key_rows(findings, diff_path):
     return rows
 
 
-def bump_counts(counts_path, keys):
-    """Increment the persisted round count of each key; returns the new count
-    per key in order. A missing, corrupt or non-object counts file reads as
-    empty and a non-integer entry as zero, so the count can only be
-    undercounted, which can only under-demote."""
-    counts = {}
+def read_counts(counts_path):
+    """The persisted round counts. A missing, corrupt or non-object counts file
+    reads as empty, so a count can only be undercounted."""
     try:
         loaded = load_json_file(counts_path)
-        if isinstance(loaded, dict):
-            counts = loaded
     except (OSError, ValueError):
-        counts = {}
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def write_counts(counts_path, counts):
+    try:
+        write_file_atomic(counts_path, dumps(counts))
+    except OSError as exc:
+        warn("[findings] could not persist round counts to %s: %s" % (counts_path, exc))
+        return False
+    return True
+
+
+def next_counts(counts, keys):
+    """Mutate COUNTS to add one round for each key in KEYS and return the new
+    count per key in order. A non-integer entry reads as zero."""
     result = []
     for key in keys:
         prior = counts.get(key, 0)
@@ -646,10 +698,15 @@ def bump_counts(counts_path, keys):
             prior = 0
         counts[key] = prior + 1
         result.append(prior + 1)
-    try:
-        write_file_atomic(counts_path, dumps(counts))
-    except OSError as exc:
-        warn("[findings] could not persist round counts to %s: %s" % (counts_path, exc))
+    return result
+
+
+def bump_counts(counts_path, keys):
+    """Increment the persisted round count of each key; returns the new count
+    per key in order."""
+    counts = read_counts(counts_path)
+    result = next_counts(counts, keys)
+    write_counts(counts_path, counts)
     return result
 
 
@@ -723,131 +780,58 @@ def cross_round(env_path, diff_path, seen_path):
         raise StageFailure(SPLICE_FAILED)
     seen = read_key_file(seen_path)
     kept, new_keys = dedup_findings(findings, "content-hash", seen, diff_path, True)
-    append_key_file(seen_path, new_keys)
     try:
         splice_findings(env_path, kept)
     except (OSError, ValueError):
         raise StageFailure(SPLICE_FAILED)
+    # Recorded only once the annotated findings are in the envelope: a failed
+    # splice must not leave this round's keys behind, or the next run would
+    # report these findings as seen in a round whose result never landed.
+    append_key_file(seen_path, new_keys)
     seen_before = sum(1 for f in kept if isinstance(f, dict) and f.get("_seen_before") is True)
     return len(findings), len(kept), seen_before
 
 
-def recurrence_demote(env_path, diff_path, counts_path, threshold):
-    """Count how many rounds each surviving finding has been reported in and
-    mark those at or past THRESHOLD _recurrence_demoted. Severity is never
-    touched: demotion only changes eligibility to block. Findings dedup kept
-    only because an earlier run saw them are not counted again, or a plain
-    re-run would demote a finding by repetition alone. Returns the demoted
-    count, or None when nothing had a computable key (envelope untouched)."""
+def recurrence_count(env_path, diff_path, counts_path):
+    """Record how many rounds each surviving finding has been reported in, as
+    an informational _recurrence_count. The count never changes whether a
+    finding blocks: an open finding stays open until it is fixed or
+    dispositioned, so repetition is context for the reader, not an exemption.
+    Findings dedup kept only because an earlier run saw them are not counted
+    again. Counts are per finding (by content key, once per round per key) and
+    are persisted only after the envelope was rewritten. Returns the number of
+    findings counted, or None when nothing was counted (envelope untouched
+    apart from clearing a stale count)."""
     findings = extract_findings(env_path)
-    if not isinstance(findings, list):
+    stale = [f for f in findings if isinstance(f, dict) and "_recurrence_count" in f]
+    for finding in stale:
+        del finding["_recurrence_count"]
+    keyed = []
+    if diff_path and os.path.isfile(diff_path):
+        for index, finding in enumerate(findings):
+            if not isinstance(finding, dict) or finding.get("_seen_before") is True:
+                continue
+            try:
+                key = window_key(finding, diff_path)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if key:
+                keyed.append((index, key))
+    counts = read_counts(counts_path)
+    distinct = list(dict.fromkeys(key for _, key in keyed))
+    new = dict(zip(distinct, next_counts(counts, distinct)))
+    for index, key in keyed:
+        findings[index]["_recurrence_count"] = new[key]
+    if not keyed and not stale:
         return None
-    unseen = [f for f in findings
-              if isinstance(f, dict) and f.get("_seen_before") is not True]
-    rows = content_key_rows(unseen, diff_path)
-    if not rows:
-        return None
-    counts = bump_counts(counts_path, [row[0] for row in rows])
-    # Matched by value against the cleaned row fields, so a finding whose text
-    # carries a tab or newline never matches and is never demoted.
-    counts_by_triple = {}
-    for row, count in zip(rows, counts):
-        counts_by_triple[(row[1], row[2], row[3])] = count
-    demoted = 0
-    for finding in findings:
-        if not isinstance(finding, dict):
-            continue
-        count = counts_by_triple.get(triple(finding))
-        # Own the field for every finding touched: a value left over from the
-        # object is never trusted.
-        if count is None:
-            finding["_recurrence_count"] = 0
-            finding["_recurrence_demoted"] = False
-            continue
-        finding["_recurrence_count"] = count
-        finding["_recurrence_demoted"] = count >= threshold
-        if count >= threshold:
-            demoted += 1
     try:
         splice_findings(env_path, findings)
     except (OSError, ValueError):
-        pass
-    return demoted
-
-
-def row_unsafe(*fields):
-    """True when any field holds a tab, CR or LF. Such an entry cannot be
-    carried in the row format deferral entries have always matched through, so
-    it has never matched; matching and lint both ask this one question."""
-    return any(c in field for field in fields for c in "\t\n\r")
-
-
-def _live_deferrals(deferrals, root):
-    """Deferral entries eligible for mechanical matching whose file still has
-    the content hash recorded at grant time. Anything doubtful is left out,
-    which keeps the finding blocking."""
-    live = []
-    if not isinstance(deferrals, list):
-        return live
-    for entry in deferrals:
-        if not isinstance(entry, dict):
-            continue
-        did, fname = entry.get("id"), entry.get("file")
-        fsha, message = entry.get("file_sha256"), entry.get("message")
-        category = str(entry.get("category", ""))
-        eligible = (isinstance(did, str) and did and isinstance(fname, str) and fname
-                    and isinstance(fsha, str) and fsha and isinstance(message, str)
-                    and message and entry.get("scope") == "stable-contract")
-        if not eligible:
-            continue
-        if row_unsafe(did, fname, category, message):
-            continue
-        try:
-            with open(root + "/" + fname, "rb") as handle:
-                actual = hashlib.sha256(handle.read()).hexdigest()
-        except OSError:
-            continue
-        if actual == fsha:
-            live.append((did, fname, category, message))
-    return live
-
-
-def deferral_match(env_path, deferrals_path, root):
-    """Mark findings that match exactly one live operator deferral. Threshold,
-    not suppression: the finding stays in the envelope, annotated. Two live
-    entries claiming one finding is ambiguous and matches neither. Returns the
-    matched count, or None when there is nothing to match against."""
-    if not os.path.isfile(deferrals_path):
         return None
-    try:
-        deferrals = load_json_file(deferrals_path)
-    except (OSError, ValueError):
+    if not keyed:
         return None
-    live = _live_deferrals(deferrals, root)
-    if not live:
-        return None
-    findings = extract_findings(env_path)
-    if not isinstance(findings, list):
-        return None
-    ids_by_triple = {}
-    for did, fname, category, message in live:
-        ids_by_triple.setdefault((fname, category, message), []).append(did)
-    matched = 0
-    for finding in findings:
-        if not isinstance(finding, dict):
-            continue
-        candidates = ids_by_triple.get(triple(finding), [])
-        if len(candidates) == 1:
-            finding["_deferral_matched"] = True
-            finding["_deferral_id"] = candidates[0]
-            matched += 1
-        else:
-            finding["_deferral_matched"] = False
-    try:
-        splice_findings(env_path, findings)
-    except (OSError, ValueError):
-        return 0
-    return matched
+    write_counts(counts_path, counts)
+    return len(keyed)
 
 
 def mark_ledger_recurrence(findings, ledger_path, branch):
@@ -865,86 +849,1224 @@ def mark_ledger_recurrence(findings, ledger_path, branch):
     return findings
 
 
-def lint_deferrals(path):
-    """Validate a deferrals file against the schema mechanical matching needs.
-    Returns (exit_code, lines)."""
+# ----------------------------------------------------- unified finding schema
+#
+# Review findings (JSON) and adversarial findings (markdown [FINDING] headers)
+# are reduced to ONE record shape before anything decides about them:
+#
+#   source, file, line, category (a CWE or rule class), message, evidence,
+#   reachable (yes|no|unknown), class (durable|ephemeral), severity_claimed
+#   (the model's own value, display only), severity (that value as a known
+#   rank name, or "unknown" when it is not one), tier (adversarial only), and
+#   the pipeline-added fingerprint (a link hint, never an identity to drop a
+#   finding on).
+#
+# The record is rebuilt from the input field by field: whatever else a model
+# or another producer wrote (a forged "disposition", a forged "fingerprint")
+# is not carried over.
+
+SOURCES = ("review", "adversarial")
+REACHABLE_VALUES = ("yes", "no", "unknown")
+CHANGE_CLASSES = ("durable", "ephemeral")
+# Reachable at this rank (high) or above is the security floor.
+FLOOR_RANK = 3
+EVALUATE_MAX_FINDINGS = 1000
+STATE_MAX_FINDINGS = 5000
+MAX_INPUT_BYTES = 16 * 1024 * 1024
+MAX_FILE_BYTES = 1024 * 1024
+MAX_ENTRIES = 1000
+MAX_TEXT = 2000
+GIT_TIMEOUT_SEC = 60
+STATE_SCHEMA = 1
+DISPOSITIONS_SCHEMA = 1
+
+
+class InputRefused(Exception):
+    """The input cannot be evaluated; the verdict is never computed from it."""
+
+
+def norm_text(text):
+    return " ".join(str(text).lower().split())
+
+
+def norm_path(path):
+    """A finding's file as a normalized relative path, so 'src/../auth.py' and
+    './auth.py' cannot reach a glob that was written for another file."""
+    text = str(path).strip().replace("\\", "/")
+    normal = posixpath.normpath(text) if text else ""
+    return "" if normal == "." else normal
+
+
+def finding_identity(source, fname, category, message):
+    """The fingerprint hint: stable across line drift and across runs, so the
+    same observation reported twice links to itself. Source is part of it: a
+    review finding and an adversarial finding about one issue are two open
+    items, each cleared on its own terms."""
+    raw = "\x1f".join((source, norm_path(fname), norm_text(category), norm_text(message)))
+    return sha256_hex(raw)[:32]
+
+
+def _clean(value, limit):
+    return sanitize_text(value if isinstance(value, str) else "", limit)
+
+
+def _line_number(value):
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, float) and value.is_integer():
+        return max(int(value), 0)
+    return 0
+
+
+def adversarial_tier(reachable, severity, given):
+    """Reachability is the precondition for blocking; reachable at high or
+    above is the security floor and always blocks. Between the two the
+    model's own tier stands."""
+    if reachable != "yes":
+        return "advisory"
+    if severity_rank(severity) >= FLOOR_RANK:
+        return "blocking"
+    return given if given in ("blocking", "advisory") else "advisory"
+
+
+def unify_finding(raw, source):
+    """One input finding as a unified record. Raises ValueError for an input
+    that is not an object: a finding that cannot be read is never skipped."""
+    if not isinstance(raw, dict):
+        raise ValueError("a finding is not an object")
+    claimed = raw.get("severity_claimed", raw.get("severity"))
+    if claimed is None:
+        shown, severity = "", None
+    elif isinstance(claimed, str):
+        shown, severity = claimed, canonical_severity(claimed) or "unknown"
+    else:
+        shown, severity = dumps(claimed), "unknown"
+    reachable = raw.get("reachable")
+    reachable = reachable.strip().lower() if isinstance(reachable, str) else ""
+    if reachable not in REACHABLE_VALUES:
+        reachable = "unknown"
+    change_class = raw.get("class")
+    change_class = change_class.strip().lower() if isinstance(change_class, str) else ""
+    if change_class not in CHANGE_CLASSES:
+        change_class = "durable"
+    record = {
+        "source": source,
+        "file": _clean(raw.get("file"), 300),
+        "line": _line_number(raw.get("line")),
+        "category": _clean(raw.get("category"), 100),
+        "message": _clean(raw.get("message"), 500),
+        "evidence": _clean(raw.get("evidence"), 1000),
+        "reachable": reachable,
+        "class": change_class,
+        "severity_claimed": sanitize_text(shown, 40),
+        "severity": severity,
+    }
+    if source == "adversarial":
+        given = raw.get("tier")
+        record["tier"] = adversarial_tier(
+            reachable, severity, given.strip().lower() if isinstance(given, str) else "")
+    for key in ("suggestion", "issue_class", "class_fix"):
+        if isinstance(raw.get(key), str):
+            record[key] = _clean(raw[key], 500)
+    record["fingerprint"] = finding_identity(
+        source, record["file"], record["category"], record["message"])
+    return record
+
+
+def unify_findings(raw_findings, source):
+    if not isinstance(raw_findings, list):
+        raise ValueError("findings is not an array")
+    if len(raw_findings) > EVALUATE_MAX_FINDINGS:
+        raise ValueError("more than %d findings" % EVALUATE_MAX_FINDINGS)
+    return [unify_finding(raw, source) for raw in raw_findings]
+
+
+def is_floor(finding):
+    """The security floor: reachable, at high impact or above. A finding on it
+    can be cleared by a fix, or by a mitigation that names the control, and by
+    nothing that merely calls it acceptable."""
+    return finding.get("reachable") == "yes" and severity_rank(finding.get("severity")) >= FLOOR_RANK
+
+
+def is_blocking(finding, threshold):
+    """Whether an unaddressed finding blocks. An adversarial finding blocks by
+    its (mechanically clamped) tier; a review finding blocks when its severity
+    meets the threshold. The severity is still the model's claim; the rubric
+    that replaces the claim is a later change."""
+    if finding.get("source") == "adversarial":
+        return finding.get("tier") == "blocking"
+    return severity_rank(finding.get("severity")) >= threshold
+
+
+# ------------------------------------------------------- dispositions store
+#
+# ONE committed file records what an operator decided about a class of
+# findings: .clagentic/dispositions.json. Matching is done here, in code, and
+# never by a model. The legacy files (deferrals.json, adversarial-acks.json,
+# accepted-risks.md) are still read for one release, converted to the same
+# entries, with a deprecation warning.
+
+DISPOSITIONS_REL = ".clagentic/dispositions.json"
+LEGACY_DEFERRALS_REL = ".clagentic/deferrals.json"
+LEGACY_ACKS_REL = ".clagentic/adversarial-acks.json"
+LEGACY_RISKS_REL = ".clagentic/accepted-risks.md"
+STATE_REL = ".clagentic/lite/findings-state.json"
+DISPOSITION_KINDS = ("by_design", "false_positive", "accepted_risk", "mitigated")
+DISPOSITION_GATES = ("review", "adversarial")
+_PLACEHOLDER_RE = re.compile(r"^<[^<>]*>$")
+_HINT_RE = re.compile(r"^[0-9a-f]{8,64}$")
+_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ].*)?$")
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9._/~^-]+$")
+
+
+def parse_date(value):
+    """The calendar date a string starts with (YYYY-MM-DD, optionally followed
+    by a time), or None."""
+    if not isinstance(value, str):
+        return None
+    match = _DATE_RE.match(value.strip())
+    if not match:
+        return None
     try:
-        with open(path, encoding="utf-8") as handle:
-            raw = handle.read()
-    except (OSError, ValueError) as exc:
-        return 1, ["[gates/deferrals-lint] cannot read {}: {}".format(path, exc)]
-    if not raw.strip():
-        return 0, []
-    try:
-        data = json.loads(raw)
-    except ValueError as exc:
-        return 1, [
-            "[gates/deferrals-lint] {} is not valid JSON: {}".format(path, exc),
-            "[gates/deferrals-lint] the reviewer prompt will still receive it (fail-open, "
-            "sanitized as opaque text), but NO entry in it can be gate-code-matched until "
-            "this is fixed"]
-    if not isinstance(data, list):
-        return 1, ["[gates/deferrals-lint] {} must be a JSON array of deferral objects, "
-                   "got {}".format(path, type(data).__name__)]
-    problems = []
-    for index, entry in enumerate(data):
-        where = "entry {}".format(index)
-        if not isinstance(entry, dict):
-            problems.append("{}: not a JSON object".format(where))
+        return datetime.date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
+def today_date(override=None):
+    """Today, from OVERRIDE or CLAGENTIC_FINDINGS_TODAY when given (tests and
+    reproducible runs), else the local date. An override that is not a date is
+    refused rather than ignored."""
+    text = override or os.environ.get("CLAGENTIC_FINDINGS_TODAY", "")
+    if not text:
+        return datetime.date.today()
+    parsed = parse_date(text)
+    if parsed is None:
+        raise InputRefused("the date override %r is not YYYY-MM-DD" % text)
+    return parsed
+
+
+_GLOBSTAR = "**"
+
+
+def compile_glob(glob):
+    """A path glob as a list of path segments. A segment that is exactly '**'
+    matches zero or more whole path segments; within any other segment '*'
+    matches any run of characters and '?' one character, neither crossing a
+    '/'; a backslash escapes the next character. Matching is by dynamic
+    programming (see glob_matches), never by a backtracking regex, because the
+    glob comes from a file the matcher does not trust."""
+    segments, tokens, stars_only = [], [], True
+    i = 0
+
+    def close():
+        segments.append(_GLOBSTAR if (stars_only and len(tokens) >= 2) else tokens[:])
+        del tokens[:]
+
+    while i < len(glob):
+        char = glob[i]
+        if char == "\\" and i + 1 < len(glob):
+            tokens.append(("lit", glob[i + 1]))
+            stars_only = False
+            i += 2
             continue
-        eid = entry.get("id")
-        if isinstance(eid, str) and eid:
-            where = "entry {} (id={!r})".format(index, eid)
+        if char == "/":
+            close()
+            stars_only = True
+            i += 1
+            continue
+        if char == "*":
+            tokens.append(("star", char))
         else:
-            problems.append("{}: missing or empty required field 'id'".format(where))
-        scope = entry.get("scope")
-        if scope is None:
+            stars_only = False
+            tokens.append(("any", char) if char == "?" else ("lit", char))
+        i += 1
+    close()
+    # '*' runs inside an ordinary segment collapse to one: they match the same.
+    out = []
+    for segment in segments:
+        if segment is _GLOBSTAR:
+            out.append(_GLOBSTAR)
             continue
-        if scope != "stable-contract":
-            problems.append(
-                "{}: scope={!r} is not a supported gate-code scope (only \"stable-contract\" "
-                "is). REFUSED LOUDLY per design: a conditional or scope-boundary acceptance "
-                "whose validity depends on code OUTSIDE this file (e.g. reset logic living "
-                "elsewhere) is not safely matchable by a single-file content hash -- see "
-                "docs/GATES.md 'Reviewer-consulted deferrals' for why this class is "
-                "deliberately unsupported rather than silently mis-honored. Either remove the "
-                "'scope' field (valid prompt-context-only deferral, weighed by the model each "
-                "round, never mechanically matched) or, if this acceptance's rationale "
-                "genuinely depends only on the named file's own content, set scope to "
-                "\"stable-contract\" and provide file/message/file_sha256.".format(where, scope))
+        collapsed = []
+        for token in segment:
+            if token[0] == "star" and collapsed and collapsed[-1][0] == "star":
+                continue
+            collapsed.append(token)
+        out.append(collapsed)
+    return out
+
+
+def _segment_matches(tokens, text):
+    """Wildcard match of one path segment: linear in the text per backtrack
+    point, no exponential case."""
+    ti = si = 0
+    star, mark = -1, 0
+    while si < len(text):
+        if ti < len(tokens) and (tokens[ti][0] == "any" or (tokens[ti][0] == "lit"
+                                                              and tokens[ti][1] == text[si])):
+            ti += 1
+            si += 1
+        elif ti < len(tokens) and tokens[ti][0] == "star":
+            star, mark = ti, si
+            ti += 1
+        elif star != -1:
+            ti = star + 1
+            mark += 1
+            si = mark
+        else:
+            return False
+    while ti < len(tokens) and tokens[ti][0] == "star":
+        ti += 1
+    return ti == len(tokens)
+
+
+def glob_match_compiled(segments, path):
+    parts = path.split("/")
+    count = len(parts)
+    reachable = {0}
+    for segment in segments:
+        following = set()
+        if segment is _GLOBSTAR:
+            following = set(range(min(reachable), count + 1))
+        else:
+            for index in reachable:
+                if index < count and _segment_matches(segment, parts[index]):
+                    following.add(index + 1)
+        if not following:
+            return False
+        reachable = following
+    return count in reachable
+
+
+def glob_matches(glob, path):
+    return glob_match_compiled(compile_glob(glob), path)
+
+
+def glob_escape(path):
+    return re.sub(r"([*?\\])", r"\\\1", path)
+
+
+def validate_entry(raw):
+    """(entry, errors). An entry is either valid in every required field and
+    returned in its normalized form, or None with every reason it is not. Fail
+    closed: an invalid entry is ignored, loudly, never half-applied."""
+    if not isinstance(raw, dict):
+        return None, ["not a JSON object"]
+    errors = []
+
+    def text(container, key, limit=MAX_TEXT, label=None):
+        label = label or key
+        value = container.get(key)
+        if not isinstance(value, str) or not value.strip():
+            errors.append("missing or empty '%s'" % label)
+            return None
+        if len(value) > limit:
+            errors.append("'%s' is longer than %d characters" % (label, limit))
+            return None
+        if _UNSAFE_RE.search(value):
+            errors.append("'%s' contains control characters" % label)
+            return None
+        value = value.strip()
+        if _PLACEHOLDER_RE.match(value):
+            errors.append("'%s' is still a <placeholder>; write the real value" % label)
+            return None
+        return value
+
+    entry_id = text(raw, "id", 200)
+    gates = raw.get("gates")
+    if (not isinstance(gates, list) or not gates
+            or any(not isinstance(g, str) or g not in DISPOSITION_GATES for g in gates)):
+        errors.append("'gates' must be a non-empty list drawn from %s" % ", ".join(DISPOSITION_GATES))
+        gates = None
+    kind = raw.get("kind")
+    if kind not in DISPOSITION_KINDS:
+        errors.append("'kind' must be one of %s" % ", ".join(DISPOSITION_KINDS))
+        kind = None
+    rationale = text(raw, "rationale")
+    by = text(raw, "by", 200)
+    at = text(raw, "at", 64)
+    if at is not None and parse_date(at) is None:
+        errors.append("'at' is not a date (YYYY-MM-DD)")
+        at = None
+    expires = raw.get("expires")
+    if expires is not None:
+        if parse_date(expires) is None:
+            errors.append("'expires' is not a date (YYYY-MM-DD)")
+            expires = None
+        else:
+            expires = expires.strip()
+    control = None
+    if kind == "mitigated":
+        control = text(raw, "control")
+    match_raw = raw.get("match")
+    match = {}
+    if not isinstance(match_raw, dict):
+        errors.append("'match' must be an object with path_glob and category")
+    else:
+        glob = text(match_raw, "path_glob", 500, "match.path_glob")
+        category = text(match_raw, "category", 100, "match.category")
+        hint = match_raw.get("fingerprint_hint")
+        message = match_raw.get("message")
+        if glob is not None:
+            match["path_glob"] = glob
+        if category is not None:
+            match["category"] = category
+        if hint is not None:
+            if isinstance(hint, str) and _HINT_RE.match(hint.strip().lower()):
+                match["fingerprint_hint"] = hint.strip().lower()
+            else:
+                errors.append("'match.fingerprint_hint' must be 8 to 64 lowercase hex characters")
+        if message is not None:
+            message = text(match_raw, "message", 500, "match.message")
+            if message is not None:
+                match["message"] = message
+        if (match.get("path_glob") in ("*", "**") and match.get("category") == "*"
+                and "fingerprint_hint" not in match and "message" not in match):
+            errors.append("'match' is a catch-all (any path, any category); narrow it")
+    if errors:
+        return None, errors
+    entry = {"id": entry_id, "gates": sorted(set(gates)), "match": match, "kind": kind,
+             "rationale": rationale, "by": by, "at": at}
+    if expires is not None:
+        entry["expires"] = expires
+    if control is not None:
+        entry["control"] = control
+    return entry, []
+
+
+def entry_key(entry):
+    """The entry's content, for telling an entry the base commit already had
+    from one added or changed since."""
+    return dumps(entry, sort_keys=True)
+
+
+def convert_legacy_deferrals(text, root, check_hash):
+    """Raw dispositions for the deferrals that were ever mechanically
+    matched (scope 'stable-contract', with file, message and file_sha256).
+    The others were prompt-context hints a model weighed; nothing applied them
+    in code and they stay that way. With CHECK_HASH a deferral whose file no
+    longer has the recorded content is dropped (the lapse-on-edit it always
+    had). Returns (raw_entries, notes)."""
+    data = json.loads(text)
+    if not isinstance(data, list):
+        raise ValueError("deferrals file is not a JSON array")
+    raws, notes, prompt_only = [], [], 0
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            notes.append("deferrals entry %d is not an object; ignored" % index)
             continue
-        fname = entry.get("file")
-        if not (isinstance(fname, str) and fname):
-            problems.append("{}: scope is \"stable-contract\" but 'file' is missing or empty "
-                            "-- required to identify what gate code should re-hash".format(where))
-        message = entry.get("message")
-        if not (isinstance(message, str) and message):
-            problems.append(
-                "{}: scope is \"stable-contract\" but 'message' is missing or empty -- "
-                "gate-code matching keys on (file, category, message) verbatim against the "
-                "Reviewer's own finding text; without it this entry can never be "
-                "mechanically matched".format(where))
-        fsha = entry.get("file_sha256")
-        if not (isinstance(fsha, str) and _SHA256_RE.match(fsha)):
-            problems.append(
-                "{}: scope is \"stable-contract\" but file_sha256 is missing or not a "
-                "64-hex-char sha256 digest -- required for gate-code matching to detect the "
-                "named file changing since this deferral was granted (lapse-on-edit). "
-                "Compute it from the SAME file this entry names: "
-                "sha256sum <file> | cut -d' ' -f1".format(where))
-        text_fields = [value for value in (eid, fname, message) if isinstance(value, str)]
-        text_fields.append(str(entry.get("category", "")))
-        if row_unsafe(*text_fields):
-            problems.append(
-                "{}: scope is \"stable-contract\" but id, file, category or message contains "
-                "a tab, CR or LF -- such an entry is never mechanically matched (the gate "
-                "drops it), so it would silently fail to defer anything. Remove the control "
-                "characters.".format(where))
-    if problems:
-        lines = ["[gates/deferrals-lint] {} problem(s) in {}:".format(len(problems), path)]
-        lines.extend("  - " + p for p in problems)
-        return 1, lines
-    return 0, ["[gates/deferrals-lint] {} entries, no problems".format(len(data))]
+        eligible = (item.get("scope") == "stable-contract"
+                    and all(isinstance(item.get(k), str) and item.get(k)
+                            for k in ("id", "file", "message", "file_sha256")))
+        if not eligible:
+            prompt_only += 1
+            continue
+        fname = norm_path(item["file"])
+        if check_hash:
+            try:
+                with open(os.path.join(root, fname), "rb") as handle:
+                    actual = hashlib.sha256(handle.read(MAX_FILE_BYTES + 1)).hexdigest()
+            except OSError:
+                actual = None
+            if actual != item["file_sha256"]:
+                notes.append("deferral %r lapsed: %s no longer has the recorded content"
+                             % (terminal_text(item["id"], 80), terminal_text(fname, 120)))
+                continue
+        try:
+            mtime = datetime.date.fromtimestamp(
+                os.stat(os.path.join(root, LEGACY_DEFERRALS_REL)).st_mtime).isoformat()
+        except OSError:
+            mtime = ""
+        raw = {
+            "id": "deferral-" + item["id"],
+            "gates": ["review"],
+            "match": {"path_glob": glob_escape(fname),
+                      "category": str(item.get("category") or "") or "*",
+                      "message": item["message"]},
+            "kind": "accepted_risk",
+            "rationale": item.get("description") or "migrated from deferrals.json (no description recorded)",
+            "by": item.get("acknowledged_by") or "legacy deferrals.json (no author recorded)",
+            "at": mtime,
+        }
+        if item.get("expires") is not None:
+            raw["expires"] = item["expires"]
+        raws.append(raw)
+    if prompt_only:
+        notes.append("%d deferral(s) without scope 'stable-contract' were prompt-context hints, "
+                     "never applied in code, and are not migrated" % prompt_only)
+    return raws, notes
+
+
+def convert_legacy_acks(text):
+    """Raw dispositions for adversarial-acks.json entries (a CWE, an optional
+    path glob, a rationale, who and when)."""
+    data = json.loads(text)
+    if not isinstance(data, list):
+        raise ValueError("acks file is not a JSON array")
+    raws, notes = [], []
+    for index, ack in enumerate(data):
+        if not isinstance(ack, dict):
+            notes.append("acks entry %d is not an object; ignored" % index)
+            continue
+        cwe, glob = ack.get("cwe"), ack.get("path_glob") or "**"
+        ident = sha256_hex("%s|%s" % (cwe, glob))[:10]
+        raws.append({
+            "id": "ack-" + ident,
+            "gates": ["adversarial"],
+            "match": {"path_glob": glob, "category": cwe},
+            "kind": "accepted_risk",
+            "rationale": ack.get("rationale"),
+            "by": ack.get("acknowledged_by"),
+            "at": ack.get("acknowledged_at"),
+        })
+    return raws, notes
+
+
+def read_text_bounded(path):
+    with open(path, "rb") as handle:
+        data = handle.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise OSError("%s is larger than %d bytes" % (path, MAX_FILE_BYTES))
+    return data.decode("utf-8")
+
+
+def worktree_reader(root):
+    """A reader of repo-relative files from the working tree: text, or None
+    for an absent file. A path that resolves outside the repository is an
+    error, not a file."""
+    real_root = os.path.realpath(root)
+
+    def read(rel):
+        path = os.path.join(root, rel)
+        if not os.path.lexists(path):
+            return None
+        real = os.path.realpath(path)
+        if real != real_root and not real.startswith(real_root + os.sep):
+            raise OSError("%s resolves outside the repository" % rel)
+        return read_text_bounded(real)
+    return read
+
+
+def git_run(root, args):
+    """A completed git process, or None when git cannot run or times out. The
+    variables that redirect which repository git touches are dropped so
+    '-C root' decides."""
+    drop = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_PREFIX", "GIT_NAMESPACE")
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    try:
+        return subprocess.run(["git", "-C", root] + list(args), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=GIT_TIMEOUT_SEC, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def git_reader(root, base):
+    """A reader of repo-relative files as they were at commit BASE."""
+    def read(rel):
+        listing = git_run(root, ["ls-tree", base, "--", rel])
+        if listing is None or listing.returncode != 0:
+            raise OSError("cannot read %s at %s" % (rel, base[:12]))
+        if not listing.stdout.strip():
+            return None
+        blob = git_run(root, ["cat-file", "blob", "%s:%s" % (base, rel)])
+        if blob is None or blob.returncode != 0:
+            raise OSError("cannot read %s at %s" % (rel, base[:12]))
+        if len(blob.stdout) > MAX_FILE_BYTES:
+            raise OSError("%s is larger than %d bytes" % (rel, MAX_FILE_BYTES))
+        return blob.stdout.decode("utf-8")
+    return read
+
+
+def load_store(root, reader, check_hash=True):
+    """The dispositions in force, read through READER. Returns a dict with the
+    valid 'entries', every 'invalid' record (source, id, errors), 'warnings'
+    (deprecations and migration notes) and the 'legacy' files that were read.
+    A file that cannot be read or parsed contributes no entries and one
+    invalid record: nothing in it applies."""
+    store = {"entries": [], "invalid": [], "warnings": [], "legacy": []}
+    seen = set()
+
+    def invalid(source, label, errors):
+        store["invalid"].append({"source": source, "id": terminal_text(label, 120),
+                                 "errors": [terminal_text(e, 300) for e in errors]})
+
+    def add(raw, source):
+        entry, errors = validate_entry(raw)
+        label = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else "<no id>"
+        if entry is not None and entry["id"] in seen:
+            entry, errors = None, ["duplicate id (the first entry with this id wins)"]
+        if entry is None:
+            invalid(source, label, errors)
+            return
+        seen.add(entry["id"])
+        store["entries"].append(entry)
+
+    def read(rel):
+        try:
+            return reader(rel), None
+        except (OSError, ValueError) as exc:
+            return None, str(exc)
+
+    text, problem = read(DISPOSITIONS_REL)
+    if problem:
+        invalid(DISPOSITIONS_REL, "<file>", ["cannot read the file: " + problem])
+    elif text is not None:
+        try:
+            document = json.loads(text)
+            items = document.get("entries") if isinstance(document, dict) else document
+            if not isinstance(items, list):
+                raise ValueError("expected a JSON array of entries or an object with an 'entries' array")
+            if len(items) > MAX_ENTRIES:
+                raise ValueError("more than %d entries" % MAX_ENTRIES)
+        except ValueError as exc:
+            invalid(DISPOSITIONS_REL, "<file>", ["not usable: %s; no entry in it applies" % exc])
+        else:
+            for raw in items:
+                add(raw, DISPOSITIONS_REL)
+
+    for rel, convert in ((LEGACY_DEFERRALS_REL, "deferrals"), (LEGACY_ACKS_REL, "acks")):
+        text, problem = read(rel)
+        if problem:
+            invalid(rel, "<file>", ["cannot read the file: " + problem])
+            continue
+        if text is None or not text.strip():
+            continue
+        store["legacy"].append(rel)
+        try:
+            if convert == "deferrals":
+                raws, notes = convert_legacy_deferrals(text, root, check_hash)
+            else:
+                raws, notes = convert_legacy_acks(text)
+        except ValueError as exc:
+            invalid(rel, "<file>", ["not usable: %s; no entry in it applies" % exc])
+            continue
+        store["warnings"].extend(notes)
+        for raw in raws[:MAX_ENTRIES]:
+            add(raw, rel)
+    text, problem = read(LEGACY_RISKS_REL)
+    if text is not None and text.strip():
+        store["legacy"].append(LEGACY_RISKS_REL)
+        store["warnings"].append(
+            "%s is freetext and was only ever read by the merge-gate model; it clears nothing "
+            "in code. Record each accepted risk as an entry in %s." % (LEGACY_RISKS_REL, DISPOSITIONS_REL))
+    for rel in store["legacy"]:
+        if rel != LEGACY_RISKS_REL:
+            store["warnings"].append(
+                "DEPRECATED: %s is read for one more release; move its entries with "
+                "'python3 findings.py dispositions migrate --root . --write' and delete it" % rel)
+    return store
+
+
+def introduced_entry_keys(root, base):
+    """The set of entry contents the BASE commit already had, or None when the
+    base is unknown. None means every entry counts as added in this change."""
+    if not base:
+        return None
+    base_store = load_store(root, git_reader(root, base), check_hash=False)
+    return {entry_key(entry) for entry in base_store["entries"]}
+
+
+_GLOB_CACHE = {}
+
+
+def _compiled_glob(entry):
+    key = entry["match"]["path_glob"]
+    if key not in _GLOB_CACHE:
+        _GLOB_CACHE[key] = compile_glob(key)
+    return _GLOB_CACHE[key]
+
+
+def entry_matches(entry, finding):
+    if finding.get("source") not in entry["gates"]:
+        return False
+    match = entry["match"]
+    if not glob_match_compiled(_compiled_glob(entry), norm_path(finding.get("file", ""))):
+        return False
+    category = match["category"]
+    if category != "*" and category.strip().lower() != str(finding.get("category", "")).strip().lower():
+        return False
+    if "message" in match and norm_text(match["message"]) != norm_text(finding.get("message", "")):
+        return False
+    hint = match.get("fingerprint_hint")
+    if hint and not str(finding.get("fingerprint", "")).startswith(hint):
+        return False
+    return True
+
+
+def entry_can_clear(entry, finding):
+    """A security-floor finding is cleared by a mitigation that names its
+    control; by_design, false_positive and accepted_risk do not reach it."""
+    return entry["kind"] == "mitigated" if is_floor(finding) else True
+
+
+# ------------------------------------------------------------------ git state
+
+def repo_head(root):
+    """HEAD of the repository ROOT is the top level of, or None. 'git -C' only
+    changes directory before git walks upward looking for a repository, so the
+    top level must be ROOT itself: an ancestor repository is not ROOT's."""
+    top = git_run(root, ["rev-parse", "--show-toplevel"])
+    if top is None or top.returncode != 0:
+        return None
+    if os.path.realpath(top.stdout.decode("utf-8", "replace").strip()) != os.path.realpath(root):
+        return None
+    head = git_run(root, ["rev-parse", "HEAD"])
+    if head is None or head.returncode != 0:
+        return None
+    sha = head.stdout.decode("utf-8", "replace").strip()
+    return sha if re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", sha) else None
+
+
+def resolve_base(root, explicit, default_branch):
+    """The commit the gated change is measured against, or None. An explicit
+    ref wins; otherwise the merge base of HEAD with origin/<default> or
+    <default>."""
+    if explicit:
+        if not _BRANCH_RE.match(explicit) or explicit.startswith("-"):
+            return None
+        proc = git_run(root, ["rev-parse", "--verify", "--quiet", explicit + "^{commit}"])
+        if proc is None or proc.returncode != 0:
+            return None
+        return proc.stdout.decode("utf-8", "replace").strip() or None
+    name = default_branch or os.environ.get("CLAGENTIC_DEFAULT_BRANCH") or "main"
+    if not _BRANCH_RE.match(name) or name.startswith("-"):
+        return None
+    for ref in ("origin/" + name, name):
+        proc = git_run(root, ["merge-base", "HEAD", ref])
+        if proc is not None and proc.returncode == 0:
+            sha = proc.stdout.decode("utf-8", "replace").strip()
+            if sha:
+                return sha
+    return None
+
+
+# ------------------------------------------------- per-HEAD accumulation state
+#
+# Open findings accumulate per HEAD: once a run has found something at a
+# commit it stays on the list until the commit changes or a disposition
+# clears it, and a re-run can only add. The state is a small file under
+# .clagentic/lite/, created on demand, owned by this file alone, so the
+# accumulation works in a repository that was never enrolled.
+
+class StateError(Exception):
+    """The accumulation state exists but cannot be trusted."""
+
+
+def state_file(root):
+    return os.path.join(root, STATE_REL)
+
+
+def fresh_state(head):
+    return {"schema": STATE_SCHEMA, "head": head, "runs": [], "findings": []}
+
+
+def load_state(root, head):
+    """The state for HEAD. A state recorded at another HEAD starts fresh (a
+    new commit is a new question); one that cannot be read is an error, never
+    an empty list, because losing the accumulation would silently clear every
+    open finding."""
+    path = state_file(root)
+    if not os.path.exists(path):
+        return fresh_state(head)
+    try:
+        data = load_json_file(path)
+    except (OSError, ValueError) as exc:
+        raise StateError("%s cannot be read (%s); remove it to start a fresh accumulation" % (path, exc))
+    if (not isinstance(data, dict) or data.get("schema") != STATE_SCHEMA
+            or not isinstance(data.get("head"), str) or not isinstance(data.get("runs"), list)
+            or not isinstance(data.get("findings"), list)):
+        raise StateError("%s is not a recognized findings state; remove it to start a fresh accumulation" % path)
+    if data["head"] != head:
+        return fresh_state(head)
+    for item in data["findings"]:
+        if (not isinstance(item, dict) or item.get("source") not in SOURCES
+                or not isinstance(item.get("fingerprint"), str)):
+            raise StateError("%s holds a malformed finding; remove it to start a fresh accumulation" % path)
+    return data
+
+
+class StateLock(object):
+    """An exclusive lock around a read-modify-write of the state file, on a
+    sibling lock file (the state itself is replaced by rename)."""
+
+    def __init__(self, root):
+        self.path = state_file(root) + ".lock"
+        self.handle = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        try:
+            import fcntl
+            self.handle = open(self.path, "a", encoding="utf-8")
+            fcntl.flock(self.handle, fcntl.LOCK_EX)
+        except (ImportError, OSError) as exc:
+            warn("[findings] could not lock the findings state (%s); a concurrent run may be lost" % exc)
+        return self
+
+    def __exit__(self, *exc_info):
+        if self.handle is not None:
+            self.handle.close()
+        return False
+
+
+def save_state(root, state):
+    path = state_file(root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_file_atomic(path, dumps(state) + "\n")
+
+
+_REACHABLE_ORDER = {"no": 0, "unknown": 1, "yes": 2}
+
+
+def accumulate(state, incoming, gate, caller):
+    """Add INCOMING (unified records) to STATE. A finding already there (the
+    same source and fingerprint, or the same source, file, line and category)
+    is merged toward the stronger reading of each field; nothing is removed.
+    Returns the number of findings that were new."""
+    by_print = {(f["source"], f["fingerprint"]): f for f in state["findings"]}
+    by_place = {(f["source"], f.get("file"), f.get("line"), str(f.get("category", "")).lower()): f
+                for f in state["findings"]}
+    new = 0
+    for record in incoming:
+        place = (record["source"], record["file"], record["line"], record["category"].lower())
+        known = by_print.get((record["source"], record["fingerprint"])) or by_place.get(place)
+        if known is None:
+            if len(state["findings"]) >= STATE_MAX_FINDINGS:
+                raise InputRefused("more than %d findings at this HEAD" % STATE_MAX_FINDINGS)
+            state["findings"].append(record)
+            by_print[(record["source"], record["fingerprint"])] = record
+            by_place[place] = record
+            new += 1
+            continue
+        if severity_rank(record["severity"]) > severity_rank(known.get("severity")):
+            known["severity"], known["severity_claimed"] = record["severity"], record["severity_claimed"]
+        if _REACHABLE_ORDER[record["reachable"]] > _REACHABLE_ORDER.get(known.get("reachable"), 1):
+            known["reachable"] = record["reachable"]
+        if record.get("tier") == "blocking":
+            known["tier"] = "blocking"
+        if record["class"] == "durable":
+            known["class"] = "durable"
+    state["runs"].append({"gate": gate, "caller": caller, "count": len(incoming), "new": new})
+    del state["runs"][:-200]
+    return new
+
+
+# ---------------------------------------------------------------- the verdict
+
+def _public_finding(finding):
+    keys = ("source", "file", "line", "category", "message", "severity", "severity_claimed",
+            "reachable", "fingerprint")
+    return {key: finding.get(key) for key in keys}
+
+
+def _public_entry(entry):
+    out = {key: entry[key] for key in ("id", "kind", "by", "at", "rationale")}
+    for key in ("control", "expires"):
+        if key in entry:
+            out[key] = entry[key]
+    return out
+
+
+def clearing_stanza(finding, today):
+    """The exact disposition entry that would clear FINDING, with its
+    judgment fields left as placeholders that the validator refuses, so a
+    stanza pasted in unedited clears nothing."""
+    fingerprint = finding["fingerprint"]
+    floor = is_floor(finding)
+    stanza = {
+        "id": "disp-" + fingerprint[:10],
+        "gates": [finding["source"]],
+        "match": {"path_glob": glob_escape(norm_path(finding.get("file", "")) or "**"),
+                  "category": finding.get("category") or "*",
+                  "fingerprint_hint": fingerprint[:16]},
+        "kind": "mitigated" if floor else "by_design",
+        "rationale": "<how the named control prevents exploitation>" if floor
+                     else "<why this finding does not need a code change>",
+        "by": "<who accepts this>",
+        "at": today.isoformat(),
+    }
+    if floor:
+        stanza["control"] = "<the external control that mitigates it>"
+    return stanza
+
+
+def build_verdict(state, store, base_keys, threshold_name, today, scope, head, base):
+    """The code verdict. Open blocking findings at HEAD, minus the ones a valid,
+    live, already-merged disposition clears."""
+    threshold = threshold_rank(threshold_name)
+    findings = [f for f in state["findings"] if scope in (None, f["source"])]
+    live, expired = [], []
+    for entry in store["entries"]:
+        until = parse_date(entry.get("expires")) if entry.get("expires") else None
+        (expired if until is not None and until < today else live).append(entry)
+
+    def introduced(entry):
+        return base_keys is None or entry_key(entry) not in base_keys
+
+    opened, cleared, pending, refused, advisory = [], [], [], [], 0
+    expired_hits = {}
+    status = {}
+    for finding in findings:
+        key = (finding["source"], finding["fingerprint"])
+        if not is_blocking(finding, threshold):
+            advisory += 1
+            status[key] = {"status": "advisory"}
+            continue
+        winner, added, refusals = None, [], []
+        for entry in live:
+            if not entry_matches(entry, finding):
+                continue
+            if not entry_can_clear(entry, finding):
+                refusals.append(entry)
+            elif introduced(entry):
+                added.append(entry)
+            elif winner is None:
+                winner = entry
+        for entry in expired:
+            if entry_matches(entry, finding) and entry_can_clear(entry, finding):
+                expired_hits[entry["id"]] = expired_hits.get(entry["id"], 0) + 1
+        if winner is not None:
+            cleared.append(dict(_public_finding(finding), entry=_public_entry(winner)))
+            status[key] = {"status": "cleared", "id": winner["id"], "kind": winner["kind"]}
+            continue
+        for entry in refusals:
+            refused.append(dict(_public_finding(finding), entry_id=entry["id"], kind=entry["kind"]))
+        for entry in added:
+            pending.append(dict(_public_finding(finding), entry_id=entry["id"]))
+        record = _public_finding(finding)
+        record["floor"] = is_floor(finding)
+        record["stanza"] = clearing_stanza(finding, today)
+        opened.append(record)
+        status[key] = {"status": "open"}
+    warnings = list(store["warnings"])
+    if base_keys is None and store["entries"]:
+        warnings.append("the base commit could not be resolved: every disposition entry is treated "
+                        "as added in this change and clears nothing")
+    return {
+        "verdict": "BLOCKED" if opened else "PASS",
+        "head": head,
+        "base": base,
+        "threshold": [name for name, rank in SEVERITY_RANKS.items() if rank == threshold][0],
+        "scope": scope or "head",
+        "total": len(findings),
+        "open": opened,
+        "cleared": cleared,
+        "advisory": advisory,
+        "pending_in_change": pending,
+        "refused": refused,
+        "expired": [dict(_public_entry(e), would_have_cleared=expired_hits.get(e["id"], 0))
+                    for e in expired],
+        "invalid": store["invalid"],
+        "warnings": warnings,
+        "runs": len(state["runs"]),
+        "_status": status,
+    }
+
+
+def render_verdict_text(verdict, caller):
+    """The verdict as the lines an operator or an agent reads. Every piece of
+    model- or operator-authored text goes through terminal_text."""
+    t = terminal_text
+    lines = []
+    head12 = (verdict["head"] or "")[:12]
+    if verdict["verdict"] == "BLOCKED":
+        lines.append("VERDICT: BLOCKED (%d open blocking finding(s) at HEAD %s)"
+                     % (len(verdict["open"]), head12))
+    else:
+        lines.append("VERDICT: PASS (no open blocking findings at HEAD %s)" % head12)
+    lines.append("findings at HEAD (%s): %d, open blocking: %d, cleared by dispositions: %d, "
+                 "advisory: %d, threshold: %s"
+                 % (verdict["scope"], verdict["total"], len(verdict["open"]),
+                    len(verdict["cleared"]), verdict["advisory"], verdict["threshold"]))
+    if verdict["open"]:
+        lines.append("Open blocking findings:")
+        for item in verdict["open"]:
+            lines.append("  [%s] [%s] %s:%s %s: %s (fingerprint %s)%s" % (
+                t(item["source"]), t(item["severity_claimed"] or item["severity"] or "unrated"),
+                t(item["file"]), t(item["line"]), t(item["category"]), t(item["message"], 300),
+                t(item["fingerprint"][:12]), "  [security floor]" if item["floor"] else ""))
+    if verdict["cleared"]:
+        lines.append("Cleared by dispositions (always listed):")
+        for item in verdict["cleared"]:
+            entry = item["entry"]
+            lines.append("  - %s [%s] %s by %s on %s: %s:%s %s -- %s" % (
+                t(entry["id"]), t(entry["kind"]), t(item["category"]), t(entry["by"]), t(entry["at"]),
+                t(item["file"]), t(item["line"]), t(item["message"], 200), t(entry["rationale"], 300)))
+    if verdict["pending_in_change"]:
+        count = len(set((p["source"], p["fingerprint"]) for p in verdict["pending_in_change"]))
+        lines.append("%d finding%s would be cleared by entries added in this PR. Entries added in "
+                     "the gated change do not clear that change's findings; they apply once they "
+                     "are on the base branch." % (count, "" if count == 1 else "s"))
+        for item in verdict["pending_in_change"]:
+            lines.append("  - entry %s would clear %s:%s %s" % (
+                t(item["entry_id"]), t(item["file"]), t(item["line"]), t(item["message"], 200)))
+    for item in verdict["refused"]:
+        lines.append("  - security-floor finding %s:%s %s cannot be cleared by entry %s (kind %s): "
+                     "fix it, or record kind mitigated naming the external control"
+                     % (t(item["file"]), t(item["line"]), t(item["message"], 200),
+                        t(item["entry_id"]), t(item["kind"])))
+    for entry in verdict["expired"]:
+        lines.append("Expired: entry %s (%s) expired on %s and no longer applies%s" % (
+            t(entry["id"]), t(entry["kind"]), t(entry.get("expires")),
+            "; it would have cleared %d finding(s)" % entry["would_have_cleared"]
+            if entry["would_have_cleared"] else ""))
+    for record in verdict["invalid"]:
+        lines.append("Invalid disposition ignored (%s, %s): %s" % (
+            t(record["source"]), t(record["id"]), "; ".join(record["errors"])))
+    for warning in verdict["warnings"]:
+        lines.append("note: " + t(warning, 400))
+    if verdict["open"]:
+        lines.append("To clear a finding, a reviewed change merged to the base branch must add an entry "
+                     "to %s. The exact stanza for each open finding (fill in the <placeholders>):"
+                     % DISPOSITIONS_REL)
+        for item in verdict["open"]:
+            lines.append(dumps(item["stanza"], indent=2))
+    if caller == "standalone":
+        lines.append("note: run outside 'gates'; this verdict does not count toward 'gates ship', "
+                     "which requires its own review run and ledger entry.")
+    return "\n".join(lines) + "\n"
+
+
+def cleared_summary(text):
+    """One line naming the dispositions a saved code verdict (the JSON that
+    evaluate --json-out writes) cleared findings by, for the audit trail.
+    Empty when nothing was cleared; raises ValueError for an unreadable one."""
+    document = json.loads(text)
+    cleared = document.get("cleared") if isinstance(document, dict) else None
+    if not isinstance(cleared, list):
+        raise ValueError("not a code verdict")
+    seen, parts = set(), []
+    for item in cleared:
+        entry = item.get("entry") if isinstance(item, dict) else None
+        if not isinstance(entry, dict) or entry.get("id") in seen:
+            continue
+        seen.add(entry.get("id"))
+        parts.append("%s %s by %s on %s" % (terminal_text(entry.get("id"), 80),
+                                            terminal_text(entry.get("kind"), 20),
+                                            terminal_text(entry.get("by"), 60),
+                                            terminal_text(entry.get("at"), 20)))
+    if not parts:
+        return ""
+    return terminal_text("%d finding(s) cleared by disposition: %s" % (len(cleared), "; ".join(parts)), 400)
+
+
+def sanitize_tree(value, limit=1000):
+    """Every string in a JSON value sanitized for a prompt."""
+    if isinstance(value, str):
+        return sanitize_text(value, limit)
+    if isinstance(value, list):
+        return [sanitize_tree(v, limit) for v in value]
+    if isinstance(value, dict):
+        return {str(k): sanitize_tree(v, limit) for k, v in value.items()}
+    return value
+
+
+def prompt_verdict(verdict):
+    """The part of the verdict a model may read: no stanzas, every string
+    sanitized, fenced by the caller."""
+    keep = ("verdict", "head", "threshold", "scope", "total", "advisory", "runs")
+    out = {key: verdict[key] for key in keep}
+    out["open"] = [{k: v for k, v in item.items() if k != "stanza"} for item in verdict["open"]]
+    out["cleared"] = verdict["cleared"]
+    out["pending_in_change"] = verdict["pending_in_change"]
+    out["refused"] = verdict["refused"]
+    out["expired"] = verdict["expired"]
+    out["invalid_entries"] = len(verdict["invalid"])
+    return sanitize_tree(out)
+
+
+def annotate_file(path, unified, verdict):
+    """Write each input finding's fingerprint and disposition status back into
+    PATH (an envelope object or a bare array), index-aligned with the input."""
+    document = load_json_file(path)
+    items = document.get("findings") if isinstance(document, dict) else document
+    if not isinstance(items, list) or len(items) != len(unified):
+        raise ValueError("cannot annotate %s: its findings do not match the evaluated input" % path)
+    for item, record in zip(items, unified):
+        if not isinstance(item, dict):
+            continue
+        item["fingerprint"] = record["fingerprint"]
+        found = verdict["_status"].get((record["source"], record["fingerprint"]))
+        if found:
+            item["disposition"] = {k: sanitize_text(str(v), 120) for k, v in found.items()}
+    write_file_atomic(path, dumps(document) + "\n")
+
+
+def attach_verdict(path, verdict):
+    """Splice the model-readable verdict into the JSON object at PATH."""
+    document = load_json_file(path)
+    if not isinstance(document, dict):
+        raise ValueError("cannot attach to %s: not a JSON object" % path)
+    shown = prompt_verdict(verdict)
+    document["code_verdict"] = shown
+    document["code_verdict_fenced"] = "===BEGIN CODE VERDICT DATA===\n%s\n===END CODE VERDICT DATA===" % (
+        dumps(shown, indent=2, sort_keys=True))
+    write_file_atomic(path, dumps(document) + "\n")
+
+
+def read_stdin_bounded():
+    data = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    if len(data) > MAX_INPUT_BYTES:
+        raise InputRefused("the input is larger than %d bytes" % MAX_INPUT_BYTES)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise InputRefused("the input is not valid UTF-8")
+
+
+def findings_from_text(text, fmt):
+    """The raw finding list in TEXT. JSON is an array, or an object whose
+    'findings' key holds one (a review envelope); an envelope marked degraded
+    is not a review. Markdown is the Auditor's report."""
+    if fmt == "markdown":
+        if not text.strip():
+            raise InputRefused("the report is empty")
+        return parse_adversarial_text(text)
+    try:
+        document = json.loads(text)
+    except ValueError as exc:
+        raise InputRefused("the input is not JSON: %s" % exc)
+    if isinstance(document, dict):
+        if document.get("degraded") is True or document.get("sanitize_failed") is True:
+            raise InputRefused("the envelope is marked degraded: it is not a review and holds no findings")
+        if "findings" not in document:
+            raise InputRefused("the input is an object without a 'findings' array")
+        document = document["findings"]
+    if not isinstance(document, list):
+        raise InputRefused("the findings are not an array")
+    return document
+
+
+def run_evaluate(args):
+    """The evaluate command. Returns (exit_status, text)."""
+    try:
+        root = os.path.realpath(args.root or os.getcwd())
+        if not os.path.isdir(root):
+            raise InputRefused("%s is not a directory" % root)
+        today = today_date(args.today)
+        gate = args.gate
+        if gate == "merge-gate" and not args.no_input:
+            raise InputRefused("the merge-gate reads the accumulated state and takes no input (--no-input)")
+        head = args.head or repo_head(root)
+        # A read-only verdict with no commit to accumulate against (the merge
+        # gate in a directory that is not a repository) has nothing open by
+        # construction; a run that brings findings still needs a HEAD to keep them.
+        headless = args.no_input and not head
+        if not headless and (not head or not re.fullmatch(r"[0-9a-f]{7,64}", head)):
+            raise InputRefused("%s is not a git repository with a commit; the accumulation is "
+                               "per HEAD and cannot be kept without one" % root)
+        threshold_name = args.threshold or os.environ.get("CLAGENTIC_BLOCK_SEVERITY") or "high"
+        incoming, unified = None, []
+        if not args.no_input:
+            incoming = findings_from_text(read_stdin_bounded(), args.format)
+            try:
+                unified = unify_findings(incoming, gate)
+            except ValueError as exc:
+                raise InputRefused(str(exc))
+        try:
+            if headless:
+                head = ""
+                state = fresh_state(head)
+            elif args.no_input:
+                state = load_state(root, head)
+            else:
+                with StateLock(root):
+                    state = load_state(root, head)
+                    accumulate(state, unified, gate, args.caller)
+                    save_state(root, state)
+        except StateError as exc:
+            raise InputRefused(str(exc))
+        except OSError as exc:
+            raise InputRefused("the findings state cannot be written: %s" % exc)
+        base = resolve_base(root, args.base, args.default_branch)
+        store = load_store(root, worktree_reader(root))
+        base_keys = introduced_entry_keys(root, base)
+        scope = gate if args.scope == "gate" and gate in SOURCES else None
+        verdict = build_verdict(state, store, base_keys, threshold_name, today, scope, head, base)
+        if args.annotate:
+            annotate_file(args.annotate, unified, verdict)
+        if args.attach_to:
+            attach_verdict(args.attach_to, verdict)
+        public = {k: v for k, v in verdict.items() if k != "_status"}
+        if args.json_out:
+            write_file_atomic(args.json_out, dumps(public) + "\n")
+    except InputRefused as exc:
+        return 2, "evaluate refused: %s\n" % exc
+    except (OSError, ValueError) as exc:
+        return 2, "evaluate failed closed: %s\n" % exc
+    text = dumps(public) + "\n" if args.json else render_verdict_text(verdict, args.caller)
+    return (1 if verdict["verdict"] == "BLOCKED" else 0), text
+
+
+# --------------------------------------------------------- dispositions lint
+
+def lint_dispositions(root, path=None):
+    """Validate the dispositions in force (or the one file PATH). Returns
+    (exit_code, lines): nonzero when any entry is invalid or a file is
+    unusable, with every reason; deprecations and expiries are reported but
+    are not problems."""
+    if path:
+        try:
+            text = read_text_bounded(path)
+        except (OSError, ValueError) as exc:
+            return 1, ["[gates/dispositions-lint] cannot read %s: %s" % (path, exc)]
+        rel = DISPOSITIONS_REL
+
+        def reader(wanted):
+            return text if wanted == rel else None
+        store = load_store(root, reader)
+    else:
+        store = load_store(root, worktree_reader(root))
+    today = today_date()
+    lines = []
+    for record in store["invalid"]:
+        lines.append("  - %s (%s): %s" % (record["id"], record["source"], "; ".join(record["errors"])))
+    code = 1 if store["invalid"] else 0
+    out = []
+    if code:
+        out.append("[gates/dispositions-lint] %d problem(s):" % len(store["invalid"]))
+        out.extend(lines)
+    else:
+        out.append("[gates/dispositions-lint] %d entries, no problems" % len(store["entries"]))
+    for entry in store["entries"]:
+        until = parse_date(entry.get("expires")) if entry.get("expires") else None
+        if until is not None and until < today:
+            out.append("[gates/dispositions-lint] entry %s expired on %s and no longer applies"
+                       % (entry["id"], entry["expires"]))
+    for warning in store["warnings"]:
+        out.append("[gates/dispositions-lint] note: " + terminal_text(warning, 400))
+    return code, out
+
+
+def migrate_dispositions(root, write):
+    """The dispositions file as it would read with every legacy entry folded
+    in. Returns (exit_code, text, lines): the new file's text, and the report.
+    Refuses to write over an existing file that has invalid entries."""
+    store = load_store(root, worktree_reader(root))
+    if any(rec["source"] == DISPOSITIONS_REL for rec in store["invalid"]):
+        return 1, "", ["[dispositions/migrate] %s has invalid entries; fix them first (dispositions lint)"
+                       % DISPOSITIONS_REL]
+    document = {"version": DISPOSITIONS_SCHEMA, "entries": store["entries"]}
+    text = dumps(document, indent=2) + "\n"
+    report = ["[dispositions/migrate] %d entries (%d legacy file(s) folded in)"
+              % (len(store["entries"]), len(store["legacy"]))]
+    for record in store["invalid"]:
+        report.append("[dispositions/migrate] not migrated: %s (%s): %s"
+                      % (record["id"], record["source"], "; ".join(record["errors"])))
+    for warning in store["warnings"]:
+        if not warning.startswith("DEPRECATED"):
+            report.append("[dispositions/migrate] " + terminal_text(warning, 400))
+    if write:
+        target = os.path.join(root, DISPOSITIONS_REL)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        write_file_atomic(target, text)
+        report.append("[dispositions/migrate] wrote %s; review it, commit it, then delete the legacy files"
+                      % DISPOSITIONS_REL)
+    return 0, text, report
 
 
 # ----------------------------------------------------------- verdict: blockers
@@ -973,13 +2095,11 @@ def count_blockers(path, threshold_name):
         return FAIL_CLOSED_BLOCKERS
 
 
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-
 def terminal_text(value, limit=None):
     """Model-authored text made safe to print on a terminal: every control
-    byte (escape sequences, newlines that could forge a second finding line)
-    becomes a space. The one helper every renderer uses for such text."""
+    byte (escape sequences, newlines that could forge a second finding line),
+    C1 control and bidirectional override becomes a space. The one helper every
+    renderer uses for such text."""
     text = _CONTROL_RE.sub(" ", "" if value is None else str(value))
     return text if limit is None else text[:limit]
 
@@ -1006,7 +2126,12 @@ def blocking_findings_listing(document_text, threshold_name):
         for finding in findings:
             if not isinstance(finding, dict):
                 return None
-            if counts_toward_verdict(finding, threshold):
+            # A finding the verdict recorded as cleared by a disposition is not
+            # one that blocked, so a refusal does not list it. This is display
+            # only: the count above never reads the annotation.
+            disposition = finding.get("disposition")
+            cleared = isinstance(disposition, dict) and disposition.get("status") == "cleared"
+            if counts_toward_verdict(finding, threshold) and not cleared:
                 line = finding.get("line") or 0
                 if not isinstance(line, (int, float)) or isinstance(line, bool):
                     line = _clean_listing(line)
@@ -1240,9 +2365,9 @@ def _class_named(finding):
 
 
 def render_review(path):
-    """Human-readable review. A demoted, deferral-matched or seen-before
-    finding gets a suffix saying why it did or did not gate, so a threshold
-    decision is never silent. Returns (exit_code, output_lines)."""
+    """Human-readable review. A cleared, repeated or seen-before finding gets a
+    suffix saying so, so a decision is never silent. Returns (exit_code,
+    output_lines)."""
     document = load_json_file(path)
     findings = document.get("findings")
     count = len(findings) if findings is not None else 0
@@ -1256,12 +2381,13 @@ def render_review(path):
             text = ("[" + _shown(finding.get("severity")) + "] " + _shown(finding.get("file"))
                     + ":" + terminal_text(_jq_tostring(finding.get("line"))) + " "
                     + _shown(finding.get("message")))
-            if finding.get("_recurrence_demoted") is True:
-                text += (" (reported " + terminal_text(_jq_tostring(finding.get("_recurrence_count")))
-                         + " rounds running — decide)")
-            if finding.get("_deferral_matched") is True:
-                deferral_id = finding.get("_deferral_id")
-                text += " (matched deferral " + (_shown(deferral_id) if deferral_id else "?") + ")"
+            count = finding.get("_recurrence_count")
+            if isinstance(count, int) and not isinstance(count, bool) and count > 1:
+                text += " (reported " + str(count) + " rounds running)"
+            disposition = finding.get("disposition")
+            if isinstance(disposition, dict) and disposition.get("status") == "cleared":
+                text += (" (cleared by disposition " + terminal_text(disposition.get("id"), 80)
+                         + " [" + terminal_text(disposition.get("kind"), 40) + "])")
             if finding.get("_seen_before") is True:
                 text += " (reported in a prior run; still counted)"
             if _class_named(finding):
@@ -1439,7 +2565,8 @@ def stale_report(summary_path):
             listed = "; ".join("%s:%s [%s] %s" % e for e in entries)
             names = ", ".join("%s:%s" % e[:2] for e in entries)
             text.append("the review at HEAD %s has unresolved blocking findings (%d): %s. Fix "
-                        "them (or record a deferral in .clagentic/deferrals.json) and commit; "
+                        "them (or have a reviewed disposition for them merged to the base "
+                        "branch, see .clagentic/dispositions.json) and commit; "
                         "running the review again at the same commit does not clear them."
                         % (short, len(entries), listed))
             audit.append("review blocked at HEAD [review_blocked_at_head]: %d unresolved "
@@ -1576,19 +2703,6 @@ def build_gate_summary(opts):
     if _flag(opts.adf_degraded):
         findings = []
         findings_fenced = json.loads(opts.adf_unavailable)
-    acks = []
-    if opts.acks:
-        try:
-            acks = load_json_file(opts.acks)
-        except (OSError, ValueError):
-            acks = []
-    accepted_risks = ""
-    if opts.accepted_risks:
-        try:
-            with open(opts.accepted_risks, encoding="utf-8") as handle:
-                accepted_risks = handle.read()
-        except (OSError, ValueError):
-            accepted_risks = ""
     return json.dumps({
         "review_fenced": review_fenced,
         "review_sha": opts.review_sha,
@@ -1604,11 +2718,8 @@ def build_gate_summary(opts):
         "resolved_change_class": resolved_class,
         "adversarial_downgraded_by_class_count": downgraded,
         "adversarial_findings_dropped_count": dropped,
-        "adversarial_acks": acks,
-        "accepted_risks": accepted_risks,
         "deterministic_gates": deterministic_gates,
         "deterministic_gates_fenced": deterministic_gates_fenced,
-        "introduces_ack_file": _flag(opts.introduces_ack),
         "threshold": opts.threshold,
     })
 
@@ -1779,15 +2890,8 @@ def cmd_dispositions_cross_round(args):
 
 
 def cmd_dispositions_recurrence(args):
-    demoted = recurrence_demote(args.file, args.diff, args.counts, args.threshold)
-    _print("none\n" if demoted is None else "demoted=%d\n" % demoted)
-    return 0
-
-
-def cmd_dispositions_deferrals(args):
-    path = args.deferrals or args.root + "/.clagentic/deferrals.json"
-    matched = deferral_match(args.file, path, args.root)
-    _print("none\n" if matched is None else "matched=%d\n" % matched)
+    counted = recurrence_count(args.file, args.diff, args.counts)
+    _print("none\n" if counted is None else "counted=%d\n" % counted)
     return 0
 
 
@@ -1805,9 +2909,34 @@ def cmd_dispositions_ledger_recurrence(args):
 
 
 def cmd_dispositions_lint(args):
-    code, lines = lint_deferrals(args.file)
+    code, lines = lint_dispositions(os.path.realpath(args.root or os.getcwd()), args.file or None)
     for line in lines:
         _print(line + "\n")
+    return code
+
+
+def cmd_dispositions_migrate(args):
+    root = os.path.realpath(args.root or os.getcwd())
+    try:
+        code, text, report = migrate_dispositions(root, args.write)
+    except OSError as exc:
+        warn("[dispositions/migrate] failed: %s" % exc)
+        return 1
+    for line in report:
+        warn(line)
+    if not args.write:
+        _print(text)
+    return code
+
+
+def cmd_evaluate(args):
+    code, text = run_evaluate(args)
+    # A refusal is an error message, not a verdict: it goes to stderr so a
+    # caller that discards stdout on a failed stage still shows the cause.
+    if code == 2:
+        sys.stderr.write(text)
+    else:
+        _print(text)
     return code
 
 
@@ -1893,6 +3022,15 @@ def cmd_render_review(args):
     for line in lines:
         _print(CLASS_FOOTER if line is None else line + "\n")
     return code
+
+
+def cmd_render_cleared_summary(args):
+    try:
+        _print(cleared_summary(read_stdin_text()))
+    except (ValueError, UnicodeDecodeError) as exc:
+        warn("[findings] cleared-summary: %s" % exc)
+        return 1
+    return 0
 
 
 def cmd_render_class_footer(args):
@@ -2017,14 +3155,27 @@ def build_parser():
     sub = op(dispositions, "recurrence", cmd_dispositions_recurrence, ("file", {}))
     sub.add_argument("--diff", required=True)
     sub.add_argument("--counts", required=True)
-    sub.add_argument("--threshold", type=int, required=True)
-    sub = op(dispositions, "deferrals", cmd_dispositions_deferrals, ("file", {}))
-    sub.add_argument("--root", required=True)
-    sub.add_argument("--deferrals", default="")
     sub = op(dispositions, "ledger-recurrence", cmd_dispositions_ledger_recurrence)
     sub.add_argument("--ledger", required=True)
     sub.add_argument("--branch", required=True)
-    op(dispositions, "lint", cmd_dispositions_lint, ("file", {}))
+    sub = op(dispositions, "lint", cmd_dispositions_lint)
+    sub.add_argument("file", nargs="?", default="")
+    sub.add_argument("--root", default="")
+    sub = op(dispositions, "migrate", cmd_dispositions_migrate)
+    sub.add_argument("--root", default="")
+    sub.add_argument("--write", action="store_true")
+
+    sub = stages.add_parser("evaluate")
+    sub.set_defaults(func=cmd_evaluate)
+    sub.add_argument("--gate", choices=("review", "adversarial", "merge-gate"), default="review")
+    sub.add_argument("--format", choices=("json", "markdown"), default="json")
+    sub.add_argument("--no-input", action="store_true")
+    sub.add_argument("--scope", choices=("head", "gate"), default="head")
+    sub.add_argument("--caller", choices=("standalone", "gates"), default="standalone")
+    sub.add_argument("--json", action="store_true")
+    for name in ("root", "head", "base", "default-branch", "threshold", "today",
+                 "annotate", "attach-to", "json-out"):
+        sub.add_argument("--" + name, default="")
 
     verdict = stages.add_parser("verdict").add_subparsers(dest="op", required=True)
     op(verdict, "blockers", cmd_verdict_blockers, ("file", {}), ("threshold", {}))
@@ -2050,6 +3201,7 @@ def build_parser():
     render = stages.add_parser("render").add_subparsers(dest="op", required=True)
     op(render, "review", cmd_render_review, ("file", {}))
     op(render, "class-footer", cmd_render_class_footer, ("file", {}))
+    op(render, "cleared-summary", cmd_render_cleared_summary)
     op(render, "verdict-lines", cmd_render_verdict_lines, ("head", {}))
     op(render, "sanitize-review", cmd_render_sanitize_review, ("file", {}))
     op(render, "sanitize-report", cmd_render_sanitize_report, ("file", {}))
@@ -2059,10 +3211,10 @@ def build_parser():
     op(render, "stale-report", cmd_render_stale_report, ("file", {}))
     sub = op(render, "gate-summary", cmd_render_gate_summary)
     sub.add_argument("--threshold", default="high")
-    for name in ("introduces-ack", "adversarial-missing", "adversarial-degraded",
+    for name in ("adversarial-missing", "adversarial-degraded",
                  "review-degraded", "adversarial-report-degraded", "adf-degraded"):
         sub.add_argument("--" + name, default="false")
-    for name in ("acks", "accepted-risks", "adf", "adf-meta", "review-fenced-file",
+    for name in ("adf", "adf-meta", "review-fenced-file",
                  "adversarial-fenced-file", "review-sha", "det-gates", "det-gates-fenced",
                  "review-unavailable", "adversarial-unavailable", "adf-unavailable"):
         sub.add_argument("--" + name, default="")

@@ -3,7 +3,7 @@
 # Blocks writes to the default branch, outside the repo, or to sensitive paths.
 # Exit 2 = block.
 #
-# managed-by: clagentic · clagentic-hooks-version: v5
+# managed-by: clagentic · clagentic-hooks-version: v6
 # Source of truth: share/hook-shims/pre-write-guard.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/pre-write-guard.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -183,6 +183,21 @@ case "$PATH_TARGET" in
   "$REPO_ROOT"|"$REPO_ROOT"/*) : ;;
   /*) block W-002 "write target outside repo root '$REPO_ROOT'" ;;
   *)  block W-002 "could not resolve write target against repo root '$REPO_ROOT'" ;;
+esac
+
+# W-007: the Builder role must not write the dispositions file. It is the
+# operator's record of what has been accepted, and the gate code clears
+# findings from it; a Builder that could write it could clear its own
+# findings. Placed ahead of W-003 so the refusal names the actual rule. The
+# role is read from agent_type (see the AGENT_TYPE capture above): a payload
+# whose agent_type names a builder is refused, whatever the exact namespace
+# ("clagentic-lite:builder" or "builder").
+case "$PATH_TARGET" in
+  */.clagentic/dispositions.json)
+    case "$AGENT_TYPE" in
+      *builder*) block W-007 "the Builder role must not write .clagentic/dispositions.json; print the gate's stanza for the operator to commit instead" ;;
+    esac
+    ;;
 esac
 
 # W-003: writes to sensitive paths

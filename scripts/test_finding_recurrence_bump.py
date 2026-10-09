@@ -194,6 +194,29 @@ class TestFindingRecurrenceBump(unittest.TestCase):
         self.assertEqual(fields[2], "correctness")
         self.assertEqual(fields[3], "null pointer dereference")
 
+    def test_a_round_larger_than_one_argv_string_persists_its_counts(self):
+        """One argv string over the kernel's MAX_ARG_STRLEN (128 KiB) fails
+        exec, so a round's rows must reach the pipeline on stdin. A regression
+        to argv passing makes the pipeline stage fail, the shell wrapper fall
+        back to 'every row gets count 1', and nothing reach the counts file:
+        this feeds a round well over 128 KiB and asserts the counts persisted
+        and a second round counts 2."""
+        message = "m" * 90
+        rows = "\n".join(_tsv_row("key%05d" % i, fname="f%d.py" % i, message=message)
+                         for i in range(2000)) + "\n"
+        self.assertGreater(len(rows.encode("utf-8")), 128 * 1024)
+        out, err, rc = self._bump(rows)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len([l for l in out.split("\n") if l]), 2000)
+        with open(self.counts_path) as f:
+            counts = json.load(f)
+        self.assertEqual(len(counts), 2000, "the counts of a round over 128 KiB were not persisted")
+        self.assertTrue(all(v == 1 for v in counts.values()))
+        out2, err2, rc2 = self._bump(rows)
+        self.assertEqual(rc2, 0, err2)
+        self.assertTrue(all(l.split("\t")[4] == "2" for l in out2.split("\n") if l),
+                        "a second round over 128 KiB must count 2 for every key")
+
 
 if __name__ == "__main__":
     unittest.main()

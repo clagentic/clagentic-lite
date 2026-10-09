@@ -62,14 +62,15 @@ Write rules (`pre-write-guard.sh`; the blocking rules exit 2, the two warn-only 
 | W-004 | No writes to files matching `*.pem`, `*id_rsa*`, `*.key` | none |
 | W-005 | Warn only: editing `CLAUDE.md`, `.claude/settings.json`, `.claude/settings.local.json`, `.claude/hooks/*.sh`, or an MCP config mid-session invalidates Claude's prompt cache | none needed (does not block) |
 | W-006 | Warn only: a Write/Edit made by the main session rather than a dispatched subagent (no `agent_type` in the hook payload); prompts delegating code changes to the Builder | none needed (does not block) |
+| W-007 | The Builder role (an `agent_type` naming a builder) must not write `.clagentic/dispositions.json`: it is the operator's record of what was accepted, and gate code clears findings from it. Checked ahead of W-003 so the refusal names the rule | none for the Builder — print the gate's stanza for the operator to commit |
 
 ## Gate 3 — Cross-CLI review
 
 | | |
 |---|---|
-| **Fires** | `clagentic-lite gates review` (or the subagent, which routes through `scripts/gates.sh review` — never bypassed); optional pre-push hook (`CLAGENTIC_REVIEW_ON_PUSH=1`) |
-| **Tool** | `scripts/gates.sh review` → `scripts/llm-client.sh review` |
-| **Blocks?** | (a) Findings ≥ `${CLAGENTIC_BLOCK_SEVERITY}` block `gates ship`; (b) degraded envelopes (every Reviewer chain step failed) block; (c) unparseable JSON blocks (sentinel value 99). |
+| **Fires** | `clagentic-lite gates review`; optional pre-push hook (`CLAGENTIC_REVIEW_ON_PUSH=1`). The Reviewer subagent is a separate path: it does **not** run `gates.sh review`. It reasons from its own prompt and pipes its findings through the bundled `bin/findings.py evaluate` (see "Standalone agents" under "The finding pipeline"); that run records no ledger entry and never satisfies `gates ship`. |
+| **Tool** | `scripts/gates.sh review` → `scripts/llm-client.sh review` → `findings.py evaluate` |
+| **Blocks?** | (a) Open blocking findings at this HEAD (the accumulated set, minus findings a merged disposition clears — see "The code verdict") block `gates ship`; (b) degraded envelopes (every Reviewer chain step failed) block; (c) unparseable JSON, or a verdict that could not be computed, blocks (sentinel value 99). |
 | **Default severity** | `high` |
 | **Per-call timeout** | `${CLAGENTIC_LLM_TIMEOUT_SEC}` seconds (default 180). Hung CLI → step failure → chain advances. |
 | **Required-role enforcement** | `CLAGENTIC_REVIEWER_REQUIRED=1` makes a full-chain failure a hard gate error (non-zero exit) instead of a degraded envelope. Use when the cross-vendor property is non-negotiable and a same-vendor fallback must be a visible failure rather than a silent degradation. Applies to any role: `CLAGENTIC_<ROLE>_REQUIRED=1`. |
@@ -137,326 +138,127 @@ installed codex predates `CODEX_MIN_VERSION` (the tool-restriction flags are
 only applied on codex's version-gated, confirmed flag-surface path) —
 `walk_chain` prints a loud stderr warning in either remaining case.
 
-### Reviewer-consulted deferrals
+### The code verdict
 
-When an operator has reviewed a finding and decided to defer it — because it is
-a known fixture, an intentional design choice, or a false positive they have
-accepted — they can record that decision in `.clagentic/deferrals.json`. The
-file is read at review time and injected into the reviewer system prompt as
-context before the diff is reviewed, AND (lr-2ebc41, see "Gate-code
-enforcement" below) is mechanically re-checked in gate code after the
-Reviewer responds, independent of whether the model chose to honor it.
+Whether findings block is decided in code, never by a model. Every review run,
+every adversarial run and every standalone agent run at a commit adds its
+findings to one accumulated set for that HEAD; the verdict is the open
+blocking findings in that set, minus the ones a valid, already-merged
+disposition clears.
 
-**File location:** `.clagentic/deferrals.json` in the enrolled repo. The
-`.clagentic/` directory is gitignored by the gate orchestrator, so this file is
-local state — it is not committed. Do not commit deferrals to version control;
-use `.clagentic/adversarial-acks.json` or `.clagentic/accepted-risks.md` for
-committed, audited suppression.
+**One finding schema.** Review findings (JSON) and adversarial findings
+(markdown `[FINDING]` headers) are reduced by `findings.py evaluate` to one
+record: `source` (`review` or `adversarial`), `file`, `line`, `category` (a CWE
+or rule class), `message`, `evidence`, `reachable` (`yes|no|unknown`), `class`
+(`durable|ephemeral`), `severity_claimed` (the model's own value, display
+only), `severity` (that value as a known rank, or `unknown` when it is not
+one), `tier` (adversarial only), and the pipeline-added `fingerprint` and
+`disposition`. The record is rebuilt field by field: a `fingerprint`,
+`disposition` or any other key a model wrote is not carried over.
 
-**Schema (JSON array):**
+**What blocks.** A review finding blocks when its severity meets
+`CLAGENTIC_BLOCK_SEVERITY` (default `high`); a severity that is not one of
+`low`/`medium`/`high`/`critical` once stripped and lower-cased (`blocker`,
+`crit`, a number) cannot be ranked and blocks. An adversarial finding blocks
+by its tier: `reachable: yes` at `high` or above is always `blocking`
+(the security floor), anything not reachable is `advisory`, and in between the
+model's own tier stands. Severity is still the model's claim in this version;
+a later change replaces the claim with a rubric.
+
+**Accumulation.** The state is `.clagentic/lite/findings-state.json`
+(gitignored, created on demand, owned by `findings.py`, so it works in a
+repository that was never enrolled). A finding found at a commit stays open
+until the commit changes or a disposition clears it; a re-run can only add. A
+new HEAD starts fresh. Two reports are one finding when they share a
+fingerprint (source, normalized file, category and message) or a source, file,
+line and category; the stronger reading of severity, reachability and tier
+wins. A state file that exists but cannot be read is an error (exit 2), never
+an empty list. Because the accumulation is per commit, an uncommitted fix does
+not clear a finding: commit it (a new HEAD) or record a disposition.
+
+**Who runs it.** `scripts/gates.sh` calls `findings.py evaluate` from
+`cmd_review` (scope: the review gate's own findings; the exit status decides
+pass or block, and the ledger records that verdict), from `cmd_adversarial`
+(records the findings; the audit stays non-blocking) and from `cmd_merge_gate`
+(scope: every gate at this HEAD). `clagentic-lite gates evaluate` is the same
+command; the Reviewer and Auditor agents call the bundled file directly. Exit
+status: `0` PASS, `1` BLOCKED, `2` the input was refused or no verdict could be
+computed (malformed or oversized JSON, a degraded envelope, a non-object
+finding, not a git repository with a commit, an unreadable state) — never read
+as a pass.
+
+### Dispositions (`.clagentic/dispositions.json`)
+
+One committed file records what the operator decided about a class of
+findings. It replaces `deferrals.json`, `adversarial-acks.json`,
+`accepted-risks.md` and recurrence demotion. It is matched in code. Example
+with every field: `share/dispositions.example.json`.
 
 ```json
-[
-  {
-    "id": "def-001",
-    "category": "sql",
-    "file": "scripts/seed-demo.sh",
-    "message": "hardcoded credential in seed-demo.sh",
-    "description": "Planted demo credential — intentional fixture, not production code.",
-    "expires": "2026-12-31",
-    "acknowledged_by": "maintainer",
-    "scope": "stable-contract",
-    "file_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-  }
-]
+{"version": 1, "entries": [
+  {"id": "seed-fixture-credential", "gates": ["review"],
+   "match": {"path_glob": "scripts/seed-demo.sh", "category": "security",
+             "message": "hardcoded credential in seed-demo.sh"},
+   "kind": "by_design", "rationale": "Planted demo credential, never deployed.",
+   "by": "maintainer", "at": "2026-10-09", "expires": "2027-04-09"}
+]}
 ```
 
-Fields:
-
-| Field | Required | Description |
+| Field | Required | Meaning |
 |---|---|---|
-| `id` | yes | Stable identifier for the deferral |
-| `category` | no | Finding category this deferral applies to |
-| `file` | no (yes for gate-code matching) | Exact path this deferral applies to |
-| `message` | no (yes for gate-code matching) | The Reviewer finding's own `message` text, VERBATIM — this is the gate-code match key, see below |
-| `description` | yes | Human-readable reason for the deferral |
-| `expires` | no | ISO date after which the deferral should be reconsidered |
-| `acknowledged_by` | no | Who approved the deferral |
-| `scope` | no (yes for gate-code matching) | Must be the literal string `"stable-contract"` to be gate-code-eligible at all — see "Gate-code enforcement" below. Any other value (or absent) means the entry is prompt-context-only, exactly as this feature behaved before lr-2ebc41. |
-| `file_sha256` | no (yes when `scope` is `"stable-contract"`) | sha256 (64 lowercase hex chars) of `file`'s content at the moment the deferral was granted. Gate code recomputes this at match time; any difference lapses the match. |
+| `id` | yes | Unique; the first entry with an id wins. |
+| `gates` | yes | Non-empty list of `review` / `adversarial`: the finding sources it applies to. |
+| `match.path_glob` | yes | Glob over the finding's normalized file, matched segment by segment: `*` and `?` stay within one path segment, a segment that is exactly `**` matches any number of segments (`src/**`, `**/gen/*.py`), `\` escapes the next character. `src/../x` is normalized before matching. Matching is linear-time, never a backtracking regex. |
+| `match.category` | yes | The finding's category, case-insensitive; `*` for any. A catch-all (`**` and `*`, no hint, no message) is invalid. |
+| `match.fingerprint_hint` | no | Lowercase hex prefix (8 to 64) of the finding's `fingerprint`; the exact stanza printed on a block carries one. |
+| `match.message` | no | The finding's message, whitespace- and case-normalized; used by migrated deferrals. |
+| `kind` | yes | `by_design`, `false_positive`, `accepted_risk` or `mitigated`. |
+| `rationale`, `by`, `at` | yes | Why, who, and the date (`YYYY-MM-DD`). Text still in `<angle-bracket placeholder>` form is invalid. |
+| `control` | for `mitigated` | The external control that mitigates it. |
+| `expires` | no | Last day the entry applies (`YYYY-MM-DD`). After it the entry stops applying and is reported. |
 
-lr-c567's original six fields (`id`/`category`/`file`/`description`/
-`expires`/`acknowledged_by`) remain valid on their own — a deferral with only
-those fields is a pure prompt-context hint, unchanged from before lr-2ebc41:
-the model weighs it, nothing mechanically enforces it, and it is never
-gate-code-matched. `message`/`scope`/`file_sha256` are additive fields that
-opt a specific entry into the stricter, mechanically-enforced path described
-next.
+**Guardrails.**
 
-**Suppression is inside model judgment for entries without `scope:
-"stable-contract"`; it is ALSO inside gate code for entries with it
-(lr-2ebc41 — see "Gate-code enforcement" below, reversal of lr-c567's
-original design).** All deferral fields still reach the reviewer system
-prompt as claims to weigh regardless of scope (see "Round-trip sanitization
-and fencing" below for how the transport is hardened — the round-trip
-mechanics are unchanged). A finding the LLM still emits despite a
-non-gate-code-eligible deferral entry stands, exactly as before. A finding
-that mechanically matches a live `stable-contract` entry is excluded from
-`severity_blockers()`'s count regardless of whether the model itself also
-honored the deferral — see below.
+1. An entry added or changed in the change being gated does not clear that
+   change's findings. "Added or changed" is measured against the merge base
+   (`--base`, else the merge base of HEAD with `origin/<default>` or
+   `<default>`): an entry whose exact content the base commit did not have, or
+   any entry when the base cannot be resolved. The output says `N findings
+   would be cleared by entries added in this PR`. Land the disposition in its
+   own reviewed change first.
+2. A security-floor finding (`reachable: yes` at `high` or above) is not
+   cleared by `by_design`, `false_positive` or `accepted_risk`: only by a fix,
+   or by `kind: mitigated` naming the control. The output says which entry was
+   refused and why.
+3. `rationale`, `by` and `at` are required; an entry that fails validation is
+   ignored, loudly, and the rest still apply. A file that cannot be parsed
+   applies nothing. A symlink out of the repository is an error.
+4. The Builder role cannot write the file: `pre-write-guard` rule W-007.
+5. Cleared findings are always printed, with the entry's id, kind, who, when
+   and rationale; the merge gate records them in the audit trail from the
+   verdict.
 
-**`expires` field semantics:** the gate does not parse or compute expiry dates.
-The expiry text is passed to the LLM (sanitized, see below) so the model can
-reason about whether the deferral is still valid given the current context.
-The gate has no date arithmetic. This is unchanged by lr-2ebc41's gate-code
-path — `expires` is not part of the mechanical match or lapse conditions;
-`file_sha256` freshness is the sole gate-code lapse mechanism (see below).
+**What a block prints.** For each open finding, the exact stanza that would
+clear it (`by_design`, or `mitigated` with a `control` for a floor finding), its
+judgment fields left as `<placeholders>` the validator refuses, so a stanza
+pasted in unedited clears nothing. `clagentic-lite gates dispositions-lint`
+validates the file (every problem, nonzero exit); there is deliberately no
+`gates defer` writer.
 
-### Gate-code deferral enforcement (lr-2ebc41)
-
-**This reverses lr-c567's original "suppression happens inside the LLM's
-judgment ... NOT in gate plumbing computing a score and dropping rows"
-decision, on purpose, for one narrow class of deferral.** Field evidence: on
-a real multi-round run, a single stage-contract finding, accepted with a
-stable documented rationale in round 2, was re-raised by the stateless
-Reviewer in rounds 3, 5, 6 (twice), and 7 — six identical rulings on the
-same accepted finding, because nothing mechanically excluded it once
-accepted; the Reviewer was only ever *asked* to honor the deferral, never
-*required* to. This is the same move this repo has already made twice
-elsewhere for the identical reason: `_parse_adversarial_findings`
-force-corrects a finding's tier in the parser rather than trusting the
-model to set it correctly, and the lr-66e598 close comment records the
-general lesson — "overwrite-on-match is not own-the-field." Deterministic
-enforcement of a model-visible hint is the pattern this codebase has
-converged on twice before lr-2ebc41 made it three.
-
-**What changed, precisely:** a review finding whose `(file, category,
-message)` triple exactly matches a `.clagentic/deferrals.json` entry with
-`scope: "stable-contract"`, AND whose named `file`'s current sha256 exactly
-equals that entry's `file_sha256`, is annotated on the finding object with
-`_deferral_matched: true` and `_deferral_id: "<id>"` by
-`_review_deferral_match` (`scripts/gates.sh`), which runs immediately after
-cross-round dedup and recurrence demotion in `cmd_review`. `severity_blockers()`
-(`scripts/gates.sh`) excludes `_deferral_matched` findings from its block
-count — **threshold only, never suppression**, the identical posture
-`_recurrence_demoted` already established (lr-66e598): the finding remains
-in `.findings`, fully visible in `last-review.json`, in
-`cmd_render_review`'s terminal output (rendered with a `(matched deferral
-<id>)` suffix), and in the audit trail (`gate_runs`, `gate=review-deferral-match`)
-— only its eligibility to gate `gates ship` changes. Model compliance with the
-deferral (skipping the finding in its own output) is unaffected by, and
-independent of, this mechanism; either or both can suppress the same
-finding from blocking.
-
-**Match key.** Deliberately NOT `finding_content_keys`' sha256-of-a-±2-line
-diff-context-window key (`scripts/review-merge.sh`) — that key is
-*computed from the lines surrounding the finding*, so an incidental,
-unrelated edit two lines away changes the key and silently breaks the
-match; this is precisely why the original recurrence-only mechanism did not
-catch the six-re-raise case. The key here is the `(file, category,
-message)` triple instead — the same triple `_review_recurrence_demote`
-already uses internally to join a bumped recurrence count back to a
-finding object. It survives incidental line-number drift by construction
-(it never mentions a line number), which is the stability property this
-needs. What it deliberately does **not** distinguish: two genuinely
-different findings that happen to share `file`+`category`+`message` text —
-extremely unlikely for anything but a fixed boilerplate lint message, and
-even then `file` still disambiguates most cases. A finding whose message
-text itself changes between rounds is treated as a NEW finding and
-correctly fails to match — this key does not attempt fuzzy or semantic
-sameness (explicitly out of scope; see "Explicitly out of scope" below).
-
-**Lapse (freshness).** A `(file, category, message)` triple match alone is
-NOT sensitive to the deferred logic changing — a deferral granted against
-one round's behavior in a file would keep matching every later round even
-after that file's logic was rewritten, if the triple were the only check.
-`file_sha256`, pinned to the named file's content at grant time and
-recomputed at match time, closes that gap for the case where the
-deferral's own validity depends only on its own file: any edit anywhere in
-that file, not just near the finding's own line, lapses the match back to
-blocking. This correctly handles a *stable-contract* acceptance (one whose
-rationale is "this holds as long as this file's own contract holds") but is
-a **deliberate, documented restriction**, not a general mechanism: it
-cannot detect a dependency living in a *different* file or region than the
-one the deferral names.
-
-**What this deliberately does not support, and why (the `:139`-class
-problem).** Some accepted findings are not stable-contract acceptances at
-all — they are reasoned *scope boundaries* whose validity depends on code
-living *elsewhere*. Example (field evidence): a finding that a gate
-intentionally does not scan a certain repo shape, accepted with the
-rationale "including them would make an unrelated reset routine clobber
-another scanner's findings, a data-loss bug — that clobber risk is why the
-scope is deliberately narrow." That deferral's truth depends on the reset
-routine staying narrow, and the reset routine lives in a *different file*
-than the finding itself. A single-file content hash cannot see that
-dependency: the named file could stay byte-identical while the real
-dependency changes elsewhere, silently leaving a stale deferral in place
-exactly when it would matter most. Rather than build a mechanism that
-silently mishandles this class (or a general cross-file dependency-graph
-mechanism, which is a materially larger and riskier feature than this task
-scoped), lr-2ebc41 chose a **deliberate, documented restriction**: only
-`scope: "stable-contract"` entries are gate-code-eligible; anything whose
-acceptance rationale depends on code outside its own named file must NOT
-declare that scope. `scripts/gates.sh deferrals-lint` (see below) refuses,
-loudly, at capture time, any entry claiming `stable-contract` scope without
-the fields gate-code matching requires — the goal is that a conditional
-acceptance is either declared correctly (no `scope`, prompt-context-only,
-unchanged from pre-lr-2ebc41 behavior) or rejected outright, never silently
-accepted and mis-honored.
-
-**Fail-closed (the property that matters most).** Any of the following
-retains a finding as blocking, exactly as if no deferral existed at all: no
-`.clagentic/deferrals.json`, or it is empty/malformed; a `deferrals.json`
-entry missing `id`/`file`/`message`; a `stable-contract`-scoped entry
-missing or with a malformed `file_sha256`; the named file missing from disk
-or unreadable; no sha256 tool available; no `python3` available (the splice
-step needs a real JSON encoder/decoder, matching `_review_recurrence_demote`'s
-own python3-only posture); and — the ambiguous case — more than one live
-(hash-matching) deferral entry independently claiming the same `(file,
-category, message)` triple. Over-matching is the dangerous direction (a
-deferral bug silencing a real high/critical finding); under-matching only
-costs an operator a redundant re-report, never a missed real issue. "Wrong
-suppressions are worse than missed dedups" (above) is the same governing
-principle applied here.
-
-**Capture-time linting: `clagentic-lite gates deferrals-lint [FILE]`.**
-Validates `.clagentic/deferrals.json` (or `FILE`) against the stricter
-gate-code schema and exits non-zero with one specific reason per problem on
-stderr — most importantly, it refuses any entry that declares `scope:
-"stable-contract"` without the fields required to make that scope
-meaningful (`id`/`file`/`message`/`file_sha256`), which is the mechanical
-half of "reject a conditional acceptance loudly at capture time" (the
-prose half — recognizing that an acceptance's rationale is conditional on
-code elsewhere — is not something shell code can verify and remains the
-capturing agent's judgment call; see `plugins/clagentic-lite/agents/builder.md`
-"Capturing an accepted review finding"). This is a **lint gate, not a
-generator** — it does not write, create, or compute anything, including
-`file_sha256` itself (the capturing agent computes that from the same file
-it is deferring, in the same edit that adds the entry — see "Why there is
-no `defer` writer subcommand" below). It is not wired into `gates ship`'s
-blocking sequence; it is meant to be run by the capturing agent (or a
-commit hook, at the operator's option) immediately after writing an entry,
-so a malformed grant is caught in the same turn it was written rather than
-discovered rounds later when it silently never matches.
-
-**Why there is no `gates defer` (or similar) writer subcommand.** This was
-evaluated and deliberately rejected. The task's own framing: "capture must
-be a byproduct of the acceptance, not a separate act — if accepting a
-finding is one step and recording it is another, the second step is the
-one that gets skipped, and that is precisely the observed six-re-raise
-failure. A `defer` subcommand the operator must remember to run is the same
-failure mode with a shorter path, not a fix." There is also no interactive
-prompt loop anywhere in this codebase's review path (`cmd_review` /
-`cmd_render_review` are pure batch CLI — see their own code) for a
-subcommand to hook into as a true byproduct of the act of accepting; the
-actual acceptance happens in a Claude Code conversation between the
-operator and the Builder (or the operator directly), entirely outside any
-process boundary `gates.sh` can observe. The closest thing this codebase
-already has to "capture a verbal acceptance as a byproduct of the same
-turn" is the Builder's existing tech-debt-trailer convention (`builder.md`
-§ "When these principles conflict with the user's request," step 3: "If
-the user explicitly accepts the shortcut, note it in the commit message ...
-so it is findable later") — lr-2ebc41 extends that exact pattern to review
-findings: the Builder writes the deferral entry in the same turn it acts on
-the operator's acceptance, not as a queued follow-up. This is honestly
-still "ask an LLM to write something down," which is the thing the task
-explicitly wants to move away from — but it is the most deterministic
-capture point that exists given no mechanically-observable acceptance
-event exists in this codebase's architecture. The mechanism this task
-requires to be genuinely deterministic is Half 2 (gate-code matching,
-above): whether or not capture happens reliably, a well-formed entry is
-enforced by shell code, not by asking the Reviewer to comply.
-
-**Fail-open:** if `.clagentic/deferrals.json` is absent or empty, the review
-runs as if no deferrals exist. The gate never blocks on a missing deferrals
-file. Non-empty content that is not a valid JSON array (malformed) is still
-surfaced to the Reviewer — fail-open on *whether deferrals apply*, not on
-*whether the file gets read* — but is no longer injected completely as-is
-(see "Round-trip sanitization" below): it goes through a best-effort
-text-level sanitize pass and the LLM will ignore text it cannot interpret
-as a deferral list.
-
-**Round-trip sanitization and fencing (lr-4f8316 follow-up, hardened in a
-second follow-up pass).** `.clagentic/deferrals.json` is gitignored, but
-gitignored means *untracked and unreviewed*, not *write-restricted* — it is
-not an enforced property, it is an assumption. Any process with filesystem
-write access to the working tree (a compromised dependency, a build step,
-an agent with Write access) can populate this file, and because the
-content never appears in a diff, it is never code-reviewed — weaker
-provenance than the change-class commit-message hint (which at least
-travels through git history), not stronger. Deferrals also carry the
-highest payoff of any prompt-interpolation site in this codebase: a
-deferral literally suppresses a finding, so a forged or injected entry
-does not just confuse the Reviewer, it can silence it.
-
-`ds_review_prompt` (`scripts/llm-client.sh`) runs a two-stage pipeline, in
-this order:
-
-1. **Allowlist** — `_llm_json_array_allowlist_fields` (`scripts/platform.sh`)
-   reduces every deferral object to ONLY the nine documented schema fields
-   (`id`/`category`/`file`/`message`/`description`/`expires`/`acknowledged_by`/
-   `scope`/`file_sha256`, extended from the original six by lr-2ebc41).
-   Any other key is DROPPED entirely, not sanitized-and-kept — an
-   unrecognized key has no defined meaning to the Reviewer. A known field
-   name holding a non-string value (a nested object or array) is also
-   dropped, not stringified: the schema defines every field as plain
-   text, so a nested structure under a real key name has no defined
-   meaning either, and passing it through would smuggle attacker content
-   one level deep past a sanitizer that inspects a field as flat text. The
-   helper is fail-closed: on any failure (non-array input, no JSON tool, a
-   tool error, a temp file that cannot be created, an empty result) it returns
-   1 with no output, never its input, so the deferrals are omitted (with an
-   explicit "Deferrals unavailable" line) and an attacker-added key cannot
-   reach the prompt through a failed reduction.
-2. **Sanitize** — only after every surviving field is a known, schema-legal
-   string does `_llm_json_array_sanitize_fields_strict` (the same shared
-   decompose/sanitize/rebuild machinery `_sanitize_adversarial_findings_json`,
-   `scripts/gates.sh`, uses for the adversarial findings sidecar) run
-   `_llm_field_sanitize` over each one.
-
-**Why the allowlist step exists as a separate function, not a change to the
-sanitize step's contract:** `_llm_json_array_sanitize_fields_strict` sanitizes
-only the fields it is told to and passes every other key through
-unchanged — safe for the adversarial-findings caller (its field set is
-fixed by `_parse_adversarial_findings`' own regex capture groups; an
-attacker cannot introduce a key at all) but unsafe for deferrals, which
-reads an arbitrary JSON object off disk. The first version of this fix
-sanitized only the six original named fields without first reducing the
-object to that schema — any extra key an attacker added rode through
-byte-identical, undefanged, unstripped, uncapped. The allowlist step closes
-that gap by running BEFORE sanitization, so there is no unlisted field left
-for the sanitizer to have skipped, and the same discipline extends to the
-three fields lr-2ebc41 added (`message`/`scope`/`file_sha256`) — they are
-allowlisted and sanitized exactly like the original six, whether or not
-they end up mechanically matched by gate code.
-
-The result is wrapped in a `===BEGIN/END DEFERRED FINDINGS DATA===` fence
-with the same treat-as-data framing the invariants and change-class-hint
-blocks use. If the content is not valid JSON (so there is no object to
-decompose), the whole blob still goes through one `_llm_field_sanitize`
-pass — control bytes stripped, forged fence labels defanged — rather than
-being interpolated completely raw. This non-JSON fallback path is not
-weaker than the field-level path: both call the same sanitizer with the
-same defang list, and the whole-blob cap (`CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS`,
-default 500 chars) is stricter in aggregate than the field-level path's
-per-field cap applied across up to six fields per entry. Deliberately
-malforming the file to route onto this path trades structured deferral
-data for shorter, opaquely-sanitized text — never a downgrade in defang
-coverage.
-
-**Deferrals vs. `accepted-risks.md`:**
-
-| Mechanism | Location | Read by | Suppression path |
-|---|---|---|---|
-| `deferrals.json`, no `scope` or `scope` != `"stable-contract"` | `.clagentic/deferrals.json` (gitignored) | Gate 3 reviewer prompt | LLM judgment only |
-| `deferrals.json`, `scope: "stable-contract"` | `.clagentic/deferrals.json` (gitignored) | Gate 3 reviewer prompt AND `severity_blockers()` gate code | LLM judgment (advisory) AND mechanical file-hash match (authoritative — see "Gate-code deferral enforcement" above) |
-| `accepted-risks.md` | `.clagentic/accepted-risks.md` (committed) | Gate 6 merge-gate | Gate plumbing reads the doc; merge-gate LLM classifies covered findings as acknowledged |
-
-Use deferrals for local, ephemeral, or per-session suppression guidance —
-`scope: "stable-contract"` entries additionally get mechanical enforcement
-independent of model compliance. Use `accepted-risks.md` for committed,
-audited architectural decisions that persist in the repo history.
+**Legacy files, for one more release.** `.clagentic/deferrals.json` (entries
+with `scope: "stable-contract"` and a matching `file_sha256`; they lapse when
+the file's content changes, as before), `.clagentic/adversarial-acks.json` and
+`.clagentic/accepted-risks.md` are still read, converted to the same entries
+and warned about. Differences that follow from the guardrails: a converted
+entry is `accepted_risk`, so it no longer clears a floor finding (an old ack
+could clear a reachable high-severity finding); `accepted-risks.md` is freetext
+that only the merge-gate model ever read and clears nothing; deferrals without
+`stable-contract` scope were prompt hints and are not migrated. Move them with
+`python3 plugins/clagentic-lite/bin/findings.py dispositions migrate --root .
+--write`, review and commit the result, then delete the old files.
+`deferrals.json` is also still shown to the Reviewer as prompt context
+(allowlisted, sanitized and fenced as data by `ds_review_prompt`); that text
+carries no authority.
 
 ### Cross-round finding dedup (opt-in)
 
@@ -465,53 +267,38 @@ audited architectural decisions that persist in the repo history.
 | **Feature flag** | `CLAGENTIC_CROSS_ROUND_DEDUP` (default: `1` — on; set `=0` to opt out) |
 | **Seen-keys file** | `.clagentic/lite/review-seen-keys` (gitignored, local gate state) |
 | **Key strategy** | `content-hash`: sha256 of a 5-line `+`-line context window around the finding from the diff. Survives line shifts (a line that moves without changing its content has the same key). If the window cannot be computed (no sha256 tool, no diff file), the finding is retained conservatively — wrong suppressions are worse than missed dedups. |
-| **Effect** | **Annotate, never drop.** A finding reported in a prior round on lines the diff shows unchanged since stays in `.findings`, marked `_seen_before: true` (with `_seen_key`, the prior key). `severity_blockers()` counts it like any other finding, so the verdict never depends on how many times the review has run: block at a HEAD, re-run at the same HEAD, and the gate blocks again. Dropping seen findings used to make that second run pass, because it forgot what the first run found. The only exclusions left are the ones with their own annotation and provenance (`_deferral_matched`, `_recurrence_demoted`). Two identical keys inside one response still collapse to one finding (higher severity wins). `cmd_render_review` suffixes a seen finding with `(reported in a prior run; still counted)`; the operator sees `[dedup] N finding(s) seen in prior run(s) kept and still counted toward the verdict`, and a `gate_runs` audit row (`gate=review-dedup`) records `collapsed:N/total:M seen_before:K mode:annotate`. |
-| **Recurrence interaction** | Seen findings are not counted as another recurrence round (`_review_recurrence_demote` skips `_seen_before` findings), or the second identical run would demote the finding to advisory and pass by repetition. |
+| **Effect** | **Annotate, never drop.** A finding reported in a prior round on lines the diff shows unchanged since stays in `.findings`, marked `_seen_before: true` (with `_seen_key`, the prior key). `severity_blockers()` counts it like any other finding, so the verdict never depends on how many times the review has run: block at a HEAD, re-run at the same HEAD, and the gate blocks again. Dropping seen findings used to make that second run pass, because it forgot what the first run found. The only way a blocking finding stops blocking is a disposition (see "Dispositions") or a fix. Two identical keys inside one response still collapse to one finding (higher severity wins). `cmd_render_review` suffixes a seen finding with `(reported in a prior run; still counted)`; the operator sees `[dedup] N finding(s) seen in prior run(s) kept and still counted toward the verdict`, and a `gate_runs` audit row (`gate=review-dedup`) records `collapsed:N/total:M seen_before:K mode:annotate`. |
+| **Recurrence interaction** | Seen findings are not counted as another recurrence round (`_review_recurrence_count` skips `_seen_before` findings), so a plain re-run does not inflate the informational count. |
 | **Reset** | `clagentic-lite gates review --reset-dedup` deletes `.clagentic/lite/review-seen-keys`. The next review run re-seeds the file from scratch. |
 | **Conservative bias** | Bias is toward showing. A finding on changed lines will always re-show (the diff window changes → different hash → not suppressed). A finding where the key cannot be computed (parse error, no diff file, no sha256) is retained. |
 | **First run** | Seen-keys file absent → no-op: all findings pass through; keys for this run's findings are appended for use by the next round. |
 
 Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/lite/config` (global). See `share/config.example` for the full entry.
 
-### Cross-round finding recurrence demotion (lr-66e598)
+### Cross-round finding recurrence count
 
-Backstop for the general case of "no loop state exists anywhere in
-clagentic-lite" — round N+1's reviewer prompt has no record of round N's
-findings, so the same class of concern can be reported, argued about, and
-re-reported indefinitely with nothing counting the rounds. Recurrence
-demotion is a second use of the same content-hash key space
-`finding_content_keys` (`scripts/review-merge.sh`) cross-round dedup already
-computes — where dedup only tests membership ("have we seen this key
-before" → suppress), recurrence tracking counts occurrences ("how many
-rounds has this key been reported in" → demote at a threshold).
+Round N+1's reviewer prompt has no record of round N's findings, so the same
+concern can be reported again and again. The count makes that visible: a second
+use of the same content-hash key space as cross-round dedup, it records how
+many rounds a finding's key has been reported in. It is **information only**.
 
-**Relationship to cross-round dedup.** The two mechanisms compose, in this
-order, every round: dedup runs first and marks a finding whose content-hash
-key was seen before `_seen_before` (it stays in `.findings` and keeps
-blocking, per "Cross-round finding dedup" above); recurrence demotion then
-counts only the findings dedup did NOT mark as seen. This means a finding
-whose content-hash key is byte-identical round to round is never counted a
-second time here — repeating a run must not be able to demote a finding to
-advisory, so recurrence demotion never gets a second round to count for it.
-Where recurrence demotion actually matters is when dedup is off
-(`CLAGENTIC_CROSS_ROUND_DEDUP=0`, in which case a finding's own occurrence
-count still accrues every round it is reported) — the mechanism inherits the
-SAME "survives line shifts, not content edits" key-stability property dedup
-has (see "Cross-round finding dedup" above); it does not invent a fuzzier
-notion of sameness.
+**Demotion was removed.** A finding reported in enough rounds in a row (a
+configurable threshold) used to be annotated `_recurrence_demoted` and dropped out of the block
+count. That stopped a finding from blocking without any operator deciding it
+should, which is the opposite of the accumulation rule (a finding found at a
+commit stays open until it is fixed or a disposition clears it), so the
+disposition store subsumes it: a finding that keeps recurring and is genuinely
+acceptable gets a reviewed `dispositions.json` entry; one that is not stays
+blocking. The threshold key is gone from `share/config.example`.
 
 | | |
 |---|---|
-| **Feature flag** | Same as cross-round dedup — runs only when `CLAGENTIC_CROSS_ROUND_DEDUP=1` (default on). Recurrence tracking depends on the same per-round content-hash-keying pass dedup performs on the diff, so the two share one on/off switch. |
-| **Threshold** | `CLAGENTIC_RECURRENCE_THRESHOLD` (default `2`, floored at `2` — a finding can only be demoted after being reported before AND reported again; a first-ever report is never demotable regardless of configuration). |
-| **Counts file** | `.clagentic/lite/review-recurrence.json` (gitignored, local gate state — same directory convention as `review-seen-keys` and `invariants.json`). A JSON object mapping content-hash key → integer round-count, maintained by `finding_recurrence_bump` (`scripts/review-merge.sh`). |
-| **Effect** | A review finding that survives cross-round dedup (i.e. is still reported this round) AND whose content-hash key has now recurred at or above the threshold is annotated `_recurrence_count` (integer) and `_recurrence_demoted: true` on the finding object. `severity_blockers()` (`scripts/gates.sh`) excludes `_recurrence_demoted` findings from its block count. **Threshold only, never suppression**: the finding remains in `.findings`, fully visible in `last-review.json`, `cmd_render_review`'s terminal output (rendered with a `(reported N rounds running — decide)` suffix), and the audit trail — only its eligibility to gate `gates ship` changes. |
-| **Audit trail** | Every recurrence pass logs a `gate_runs` row (`gate=review-recurrence`) recording `demoted:N threshold:T`, and the operator sees a stderr notice (`[recurrence] N finding(s) demoted to advisory ...`) when N > 0. |
-| **Reset** | `clagentic-lite gates review --reset-dedup` deletes BOTH `.clagentic/lite/review-seen-keys` AND `.clagentic/lite/review-recurrence.json` — a reset means every finding is treated as fresh in both senses (not suppressed by dedup, and not recurrence-demoted). |
-| **Conservative bias** | Identical posture to cross-round dedup, applied to demotion instead of suppression: empty key → retained, un-demoted. Splice failure → original findings retained untouched. No JSON tool at all → full passthrough, `last-review.json` unmodified. A finding is annotated only when its key was actually computable this round; an uncomputable key never accrues a count and can never be demoted. |
-| **Scope** | Review findings only (Gate 3). Adversarial findings (Gate 5) already have their own two-tier `reachable`/`tier` mechanism (see "Blocking vs advisory" above) with its own mechanical security-floor clamp; recurrence demotion does not read or write adversarial findings and has no interaction with that clamp — a finding held `tier: blocking` by the security floor is a Gate 5 concept entirely outside this function's reach. |
-
-Configure in `.clagentic/config` (per-repo) or `~/.config/clagentic/lite/config` (global). See `share/config.example` for the full entry.
+| **Feature flag** | Same as cross-round dedup: runs only when `CLAGENTIC_CROSS_ROUND_DEDUP=1` (default on). |
+| **Counts file** | `.clagentic/lite/review-recurrence.json` (gitignored). A JSON object mapping content-hash key → integer round-count, maintained by `finding_recurrence_bump` (`scripts/review-merge.sh`). Each finding gets its own count by position in the envelope, once per distinct key per round, and counts are persisted only after the envelope was rewritten. |
+| **Effect** | Surviving findings get `_recurrence_count`; `cmd_render_review` shows `(reported N rounds running)` for N above 1. The count never reaches the verdict. |
+| **Audit trail** | A `gate_runs` row (`gate=review-recurrence`) records `counted:N`. |
+| **Reset** | `clagentic-lite gates review --reset-dedup` deletes `.clagentic/lite/review-seen-keys` and `review-recurrence.json`. It does not touch the accumulated findings state, which a reset must not be able to clear. |
+| **Conservative bias** | A finding whose key cannot be computed is not counted; a splice failure leaves the findings as they were; no `python3` is a passthrough. |
 
 ### Review ledger and anchored verdicts (lr-01ae73)
 
@@ -552,7 +339,7 @@ remote` configured at all.
      "message": "...", "issue_class": "...", "class_fix": "...",
      "_ledger_recurring": false}
   ],
-  "config": {"block_severity": "high", "cross_round_dedup": true, "recurrence_threshold": 2}
+  "config": {"block_severity": "high", "cross_round_dedup": true}
 }
 ```
 
@@ -562,10 +349,10 @@ remote` configured at all.
 | `branch` | Branch name the review ran on (`_review_current_branch`, `scripts/gates.sh`); empty on a detached HEAD or a non-git `REPO_ROOT` |
 | `base_sha` | `merge-base(origin/<default-branch>, HEAD)`, resolved via the SAME provably-current freshness precondition `cmd_sast`'s `--baseline-commit` scoping uses (`_gate_resolve_fresh_default_branch_ref`) — reuse, not a parallel freshness check. Empty when unresolvable (detached HEAD, on the default branch itself, unreachable remote, shallow clone) — provenance, not the anchor itself; a ledger entry with an empty `base_sha` is still a valid, anchored entry as long as `head_sha` resolved. |
 | `head_sha` | The commit SHA this verdict evaluated, via `_git_repo_scoped_head_sha` (same repo-scoping discipline as every other SHA read in this file). **This is the anchor** — see "Anchored verdicts" below. |
-| `verdict` | `"pass"`, `"block"`, `"unanchored"`, or `"skip"` (see below) |
+| `verdict` | `"pass"`, `"block"`, `"unanchored"`, or `"skip"` (see below). For `gate: "review"` the `pass` / `block` is the verdict `findings.py evaluate` returned for the review gate (see "The code verdict"); the ledger records it and keeps no second copy of the logic. Each finding in `findings` is annotated with its `fingerprint` and `disposition` (`open`, `cleared` with the entry id and kind, or `advisory`). |
 | `gate` | Which gate wrote this entry — `"review"` (`cmd_review`) or `"adversarial"` (`cmd_adversarial`). Both gates share this one ledger file; `gate` is what keeps their delta-re-review anchors from colliding — see "Delta re-review is shared, and gate-scoped" below. A legacy entry written before this field existed has no `gate` key at all, and is never treated as `"review"` by default — see that section. |
 | `findings` | For `gate: "review"`, the exact structured findings array from this round's `last-review.json`, each annotated with `_ledger_recurring` (see "Stable finding identity" below). For `gate: "adversarial"`, always `[]` — `_ledger_record_review_verdict` (`scripts/gates.sh`) reads `.findings` from the markdown file `cmd_adversarial` writes (`last-adversarial.md`), which has no such key, so extraction falls through to empty; the adversarial findings themselves live in `last-adversarial-findings.json`, not in this ledger entry. |
-| `config` | The gate config in effect for this run: `block_severity` (`CLAGENTIC_BLOCK_SEVERITY`), `cross_round_dedup` (`CLAGENTIC_CROSS_ROUND_DEDUP`), `recurrence_threshold` (`CLAGENTIC_RECURRENCE_THRESHOLD`). For `gate: "review"` entries it also carries the per-run provenance below. |
+| `config` | The gate config in effect for this run: `block_severity` (`CLAGENTIC_BLOCK_SEVERITY`), `cross_round_dedup` (`CLAGENTIC_CROSS_ROUND_DEDUP`). For `gate: "review"` entries it also carries the per-run provenance below. |
 
 **Per-run provenance (review entries).** So a verdict can be diagnosed after
 the fact, every review run records, in `config` and in an audit row
@@ -732,27 +519,17 @@ severity demotion.** Every finding written to a ledger entry carries
 (`scripts/gates.sh`) by checking the finding's `(file, category, message)`
 triple against every PRIOR ledger entry's findings for the same branch —
 deliberately NOT `finding_content_keys`' sha256-of-a-diff-context-window key
-(`scripts/review-merge.sh`, used by cross-round dedup and recurrence
-demotion): that key is a function of THIS ROUND's diff content around the
+(`scripts/review-merge.sh`, used by cross-round dedup and the recurrence
+count): that key is a function of THIS ROUND's diff content around the
 finding's own line, so a recurring finding in a round whose diff does not
 happen to touch that file again at all (a common case — the model is simply
 re-reporting an unresolved issue while this round's diff is elsewhere)
 would make the content-hash key uncomputable for the comparison, a false
-negative rather than a real absence of recurrence. The `(file, category,
-message)` triple is the SAME match key `_review_recurrence_demote` and
-`_review_deferral_match` already use for the identical "survive rounds
-where the file/line isn't in the current diff" property — see either
-function's own doc comment. **This is recurrence RECORDING, not
-recurrence-based severity demotion** — the `_ledger_recurring` annotation
-is purely informational history; unlike `_recurrence_demoted` (see
-"Cross-round finding recurrence demotion" above), `severity_blockers()`
-does NOT read `_ledger_recurring` and it has no effect on whether a finding
-blocks. `lr-66e598`'s severity-demotion policy is prior art this task
-deliberately does not resurrect or extend — the ledger's own recurrence
-marker and `_review_recurrence_demote`'s blocking-eligibility marker are
-two independent mechanisms, each over its own match key, exactly the way
-cross-round dedup and recurrence demotion already coexist as two
-independent uses of one key space.
+negative rather than a real absence of recurrence. **This is recurrence
+RECORDING** — the `_ledger_recurring` annotation is purely informational
+history and has no effect on whether a finding blocks. The ledger's
+recurrence marker and the per-round `_recurrence_count` are two independent
+informational mechanisms, each over its own match key.
 
 **Everything above is proven repo-locally.** Every ledger capability —
 recording an anchored verdict, delta re-review off a prior verdict,
@@ -783,12 +560,9 @@ against a hostile local user. A team that needs that property should enforce
 review at the host side — CI, or a server-side check on the change-request
 thread — which is where tamper-resistance belongs.
 
-**Ingest sanitization — closing a self-exempting-suppression gap (security-review follow-up).** `last-review.json` is written directly from the LLM's raw structured JSON output; the pre-write validation (`validate_output`, `scripts/llm-client.sh`) checks that `.findings` is an array, that each `.severity`, if present, is a legal enum value, and (lr-3eb18c, reviewer role only — see "Class-level review findings" below) that every finding carries a non-empty `issue_class` and `class_fix` — it does not allowlist the rest of the object's field set. Before this fix, a model (compromised, manipulated by attacker-influenced code under review, or simply emitting whatever the prompt schema loosely tolerates) could include `_recurrence_demoted: true` directly in its own JSON response. `_review_recurrence_demote`'s splice only *overwrites* `_recurrence_count`/`_recurrence_demoted` on a finding whose `(file, category, message)` triple matches a row in the current round's content-hash-keyed TSV (i.e. whose cited line falls inside `finding_content_keys`' diff-context window); a finding outside that window was left untouched, so a self-forged `_recurrence_demoted: true` on a **first-ever-reported** finding survived verbatim into `last-review.json`, and `severity_blockers()` (which reads `._recurrence_demoted` with no provenance check) excluded it from the block count — a finding could self-exempt from blocking with zero actual repetition.
+**Ingest sanitization — a model cannot write its own annotations.** `last-review.json` is written directly from the LLM's raw structured JSON output; the pre-write validation (`validate_output`, `scripts/llm-client.sh`) checks that `.findings` is an array, that each `.severity`, if present, is a legal enum value, and (reviewer role only — see "Class-level review findings" below) that every finding carries a non-empty `issue_class` and `class_fix` — it does not allowlist the rest of the object's field set. A model (compromised, manipulated by attacker-influenced code under review, or simply emitting whatever the prompt schema loosely tolerates) could therefore include a gate-owned annotation in its own JSON response. Annotations used to carry weight in the block count (`_recurrence_demoted`, `_deferral_matched`), which is why the strip below was introduced; no annotation does any more. The verdict reads `severity` and the finding's location only, and the pipeline's own `fingerprint` and `disposition` are written by `findings.py` after the strip, never trusted from the input.
 
-The fix has two independent layers:
-
-1. **Ingest strip (the actual closure point).** `_sanitize_review_findings_envelope` (`scripts/gates.sh`) reduces every finding to the closed review-finding schema — `severity`, `file`, `line`, `category`, `message`, `evidence`, `suggestion`, `issue_class`, `class_fix` (the exact fields `ds_review_prompt`, `scripts/llm-client.sh`, documents — the last two added by lr-3eb18c, see "Class-level review findings" below) — via `_llm_json_array_allowlist_fields` (`scripts/platform.sh`), dropping every other key including any `_recurrence_demoted`/`_recurrence_count` the model itself supplied. It runs immediately after **every** raw LLM write to an envelope file: the single-pass path's `$OUT`, and each per-chunk envelope in the chunked path *before* `merge_envelopes` ever unions chunks (`merge_envelopes`/`dedup_findings` are pure concatenation/dedup with no field validation of their own, so an unsanitized chunk would have carried a forged field through the merge untouched). This mirrors the established choke-point pattern `_sanitize_adversarial_findings_json` and the deferrals allowlist already use elsewhere in this codebase — sanitize once at the one true ingest boundary, not at every reader.
-2. **Own-the-field in the splice (defense in depth).** `_review_recurrence_demote`'s unmatched branch (a finding whose triple has no match in this round's bumped TSV) now sets `_recurrence_count: 0` / `_recurrence_demoted: false` explicitly rather than leaving the finding object untouched — so even if the ingest strip were ever bypassed, skipped, or reordered by a future change, this function still writes a definite, function-decided value for every finding it processes rather than trusting whatever the object already carried.
+**Ingest strip.** `_sanitize_review_findings_envelope` (`scripts/gates.sh`, `findings.py ingest review-envelope`) reduces every finding to the closed review-finding schema — `severity`, `file`, `line`, `category`, `message`, `evidence`, `suggestion`, `issue_class`, `class_fix` (the exact fields `ds_review_prompt`, `scripts/llm-client.sh`, documents; see "Class-level review findings" below) — dropping every other key. It runs immediately after **every** raw LLM write to an envelope file: the single-pass path's `$OUT`, and each per-chunk envelope in the chunked path *before* `merge_envelopes` ever unions chunks (`merge_envelopes`/`dedup_findings` are pure concatenation/dedup with no field validation of their own). When a findings array cannot be reduced the file is replaced by the degraded stub (`degraded` and `sanitize_failed` true, no findings); when even that write fails the raw file is removed and the ingest exits non-zero, and the gate stops (`cmd_review` blocks) rather than read the raw findings. The unified schema in "The code verdict" is built on top of this: `findings.py evaluate` rebuilds each record field by field and carries nothing else over.
 
 **`line` field type widening.** `_llm_json_array_allowlist_fields`'s base contract keeps only string-valued fields (correct for `deferrals.json`, an all-string schema). Review findings' `line` field is legitimately a JSON number, so the function now accepts a `"fieldname:number"` suffix that declares that ONE field's type as number instead of string (a type declaration, not an added alternative — a string value under a `:number` field is dropped, never coerced; a JSON boolean is explicitly excluded from the numeric type even though Python's `bool` is an `int` subclass). See `scripts/platform.sh`'s updated docstring for the full contract.
 
@@ -797,7 +571,7 @@ The fix has two independent layers:
 | Field | Object | Origin | Validation before a blocking read | Forgeable |
 |---|---|---|---|---|
 | `severity` | review finding | raw LLM JSON | Enum-checked in `validate_output` (`scripts/llm-client.sh`); re-normalized case-insensitively by `severity_rank`/`rank()` (`scripts/gates.sh`) | No (closed enum) |
-| `_recurrence_demoted`, `_recurrence_count` | review finding | raw LLM JSON (before this fix) / gates.sh-only (after) | `_sanitize_review_findings_envelope` strips both unconditionally at ingest; `_review_recurrence_demote` additionally owns both explicitly for every finding it touches | No (closed by ingest strip + own-the-field) |
+| `_recurrence_count`, `disposition`, `fingerprint` | review finding | gates.sh / `findings.py` only | `_sanitize_review_findings_envelope` strips any model-supplied copy at ingest; the pipeline writes them afterwards; none is read by the block count | No (stripped at ingest; none decides a verdict) |
 | `file`, `line`, `category`, `message`, `evidence`, `suggestion` | review finding | raw LLM JSON | Reduced to exactly these keys (closed schema, alongside `issue_class`/`class_fix` below) by `_sanitize_review_findings_envelope`; `line` type-restricted to number, the rest to string | Not a blocking lever on their own. Free text is stored unsanitized in `last-review.json`, but the Merge Gate never reads that file directly: `build_gate_summary` runs it through `_sanitize_review_for_prompt` (key allowlist plus `_llm_field_sanitize` on every free-text field) and delivers it only as `review_fenced`. See "Review and adversarial output reach the Merge Gate sanitized and fenced" below |
 | `issue_class`, `class_fix` | review finding | raw LLM JSON | (lr-3eb18c) PRESENCE required by `validate_output` (`scripts/llm-client.sh`, reviewer role only — non-empty string, no enum check) before a chain step counts as a pass at all; reduced to these two keys (string-only) by `_sanitize_review_findings_envelope` at ingest, same as the other free-text fields above | Content is unsanitized free text, same posture as `message`/`evidence`/`suggestion` above — **never read by `severity_blockers()`** (see that function's own comment, `scripts/gates.sh`): mandatory presence, never a blocking lever, by explicit design (see "Class-level review findings" below) |
 | `severity`, `reachable`, `tier`, `class`, `line` | adversarial finding | constructed by `_parse_adversarial_findings` from named regex capture groups into a fixed Python dict literal with exactly 8 keys (`scripts/gates.sh`) | Each enum-validated and force-corrected at parse time; the security-floor clamp (`reachable=="yes"` and severity high/critical → `tier` forced `"blocking"`) runs unconditionally after `class` resolves | No — this object is never a decode of attacker-supplied JSON, so no extra key (forged or otherwise) can exist on it at all; see "Every field in the parsed finding record, enumerated" under Gate 6 for the field-by-field detail |
@@ -805,7 +579,7 @@ The fix has two independent layers:
 
 **Review and adversarial output reach the Merge Gate sanitized and fenced.** The review table above once waived sanitization on the premise that review findings are "not currently interpolated into a later prompt." That premise expired: `build_gate_summary` feeds the review to the Merge Gate on stdin, where it is the primary refusal basis, and the Merge Gate falls back to the raw adversarial markdown prose as its finding source when `adversarial_findings` is empty. Both carry text influenced by the diff under review, so both now follow the payload convention (sanitized AND fenced), and the raw `review`/`adversarial` payload fields are no longer emitted:
 
-- `review_fenced` — `last-review.json` reduced by `_sanitize_review_for_prompt` (top level keeps only `summary`, `findings`, `_clagentic_diff_sha`; each finding keeps only the closed review schema plus the repo-written `_recurrence_*`/`_deferral_*` annotations; every free-text field goes through `_llm_field_sanitize`), rendered inside `===BEGIN/END REVIEW FINDINGS DATA===`. `null` only when there is no review file. A review file that exists but is not a JSON object, or cannot be fully extracted and sanitized, is a failure (see "One rule for a sanitize failure" below), not `null`.
+- `review_fenced` — `last-review.json` reduced by `_sanitize_review_for_prompt` (top level keeps only `summary`, `findings`, `_clagentic_diff_sha`; each finding keeps only the closed review schema plus the repo-written `_recurrence_count`; every free-text field goes through `_llm_field_sanitize`), rendered inside `===BEGIN/END REVIEW FINDINGS DATA===`. `null` only when there is no review file. A review file that exists but is not a JSON object, or cannot be fully extracted and sanitized, is a failure (see "One rule for a sanitize failure" below), not `null`.
 - `adversarial_fenced` — the raw adversarial markdown through `_llm_field_sanitize` (exempt from the shared per-field cap: it is the fallback refusal basis, so truncating it would change what the gate can refuse on; the only bound is three times the file's byte length, which leaves room for defanging to lengthen forged fence labels, and the text never travels as a process argument, so report size cannot fail the payload build), inside `===BEGIN/END ADVERSARIAL REPORT DATA===`. `null` when the report file is absent or `adversarial_missing` is true (a leftover file from an earlier run is never fenced in that case).
 - `review_sha` — the review's `_clagentic_diff_sha` lifted out as a plain string, because `merge-gate --recheck`'s staleness guard used to read it from the raw `review` object. A summary written before `review_sha` existed is still accepted via the old `review._clagentic_diff_sha` location.
 
@@ -820,7 +594,7 @@ The fix has two independent layers:
 - **`issue_class`** — the recurring class this finding is an instance of, in a few words (e.g. "unbounded external call", "missing input validation on trust boundary"), or the literal string `"none — isolated"` when the finding is genuinely a one-off with no recognizable recurring shape.
 - **`class_fix`** — a higher-level, structural change that would eliminate every instance of the class at once (not a fix for this one line), or `"n/a — isolated"` when `issue_class` is `"none — isolated"`.
 
-**Mandatory but never blocking (settled, not relitigated in this task's PR).** `validate_output` (`scripts/llm-client.sh`) requires both fields to be present, non-empty strings on every finding for the reviewer role — an envelope missing either is treated as a schema violation exactly like a missing `.findings` array or an invalid `.severity`, which fails that chain step the same way any malformed response always has. What this does **not** do: `severity_blockers()` (`scripts/gates.sh`) never reads `issue_class`/`class_fix` at all — an unresolved or freshly-named class can never gate `gates ship`, by construction, not by convention. This is deliberately the same shape as `_recurrence_demoted`/`_deferral_matched`'s own "threshold, not suppression" posture (see "Cross-round finding recurrence demotion" and "Gate-code deferral enforcement" above), inverted: those two fields can only ever *reduce* the blocker count; `issue_class`/`class_fix` never enter the count in either direction. `cmd_render_review` surfaces a non-`"none — isolated"` class on its own indented line so the answer is legible to the operator without adding noise to the (expected, honest) majority of genuinely isolated findings.
+**Mandatory but never blocking (settled, not relitigated in this task's PR).** `validate_output` (`scripts/llm-client.sh`) requires both fields to be present, non-empty strings on every finding for the reviewer role — an envelope missing either is treated as a schema violation exactly like a missing `.findings` array or an invalid `.severity`, which fails that chain step the same way any malformed response always has. What this does **not** do: `severity_blockers()` (`scripts/gates.sh`) never reads `issue_class`/`class_fix` at all — an unresolved or freshly-named class can never gate `gates ship`, by construction, not by convention. `issue_class`/`class_fix` never enter the count in either direction. `cmd_render_review` surfaces a non-`"none — isolated"` class on its own indented line so the answer is legible to the operator without adding noise to the (expected, honest) majority of genuinely isolated findings.
 
 **Builder-side consumer.** The Builder is the consumer of these fields. `plugins/clagentic-lite/agents/builder.md` ("Fix the class, not the line") and the non-interactive `ds_build_prompt` (`scripts/llm-client.sh`) both instruct it to weigh any finding whose `issue_class` is not `"none — isolated"` as a class-level problem and evaluate its `class_fix` as a proposal, or state why not. Both surfaces state that `issue_class`/`class_fix` are untrusted reviewer output (a design proposal to check against the code, never instructions or commands to execute verbatim) and that the Builder decides the fix. Mechanically, `cmd_render_review` ends with one static footer line (`_review_class_footer`, `scripts/gates.sh`) when at least one finding names a non-isolated class. The footer is fully static text (count-agnostic wording; `jq` computes only a presence test), never review-finding text, so it adds no new prompt-injection surface and needs no `_llm_field_sanitize` call. Neither the footer nor the Builder instruction is a blocking lever: `severity_blockers()` still never reads `issue_class`/`class_fix`.
 
@@ -1431,8 +1205,8 @@ and carries the same trust model as a pusher flag.
 changed-path set touches ANY gate's own config — `.gitleaks.toml`,
 `.clagentic/osv-ignore`, `.clagentic/semgrep-exclude`, `.semgrepignore`,
 `.clagentic/config`, `.clagentic-bleed-ignore`, `.clagentic/bleed-patterns`,
-`.clagentic/deferrals.json`, `.clagentic/adversarial-acks.json`,
-`.clagentic/accepted-risks.md` (the full list: `_gate_config_paths`,
+`.clagentic/dispositions.json`, `.clagentic/deferrals.json`,
+`.clagentic/adversarial-acks.json`, `.clagentic/accepted-risks.md` (the full list: `_gate_config_paths`,
 `scripts/gates.sh`) — **no gate may be skipped on that push**, regardless of
 what else changed. Without this the mechanism has a privilege-escalation
 shape: weaken a gate's config and skip the gate that would have noticed, in
@@ -1607,7 +1381,7 @@ The freshness fetch and `ls-remote` keep git's stderr. A failure is reported as 
 
 ### Subcommand arguments
 
-Every `gates.sh` subcommand rejects an argument it does not accept: an unknown option, or a stray positional, prints `usage: gates.sh <subcommand> ...` to stderr and exits `2`. The dispatcher forwards `"$@"` to each subcommand, so without this a misspelled flag such as `--fullscan` would be silently ignored and the run would quietly narrow to the default scope. Accepted flags: `secrets`/`bleed` `--full-scan`; `review` `--full-review`, `--since-last-review`, `--reset-dedup`; `adversarial` `--full-review`; `merge-gate` `--recheck`; `tail` `--no-follow`. `render-manifest`, `render-review`, `deferrals-lint`, `audit-vocab-lint` take one optional FILE and `status` one optional N. `log-run` takes `GATE OUTCOME [DETAILS]`. Everything else takes no arguments.
+Every `gates.sh` subcommand rejects an argument it does not accept: an unknown option, or a stray positional, prints `usage: gates.sh <subcommand> ...` to stderr and exits `2`. The dispatcher forwards `"$@"` to each subcommand, so without this a misspelled flag such as `--fullscan` would be silently ignored and the run would quietly narrow to the default scope. Accepted flags: `secrets`/`bleed` `--full-scan`; `review` `--full-review`, `--since-last-review`, `--reset-dedup`; `adversarial` `--full-review`; `merge-gate` `--recheck`; `tail` `--no-follow`. `render-manifest`, `render-review`, `dispositions-lint` (and its deprecated alias `deferrals-lint`), `audit-vocab-lint` take one optional FILE and `status` one optional N. `evaluate` forwards its options to `findings.py evaluate` and validates them there. `log-run` takes `GATE OUTCOME [DETAILS]`. Everything else takes no arguments.
 
 ### 4d. Internal-bleed scan
 
@@ -1639,7 +1413,7 @@ A pattern-file change is also detected and forces a full scan regardless of the 
 |---|---|
 | **Fires** | `clagentic-lite gates adversarial` (or the subagent); `scripts/gates.sh adversarial` |
 | **Tool** | Auditor role via `scripts/llm-client.sh adversarial` |
-| **Blocks?** | No — Gate 5 itself is commentary only. A finding's `tier` field can make Gate 6 (Merge Gate) refuse — see "Reachability requirement" and "Blocking vs advisory" below. `gates.sh ship` runs it as `cmd_adversarial \|\| true` (an explicit, deliberate opt-out, not an accidental default — see "Exit codes" below). |
+| **Blocks?** | No — Gate 5 itself is commentary only. A finding's `tier` field decides whether it counts toward the code verdict that makes Gate 6 (Merge Gate) refuse — see "Reachability requirement" and "Blocking vs advisory" below, and "The code verdict". The Auditor subagent reports that verdict itself by piping its report through `findings.py evaluate`. `gates.sh ship` runs it as `cmd_adversarial \|\| true` (an explicit, deliberate opt-out, not an accidental default — see "Exit codes" below). |
 | **Output** | Markdown attack scenarios saved to `.clagentic/lite/last-adversarial.md`; structured findings (same data, machine-readable) saved to `.clagentic/lite/last-adversarial-findings.json`; attach to PR if interesting |
 
 The Auditor argues, in concrete terms, how a hostile user could exploit each new or modified input surface. Cites file:line. Names threats with CWE if obvious. If nothing is exploitable, says so in one sentence and lists the surfaces considered.
@@ -1699,7 +1473,7 @@ Every finding states whether the vulnerable code is actually reachable from an e
 
 This is the mechanical precondition for blocking eligibility (see "Blocking vs advisory" next): a finding cannot be `tier: blocking` unless it is `reachable: yes`, regardless of the severity the Auditor assigns it. `_parse_adversarial_findings` (`scripts/gates.sh`) enforces this at the parser level, not just the prompt level — it force-corrects `tier` to `advisory` whenever the parsed `reachable` value is not exactly `yes`, so a miscalibrated model cannot cause a block by stating a high tier without reachability.
 
-`severity` is enum-validated the same way: `_parse_adversarial_findings` accepts only `low`/`medium`/`high`/`critical` (case-normalized) and force-corrects any other captured text to the sentinel `unknown`. `severity_rank()` (`scripts/gates.sh`) ranks `unknown` at `0`, below every real severity level, so an unrecognized value can never inflate its own rank anywhere severity is later compared. This closes a gap a follow-up review caught: `severity` was originally captured as unvalidated free text bounded only by the next `|` in the header line — the identical round-trip exposure `_llm_field_sanitize` closes for `file`/`category`/`message` (see "Round-trip sanitization" under Gate 6), just left open on this one field until the fix.
+`severity` is enum-validated the same way: `_parse_adversarial_findings` accepts only `low`/`medium`/`high`/`critical` (case-normalized) and force-corrects any other captured text to the sentinel `unknown`. The shared ranking (`severity_rank`, `findings.py`) treats `unknown`, like any string that is not a known rank name, as unrankable, which blocks: a reachable finding with an unreadable severity is on the security floor rather than quietly below it. This closes a gap a follow-up review caught: `severity` was originally captured as unvalidated free text bounded only by the next `|` in the header line — the identical round-trip exposure `_llm_field_sanitize` closes for `file`/`category`/`message` (see "Round-trip sanitization" under Gate 6), just left open on this one field until the fix.
 
 ### Blocking vs advisory — threshold, not suppression
 
@@ -1717,7 +1491,7 @@ A finding is `tier: blocking` only when reachability is `yes` (with a cited conc
 - `deterministic_gates` (lr-367a21, INFORMATIONAL ONLY) — `{"secrets": ..., "deps": ..., "sast": ..., "audit_db_unavailable": <bool>}`. Each of `secrets`/`deps`/`sast` is either `null` (no logged `gate_runs` row for that gate) or `{"outcome": "pass"|"warn"|"skip"|"block", "details": "..."}`, read as the LATEST logged row per gate from `.clagentic/lite/audit.db`. `audit_db_unavailable` is `true` when the read itself could not happen (no `sqlite3`, no `audit.db`, or an unreadable/corrupt DB) — in that case all three gate fields are `null` and this tells the Merge Gate nothing about whether those gates ran. See "Deterministic-gates payload block" below. As of lr-1ad8da, `outcome` for `deps`/`sast` is no longer a closed `pass`/`warn`/`skip`/`block` set — it can also be `not_applicable`, a fourth, distinct state meaning the gate's verdict provably could not depend on this push's changed-path set (see "Gate input domain" below). `outcome` remains a closed enum, just a wider one; `_read_deterministic_gates` passes it through verbatim, unvalidated (it already did before this task — the enum was documentation, not code, so no gate code needed to change to admit the new value).
 - `deterministic_gates_fenced` (lr-92d931) — the same `deterministic_gates` object rendered as text inside a `===BEGIN/END DETERMINISTIC GATES DATA===` fenced block, mirroring `adversarial_findings_fenced`. See "Fenced, not just sanitized" below.
 
-The Merge Gate prompt (`ds_merge_gate_prompt`) is instructed to refuse only on `tier: "blocking"` findings not covered by `adversarial-acks.json`/`accepted-risks.md`, and to note advisory findings — including class-downgraded ones — in its `reason` text without gating on them. If `adversarial_findings` is empty or absent (e.g. a gate run predating this feature, or a model that emitted no parseable `[FINDING]` headers), the Merge Gate falls back to reasoning over the adversarial markdown prose directly, as it did before this change. That prose now arrives as `adversarial_fenced` (sanitized, inside `===BEGIN/END ADVERSARIAL REPORT DATA===`); see "Review and adversarial output reach the Merge Gate sanitized and fenced" under the review-field table.
+Counting `tier: "blocking"` findings is the code verdict's job (`findings.py evaluate`); the Merge Gate prompt (`ds_merge_gate_prompt`) receives the verdict and only notes advisory findings — including class-downgraded ones — in its `reason` text. If `adversarial_findings` is empty or absent (e.g. a gate run predating this feature, or a model that emitted no parseable `[FINDING]` headers), the Merge Gate falls back to reasoning over the adversarial markdown prose directly, as it did before this change. That prose now arrives as `adversarial_fenced` (sanitized, inside `===BEGIN/END ADVERSARIAL REPORT DATA===`); see "Review and adversarial output reach the Merge Gate sanitized and fenced" under the review-field table.
 
 **Parser default (fail-open on the non-blocking side).** `reachable`/`tier`/`class` are optional at the parser level for backward compatibility with an older header (`severity | title`, no `reachable`/`tier`/`class`) or a model that omits them despite the prompt instruction. An unparseable or absent `tier` is classified `advisory`, never `blocking` — a parser gap can only ever under-block. An unparseable or absent `class` is classified `durable`, never `ephemeral` — the same fail-closed direction on the class axis, since `durable` is the class that never relaxes anything; a parser gap can only ever leave the full bar in place, never silently grant a downgrade. The finding is still fully visible in the markdown output and the sidecar; it simply cannot gate the merge on its own, or receive a class-based downgrade, if the classification is missing.
 
@@ -1816,11 +1590,14 @@ As a second, independent layer, `ds_adversarial_prompt` (`scripts/llm-client.sh`
 | | |
 |---|---|
 | **Fires** | `clagentic-lite gates ship` (or the subagent), which runs `scripts/gates.sh ship`, after all other gates have passed |
-| **Tool** | LLM "gate" role via `scripts/llm-client.sh merge-gate` |
-| **Input** | A JSON gate-summary payload (`.clagentic/lite/gate-summary.json`) built from `last-review.json` + `last-adversarial.md` + `last-adversarial-findings.json` + threshold + an informational `deterministic_gates` block read from `audit.db` (lr-367a21; see Gate 5 "Deterministic-gates payload block") |
+| **Tool** | The code verdict (`findings.py evaluate`, run by `scripts/gates.sh merge-gate`), then, only on a PASS, the LLM "gate" role via `scripts/llm-client.sh merge-gate` |
+| **Input** | The code verdict (`.clagentic/lite/code-verdict.json`; see "The code verdict"), and a JSON gate-summary payload (`.clagentic/lite/gate-summary.json`) built from `last-review.json` + `last-adversarial.md` + `last-adversarial-findings.json` + threshold + an informational `deterministic_gates` block read from `audit.db` (lr-367a21; see Gate 5 "Deterministic-gates payload block"), carrying the verdict as `code_verdict` / `code_verdict_fenced` |
 | **Output** | `{decision: "approve" | "refuse", reason: "<one sentence>"}` JSON at `.clagentic/lite/last-merge-gate.json` |
 | **Blocks?** | **Yes by default** (`CLAGENTIC_MERGE_GATE_BLOCKING=1`). Set to `0` to make advisory. |
 | **Unparseable decision** | Also blocks — schema-invalid merge-gate output is treated as a gate failure, not a pass. |
+| **No code verdict** | Refuses: a verdict that cannot be computed (an unreadable findings state, the pipeline missing or refusing its input, an adversarial run whose findings could not be recorded at this HEAD) is a refusal, and the model is not called. |
+
+**Code decides, the model may only add a refusal.** Before any model is called, `cmd_merge_gate` asks the finding pipeline for the head-level code verdict: the open blocking findings accumulated at this HEAD by every review and adversarial run, minus those a valid, already-merged disposition clears. When it is BLOCKED the gate refuses deterministically (no model call, no token burn), prints the verdict, and for each open finding the exact stanza that would clear it; the model could not change that outcome and is never asked. When it is PASS the model receives the verdict and the applied dispositions (`code_verdict`, with the cleared findings and the entry that cleared each) and returns approve or refuse; a refusal stands, and it can never turn a code BLOCKED into an approve. The prompt no longer has the model judge acknowledgment coverage, accepted-risk documents or review severities. The merge-gate subagent (`agents/merge-gate.md`) carries the same rule: it refuses when the payload has no code-computed PASS verdict. The cleared findings are recorded in the `merge-gate` audit row from the verdict.
 
 The Merge Gate is the last LLM check before the PR is opened. It never overrides the deterministic security gates (those already gated upstream) and never adds its own findings — it reads the structured outputs of every prior gate and returns a single approve/refuse decision.
 
@@ -1828,7 +1605,7 @@ The Merge Gate is the last LLM check before the PR is opened. It never overrides
 
 `cmd_merge_gate` now computes a **state identity** — `<HEAD SHA>:<content hash>` — before doing anything else:
 
-- The content hash is `sha256(git diff HEAD + git status --porcelain)`, using the same `_rm_sha256` shim `dedup_findings`/`_review_deferral_match` already use for content-not-timestamp fingerprinting (`scripts/review-merge.sh`). `git diff HEAD` captures staged and unstaged changes to tracked files; `git status --porcelain` captures untracked files. Neither reads a file's mtime.
+- The content hash is `sha256(git diff HEAD + git status --porcelain)`, using the same `_rm_sha256` shim `dedup_findings` already uses for content-not-timestamp fingerprinting (`scripts/review-merge.sh`). `git diff HEAD` captures staged and unstaged changes to tracked files; `git status --porcelain` captures untracked files. Neither reads a file's mtime.
 - A commit SHA alone would be insufficient: a dirty working tree is the normal state while iterating, not an edge case, and two dirty trees on the same commit can differ. The content hash makes a dirty tree representable as its own distinct, cacheable state.
 - Every `pass` merge-gate audit row is stamped with `[state=<identity>]` in `gate_runs.details` (visible via `gates.sh status`/`gates.sh tail`, per Gate 6's own audit convention). Before doing any work, `cmd_merge_gate` looks up the most recent `merge-gate`/`merge-gate recheck` row; if its outcome is `pass` and its stamped state identity matches the current one, the invocation is a no-op — it reports the cached pass (from `last-merge-gate.json` if present) and returns without calling the LLM, without touching `gate-summary.json`, and without any new prompt to the operator.
 - Only a stored **pass** short-circuits. A stored `refuse` never does — a real refusal always requires the operator to act (fix the code, or re-run after a real change), so it is never silently bypassed by invoking `gates merge-gate` again.
@@ -1836,7 +1613,7 @@ The Merge Gate is the last LLM check before the PR is opened. It never overrides
 
 This closes the operator-facing complaint directly: run the gate to a pass, re-run with no content changes, and the second (and any subsequent) invocation reports the cached pass with zero LLM calls and zero new prompts.
 
-**Adversarial findings gate here on `tier`, not on severity alone (lr-e2b975).** Only `tier: "blocking"` adversarial findings (reachable, high/critical severity, and not excused by an ephemeral change class — see Gate 5 "Blocking vs advisory" and "Change class") are eligible to refuse the merge. `tier: "advisory"` findings — including real, correctly-severity-rated ones that are simply unreachable, lower severity, or class-downgraded — never gate `gates ship` on their own; they are noted in the Merge Gate's `reason` text and remain fully visible in `last-adversarial.md`, `last-adversarial-findings.json`, and the audit trail. This is a threshold change, never suppression.
+**Adversarial findings gate here on `tier`, not on severity alone (lr-e2b975).** Only `tier: "blocking"` adversarial findings (reachable, high/critical severity, and not excused by an ephemeral change class — see Gate 5 "Blocking vs advisory" and "Change class") count toward the code verdict that refuses the merge. `tier: "advisory"` findings — including real, correctly-severity-rated ones that are simply unreachable, lower severity, or class-downgraded — never gate `gates ship` on their own; they are noted in the Merge Gate's `reason` text and remain fully visible in `last-adversarial.md`, `last-adversarial-findings.json`, and the audit trail. This is a threshold change, never suppression.
 
 **Resolved change class recorded on every merge-gate run (lr-4f8316).** `build_gate_summary`'s `resolved_change_class` and `adversarial_downgraded_by_class_count` fields (see Gate 5 "Change class") are read back and appended to the `merge-gate`/`merge-gate recheck` audit row as `[class=<durable|ephemeral> downgraded=<N>]`, on both the `approve` and `refuse` outcomes — the class that applied to a ship attempt is part of the audit trail regardless of the decision it fed into. The Merge Gate prompt itself never re-derives or widens what `tier: "blocking"` means from this data; class was already folded into `tier` by the Auditor before the payload reached the Merge Gate.
 
@@ -1856,7 +1633,7 @@ This closes the operator-facing complaint directly: run the gate to a pass, re-r
 | `ds_merge_gate_prompt` (payload) | `deterministic_gates` / `deterministic_gates_fenced` (`details` text) | Yes — `_llm_field_sanitize` via `_read_deterministic_gates` (lr-367a21) | **No, until this fix** → Yes — `===BEGIN/END DETERMINISTIC GATES DATA===` | **THE DIVERGENCE THIS PR FIXES** |
 | `ds_merge_gate_prompt` (payload) | `review_fenced` (`last-review.json`, replaces the raw `review` field) | Yes — `_llm_field_sanitize` via `_sanitize_review_for_prompt` | Yes — `===BEGIN/END REVIEW FINDINGS DATA===` | Both (closed after the sweep above) |
 | `ds_merge_gate_prompt` (payload) | `adversarial_fenced` (raw markdown prose, replaces the raw `adversarial` field) | Yes — `_llm_field_sanitize` via `_sanitize_adversarial_report_for_prompt` | Yes — `===BEGIN/END ADVERSARIAL REPORT DATA===` | Both (closed after the sweep above); the fallback is fenced rather than removed, see the decision under the review-field table |
-| `ds_merge_gate_prompt` (payload) | `adversarial_acks` / `accepted_risks` (operator-authored local files) | No | No | Lower-risk category (operator-authored, not model-authored, same posture as `deferrals.json`'s provenance discussion above) — not re-audited in this sweep; not a fenced/sanitized round-trip of MODEL output, which is the shape this convention targets |
+| `ds_merge_gate_prompt` (payload) | `code_verdict` / `code_verdict_fenced` (finding text and operator-written rationales) | Yes — `sanitize_text` over every string (`findings.py`) | Yes — `===BEGIN/END CODE VERDICT DATA===` | Both. Replaces `adversarial_acks` / `accepted_risks`, which the payload no longer carries |
 
 **Stated result: `deterministic_gates` was the only sanitized-but-unfenced divergence found in this sweep.** No fenced-but-not-sanitized field was found anywhere in the three prompts (that shape would be reported as a more serious finding, not fixed quietly, per this task's own instructions). `review`/`adversarial` were a distinct, pre-existing gap at the time of that sweep (neither sanitized nor fenced), since closed: see "Review and adversarial output reach the Merge Gate sanitized and fenced". The table rows above reflect the current state.
 
@@ -1875,7 +1652,7 @@ This closes the operator-facing complaint directly: run the gate to a pass, re-r
 
 Every field lands in one of three buckets: free-text-and-sanitized, closed-set-and-force-corrected-at-parse-time, or non-text-by-construction. `severity` was the one field that fell through this classification for a period — captured as free text but never enum-checked, the identical fence-escape shape already closed for the other three text fields — until a follow-up review caught it.
 
-If an adversarial finding describes inherent product behavior (e.g., a security dashboard that exposes CVE data to authenticated analysts), commit `.clagentic/accepted-risks.md` to the repo documenting the decision. The merge-gate reads that file and classifies covered findings as acknowledged rather than refusing. Copy `share/accepted-risks.example.md` from the clagentic-lite install tree as a starting template. For per-CWE structured acknowledgments with path-glob scoping, `.clagentic/adversarial-acks.json` remains the more precise mechanism and takes precedence when both apply.
+If an adversarial finding describes inherent product behavior (e.g., a security dashboard that exposes CVE data to authenticated analysts), record the decision as an entry in `.clagentic/dispositions.json` (see "Dispositions"): `kind: accepted_risk` or `by_design`, a path glob and the CWE as the category. A reachable high-severity finding is not clearable that way; it needs a fix, or `kind: mitigated` naming the control. The old `accepted-risks.md` and `adversarial-acks.json` are read for one more release and converted.
 
 ## Gate 7 — Session summarize
 
@@ -1900,11 +1677,24 @@ Every decision the gates make about a finding lives in one stdlib-only Python fi
 |---|---|---|
 | `ingest` | `review-envelope`, `findings`, `adversarial-parse`, `adversarial-sanitize`, `adversarial-sort`, `cap`, `length`, `merge`, `sanitize-text`, `allowlist`, `sanitize-fields` | reducing model output to the closed schema, the Auditor header parse and its tier/class clamps, the single sanitizer, chunk-envelope merging |
 | `fingerprint` | `dedup`, `keys`, `bump` | the one content-window and location key, severity-wins dedup (annotate mode never drops a finding that feeds a verdict), recurrence counts |
-| `dispositions` | `cross-round`, `recurrence`, `deferrals`, `ledger-recurrence`, `lint` | seen-before annotation, recurrence demotion, live-deferral matching, ledger recurrence marking, deferral schema lint |
-| `verdict` | `blockers`, `blocking-json`, `rank`, `ledger-*` | the one severity ranking (a present non-string severity ranks as blocking), the blocker count (`99` when unreadable), and every ledger read and write |
-| `render` | `review`, `class-footer`, `verdict-lines`, `sanitize-review`, `sanitize-report`, `fence-data`, `fence-findings`, `json-field`, `stale-report`, `gate-summary` | operator-facing review text, the Merge Gate payload and its fences, the stale-payload refusal wording |
+| `dispositions` | `cross-round`, `recurrence`, `ledger-recurrence`, `lint`, `migrate` | seen-before annotation, the informational recurrence count, ledger recurrence marking, the dispositions schema lint, the move from the legacy files |
+| `verdict` | `blockers`, `blocking-json`, `rank`, `ledger-*` | the one severity ranking (a severity that is not a known rank name ranks as blocking), the raw blocker count (`99` when unreadable), and every ledger read and write |
+| `render` | `review`, `class-footer`, `verdict-lines`, `sanitize-review`, `sanitize-report`, `fence-data`, `fence-findings`, `json-field`, `stale-report`, `cleared-summary`, `gate-summary` | operator-facing review text, the Merge Gate payload and its fences, the stale-payload refusal wording |
+| `evaluate` | (no operation) | the code verdict: unified findings in, dispositions and guardrails applied, per-HEAD accumulation, verdict and clearing stanzas out |
 
 Run `python3 plugins/clagentic-lite/bin/findings.py --help` for the stages. Payloads of unbounded size travel on stdin or as file paths, never as argv.
+
+### Standalone agents
+
+The Reviewer and Auditor Claude Code subagents get the same verdict without `gates.sh` and without enrollment, because the pipeline is one file inside the plugin. Each agent file tells the agent to pipe its findings through the single command `python3 <plugin>/bin/findings.py evaluate --gate review` (the Reviewer, JSON on stdin) or `--gate adversarial --format markdown` (the Auditor, its report on stdin) and to report the printed verdict verbatim. The Reviewer's Bash access is scoped by its prompt to read-only git and that one command, the same arrangement the Auditor already had for its scanners; the agent frontmatter lists Bash for both. This needs only `python3` and a git repository with a commit.
+
+What a standalone run does and does not do:
+
+- It records its findings in the same per-HEAD state as the gates' own runs (`.clagentic/lite/findings-state.json`, created on demand), so findings it adds can only add a blocker to a later `gates ship`.
+- It **does not count toward `gates ship`** (fail closed): it writes no ledger entry, and the ship sequence requires its own review run and an anchored ledger pass at HEAD. A standalone PASS never satisfies anything. The output ends with a note saying so.
+- Detection variance (which findings the model notices) is not removed; accumulation turns it into added coverage across runs at one HEAD.
+- Input is untrusted: malformed, oversized, non-UTF-8 or degraded input is refused with exit `2` and no verdict; a non-git directory is refused; every model-authored string is control-stripped before it is printed and sanitized before it is handed to a model.
+- `clagentic-lite gates evaluate` is the same command from an enrolled checkout.
 
 Behaviours that decide a gate outcome and are easy to miss:
 
@@ -1971,67 +1761,23 @@ Not wired into `gates ship`'s blocking sequence — it is diagnostic output, run
 | Gate 2 — bash guard | Legitimate command blocked by a rule | Set `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` in `.clagentic/config`. Multiple rules: comma-separated. Add a comment explaining why in the commit. |
 | Gate 2 — write guard (W-001) | Intentional work on default branch | Set `CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1` in `.clagentic/config`. This is unusual — default-branch protection exists for good reason. |
 | Gate 3 — review | Cross-vendor fallback silently taken | Set `CLAGENTIC_REVIEWER_REQUIRED=1` to make chain failure a hard error. Chain fallback becomes visible in audit trail and the gate blocks rather than emitting a degraded envelope. |
-| Gate 6 — adversarial (via merge-gate) | By-design behavior flagged as a CWE finding (per-CWE, path-scoped) | Commit `.clagentic/adversarial-acks.json` to the repo. See "adversarial-acks.json" below. |
-| Gate 6 — adversarial (via merge-gate) | Finding is inherent product behavior (architectural, not per-CWE) | Commit `.clagentic/accepted-risks.md` documenting the decision. Copy `share/accepted-risks.example.md` as template. See "accepted-risks.md" below. |
+| Gate 3 / Gate 5 / Gate 6 — review or adversarial finding | Finding is by design, a false positive, an accepted risk, or mitigated by a control outside the code | Record it in `.clagentic/dispositions.json` in a **separate reviewed change that reaches the base branch first** (an entry added in the change being gated does not clear that change's findings). A blocked run prints the exact stanza for each open finding. See "Dispositions" and "Disposition entries" below. |
+| Gate 6 — reachable high-severity finding (security floor) | You cannot fix it now | Fix it, or add a `kind: mitigated` entry whose `control` names the external control that prevents exploitation. `by_design`, `false_positive` and `accepted_risk` do not clear it. |
 | Any gate | Tool not installed | Set `CLAGENTIC_ALLOW_MISSING_<TOOL>=1`. Prefer installing the tool. |
 
-### adversarial-acks.json — per-finding acknowledgment for the merge gate
+### Disposition entries
 
-When an adversarial finding reflects intentional design (e.g., a service that reads untrusted input by contract), you can acknowledge it rather than suppress the adversarial pass entirely. The acknowledgment is committed to the repo so it is visible in code review and audit.
+`.clagentic/dispositions.json` replaces three older mechanisms: `.clagentic/adversarial-acks.json` (per-CWE acknowledgments the merge-gate model applied by reading prompt text), `.clagentic/accepted-risks.md` (freetext the merge-gate model read) and `.clagentic/deferrals.json` (review findings, partly matched in code). The code verdict applies it; no model does. The schema, kinds, matching rules and guardrails are under "Dispositions" in Gate 3 above, and `share/dispositions.example.json` is a complete example.
 
-**File location:** `.clagentic/adversarial-acks.json` in the enrolled repo root.
+**What changed for existing files.** They are still read for one more release, converted to equivalent entries and flagged with a deprecation warning; `python3 plugins/clagentic-lite/bin/findings.py dispositions migrate --root . --write` writes the converted file. Three behaviours differ and are intended:
 
-**Schema:** a JSON array of ack objects. Copy `adversarial-acks.json.example` from the clagentic-lite install tree root as a starting point.
+- A converted entry is `kind: accepted_risk`, so it **no longer clears a security-floor finding**. An old ack could clear a reachable high-severity finding; now that needs a fix or a `mitigated` entry naming the control.
+- **The bootstrap exemption is gone.** The `introduces_ack_file` flag and the model-applied exemption for the file that introduces itself are replaced by a rule that is stricter and simpler: an entry added in the gated change clears nothing in that change.
+- `accepted-risks.md` is freetext and was only ever interpreted by a model. It clears nothing; write each accepted risk as an entry.
 
-```json
-[
-  {
-    "cwe": "CWE-807",
-    "path_glob": "src/reachability/**",
-    "rationale": "Deployment-discovery reads K8s workload specs by design; security analysts viewing CVEs is the product surface.",
-    "acknowledged_by": "andy",
-    "acknowledged_at": "2026-06-04"
-  }
-]
-```
+**Trust model.** The file is repo-controlled: a contributor who can edit it can record an acceptance. The guardrails are what keep that from being a self-service exemption: a new or changed entry cannot clear its own change's findings, the Builder role is blocked from writing the file (rule W-007), the floor needs a fix or a named control, and every cleared finding is printed with who, when and why. Put the file under CODEOWNERS (or your host's equivalent) so a change to it needs a reviewer other than the author; the gate cannot enforce that for you. `by` and `at` are plain strings and are not authenticated.
 
-Fields:
-
-| Field | Required | Description |
-|---|---|---|
-| `cwe` | yes | CWE identifier string, e.g. `"CWE-807"` |
-| `path_glob` | no | If present, the ack only applies when the cited file matches this glob. If absent, the ack covers all paths for that CWE. |
-| `rationale` | yes | Human-readable explanation of why the finding is intentional |
-| `acknowledged_by` | yes | Who made the call |
-| `acknowledged_at` | yes | ISO date string |
-
-**Coverage rule:** a finding is covered when (a) its CWE matches `acks[].cwe`, and (b) either `path_glob` is absent or the cited file matches `path_glob`.
-
-**Effect:** when all blocking adversarial findings are covered, the merge gate approves and writes a `gate_runs` row to `audit.db` with the full per-finding detail (CWE, cited file:line, rationale) in the `details` column. Uncovered findings still refuse. The gate output also includes an `acknowledged` array for inspection via `clagentic-lite show gates`.
-
-**Important:** the acks file must be committed deliberately. A missing file means no acks are in effect — the merge gate sees an empty list and refuses on any unmitigated CWE finding.
-
-**Trust model:** `adversarial-acks.json` is repo-controlled. It is a workflow convenience for trusted internal contributors, not a security control. `acknowledged_by` is a plain string — it is not verified or authenticated. A contributor can add both a regression and a covering ack entry in the same diff; the gate has no way to detect this. `path_glob` entries should be as narrow as the real affected scope — overly broad globs (e.g., `**`) allow future regressions in covered files to be silently acknowledged. The structural fix is CODEOWNERS protection on `.clagentic/adversarial-acks.json` so adding or editing an entry requires review from someone outside the submitter. Until that is in place, treat the ack mechanism as convenience, not enforcement.
-
-**Bootstrap sequence — first ack in a repo:** the first time you commit `.clagentic/adversarial-acks.json` (or `accepted-risks.md`), the merge-gate adversarial pass may flag the file itself ("repo-controlled suppression", "unauthenticated acknowledged_by"). The gate-summary payload includes a deterministic `introduces_ack_file` boolean (set by `build_gate_summary` via `git diff --name-status`). When `true` — meaning the ack file is being **added** in this exact diff, not modified — the merge-gate applies a bootstrap exemption and does not block on findings whose only cited file is the ack file itself. Findings on other files in the same diff are still evaluated normally. Recommended practice: add `.clagentic/adversarial-acks.json` and `.clagentic/accepted-risks.md` to `.github/CODEOWNERS` (or your host's equivalent) so all future edits require explicit human approval. Once the ack file is on the default branch, subsequent diffs that the ack covers pass normally.
-
-### accepted-risks.md — architectural risk documentation for the merge gate
-
-When an adversarial finding describes behavior that is inherent to the product's stated purpose — not a bug or an oversight, but a deliberate architectural decision — commit `.clagentic/accepted-risks.md` to the repo documenting that decision. The merge-gate reads this file and uses it to classify covered findings as acknowledged rather than refused.
-
-**File location:** `.clagentic/accepted-risks.md` in the enrolled repo root.
-
-**Template:** copy `share/accepted-risks.example.md` from the clagentic-lite install tree. It shows the recommended format with example entries.
-
-**Format:** freetext markdown. Each entry should state the CWE(s) it covers, the specific behavior that triggers the finding, why that behavior is intentional, and who accepted it and when.
-
-**Effect:** the merge-gate reads the document and, for each adversarial finding that would otherwise block, checks whether the finding describes behavior that is inherent to the stated product purpose as documented in `accepted_risks`. Covered findings are approved with `"source": "accepted-risks"` in the `acknowledged` array. Uncovered findings still refuse.
-
-**When to use this vs. adversarial-acks.json:** use `adversarial-acks.json` for precise per-CWE, path-glob-scoped acknowledgments. Use `accepted-risks.md` for broader architectural decisions that cover classes of findings rather than individual CWEs — e.g., "this entire subsystem exposes security intelligence data to authenticated analysts because that is the product." Both mechanisms are active simultaneously; `adversarial-acks.json` takes precedence when both apply to the same finding.
-
-**Important:** the file must be committed deliberately. Its presence in version history is part of the audit trail — it is the documented record that a human accepted this risk, not a suppression added to make a gate go green.
-
-**Bootstrap:** same mechanism as `adversarial-acks.json` above — `introduces_ack_file` is `true` when this file is added, and the merge-gate does not block on findings citing only this path. The ack takes effect for subsequent diffs.
+**Lint:** `clagentic-lite gates dispositions-lint [FILE]` reports every invalid entry (an invalid entry is ignored, loudly) and exits non-zero.
 
 **Agents: if a gate blocks you, consult this table first.** Editing `pre-bash-guard.sh`, `pre-write-guard.sh`, or `scripts/gates.sh` to remove a rule or suppress a finding is a contract violation — it removes the protection for all future sessions, not just the one where it was inconvenient. Use the config bypass and explain why.
 
