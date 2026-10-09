@@ -69,7 +69,17 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_source_helpers import GATES_SH, PLATFORM_SH, source_env  # noqa: E402
+from test_source_helpers import (  # noqa: E402
+    GATES_SH,
+    GIT_IDENTITY_ENV as _GIT_IDENTITY_ENV,
+    PLATFORM_SH,
+    RECURRING_FINDING as _RECURRING_FINDING,
+    init_git_repo as _init_git_repo,
+    setup_fake_tool_home as _setup_fake_tool_home,
+    setup_project as _setup_project,
+    source_env,
+    stage_identical_recreation as _stage_identical_recreation,
+)
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -116,15 +126,6 @@ _STABLE_DIFF = textwrap.dedent("""\
     +def handle(x):
     +    return x
     """)
-
-_RECURRING_FINDING = {
-    "severity": "high",
-    "file": "app.py",
-    "line": 2,
-    "category": "security",
-    "message": "unsanitized input reaches a sink",
-}
-
 
 def _write_envelope(path, findings):
     with open(path, "w") as f:
@@ -293,86 +294,10 @@ class TestRecurrenceDemoteFunctionDirect(unittest.TestCase):
 # Layer 2: cmd_review end-to-end, real git repo, stub llm-client.sh.
 # --------------------------------------------------------------------------
 
-def _setup_project(tmpdir):
-    clagentic_dir = os.path.join(tmpdir, ".clagentic", "lite")
-    os.makedirs(clagentic_dir, exist_ok=True)
-    db_path = os.path.join(clagentic_dir, "audit.db")
-    conn = sqlite3.connect(db_path)
-    conn.execute(textwrap.dedent("""\
-        CREATE TABLE IF NOT EXISTS gate_runs (
-          id         INTEGER PRIMARY KEY,
-          ts         TEXT NOT NULL,
-          gate       TEXT NOT NULL,
-          outcome    TEXT NOT NULL,
-          details    TEXT,
-          session_id TEXT,
-          branch     TEXT
-        )
-    """))
-    conn.commit()
-    conn.close()
-    return tmpdir
-
-
-_GIT_IDENTITY_ENV = {
-    "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-    "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-}
-
-
-def _init_git_repo(project_root):
-    env = os.environ.copy()
-    env.update(_GIT_IDENTITY_ENV)
-    subprocess.run(["git", "init", "-q", project_root], check=True, env=env)
-    target = os.path.join(project_root, "app.py")
-    with open(target, "w") as f:
-        f.write("def handle(x):\n    return x\n")
-    subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
-    subprocess.run(["git", "commit", "-q", "-m", "seed"], check=True, cwd=project_root, env=env)
-
-
 def _commit_round(project_root):
     env = os.environ.copy()
     env.update(_GIT_IDENTITY_ENV)
     subprocess.run(["git", "commit", "-q", "-m", "round"], check=True, cwd=project_root, env=env)
-
-
-def _stage_identical_recreation(project_root, round_n):
-    """Commit whatever is currently staged/committed as a clean baseline
-    (so the working tree starts each round from a known committed state,
-    regardless of what a PRIOR call to this function left staged but
-    uncommitted), delete app.py, commit the deletion, then recreate it with
-    a BYTE-IDENTICAL body and stage (but do not commit) the recreation —
-    forces every round's staged diff to show the same lines as freshly
-    ADDED (a 'new file' diff each time), so the flagged line's content-hash
-    key is genuinely stable and independent of git's diff-minimization
-    heuristics (which otherwise treat an unchanged line as context, never
-    `+`, and never re-emit it at all). The caller is expected to run the
-    gate against the staged recreation; this function does NOT commit the
-    recreation itself, so the gate sees it as a staged (uncommitted) diff,
-    matching get_review_diff's staged-diff-first priority."""
-    env = os.environ.copy()
-    env.update(_GIT_IDENTITY_ENV)
-    # Commit any staged-but-uncommitted state from a PRIOR call before
-    # starting this round's delete/recreate cycle, so `git add` + `git
-    # commit` below always has a clean, fully-committed baseline to work
-    # from — otherwise the second call in a sequence finds nothing new to
-    # commit for the deletion step (the previous round's recreation was
-    # staged, not committed) and `git commit` fails with "nothing to commit".
-    subprocess.run(
-        ["git", "commit", "-q", "-m", "checkpoint", "--allow-empty"],
-        check=True, cwd=project_root, env=env,
-    )
-    target = os.path.join(project_root, "app.py")
-    if os.path.exists(target):
-        os.remove(target)
-        subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
-        subprocess.run(
-            ["git", "commit", "-q", "-m", "delete"], check=True, cwd=project_root, env=env,
-        )
-    with open(target, "w") as f:
-        f.write("def handle(x):\n    return x\n")
-    subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
 
 
 def _make_stub_llm_client(tmpdir, envelopes_by_round):
@@ -414,25 +339,6 @@ def _make_stub_llm_client(tmpdir, envelopes_by_round):
         """))
     os.chmod(stub, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
     return tmpdir
-
-
-def _setup_fake_tool_home(fake_tool_home):
-    scripts_dir = os.path.join(fake_tool_home, "scripts")
-    os.makedirs(scripts_dir, exist_ok=True)
-    real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
-    for fname in os.listdir(real_scripts_dir):
-        if not fname.endswith(".sh"):
-            continue
-        if fname == "llm-client.sh":
-            continue
-        src = os.path.join(real_scripts_dir, fname)
-        dst = os.path.join(scripts_dir, fname)
-        if not os.path.exists(dst):
-            os.symlink(src, dst)
-    real_share = os.path.join(TOOL_HOME, "share")
-    fake_share = os.path.join(fake_tool_home, "share")
-    if not os.path.exists(fake_share) and os.path.isdir(real_share):
-        os.symlink(real_share, fake_share)
 
 
 def _run_review(extra_args, fake_tool_home, project_root, env_overrides=None):

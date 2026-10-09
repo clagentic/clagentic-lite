@@ -28,14 +28,18 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_review_dedup_annotate import _stub_llm, path_without  # noqa: E402
-from test_source_helpers import GATES_SH, PLATFORM_SH, TOOL_HOME, source_env  # noqa: E402
-from test_review_recurrence_demotion import (  # noqa: E402
-    _RECURRING_FINDING,
-    _init_git_repo,
-    _setup_fake_tool_home,
-    _setup_project,
-    _stage_identical_recreation,
+from test_source_helpers import (  # noqa: E402
+    GATES_SH,
+    PLATFORM_SH,
+    RECURRING_FINDING as _RECURRING_FINDING,
+    TOOL_HOME,
+    init_git_repo as _init_git_repo,
+    path_without,
+    setup_fake_tool_home as _setup_fake_tool_home,
+    setup_project as _setup_project,
+    source_env,
+    stage_identical_recreation as _stage_identical_recreation,
+    stub_review_llm as _stub_llm,
 )
 
 
@@ -221,6 +225,56 @@ class TestReviewBlockedAtHead(_Base):
         self._merge_gate()
         with open(os.path.join(self._lite, "gate-summary.json")) as f:
             self.assertEqual(json.load(f)["blocking_findings"], [])
+
+
+class TestMalformedFindingsStillNamed(_Base):
+    """A malformed severity must not blank the list while the review blocks."""
+
+    def _rewrite_ledger_entry(self, mutate):
+        ledger = os.path.join(self._lite, "review-ledger.jsonl")
+        with open(ledger) as f:
+            entry = json.loads(f.read().strip().splitlines()[-1])
+        mutate(entry)
+        with open(ledger, "w") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def _numeric_severity(self, hide=None):
+        self._block_review_at_head()
+        self._rewrite_ledger_entry(lambda e: e["findings"][0].update(severity=3))
+        r = self._merge_gate(hide=hide)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        refusal = self._refusal()
+        self.assertEqual(refusal["stale_reason"], "review_blocked_at_head")
+        self.assertIn("app.py:2", refusal["reason"], "the finding is still listed")
+        self.assertIn(_RECURRING_FINDING["message"], refusal["reason"])
+        self.assertNotIn("could not be listed", refusal["reason"])
+        with open(os.path.join(self._lite, "gate-summary.json")) as f:
+            listed = json.load(f)["blocking_findings"]
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["severity"], "3")
+
+    def test_numeric_severity_is_listed_with_jq(self):
+        self._numeric_severity()
+
+    def test_numeric_severity_is_listed_with_python3_only(self):
+        self._numeric_severity(hide="jq")
+
+    def _unlistable(self, hide=None):
+        self._block_review_at_head()
+        self._rewrite_ledger_entry(lambda e: e.update(findings=5))
+        r = self._merge_gate(hide=hide)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        refusal = self._refusal()
+        self.assertEqual(refusal["stale_reason"], "review_blocked_at_head")
+        self.assertIn("blocking findings could not be listed; see last-review.json", refusal["reason"])
+        self.assertNotIn("(0)", refusal["reason"])
+        self.assertIn("could not be listed", self._audit_details())
+
+    def test_unlistable_findings_say_so_with_jq(self):
+        self._unlistable()
+
+    def test_unlistable_findings_say_so_with_python3_only(self):
+        self._unlistable(hide="jq")
 
 
 class TestEmptyHead(_Base):

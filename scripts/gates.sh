@@ -6851,6 +6851,7 @@ _mg_stale_report() {
       "P\u001f\(.stale_reason // "")\u001f\u001f",
       "H\u001f\(.current_sha // "")\u001f\u001f",
       ((.stale_reasons // {}) | to_entries[] | "R\u001f\(.key)\u001f\(.value)\u001f"),
+      (if .blocking_findings == null then "U\u001f\u001f\u001f" else empty end),
       ((.blocking_findings // [])[] | "F\u001f\(.file)\u001f\(.line)\u001f\(.severity)\u001f\(.message)")
     ' "$_msr_file" 2>/dev/null) || _msr_rows=""
   elif command -v python3 >/dev/null 2>&1; then
@@ -6865,6 +6866,8 @@ print(us.join(["P", str(d.get("stale_reason") or ""), "", ""]))
 print(us.join(["H", str(d.get("current_sha") or ""), "", ""]))
 for k, v in (d.get("stale_reasons") or {}).items():
     print(us.join(["R", str(k), str(v), ""]))
+if d.get("blocking_findings") is None:
+    print(us.join(["U", "", "", ""]))
 for f in d.get("blocking_findings") or []:
     print(us.join(["F", str(f.get("file", "")), str(f.get("line", "")), str(f.get("severity", "")), str(f.get("message", ""))]))
 ' "$_msr_file" 2>/dev/null) || _msr_rows=""
@@ -6877,6 +6880,7 @@ for f in d.get("blocking_findings") or []:
   _msr_g_head=""
   _msr_blocked=0
   _msr_nf=0
+  _msr_unlisted=0
   _msr_flist=""
   _msr_fshort=""
   while IFS="$_msr_us" read -r _msr_t _msr_a _msr_b _msr_c _msr_d; do
@@ -6891,6 +6895,7 @@ for f in d.get("blocking_findings") or []:
           review_blocked_at_head) _msr_blocked=1 ;;
         esac
         ;;
+      U) _msr_unlisted=1 ;;
       F)
         _msr_nf=$((_msr_nf + 1))
         _msr_flist="${_msr_flist:+$_msr_flist; }${_msr_a}:${_msr_b} [${_msr_c}] ${_msr_d}"
@@ -6910,7 +6915,10 @@ EOF
   _MG_STALE_AUDIT=""
   if [ "$_msr_blocked" -eq 1 ]; then
     _msr_short_head=$(printf '%.12s' "$_msr_head")
-    if [ "$_msr_nf" -gt 0 ]; then
+    if [ "$_msr_unlisted" -eq 1 ]; then
+      _MG_STALE_TEXT="the review at HEAD ${_msr_short_head} has unresolved blocking findings; blocking findings could not be listed; see last-review.json. Running the review again at the same commit does not clear them."
+      _MG_STALE_AUDIT="review blocked at HEAD [review_blocked_at_head]: blocking findings could not be listed"
+    elif [ "$_msr_nf" -gt 0 ]; then
       _MG_STALE_TEXT="the review at HEAD ${_msr_short_head} has unresolved blocking findings (${_msr_nf}): ${_msr_flist}. Fix them (or record a deferral in .clagentic/deferrals.json) and commit; running the review again at the same commit does not clear them."
       _MG_STALE_AUDIT="review blocked at HEAD [review_blocked_at_head]: ${_msr_nf} unresolved blocking finding(s): ${_msr_fshort}"
     else
@@ -7266,6 +7274,9 @@ severity_blockers() {
   # the caller's `> 0` block check unambiguously. Three branches that
   # could fail (jq parse, python3 parse, no validator at all) all return
   # 99 — there is no path where an unparseable review counts as "clean."
+  # A non-string, non-null severity (a number, say) cannot be ranked and counts
+  # as blocking in both branches; the jq branch used to error out to the 99
+  # sentinel while the python3 branch ranked it 0 and let it pass.
   # Severity strings are normalized case-insensitively. LLM models routinely
   # return "HIGH" or "CRITICAL" uppercase — without normalization these rank
   # 0 (unknown) and blocking findings silently pass.
@@ -7291,12 +7302,14 @@ severity_blockers() {
   if command -v jq >/dev/null 2>&1; then
     R=$(jq -r --argjson tr "$TR" '
       def rank(s):
-        (s // "" | ascii_downcase) as $s
+        if s == null then 0
+        elif (s | type) != "string" then 4
+        else (s | ascii_downcase) as $s
         | if $s == "critical" then 4
         elif $s == "high" then 3
         elif $s == "medium" then 2
         elif $s == "low" then 1
-        else 0 end;
+        else 0 end end;
       [(.findings // [])[] | select(rank(.severity) >= $tr and (._recurrence_demoted // false) != true and (._deferral_matched // false) != true)] | length
     ' "$FILE" 2>/dev/null)
     if [ -z "$R" ]; then echo 99; else echo "$R"; fi
@@ -7309,9 +7322,15 @@ try:
 except Exception:
     print(99); sys.exit(0)
 tr = int(sys.argv[2])
+def rank(sev):
+    if sev is None:
+        return 0
+    if not isinstance(sev, str):
+        return 4
+    return ranks.get(sev.lower(), 0)
 print(sum(
     1 for f in d.get("findings", [])
-    if ranks.get(str(f.get("severity","")).lower(),0) >= tr
+    if rank(f.get("severity")) >= tr
     and f.get("_recurrence_demoted") is not True
     and f.get("_deferral_matched") is not True
 ))
@@ -7331,25 +7350,32 @@ PY
 # predicate as severity_blockers (severity rank, not _recurrence_demoted, not
 # _deferral_matched) so the list a refusal shows is exactly the set that
 # blocked. Control bytes are stripped from the free text and message is capped:
-# the text is model-authored and ends up on a terminal. Prints "[]" when no JSON
-# tool exists or the input is unreadable, never a partial list.
+# the text is model-authored and ends up on a terminal. Prints "null" (not "[]",
+# which would read as "nothing blocked") when no JSON tool exists or the input
+# is unreadable, never a partial list; _mg_stale_report renders null as "could
+# not be listed".
+# A non-string, non-null severity cannot be ranked, so it counts as blocking
+# (rank 4): the same fail-closed reading severity_blockers applies, which keeps
+# the list equal to the set that blocked.
 _blocking_findings_json() {
   _bfj_tr=$(severity_rank "$1")
   [ "$_bfj_tr" -eq 0 ] && _bfj_tr=3
   if command -v jq >/dev/null 2>&1; then
     jq -c --argjson tr "$_bfj_tr" '
       def rank(s):
-        (s // "" | ascii_downcase) as $s
+        if s == null then 0
+        elif (s | type) != "string" then 4
+        else (s | ascii_downcase) as $s
         | if $s == "critical" then 4
         elif $s == "high" then 3
         elif $s == "medium" then 2
         elif $s == "low" then 1
-        else 0 end;
+        else 0 end end;
       def clean: (. // "" | tostring | gsub("[\u0001-\u001f\u007f]"; " ") | .[0:300]);
       [(.findings // [])[]
         | select(rank(.severity) >= $tr and (._recurrence_demoted // false) != true and (._deferral_matched // false) != true)
         | {file: (.file | clean), line: (.line // 0), severity: (.severity | clean), message: (.message | clean)}]
-    ' 2>/dev/null || printf '[]'
+    ' 2>/dev/null || printf 'null'
     return 0
   fi
   if command -v python3 >/dev/null 2>&1; then
@@ -7359,23 +7385,29 @@ ranks = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 tr = int(sys.argv[1])
 def clean(v):
     return re.sub(r"[\x00-\x1f\x7f]", " ", "" if v is None else str(v))[:300]
+def rank(sev):
+    if sev is None:
+        return 0
+    if not isinstance(sev, str):
+        return 4
+    return ranks.get(sev.lower(), 0)
 try:
     d = json.load(sys.stdin)
     out = [
         {"file": clean(f.get("file")), "line": f.get("line") or 0,
          "severity": clean(f.get("severity")), "message": clean(f.get("message"))}
         for f in d.get("findings", []) if isinstance(f, dict)
-        and ranks.get(str(f.get("severity", "")).lower(), 0) >= tr
+        and rank(f.get("severity")) >= tr
         and f.get("_recurrence_demoted") is not True
         and f.get("_deferral_matched") is not True
     ]
     print(json.dumps(out))
 except Exception:
-    print("[]")
-' "$_bfj_tr" 2>/dev/null || printf '[]'
+    print("null")
+' "$_bfj_tr" 2>/dev/null || printf 'null'
     return 0
   fi
-  printf '[]'
+  printf 'null'
 }
 
 # _fence_adversarial_findings JSON_ARRAY — render an (already sanitized)
@@ -8487,7 +8519,7 @@ build_gate_summary() {
               # overwritten by every run and may no longer match).
               _mg_ledger_entry=$(_ledger_latest_gate_entry "$_mg_ledger" "$_mg_ledger_branch" review)
               STALE_BLOCKING_JSON=$(printf '%s' "$_mg_ledger_entry" | _blocking_findings_json "$THRESHOLD")
-              [ -n "$STALE_BLOCKING_JSON" ] || STALE_BLOCKING_JSON="[]"
+              [ -n "$STALE_BLOCKING_JSON" ] || STALE_BLOCKING_JSON="null"
             fi
           fi
         fi

@@ -89,3 +89,144 @@ def source_env(gates=False, llm_client=False):
         env["CLAGENTIC_LLM_CLIENT_SOURCE_ONLY"] = "1"
         env["CLAGENTIC_LLM_CLIENT_DELIBERATE_SOURCE"] = "1"
     return env
+
+
+# --------------------------------------------------------------------------
+# Shared fixtures for tests that drive `gates.sh review` end to end against a
+# throwaway project dir (real git repo, SQLite audit table, symlinked tool
+# home). Every path they write is under the caller-supplied temp dir.
+# --------------------------------------------------------------------------
+import sqlite3
+import subprocess
+import textwrap
+
+RECURRING_FINDING = {
+    "severity": "high",
+    "file": "app.py",
+    "line": 2,
+    "category": "security",
+    "message": "unsanitized input reaches a sink",
+}
+
+GIT_IDENTITY_ENV = {
+    "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
+    "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
+}
+
+
+def setup_project(tmpdir):
+    clagentic_dir = os.path.join(tmpdir, ".clagentic", "lite")
+    os.makedirs(clagentic_dir, exist_ok=True)
+    db_path = os.path.join(clagentic_dir, "audit.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute(textwrap.dedent("""\
+        CREATE TABLE IF NOT EXISTS gate_runs (
+          id         INTEGER PRIMARY KEY,
+          ts         TEXT NOT NULL,
+          gate       TEXT NOT NULL,
+          outcome    TEXT NOT NULL,
+          details    TEXT,
+          session_id TEXT,
+          branch     TEXT
+        )
+    """))
+    conn.commit()
+    conn.close()
+    return tmpdir
+
+
+def init_git_repo(project_root):
+    env = os.environ.copy()
+    env.update(GIT_IDENTITY_ENV)
+    subprocess.run(["git", "init", "-q", project_root], check=True, env=env)
+    target = os.path.join(project_root, "app.py")
+    with open(target, "w") as f:
+        f.write("def handle(x):\n    return x\n")
+    subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], check=True, cwd=project_root, env=env)
+
+
+def stage_identical_recreation(project_root, round_n):
+    """Commit the current state as a clean baseline, delete app.py, commit the
+    deletion, then recreate it byte-identically and stage (not commit) it.
+    Every round's staged diff then shows the same lines as freshly ADDED, so
+    the flagged line's content-hash key is stable regardless of git's
+    diff-minimization (which would otherwise emit an unchanged line only as
+    context). The gate under test sees a staged, uncommitted diff."""
+    env = os.environ.copy()
+    env.update(GIT_IDENTITY_ENV)
+    # A prior call leaves its recreation staged but uncommitted; without this
+    # checkpoint the deletion commit below would find nothing to commit.
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "checkpoint", "--allow-empty"],
+        check=True, cwd=project_root, env=env,
+    )
+    target = os.path.join(project_root, "app.py")
+    if os.path.exists(target):
+        os.remove(target)
+        subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "delete"], check=True, cwd=project_root, env=env,
+        )
+    with open(target, "w") as f:
+        f.write("def handle(x):\n    return x\n")
+    subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
+
+
+def setup_fake_tool_home(fake_tool_home):
+    scripts_dir = os.path.join(fake_tool_home, "scripts")
+    os.makedirs(scripts_dir, exist_ok=True)
+    for fname in os.listdir(SCRIPTS_DIR):
+        if not fname.endswith(".sh") or fname == "llm-client.sh":
+            continue
+        dst = os.path.join(scripts_dir, fname)
+        if not os.path.exists(dst):
+            os.symlink(os.path.join(SCRIPTS_DIR, fname), dst)
+    real_share = os.path.join(TOOL_HOME, "share")
+    fake_share = os.path.join(fake_tool_home, "share")
+    if not os.path.exists(fake_share) and os.path.isdir(real_share):
+        os.symlink(real_share, fake_share)
+
+
+def path_without(tool):
+    """A PATH like the current one with `tool` hidden, built from symlinks so
+    the python3 fallback branches of the gate run for real. The caller removes
+    the returned directory."""
+    import tempfile
+    shadow = tempfile.mkdtemp(prefix="clagentic-test-nopath-")
+    seen = set()
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            if name == tool or name in seen:
+                continue
+            seen.add(name)
+            try:
+                os.symlink(os.path.join(d, name), os.path.join(shadow, name))
+            except OSError:
+                continue
+    return shadow
+
+
+def stub_review_llm(tmpdir, envelope, record_meta=True):
+    """Stub llm-client.sh returning `envelope`. When asked it appends the same
+    TSV provenance line the real walk_chain writes, so the gates.sh side is
+    exercised end to end."""
+    import stat
+    scripts_dir = os.path.join(tmpdir, "scripts")
+    os.makedirs(scripts_dir, exist_ok=True)
+    stub = os.path.join(scripts_dir, "llm-client.sh")
+    with open(stub, "w") as f:
+        f.write(textwrap.dedent(f"""\
+            #!/usr/bin/env python3
+            import json, os, sys
+            data = sys.stdin.read()
+            meta = os.environ.get("CLAGENTIC_LLM_RUN_META_FILE")
+            if {record_meta!r} and meta:
+                with open(meta, "a") as m:
+                    m.write("\\t".join(["stub-model-1", "claude", "high", "ab" * 32,
+                                         "111", str(len(data.encode()))]) + "\\n")
+            sys.stdout.write(json.dumps({envelope!r}))
+        """))
+    os.chmod(stub, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)

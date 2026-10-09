@@ -33,13 +33,18 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_source_helpers import LLM_CLIENT_SH, PLATFORM_SH, REVIEW_MERGE_SH, source_env  # noqa: E402
-from test_review_recurrence_demotion import (  # noqa: E402
-    _RECURRING_FINDING,
-    _init_git_repo,
-    _setup_fake_tool_home,
-    _setup_project,
-    _stage_identical_recreation,
+from test_source_helpers import (  # noqa: E402
+    LLM_CLIENT_SH,
+    PLATFORM_SH,
+    RECURRING_FINDING as _RECURRING_FINDING,
+    REVIEW_MERGE_SH,
+    init_git_repo as _init_git_repo,
+    path_without,
+    setup_fake_tool_home as _setup_fake_tool_home,
+    setup_project as _setup_project,
+    source_env,
+    stage_identical_recreation as _stage_identical_recreation,
+    stub_review_llm as _stub_llm,
 )
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -79,25 +84,6 @@ def _dedup(findings, seen_path, mode, force_python=False):
         shutil.rmtree(work, ignore_errors=True)
         if shadow:
             shutil.rmtree(shadow, ignore_errors=True)
-
-
-def path_without(tool):
-    """A PATH like the current one with `tool` hidden, built from symlinks so
-    the python3 fallback branches of the gate run for real."""
-    shadow = tempfile.mkdtemp(prefix="clagentic-test-nopath-")
-    seen = set()
-    for d in os.environ.get("PATH", "").split(os.pathsep):
-        if not os.path.isdir(d):
-            continue
-        for name in os.listdir(d):
-            if name == tool or name in seen:
-                continue
-            seen.add(name)
-            try:
-                os.symlink(os.path.join(d, name), os.path.join(shadow, name))
-            except OSError:
-                continue
-    return shadow
 
 
 class TestDedupFindingsAnnotateMode(unittest.TestCase):
@@ -147,27 +133,6 @@ class TestDedupFindingsAnnotateMode(unittest.TestCase):
                 self.assertEqual(len(out), 2, "duplicate pair collapses to one")
                 self.assertIs(by_msg[_RECURRING_FINDING["message"]]["_seen_before"], True)
                 self.assertNotIn("_seen_before", by_msg["different"])
-
-
-def _stub_llm(tmpdir, envelope, record_meta=True):
-    """Stub llm-client.sh. When asked it appends the same TSV provenance line
-    the real walk_chain writes, so the gates.sh side is exercised end to end."""
-    scripts_dir = os.path.join(tmpdir, "scripts")
-    os.makedirs(scripts_dir, exist_ok=True)
-    stub = os.path.join(scripts_dir, "llm-client.sh")
-    with open(stub, "w") as f:
-        f.write(textwrap.dedent(f"""\
-            #!/usr/bin/env python3
-            import json, os, sys
-            data = sys.stdin.read()
-            meta = os.environ.get("CLAGENTIC_LLM_RUN_META_FILE")
-            if {record_meta!r} and meta:
-                with open(meta, "a") as m:
-                    m.write("\\t".join(["stub-model-1", "claude", "high", "ab" * 32,
-                                         "111", str(len(data.encode()))]) + "\\n")
-            sys.stdout.write(json.dumps({envelope!r}))
-        """))
-    os.chmod(stub, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
 
 
 def _run_review(tool_home, project, extra_env=None):
@@ -365,6 +330,9 @@ class TestLlmClientRecordsRunMeta(unittest.TestCase):
         env = os.environ.copy()
         env.update(source_env(llm_client=True))
         env.pop("CLAGENTIC_LLM_RUN_META_FILE", None)
+        # Sourcing llm-client.sh resolves REPO_ROOT and its audit.db from the
+        # cwd otherwise, i.e. the live checkout.
+        env["CLAGENTIC_PROJECT_ROOT"] = os.path.dirname(meta_path)
         if set_env:
             env["CLAGENTIC_LLM_RUN_META_FILE"] = meta_path
         return subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env,
