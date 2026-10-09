@@ -27,7 +27,7 @@ Keyword extraction is the simplest thing that works: strip stopwords from the pr
 | **Path normalization** | `pre-write-guard.sh` resolves relative paths against the repo root via `python3 os.path.realpath` before the W-002 "inside repo" check, so `../outside.txt` traversal blocks. |
 | **Override** | `CLAGENTIC_ALLOW_BASH_RULES=R-XXX` (comma-separated) in `.clagentic/config` or `~/.config/clagentic/lite/config`. Document the reason in your commit or PR body. Never edit `pre-bash-guard.sh` to remove a rule. |
 
-Bash rules (R-001 through R-020) implemented inline in `pre-bash-guard.sh`:
+Bash rules (R-001 through R-021) implemented inline in `pre-bash-guard.sh`:
 
 | ID | Pattern | Reason |
 |---|---|---|
@@ -51,6 +51,7 @@ Bash rules (R-001 through R-020) implemented inline in `pre-bash-guard.sh`:
 | R-018 | `> /dev/sda*` / `dd of=/dev/...` | disk-level write |
 | R-019 | `find ... -delete` without a literal (non-wildcard) `-path` constraint | unbounded delete |
 | R-020 | truncating `.env` / `*.pem` / `*.key` (`: > .env`, `truncate ... .env`) | credential destruction |
+| R-021 | The Builder role (an `agent_type` naming a builder, in any case) running a command that names `dispositions.json`, or a glob in the first segment under `.clagentic/`: the shell-channel half of W-007. No `CLAGENTIC_ALLOW_BASH_RULES` escape | the file clears the Builder's own findings; a static check of the command text, not a sandbox |
 
 Write rules (`pre-write-guard.sh`; the blocking rules exit 2, the two warn-only rules exit 0 and log a `warn` row to `audit.db`):
 
@@ -62,7 +63,7 @@ Write rules (`pre-write-guard.sh`; the blocking rules exit 2, the two warn-only 
 | W-004 | No writes to files matching `*.pem`, `*id_rsa*`, `*.key` | none |
 | W-005 | Warn only: editing `CLAUDE.md`, `.claude/settings.json`, `.claude/settings.local.json`, `.claude/hooks/*.sh`, or an MCP config mid-session invalidates Claude's prompt cache | none needed (does not block) |
 | W-006 | Warn only: a Write/Edit made by the main session rather than a dispatched subagent (no `agent_type` in the hook payload); prompts delegating code changes to the Builder | none needed (does not block) |
-| W-007 | The Builder role (an `agent_type` naming a builder) must not write `.clagentic/dispositions.json`: it is the operator's record of what was accepted, and gate code clears findings from it. Checked ahead of W-003 so the refusal names the rule | none for the Builder — print the gate's stanza for the operator to commit |
+| W-007 | The Builder role (an `agent_type` naming a builder, matched without regard to case or namespace) must not write `.clagentic/dispositions.json` (path compared without regard to case); R-021 is the same rule for the shell: it is the operator's record of what was accepted, and gate code clears findings from it. Checked ahead of W-003 so the refusal names the rule | none for the Builder — print the gate's stanza for the operator to commit |
 
 ## Gate 3 — Cross-CLI review
 
@@ -209,7 +210,7 @@ with every field: `share/dispositions.example.json`.
 | `id` | yes | Unique; the first entry with an id wins. |
 | `gates` | yes | Non-empty list of `review` / `adversarial`: the finding sources it applies to. |
 | `match.path_glob` | yes | Glob over the finding's normalized file, matched segment by segment: `*` and `?` stay within one path segment, a segment that is exactly `**` matches any number of segments (`src/**`, `**/gen/*.py`), `\` escapes the next character. `src/../x` is normalized before matching. Matching is linear-time, never a backtracking regex. |
-| `match.category` | yes | The finding's category, case-insensitive; `*` for any. A catch-all (`**` and `*`, no hint, no message) is invalid. |
+| `match.category` | yes | The finding's category, case-insensitive; `*` for any. A catch-all (a glob that matches every top-level name or every nested path, however spelled: `*`, `**`, `**/*`, `***`, `*/**`, with no hint and no message) is invalid; it is decided by running the compiled glob over probe paths, not by comparing spellings. |
 | `match.fingerprint_hint` | no | Lowercase hex prefix (8 to 64) of the finding's `fingerprint`; the exact stanza printed on a block carries one. |
 | `match.message` | no | The finding's message, whitespace- and case-normalized; used by migrated deferrals. |
 | `kind` | yes | `by_design`, `false_positive`, `accepted_risk` or `mitigated`. |
@@ -233,7 +234,8 @@ with every field: `share/dispositions.example.json`.
 3. `rationale`, `by` and `at` are required; an entry that fails validation is
    ignored, loudly, and the rest still apply. A file that cannot be parsed
    applies nothing. A symlink out of the repository is an error.
-4. The Builder role cannot write the file: `pre-write-guard` rule W-007.
+4. The Builder role cannot write the file: `pre-write-guard` rule W-007 for the
+   Write and Edit tools, `pre-bash-guard` rule R-021 for the shell.
 5. Cleared findings are always printed, with the entry's id, kind, who, when
    and rationale; the merge gate records them in the audit trail from the
    verdict.
@@ -255,7 +257,9 @@ could clear a reachable high-severity finding); `accepted-risks.md` is freetext
 that only the merge-gate model ever read and clears nothing; deferrals without
 `stable-contract` scope were prompt hints and are not migrated. Move them with
 `python3 plugins/clagentic-lite/bin/findings.py dispositions migrate --root .
---write`, review and commit the result, then delete the old files.
+--write`, review and commit the result, then delete the old files. If any
+entry cannot be migrated the command exits nonzero, writes nothing and does
+not advise deleting anything; fix the entries it names and run it again.
 `deferrals.json` is also still shown to the Reviewer as prompt context
 (allowlisted, sanitized and fenced as data by `ds_review_prompt`); that text
 carries no authority.
@@ -755,6 +759,7 @@ Publish failure never blocks ship — the same fallback contract as `_publish_re
 
 - `infra-degraded: all reviewer chain steps failed` — for degraded envelope path
 - `review-blocked: N finding(s) at >= THRESHOLD` — for real findings path
+- `review-blocked: the verdict could not be computed` — the finding pipeline refused the input or could not run (never printed as a finding count)
 
 Example query to distinguish failure classes:
 
