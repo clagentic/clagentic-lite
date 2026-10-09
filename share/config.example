@@ -536,7 +536,12 @@ CLAGENTIC_DEFAULT_BRANCH=main
 #     fix, or by kind "mitigated" naming the external control, never by
 #     by_design / false_positive / accepted_risk;
 #   - rationale, by and at are required; an invalid entry is ignored, loudly.
-# The Builder role is blocked from writing the file (pre-write-guard W-007).
+# The Builder role is blocked from writing the file through the Write and Edit
+# tools (pre-write-guard W-007) and through the shell (pre-bash-guard R-021,
+# which refuses any Builder command that names the file). Both are static
+# checks of what the tool call says, not a sandbox: they stop the ordinary
+# routes, and the review of the change that adds an entry is what a determined
+# bypass has to get past.
 #
 # Lint it:           clagentic-lite gates dispositions-lint
 # Migrate old files: python3 plugins/clagentic-lite/bin/findings.py dispositions migrate --root . --write

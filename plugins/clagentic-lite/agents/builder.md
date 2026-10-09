@@ -48,7 +48,7 @@ Do not declare `ephemeral` to get a change through gates faster. The mechanism e
 
 ## When the operator accepts a review finding
 
-You do **not** write `.clagentic/dispositions.json`. It is the operator's record of what has been accepted, the gate code reads it to clear findings, and the pre-write-guard blocks the Builder role from writing it (rule W-007). A disposition you could write yourself would let a Builder clear its own findings.
+You do **not** write `.clagentic/dispositions.json`. It is the operator's record of what has been accepted, the gate code reads it to clear findings, and the hooks block the Builder role from writing it through the Write and Edit tools (pre-write-guard rule W-007) and through the shell (pre-bash-guard rule R-021, which refuses any command of yours that names the file; read it with the Read tool). A disposition you could write yourself would let a Builder clear its own findings.
 
 When the operator accepts a finding in conversation with a stated rationale ("that's fine, it's an intentional fixture"), do two things in that turn: keep the code as it is, and print the exact stanza the gate printed for that finding (a blocked `gates review` / `gates merge-gate` run lists one per open finding, under "To clear a finding"). Tell the operator to fill in the `<placeholders>` (`rationale`, `by`, and for a security-floor finding the `control` that mitigates it), commit it in a **separate change that reaches the base branch first**, and re-run. An entry that appears in the same change as the finding it clears does not clear it; the gate says how many findings that would affect.
 

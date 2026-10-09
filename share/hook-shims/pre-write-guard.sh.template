@@ -190,13 +190,16 @@ esac
 # findings from it; a Builder that could write it could clear its own
 # findings. Placed ahead of W-003 so the refusal names the actual rule. The
 # role is read from agent_type (see the AGENT_TYPE capture above): a payload
-# whose agent_type names a builder is refused, whatever the exact namespace
-# ("clagentic-lite:builder" or "builder").
-case "$PATH_TARGET" in
+# whose agent_type names a builder is refused, whatever the exact namespace or
+# case ("clagentic-lite:builder", "Builder"). The path is compared in lower
+# case too: on a case-insensitive filesystem "Dispositions.JSON" is the same
+# file. pre-bash-guard R-021 is the same rule for the shell channel.
+_pwg_target_lc=$(printf '%s' "$PATH_TARGET" | tr '[:upper:]' '[:lower:]')
+case "$_pwg_target_lc" in
   */.clagentic/dispositions.json)
-    case "$AGENT_TYPE" in
-      *builder*) block W-007 "the Builder role must not write .clagentic/dispositions.json; print the gate's stanza for the operator to commit instead" ;;
-    esac
+    if ds_agent_is_builder "$AGENT_TYPE"; then
+      block W-007 "the Builder role must not write .clagentic/dispositions.json; print the gate's stanza for the operator to commit instead"
+    fi
     ;;
 esac
 
