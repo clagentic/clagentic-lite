@@ -246,14 +246,35 @@ _gate_check_args() {
   _gca_posname="$3"
   shift 3
   _gca_usage="usage: gates.sh $_gca_sub"
-  for _gca_f in $_gca_flags; do _gca_usage="$_gca_usage [$_gca_f]"; done
+  # A flag listed with a trailing '=' takes a value, given as the next argument
+  # or as --flag=VALUE.
+  for _gca_f in $_gca_flags; do
+    case "$_gca_f" in
+      *=) _gca_usage="$_gca_usage [${_gca_f%=} VALUE]" ;;
+      *) _gca_usage="$_gca_usage [$_gca_f]" ;;
+    esac
+  done
   [ -n "$_gca_posname" ] && _gca_usage="$_gca_usage [$_gca_posname]"
   _gca_pos=0
+  _gca_want_value=""
   for _gca_arg in "$@"; do
+    if [ -n "$_gca_want_value" ]; then
+      _gca_want_value=""
+      continue
+    fi
     case "$_gca_arg" in
       -*)
+        # The argument is quoted inside the patterns: unquoted, a '*' or '?' in
+        # it would match any listed flag.
         case " $_gca_flags " in
-          *" $_gca_arg "*) continue ;;
+          *" ""$_gca_arg"" "*) continue ;;
+        esac
+        _gca_name=${_gca_arg%%=*}
+        case " $_gca_flags " in
+          *" ""$_gca_name""= "*)
+            [ "$_gca_name" != "$_gca_arg" ] || _gca_want_value="$_gca_name"
+            continue
+            ;;
         esac
         printf "gates.sh %s: unknown option '%s'\n%s\n" "$_gca_sub" "$_gca_arg" "$_gca_usage" 1>&2
         return 2
@@ -267,6 +288,10 @@ _gate_check_args() {
         ;;
     esac
   done
+  if [ -n "$_gca_want_value" ]; then
+    printf "gates.sh %s: option '%s' needs a value\n%s\n" "$_gca_sub" "$_gca_want_value" "$_gca_usage" 1>&2
+    return 2
+  fi
   return 0
 }
 
@@ -4478,10 +4503,13 @@ _invariant_feed_distill() {
 # disposition clears. Annotates the envelope's findings with their fingerprint
 # and disposition. The verdict text goes to stderr.
 #
-# Sets _RCV_BLOCKERS to the number of open blocking findings, or to 99 when no
-# verdict could be computed (the pipeline refused the input or could not run):
-# a verdict that was not computed is a block, never a pass. Always returns 0 so
-# a caller under `set -e` reads the number, not an exit status.
+# Sets _RCV_COMPUTED to 1 and _RCV_BLOCKERS to the number of open blocking
+# findings when a verdict was computed. When none could be (the pipeline refused
+# the input or could not run) _RCV_COMPUTED is 0 and _RCV_BLOCKERS is the
+# sentinel 99, which is never a finding count: a verdict that was not computed
+# is a block, never a pass. Callers decide through _review_verdict_blocks,
+# which treats anything but a computed zero as a block. Always returns 0 so a
+# caller under `set -e` reads the variables, not an exit status.
 _review_code_verdict() {
   _rcv_env="$1"
   _rcv_base="$2"
@@ -4489,18 +4517,43 @@ _review_code_verdict() {
   _rcv_text=$(_gate_evaluate review "$_rcv_env" "$_rcv_base" gate --annotate "$_rcv_env") || _rcv_rc=$?
   [ -z "$_rcv_text" ] || printf '%s\n' "$_rcv_text" 1>&2
   _RCV_BLOCKERS=99
+  _RCV_COMPUTED=0
   case "$_rcv_rc" in
-    0) _RCV_BLOCKERS=0 ;;
+    0) _RCV_BLOCKERS=0; _RCV_COMPUTED=1 ;;
     1)
       _rcv_n=${_rcv_text#VERDICT: BLOCKED (}
       _rcv_n=${_rcv_n%% *}
-      case "$_rcv_n" in ''|*[!0-9]*) _rcv_n=99 ;; esac
-      [ "$_rcv_n" -gt 0 ] || _rcv_n=99
-      _RCV_BLOCKERS=$_rcv_n
+      case "$_rcv_n" in
+        ''|*[!0-9]*) ;;
+        0) ;;
+        *) _RCV_BLOCKERS=$_rcv_n; _RCV_COMPUTED=1 ;;
+      esac
       ;;
     *) printf '[gates/review] the code verdict could not be computed; treating the review as blocked\n' 1>&2 ;;
   esac
   return 0
+}
+
+# _review_verdict_blocks — success (block) unless _review_code_verdict computed
+# a verdict with zero open blocking findings. An unset, empty or non-numeric
+# count blocks: the old `${BLOCKERS:-0}` read the same states as a pass.
+_review_verdict_blocks() {
+  [ "${_RCV_COMPUTED:-}" = "1" ] || return 0
+  case "${_RCV_BLOCKERS:-}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_RCV_BLOCKERS" -gt 0 ]
+}
+
+# _review_blocked_reason THRESHOLD log|say — what to record (log: the audit-row
+# details) or print (say) about a blocked review. The sentinel is never
+# printed as a finding count.
+_review_blocked_reason() {
+  if [ "${_RCV_COMPUTED:-}" != "1" ]; then
+    printf 'the verdict could not be computed'
+  elif [ "$2" = "log" ]; then
+    printf '%s finding(s) at >= %s' "$_RCV_BLOCKERS" "$1"
+  else
+    printf "%s finding(s) at or above severity '%s'" "$_RCV_BLOCKERS" "$1"
+  fi
 }
 
 cmd_review() {
@@ -4825,10 +4878,9 @@ cmd_review() {
 
       THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
       _review_code_verdict "$OUT" "$_crv_base_sha"
-      BLOCKERS=$_RCV_BLOCKERS
-      if [ "${BLOCKERS:-0}" -gt 0 ]; then
-        cmd_log_run review block "review-blocked: $BLOCKERS finding(s) at >= $THRESHOLD"
-        echo "[gates/review] REVIEW_BLOCKED: $BLOCKERS finding(s) at or above severity '$THRESHOLD'." 1>&2
+      if _review_verdict_blocks; then
+        cmd_log_run review block "review-blocked: $(_review_blocked_reason "$THRESHOLD" log)"
+        echo "[gates/review] REVIEW_BLOCKED: $(_review_blocked_reason "$THRESHOLD" say)." 1>&2
         cmd_render_review "$OUT" 1>&2
         _ledger_record_review_verdict review "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
         rm -f "$_crv_diff_tmp"
@@ -4963,10 +5015,9 @@ cmd_review() {
   # ones a merged disposition clears) at or above the configured threshold.
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
   _review_code_verdict "$OUT" "$_crv_base_sha"
-  BLOCKERS=$_RCV_BLOCKERS
-  if [ "${BLOCKERS:-0}" -gt 0 ]; then
-    cmd_log_run review block "review-blocked: $BLOCKERS finding(s) at >= $THRESHOLD"
-    echo "[gates/review] REVIEW_BLOCKED: $BLOCKERS finding(s) at or above severity '$THRESHOLD'." 1>&2
+  if _review_verdict_blocks; then
+    cmd_log_run review block "review-blocked: $(_review_blocked_reason "$THRESHOLD" log)"
+    echo "[gates/review] REVIEW_BLOCKED: $(_review_blocked_reason "$THRESHOLD" say)." 1>&2
     cmd_render_review "$OUT" 1>&2
     _ledger_record_review_verdict review "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
     rm -f "$_crv_diff_tmp"
@@ -5389,6 +5440,72 @@ _sanitize_adversarial_findings_json() {
   _llm_json_array_sanitize_fields_strict "$_safj_json" file category message
 }
 
+# The adversarial audit's findings are added to HEAD's accumulated set (the
+# code verdict). When that cannot be done, a marker naming HEAD is left and the
+# merge gate refuses while it matches HEAD; a later successful record removes
+# it. The stamp the marker is written with and the stamp the merge gate
+# compares it to come from the one function below, so the two cannot drift
+# apart and leave a refusal that never fires.
+#
+# Exit status of cmd_adversarial (and of _adv_record_findings) when the
+# findings could not be recorded and the marker could not be written either:
+# nothing then makes the merge gate refuse, so the run itself fails loudly.
+_ADV_UNRECORDED_RC=4
+
+_adv_unrecorded_marker_path() {
+  printf '%s/.clagentic/lite/adversarial-unrecorded' "$REPO_ROOT"
+}
+
+_adv_unrecorded_stamp() {
+  _git_repo_scoped_head_sha
+}
+
+# Success when an unrecorded-findings marker for the current HEAD stands. A
+# marker that cannot be read counts as standing: not knowing is a refusal.
+_adv_unrecorded_pending() {
+  _aup_marker=$(_adv_unrecorded_marker_path)
+  [ -f "$_aup_marker" ] || return 1
+  _aup_have=$(cat "$_aup_marker") || return 0
+  [ "$_aup_have" = "$(_adv_unrecorded_stamp)" ]
+}
+
+_adv_unrecorded_mark() {
+  _aum_stamp=$(_adv_unrecorded_stamp)
+  printf '%s\n' "$_aum_stamp" > "$(_adv_unrecorded_marker_path)"
+}
+
+# _adv_record_findings FINDINGS_FILE BASE_SHA [quiet]
+#
+# Records FINDINGS_FILE (the audit's structured findings; an empty audit is a
+# run on record with no findings) in the code verdict. Returns 0 when recorded,
+# or when it was not but the marker now makes the merge gate refuse; returns
+# _ADV_UNRECORDED_RC when neither could be done. The verdict text goes to
+# stderr unless "quiet".
+_adv_record_findings() {
+  _arf_file="$1"
+  _arf_base="$2"
+  _arf_quiet="${3:-}"
+  _arf_rc=0
+  _arf_text=$(_gate_evaluate adversarial "$_arf_file" "$_arf_base" gate) || _arf_rc=$?
+  case "$_arf_rc" in
+    0|1)
+      if [ -z "$_arf_quiet" ] && [ -n "$_arf_text" ]; then
+        printf '%s\n' "$_arf_text" 1>&2
+      fi
+      rm -f "$(_adv_unrecorded_marker_path)"
+      return 0
+      ;;
+  esac
+  if _adv_unrecorded_mark; then
+    cmd_log_run adversarial warn "adversarial findings could not be recorded for the code verdict (status=$_arf_rc); the merge gate will refuse"
+    echo "[gates/adversarial] WARN: adversarial findings could not be recorded for the code verdict; the merge gate will refuse until this is fixed." 1>&2
+    return 0
+  fi
+  cmd_log_run adversarial block "adversarial findings could not be recorded (status=$_arf_rc) and the unrecorded marker could not be written; nothing will make the merge gate refuse"
+  echo "[gates/adversarial] ERROR: adversarial findings could not be recorded for the code verdict, and the marker that makes the merge gate refuse could not be written either. Fix the write access to $(_adv_unrecorded_marker_path) and re-run gates adversarial." 1>&2
+  return "$_ADV_UNRECORDED_RC"
+}
+
 cmd_adversarial() {
   _gate_check_args adversarial "--full-review" "" "$@" || return 2
   # --full-review: gates.sh's dispatcher now forwards argv
@@ -5464,8 +5581,15 @@ cmd_adversarial() {
     _adv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
     _adv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_adv_fetch_timeout")
     # An empty audit is still a run on record (with no findings), so the merge
-    # gate's "an adversarial run is on record" requirement holds for it.
-    _gate_evaluate adversarial "$FINDINGS_OUT" "$_adv_base_sha" gate >/dev/null || :
+    # gate's "an adversarial run is on record" requirement holds for it. A
+    # failure to record it is handled exactly as on the main path: a marker
+    # that makes the merge gate refuse, or a hard error when that fails too.
+    _adv_record_rc=0
+    _adv_record_findings "$FINDINGS_OUT" "$_adv_base_sha" quiet || _adv_record_rc=$?
+    if [ "$_adv_record_rc" -ne 0 ]; then
+      rm -f "$_adv_diff_tmp"
+      return "$_adv_record_rc"
+    fi
     _ledger_record_review_verdict adversarial "$OUT" "$_adv_diff_tmp" "skip" "$_adv_base_sha" "$_adv_sha"
     rm -f "$_adv_diff_tmp"
     cat "$OUT"
@@ -5664,21 +5788,13 @@ cmd_adversarial() {
   # to record is not silent: it leaves a marker naming this HEAD, and the merge
   # gate refuses while the marker matches HEAD (a later successful run removes
   # it).
-  _adv_unrecorded_marker="$REPO_ROOT/.clagentic/lite/adversarial-unrecorded"
   if [ "$_adv_degraded" -ne 1 ] && [ "$_adv_findings_degraded" != "true" ]; then
-    _adv_ev_rc=0
-    _adv_ev_text=$(_gate_evaluate adversarial "$FINDINGS_OUT" "$_adv_base_sha" gate) || _adv_ev_rc=$?
-    case "$_adv_ev_rc" in
-      0|1)
-        [ -z "$_adv_ev_text" ] || printf '%s\n' "$_adv_ev_text" 1>&2
-        rm -f "$_adv_unrecorded_marker"
-        ;;
-      *)
-        printf '%s\n' "$_adv_sha" > "$_adv_unrecorded_marker" 2>/dev/null || :
-        cmd_log_run adversarial warn "adversarial findings could not be recorded for the code verdict (status=$_adv_ev_rc); the merge gate will refuse"
-        echo "[gates/adversarial] WARN: adversarial findings could not be recorded for the code verdict; the merge gate will refuse until this is fixed." 1>&2
-        ;;
-    esac
+    _adv_record_rc=0
+    _adv_record_findings "$FINDINGS_OUT" "$_adv_base_sha" || _adv_record_rc=$?
+    if [ "$_adv_record_rc" -ne 0 ]; then
+      rm -f "$_adv_diff_tmp"
+      return "$_adv_record_rc"
+    fi
   fi
 
   # cmd_adversarial can no longer report a clean audit when the auditor was
@@ -5893,7 +6009,10 @@ cmd_merge_gate() {
       _mg_cached_details=${_mg_cached#*|}
       case "$_mg_cached_details" in
         *"[state=${_mg_state_id}]"*)
-          if [ "$_mg_cached_outcome" = "pass" ]; then
+          # A cached pass does not outlive an adversarial run at this state
+          # whose findings could not be recorded: that falls through to the
+          # full path, which refuses on the marker.
+          if [ "$_mg_cached_outcome" = "pass" ] && ! _adv_unrecorded_pending; then
             printf '[gates/merge-gate] already passed for this exact commit+content state — no-op (state=%s)\n' "$_mg_state_id" 1>&2
             if [ -f "$OUT" ]; then
               cat "$OUT"
@@ -6017,8 +6136,7 @@ except Exception:
   # PASS the model receives the verdict and the applied dispositions in the
   # payload (code_verdict) and may only ADD a refusal. A verdict that cannot be
   # computed refuses: the merge gate does not run without one.
-  _mg_marker="$REPO_ROOT/.clagentic/lite/adversarial-unrecorded"
-  if [ -f "$_mg_marker" ] && [ "$(cat "$_mg_marker" 2>/dev/null)" = "$(_git_repo_scoped_head_sha)" ]; then
+  if _adv_unrecorded_pending; then
     _mg_refuse_code "the adversarial findings at this HEAD could not be recorded, so the code verdict is incomplete; re-run gates adversarial" "" "$_mg_gate_name"
     return $?
   fi
@@ -7507,11 +7625,21 @@ cmd_deferrals_lint() {
 # (fail closed). Options are findings.py evaluate's; --root defaults to this
 # repository.
 cmd_evaluate() {
-  case " $* " in *" --root "*) ;; *) set -- --root "$REPO_ROOT" "$@" ;; esac
-  case " $* " in
-    *" --no-input "*) ds_findings_call -e any -o 1 evaluate "$@" ;;
-    *) ds_findings_call -s -e any -o 1 evaluate "$@" ;;
-  esac
+  _gate_check_args evaluate "--no-input --json --gate= --format= --scope= --caller= --root= --head= --base= --default-branch= --threshold= --today= --annotate= --attach-to= --json-out=" "" "$@" || return 2
+  _ev_has_root=0
+  _ev_no_input=0
+  for _ev_arg in "$@"; do
+    case "$_ev_arg" in
+      --root|--root=*) _ev_has_root=1 ;;
+      --no-input) _ev_no_input=1 ;;
+    esac
+  done
+  [ "$_ev_has_root" = "1" ] || set -- --root "$REPO_ROOT" "$@"
+  if [ "$_ev_no_input" = "1" ]; then
+    ds_findings_call -e any -o 1 evaluate "$@"
+  else
+    ds_findings_call -s -e any -o 1 evaluate "$@"
+  fi
 }
 
 # cmd_audit_vocab_lint [FILE] (lr-7047bf, foundry sub-class 1.6-1.11; widened
@@ -7827,6 +7955,14 @@ cmd_ship() {
     _adv_watermark=$(_manifest_audit_watermark)
     _adv_rc=0
     cmd_adversarial || _adv_rc=$?
+    if [ "$_adv_rc" -eq "$_ADV_UNRECORDED_RC" ]; then
+      # Not recorded and no marker to make the merge gate refuse: ship must
+      # not go on as if the audit were on record.
+      _manifest_record_llm_gate adversarial auditor failed "$_adv_watermark" "adversarial findings could not be recorded"
+      echo "[gates/ship] BLOCKED at adversarial: its findings could not be recorded"; ship_step_hint
+      _manifest_finalize "$_SHIP_DECLARED_GATES"
+      exit 1
+    fi
     if [ "$_adv_rc" -eq 2 ]; then
       _manifest_record_llm_gate adversarial auditor degraded "$_adv_watermark" "adversarial ran degraded (non-blocking)"
     else
