@@ -17,11 +17,11 @@
 #
 # Dependencies:
 #   Required: git, awk, sed (via platform.sh shims), wc, python3 (every JSON
-#             operation; see ds_findings_run in platform.sh, which fails closed
+#             operation; see ds_findings_call in platform.sh, which fails closed
 #             and says so when python3 is missing)
 #   Optional: sha256sum or shasum (soft; identity fallback when both absent)
 #
-# This module needs platform.sh sourced first (ds_findings_run, ds_file_size).
+# This module needs platform.sh sourced first (ds_findings_call, ds_file_size).
 # It does NOT source memory.sh or llm-client.sh, and does NOT call
 # ds_audit_log (audit stays in gates.sh).
 
@@ -263,9 +263,12 @@ merge_envelopes() {
   _me_dir="$1"
   _me_strategy="${2:-location}"
   _me_rc=0
-  _me_out=$(ds_findings_run ingest merge "$_me_dir" --strategy "$_me_strategy") || _me_rc=$?
+  # Status 1 is the stage's own "no valid envelopes" answer and comes with its
+  # degraded envelope; any other failure comes with no output at all, and the
+  # primitive has already said why on stderr.
+  _me_out=$(ds_findings_call -e object -o 1 ingest merge "$_me_dir" --strategy "$_me_strategy") || _me_rc=$?
   if [ -z "$_me_out" ]; then
-    printf '{"degraded":true,"chunked":true,"chunks":0,"chunks_degraded":0,"summary":"[clagentic-lite degraded] python3 (the finding pipeline) unavailable for merge_envelopes","checked":[],"findings":[]}\n'
+    printf '{"degraded":true,"chunked":true,"chunks":0,"chunks_degraded":0,"summary":"[clagentic-lite degraded] the finding pipeline failed or is unavailable for merge_envelopes","checked":[],"findings":[]}\n'
     return 1
   fi
   printf '%s\n' "$_me_out"
@@ -294,8 +297,16 @@ dedup_findings() {
   _df_seen="$2"
   _df_difffile="${3:-}"
   _df_mode="${4:-drop}"
-  ds_findings_run fingerprint dedup --strategy "$_df_strategy" --seen "$_df_seen" \
-    --diff "$_df_difffile" --mode "$_df_mode" || cat
+  # stdin is read ONCE, here: a stage that fails after consuming a pipe leaves
+  # nothing to pass through, so the findings are held to print unchanged if the
+  # pipeline fails. Passing them through drops nothing and so can only keep a
+  # finding blocking; ds_findings_call prints nothing on failure, so the
+  # passthrough is never appended to partial output.
+  _df_input=$(cat)
+  ds_findings_call -t "$_df_input" -e any fingerprint dedup --strategy "$_df_strategy" \
+    --seen "$_df_seen" --diff "$_df_difffile" --mode "$_df_mode" \
+    || printf '%s\n' "$_df_input"
+  return 0
 }
 
 # ------------------------------------------------------------ finding_content_keys --
@@ -310,7 +321,10 @@ dedup_findings() {
 # The key is the SAME one dedup_findings' content-hash strategy computes, so a
 # key here is directly comparable to one persisted in a SEEN_FILE.
 finding_content_keys() {
-  ds_findings_run fingerprint keys --diff "$1" || return 0
+  # A failed pipeline yields no rows (and ds_findings_call says why on stderr).
+  # No key means no recurrence count, so no demotion: the direction that keeps
+  # a finding blocking.
+  ds_findings_call -s -e any fingerprint keys --diff "$1" || return 0
 }
 
 # ------------------------------------------------------- finding_recurrence_bump --
@@ -324,7 +338,18 @@ finding_content_keys() {
 #         count 1 and is not persisted; an unreadable COUNTS_FILE reads as
 #         empty, so a count can only be undercounted, which can only under-demote.
 finding_recurrence_bump() {
-  ds_findings_run fingerprint bump "$1"
+  _frb_input=$(cat)
+  if ds_findings_call -t "$_frb_input" -e any fingerprint bump "$1"; then
+    return 0
+  fi
+  # Failed pipeline: every row gets count 1, the documented undercount, which
+  # can only under-demote. Nothing was printed by the failed call.
+  printf '%s\n' "$_frb_input" | while IFS= read -r _frb_row; do
+    if [ -n "$_frb_row" ]; then
+      printf '%s\t1\n' "$_frb_row"
+    fi
+  done
+  return 0
 }
 
 # ------------------------------------------------------------- ledger_append --
@@ -345,7 +370,9 @@ ledger_append() {
   _la_line="$2"
   _la_max="${3:-0}"
   case "$_la_max" in ''|*[!0-9]*) _la_max=0 ;; esac
-  printf '%s' "$_la_line" | ds_findings_run verdict ledger-append "$_la_file" "$_la_max" || :
+  # A lost entry only forces a fresh full-range review next round; the failure
+  # is reported on stderr by ds_findings_call and never changes a verdict.
+  ds_findings_call -t "$_la_line" -e any verdict ledger-append "$_la_file" "$_la_max" || :
   return 0
 }
 
@@ -360,7 +387,10 @@ ledger_entries_for_branch() {
   _lefb_file="$1"
   _lefb_branch="$2"
   [ -f "$_lefb_file" ] || return 0
-  ds_findings_run verdict ledger-entries "$_lefb_file" "$_lefb_branch" || :
+  # A failed pipeline yields no entries, which every reader treats as "no
+  # anchored verdict": the fail-closed answer. The cause is reported on stderr
+  # by ds_findings_call, so the failure is not mistaken for an empty ledger.
+  ds_findings_call -e any verdict ledger-entries "$_lefb_file" "$_lefb_branch" || :
   return 0
 }
 

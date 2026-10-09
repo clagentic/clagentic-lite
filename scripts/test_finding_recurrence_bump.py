@@ -37,7 +37,9 @@ def sh(script, stdin=None):
 
 
 def source_and_run(fn_call, stdin=None):
+    # The finding pipeline is found only under the tool home.
     script = textwrap.dedent(f"""\
+        TOOL_HOME='{os.path.abspath(TOOL_HOME)}'
         . '{PLATFORM_SH}'
         ds_load_env 2>/dev/null || true
         . '{RM_SH}'

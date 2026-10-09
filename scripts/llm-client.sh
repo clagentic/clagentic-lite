@@ -286,12 +286,22 @@ ds_review_prompt() {
     # allowed fields, no drops needed), so "changed vs unchanged" is not a
     # reliable proxy for "did decompose succeed" the way it was for the
     # single-stage sanitize-only pipeline this replaces.
+    # Status 1 is the stage's "not an array" answer; any other nonzero status
+    # is a pipeline failure (python3 or findings.py missing, a crash) and is
+    # reported on stderr by ds_findings_call. A failure must not read as "not
+    # an array": it omits the deferrals, like every other failed step here.
     _drp_deferrals_is_array=0
-    if printf '%s' "$_drp_deferrals" | ds_findings_run ingest is-array 2>/dev/null; then
-      _drp_deferrals_is_array=1
-    fi
+    _drp_isarray_rc=0
+    ds_findings_call -t "$_drp_deferrals" -e any -o 1 ingest is-array || _drp_isarray_rc=$?
+    case "$_drp_isarray_rc" in
+      0) _drp_deferrals_is_array=1 ;;
+      1) ;;
+      *) _drp_deferrals_failed=1 ;;
+    esac
 
-    if [ "$_drp_deferrals_is_array" = "1" ]; then
+    if [ "$_drp_deferrals_failed" = "1" ]; then
+      _drp_deferrals_clean=""
+    elif [ "$_drp_deferrals_is_array" = "1" ]; then
       # Field set extended lr-2ebc41: message/scope/file_sha256 added
       # alongside the original six lr-c567 fields. message/scope/
       # file_sha256 exist for the GATE-CODE match path

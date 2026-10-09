@@ -94,6 +94,8 @@ def _sh(script, env=None):
     full_env = os.environ.copy()
     for key in [k for k in full_env if k.startswith("CLAGENTIC_")]:
         del full_env[key]
+    # The finding pipeline is found only under the tool home.
+    full_env["TOOL_HOME"] = os.path.abspath(TOOL_HOME)
     if env:
         full_env.update(env)
     return subprocess.run(

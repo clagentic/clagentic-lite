@@ -978,11 +978,14 @@ ds_pending_reset() {
 
 # ds_findings_py — print the path of the standalone finding pipeline
 # (plugins/clagentic-lite/bin/findings.py), or return 1 when it cannot be
-# found. A sourced POSIX sh file cannot learn its own path, so the lookup
-# tries, in order: the tool home the sourcing script resolved (TOOL_HOME, and
-# _DS_REAL_HOME for a script reached through a symlinked copy);
-# CLAGENTIC_LITE_HOME; then a walk up from $PWD, which is what finds it for a
-# file sourced directly from inside a checkout.
+# found. The pipeline decides every gate verdict, so it is only ever taken
+# from the tool's own install: the tool home the sourcing script resolved
+# (TOOL_HOME, and _DS_REAL_HOME for a script reached through a symlinked
+# copy), CLAGENTIC_LITE_HOME, or CLAUDE_PLUGIN_ROOT for an agent running from
+# the rendered plugin. There is deliberately no walk up from $PWD: the working
+# directory is the repository under review, and a findings.py found there
+# would be attacker-supplied code that decides whether the gate passes (the
+# same rule ds_prompt_source applies to prompts).
 ds_findings_py() {
   _dfp_rel="plugins/clagentic-lite/bin/findings.py"
   for _dfp_home in "${TOOL_HOME:-}" "${_DS_REAL_HOME:-}" "${CLAGENTIC_LITE_HOME:-}"; do
@@ -991,34 +994,175 @@ ds_findings_py() {
       return 0
     fi
   done
-  _dfp_dir="$PWD"
-  while :; do
-    if [ -f "$_dfp_dir/$_dfp_rel" ]; then
-      printf '%s' "$_dfp_dir/$_dfp_rel"
-      return 0
-    fi
-    [ "$_dfp_dir" = "/" ] && break
-    _dfp_dir=$(dirname "$_dfp_dir")
-  done
+  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "$CLAUDE_PLUGIN_ROOT/bin/findings.py" ]; then
+    printf '%s' "$CLAUDE_PLUGIN_ROOT/bin/findings.py"
+    return 0
+  fi
   return 1
 }
 
 # ds_findings_run STAGE OP [ARGS...] — run the finding pipeline. python3 is
-# REQUIRED for every finding decision; without it (or without the pipeline
-# file) this prints one loud line and returns 1, and every caller treats a
-# nonzero status as its existing fail-closed answer (severity_blockers prints
-# its 99 sentinel, the ledger reads report no anchored verdict). stdin and
-# stdout pass through, so payloads of any size stay off argv.
+# REQUIRED for every finding decision. Without it this prints one loud line
+# and returns 127; without the pipeline file, 126. Any other status is the
+# stage's own. stdin and stdout pass through, so payloads of any size stay off
+# argv. Gate code does not call this directly: ds_findings_call (below) wraps
+# it so a failure can never leave partial output behind or read as clean.
 ds_findings_run() {
   if ! command -v python3 >/dev/null 2>&1; then
     printf '[clagentic-lite] python3 is required for the finding pipeline and was not found on PATH (install python3: apt install python3 | brew install python3); failing closed.\n' 1>&2
-    return 1
+    return 127
   fi
   _dfr_py=$(ds_findings_py) || {
-    printf '[clagentic-lite] finding pipeline plugins/clagentic-lite/bin/findings.py not found (reinstall: clagentic-lite update); failing closed.\n' 1>&2
-    return 1
+    printf '[clagentic-lite] finding pipeline plugins/clagentic-lite/bin/findings.py not found under the tool home (set CLAGENTIC_LITE_HOME or reinstall: clagentic-lite update); failing closed.\n' 1>&2
+    return 126
   }
   python3 "$_dfr_py" "$@"
+}
+
+# ds_findings_call [-i FILE | -t TEXT | -s] [-e KIND] [-o "RC..."] STAGE OP [ARGS...]
+#
+# THE one way gate code runs a finding-pipeline stage. It exists because every
+# caller used to write its own "run it, and if that fails do something else"
+# around ds_findings_run, and the variants were wrong in the same few ways: a
+# fallback that read a pipe the stage had already consumed, a fallback printed
+# after the stage had already written partial output, an empty result read as
+# "no findings", and every failure reported as one assumed cause. This
+# primitive makes those shapes impossible:
+#
+#   - the stage's input comes from a file (-i FILE), from TEXT held in a shell
+#     variable (-t TEXT, written to a temp file with the printf builtin, so it
+#     never rides argv), or from this function's own stdin copied to a temp
+#     file first (-s); with none of those it gets no input
+#   - the stage's stdout goes to a temp file, and is printed ONLY when the
+#     status is acceptable and the output is well-formed for KIND; otherwise
+#     nothing is printed at all
+#   - on failure it says which cause it was (python3 missing, pipeline file
+#     missing, or the stage's own status) on stderr and returns nonzero
+#
+# KIND (-e) names what "well-formed" means for this stage's stdout:
+#   nonempty (default)  at least one byte
+#   any                 may legitimately be empty
+#   array | object | string   a JSON value of that shape, bracket-checked
+#   array_or_null       a JSON array or the literal null
+#   int                 digits only
+#   ints3               three space-separated integers
+# -o lists extra statuses that are a real answer, not a failure (a predicate
+# stage exiting 1, a merge stage exiting 1 with its degraded envelope); the
+# stage's output is then printed and that status is returned. Status 0 is
+# always acceptable. Callers take their own documented fail-closed branch on a
+# nonzero return and must NOT try to print a fallback after partial output:
+# there is none.
+ds_findings_call() {
+  _dfc_in=""
+  _dfc_text=""
+  _dfc_has_text=0
+  _dfc_from_stdin=0
+  _dfc_kind="nonempty"
+  _dfc_ok_rcs=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -i) _dfc_in="$2"; shift 2 ;;
+      -t) _dfc_text="$2"; _dfc_has_text=1; shift 2 ;;
+      -s) _dfc_from_stdin=1; shift ;;
+      -e) _dfc_kind="$2"; shift 2 ;;
+      -o) _dfc_ok_rcs="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  if [ $# -lt 2 ]; then
+    printf '[clagentic-lite] ds_findings_call needs STAGE and OP; failing closed.\n' 1>&2
+    return 1
+  fi
+  _dfc_label="$1 $2"
+
+  _dfc_dir=$(mktemp -d -t clagentic-findings.XXXXXX 2>/dev/null) || {
+    printf '[clagentic-lite] finding pipeline %s: could not create a temp directory; failing closed.\n' "$_dfc_label" 1>&2
+    return 1
+  }
+  _dfc_stdin_file="$_dfc_dir/in"
+  _dfc_out="$_dfc_dir/out"
+  if [ "$_dfc_from_stdin" = "1" ]; then
+    cat > "$_dfc_stdin_file" || {
+      rm -f "$_dfc_stdin_file" "$_dfc_out"; rmdir "$_dfc_dir"
+      printf '[clagentic-lite] finding pipeline %s: could not stage its input; failing closed.\n' "$_dfc_label" 1>&2
+      return 1
+    }
+  elif [ "$_dfc_has_text" = "1" ]; then
+    printf '%s' "$_dfc_text" > "$_dfc_stdin_file" || {
+      rm -f "$_dfc_stdin_file" "$_dfc_out"; rmdir "$_dfc_dir"
+      printf '[clagentic-lite] finding pipeline %s: could not stage its input; failing closed.\n' "$_dfc_label" 1>&2
+      return 1
+    }
+  elif [ -n "$_dfc_in" ]; then
+    _dfc_stdin_file="$_dfc_in"
+  else
+    _dfc_stdin_file=/dev/null
+  fi
+
+  _dfc_rc=0
+  ds_findings_run "$@" < "$_dfc_stdin_file" > "$_dfc_out" || _dfc_rc=$?
+
+  _dfc_accept=0
+  if [ "$_dfc_rc" -eq 0 ]; then
+    _dfc_accept=1
+  else
+    for _dfc_okrc in $_dfc_ok_rcs; do
+      [ "$_dfc_rc" -eq "$_dfc_okrc" ] && _dfc_accept=1
+    done
+  fi
+
+  _dfc_final=0
+  if [ "$_dfc_accept" -eq 0 ]; then
+    case "$_dfc_rc" in
+      127) _dfc_cause="python3 is not installed" ;;
+      126) _dfc_cause="the pipeline file findings.py was not found" ;;
+      *) _dfc_cause="the stage failed" ;;
+    esac
+    printf '[clagentic-lite] finding pipeline %s: %s (rc=%s); its output was discarded.\n' "$_dfc_label" "$_dfc_cause" "$_dfc_rc" 1>&2
+    _dfc_final=$_dfc_rc
+  elif ! _ds_findings_well_formed "$_dfc_kind" "$_dfc_out"; then
+    printf '[clagentic-lite] finding pipeline %s: exited %s but its output is not a well-formed %s; discarded.\n' "$_dfc_label" "$_dfc_rc" "$_dfc_kind" 1>&2
+    _dfc_final=1
+  else
+    cat "$_dfc_out"
+    _dfc_final=$_dfc_rc
+  fi
+
+  if [ "$_dfc_from_stdin" = "1" ] || [ "$_dfc_has_text" = "1" ]; then
+    rm -f "$_dfc_stdin_file"
+  fi
+  rm -f "$_dfc_out"
+  rmdir "$_dfc_dir" 2>/dev/null || :
+  return "$_dfc_final"
+}
+
+# _ds_findings_well_formed KIND FILE — the output check ds_findings_call
+# applies. Shape only: the stages validate content themselves; this catches an
+# empty or truncated result a status of 0 would otherwise let through.
+_ds_findings_well_formed() {
+  case "$1" in
+    any) return 0 ;;
+    nonempty) [ -s "$2" ] ;;
+    *)
+      _dfw_text=$(cat "$2")
+      case "$1" in
+        array) case "$_dfw_text" in '['*']') return 0 ;; esac ;;
+        object) case "$_dfw_text" in '{'*'}') return 0 ;; esac ;;
+        string) case "$_dfw_text" in '"'*'"') return 0 ;; esac ;;
+        array_or_null)
+          case "$_dfw_text" in '['*']'|null) return 0 ;; esac ;;
+        int)
+          case "$_dfw_text" in ''|*[!0-9]*) ;; *) return 0 ;; esac ;;
+        ints3)
+          case "$_dfw_text" in
+            ''|*[!0-9\ ]*) ;;
+            *) set -- $_dfw_text
+               [ $# -eq 3 ] && return 0 ;;
+          esac ;;
+      esac
+      return 1
+      ;;
+  esac
 }
 
 # ----------------------------------------------- shared role-prompt sources ----
@@ -1202,7 +1346,7 @@ _llm_field_sanitize() {
     # one implementation of it. A failure returns nonzero with NO output:
     # every caller that feeds a prompt must see the failure, not an empty
     # "sanitized" string. printf is a builtin, so the text never rides argv.
-    printf '%s' "$_lfs_text" | ds_findings_run ingest sanitize-text --max "$_lfs_max"
+    ds_findings_call -t "$_lfs_text" -e any ingest sanitize-text --max "$_lfs_max"
     return $?
   fi
 
@@ -1237,7 +1381,7 @@ _llm_json_array_allowlist_fields() {
   _ljaaf_json="$1"
   shift
   [ -n "$*" ] || return 1
-  printf '%s' "$_ljaaf_json" | ds_findings_run ingest allowlist "$@"
+  ds_findings_call -t "$_ljaaf_json" -e array ingest allowlist "$@"
 }
 
 # _llm_json_array_sanitize_fields_strict JSON FIELD1 [FIELD2 ...] — decompose
@@ -1270,7 +1414,7 @@ _llm_json_array_sanitize_fields_strict() {
   _ljass_json="$1"
   shift
   [ -n "$*" ] || return 1
-  printf '%s' "$_ljass_json" | ds_findings_run ingest sanitize-fields "$@"
+  ds_findings_call -t "$_ljass_json" -e array ingest sanitize-fields "$@"
 }
 
 # _adversarial_findings_sort_blocking_first JSON — reorder a JSON array of
@@ -1317,7 +1461,7 @@ _llm_json_array_sanitize_fields_strict() {
 # unchanged, on any failure).
 _adversarial_findings_sort_blocking_first() {
   _afsbf_json="$1"
-  printf '%s' "$_afsbf_json" | ds_findings_run ingest adversarial-sort || printf '%s' "$_afsbf_json"
+  ds_findings_call -t "$_afsbf_json" -e any ingest adversarial-sort || printf '%s' "$_afsbf_json"
 }
 
 # _llm_json_array_cap JSON MAX — truncate a JSON array of objects to the
@@ -1360,7 +1504,7 @@ _llm_json_array_cap() {
   # 0 is not "no findings": it falls back to 200 like any other invalid value.
   _ljac_max=$(ds_positive_int_or_default "$_ljac_max" 200)
 
-  printf '%s' "$_ljac_json" | ds_findings_run ingest cap --max "$_ljac_max" || printf '%s' "$_ljac_json"
+  ds_findings_call -t "$_ljac_json" -e any ingest cap --max "$_ljac_max" || printf '%s' "$_ljac_json"
 }
 
 # ---------------------------------------------------------------- router URL classification (lr-02f048)

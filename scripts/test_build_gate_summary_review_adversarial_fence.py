@@ -605,6 +605,33 @@ class TestReviewSanitizeFailureDegrades(_FailureBase):
         self._stub("python3", _fail_stage("fence-data"))
         self._assert_review_degraded(self._payload(self._path()))
 
+    def test_pipeline_temp_dir_failure_blanks_no_field(self):
+        # Every pipeline call stages its input and output in one temp dir. If
+        # it cannot be created no stage runs, including the emitter, so the
+        # payload is not built at all: nothing on stdout, a loud reason on
+        # stderr, a nonzero status. It is never a payload with blank fields
+        # (the pre-pipeline sanitizer ran over a missing temp file and
+        # returned empty fields).
+        self._stub("mktemp", 'case "$*" in *clagentic-findings*) exit 1;; esac')
+        r = self._run(self._path())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("could not create a temp directory", r.stderr)
+
+    def test_stage_failing_after_partial_output_degrades(self):
+        # A stage that prints part of its answer and then fails must yield the
+        # marker, never the fragment and never a fragment plus a fallback.
+        self._stub("python3", 'case "$*" in *sanitize-review*) printf \'{"summary": "PART\'; exit 3;; esac')
+        payload = self._payload(self._path())
+        self._assert_review_degraded(payload)
+        self.assertNotIn("PART", json.dumps(payload))
+
+    def test_fence_stage_failing_after_partial_output_degrades(self):
+        self._stub("python3", 'case "$*" in *fence-data*) printf \'"===BEGIN PART\'; exit 3;; esac')
+        payload = self._payload(self._path())
+        self._assert_review_degraded(payload)
+        self.assertNotIn("PART", json.dumps(payload))
+
 
 class TestAdversarialSanitizeFailureDegrades(_FailureBase):
     def setUp(self):
@@ -615,9 +642,41 @@ class TestAdversarialSanitizeFailureDegrades(_FailureBase):
         self._stub("python3", _fail_stage("sanitize-report"))
         self._assert_adversarial_degraded(self._payload(self._path()))
 
+    def test_report_sanitize_stage_failing_after_partial_output(self):
+        self._stub("python3", 'case "$*" in *sanitize-report*) printf PARTIAL-REPORT; exit 3;; esac')
+        payload = self._payload(self._path())
+        self._assert_adversarial_degraded(payload)
+        self.assertNotIn("PARTIAL-REPORT", json.dumps(payload))
+
     def test_payload_handoff_mktemp_failure(self):
         self._stub("mktemp", 'case "$*" in *clagentic-gate-adversarial*) exit 1;; esac')
         self._assert_adversarial_degraded(self._payload(self._path()))
+
+    def test_gate_summary_stage_failing_after_partial_output_emits_no_payload(self):
+        # The emitter is the last pipeline call: when it prints a fragment and
+        # fails, build_gate_summary must fail with nothing on stdout, not hand
+        # the Merge Gate a truncated payload.
+        self._stub("python3", 'case "$*" in *gate-summary*) printf \'{"review_fenced": PARTIAL\'; exit 3;; esac')
+        r = self._run(self._path())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("gate-summary", r.stderr)
+
+    def test_corrupt_findings_sidecar_degrades_the_source_instead_of_reading_clean(self):
+        # An unreadable or non-list sidecar used to become findings=[] with no
+        # blockers. It must mark the adversarial source degraded so the Merge
+        # Gate refuses on it.
+        sidecar = os.path.join(self._lite, "last-adversarial-findings.json")
+        for label, content in (("corrupt", "{not json"), ("object", '{"a": 1}'), ("scalar", "7")):
+            with self.subTest(label):
+                with open(sidecar, "w") as f:
+                    f.write(content)
+                payload = self._payload(self._path())
+                self.assertEqual(payload["adversarial_findings"], [])
+                self.assertEqual(payload["adversarial_blocking_count"], 0)
+                self.assertIs(payload["adversarial_report_degraded"], True)
+                self.assertEqual(payload["adversarial_fenced"], ADV_UNAVAILABLE)
+                self.assertIn("source unavailable", payload["adversarial_findings_fenced"])
 
     def test_stale_report_with_adversarial_missing_true_is_not_fenced(self):
         """adversarial_missing=true must fence NOTHING. A file that appears at
@@ -846,11 +905,12 @@ class TestReviewIngestFailsClosed(_FailureBase):
         super().setUp()
         self._review_path = os.path.join(self._lite, "last-review.json")
 
-    def _ingest(self, path):
+    def _ingest(self, path, extra_env=None):
         r = self._run(
             path,
             script_body=(f"_sanitize_review_findings_envelope '{self._review_path}'\n"
                          f"review_is_degraded '{self._review_path}' && printf DEGRADED >&2\n:"),
+            extra_env=extra_env,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(self._review_path) as f:
@@ -872,6 +932,35 @@ class TestReviewIngestFailsClosed(_FailureBase):
         self._assert_failed_stub(env, err)
         self.assertEqual(
             self._payload(self._path())["review_fenced"], REVIEW_UNAVAILABLE)
+
+    def test_unreadable_findings_are_not_written_as_empty_findings(self):
+        # A read failure inside the pipeline (here: bytes that are not UTF-8)
+        # must leave the degraded stub, never "findings": [] over real data.
+        with open(self._review_path, "wb") as f:
+            f.write(b'\xff\xfe{"findings": [{"severity": "high"}]}')
+        env, err = self._ingest(self._path())
+        self._assert_failed_stub(env, err)
+
+    def test_present_non_array_findings_are_not_written_as_empty_findings(self):
+        self._write_review({"summary": "s", "findings": "not a list"})
+        env, err = self._ingest(self._path())
+        self._assert_failed_stub(env, err)
+
+    def test_write_back_failure_degrades(self):
+        # The reduced findings are written back with an atomic replace. If that
+        # fails, the raw findings still in the file must not survive. The
+        # failure is injected into the real pipeline process with a
+        # sitecustomize that makes os.replace raise.
+        self._write_review(self.FORGED)
+        inject = os.path.join(self._stub_dir, "inject")
+        os.makedirs(inject)
+        with open(os.path.join(inject, "sitecustomize.py"), "w") as f:
+            f.write("import os\n"
+                    "def _fail(*a, **k):\n"
+                    "    raise OSError('injected write-back failure')\n"
+                    "os.replace = _fail\n")
+        env, err = self._ingest(self._path(), extra_env={"PYTHONPATH": inject})
+        self._assert_failed_stub(env, err)
 
     def test_review_over_max_arg_strlen_is_reduced(self):
         findings = []

@@ -238,7 +238,7 @@ class TestReviewMergeHoldsNoFindingLogic(unittest.TestCase):
     def test_merge_and_dedup_delegate_to_the_pipeline(self):
         for call in ("ingest merge", "fingerprint dedup", "fingerprint keys", "fingerprint bump",
                      "verdict ledger-append", "verdict ledger-entries"):
-            self.assertIn("ds_findings_run " + call, self.content)
+            self.assertRegex(self.content, r"ds_findings_call [^\n]*" + call)
 
     def test_no_inline_severity_table_or_json_tooling(self):
         self.assertNotIn('"low": 1, "medium": 2, "high": 3, "critical": 4', self.content)

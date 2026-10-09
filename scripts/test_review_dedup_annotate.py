@@ -67,6 +67,8 @@ def _dedup(findings, seen_path, mode):
         with open(diff_path, "w") as f:
             f.write(_DIFF)
         env = os.environ.copy()
+        # The finding pipeline is found only under the tool home.
+        env["TOOL_HOME"] = TOOL_HOME
         script = textwrap.dedent(f"""\
             . '{PLATFORM_SH}'
             . '{REVIEW_MERGE_SH}'

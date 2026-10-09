@@ -66,6 +66,8 @@ def _run_review_merge_fn(call_line, env_overrides=None):
     """Source platform.sh + review-merge.sh and run one call line, returning
     (stdout, stderr, returncode)."""
     env = os.environ.copy()
+    # The finding pipeline is found only under the tool home.
+    env["TOOL_HOME"] = TOOL_HOME
     if env_overrides:
         env.update(env_overrides)
     script = textwrap.dedent(f"""\

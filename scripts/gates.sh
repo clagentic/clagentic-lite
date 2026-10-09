@@ -2834,7 +2834,9 @@ _review_run_provenance_fields() {
 _ledger_anchored_pass_at_head() {
   _laph_head="$3"
   [ -n "$_laph_head" ] || return 1
-  ds_findings_run verdict ledger-pass "$1" "$2" "$_laph_head" "${4:-review}" || return 1
+  # Status 1 is the stage's "not an anchored pass" answer; a pipeline failure
+  # is also nonzero and so also not a pass, the fail-closed reading.
+  ds_findings_call -e any -o 1 verdict ledger-pass "$1" "$2" "$_laph_head" "${4:-review}" || return 1
 }
 
 # _ledger_latest_gate_entry LEDGER_FILE BRANCH GATE — print the most recent
@@ -2845,13 +2847,13 @@ _ledger_anchored_pass_at_head() {
 # the pass check and the refusal-reason classification can never disagree
 # about which entry is latest.
 _ledger_latest_gate_entry() {
-  ds_findings_run verdict ledger-latest "$1" "$2" "$3"
+  ds_findings_call -e any verdict ledger-latest "$1" "$2" "$3"
 }
 
 # _ledger_entry_field ENTRY_JSON FIELD — print FIELD of one ledger entry as a
 # string ("" when absent). Returns 1 when the finding pipeline is unavailable.
 _ledger_entry_field() {
-  printf '%s' "$1" | ds_findings_run verdict ledger-field "$2"
+  ds_findings_call -t "$1" -e any verdict ledger-field "$2"
 }
 
 # _ledger_head_verdict_state LEDGER_FILE BRANCH HEAD_SHA GATE
@@ -2871,7 +2873,7 @@ _ledger_entry_field() {
 # predicate's boolean contract has many callers and must not grow output.
 _ledger_head_verdict_state() {
   # An unavailable pipeline reads as no usable entry, the fail-closed answer.
-  ds_findings_run verdict ledger-state "$1" "$2" "$3" "${4:-review}" || printf 'missing_stamp'
+  ds_findings_call verdict ledger-state "$1" "$2" "$3" "${4:-review}" || printf 'missing_stamp'
   return 0
 }
 
@@ -2932,7 +2934,7 @@ _ledger_latest_passing_head_for_branch() {
   # (get_review_diff) treats empty as "no prior passing verdict," which falls
   # through to full-range review (fail toward MORE coverage, never a silent
   # narrower diff).
-  ds_findings_run verdict ledger-pass-head "$_llphfb_file" "$2" "${3:-review}" || :
+  ds_findings_call -e any verdict ledger-pass-head "$_llphfb_file" "$2" "${3:-review}" || :
   return 0
 }
 
@@ -2973,8 +2975,8 @@ _ledger_mark_recurrence() {
 
   # The diff argument ($2) is accepted for the existing call shape; the
   # (file, category, message) match key does not read it.
-  _lmr_out=$(printf '%s' "$_lmr_findings_json" \
-    | ds_findings_run dispositions ledger-recurrence --ledger "$_lmr_ledger" --branch "$_lmr_branch") || _lmr_out=""
+  _lmr_out=$(ds_findings_call -t "$_lmr_findings_json" -e array \
+    dispositions ledger-recurrence --ledger "$_lmr_ledger" --branch "$_lmr_branch") || _lmr_out=""
   [ -n "$_lmr_out" ] && printf '%s' "$_lmr_out" || printf '%s' "$_lmr_findings_json"
   return 0
 }
@@ -3033,7 +3035,7 @@ _ledger_record_review_verdict() {
 
   # The findings ride stdin: a ledger entry can carry a list larger than one
   # argv string may be.
-  _lrrv_line=$(printf '%s' "$_lrrv_findings" | ds_findings_run verdict ledger-entry \
+  _lrrv_line=$(ds_findings_call -t "$_lrrv_findings" -e object verdict ledger-entry \
     --ts "$_lrrv_ts" --branch "$_lrrv_branch" --gate "$_lrrv_gate" --base "$_lrrv_base_sha" \
     --head "$_lrrv_head_sha" --verdict "$_lrrv_verdict" --config "$_lrrv_config") || _lrrv_line=""
 
@@ -3154,17 +3156,17 @@ _publish_review_verdict() {
 # taken as a parameter only so the caller doesn't have to duplicate the
 # argument-passing contract; it composes into either a standalone comment or
 # a PR-body subsection without any string-surgery on the output. Fails
-# closed (no output, non-zero exit): 1 with no python3 or when the findings
-# could not be staged, 2 when the findings are unreadable or not an array. A
-# caller must tell either failure apart from an empty list, which prints
-# "Findings: none".
+# closed (no output, non-zero exit): 2 when the findings are unreadable or not
+# an array, another nonzero status when the pipeline could not run (python3 or
+# findings.py missing, a stage failure). A caller must tell either failure
+# apart from an empty list, which prints "Findings: none".
 _render_review_verdict_lines() {
   # The findings ride stdin, not argv: one argv string is capped at ~128 KiB
   # by the kernel, so a large findings list made the exec fail outright and
   # the caller degrade to a false "no review recorded". The renderer returns
   # 2 with no output for unreadable findings; an unavailable pipeline returns
   # 1 the same way, so the caller degrades honestly and logs it.
-  printf '%s' "$2" | ds_findings_run render verdict-lines "$1"
+  ds_findings_call -t "$2" render verdict-lines "$1"
 }
 
 # _build_review_verdict_comment_body VERDICT HEAD_SHA FINDINGS_JSON — renders
@@ -3693,7 +3695,7 @@ _build_ship_pr_body() {
     if [ -n "$_bspb_latest" ]; then
       _bspb_entry_head=$(_ledger_entry_field "$_bspb_latest" head_sha) || _bspb_entry_head=""
       _bspb_entry_verdict=$(_ledger_entry_field "$_bspb_latest" verdict) || _bspb_entry_verdict=""
-      _bspb_entry_findings=$(printf '%s' "$_bspb_latest" | ds_findings_run verdict ledger-field findings --json-default '[]') \
+      _bspb_entry_findings=$(ds_findings_call -t "$_bspb_latest" verdict ledger-field findings --json-default '[]') \
         || _bspb_entry_findings=""
 
       if [ -z "$_bspb_entry_findings" ]; then
@@ -4001,7 +4003,9 @@ _cross_round_dedup() {
   # says which step failed (10 key computation, 11 splice) and the original
   # findings are retained either way.
   _crd_rc=0
-  _crd_counts=$(ds_findings_run dispositions cross-round "$_crd_envelope" \
+  # ints3 makes a stage that exits 0 with empty or odd output a failure here,
+  # instead of letting it reach the arithmetic below unvalidated.
+  _crd_counts=$(ds_findings_call -e ints3 dispositions cross-round "$_crd_envelope" \
     --diff "$_crd_diff" --seen "$_crd_seen") || _crd_rc=$?
   case "$_crd_rc" in
     0)
@@ -4139,7 +4143,7 @@ _review_recurrence_demote() {
   # it reaches this stage on every re-run. Counting each re-run as another
   # "round" would demote it to advisory on the second identical run, the same
   # verdict-by-repetition hole the dedup change closes.
-  _rrd_result=$(ds_findings_run dispositions recurrence "$_rrd_envelope" \
+  _rrd_result=$(ds_findings_call dispositions recurrence "$_rrd_envelope" \
     --diff "$_rrd_diff" --counts "$_rrd_counts" --threshold "$_rrd_threshold") || return 0
   case "$_rrd_result" in
     demoted=*) _rrd_demoted_count="${_rrd_result#demoted=}" ;;
@@ -4255,7 +4259,7 @@ _review_deferral_match() {
   # no eligible live entry) and "matched=N" otherwise. Every case that
   # cannot be decided stays blocking: a malformed or ambiguous entry never
   # suppresses a finding.
-  _rdm_result=$(ds_findings_run dispositions deferrals "$_rdm_envelope" --root "$REPO_ROOT") || return 0
+  _rdm_result=$(ds_findings_call dispositions deferrals "$_rdm_envelope" --root "$REPO_ROOT") || return 0
   case "$_rdm_result" in
     matched=*) _rdm_matched_count="${_rdm_result#matched=}" ;;
     *) return 0 ;;
@@ -4280,7 +4284,7 @@ _review_deferral_match() {
 # expectation that FILE has already been sanitized by
 # _sanitize_review_findings_envelope (below) BEFORE any of them ever see it.
 _extract_findings_json() {
-  ds_findings_run ingest findings "$1" 2>/dev/null || printf '[]'
+  ds_findings_call -e array ingest findings "$1" || printf '[]'
 }
 
 # _extract_findings_json_strict FILE — like _extract_findings_json, but FAIL
@@ -4291,7 +4295,7 @@ _extract_findings_json() {
 # a present-but-null key must not be read as a clean review. Used where "[]"
 # would be written over real findings.
 _extract_findings_json_strict() {
-  ds_findings_run ingest findings "$1" --strict 2>/dev/null || return 1
+  ds_findings_call -e array ingest findings "$1" --strict || return 1
 }
 
 # _sanitize_review_findings_envelope FILE
@@ -4387,7 +4391,7 @@ _sanitize_review_findings_envelope() {
   # stub on any failure. If the pipeline itself cannot run, the file still
   # holds the model's raw findings, so the stub is written here too, with a
   # printf literal that needs no tool.
-  if ! ds_findings_run ingest review-envelope "$_srfe_file"; then
+  if ! ds_findings_call -e any ingest review-envelope "$_srfe_file"; then
     _review_envelope_mark_sanitize_failed "$_srfe_file"
   fi
   return 0
@@ -5422,7 +5426,7 @@ _parse_adversarial_findings() {
   # headers is an ordinary clean audit and prints "[]" with status 0, and the
   # two must not be the same bytes. Without python3 the parse cannot run at
   # all, which is the same failure, so it is signalled the same way.
-  ds_findings_run ingest adversarial-parse "$1"
+  ds_findings_call -e array ingest adversarial-parse "$1"
 }
 
 # _sanitize_adversarial_findings_json JSON_ARRAY
@@ -5738,10 +5742,20 @@ cmd_adversarial() {
   # normal run, same "absent == 0" fail-open posture as every other
   # optional gate-plumbing file in this codebase).
   _adv_findings_dropped_count=0
-  _adv_findings_total_before_cap=$(printf '%s' "$_adv_findings_json_sorted" | ds_findings_run ingest length 2>/dev/null || echo 0)
-  _adv_findings_total_after_cap=$(printf '%s' "$_adv_findings_json" | ds_findings_run ingest length 2>/dev/null || echo 0)
-  case "$_adv_findings_total_before_cap" in ''|*[!0-9]*) _adv_findings_total_before_cap=0 ;; esac
-  case "$_adv_findings_total_after_cap" in ''|*[!0-9]*) _adv_findings_total_after_cap=0 ;; esac
+  # A count that cannot be taken must not read as "nothing was dropped": the
+  # sidecar is then marked findings_degraded, which the merge gate treats as an
+  # unavailable source.
+  _adv_findings_total_before_cap=$(ds_findings_call -t "$_adv_findings_json_sorted" -e int ingest length) \
+    || _adv_findings_total_before_cap=""
+  _adv_findings_total_after_cap=$(ds_findings_call -t "$_adv_findings_json" -e int ingest length) \
+    || _adv_findings_total_after_cap=""
+  if [ -z "$_adv_findings_total_before_cap" ] || [ -z "$_adv_findings_total_after_cap" ]; then
+    _adv_findings_degraded=true
+    _adv_findings_total_before_cap=0
+    _adv_findings_total_after_cap=0
+    cmd_log_run adversarial warn "adversarial findings could not be counted; sidecar marked degraded (merge gate treats the source as unavailable)"
+    echo "[gates/adversarial] WARN: adversarial findings could not be counted; the merge gate will treat this source as unavailable." 1>&2
+  fi
   if [ "$_adv_findings_total_before_cap" -gt "$_adv_findings_total_after_cap" ]; then
     _adv_findings_dropped_count=$((_adv_findings_total_before_cap - _adv_findings_total_after_cap))
   fi
@@ -5892,12 +5906,20 @@ _mg_stale_report() {
   # ASCII unit separator (the free text never contains one: control bytes are
   # stripped from every finding field before it is listed).
   _msr_us=$(printf '\037')
-  _msr_out=$(ds_findings_run render stale-report "$1") || _msr_out=""
-  if [ -z "$_msr_out" ]; then
-    # Pipeline unavailable: refuse with the one reason that is always true.
+  _msr_rc=0
+  _msr_out=$(ds_findings_call render stale-report "$1") || _msr_rc=$?
+  if [ "$_msr_rc" -ne 0 ] || [ -z "$_msr_out" ]; then
+    # Could not classify: refuse with the one reason that is always true, and
+    # name the real cause rather than assuming one.
+    case "$_msr_rc" in
+      127) _msr_cause="python3 is not installed" ;;
+      126) _msr_cause="the finding pipeline file findings.py was not found" ;;
+      0) _msr_cause="the stale-report stage produced no output" ;;
+      *) _msr_cause="the stale-report stage failed with status $_msr_rc" ;;
+    esac
     _MG_STALE_PRIMARY="missing_stamp"
-    _MG_STALE_TEXT="the finding pipeline (python3) is unavailable, so the stale gate payload could not be classified; re-run clagentic-lite gates review and gates adversarial first."
-    _MG_STALE_AUDIT="stale payload [missing_stamp]: finding pipeline unavailable"
+    _MG_STALE_TEXT="the stale gate payload could not be classified: ${_msr_cause}; re-run clagentic-lite gates review and gates adversarial first."
+    _MG_STALE_AUDIT="stale payload [missing_stamp]: could not classify (${_msr_cause})"
     return 0
   fi
   IFS="$_msr_us" read -r _MG_STALE_PRIMARY _MG_STALE_TEXT _MG_STALE_AUDIT <<EOF
@@ -6207,7 +6229,7 @@ print("; ".join(parts))
 severity_rank() {
   # The one ranking table lives in findings.py; an unavailable pipeline ranks
   # the name 0 (unknown), which every caller reads as 'use the default'.
-  ds_findings_run verdict rank "$1" 2>/dev/null || echo 0
+  ds_findings_call -e int verdict rank "$1" || echo 0
 }
 
 # ISSUE_CLASS / CLASS_FIX (lr-3eb18c): deliberately NOT read anywhere in
@@ -6227,7 +6249,7 @@ severity_blockers() {
   # not suppression: the finding stays in .findings with its honest severity)
   # all live in findings.py verdict blockers. A missing python3 is the same
   # unreadable-review case.
-  _sb_out=$(ds_findings_run verdict blockers "$1" "$2") || _sb_out=""
+  _sb_out=$(ds_findings_call -e int verdict blockers "$1" "$2") || _sb_out=""
   if [ -z "$_sb_out" ]; then echo 99; else echo "$_sb_out"; fi
 }
 
@@ -6245,7 +6267,7 @@ severity_blockers() {
 # (rank 4): the same fail-closed reading severity_blockers applies, which keeps
 # the list equal to the set that blocked.
 _blocking_findings_json() {
-  _bfj_out=$(ds_findings_run verdict blocking-json "$1" 2>/dev/null) || _bfj_out=""
+  _bfj_out=$(ds_findings_call -s -e array_or_null verdict blocking-json "$1") || _bfj_out=""
   [ -n "$_bfj_out" ] || _bfj_out="null"
   printf '%s' "$_bfj_out"
   return 0
@@ -6262,8 +6284,10 @@ _blocking_findings_json() {
 # sidecar is ever written) — this function only renders and fences, it does
 # not sanitize a second time.
 _fence_adversarial_findings() {
-  # An unavailable pipeline renders an empty string literal, as before.
-  printf '%s' "$1" | ds_findings_run render fence-findings || printf '""'
+  # A failure returns nonzero with no output. It is never an empty string
+  # literal a caller could mistake for "no findings", and never a literal
+  # appended to whatever the stage printed before it failed.
+  ds_findings_call -t "$1" -e string render fence-findings
 }
 
 # _fence_deterministic_gates JSON_OBJECT — render an (already sanitized)
@@ -6348,7 +6372,7 @@ _fence_data_block() {
   # that same sanitized text. An unavailable encoder is a failure (return 1, no
   # output), never an empty string literal a caller could read as "empty
   # content".
-  printf '%s' "$3" | ds_findings_run render fence-data "$1" "$2"
+  ds_findings_call -t "$3" -e string render fence-data "$1" "$2"
 }
 
 # Fixed, pre-encoded replacements for review_fenced / adversarial_fenced when
@@ -6389,13 +6413,16 @@ _sanitize_review_for_prompt() {
   # The reduction, sanitizing and fail-closed rules live in findings.py render
   # sanitize-review: 'null' for an absent file, status 1 with no output for
   # one that exists but cannot be fully extracted and sanitized.
-  ds_findings_run render sanitize-review "$1"
+  ds_findings_call render sanitize-review "$1"
 }
 
 # _json_string_field JSON_OBJECT KEY — print the string value at KEY ("" when
 # absent or not a string, or when the finding pipeline is unavailable).
 _json_string_field() {
-  printf '%s' "$1" | ds_findings_run render json-field "$2" 2>/dev/null
+  # Malformed input is a failure (the stage exits nonzero) and so is a missing
+  # pipeline; both print nothing, which callers read as an absent field. The
+  # cause is reported on stderr, not hidden.
+  ds_findings_call -t "$1" -e any render json-field "$2" || :
   return 0
 }
 
@@ -6412,7 +6439,7 @@ _json_string_field() {
 # FAIL CLOSED: a read, length or sanitize failure returns 1 with no output,
 # never the unsanitized report and never an empty string.
 _sanitize_adversarial_report_for_prompt() {
-  ds_findings_run render sanitize-report "$1"
+  ds_findings_call -e any render sanitize-report "$1"
 }
 
 # _stage_payload_file PREFIX PAYLOAD — the one handoff primitive for any
@@ -7445,7 +7472,10 @@ build_gate_summary() {
     # The whole stage+emit runs in a subshell so its EXIT/INT/TERM/HUP traps
     # are the subshell's own: the caller's traps (cmd_ship's cmd_deps osv
     # temp-file cleanup is one) are never replaced and need no restore.
-    (
+    # Its output is captured and printed only when the stage succeeded; a
+    # failed stage returns 1 with no payload rather than leaving a partial
+    # one.
+    if _bgs_summary=$(
     _bgs_review_tmp=""
     _bgs_adv_tmp=""
     trap '_bgs_cleanup_payload_tmp' EXIT
@@ -7467,7 +7497,7 @@ build_gate_summary() {
         ADVERSARIAL_FENCED_PAYLOAD=$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED
       }
     fi
-    ds_findings_run render gate-summary \
+    ds_findings_call -e object render gate-summary \
       --threshold "$THRESHOLD" --introduces-ack "$INTRODUCES_ACK_FILE" \
       --adversarial-missing "$ADVERSARIAL_MISSING" --adversarial-degraded "$ADVERSARIAL_DEGRADED" \
       --acks "$ACKS_ARG" --accepted-risks "$AR_ARG" --adf "$ADF_ARG" --adf-meta "$ADF_META_ARG" \
@@ -7479,8 +7509,12 @@ build_gate_summary() {
       --review-unavailable "$_GATE_REVIEW_UNAVAILABLE_FENCED" \
       --adversarial-unavailable "$_GATE_ADVERSARIAL_UNAVAILABLE_FENCED" \
       --adf-unavailable "$_GATE_ADVERSARIAL_FINDINGS_UNAVAILABLE_FENCED"
-    )
-    return 0
+    ); then
+      printf '%s\n' "$_bgs_summary"
+      return 0
+    fi
+    printf '[gates/build-gate-summary] the finding pipeline could not build the gate summary; failing closed with no payload\n' 1>&2
+    return 1
   fi
 
   # No JSON encoder available (lr-7047bf, site 1.12: this branch used to
@@ -7564,7 +7598,7 @@ cmd_render_manifest() {
 _review_class_footer() {
   # A failure returns nonzero with a message: a silent return 0 here would
   # report a successful render with the footer dropped.
-  ds_findings_run render class-footer "$1" || return 1
+  ds_findings_call -e any render class-footer "$1" || return 1
 }
 
 cmd_render_review() {
@@ -7581,7 +7615,7 @@ cmd_render_review() {
   # would otherwise drown out the findings that DO name a class). Display
   # only: it never gates /ship. The rendering lives in findings.py render
   # review.
-  ds_findings_run render review "$FILE" || return 1
+  ds_findings_call -e any render review "$FILE" || return 1
 }
 
 # cmd_deferrals_lint [FILE] (lr-2ebc41)
@@ -7629,7 +7663,7 @@ cmd_deferrals_lint() {
 
   # The schema check is findings.py dispositions lint; its problems print on
   # stdout, one line each, and a nonzero status means the file is not clean.
-  ds_findings_run dispositions lint "$_cdl_file"
+  ds_findings_call -e any -o 1 dispositions lint "$_cdl_file"
   return $?
 }
 

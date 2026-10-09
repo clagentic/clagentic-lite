@@ -38,7 +38,8 @@ def _call_allowlist_fields(call_line):
     (typically `_llm_json_array_allowlist_fields ...`)."""
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-allowlist-")
     try:
-        script = f". '{PLATFORM_SH}'\n{call_line}\n"
+        # The finding pipeline is found only under the tool home.
+        script = f"TOOL_HOME='{TOOL_HOME}'\n. '{PLATFORM_SH}'\n{call_line}\n"
         env = os.environ.copy()
         env["HOME"] = tmpdir
         r = subprocess.run(
