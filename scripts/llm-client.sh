@@ -1228,6 +1228,29 @@ log_attempt() {
   ds_audit_log llm-call "$OUTCOME" "$DETAILS"
 }
 
+# _llm_record_run_meta CLI TIER MODEL PROMPT_FILE INPUT_FILE
+#
+# Appends one tab-separated provenance line for the step that produced the
+# accepted output to the file named by CLAGENTIC_LLM_RUN_META_FILE, when that
+# variable is set (a caller such as gates.sh review opts in per call). Fields:
+# model, cli, tier, sha256 of the assembled system prompt (PROMPT_FILE: role
+# prompt plus every injected block), prompt bytes, input bytes. This is how a
+# verdict stays diagnosable after the fact: which model, given exactly which
+# prompt. Unset variable is a no-op, so every other caller is unchanged.
+# A missing sha256 tool or an unwritable file never fails the call -- the
+# provenance is a record of the run, not a precondition for it -- but the
+# digest field then reads "none" instead of being silently dropped.
+_llm_record_run_meta() {
+  [ -n "${CLAGENTIC_LLM_RUN_META_FILE:-}" ] || return 0
+  _lrm_sha=$(ds_sha256_file "$4" 2>/dev/null) || _lrm_sha=""
+  [ -n "$_lrm_sha" ] || _lrm_sha="none"
+  _lrm_model="${3:-cli-default}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$_lrm_model" "$1" "$2" "$_lrm_sha" "$(ds_file_size "$4")" "$(ds_file_size "$5")" \
+    >> "$CLAGENTIC_LLM_RUN_META_FILE" 2>/dev/null || :
+  return 0
+}
+
 # Print a one-line stderr notice for a step-failed or fallback outcome.
 # Previously log_attempt (above) was the ONLY destination for these
 # outcomes -- audit.db, never the terminal -- so a same-vendor fallback
@@ -3363,6 +3386,7 @@ walk_chain() {
         fi
         if [ "$ROUTER_EXIT" -eq 0 ] && [ "$ROUTER_UNWRAP_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
           log_attempt "$ROLE_L" "router" "role:${ROLE_L}-chain" "pass" "via clagentic-router"
+          _llm_record_run_meta "router" "" "role:${ROLE_L}-chain" "$TMP_PROMPT" "$TMP_IN"
           cat "$TMP_OUT"
           rm -f "$TMP_IN" "$TMP_PROMPT" "$TMP_OUT" "$TMP_ERR" "$TMP_CHAIN"
           return 0
@@ -3585,6 +3609,7 @@ walk_chain() {
       continue
     fi
     if [ "$EXIT_CODE" -eq 0 ] && [ "$UNWRAP_CODE" -eq 0 ] && validate_output "$MODE" "$TMP_OUT" "$ROLE_L"; then
+      _llm_record_run_meta "$CLI" "$TIER" "$MODEL" "$TMP_PROMPT" "$TMP_IN"
       if [ "$ATTEMPT" -eq 1 ]; then
         log_attempt "$ROLE_L" "$CLI" "$TIER" "pass" "num_turns=$TURN_NUM_TURNS" "$MODEL"
       else

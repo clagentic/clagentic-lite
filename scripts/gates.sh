@@ -2733,14 +2733,69 @@ _resolve_base_sha() {
 # a verdict was scored, not every CLAGENTIC_* var in the process environment
 # (an unbounded env dump would itself be an injection/bloat surface into a
 # file later read back and rendered).
+#
+# GATE and DIFF_FILE (optional): for the review gate the snapshot also carries
+# the per-run provenance fields (_review_run_provenance_fields) so a recorded
+# verdict can be tied to the model, prompt and diff that produced it. The
+# adversarial gate shares the ledger but not those inputs, so it gets none.
 _ledger_config_snapshot() {
+  _lcs_gate="${1:-}"
+  _lcs_diff="${2:-}"
   _lcs_threshold="${CLAGENTIC_BLOCK_SEVERITY:-high}"
   _lcs_dedup="${CLAGENTIC_CROSS_ROUND_DEDUP:-1}"
   _lcs_recurrence_threshold=$(_review_recurrence_threshold)
-  printf '{"block_severity":"%s","cross_round_dedup":%s,"recurrence_threshold":%s}' \
+  _lcs_run=""
+  if [ "$_lcs_gate" = "review" ]; then
+    _lcs_run=",$(_review_run_provenance_fields "$_lcs_diff")"
+  fi
+  printf '{"block_severity":"%s","cross_round_dedup":%s,"recurrence_threshold":%s%s}' \
     "$_lcs_threshold" \
     "$([ "$_lcs_dedup" = "1" ] && echo true || echo false)" \
-    "$_lcs_recurrence_threshold"
+    "$_lcs_recurrence_threshold" \
+    "$_lcs_run"
+}
+
+# _review_run_provenance_fields DIFF_FILE
+#
+# Prints (no surrounding braces) the JSON members that make a review verdict
+# diagnosable after the fact:
+#   model         model id(s) of the chain step(s) that produced accepted output
+#   prompt_sha256 sha256 of the assembled system prompt (role prompt plus every
+#                 injected block), as llm-client.sh recorded it per call
+#   diff_sha256   sha256 of the diff text the reviewer was given. Distinct from
+#                 _clagentic_diff_sha, which despite its name stamps HEAD; that
+#                 field is kept as is because consumers read it.
+#   chunk_count / chunk_sizes  how the diff was split (single pass = one chunk
+#                 the size of the diff; empty resolved diff = zero)
+# Inputs come from cmd_review's run state (_REVIEW_RUN_PROV_FILE,
+# _REVIEW_RUN_CHUNK_SIZES). A value that could not be determined prints as
+# "none" rather than being omitted, so absence is itself visible.
+_review_run_provenance_fields() {
+  _rrpf_diff="$1"
+  _rrpf_model=""
+  _rrpf_prompt=""
+  if [ -n "${_REVIEW_RUN_PROV_FILE:-}" ] && [ -s "$_REVIEW_RUN_PROV_FILE" ]; then
+    _rrpf_model=$(cut -f1 "$_REVIEW_RUN_PROV_FILE" | LC_ALL=C sort -u | tr '\n' ',' | tr -cd 'A-Za-z0-9._:/@+,-')
+    _rrpf_prompt=$(cut -f4 "$_REVIEW_RUN_PROV_FILE" | LC_ALL=C sort -u | tr '\n' ',' | tr -cd 'A-Za-z0-9,')
+    _rrpf_model="${_rrpf_model%,}"
+    _rrpf_prompt="${_rrpf_prompt%,}"
+  fi
+  [ -n "$_rrpf_model" ] || _rrpf_model="none"
+  [ -n "$_rrpf_prompt" ] || _rrpf_prompt="none"
+  _rrpf_diff_sha=""
+  if [ -n "$_rrpf_diff" ]; then
+    _rrpf_diff_sha=$(ds_sha256_file "$_rrpf_diff" 2>/dev/null) || _rrpf_diff_sha=""
+  fi
+  [ -n "$_rrpf_diff_sha" ] || _rrpf_diff_sha="none"
+  _rrpf_count=0
+  _rrpf_sizes=""
+  for _rrpf_sz in ${_REVIEW_RUN_CHUNK_SIZES:-}; do
+    case "$_rrpf_sz" in ''|*[!0-9]*) continue ;; esac
+    _rrpf_count=$((_rrpf_count + 1))
+    _rrpf_sizes="${_rrpf_sizes:+$_rrpf_sizes,}$_rrpf_sz"
+  done
+  printf '"model":"%s","prompt_sha256":"%s","diff_sha256":"%s","chunk_count":%d,"chunk_sizes":[%s]' \
+    "$_rrpf_model" "$_rrpf_prompt" "$_rrpf_diff_sha" "$_rrpf_count" "$_rrpf_sizes"
 }
 
 # _ledger_anchored_pass_at_head LEDGER_FILE BRANCH HEAD_SHA — exit 0 (true)
@@ -2795,12 +2850,34 @@ _ledger_anchored_pass_at_head() {
   _laph_gate="${4:-review}"
   [ -n "$_laph_head" ] || return 1
 
-  _laph_latest=""
+  _laph_latest=$(_ledger_latest_gate_entry "$_laph_file" "$_laph_branch" "$_laph_gate") || return 1
+  [ -n "$_laph_latest" ] || return 1
+
+  _laph_entry_head=$(_ledger_entry_field "$_laph_latest" head_sha) || return 1
+  _laph_entry_verdict=$(_ledger_entry_field "$_laph_latest" verdict) || return 1
+
+  [ -n "$_laph_entry_head" ] || return 1
+  [ "$_laph_entry_head" = "$_laph_head" ] || return 1
+  [ "$_laph_entry_verdict" = "pass" ]
+}
+
+# _ledger_latest_gate_entry LEDGER_FILE BRANCH GATE — print the most recent
+# ledger entry (one JSON line) for BRANCH written by GATE, nothing if there is
+# none. Returns 1 when no JSON tool exists. Sole implementation of the
+# "latest entry for this gate" scan; _ledger_anchored_pass_at_head and
+# _ledger_head_verdict_state both read through it so the pass check and the
+# refusal-reason classification can never disagree about which entry is latest.
+_ledger_latest_gate_entry() {
+  _llge_file="$1"
+  _llge_branch="$2"
+  _llge_gate="$3"
   if command -v jq >/dev/null 2>&1; then
-    _laph_latest=$(ledger_entries_for_branch "$_laph_file" "$_laph_branch" \
-      | jq -c --arg g "$_laph_gate" 'select(.gate == $g)' 2>/dev/null | tail -n 1)
-  elif command -v python3 >/dev/null 2>&1; then
-    _laph_latest=$(ledger_entries_for_branch "$_laph_file" "$_laph_branch" | python3 -c '
+    ledger_entries_for_branch "$_llge_file" "$_llge_branch" \
+      | jq -c --arg g "$_llge_gate" 'select(.gate == $g)' 2>/dev/null | tail -n 1
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    ledger_entries_for_branch "$_llge_file" "$_llge_branch" | python3 -c '
 import json, sys
 gate = sys.argv[1]
 best = ""
@@ -2816,35 +2893,73 @@ for line in sys.stdin:
         best = line
 if best:
     print(best)
-' "$_laph_gate" 2>/dev/null)
-  else
-    return 1
+' "$_llge_gate" 2>/dev/null
+    return 0
   fi
-  [ -n "$_laph_latest" ] || return 1
+  return 1
+}
 
-  _laph_entry_head=""
-  _laph_entry_verdict=""
+# _ledger_entry_field ENTRY_JSON FIELD — print FIELD of one ledger entry as a
+# string ("" when absent). Returns 1 when no JSON tool exists.
+_ledger_entry_field() {
   if command -v jq >/dev/null 2>&1; then
-    _laph_entry_head=$(printf '%s' "$_laph_latest" | jq -r '.head_sha // ""' 2>/dev/null)
-    _laph_entry_verdict=$(printf '%s' "$_laph_latest" | jq -r '.verdict // ""' 2>/dev/null)
-  elif command -v python3 >/dev/null 2>&1; then
-    _laph_entry_head=$(printf '%s' "$_laph_latest" | python3 -c 'import json,sys
-try:
-    print(json.load(sys.stdin).get("head_sha",""))
-except Exception:
-    print("")' 2>/dev/null)
-    _laph_entry_verdict=$(printf '%s' "$_laph_latest" | python3 -c 'import json,sys
-try:
-    print(json.load(sys.stdin).get("verdict",""))
-except Exception:
-    print("")' 2>/dev/null)
-  else
-    return 1
+    printf '%s' "$1" | jq -r --arg f "$2" '.[$f] // "" | tostring' 2>/dev/null
+    return 0
   fi
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 -c 'import json,sys
+try:
+    v = json.load(sys.stdin).get(sys.argv[1], "")
+    print("" if v is None else v)
+except Exception:
+    print("")' "$2" 2>/dev/null
+    return 0
+  fi
+  return 1
+}
 
-  [ -n "$_laph_entry_head" ] || return 1
-  [ "$_laph_entry_head" = "$_laph_head" ] || return 1
-  [ "$_laph_entry_verdict" = "pass" ]
+# _ledger_head_verdict_state LEDGER_FILE BRANCH HEAD_SHA GATE
+#
+# Classify WHY _ledger_anchored_pass_at_head failed, as one token on stdout:
+#   review_blocked_at_head  latest GATE entry is anchored to HEAD_SHA with
+#                           verdict "block": the review ran at this commit and
+#                           its findings are unresolved. Re-running cannot fix
+#                           that; the code or a deferral has to change.
+#   sha_mismatch            latest GATE entry is anchored to a different SHA
+#   missing_stamp           no usable entry: no ledger, no entry for this
+#                           gate/branch, an entry with no head_sha, or an
+#                           entry at HEAD whose verdict is not pass/block
+#                           (skip, unanchored)
+#   pass                    the pass predicate holds (nothing to explain)
+# Kept as a classifier beside the predicate rather than folded into it: the
+# predicate's boolean contract has many callers and must not grow output.
+_ledger_head_verdict_state() {
+  _lhvs_file="$1"
+  _lhvs_branch="$2"
+  _lhvs_head="$3"
+  _lhvs_gate="${4:-review}"
+
+  if _ledger_anchored_pass_at_head "$_lhvs_file" "$_lhvs_branch" "$_lhvs_head" "$_lhvs_gate"; then
+    printf 'pass'
+    return 0
+  fi
+  _lhvs_latest=$(_ledger_latest_gate_entry "$_lhvs_file" "$_lhvs_branch" "$_lhvs_gate") || _lhvs_latest=""
+  if [ -z "$_lhvs_latest" ]; then
+    printf 'missing_stamp'
+    return 0
+  fi
+  _lhvs_entry_head=$(_ledger_entry_field "$_lhvs_latest" head_sha) || _lhvs_entry_head=""
+  _lhvs_entry_verdict=$(_ledger_entry_field "$_lhvs_latest" verdict) || _lhvs_entry_verdict=""
+  if [ -z "$_lhvs_entry_head" ]; then
+    printf 'missing_stamp'
+  elif [ "$_lhvs_entry_head" != "$_lhvs_head" ]; then
+    printf 'sha_mismatch'
+  elif [ "$_lhvs_entry_verdict" = "block" ]; then
+    printf 'review_blocked_at_head'
+  else
+    printf 'missing_stamp'
+  fi
+  return 0
 }
 
 # _ledger_latest_passing_head_for_branch LEDGER_FILE BRANCH GATE — stdout: the
@@ -3063,7 +3178,12 @@ _ledger_record_review_verdict() {
   _lrrv_ledger=$(_review_ledger_path)
   _lrrv_branch=$(_review_current_branch)
   _lrrv_ts=$(ds_date_iso)
-  _lrrv_config=$(_ledger_config_snapshot)
+  _lrrv_config=$(_ledger_config_snapshot "$_lrrv_gate" "$_lrrv_diff")
+  if [ "$_lrrv_gate" = "review" ]; then
+    # Same fields as the ledger config, in the audit trail InfoSec reads.
+    ds_audit_log "review-run" "pass" \
+      "head=${_lrrv_head_sha:-<unresolved>} verdict=${_lrrv_verdict} $(_review_run_provenance_fields "$_lrrv_diff" | tr -d '"{}')"
+  fi
 
   _lrrv_findings='[]'
   if [ -f "$_lrrv_out" ]; then
@@ -3128,6 +3248,8 @@ PYEOF
   # entry came from the review gate.
   if [ "$_lrrv_gate" = "review" ]; then
     _publish_review_verdict "$_lrrv_branch" "$_lrrv_verdict" "$_lrrv_head_sha" "$_lrrv_findings"
+    [ -z "${_REVIEW_RUN_PROV_FILE:-}" ] || rm -f "$_REVIEW_RUN_PROV_FILE"
+    _REVIEW_RUN_PROV_FILE=""
   fi
 
   return 0
@@ -4122,12 +4244,21 @@ _gate_resolved_diff_is_empty() {
 #
 # Reads the findings array from ENVELOPE_FILE, pipes it through dedup_findings
 # content-hash (from review-merge.sh) with SEEN_FILE as the persisted key store
-# and DIFF_FILE as the context source, splices the deduped findings back into
-# ENVELOPE_FILE in place, and logs a gate_runs audit row with the suppression count.
+# and DIFF_FILE as the context source, splices the result back into
+# ENVELOPE_FILE in place, and logs a gate_runs audit row with the counts.
+#
+# ANNOTATE, NEVER DROP: a finding whose key an earlier run recorded stays in
+# the envelope with `_seen_before: true`, so severity_blockers still counts it.
+# Dropping it made a re-run of `gates review` at an unchanged HEAD forget the
+# first run's blocking finding and pass: the gate's verdict depended on how
+# many times it had been asked. Display may collapse seen findings
+# (cmd_render_review marks them); the verdict may not change because one was
+# seen before. The only suppressions that remain are the ones with their own
+# annotation and provenance (_deferral_matched, _recurrence_demoted).
 #
 # Conservative by design: dedup_findings retains findings when the key cannot be
-# computed (no diff window, no sha256 tool) — wrong suppressions are worse than
-# missed dedups. Seen-file absent on first call is a no-op (fail-open).
+# computed (no diff window, no sha256 tool). Seen-file absent on first call is a
+# no-op that seeds the file.
 #
 # Called only when CLAGENTIC_CROSS_ROUND_DEDUP=1. Not called on degraded envelopes
 # (caller checks degraded state after this function returns).
@@ -4162,8 +4293,9 @@ _cross_round_dedup() {
   fi
 
   if [ "$_crd_ok" = "1" ]; then
-    # dedup_findings appends new keys to _crd_seen in-place and writes deduped array to stdout.
-    dedup_findings "content-hash" "$_crd_seen" "$_crd_diff" \
+    # dedup_findings appends new keys to _crd_seen in-place and writes the
+    # annotated array to stdout (annotate mode: prior-run findings are kept).
+    dedup_findings "content-hash" "$_crd_seen" "$_crd_diff" annotate \
       < "$_crd_raw_findings" > "$_crd_deduped_findings" 2>/dev/null || _crd_ok=0
   fi
 
@@ -4213,14 +4345,24 @@ PYEOF
           "$_crd_envelope" 2>/dev/null || echo 0)
       fi
       case "$_crd_after" in ''|*[!0-9]*) _crd_after=0 ;; esac
+      # Within-run collapses (same key twice in one response) are the only
+      # reduction left; prior-run findings are counted separately as seen.
       _crd_suppressed=$((_crd_before - _crd_after))
       [ "$_crd_suppressed" -lt 0 ] && _crd_suppressed=0
-      if [ "$_crd_suppressed" -gt 0 ]; then
-        printf '[dedup] suppressed %d finding(s) seen in prior run(s)\n' \
-          "$_crd_suppressed" 1>&2
+      _crd_seen_n=0
+      if command -v jq >/dev/null 2>&1; then
+        _crd_seen_n=$(jq -r '[(.findings // [])[] | select(._seen_before == true)] | length' "$_crd_envelope" 2>/dev/null || echo 0)
+      elif command -v python3 >/dev/null 2>&1; then
+        _crd_seen_n=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for f in d.get("findings",[]) if isinstance(f,dict) and f.get("_seen_before") is True))' \
+          "$_crd_envelope" 2>/dev/null || echo 0)
+      fi
+      case "$_crd_seen_n" in ''|*[!0-9]*) _crd_seen_n=0 ;; esac
+      if [ "$_crd_seen_n" -gt 0 ]; then
+        printf '[dedup] %d finding(s) seen in prior run(s) kept and still counted toward the verdict\n' \
+          "$_crd_seen_n" 1>&2
       fi
       ds_audit_log "review-dedup" "pass" \
-        "suppressed:${_crd_suppressed}/total:${_crd_before}"
+        "collapsed:${_crd_suppressed}/total:${_crd_before} seen_before:${_crd_seen_n} mode:annotate"
     else
       # Conservative: splice failed, retain original findings.
       printf '[gates/review] cross-round dedup: splice failed — retaining all findings (conservative)\n' 1>&2
@@ -4346,8 +4488,25 @@ _review_recurrence_demote() {
   # so downstream matching is done BY VALUE (file/category/message), never
   # by array position, which would misalign the moment any finding in this
   # round lacks a computable key.
+  #
+  # SEEN-BEFORE FINDINGS ARE NOT BUMPED. _cross_round_dedup now keeps a
+  # finding an earlier run recorded (annotated _seen_before) instead of
+  # dropping it, so it reaches this function on every re-run. Counting each
+  # re-run as another "round" would demote it to advisory on the second
+  # identical run, which is the same verdict-by-repetition hole the dedup
+  # change closes. Recurrence therefore counts only findings dedup treated as
+  # new, exactly the population it saw when dedup dropped the rest.
   _rrd_keyed_tsv=$(mktemp -t clagentic-rrd-keyed.XXXXXX)
-  printf '%s' "$_rrd_findings" | finding_content_keys "$_rrd_diff" > "$_rrd_keyed_tsv" 2>/dev/null
+  _rrd_unseen=$(printf '%s' "$_rrd_findings" | python3 -c '
+import json, sys
+try:
+    items = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print(json.dumps([f for f in items if not (isinstance(f, dict) and f.get("_seen_before") is True)]))
+' 2>/dev/null) || _rrd_unseen='[]'
+  [ -n "$_rrd_unseen" ] || _rrd_unseen='[]'
+  printf '%s' "$_rrd_unseen" | finding_content_keys "$_rrd_diff" > "$_rrd_keyed_tsv" 2>/dev/null
 
   if [ ! -s "$_rrd_keyed_tsv" ]; then
     # No finding in this round had a computable key (empty diff window, no
@@ -5274,6 +5433,12 @@ cmd_review() {
   done
   export REVIEW_FULL
 
+  # Per-run provenance state (see _review_run_provenance_fields). Reset every
+  # run: `ship` calls cmd_review in the same process as other gates, and a
+  # stale value from an earlier run must never be recorded against this one.
+  _REVIEW_RUN_PROV_FILE=""
+  _REVIEW_RUN_CHUNK_SIZES=""
+
   # --reset-dedup: delete the persisted seen-keys file (and the recurrence
   # counts file, which is derived from the same content-hash key space and
   # would otherwise still remember round counts from before the reset) and
@@ -5366,6 +5531,10 @@ cmd_review() {
   fi
   rm -f "$_crv_diff_reason_tmp"
 
+  # llm-client.sh appends one provenance line per accepted call to this file
+  # (CLAGENTIC_LLM_RUN_META_FILE). Removed by _ledger_record_review_verdict.
+  _REVIEW_RUN_PROV_FILE=$(mktemp -t clagentic-review-prov.XXXXXX)
+
   # Chunking threshold: CLAGENTIC_REVIEWER_MAX_DIFF_KB (operator-facing alias,
   # in KB) takes precedence; CLAGENTIC_REVIEW_CHUNK_BYTES (in bytes) is the
   # secondary alias; default 262144 bytes (256 KB).
@@ -5433,7 +5602,9 @@ cmd_review() {
         # payload, not a crash, so it belongs on this same branch as 3.
         _crv_chunk_status=0
         _crv_chunk_err=$(mktemp -t clagentic-review-chunk-err.XXXXXX)
-        "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_chunk" > "$_crv_env_file" 2>"$_crv_chunk_err" || _crv_chunk_status=$?
+        _REVIEW_RUN_CHUNK_SIZES="${_REVIEW_RUN_CHUNK_SIZES:+$_REVIEW_RUN_CHUNK_SIZES }${_crv_cbytes}"
+        CLAGENTIC_LLM_RUN_META_FILE="$_REVIEW_RUN_PROV_FILE" \
+          "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_chunk" > "$_crv_env_file" 2>"$_crv_chunk_err" || _crv_chunk_status=$?
         _crv_chunk_outcome="pass"
         if [ "$_crv_chunk_status" -ne 0 ] && [ "$_crv_chunk_status" -ne 3 ] && [ "$_crv_chunk_status" -ne 4 ]; then
           # A nonzero status that is NOT one of walk_chain's own degraded
@@ -5595,7 +5766,9 @@ cmd_review() {
   # INFRA_DEGRADED (exit 2) path. _crv_review_status is recorded in the audit
   # details string below for the same reason the chunked path records it.
   _crv_review_status=0
-  "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_diff_tmp" > "$OUT" || _crv_review_status=$?
+  _REVIEW_RUN_CHUNK_SIZES="$_crv_diff_bytes"
+  CLAGENTIC_LLM_RUN_META_FILE="$_REVIEW_RUN_PROV_FILE" \
+    "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_diff_tmp" > "$OUT" || _crv_review_status=$?
   # Note: _crv_diff_tmp is NOT deleted yet — cross-round dedup needs it below.
 
   # SECURITY (lr-66e598 follow-up): strip every finding to the closed
@@ -6644,6 +6817,162 @@ _mg_state_identity() {
   printf '%s:%s' "$_mgsi_head" "$_mgsi_content_hash"
 }
 
+# _mg_summary_stale_flag SUMMARY_FILE — print "true" when the gate summary is
+# the minimal stale-payload envelope build_gate_summary emits, else "false".
+_mg_summary_stale_flag() {
+  _mssf_out=""
+  if command -v jq >/dev/null 2>&1; then
+    _mssf_out=$(jq -r '.stale_payload // "false"' "$1" 2>/dev/null || echo "false")
+  elif command -v python3 >/dev/null 2>&1; then
+    _mssf_out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(str(d.get("stale_payload","false")).lower())' "$1" 2>/dev/null || echo "false")
+  fi
+  printf '%s' "${_mssf_out:-false}"
+}
+
+# _mg_stale_report SUMMARY_FILE
+#
+# Turns a stale-payload gate summary into the operator-facing refusal. Sets
+#   _MG_STALE_PRIMARY  the one reason that decides the headline
+#   _MG_STALE_TEXT     refusal text (also the "reason" in last-merge-gate.json)
+#   _MG_STALE_AUDIT    audit-trail detail
+# The reasons are build_gate_summary's closed set; each gets its own wording
+# because the right next step differs: sha_mismatch / missing_stamp / empty_head
+# mean the gate output does not describe HEAD, so re-running is the fix, while
+# review_blocked_at_head means the review ran at HEAD and BLOCKED, so
+# re-running cannot help and the findings are listed instead. A summary with no
+# reason fields (older envelope, no JSON tool) reads as sha_mismatch, the one
+# cause the old single message described.
+_mg_stale_report() {
+  _msr_file="$1"
+  _msr_us=$(printf '\037')
+  _msr_rows=""
+  if command -v jq >/dev/null 2>&1; then
+    _msr_rows=$(jq -r '
+      "P\u001f\(.stale_reason // "")\u001f\u001f",
+      "H\u001f\(.current_sha // "")\u001f\u001f",
+      ((.stale_reasons // {}) | to_entries[] | "R\u001f\(.key)\u001f\(.value)\u001f"),
+      (if .blocking_findings == null then "U\u001f\u001f\u001f" else empty end),
+      ((.blocking_findings // [])[] | "F\u001f\(.file)\u001f\(.line)\u001f\(.severity)\u001f\(.message)")
+    ' "$_msr_file" 2>/dev/null) || _msr_rows=""
+  elif command -v python3 >/dev/null 2>&1; then
+    _msr_rows=$(python3 -c '
+import json, sys
+us = "\x1f"
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+print(us.join(["P", str(d.get("stale_reason") or ""), "", ""]))
+print(us.join(["H", str(d.get("current_sha") or ""), "", ""]))
+for k, v in (d.get("stale_reasons") or {}).items():
+    print(us.join(["R", str(k), str(v), ""]))
+if d.get("blocking_findings") is None:
+    print(us.join(["U", "", "", ""]))
+for f in d.get("blocking_findings") or []:
+    print(us.join(["F", str(f.get("file", "")), str(f.get("line", "")), str(f.get("severity", "")), str(f.get("message", ""))]))
+' "$_msr_file" 2>/dev/null) || _msr_rows=""
+  fi
+
+  _msr_primary=""
+  _msr_head=""
+  _msr_g_sha=""
+  _msr_g_stamp=""
+  _msr_g_head=""
+  _msr_blocked=0
+  _msr_nf=0
+  _msr_unlisted=0
+  _msr_flist=""
+  _msr_fshort=""
+  while IFS="$_msr_us" read -r _msr_t _msr_a _msr_b _msr_c _msr_d; do
+    case "$_msr_t" in
+      P) _msr_primary="$_msr_a" ;;
+      H) _msr_head="$_msr_a" ;;
+      R)
+        case "$_msr_b" in
+          sha_mismatch) _msr_g_sha="${_msr_g_sha:+$_msr_g_sha, }$_msr_a" ;;
+          missing_stamp) _msr_g_stamp="${_msr_g_stamp:+$_msr_g_stamp, }$_msr_a" ;;
+          empty_head) _msr_g_head="${_msr_g_head:+$_msr_g_head, }$_msr_a" ;;
+          review_blocked_at_head) _msr_blocked=1 ;;
+        esac
+        ;;
+      U) _msr_unlisted=1 ;;
+      F)
+        _msr_nf=$((_msr_nf + 1))
+        _msr_flist="${_msr_flist:+$_msr_flist; }${_msr_a}:${_msr_b} [${_msr_c}] ${_msr_d}"
+        _msr_fshort="${_msr_fshort:+$_msr_fshort, }${_msr_a}:${_msr_b}"
+        ;;
+    esac
+  done <<EOF
+$_msr_rows
+EOF
+
+  # No per-gate reasons at all: legacy single-cause wording.
+  if [ -z "$_msr_g_sha$_msr_g_stamp$_msr_g_head" ] && [ "$_msr_blocked" -eq 0 ]; then
+    _msr_g_sha="review, adversarial"
+  fi
+
+  _MG_STALE_TEXT=""
+  _MG_STALE_AUDIT=""
+  if [ "$_msr_blocked" -eq 1 ]; then
+    _msr_short_head=$(printf '%.12s' "$_msr_head")
+    if [ "$_msr_unlisted" -eq 1 ]; then
+      _MG_STALE_TEXT="the review at HEAD ${_msr_short_head} has unresolved blocking findings; blocking findings could not be listed; see last-review.json. Running the review again at the same commit does not clear them."
+      _MG_STALE_AUDIT="review blocked at HEAD [review_blocked_at_head]: blocking findings could not be listed"
+    elif [ "$_msr_nf" -gt 0 ]; then
+      _MG_STALE_TEXT="the review at HEAD ${_msr_short_head} has unresolved blocking findings (${_msr_nf}): ${_msr_flist}. Fix them (or record a deferral in .clagentic/deferrals.json) and commit; running the review again at the same commit does not clear them."
+      _MG_STALE_AUDIT="review blocked at HEAD [review_blocked_at_head]: ${_msr_nf} unresolved blocking finding(s): ${_msr_fshort}"
+    else
+      _MG_STALE_TEXT="the review at HEAD ${_msr_short_head} recorded a blocking verdict but no blocking findings are on record (an infra-degraded run records one); see 'clagentic-lite gates digest' for the cause."
+      _MG_STALE_AUDIT="review blocked at HEAD [review_blocked_at_head]: no blocking findings on record (degraded run?)"
+    fi
+  fi
+  if [ -n "$_msr_g_sha" ]; then
+    _MG_STALE_TEXT="${_MG_STALE_TEXT:+$_MG_STALE_TEXT }stale gate payload (SHA mismatch): ${_msr_g_sha} was produced for a different commit than HEAD — re-run clagentic-lite gates review and gates adversarial first."
+    _MG_STALE_AUDIT="${_MG_STALE_AUDIT:+$_MG_STALE_AUDIT | }stale payload [sha_mismatch]: ${_msr_g_sha} — re-run review + adversarial (SHA mismatch)"
+  fi
+  if [ -n "$_msr_g_stamp" ]; then
+    _MG_STALE_TEXT="${_MG_STALE_TEXT:+$_MG_STALE_TEXT }stale gate payload (no SHA stamp or no passing verdict recorded for HEAD): ${_msr_g_stamp} — re-run clagentic-lite gates review and gates adversarial first."
+    _MG_STALE_AUDIT="${_MG_STALE_AUDIT:+$_MG_STALE_AUDIT | }stale payload [missing_stamp]: ${_msr_g_stamp} — no SHA stamp or passing verdict at HEAD, re-run review + adversarial"
+  fi
+  if [ -n "$_msr_g_head" ]; then
+    _MG_STALE_TEXT="${_MG_STALE_TEXT:+$_MG_STALE_TEXT }stale gate payload: HEAD could not be resolved in this git repository, so no gate output can be matched to it."
+    _MG_STALE_AUDIT="${_MG_STALE_AUDIT:+$_MG_STALE_AUDIT | }stale payload [empty_head]: HEAD unresolved"
+  fi
+
+  if [ "$_msr_blocked" -eq 1 ]; then
+    _MG_STALE_PRIMARY="review_blocked_at_head"
+  elif [ -n "$_msr_primary" ]; then
+    _MG_STALE_PRIMARY="$_msr_primary"
+  elif [ -n "$_msr_g_sha" ]; then
+    _MG_STALE_PRIMARY="sha_mismatch"
+  elif [ -n "$_msr_g_stamp" ]; then
+    _MG_STALE_PRIMARY="missing_stamp"
+  else
+    _MG_STALE_PRIMARY="empty_head"
+  fi
+}
+
+# _mg_refuse_stale SUMMARY_FILE OUT_FILE GATE_NAME
+#
+# The one deterministic stale-payload refusal (no LLM call, no token burn),
+# shared by the normal and --recheck paths so the two cannot word the same
+# cause differently. Returns 1 (refuse) unless CLAGENTIC_MERGE_GATE_BLOCKING=0.
+_mg_refuse_stale() {
+  _mrs_summary="$1"
+  _mrs_out="$2"
+  _mrs_gate="$3"
+  _mg_stale_report "$_mrs_summary"
+  printf '{"decision": "refuse", "stale_reason": "%s", "reason": "%s"}\n' \
+    "$_MG_STALE_PRIMARY" "$(ds_json_escape "$_MG_STALE_TEXT")" > "$_mrs_out"
+  cmd_log_run "$_mrs_gate" block "$_MG_STALE_AUDIT"
+  printf '[gates/merge-gate] REFUSED (%s): %s\n' "$_MG_STALE_PRIMARY" "$_MG_STALE_TEXT" 1>&2
+  cat "$_mrs_out"
+  if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
+    return 1
+  fi
+  return 0
+}
+
 cmd_merge_gate() {
   _gate_check_args merge-gate "--recheck" "" "$@" || return 2
   # Final LLM sanity check: feed gate outputs back through the merge-gate
@@ -6705,6 +7034,15 @@ cmd_merge_gate() {
       return 1
     fi
 
+    # The summary on disk may itself be the stale-payload envelope an earlier
+    # run wrote. It carries no review_sha, so the SHA guard below would report
+    # that as a missing stamp whatever the real cause was (a review blocked at
+    # HEAD, say). Refuse with the reason the envelope recorded instead.
+    if [ "$(_mg_summary_stale_flag "$IN")" = "true" ]; then
+      _mg_refuse_stale "$IN" "$OUT" "merge-gate recheck"
+      return $?
+    fi
+
     # SHA-staleness guard: --recheck is for retrying a transient LLM failure,
     # not for replaying an old summary against a new commit. Read the SHA
     # stamped inside gate-summary.json (review_sha, lifted from the review's
@@ -6735,10 +7073,16 @@ except Exception:
     print("")
 ' "$IN" 2>/dev/null || echo "")
       fi
-      if [ -z "$_mg_summary_sha" ] || [ "$_mg_summary_sha" != "$_mg_head_sha" ]; then
+      if [ -z "$_mg_summary_sha" ]; then
+        printf '[gates/merge-gate] --recheck refused: gate-summary.json carries no review SHA stamp (HEAD is %s), so it cannot be matched to this commit. Run '"'"'gates review'"'"' then '"'"'gates merge-gate'"'"', or '"'"'gates ship'"'"' to rebuild.\n' \
+          "$_mg_head_sha" 1>&2
+        cmd_log_run "merge-gate recheck" block "stale payload [missing_stamp]: gate-summary.json has no review SHA stamp, head=${_mg_head_sha}"
+        return 1
+      fi
+      if [ "$_mg_summary_sha" != "$_mg_head_sha" ]; then
         printf '[gates/merge-gate] --recheck refused: gate-summary.json is for %s, HEAD is %s. Run '"'"'gates review'"'"' then '"'"'gates merge-gate'"'"', or '"'"'gates ship'"'"' to rebuild.\n' \
-          "${_mg_summary_sha:-<no sha>}" "$_mg_head_sha" 1>&2
-        cmd_log_run "merge-gate recheck" block "SHA mismatch: summary=${_mg_summary_sha:-<absent>} head=${_mg_head_sha}"
+          "$_mg_summary_sha" "$_mg_head_sha" 1>&2
+        cmd_log_run "merge-gate recheck" block "stale payload [sha_mismatch]: SHA mismatch: summary=${_mg_summary_sha} head=${_mg_head_sha}"
         return 1
       fi
     fi
@@ -6779,20 +7123,9 @@ except Exception:
   # Note: --recheck skips build_gate_summary entirely, so stale_payload will
   # not be set in the existing gate-summary.json; this check is a no-op on
   # the recheck path but is preserved for safety.
-  _stale_check=""
-  if command -v jq >/dev/null 2>&1; then
-    _stale_check=$(jq -r '.stale_payload // "false"' "$IN" 2>/dev/null || echo "false")
-  elif command -v python3 >/dev/null 2>&1; then
-    _stale_check=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(str(d.get("stale_payload","false")).lower())' "$IN" 2>/dev/null || echo "false")
-  fi
-  if [ "${_stale_check}" = "true" ]; then
-    printf '{"decision": "refuse", "reason": "stale gate payload — re-run clagentic-lite gates review and gates adversarial first"}\n' > "$OUT"
-    cmd_log_run "$_mg_gate_name" block "stale payload — re-run review + adversarial (SHA mismatch)"
-    cat "$OUT"
-    if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
-      return 1
-    fi
-    return 0
+  if [ "$(_mg_summary_stale_flag "$IN")" = "true" ]; then
+    _mg_refuse_stale "$IN" "$OUT" "$_mg_gate_name"
+    return $?
   fi
 
   # STATUS-CHECKED (lr-7047bf, INV-1b): guard explicitly -- gates.sh runs
@@ -6941,6 +7274,9 @@ severity_blockers() {
   # the caller's `> 0` block check unambiguously. Three branches that
   # could fail (jq parse, python3 parse, no validator at all) all return
   # 99 — there is no path where an unparseable review counts as "clean."
+  # A non-string, non-null severity (a number, say) cannot be ranked and counts
+  # as blocking in both branches; the jq branch used to error out to the 99
+  # sentinel while the python3 branch ranked it 0 and let it pass.
   # Severity strings are normalized case-insensitively. LLM models routinely
   # return "HIGH" or "CRITICAL" uppercase — without normalization these rank
   # 0 (unknown) and blocking findings silently pass.
@@ -6966,12 +7302,14 @@ severity_blockers() {
   if command -v jq >/dev/null 2>&1; then
     R=$(jq -r --argjson tr "$TR" '
       def rank(s):
-        (s // "" | ascii_downcase) as $s
+        if s == null then 0
+        elif (s | type) != "string" then 4
+        else (s | ascii_downcase) as $s
         | if $s == "critical" then 4
         elif $s == "high" then 3
         elif $s == "medium" then 2
         elif $s == "low" then 1
-        else 0 end;
+        else 0 end end;
       [(.findings // [])[] | select(rank(.severity) >= $tr and (._recurrence_demoted // false) != true and (._deferral_matched // false) != true)] | length
     ' "$FILE" 2>/dev/null)
     if [ -z "$R" ]; then echo 99; else echo "$R"; fi
@@ -6984,9 +7322,15 @@ try:
 except Exception:
     print(99); sys.exit(0)
 tr = int(sys.argv[2])
+def rank(sev):
+    if sev is None:
+        return 0
+    if not isinstance(sev, str):
+        return 4
+    return ranks.get(sev.lower(), 0)
 print(sum(
     1 for f in d.get("findings", [])
-    if ranks.get(str(f.get("severity","")).lower(),0) >= tr
+    if rank(f.get("severity")) >= tr
     and f.get("_recurrence_demoted") is not True
     and f.get("_deferral_matched") is not True
 ))
@@ -6998,6 +7342,72 @@ PY
     # than a model that legitimately found 99 issues.
     echo 99
   fi
+}
+
+# _blocking_findings_json THRESHOLD — read a JSON object with a .findings array
+# on stdin and print, as compact JSON, the findings severity_blockers would
+# count at THRESHOLD, reduced to {file, line, severity, message}. Same
+# predicate as severity_blockers (severity rank, not _recurrence_demoted, not
+# _deferral_matched) so the list a refusal shows is exactly the set that
+# blocked. Control bytes are stripped from the free text and message is capped:
+# the text is model-authored and ends up on a terminal. Prints "null" (not "[]",
+# which would read as "nothing blocked") when no JSON tool exists or the input
+# is unreadable, never a partial list; _mg_stale_report renders null as "could
+# not be listed".
+# A non-string, non-null severity cannot be ranked, so it counts as blocking
+# (rank 4): the same fail-closed reading severity_blockers applies, which keeps
+# the list equal to the set that blocked.
+_blocking_findings_json() {
+  _bfj_tr=$(severity_rank "$1")
+  [ "$_bfj_tr" -eq 0 ] && _bfj_tr=3
+  if command -v jq >/dev/null 2>&1; then
+    jq -c --argjson tr "$_bfj_tr" '
+      def rank(s):
+        if s == null then 0
+        elif (s | type) != "string" then 4
+        else (s | ascii_downcase) as $s
+        | if $s == "critical" then 4
+        elif $s == "high" then 3
+        elif $s == "medium" then 2
+        elif $s == "low" then 1
+        else 0 end end;
+      def clean: (. // "" | tostring | gsub("[\u0001-\u001f\u007f]"; " ") | .[0:300]);
+      [(.findings // [])[]
+        | select(rank(.severity) >= $tr and (._recurrence_demoted // false) != true and (._deferral_matched // false) != true)
+        | {file: (.file | clean), line: (.line // 0), severity: (.severity | clean), message: (.message | clean)}]
+    ' 2>/dev/null || printf 'null'
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, re, sys
+ranks = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+tr = int(sys.argv[1])
+def clean(v):
+    return re.sub(r"[\x00-\x1f\x7f]", " ", "" if v is None else str(v))[:300]
+def rank(sev):
+    if sev is None:
+        return 0
+    if not isinstance(sev, str):
+        return 4
+    return ranks.get(sev.lower(), 0)
+try:
+    d = json.load(sys.stdin)
+    out = [
+        {"file": clean(f.get("file")), "line": f.get("line") or 0,
+         "severity": clean(f.get("severity")), "message": clean(f.get("message"))}
+        for f in d.get("findings", []) if isinstance(f, dict)
+        and rank(f.get("severity")) >= tr
+        and f.get("_recurrence_demoted") is not True
+        and f.get("_deferral_matched") is not True
+    ]
+    print(json.dumps(out))
+except Exception:
+    print("null")
+' "$_bfj_tr" 2>/dev/null || printf 'null'
+    return 0
+  fi
+  printf 'null'
 }
 
 # _fence_adversarial_findings JSON_ARRAY — render an (already sanitized)
@@ -8016,7 +8426,7 @@ build_gate_summary() {
   _git_dir_ok=0
   if _git_repo_root_is_scoped; then _git_dir_ok=1; fi
   if [ -z "$CURRENT_SHA" ] && [ "$_git_dir_ok" = "1" ] && [ "${CLAGENTIC_ALLOW_STALE_PAYLOAD:-0}" != "1" ]; then
-    printf '{"stale_payload": true, "stale_gates": ["review","adversarial"], "current_sha": "", "review_sha": "", "adversarial_sha": ""}\n'
+    printf '{"stale_payload": true, "stale_reason": "empty_head", "stale_reasons": {"review": "empty_head", "adversarial": "empty_head"}, "stale_gates": ["review","adversarial"], "blocking_findings": [], "current_sha": "", "review_sha": "", "adversarial_sha": ""}\n'
     return 0
   fi
   if [ -n "$CURRENT_SHA" ] || [ "$_git_dir_ok" = "0" ]; then
@@ -8025,6 +8435,12 @@ build_gate_summary() {
     else
       STALE_PAYLOAD=false
       STALE_GATES=""
+      # One "gate=reason" pair per stale gate, reasons drawn from the closed
+      # set sha_mismatch | missing_stamp | review_blocked_at_head | empty_head.
+      # cmd_merge_gate renders a distinct refusal per reason: the cause decides
+      # what the operator should do next, and "re-run" is only right for some.
+      STALE_REASONS=""
+      STALE_BLOCKING_JSON="[]"
 
       # Extract SHA from last-review.json.
       _rv_sha=""
@@ -8035,9 +8451,14 @@ build_gate_summary() {
           _rv_sha=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("_clagentic_diff_sha",""))' "$RV" 2>/dev/null || echo "")
         fi
         # File exists: stale if stamp is empty (pre-feature file) OR stamp mismatches.
-        if [ -z "$_rv_sha" ] || [ "$_rv_sha" != "$CURRENT_SHA" ]; then
+        if [ -z "$_rv_sha" ]; then
           STALE_PAYLOAD=true
           STALE_GATES="review"
+          STALE_REASONS="review=missing_stamp"
+        elif [ "$_rv_sha" != "$CURRENT_SHA" ]; then
+          STALE_PAYLOAD=true
+          STALE_GATES="review"
+          STALE_REASONS="review=sha_mismatch"
         fi
       fi
 
@@ -8090,6 +8511,16 @@ build_gate_summary() {
             else
               STALE_GATES="review-ledger"
             fi
+            _mg_ledger_state=$(_ledger_head_verdict_state "$_mg_ledger" "$_mg_ledger_branch" "$CURRENT_SHA" review)
+            STALE_REASONS="${STALE_REASONS:+$STALE_REASONS }review-ledger=${_mg_ledger_state:-missing_stamp}"
+            if [ "$_mg_ledger_state" = "review_blocked_at_head" ]; then
+              # The refusal names the findings that blocked, from the ledger
+              # entry the verdict was recorded with (last-review.json is
+              # overwritten by every run and may no longer match).
+              _mg_ledger_entry=$(_ledger_latest_gate_entry "$_mg_ledger" "$_mg_ledger_branch" review)
+              STALE_BLOCKING_JSON=$(printf '%s' "$_mg_ledger_entry" | _blocking_findings_json "$THRESHOLD")
+              [ -n "$STALE_BLOCKING_JSON" ] || STALE_BLOCKING_JSON="null"
+            fi
           fi
         fi
       fi
@@ -8108,6 +8539,11 @@ build_gate_summary() {
             STALE_GATES="$STALE_GATES adversarial"
           else
             STALE_GATES="adversarial"
+          fi
+          if [ -z "$_ad_sha" ]; then
+            STALE_REASONS="${STALE_REASONS:+$STALE_REASONS }adversarial=missing_stamp"
+          else
+            STALE_REASONS="${STALE_REASONS:+$STALE_REASONS }adversarial=sha_mismatch"
           fi
         fi
         # ROUTED THROUGH THE HARDENED DETECTOR (BOBBIE finding 1 remainder,
@@ -8144,8 +8580,24 @@ build_gate_summary() {
             _stale_arr="\"$_sg\""
           fi
         done
-        printf '{"stale_payload": true, "stale_gates": [%s], "current_sha": "%s", "review_sha": "%s", "adversarial_sha": "%s"}\n' \
-          "$_stale_arr" "$CURRENT_SHA" "$_rv_sha_val" "$_ad_sha_val"
+        # stale_reasons object from the "gate=reason" pairs; every token is
+        # from a closed lowercase set, so it is safe to splice as literals
+        # (this branch must work with no JSON encoder at all).
+        _stale_reasons_obj=""
+        _stale_primary=""
+        for _sr in $STALE_REASONS; do
+          _sr_gate="${_sr%%=*}"
+          _sr_reason="${_sr#*=}"
+          [ -n "$_stale_primary" ] || _stale_primary="$_sr_reason"
+          _stale_reasons_obj="${_stale_reasons_obj:+$_stale_reasons_obj, }\"$_sr_gate\": \"$_sr_reason\""
+        done
+        # A blocked review is the actionable cause even when a sibling gate is
+        # also stale, so it wins the single top-level stale_reason.
+        case " $STALE_REASONS " in
+          *"=review_blocked_at_head "*) _stale_primary="review_blocked_at_head" ;;
+        esac
+        printf '{"stale_payload": true, "stale_reason": "%s", "stale_reasons": {%s}, "stale_gates": [%s], "blocking_findings": %s, "current_sha": "%s", "review_sha": "%s", "adversarial_sha": "%s"}\n' \
+          "${_stale_primary:-sha_mismatch}" "$_stale_reasons_obj" "$_stale_arr" "$STALE_BLOCKING_JSON" "$CURRENT_SHA" "$_rv_sha_val" "$_ad_sha_val"
         return 0
       fi
     fi
@@ -8748,6 +9200,9 @@ cmd_render_review() {
               else "" end) +
              (if ._deferral_matched == true
               then " (matched deferral " + (._deferral_id // "?") + ")"
+              else "" end) +
+             (if ._seen_before == true
+              then " (reported in a prior run; still counted)"
               else "" end) +
              (if class_named
               then "\n    class: " + .issue_class + (if (.class_fix != null) and (.class_fix != "") then " -> " + .class_fix else "" end)

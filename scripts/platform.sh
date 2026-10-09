@@ -751,6 +751,24 @@ sys.stdout.write(encoded[1:-1])
   fi
 }
 
+# Print the sha256 hex digest of FILE and nothing else. Returns 1 with no
+# output when FILE is unreadable or neither sha256sum nor shasum exists, so a
+# provenance field is either a real digest or visibly absent -- never an
+# identity-function stand-in that review-merge.sh's _rm_sha256 falls back to
+# for dedup keys (acceptable for a lookup key, wrong for a recorded hash).
+#
+# Args: FILE
+ds_sha256_file() {
+  [ -r "$1" ] || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum < "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 < "$1" | cut -d' ' -f1
+  else
+    return 1
+  fi
+}
+
 # Emit a Claude Code hook-output envelope that injects context into the
 # session. Sole sanctioned emitter for every hook shim: Claude Code only
 # honors additionalContext nested under hookSpecificOutput (with a matching

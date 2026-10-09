@@ -100,6 +100,9 @@ INTERNAL_ONLY = {
     "CLAGENTIC_REPO_ENV_LOADED": "loader idempotence latch",
     "CLAGENTIC_GLOBAL_CONFIG_OLD_PATH_WARNED": "once-per-process warning latch",
     "CLAGENTIC_LITE_HOME_SET": "once-per-process warning latch",
+    # Per-call handoff gates.sh sets for one llm-client.sh invocation to receive
+    # the accepted step's model and prompt hash; never an operator setting.
+    "CLAGENTIC_LLM_RUN_META_FILE": "internal gates.sh -> llm-client.sh per-call handoff file",
     # Shell constants inside bin/clagentic-lite, not read from the environment.
     "CLAGENTIC_HOOK_SCRIPTS": "internal constant: hook scripts to stamp",
     "CLAGENTIC_SECURITY_TOOLS": "internal constant: scanner list init/doctor iterate",

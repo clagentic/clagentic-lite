@@ -2,10 +2,11 @@
 Acceptance tests for lr-66e598: cross-round finding recurrence demotion.
 
 BACKGROUND: cross-round dedup (CLAGENTIC_CROSS_ROUND_DEDUP, review-seen-keys)
-already SUPPRESSES a review finding whose content-hash key exactly repeats
-across rounds -- so a finding that recurs with a BYTE-IDENTICAL diff context
-window never reaches a third round at all; dedup already hides it after
-round 1. Recurrence demotion is the backstop for what dedup does not catch:
+MARKS a review finding whose content-hash key exactly repeats across rounds
+(_seen_before; it is kept and keeps blocking) and recurrence counting skips
+marked findings -- so a finding that recurs with a BYTE-IDENTICAL diff context
+window is never counted a second round here. Recurrence demotion is the
+backstop for what dedup does not catch:
 this task's SCOPE explicitly reuses the SAME content-hash key space
 (finding_content_keys, review-merge.sh) for a SECOND purpose -- counting
 occurrences instead of only testing membership -- via a SEPARATE persisted
@@ -68,7 +69,17 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_source_helpers import GATES_SH, PLATFORM_SH, source_env  # noqa: E402
+from test_source_helpers import (  # noqa: E402
+    GATES_SH,
+    GIT_IDENTITY_ENV as _GIT_IDENTITY_ENV,
+    PLATFORM_SH,
+    RECURRING_FINDING as _RECURRING_FINDING,
+    init_git_repo as _init_git_repo,
+    setup_fake_tool_home as _setup_fake_tool_home,
+    setup_project as _setup_project,
+    source_env,
+    stage_identical_recreation as _stage_identical_recreation,
+)
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -115,15 +126,6 @@ _STABLE_DIFF = textwrap.dedent("""\
     +def handle(x):
     +    return x
     """)
-
-_RECURRING_FINDING = {
-    "severity": "high",
-    "file": "app.py",
-    "line": 2,
-    "category": "security",
-    "message": "unsanitized input reaches a sink",
-}
-
 
 def _write_envelope(path, findings):
     with open(path, "w") as f:
@@ -292,86 +294,10 @@ class TestRecurrenceDemoteFunctionDirect(unittest.TestCase):
 # Layer 2: cmd_review end-to-end, real git repo, stub llm-client.sh.
 # --------------------------------------------------------------------------
 
-def _setup_project(tmpdir):
-    clagentic_dir = os.path.join(tmpdir, ".clagentic", "lite")
-    os.makedirs(clagentic_dir, exist_ok=True)
-    db_path = os.path.join(clagentic_dir, "audit.db")
-    conn = sqlite3.connect(db_path)
-    conn.execute(textwrap.dedent("""\
-        CREATE TABLE IF NOT EXISTS gate_runs (
-          id         INTEGER PRIMARY KEY,
-          ts         TEXT NOT NULL,
-          gate       TEXT NOT NULL,
-          outcome    TEXT NOT NULL,
-          details    TEXT,
-          session_id TEXT,
-          branch     TEXT
-        )
-    """))
-    conn.commit()
-    conn.close()
-    return tmpdir
-
-
-_GIT_IDENTITY_ENV = {
-    "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-    "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-}
-
-
-def _init_git_repo(project_root):
-    env = os.environ.copy()
-    env.update(_GIT_IDENTITY_ENV)
-    subprocess.run(["git", "init", "-q", project_root], check=True, env=env)
-    target = os.path.join(project_root, "app.py")
-    with open(target, "w") as f:
-        f.write("def handle(x):\n    return x\n")
-    subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
-    subprocess.run(["git", "commit", "-q", "-m", "seed"], check=True, cwd=project_root, env=env)
-
-
 def _commit_round(project_root):
     env = os.environ.copy()
     env.update(_GIT_IDENTITY_ENV)
     subprocess.run(["git", "commit", "-q", "-m", "round"], check=True, cwd=project_root, env=env)
-
-
-def _stage_identical_recreation(project_root, round_n):
-    """Commit whatever is currently staged/committed as a clean baseline
-    (so the working tree starts each round from a known committed state,
-    regardless of what a PRIOR call to this function left staged but
-    uncommitted), delete app.py, commit the deletion, then recreate it with
-    a BYTE-IDENTICAL body and stage (but do not commit) the recreation —
-    forces every round's staged diff to show the same lines as freshly
-    ADDED (a 'new file' diff each time), so the flagged line's content-hash
-    key is genuinely stable and independent of git's diff-minimization
-    heuristics (which otherwise treat an unchanged line as context, never
-    `+`, and never re-emit it at all). The caller is expected to run the
-    gate against the staged recreation; this function does NOT commit the
-    recreation itself, so the gate sees it as a staged (uncommitted) diff,
-    matching get_review_diff's staged-diff-first priority."""
-    env = os.environ.copy()
-    env.update(_GIT_IDENTITY_ENV)
-    # Commit any staged-but-uncommitted state from a PRIOR call before
-    # starting this round's delete/recreate cycle, so `git add` + `git
-    # commit` below always has a clean, fully-committed baseline to work
-    # from — otherwise the second call in a sequence finds nothing new to
-    # commit for the deletion step (the previous round's recreation was
-    # staged, not committed) and `git commit` fails with "nothing to commit".
-    subprocess.run(
-        ["git", "commit", "-q", "-m", "checkpoint", "--allow-empty"],
-        check=True, cwd=project_root, env=env,
-    )
-    target = os.path.join(project_root, "app.py")
-    if os.path.exists(target):
-        os.remove(target)
-        subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
-        subprocess.run(
-            ["git", "commit", "-q", "-m", "delete"], check=True, cwd=project_root, env=env,
-        )
-    with open(target, "w") as f:
-        f.write("def handle(x):\n    return x\n")
-    subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
 
 
 def _make_stub_llm_client(tmpdir, envelopes_by_round):
@@ -413,25 +339,6 @@ def _make_stub_llm_client(tmpdir, envelopes_by_round):
         """))
     os.chmod(stub, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
     return tmpdir
-
-
-def _setup_fake_tool_home(fake_tool_home):
-    scripts_dir = os.path.join(fake_tool_home, "scripts")
-    os.makedirs(scripts_dir, exist_ok=True)
-    real_scripts_dir = os.path.join(TOOL_HOME, "scripts")
-    for fname in os.listdir(real_scripts_dir):
-        if not fname.endswith(".sh"):
-            continue
-        if fname == "llm-client.sh":
-            continue
-        src = os.path.join(real_scripts_dir, fname)
-        dst = os.path.join(scripts_dir, fname)
-        if not os.path.exists(dst):
-            os.symlink(src, dst)
-    real_share = os.path.join(TOOL_HOME, "share")
-    fake_share = os.path.join(fake_tool_home, "share")
-    if not os.path.exists(fake_share) and os.path.isdir(real_share):
-        os.symlink(real_share, fake_share)
 
 
 def _run_review(extra_args, fake_tool_home, project_root, env_overrides=None):
@@ -477,12 +384,13 @@ class TestRecurrenceViaCmdReview(unittest.TestCase):
         self.assertEqual(result.returncode, 1,
                           f"first-ever report must block: {result.stderr!r}")
 
-    def test_dedup_and_recurrence_compose_dedup_suppresses_first(self):
+    def test_dedup_and_recurrence_compose_dedup_annotates_and_recurrence_skips_seen(self):
         """When cross-round dedup is on (default) and a finding's content
-        window IS byte-identical round to round, dedup suppresses it before
-        recurrence ever gets a chance to see a second round — this is the
-        correct, tested COMPOSITION of the two features, not a bug: a
-        byte-identical repeat is dedup's job, and dedup runs first."""
+        window IS byte-identical round to round, dedup marks it
+        _seen_before but KEEPS it, so it still blocks (a verdict that
+        passed because the finding was seen before was a fail-open), and
+        recurrence demotion does not count a seen finding as another round,
+        so it cannot demote it to advisory either."""
         _make_stub_llm_client(self._tmpdir, [_envelope_with_finding(), _envelope_with_finding()])
         _stage_identical_recreation(self._project, 1)
         r1 = _run_review([], self._tmpdir, self._project)
@@ -490,14 +398,16 @@ class TestRecurrenceViaCmdReview(unittest.TestCase):
 
         _stage_identical_recreation(self._project, 2)
         r2 = _run_review([], self._tmpdir, self._project)
-        self.assertEqual(r2.returncode, 0, "round 2 must pass (dedup-suppressed)")
-        self.assertIn("suppressed", r2.stderr)
+        self.assertEqual(r2.returncode, 1, "round 2 must still block (seen, not dropped)")
+        self.assertIn("seen in prior run", r2.stderr)
 
         review_path = os.path.join(self._project, ".clagentic", "lite", "last-review.json")
         with open(review_path) as f:
             review = json.load(f)
-        self.assertEqual(review["findings"], [],
-                          "dedup-suppressed finding must not appear in round 2's output")
+        self.assertEqual(len(review["findings"]), 1,
+                          "a seen finding must stay in round 2's output")
+        self.assertIs(review["findings"][0]["_seen_before"], True)
+        self.assertFalse(review["findings"][0].get("_recurrence_demoted", False))
 
     def test_reset_dedup_clears_recurrence_file_too(self):
         """Task constraint (e): --reset-dedup must clear recurrence counts
