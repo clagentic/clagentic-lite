@@ -7605,16 +7605,8 @@ cmd_render_review() {
   _gate_check_args render-review "" "FILE" "$@" || return 2
   FILE="${1:-$REPO_ROOT/.clagentic/lite/last-review.json}"
   [ -f "$FILE" ] || { echo "no review file at $FILE" 1>&2; return 1; }
-  # A recurrence-demoted finding gets a "reported N rounds running — decide"
-  # suffix so the operator sees WHY a finding that looks blocking-severity did
-  # not gate /ship, rather than the demotion being silent; a deferral-matched
-  # finding gets a "matched deferral <id>" suffix naming which
-  # .clagentic/deferrals.json entry excluded it; a finding seen in a prior run
-  # says it is still counted. issue_class/class_fix render as a second,
-  # indented line, suppressed for "none — isolated" (the honest majority case
-  # would otherwise drown out the findings that DO name a class). Display
-  # only: it never gates /ship. The rendering lives in findings.py render
-  # review.
+  # Display only: it never gates /ship. Suffixes, class lines and the class
+  # footer are all produced by findings.py render review.
   ds_findings_call -e any render review "$FILE" || return 1
 }
 

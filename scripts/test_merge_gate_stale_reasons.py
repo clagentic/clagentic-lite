@@ -195,6 +195,22 @@ class TestReviewBlockedAtHead(_Base):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertNotIn('"decision": "approve"', r.stdout)
 
+    def test_missing_python3_is_the_reason_on_a_clean_review(self):
+        """On a review that did not block, the refusal can only come from the
+        missing pipeline, so it must say so."""
+        _stub_llm(self._review_home, {"summary": "clean", "checked": ["security"], "findings": []})
+        _stage_identical_recreation(self._project, 1)
+        _setup_fake_tool_home(self._review_home)
+        review = self._gate(self._review_home, "review")
+        self.assertEqual(review.returncode, 0, f"review must pass to set up the case: {review.stderr}")
+        # Hidden first: a passing run records its state and a repeat is a no-op.
+        r = self._merge_gate(hide="python3")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("python3", r.stdout + r.stderr)
+        self.assertNotIn("unresolved blocking findings", r.stdout + r.stderr)
+        control = self._merge_gate()
+        self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
+
     def test_summary_carries_machine_readable_reason(self):
         self._block_review_at_head()
         self._merge_gate()

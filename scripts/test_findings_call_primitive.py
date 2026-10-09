@@ -172,6 +172,20 @@ class TestPrimitiveContract(Base):
         unlisted = self.platform("ds_findings_call -e any verdict ledger-pass", home=home)
         self.assertEqual((unlisted.returncode, unlisted.stdout), (1, ""))
 
+    def test_a_stage_crash_is_not_accepted_as_a_listed_answer(self):
+        # Python's own uncaught-exception status is 1, the status predicate
+        # stages use for "no"; the real file must exit differently on a crash.
+        real = os.path.join(TOOL_HOME, "plugins", "clagentic-lite", "bin", "findings.py")
+        with open(real) as handle:
+            source = handle.read()
+        marker = "def main(argv=None):\n"
+        self.assertIn(marker, source)
+        crashing = source.replace(marker, marker + "    raise RuntimeError('boom')\n", 1)
+        home = self.make_home(crashing)
+        result = self.platform("ds_findings_call -t '[]' -e any -o 1 verdict ledger-pass", home=home)
+        self.assertEqual((result.returncode, result.stdout), (70, ""))
+        self.assertIn("rc=70", result.stderr)
+
     def test_input_reaches_the_stage_from_text_stdin_or_a_file(self):
         home = self.make_home(ECHO_STDIN)
         by_text = self.platform("ds_findings_call -t 'a b\nc' -e any x y", home=home)

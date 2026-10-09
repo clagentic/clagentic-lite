@@ -610,8 +610,6 @@ class TestRender(Tmp):
         self.assertIn("(matched deferral D9)", out)
         self.assertIn("(reported in a prior run; still counted)", out)
         self.assertIn("\n    class: a class -> fix it", out)
-        # Only the finding that names a class gets a class line; the one whose
-        # class is "none — isolated" gets none.
         self.assertEqual(out.count("\n    class: "), 1)
         self.assertNotIn("class: none", out)
         self.assertTrue(out.endswith("\nFindings above name a class -- fix via class_fix across "
@@ -886,6 +884,11 @@ class TestDeferralLintMatchesTheMatcher(Tmp):
                     entry = {"id": "d1", "file": "src.py", "category": "security", "message": "m",
                              "scope": "stable-contract", "file_sha256": sha}
                     entry[field] = entry[field] + bad
+                    if field == "file":
+                        # The named file exists with the recorded hash, so the
+                        # only thing that can drop the entry is the unsafe char.
+                        with open(os.path.join(root, entry["file"]), "w") as handle:
+                            handle.write("content\n")
                     lint_path = self.write("deferrals.json", [entry])
                     lint = run(["dispositions", "lint", lint_path])
                     self.assertEqual(lint.returncode, 1, lint.stdout)
@@ -895,6 +898,22 @@ class TestDeferralLintMatchesTheMatcher(Tmp):
                         file=entry["file"], category=entry["category"], message=entry["message"])]})
                     self.assertEqual(run(["dispositions", "deferrals", env, "--root", root]).stdout.strip(),
                                      "none")
+
+    def test_a_clean_entry_passes_lint_and_matches(self):
+        # Positive control for the test above: without it "none" could come
+        # from any cause, including a matcher that never matches.
+        root = self.path("root")
+        os.makedirs(os.path.join(root, ".clagentic"))
+        with open(os.path.join(root, "src.py"), "w") as handle:
+            handle.write("content\n")
+        entry = {"id": "d1", "file": "src.py", "category": "security", "message": "m",
+                 "scope": "stable-contract", "file_sha256": hashlib.sha256(b"content\n").hexdigest()}
+        self.assertEqual(run(["dispositions", "lint", self.write("d0.json", [entry])]).returncode, 0)
+        self.write("root/.clagentic/deferrals.json", [entry])
+        env = self.write("env.json", {"findings": [finding(
+            file="src.py", category="security", message="m")]})
+        self.assertEqual(run(["dispositions", "deferrals", env, "--root", root]).stdout.strip(),
+                         "matched=1")
 
     def test_a_clean_entry_passes_lint(self):
         entry = {"id": "d1", "file": "f", "category": "c", "message": "m",

@@ -102,6 +102,14 @@ class TestReviewClassFooter(unittest.TestCase):
         isolated = _run_gates("cmd_render_review '{path}'", [_finding(ISOLATED, "n/a — isolated")])
         self.assertNotIn("name a class", isolated.stdout)
 
+    def test_cmd_render_review_emits_the_footer_once_and_last(self):
+        # cmd_render_review makes a single pipeline call; the footer must come
+        # from that call and be the final text, not be dropped or doubled.
+        r = _run_gates("cmd_render_review '{path}'", [_finding("c1"), _finding("c2")])
+        self.assertEqual(r.stdout.count("name a class"), 1)
+        self.assertTrue(r.stdout.endswith(
+            "\nFindings above name a class -- fix via class_fix across every site, not per-line\n"))
+
 
 def _run_gates_raw_file(body, content):
     """Expected-failure counterpart of _run_gates: writes CONTENT verbatim

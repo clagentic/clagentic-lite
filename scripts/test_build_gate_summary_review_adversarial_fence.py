@@ -232,6 +232,17 @@ class TestReviewFence(_Base):
         self.assertEqual(payload["review_fenced"], REVIEW_UNAVAILABLE)
         self.assertIs(payload["review_degraded"], True)
 
+    def test_valid_hostile_input_is_sanitized_not_degraded(self):
+        """Hostile but well-formed sources are cleaned, not refused: a
+        fail-closed-everything regression would degrade them."""
+        self._write_review(HOSTILE_REVIEW)
+        self._write_adversarial(HOSTILE_ADVERSARIAL)
+        payload = _run_build_gate_summary(self._tmpdir)
+        self.assertIs(payload["review_degraded"], False)
+        self.assertIs(payload["adversarial_report_degraded"], False)
+        self.assertNotEqual(payload["review_fenced"], REVIEW_UNAVAILABLE)
+        self.assertNotEqual(payload["adversarial_fenced"], ADV_UNAVAILABLE)
+
     def test_payload_does_not_need_jq(self):
         self._write_review(HOSTILE_REVIEW)
         self._write_adversarial(HOSTILE_ADVERSARIAL)
@@ -930,8 +941,9 @@ class TestReviewIngestFailsClosed(_FailureBase):
         self._stub("python3", _fail_stage("review-envelope"))
         env, err = self._ingest(self._path())
         self._assert_failed_stub(env, err)
-        self.assertEqual(
-            self._payload(self._path())["review_fenced"], REVIEW_UNAVAILABLE)
+        payload = self._payload(self._path())
+        self.assertEqual(payload["review_fenced"], REVIEW_UNAVAILABLE)
+        self.assertIs(payload["review_degraded"], True)
 
     def test_unreadable_findings_are_not_written_as_empty_findings(self):
         # A read failure inside the pipeline (here: bytes that are not UTF-8)

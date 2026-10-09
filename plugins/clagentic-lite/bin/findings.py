@@ -32,7 +32,7 @@ Usage: findings.py STAGE OP [ARGS]
 Findings and other payloads of unbounded size arrive on stdin or as file
 paths, never as argv: one argv string over the kernel's MAX_ARG_STRLEN fails
 exec. Exit status is the contract: 0 ok, 1 refused or failed closed, 2 unreadable
-input where the caller must tell that apart from empty.
+input where the caller must tell that apart from empty, 70 an internal crash.
 """
 import argparse
 import hashlib
@@ -43,6 +43,7 @@ import re
 import sys
 import tempfile
 
+CRASH_STATUS = 70
 SEVERITY_RANKS = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 DEFAULT_THRESHOLD_RANK = 3
 # A severity that is present but not a string cannot be ranked; it counts as
@@ -2079,4 +2080,10 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        # Python's own uncaught-exception status is 1, which callers read as a
+        # refused answer; a crash gets its own status so it can never pass for one.
+        sys.excepthook(*sys.exc_info())
+        sys.exit(CRASH_STATUS)

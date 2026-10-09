@@ -339,7 +339,8 @@ finding_content_keys() {
 #         empty, so a count can only be undercounted, which can only under-demote.
 finding_recurrence_bump() {
   _frb_input=$(cat)
-  if ds_findings_call -t "$_frb_input" -e any fingerprint bump "$1"; then
+  # The rows go in on stdin: a large round as one argv string fails exec (E2BIG).
+  if printf '%s' "$_frb_input" | ds_findings_call -s -e any fingerprint bump "$1"; then
     return 0
   fi
   # Failed pipeline: every row gets count 1, the documented undercount, which

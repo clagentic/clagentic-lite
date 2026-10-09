@@ -1178,9 +1178,9 @@ _ds_findings_well_formed() {
 # is a sequence of blocks, each opened by a line "@@@ NAME".
 
 # ds_prompt_source ROLE — print the path of ROLE's shared prompt source, or
-# return 1. Looked up under the same homes as ds_findings_py (minus the
-# working-directory walk: a prompt must come from the install, not from
-# whatever repository the caller happens to be in).
+# return 1. Looked up under the install homes only (TOOL_HOME,
+# _DS_REAL_HOME, CLAGENTIC_LITE_HOME): a prompt must come from the install, not
+# from whatever repository the caller happens to be in.
 ds_prompt_source() {
   _dps_rel="plugins/clagentic-lite/prompts/$1.shared.txt"
   for _dps_home in "${TOOL_HOME:-}" "${_DS_REAL_HOME:-}" "${CLAGENTIC_LITE_HOME:-}"; do
