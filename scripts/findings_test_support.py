@@ -28,15 +28,22 @@ def load_module():
     return module
 
 
+def clean_env(drop=("CLAGENTIC_", "GIT_")):
+    """The caller's environment minus every variable whose name starts with a
+    DROP prefix. GIT_DIR or GIT_INDEX_FILE exported by a hook would otherwise
+    redirect a fixture's git call off its temp repository."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(tuple(drop))}
+
+
 def run_findings(args, stdin=None, cwd=None, env=None):
-    base = {k: v for k, v in os.environ.items() if not k.startswith(("CLAGENTIC_", "GIT_"))}
+    base = clean_env()
     base.update(env or {})
     return subprocess.run([sys.executable, FINDINGS_PY] + list(args), input=stdin,
                           capture_output=True, text=True, cwd=cwd, env=base, timeout=120)
 
 
 def git(repo, *args, check=True):
-    env = dict(os.environ)
+    env = clean_env(drop=("GIT_",))
     env.update(GIT_IDENTITY)
     return subprocess.run(["git", "-C", repo] + list(args), check=check,
                           capture_output=True, text=True, env=env, timeout=60)

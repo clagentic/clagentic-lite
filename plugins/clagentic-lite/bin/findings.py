@@ -341,7 +341,14 @@ def extract_findings(path):
     if not isinstance(document, dict):
         return []
     value = document.get("findings")
-    return value if isinstance(value, list) else []
+    if isinstance(value, list):
+        return value
+    if "findings" in document:
+        # Lenient callers still get [], but never silently: a present non-array
+        # is a malformed envelope, and the strict path is what fails closed on it.
+        warn("[findings] %s: 'findings' is not an array; read as no findings here "
+             "(the strict path refuses it)" % path)
+    return []
 
 
 def extract_findings_strict(path):
@@ -801,8 +808,12 @@ def recurrence_count(env_path, diff_path, counts_path):
     again. Counts are per finding (by content key, once per round per key) and
     are persisted only after the envelope was rewritten. Returns the number of
     findings counted, or None when nothing was counted (envelope untouched
-    apart from clearing a stale count)."""
-    findings = extract_findings(env_path)
+    apart from clearing a stale count). An envelope whose findings are not an
+    array is never touched: None, no exception, nothing rewritten."""
+    try:
+        findings = extract_findings_strict(env_path)
+    except (OSError, ValueError, KeyError):
+        return None
     stale = [f for f in findings if isinstance(f, dict) and "_recurrence_count" in f]
     for finding in stale:
         del finding["_recurrence_count"]
@@ -895,6 +906,56 @@ def norm_path(path):
     text = str(path).strip().replace("\\", "/")
     normal = posixpath.normpath(text) if text else ""
     return "" if normal == "." else normal
+
+
+def plain_relative_path(path):
+    """PATH as a normalized repo-relative path when it is a plain one, else
+    None: no '..' segment, not absolute, no NUL, not empty. Used for every path
+    that is read from a file the repository holds and then opened, where
+    norm_path's forgiving collapse of 'a/../b' would hide an escape attempt."""
+    text = str(path).strip().replace("\\", "/")
+    if not text or "\x00" in text or text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+        return None
+    if ".." in text.split("/"):
+        return None
+    normal = norm_path(text)
+    return normal or None
+
+
+def open_contained_regular(root, rel):
+    """A binary read handle on REL under ROOT, or None when REL is not a plain
+    relative path, resolves (through symlinks) outside ROOT, or is not a
+    regular file. The kind check is made on the opened descriptor and the open
+    does not block, so a FIFO or a device node can neither hang nor be read."""
+    plain = plain_relative_path(rel)
+    if plain is None:
+        return None
+    real_root = os.path.realpath(root)
+    real = os.path.realpath(os.path.join(real_root, plain))
+    if real != real_root and not real.startswith(real_root + os.sep):
+        return None
+    try:
+        fd = os.open(real, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        # 0o170000 is S_IFMT and 0o100000 is S_IFREG: spelled out so this file
+        # keeps to the imports it already has.
+        if os.fstat(fd).st_mode & 0o170000 != 0o100000:
+            os.close(fd)
+            return None
+        return os.fdopen(fd, "rb")
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def sha256_stream(handle, chunk=1024 * 1024):
+    """sha256 hex digest of everything HANDLE yields, read in chunks."""
+    digest = hashlib.sha256()
+    for block in iter(lambda: handle.read(chunk), b""):
+        digest.update(block)
+    return digest.hexdigest()
 
 
 def finding_identity(source, fname, category, message):
@@ -1145,6 +1206,26 @@ def glob_matches(glob, path):
     return glob_match_compiled(compile_glob(glob), path)
 
 
+# Paths of every shape a repository holds, dotted and hidden names included.
+# '*' stays within one segment, so a catch-all is a glob that matches every
+# top-level name or every nested path; the two probe sets test each.
+_PROBE_TOP_LEVEL = ("a", "0", "z", "README.md", ".env", "x.y")
+_PROBE_NESTED = ("a/b", "a/b/c", ".github/workflows/ci.yml", "src/app/main.go",
+                 "docs/a.b/c.d.e", "deep/" * 8 + "file.txt")
+
+
+def matches_every_probe(glob):
+    """True when GLOB is a catch-all: it matches every top-level probe name or
+    every nested probe path. Decided by the compiled matcher, so '*', '?*',
+    '**', '**/*', '***', '**/**' and '*/*/**' are all caught however they are
+    spelled."""
+    compiled = compile_glob(glob)
+    for probes in (_PROBE_TOP_LEVEL, _PROBE_NESTED):
+        if all(glob_match_compiled(compiled, probe) for probe in probes):
+            return True
+    return False
+
+
 def glob_escape(path):
     return re.sub(r"([*?\\])", r"\\\1", path)
 
@@ -1223,8 +1304,9 @@ def validate_entry(raw):
             message = text(match_raw, "message", 500, "match.message")
             if message is not None:
                 match["message"] = message
-        if (match.get("path_glob") in ("*", "**") and match.get("category") == "*"
-                and "fingerprint_hint" not in match and "message" not in match):
+        if (match.get("path_glob") and match.get("category") == "*"
+                and "fingerprint_hint" not in match and "message" not in match
+                and matches_every_probe(match["path_glob"])):
             errors.append("'match' is a catch-all (any path, any category); narrow it")
     if errors:
         return None, errors
@@ -1264,13 +1346,23 @@ def convert_legacy_deferrals(text, root, check_hash):
         if not eligible:
             prompt_only += 1
             continue
-        fname = norm_path(item["file"])
+        fname = plain_relative_path(item["file"])
+        if fname is None:
+            notes.append("deferral %r ignored: its file %r is not a plain relative path inside "
+                         "the repository" % (terminal_text(item["id"], 80),
+                                             terminal_text(item["file"], 120)))
+            continue
         if check_hash:
+            # The whole file is hashed: the recorded digest is of the full
+            # content, so a prefix could never equal it for a large file.
+            handle = open_contained_regular(root, fname)
             try:
-                with open(os.path.join(root, fname), "rb") as handle:
-                    actual = hashlib.sha256(handle.read(MAX_FILE_BYTES + 1)).hexdigest()
+                actual = sha256_stream(handle) if handle is not None else None
             except OSError:
                 actual = None
+            finally:
+                if handle is not None:
+                    handle.close()
             if actual != item["file_sha256"]:
                 notes.append("deferral %r lapsed: %s no longer has the recorded content"
                              % (terminal_text(item["id"], 80), terminal_text(fname, 120)))
@@ -1448,7 +1540,9 @@ def load_store(root, reader, check_hash=True):
         for raw in raws[:MAX_ENTRIES]:
             add(raw, rel)
     text, problem = read(LEGACY_RISKS_REL)
-    if text is not None and text.strip():
+    if problem:
+        invalid(LEGACY_RISKS_REL, "<file>", ["cannot read the file: " + problem])
+    elif text is not None and text.strip():
         store["legacy"].append(LEGACY_RISKS_REL)
         store["warnings"].append(
             "%s is freetext and was only ever read by the merge-gate model; it clears nothing "
@@ -1599,12 +1693,19 @@ class StateLock(object):
 
     def __enter__(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        # A run that cannot take the lock must not go on: a concurrent
+        # read-modify-write would then lose accumulated findings, and a lost
+        # finding reads as a cleared one.
         try:
             import fcntl
             self.handle = open(self.path, "a", encoding="utf-8")
             fcntl.flock(self.handle, fcntl.LOCK_EX)
         except (ImportError, OSError) as exc:
-            warn("[findings] could not lock the findings state (%s); a concurrent run may be lost" % exc)
+            if self.handle is not None:
+                self.handle.close()
+                self.handle = None
+            raise StateError("could not lock the findings state (%s); refusing to run without "
+                             "it because a concurrent run could lose accumulated findings" % exc)
         return self
 
     def __exit__(self, *exc_info):
@@ -2060,6 +2161,14 @@ def migrate_dispositions(root, write):
     for warning in store["warnings"]:
         if not warning.startswith("DEPRECATED"):
             report.append("[dispositions/migrate] " + terminal_text(warning, 400))
+    if store["invalid"]:
+        # Deleting a legacy file after a migration that left entries behind
+        # drops them silently, so nothing is written and nothing is advised
+        # until every entry can move.
+        report.append("[dispositions/migrate] %d entr%s could not be migrated: nothing was written, "
+                      "and the legacy files must be kept; fix them and run this again"
+                      % (len(store["invalid"]), "y" if len(store["invalid"]) == 1 else "ies"))
+        return 1, text, report
     if write:
         target = os.path.join(root, DISPOSITIONS_REL)
         os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -2093,6 +2202,14 @@ def count_blockers(path, threshold_name):
         return total
     except (OSError, ValueError):
         return FAIL_CLOSED_BLOCKERS
+
+
+def is_cleared(finding):
+    """Whether the verdict annotated FINDING as cleared by a disposition. The
+    one definition both the refusal listing and the review render use; display
+    only, no count or verdict ever reads the annotation."""
+    disposition = finding.get("disposition")
+    return isinstance(disposition, dict) and disposition.get("status") == "cleared"
 
 
 def terminal_text(value, limit=None):
@@ -2129,9 +2246,7 @@ def blocking_findings_listing(document_text, threshold_name):
             # A finding the verdict recorded as cleared by a disposition is not
             # one that blocked, so a refusal does not list it. This is display
             # only: the count above never reads the annotation.
-            disposition = finding.get("disposition")
-            cleared = isinstance(disposition, dict) and disposition.get("status") == "cleared"
-            if counts_toward_verdict(finding, threshold) and not cleared:
+            if counts_toward_verdict(finding, threshold) and not is_cleared(finding):
                 line = finding.get("line") or 0
                 if not isinstance(line, (int, float)) or isinstance(line, bool):
                     line = _clean_listing(line)
@@ -2370,6 +2485,8 @@ def render_review(path):
     output_lines)."""
     document = load_json_file(path)
     findings = document.get("findings")
+    if findings is not None and not isinstance(findings, list):
+        raise ValueError("'findings' is not an array")
     count = len(findings) if findings is not None else 0
     lines = ["== clagentic-lite review ==\nsummary: " + _shown(document.get("summary"))
              + "\nfindings: " + str(count) + "\n"]
@@ -2381,11 +2498,11 @@ def render_review(path):
             text = ("[" + _shown(finding.get("severity")) + "] " + _shown(finding.get("file"))
                     + ":" + terminal_text(_jq_tostring(finding.get("line"))) + " "
                     + _shown(finding.get("message")))
-            count = finding.get("_recurrence_count")
-            if isinstance(count, int) and not isinstance(count, bool) and count > 1:
-                text += " (reported " + str(count) + " rounds running)"
-            disposition = finding.get("disposition")
-            if isinstance(disposition, dict) and disposition.get("status") == "cleared":
+            rounds = finding.get("_recurrence_count")
+            if isinstance(rounds, int) and not isinstance(rounds, bool) and rounds > 1:
+                text += " (reported " + str(rounds) + " rounds running)"
+            if is_cleared(finding):
+                disposition = finding["disposition"]
                 text += (" (cleared by disposition " + terminal_text(disposition.get("id"), 80)
                          + " [" + terminal_text(disposition.get("kind"), 40) + "])")
             if finding.get("_seen_before") is True:
