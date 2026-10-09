@@ -489,6 +489,18 @@ PYEOF2
 # SEEN_FILE: path to a file of previously-seen keys (one per line). New keys
 # are appended in place. May be empty or non-existent on first call.
 #
+# SEEN_MODE (4th arg, default "drop"):
+#   "drop"     a finding whose key is already in SEEN_FILE is removed from the
+#              output. Only safe for a caller that does not feed the result to
+#              a verdict (adversarial seed-keys, merge_envelopes' scratch file).
+#   "annotate" a finding whose key is already in SEEN_FILE stays in the output
+#              with `_seen_before: true` and `_seen_key: <key>`. Within-run
+#              collapsing (same key twice in one input, higher severity wins)
+#              is unchanged. This is the mode every verdict-bearing caller
+#              must use: a key is a link hint, never an identity to drop a
+#              blocking finding on, or a re-run at the same HEAD would pass
+#              by forgetting what the first run found.
+#
 # Severity rank: low=1, medium=2, high=3, critical=4 (matches gates.sh).
 # Conservative retain: if a key CANNOT be computed (parse error, missing tool,
 # strategy=content-hash with no diff_file), the finding is KEPT, never dropped.
@@ -496,11 +508,12 @@ dedup_findings() {
   _df_strategy="$1"
   _df_seen="$2"
   _df_difffile="${3:-}"
+  _df_mode="${4:-drop}"
 
   if command -v jq >/dev/null 2>&1; then
-    _dedup_findings_jq "$_df_strategy" "$_df_seen" "$_df_difffile"
+    _dedup_findings_jq "$_df_strategy" "$_df_seen" "$_df_difffile" "$_df_mode"
   elif command -v python3 >/dev/null 2>&1; then
-    _dedup_findings_py "$_df_strategy" "$_df_seen" "$_df_difffile"
+    _dedup_findings_py "$_df_strategy" "$_df_seen" "$_df_difffile" "$_df_mode"
   else
     # No JSON tool — passthrough (conservative: retain all).
     cat
@@ -511,6 +524,8 @@ _dedup_findings_jq() {
   _dfj_strategy="$1"
   _dfj_seen="$2"
   _dfj_difffile="${3:-}"
+  _dfj_annotate=0
+  [ "${4:-drop}" = "annotate" ] && _dfj_annotate=1
 
   # Read stdin into a temp file so we can both parse it and re-read it if needed.
   _dfj_in=$(mktemp -t clagentic-df-in.XXXXXX)
@@ -637,7 +652,7 @@ _dedup_findings_jq() {
 
   # awk: process combined file, track winner per key.
   # Output: one index per line (the winning index for each key), in insertion order.
-  _dfj_winners=$(awk -v seen_file="$_dfj_seen" '
+  _dfj_winners=$(awk -v seen_file="$_dfj_seen" -v annotate="$_dfj_annotate" '
     BEGIN {
       while ((getline line < seen_file) > 0) {
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
@@ -658,7 +673,7 @@ _dedup_findings_jq() {
         next
       }
       r = (sev in srank) ? srank[sev] : 0
-      if (key in preseen) {
+      if ((key in preseen) && annotate != 1) {
         # Already seen in a prior run: check if we need to update a retained winner.
         if (key in winner_idx) {
           old_r = (winner_sev[key] in srank) ? srank[winner_sev[key]] : 0
@@ -667,6 +682,9 @@ _dedup_findings_jq() {
         # Do not emit a new entry (already deduplicated by prior run).
         next
       }
+      # annotate mode: a prior-run key is kept and flagged, then handled by
+      # the ordinary within-run winner logic below.
+      if (key in preseen) seenflag[key] = 1
       if (!(key in winner_idx)) {
         # First time we see this key in this run.
         winner_idx[key] = idx; winner_sev[key] = sev
@@ -681,12 +699,17 @@ _dedup_findings_jq() {
       # retain[i] is set for no-key findings (conservative retain);
       # order[i] is set for keyed findings (winner tracking).
       # Both arrays share the same index n — only one is set per slot.
+      # Annotate mode prints "idx<TAB>seenflag<TAB>key" so the caller can
+      # mark prior-run findings; drop mode keeps the bare index.
       for (i = 0; i < n; i++) {
         if (i in retain) {
-          print retain[i]
+          if (annotate == 1) print retain[i] "\t0\t"; else print retain[i]
         } else {
           k2 = order[i]
-          if (k2 in winner_idx) print winner_idx[k2]
+          if (k2 in winner_idx) {
+            if (annotate == 1) print winner_idx[k2] "\t" ((k2 in seenflag) ? 1 : 0) "\t" k2
+            else print winner_idx[k2]
+          }
         }
       }
     }
@@ -716,6 +739,20 @@ _dedup_findings_jq() {
   # Build the output JSON array from the winning indices.
   if [ -z "$_dfj_winners" ]; then
     printf '[]\n'
+  elif [ "$_dfj_annotate" = "1" ]; then
+    _dfj_jq_indices=$(printf '%s\n' "$_dfj_winners" \
+      | awk -F'\t' 'NF{printf "%s%s", (NR>1?",":""), $1} END{printf ""}')
+    _dfj_flags=$(printf '%s\n' "$_dfj_winners" \
+      | awk -F'\t' 'NF{printf "%s%s", (NR>1?",":""), ($2 == 1 ? 1 : 0)} END{printf ""}')
+    # Keys travel through jq's own string encoder, never spliced into JSON text
+    # by the shell: the identity-fallback sha shim makes a key raw content.
+    _dfj_keys_json=$(printf '%s\n' "$_dfj_winners" | awk -F'\t' 'NF{print $3}' \
+      | jq -Rsc 'split("\n")[:-1]' 2>/dev/null)
+    [ -n "$_dfj_keys_json" ] || _dfj_keys_json='[]'
+    jq -c --argjson fl "[$_dfj_flags]" --argjson ks "$_dfj_keys_json" \
+      "[.[$_dfj_jq_indices]] | to_entries | map(if \$fl[.key] == 1 then .value + {_seen_before: true, _seen_key: \$ks[.key]} else .value end)" \
+      "$_dfj_in" 2>/dev/null \
+      || cat "$_dfj_in"  # conservative fallback: passthrough on jq error
   else
     # Convert newline-separated indices to a jq index list.
     _dfj_jq_indices=$(printf '%s\n' "$_dfj_winners" \
@@ -732,13 +769,22 @@ _dedup_findings_py() {
   _dfp_strategy="$1"
   _dfp_seen="$2"
   _dfp_difffile="${3:-}"
+  _dfp_mode="${4:-drop}"
 
-  python3 - "$_dfp_strategy" "$_dfp_seen" "$_dfp_difffile" <<'PYEOF'
+  # The findings arrive on stdin, but `python3 -` reads its own script from
+  # stdin (the heredoc below): reading findings from sys.stdin there got EOF,
+  # so this path printed nothing for every input and callers fell back to
+  # "retain all". Stage them in a file the script opens by path instead.
+  _dfp_in=$(mktemp -t clagentic-dfp-in.XXXXXX)
+  cat > "$_dfp_in"
+
+  python3 - "$_dfp_strategy" "$_dfp_seen" "$_dfp_difffile" "$_dfp_mode" "$_dfp_in" <<'PYEOF'
 import json, sys, hashlib, os
 
 strategy  = sys.argv[1]
 seen_file = sys.argv[2]
 diff_file = sys.argv[3] if len(sys.argv) > 3 else ""
+annotate  = (sys.argv[4] == "annotate") if len(sys.argv) > 4 else False
 
 severity_rank = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
@@ -789,13 +835,16 @@ def compute_key(f, strategy, diff_file):
     except Exception:
         return None
 
-# Read stdin.
+# Read the staged findings.
+with open(sys.argv[5]) as inf:
+    raw_input_text = inf.read()
 try:
-    findings = json.load(sys.stdin)
+    findings = json.loads(raw_input_text)
     if not isinstance(findings, list):
         raise ValueError("not a list")
 except Exception:
     # Conservative: passthrough raw.
+    sys.stdout.write(raw_input_text)
     sys.exit(0)
 
 # Load seen keys.
@@ -824,7 +873,7 @@ for f in findings:
     sev = str(f.get("severity", "")).lower()
     r = severity_rank.get(sev, 0)
 
-    if key in seen:
+    if key in seen and not annotate:
         # Already seen in a prior run: skip (already deduped).
         # But check if this is a higher-severity version of an existing winner.
         if key in key_to_pos:
@@ -838,13 +887,21 @@ for f in findings:
     if key not in key_to_pos:
         key_to_pos[key] = len(deduped)
         deduped.append(f)
-        new_keys[key] = True
+        if key not in seen:
+            new_keys[key] = True
     else:
         pos = key_to_pos[key]
         old_sev = str(deduped[pos].get("severity", "")).lower()
         old_r = severity_rank.get(old_sev, 0)
         if r > old_r:
             deduped[pos] = f
+
+# annotate mode: flag every surviving finding whose key a prior run recorded.
+# Done after winner selection so the marker lands on the finding actually kept.
+if annotate:
+    for key, pos in key_to_pos.items():
+        if key in seen and isinstance(deduped[pos], dict):
+            deduped[pos] = dict(deduped[pos], _seen_before=True, _seen_key=key)
 
 # Append new keys to seen file.
 try:
@@ -856,7 +913,9 @@ except Exception:
 
 print(json.dumps(deduped))
 PYEOF
-  return $?
+  _dfp_rc=$?
+  rm -f "$_dfp_in"
+  return $_dfp_rc
 }
 
 # ------------------------------------------------------------ finding_content_keys --

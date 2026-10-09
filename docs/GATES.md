@@ -465,7 +465,8 @@ audited architectural decisions that persist in the repo history.
 | **Feature flag** | `CLAGENTIC_CROSS_ROUND_DEDUP` (default: `1` — on; set `=0` to opt out) |
 | **Seen-keys file** | `.clagentic/lite/review-seen-keys` (gitignored, local gate state) |
 | **Key strategy** | `content-hash`: sha256 of a 5-line `+`-line context window around the finding from the diff. Survives line shifts (a line that moves without changing its content has the same key). If the window cannot be computed (no sha256 tool, no diff file), the finding is retained conservatively — wrong suppressions are worse than missed dedups. |
-| **Effect** | Findings reported in a prior round on lines the diff shows unchanged since are suppressed. Suppression is annotated: a `gate_runs` audit row (`gate=review-dedup`) records `suppressed:N/total:M` and the operator sees a stderr notice (`[dedup] suppressed N finding(s) seen in prior run(s)`). Silently dropped findings are not possible — every suppression is logged. |
+| **Effect** | **Annotate, never drop.** A finding reported in a prior round on lines the diff shows unchanged since stays in `.findings`, marked `_seen_before: true` (with `_seen_key`, the prior key). `severity_blockers()` counts it like any other finding, so the verdict never depends on how many times the review has run: block at a HEAD, re-run at the same HEAD, and the gate blocks again. Dropping seen findings used to make that second run pass, because it forgot what the first run found. The only exclusions left are the ones with their own annotation and provenance (`_deferral_matched`, `_recurrence_demoted`). Two identical keys inside one response still collapse to one finding (higher severity wins). `cmd_render_review` suffixes a seen finding with `(reported in a prior run; still counted)`; the operator sees `[dedup] N finding(s) seen in prior run(s) kept and still counted toward the verdict`, and a `gate_runs` audit row (`gate=review-dedup`) records `collapsed:N/total:M seen_before:K mode:annotate`. |
+| **Recurrence interaction** | Seen findings are not counted as another recurrence round (`_review_recurrence_demote` skips `_seen_before` findings), or the second identical run would demote the finding to advisory and pass by repetition. |
 | **Reset** | `clagentic-lite gates review --reset-dedup` deletes `.clagentic/lite/review-seen-keys`. The next review run re-seeds the file from scratch. |
 | **Conservative bias** | Bias is toward showing. A finding on changed lines will always re-show (the diff window changes → different hash → not suppressed). A finding where the key cannot be computed (parse error, no diff file, no sha256) is retained. |
 | **First run** | Seen-keys file absent → no-op: all findings pass through; keys for this run's findings are appended for use by the next round. |
@@ -485,13 +486,14 @@ before" → suppress), recurrence tracking counts occurrences ("how many
 rounds has this key been reported in" → demote at a threshold).
 
 **Relationship to cross-round dedup.** The two mechanisms compose, in this
-order, every round: dedup runs first and can suppress a finding outright
-(same content-hash key seen before → dropped from `.findings` entirely, per
-"Cross-round finding dedup" above); recurrence demotion then runs only
-against whatever survived dedup. This means a finding whose content-hash key
-is byte-identical round to round is dedup's job — it is suppressed starting
-round 2 and recurrence demotion never gets a second round to count. Where
-recurrence demotion actually matters is when dedup is off
+order, every round: dedup runs first and marks a finding whose content-hash
+key was seen before `_seen_before` (it stays in `.findings` and keeps
+blocking, per "Cross-round finding dedup" above); recurrence demotion then
+counts only the findings dedup did NOT mark as seen. This means a finding
+whose content-hash key is byte-identical round to round is never counted a
+second time here — repeating a run must not be able to demote a finding to
+advisory, so recurrence demotion never gets a second round to count for it.
+Where recurrence demotion actually matters is when dedup is off
 (`CLAGENTIC_CROSS_ROUND_DEDUP=0`, in which case a finding's own occurrence
 count still accrues every round it is reported) — the mechanism inherits the
 SAME "survives line shifts, not content edits" key-stability property dedup
@@ -563,7 +565,22 @@ remote` configured at all.
 | `verdict` | `"pass"`, `"block"`, `"unanchored"`, or `"skip"` (see below) |
 | `gate` | Which gate wrote this entry — `"review"` (`cmd_review`) or `"adversarial"` (`cmd_adversarial`). Both gates share this one ledger file; `gate` is what keeps their delta-re-review anchors from colliding — see "Delta re-review is shared, and gate-scoped" below. A legacy entry written before this field existed has no `gate` key at all, and is never treated as `"review"` by default — see that section. |
 | `findings` | For `gate: "review"`, the exact structured findings array from this round's `last-review.json`, each annotated with `_ledger_recurring` (see "Stable finding identity" below). For `gate: "adversarial"`, always `[]` — `_ledger_record_review_verdict` (`scripts/gates.sh`) reads `.findings` from the markdown file `cmd_adversarial` writes (`last-adversarial.md`), which has no such key, so extraction falls through to empty; the adversarial findings themselves live in `last-adversarial-findings.json`, not in this ledger entry. |
-| `config` | The gate config in effect for this run: `block_severity` (`CLAGENTIC_BLOCK_SEVERITY`), `cross_round_dedup` (`CLAGENTIC_CROSS_ROUND_DEDUP`), `recurrence_threshold` (`CLAGENTIC_RECURRENCE_THRESHOLD`) |
+| `config` | The gate config in effect for this run: `block_severity` (`CLAGENTIC_BLOCK_SEVERITY`), `cross_round_dedup` (`CLAGENTIC_CROSS_ROUND_DEDUP`), `recurrence_threshold` (`CLAGENTIC_RECURRENCE_THRESHOLD`). For `gate: "review"` entries it also carries the per-run provenance below. |
+
+**Per-run provenance (review entries).** So a verdict can be diagnosed after
+the fact, every review run records, in `config` and in an audit row
+(`gate=review-run`): `model` (the chain step that produced the accepted
+output; several when chunks used different steps), `prompt_sha256` (sha256 of
+the assembled system prompt, role prompt plus every injected block, as
+`llm-client.sh` recorded it), `diff_sha256` (sha256 of the diff text the
+reviewer was given), and `chunk_count` / `chunk_sizes` (bytes per chunk; a
+single pass is one chunk the size of the diff, an empty resolved diff is
+zero). A value that could not be determined is the string `"none"`, never
+omitted. `diff_sha256` is a true content hash of the reviewed diff;
+`last-review.json`'s `_clagentic_diff_sha` is unchanged and still stamps HEAD.
+`llm-client.sh` writes the model and prompt hash to the file named by
+`CLAGENTIC_LLM_RUN_META_FILE` when a caller sets it (`cmd_review` does); unset,
+nothing is written.
 
 **Append-only; prior entries retained.** `ledger_append` never rewrites or
 removes an entry except for the optional per-branch cap
@@ -663,7 +680,17 @@ requires `_ledger_anchored_pass_at_head(<ledger>, <current branch>,
 true` (with `"review-ledger"` appended to `stale_gates` when the ledger
 check is the one that failed) — `cmd_merge_gate` short-circuits on a stale
 payload exactly as before (deterministic refusal, no LLM call, no token
-burn — see "Gate 6 — Merge Gate" below). This closes a gap the single-file
+burn — see "Gate 6 — Merge Gate" below). **Every stale gate carries a reason**
+in the summary (`stale_reasons`, a `gate -> reason` object; `stale_reason` is
+the headline) from a closed set, and the refusal and its audit row differ per
+reason: `sha_mismatch` (the gate output is for another commit: re-run),
+`missing_stamp` (no SHA stamp, or no passing verdict recorded for HEAD:
+re-run), `review_blocked_at_head` (the review ran at HEAD and BLOCKED: the
+refusal lists the blocking findings as `file:line [severity] message` from the
+ledger entry, and does not tell the operator to re-run, because re-running
+cannot clear them), and `empty_head` (HEAD unresolvable in a git repo). The
+summary also carries `blocking_findings` for the `review_blocked_at_head` case.
+`--recheck` reports the same reasons. This closes a gap the single-file
 snapshot check could not: a `last-review.json` stamp match with no
 corresponding ledger entry for the current branch/SHA — including when the
 ledger file is absent entirely — still stales, and — more importantly — a

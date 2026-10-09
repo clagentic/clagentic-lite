@@ -2,10 +2,11 @@
 Acceptance tests for lr-66e598: cross-round finding recurrence demotion.
 
 BACKGROUND: cross-round dedup (CLAGENTIC_CROSS_ROUND_DEDUP, review-seen-keys)
-already SUPPRESSES a review finding whose content-hash key exactly repeats
-across rounds -- so a finding that recurs with a BYTE-IDENTICAL diff context
-window never reaches a third round at all; dedup already hides it after
-round 1. Recurrence demotion is the backstop for what dedup does not catch:
+MARKS a review finding whose content-hash key exactly repeats across rounds
+(_seen_before; it is kept and keeps blocking) and recurrence counting skips
+marked findings -- so a finding that recurs with a BYTE-IDENTICAL diff context
+window is never counted a second round here. Recurrence demotion is the
+backstop for what dedup does not catch:
 this task's SCOPE explicitly reuses the SAME content-hash key space
 (finding_content_keys, review-merge.sh) for a SECOND purpose -- counting
 occurrences instead of only testing membership -- via a SEPARATE persisted
@@ -477,12 +478,13 @@ class TestRecurrenceViaCmdReview(unittest.TestCase):
         self.assertEqual(result.returncode, 1,
                           f"first-ever report must block: {result.stderr!r}")
 
-    def test_dedup_and_recurrence_compose_dedup_suppresses_first(self):
+    def test_dedup_and_recurrence_compose_dedup_annotates_and_recurrence_skips_seen(self):
         """When cross-round dedup is on (default) and a finding's content
-        window IS byte-identical round to round, dedup suppresses it before
-        recurrence ever gets a chance to see a second round — this is the
-        correct, tested COMPOSITION of the two features, not a bug: a
-        byte-identical repeat is dedup's job, and dedup runs first."""
+        window IS byte-identical round to round, dedup marks it
+        _seen_before but KEEPS it, so it still blocks (a verdict that
+        passed because the finding was seen before was a fail-open), and
+        recurrence demotion does not count a seen finding as another round,
+        so it cannot demote it to advisory either."""
         _make_stub_llm_client(self._tmpdir, [_envelope_with_finding(), _envelope_with_finding()])
         _stage_identical_recreation(self._project, 1)
         r1 = _run_review([], self._tmpdir, self._project)
@@ -490,14 +492,16 @@ class TestRecurrenceViaCmdReview(unittest.TestCase):
 
         _stage_identical_recreation(self._project, 2)
         r2 = _run_review([], self._tmpdir, self._project)
-        self.assertEqual(r2.returncode, 0, "round 2 must pass (dedup-suppressed)")
-        self.assertIn("suppressed", r2.stderr)
+        self.assertEqual(r2.returncode, 1, "round 2 must still block (seen, not dropped)")
+        self.assertIn("seen in prior run", r2.stderr)
 
         review_path = os.path.join(self._project, ".clagentic", "lite", "last-review.json")
         with open(review_path) as f:
             review = json.load(f)
-        self.assertEqual(review["findings"], [],
-                          "dedup-suppressed finding must not appear in round 2's output")
+        self.assertEqual(len(review["findings"]), 1,
+                          "a seen finding must stay in round 2's output")
+        self.assertIs(review["findings"][0]["_seen_before"], True)
+        self.assertFalse(review["findings"][0].get("_recurrence_demoted", False))
 
     def test_reset_dedup_clears_recurrence_file_too(self):
         """Task constraint (e): --reset-dedup must clear recurrence counts
