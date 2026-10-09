@@ -1425,7 +1425,7 @@ _render_clagentic_lite_plugin_dir() {
   if [ -d "$_rcpd_skills_src" ]; then
     _rcpd_out_skills="$_RENDERED_PLUGIN_DIR/plugins/$_RENDERED_PLUGIN_NAME/skills"
     mkdir -p "$_rcpd_out_skills"
-    cp -R "$_rcpd_skills_src"/. "$_rcpd_out_skills"/ 2>/dev/null || true
+    cp -R "$_rcpd_skills_src"/. "$_rcpd_out_skills"/ || { warn "plugin render: could not copy $_rcpd_skills_src into $_rcpd_out_skills"; return 1; }
   fi
 
   # The finding pipeline ships inside the plugin so a bare Reviewer or Auditor
@@ -1435,8 +1435,10 @@ _render_clagentic_lite_plugin_dir() {
   _rcpd_bin_src="$CLAGENTIC_LITE_HOME/plugins/clagentic-lite/bin"
   if [ -d "$_rcpd_bin_src" ]; then
     _rcpd_out_bin="$_RENDERED_PLUGIN_DIR/plugins/$_RENDERED_PLUGIN_NAME/bin"
-    mkdir -p "$_rcpd_out_bin"
-    cp -R "$_rcpd_bin_src"/. "$_rcpd_out_bin"/ 2>/dev/null || true
+    mkdir -p "$_rcpd_out_bin" || { warn "plugin render: cannot create $_rcpd_out_bin"; return 1; }
+    # A failed copy must fail the render: reviewer.md and auditor.md tell the
+    # agent to run this copy, so a rendered plugin without it is broken.
+    cp -R "$_rcpd_bin_src"/. "$_rcpd_out_bin"/ || { warn "plugin render: could not copy $_rcpd_bin_src into $_rcpd_out_bin"; return 1; }
   fi
 
   _rcpd_stamp="$(_render_stamp)"
@@ -4154,6 +4156,16 @@ cmd_doctor() {
     _ok "finding pipeline present: $_findings_py"
   else
     _fail "finding pipeline missing: $_findings_py — reinstall (clagentic-lite update)"
+  fi
+  # The Reviewer/Auditor agents run the rendered plugin's copy, not the
+  # checkout's, so a rendered plugin that exists must carry it too.
+  _rendered_plugin_root="$_RENDERED_PLUGIN_DIR/plugins/$_RENDERED_PLUGIN_NAME"
+  if [ -d "$_rendered_plugin_root" ]; then
+    if [ -f "$_rendered_plugin_root/bin/findings.py" ]; then
+      _ok "rendered plugin carries the finding pipeline"
+    else
+      _fail "rendered plugin is missing bin/findings.py ($_rendered_plugin_root) — the Reviewer and Auditor agents cannot run it; re-render (clagentic-lite update)"
+    fi
   fi
 
   # 5. Security tool status (advisory — missing is a warn, not a fail).

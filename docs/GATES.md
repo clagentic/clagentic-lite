@@ -1890,7 +1890,9 @@ Reads the last assistant turn from the Claude Code transcript path, passes it th
 
 ## The finding pipeline
 
-Every decision the gates make about a finding lives in one stdlib-only Python file shipped inside the plugin, `plugins/clagentic-lite/bin/findings.py`. It depends on none of `gates.sh`, `llm-client.sh`, `platform.sh` or enrollment state, so a bare Reviewer or Auditor agent can run it from any git repository; the rendered plugin carries a copy next to the agent files. `scripts/gates.sh`, `scripts/review-merge.sh` and `scripts/platform.sh` keep their function names (`severity_blockers`, `dedup_findings`, `merge_envelopes`, `_ledger_anchored_pass_at_head`, ...) as thin POSIX-sh wrappers that stage files, call `ds_findings_run` (which locates the pipeline and fails closed, loudly, when it cannot run) and log; they hold no finding logic.
+Every decision the gates make about a finding lives in one stdlib-only Python file shipped inside the plugin, `plugins/clagentic-lite/bin/findings.py`. It depends on none of `gates.sh`, `llm-client.sh`, `platform.sh` or enrollment state, so a bare Reviewer or Auditor agent can run it from any git repository; the rendered plugin carries a copy next to the agent files. `scripts/gates.sh`, `scripts/review-merge.sh` and `scripts/platform.sh` keep their function names (`severity_blockers`, `dedup_findings`, `merge_envelopes`, `_ledger_anchored_pass_at_head`, ...) as thin POSIX-sh wrappers that stage files, call `ds_findings_call` and log; they hold no finding logic.
+
+`ds_findings_call` (`scripts/platform.sh`) is the one way gate code runs a stage. The stage's input comes from a temp file (never a pipe a fallback would find already consumed), its stdout goes to a temp file, and the output is printed only when the status is acceptable and the output is well-formed for the stage; otherwise nothing is printed, the cause (python3 missing, `findings.py` missing, or the stage's own status) goes to stderr, and the status is nonzero. A caller therefore never concatenates partial output with a fallback and never sees a failure as an empty result; each takes its own documented fail-closed branch. The pipeline file is located only under the tool's own install (`TOOL_HOME`, `CLAGENTIC_LITE_HOME`, `CLAUDE_PLUGIN_ROOT`): there is no search upward from the working directory, because that is the repository under review.
 
 **`python3` is required.** There is no jq or awk fallback for finding logic. Without `python3` the gate commands fail closed on their existing sentinels (`severity_blockers` prints `99`, the ledger reads report no anchored verdict, `_parse_adversarial_findings` reports a read failure), and `clagentic-lite init`/`doctor` report it missing. Hook JSON parsing is a separate concern and still accepts `jq` or `python3`.
 
@@ -1903,6 +1905,13 @@ Every decision the gates make about a finding lives in one stdlib-only Python fi
 | `render` | `review`, `class-footer`, `verdict-lines`, `sanitize-review`, `sanitize-report`, `fence-data`, `fence-findings`, `json-field`, `stale-report`, `gate-summary` | operator-facing review text, the Merge Gate payload and its fences, the stale-payload refusal wording |
 
 Run `python3 plugins/clagentic-lite/bin/findings.py --help` for the stages. Payloads of unbounded size travel on stdin or as file paths, never as argv.
+
+Behaviours that decide a gate outcome and are easy to miss:
+
+- **Window keys use new-file line numbers.** The content-hash key of a finding hashes the added lines within two lines of its cited line. Numbering follows unified-diff semantics: it advances on context and `+` lines, not on `-` lines, and an added line whose text starts with `++ ` is never taken for a file header (the hunk's declared line counts say where a hunk ends).
+- **An unreadable adversarial sidecar is a degraded source, not "no findings".** If `last-adversarial-findings.json` cannot be read or is not a JSON array, `render gate-summary` emits the unavailable markers for both the findings and the report and sets `adversarial_report_degraded`, exactly as when `cmd_adversarial` itself recorded `findings_degraded`. A missing report has no sidecar to distrust.
+- **Ledger appends are serialized.** `verdict ledger-append` takes an exclusive `flock` on `<ledger>.lock` around the append and the per-branch trim, so a concurrent gate's append is not lost between the trim's read and its replace. Where `flock` is unavailable the pipeline warns and falls back to the unlocked behaviour.
+- **Model-authored text is control-stripped before it reaches a terminal.** `render review`, `render verdict-lines`, `render stale-report` and the blocking listing all use one helper (`terminal_text`).
 
 ### Single-sourced role prompts
 
