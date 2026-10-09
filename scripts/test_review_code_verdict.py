@@ -23,8 +23,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from scripts.findings_test_support import git  # noqa: E402
 from test_source_helpers import (  # noqa: E402
-    GIT_IDENTITY_ENV,
     RECURRING_FINDING,
     init_git_repo,
     setup_fake_tool_home,
@@ -65,7 +65,7 @@ class Case(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.project = setup_project(self.tmp)
         init_git_repo(self.project)
-        subprocess.run(["git", "-C", self.project, "branch", "-M", "master"], check=True)
+        git(self.project, "branch", "-M", "master")
         self.lite = os.path.join(self.project, ".clagentic", "lite")
 
     def last_review(self):
@@ -80,12 +80,8 @@ class Case(unittest.TestCase):
         path = os.path.join(self.project, ".clagentic", "dispositions.json")
         with open(path, "w") as handle:
             json.dump({"entries": entries}, handle)
-        env = dict(os.environ)
-        env.update(GIT_IDENTITY_ENV)
-        subprocess.run(["git", "-C", self.project, "add", "-f", ".clagentic/dispositions.json"],
-                       check=True)
-        subprocess.run(["git", "-C", self.project, "commit", "-q", "-m", "dispositions"],
-                       check=True, env=env)
+        git(self.project, "add", "-f", ".clagentic/dispositions.json")
+        git(self.project, "commit", "-q", "-m", "dispositions")
 
 
 class TestBlockIsTheAccumulatedVerdict(Case):
@@ -107,11 +103,8 @@ class TestBlockIsTheAccumulatedVerdict(Case):
         stub_review_llm(self.tmp, FINDING_ENVELOPE)
         stage_identical_recreation(self.project, 1)
         self.assertEqual(run_review(self.tmp, self.project).returncode, 1)
-        env = dict(os.environ)
-        env.update(GIT_IDENTITY_ENV)
-        subprocess.run(["git", "-C", self.project, "commit", "-q", "-m", "fix"], check=True, env=env)
-        subprocess.run(["git", "-C", self.project, "commit", "-q", "--allow-empty", "-m", "next"],
-                       check=True, env=env)
+        git(self.project, "commit", "-q", "-m", "fix")
+        git(self.project, "commit", "-q", "--allow-empty", "-m", "next")
         stub_review_llm(self.tmp, CLEAN_ENVELOPE)
         stage_identical_recreation(self.project, 2)
         self.assertEqual(run_review(self.tmp, self.project).returncode, 0)

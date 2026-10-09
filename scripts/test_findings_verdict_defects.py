@@ -12,6 +12,7 @@ finding that should block, or an unsanitized byte, through.
 
 Run with: python3 -m unittest scripts.test_findings_verdict_defects -v
 """
+import io
 import json
 import os
 import shutil
@@ -50,43 +51,38 @@ class TestIngestNeverEmitsRawFindings(Tmp):
         # findings is present but not an array, so ingest takes the stub path.
         return self.write("env.json", {"summary": "s", "findings": {"severity": "critical"}})
 
-    def test_stub_write_failure_exits_nonzero(self):
-        target = self._unusable_envelope()
+    def _failing_open(self, target, reason):
+        """An open() that refuses to write TARGET, as a full or read-only disk would."""
         real_open = open
 
         def failing_open(path, mode="r", *args, **kwargs):
             if os.fspath(path) == target and "w" in mode:
-                raise OSError("disk full")
+                raise OSError(reason)
             return real_open(path, mode, *args, **kwargs)
+        return failing_open
 
-        with mock.patch("builtins.open", failing_open):
+    def test_stub_write_failure_exits_nonzero(self):
+        target = self._unusable_envelope()
+        with mock.patch("builtins.open", self._failing_open(target, "disk full")):
             status = findings.ingest_review_envelope(target)
         self.assertEqual(status, 1)
 
     def test_unremovable_raw_file_is_reported_not_hidden(self):
         target = self._unusable_envelope()
-        real_open = open
-
-        def failing_open(path, mode="r", *args, **kwargs):
-            if os.fspath(path) == target and "w" in mode:
-                raise OSError("read-only")
-            return real_open(path, mode, *args, **kwargs)
-
-        with mock.patch("builtins.open", failing_open), \
-                mock.patch("os.unlink", side_effect=OSError("busy")):
+        stderr = io.StringIO()
+        with mock.patch("builtins.open", self._failing_open(target, "read-only")), \
+                mock.patch("os.unlink", side_effect=OSError("busy")), \
+                mock.patch.object(findings.sys, "stderr", stderr):
             self.assertFalse(findings.mark_review_sanitize_failed(target))
             self.assertEqual(findings.ingest_review_envelope(target), 1)
+        report = stderr.getvalue()
+        self.assertIn("could not rewrite", report)
+        self.assertIn("could not remove", report)
+        self.assertIn("may still hold raw unsanitized findings", report)
 
     def test_a_removed_raw_file_does_not_survive_as_a_review(self):
         target = self._unusable_envelope()
-        real_open = open
-
-        def failing_open(path, mode="r", *args, **kwargs):
-            if os.fspath(path) == target and "w" in mode:
-                raise OSError("read-only")
-            return real_open(path, mode, *args, **kwargs)
-
-        with mock.patch("builtins.open", failing_open):
+        with mock.patch("builtins.open", self._failing_open(target, "read-only")):
             status = findings.ingest_review_envelope(target)
         self.assertEqual(status, 1)
         self.assertFalse(os.path.exists(target), "the raw envelope was left in place")

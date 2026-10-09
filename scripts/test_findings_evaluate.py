@@ -238,7 +238,7 @@ class TestRefusedInput(Case):
     def test_a_repository_with_no_commit_has_no_head(self):
         bare = os.path.join(self.tmp, "nocommit")
         os.makedirs(bare)
-        subprocess.run(["git", "init", "-q", bare], check=True, timeout=60)
+        git(bare, "init", "-q")
         self.assert_refused(run_findings(["evaluate", "--root", bare], stdin='{"findings": []}',
                                          cwd=bare), "not a git repository")
 
