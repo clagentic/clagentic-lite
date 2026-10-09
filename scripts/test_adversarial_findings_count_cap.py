@@ -52,7 +52,10 @@ _GIT_ENV = {
 def _run_platform_function(call_line):
     tmpdir = tempfile.mkdtemp(prefix="clagentic-test-cap-")
     try:
+        # The finding pipeline is found only under the tool home, so a harness
+        # that sources platform.sh directly names it.
         script = textwrap.dedent(f"""\
+            TOOL_HOME='{TOOL_HOME}'
             . '{PLATFORM_SH}'
             {call_line}
         """)

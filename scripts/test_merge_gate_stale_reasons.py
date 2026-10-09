@@ -11,7 +11,8 @@ Each stale gate now carries a machine-readable reason in the summary
 (`stale_reasons`, plus the headline `stale_reason`): sha_mismatch |
 missing_stamp | review_blocked_at_head | empty_head. cmd_merge_gate renders a
 distinct refusal and audit detail per reason, on the normal path and on
---recheck, with both the jq and the python3 implementations.
+--recheck. The classification is the one python3 implementation in the
+finding pipeline; without python3 the gate refuses.
 
 Run with: python3 -m unittest scripts.test_merge_gate_stale_reasons -v
 """
@@ -178,13 +179,37 @@ class TestReviewBlockedAtHead(_Base):
         self.assertNotIn("SHA mismatch", detail, "the SHAs match; the audit row must not say otherwise")
         self.assertIn("app.py:2", detail)
 
-    def test_blocked_review_at_head_lists_findings_with_jq(self):
+    def test_blocked_review_at_head_lists_findings(self):
         self._block_review_at_head()
         self._assert_blocked_refusal(self._merge_gate())
 
-    def test_blocked_review_at_head_lists_findings_with_python3_only(self):
+    def test_listing_does_not_need_jq(self):
         self._block_review_at_head()
         self._assert_blocked_refusal(self._merge_gate(hide="jq"))
+
+    def test_merge_gate_refuses_when_python3_is_unavailable(self):
+        """The finding pipeline is required: with python3 hidden the gate
+        cannot build or classify the summary and must refuse, not pass."""
+        self._block_review_at_head()
+        r = self._merge_gate(hide="python3")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn('"decision": "approve"', r.stdout)
+
+    def test_missing_python3_is_the_reason_on_a_clean_review(self):
+        """On a review that did not block, the refusal can only come from the
+        missing pipeline, so it must say so."""
+        _stub_llm(self._review_home, {"summary": "clean", "checked": ["security"], "findings": []})
+        _stage_identical_recreation(self._project, 1)
+        _setup_fake_tool_home(self._review_home)
+        review = self._gate(self._review_home, "review")
+        self.assertEqual(review.returncode, 0, f"review must pass to set up the case: {review.stderr}")
+        # Hidden first: a passing run records its state and a repeat is a no-op.
+        r = self._merge_gate(hide="python3")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("python3", r.stdout + r.stderr)
+        self.assertNotIn("unresolved blocking findings", r.stdout + r.stderr)
+        control = self._merge_gate()
+        self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
 
     def test_summary_carries_machine_readable_reason(self):
         self._block_review_at_head()
@@ -196,14 +221,6 @@ class TestReviewBlockedAtHead(_Base):
         self.assertEqual(summary["stale_reasons"]["review-ledger"], "review_blocked_at_head")
         self.assertEqual(summary["blocking_findings"][0]["file"], "app.py")
         self.assertEqual(summary["blocking_findings"][0]["severity"], "high")
-
-    def test_python3_summary_carries_the_same_fields(self):
-        self._block_review_at_head()
-        self._merge_gate(hide="jq")
-        with open(os.path.join(self._lite, "gate-summary.json")) as f:
-            summary = json.load(f)
-        self.assertEqual(summary["stale_reasons"]["review-ledger"], "review_blocked_at_head")
-        self.assertEqual(len(summary["blocking_findings"]), 1)
 
     def test_recheck_on_a_stale_summary_reports_the_recorded_reason(self):
         self._block_review_at_head()
@@ -238,10 +255,10 @@ class TestMalformedFindingsStillNamed(_Base):
         with open(ledger, "w") as f:
             f.write(json.dumps(entry) + "\n")
 
-    def _numeric_severity(self, hide=None):
+    def test_numeric_severity_is_listed(self):
         self._block_review_at_head()
         self._rewrite_ledger_entry(lambda e: e["findings"][0].update(severity=3))
-        r = self._merge_gate(hide=hide)
+        r = self._merge_gate()
         self.assertEqual(r.returncode, 1, r.stderr)
         refusal = self._refusal()
         self.assertEqual(refusal["stale_reason"], "review_blocked_at_head")
@@ -253,28 +270,16 @@ class TestMalformedFindingsStillNamed(_Base):
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0]["severity"], "3")
 
-    def test_numeric_severity_is_listed_with_jq(self):
-        self._numeric_severity()
-
-    def test_numeric_severity_is_listed_with_python3_only(self):
-        self._numeric_severity(hide="jq")
-
-    def _unlistable(self, hide=None):
+    def test_unlistable_findings_say_so(self):
         self._block_review_at_head()
         self._rewrite_ledger_entry(lambda e: e.update(findings=5))
-        r = self._merge_gate(hide=hide)
+        r = self._merge_gate()
         self.assertEqual(r.returncode, 1, r.stderr)
         refusal = self._refusal()
         self.assertEqual(refusal["stale_reason"], "review_blocked_at_head")
         self.assertIn("blocking findings could not be listed; see last-review.json", refusal["reason"])
         self.assertNotIn("(0)", refusal["reason"])
         self.assertIn("could not be listed", self._audit_details())
-
-    def test_unlistable_findings_say_so_with_jq(self):
-        self._unlistable()
-
-    def test_unlistable_findings_say_so_with_python3_only(self):
-        self._unlistable(hide="jq")
 
 
 class TestEmptyHead(_Base):

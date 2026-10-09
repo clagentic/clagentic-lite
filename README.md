@@ -131,6 +131,7 @@ Required:
 |--------------|----------------------------------------|-----------------------------|-----------------------------|
 | `sqlite3`    | session memory + audit DB              | `apt install sqlite3`       | `brew install sqlite`       |
 | `git`        | hooks, diffs                           | `apt install git`           | `xcode-select --install`    |
+| `python3` | the finding pipeline (`plugins/clagentic-lite/bin/findings.py`, stdlib only): every review, adversarial, ledger and merge-gate finding decision. Gate commands fail closed without it (`severity_blockers` reports its 99 sentinel). `doctor` and `init` report it missing | `apt install python3` | `brew install python3` (ships with macOS) |
 | `jq` or `python3` | hook JSON parsing — hooks fail closed without either | `apt install jq` | `brew install jq` (python3 ships with macOS) |
 | **one LLM CLI** | for Builder + Reviewer roles. `claude` or `codex`; both is the cross-CLI pattern. Not checked by `init` or `doctor`; a missing CLI shows up as a failed chain step in the audit trail. | see vendor docs | see vendor docs |
 

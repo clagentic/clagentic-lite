@@ -10,7 +10,7 @@ first run's blocking finding. Dedup now keeps such a finding, marked
 `_seen_before: true`, and the verdict is computed over it like any other.
 
 Layers:
-  1. dedup_findings (review-merge.sh) in annotate mode, jq and python3 paths.
+  1. dedup_findings (review-merge.sh) in annotate and drop mode.
   2. cmd_review end to end (real git repo, stub llm-client.sh), single-pass
      and chunked: block, then an identical re-run still blocks.
   3. The per-run provenance fields (model, prompt hash, diff hash, chunk
@@ -39,7 +39,6 @@ from test_source_helpers import (  # noqa: E402
     RECURRING_FINDING as _RECURRING_FINDING,
     REVIEW_MERGE_SH,
     init_git_repo as _init_git_repo,
-    path_without,
     setup_fake_tool_home as _setup_fake_tool_home,
     setup_project as _setup_project,
     source_env,
@@ -60,34 +59,31 @@ _DIFF = textwrap.dedent("""\
     """)
 
 
-def _dedup(findings, seen_path, mode, force_python=False):
-    """Call the real sh dedup_findings; force_python hides jq from PATH."""
+def _dedup(findings, seen_path, mode):
+    """Call the real sh dedup_findings (a wrapper over the finding pipeline)."""
     work = tempfile.mkdtemp(prefix="clagentic-test-dedup-")
     try:
         diff_path = os.path.join(work, "d.diff")
         with open(diff_path, "w") as f:
             f.write(_DIFF)
         env = os.environ.copy()
-        shadow = None
-        if force_python:
-            shadow = path_without("jq")
-            env["PATH"] = shadow
+        # The finding pipeline is found only under the tool home.
+        env["TOOL_HOME"] = TOOL_HOME
         script = textwrap.dedent(f"""\
             . '{PLATFORM_SH}'
             . '{REVIEW_MERGE_SH}'
             dedup_findings content-hash '{seen_path}' '{diff_path}' {mode}
         """)
         r = subprocess.run(["sh", "-c", script], input=json.dumps(findings),
-                           capture_output=True, text=True, env=env)
+                           capture_output=True, text=True, env=env,
+                           cwd=os.path.join(TOOL_HOME, "scripts"))
         return json.loads(r.stdout), r
     finally:
         shutil.rmtree(work, ignore_errors=True)
-        if shadow:
-            shutil.rmtree(shadow, ignore_errors=True)
 
 
 class TestDedupFindingsAnnotateMode(unittest.TestCase):
-    """Layer 1: both dedup_findings implementations."""
+    """Layer 1: dedup_findings in annotate and drop mode."""
 
     def setUp(self):
         self._dir = tempfile.mkdtemp(prefix="clagentic-test-dedup-seen-")
@@ -96,43 +92,33 @@ class TestDedupFindingsAnnotateMode(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self._dir, ignore_errors=True)
 
-    def _both_paths(self):
-        yield "jq", False
-        yield "python3", True
-
     def test_seen_finding_is_kept_and_marked_in_annotate_mode(self):
-        for label, force_py in self._both_paths():
-            with self.subTest(path=label):
-                open(self._seen, "w").close()
-                first, _ = _dedup([dict(_RECURRING_FINDING)], self._seen, "annotate", force_py)
-                self.assertEqual(len(first), 1)
-                self.assertNotIn("_seen_before", first[0], "first sighting is not seen")
-                second, r = _dedup([dict(_RECURRING_FINDING)], self._seen, "annotate", force_py)
-                self.assertEqual(len(second), 1, f"seen finding must be kept: {r.stderr}")
-                self.assertIs(second[0]["_seen_before"], True)
-                self.assertTrue(second[0]["_seen_key"], "prior key must be carried")
-                self.assertEqual(second[0]["severity"], "high", "severity untouched")
+        open(self._seen, "w").close()
+        first, _ = _dedup([dict(_RECURRING_FINDING)], self._seen, "annotate")
+        self.assertEqual(len(first), 1)
+        self.assertNotIn("_seen_before", first[0], "first sighting is not seen")
+        second, r = _dedup([dict(_RECURRING_FINDING)], self._seen, "annotate")
+        self.assertEqual(len(second), 1, f"seen finding must be kept: {r.stderr}")
+        self.assertIs(second[0]["_seen_before"], True)
+        self.assertTrue(second[0]["_seen_key"], "prior key must be carried")
+        self.assertEqual(second[0]["severity"], "high", "severity untouched")
 
     def test_drop_mode_still_drops_for_non_verdict_callers(self):
-        for label, force_py in self._both_paths():
-            with self.subTest(path=label):
-                open(self._seen, "w").close()
-                _dedup([dict(_RECURRING_FINDING)], self._seen, "drop", force_py)
-                again, _ = _dedup([dict(_RECURRING_FINDING)], self._seen, "drop", force_py)
-                self.assertEqual(again, [])
+        open(self._seen, "w").close()
+        _dedup([dict(_RECURRING_FINDING)], self._seen, "drop")
+        again, _ = _dedup([dict(_RECURRING_FINDING)], self._seen, "drop")
+        self.assertEqual(again, [])
 
     def test_annotate_keeps_within_run_collapse_and_new_findings_unmarked(self):
         new = dict(_RECURRING_FINDING, file="other.py", line=5, message="different")
-        for label, force_py in self._both_paths():
-            with self.subTest(path=label):
-                open(self._seen, "w").close()
-                _dedup([dict(_RECURRING_FINDING)], self._seen, "annotate", force_py)
-                out, _ = _dedup([dict(_RECURRING_FINDING), dict(_RECURRING_FINDING), new],
-                                self._seen, "annotate", force_py)
-                by_msg = {f["message"]: f for f in out}
-                self.assertEqual(len(out), 2, "duplicate pair collapses to one")
-                self.assertIs(by_msg[_RECURRING_FINDING["message"]]["_seen_before"], True)
-                self.assertNotIn("_seen_before", by_msg["different"])
+        open(self._seen, "w").close()
+        _dedup([dict(_RECURRING_FINDING)], self._seen, "annotate")
+        out, _ = _dedup([dict(_RECURRING_FINDING), dict(_RECURRING_FINDING), new],
+                        self._seen, "annotate")
+        by_msg = {f["message"]: f for f in out}
+        self.assertEqual(len(out), 2, "duplicate pair collapses to one")
+        self.assertIs(by_msg[_RECURRING_FINDING["message"]]["_seen_before"], True)
+        self.assertNotIn("_seen_before", by_msg["different"])
 
 
 def _run_review(tool_home, project, extra_env=None):

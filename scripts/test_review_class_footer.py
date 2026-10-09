@@ -102,6 +102,14 @@ class TestReviewClassFooter(unittest.TestCase):
         isolated = _run_gates("cmd_render_review '{path}'", [_finding(ISOLATED, "n/a — isolated")])
         self.assertNotIn("name a class", isolated.stdout)
 
+    def test_cmd_render_review_emits_the_footer_once_and_last(self):
+        # cmd_render_review makes a single pipeline call; the footer must come
+        # from that call and be the final text, not be dropped or doubled.
+        r = _run_gates("cmd_render_review '{path}'", [_finding("c1"), _finding("c2")])
+        self.assertEqual(r.stdout.count("name a class"), 1)
+        self.assertTrue(r.stdout.endswith(
+            "\nFindings above name a class -- fix via class_fix across every site, not per-line\n"))
+
 
 def _run_gates_raw_file(body, content):
     """Expected-failure counterpart of _run_gates: writes CONTENT verbatim
@@ -153,7 +161,7 @@ def _path_without_jq(tmp):
 
 
 class TestRenderReviewWithoutJq(unittest.TestCase):
-    def test_no_jq_renders_raw_and_notes_footer_needs_jq(self):
+    def test_no_jq_still_renders_the_findings_and_the_footer(self):
         with tempfile.TemporaryDirectory(prefix="clagentic-test-class-footer-") as d:
             path = os.path.join(d, "review.json")
             with open(path, "w") as f:
@@ -167,12 +175,14 @@ class TestRenderReviewWithoutJq(unittest.TestCase):
             """)
             env = os.environ.copy()
             env.update(source_env(gates=True))
+            env["CLAGENTIC_PROJECT_ROOT"] = d
             env["PATH"] = _path_without_jq(d)
             r = _run_raw(script, env)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("some class", r.stdout)
-        self.assertIn("requires jq", r.stderr)
-        self.assertIn("issue_class/class_fix", r.stderr)
+        self.assertIn("== clagentic-lite review ==", r.stdout)
+        self.assertIn("class: some class -> fix", r.stdout)
+        self.assertIn("name a class", r.stdout)
+        self.assertNotIn("requires jq", r.stderr)
 
 
 class TestSeverityBlockersUnchanged(unittest.TestCase):
