@@ -51,7 +51,7 @@ All capabilities below are per-project and activate only in enrolled repos (`cla
 | **Cross-CLI review** | Builder writes; Reviewer (configured to a different CLI by default) reads the staged diff and returns JSON findings. |
 | **Local-tool security gates** | gitleaks pre-commit, osv-scanner + semgrep pre-push. Deterministic. Blocking. No LLM in the security path. |
 | **LLM adversarial pass** | Auditor role plays attacker on the diff. Non-blocking. Logged. Attach to PR if interesting. |
-| **Merge gate** | Final LLM check reads every prior gate's structured output and returns `approve|refuse`. Never opens PRs, never pushes. |
+| **Merge gate** | Code computes the verdict on findings (open blocking findings at this commit, minus recorded dispositions); on a pass an LLM check reads it with every prior gate's structured output and returns `approve|refuse`. It can add a refusal, never override a block. Never opens PRs, never pushes. |
 | **Troubleshooter** | Read-only failure diagnosis agent. Receives one artifact (gate error, hook trace, wrong output), applies structured Tier 0→2 diagnosis, emits root cause and bounce target. Never writes, never dispatches. |
 | **Session memory** | Stop-hook pipes the last assistant turn through the Summarizer, writes one row to `.clagentic/lite/memory.db`. UserPromptSubmit hook recalls relevant rows into the next prompt's context. |
 | **Safe-by-default tool use** | PreToolUse hooks (`pre-bash-guard.sh`, `pre-write-guard.sh`) block 20 dangerous patterns and writes to the default branch / outside repo / to credential-shaped paths. |
@@ -196,7 +196,7 @@ Everything else enroll and update write lives under `.git/` or `.clagentic/lite/
 | Regular repo, `CLAGENTIC_IGNORE_TARGET=exclude` | never touched | same as above | `.git/info/exclude` |
 | Wrapper layout (enrolled through a wrapper directory, at any depth) | never touched | in the wrapper: the wrapper `CLAUDE.md` (or the wrapper `AGENTS.md` when that carries the marker) holds the rules and Claude Code loads it as an ancestor file. The nested repo's own `CLAUDE.md`/`AGENTS.md` is project-owned: not created, not reported on by `update` or `doctor`; a clagentic-managed one keeps its notice refreshed. Claude Code skips `AGENTS.md` when a `CLAUDE.md` exists in an ancestor directory, so for each nested repo that has an `AGENTS.md` and no `CLAUDE.md`, the managed wrapper `CLAUDE.md` carries one `@<relative path>/AGENTS.md` import line, regenerated from the pointer on every stamp. Only the generated region of a wrapper file (the notice, the project table and those import lines) is rewritten: anything you add above or below it, in `CLAUDE.md` or `AGENTS.md`, survives every restamp. Nested imports are written only into a wrapper `CLAUDE.md`, never into a wrapper `AGENTS.md` | `.git/info/exclude` |
 
-`CLAGENTIC_IGNORE_TARGET` (`gitignore` or `exclude`, in the global config) overrides the per-layout default. To keep a project's tracked files untouched, set it to `exclude`, or enroll through the wrapper layout. A pattern already present in either `.gitignore` or `.git/info/exclude` counts as satisfied, so a pattern you moved to `info/exclude` is never added back to `.gitignore`. The exclude path is resolved with `git rev-parse --git-path`, so linked worktrees and submodules (where `.git` is a file) work. Governance files at the top of `.clagentic/` (`adversarial-acks.json`, `osv-ignore`, `accepted-risks.md`, `config`) stay trackable in every mode.
+`CLAGENTIC_IGNORE_TARGET` (`gitignore` or `exclude`, in the global config) overrides the per-layout default. To keep a project's tracked files untouched, set it to `exclude`, or enroll through the wrapper layout. A pattern already present in either `.gitignore` or `.git/info/exclude` counts as satisfied, so a pattern you moved to `info/exclude` is never added back to `.gitignore`. The exclude path is resolved with `git rev-parse --git-path`, so linked worktrees and submodules (where `.git` is a file) work. Governance files at the top of `.clagentic/` (`dispositions.json`, `osv-ignore`, `config`, and the legacy `adversarial-acks.json` / `accepted-risks.md`) stay trackable in every mode; enroll and update never create or ignore `dispositions.json`.
 
 Lines an earlier enrollment already added to a tracked `.gitignore` are not removed automatically; for a wrapper-enrolled repo `doctor` prints an INFO line saying they can be moved to `.git/info/exclude`. `update`'s one-time migration of old per-file `.clagentic/*` patterns removes only those exact legacy lines and keeps every other line, blank lines included.
 
@@ -257,6 +257,8 @@ For review/ship, use the subagent or gates subcommands directly (no slash comman
 clagentic-lite gates review   # cross-CLI review of the staged diff (no diff staged yet, so it'll say so)
 clagentic-lite gates ship     # runs the full gate sequence (won't actually push on main)
 ```
+
+**Using the Reviewer and Auditor agents without the gates tool.** The agents work in any git repository, enrolled or not. Each pipes its findings through the one self-contained file the plugin ships, `bin/findings.py evaluate` (it needs only Python 3 and a repository with a commit), and reports its verdict verbatim: `VERDICT: PASS` or `VERDICT: BLOCKED`, with each open finding and the exact disposition stanza that would clear it. It accumulates findings per commit in `.clagentic/lite/findings-state.json`, so a re-run that misses a finding cannot clear it. A standalone run is not a gate run: it writes no ledger entry and never satisfies `clagentic-lite gates ship`. From an enrolled checkout the same command is `clagentic-lite gates evaluate`. See `docs/GATES.md` "The code verdict" and "Standalone agents".
 
 If `/infosec-rt` or `/eng-consult` aren't recognized, the `clagentic-lite` plugin may not be installed or may have failed to load. Run `claude plugin list` and check for `clagentic-lite` with status `✔ active`. If it shows failed, re-run `clagentic-lite init`. Skills are discovered by Claude Code from the plugin's `skills/` directory — no per-repo files are needed.
 
@@ -362,10 +364,11 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
 ├── CLAUDE.md                                   pointer to AGENTS.md
 ├── README.md                                   this file
 ├── install.sh                                  stub that only prints a redirect to the steps above
-├── adversarial-acks.json.example               template for a repo's .clagentic/adversarial-acks.json
+├── adversarial-acks.json.example               legacy template (replaced by share/dispositions.example.json)
 ├── share/
 │   ├── config.example                          global config template (written to ~/.config/clagentic/lite/config)
-│   ├── accepted-risks.example.md               template for a repo's .clagentic/accepted-risks.md
+│   ├── dispositions.example.json               template for a repo's .clagentic/dispositions.json
+│   ├── accepted-risks.example.md               legacy template (replaced by dispositions.example.json)
 │   ├── bleed-patterns.example                  template for the internal-bleed gate's pattern file
 │   └── hook-shims/                             templates stamped or materialized by init/enroll/update:
 │       ├── pre-commit.template, pre-push.template          git hook shims, stamped into enrolled repos
@@ -388,6 +391,7 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
 │   └── clagentic-lite/
 │       ├── .claude-plugin/plugin.json          plugin manifest (name, version)
 │       ├── agents/{builder,reviewer,auditor,merge-gate,troubleshooter}.md  role contracts
+│       ├── bin/findings.py                     the finding pipeline: one stdlib-only file, also run directly by the Reviewer and Auditor agents
 │       └── skills/{infosec-rt,eng-consult}/SKILL.md  commentary skills
 ├── .codex/
 │   ├── config.toml                             Codex sandbox + role config (operator-facing docs; not auto-loaded — see AGENTS.md)
@@ -423,8 +427,8 @@ The tool lives in `$CLAGENTIC_LITE_HOME` (default `~/.clagentic/lite`). Your enr
 
 <any enrolled repo>/
 ├── .clagentic/
-│   ├── adversarial-acks.json                   per-CWE ack list (governance, committed)
-│   ├── accepted-risks.md                       architectural risk docs (governance, committed)
+│   ├── dispositions.json                       what the operator accepted about review/adversarial findings (governance, committed)
+│   ├── adversarial-acks.json, accepted-risks.md, deferrals.json   legacy; read for one more release, replaced by dispositions.json
 │   ├── osv-ignore                              osv CVE ignore list (governance, committed)
 │   ├── config                                  repo-level config overrides (governance, committed; not read on the first `enroll` — see "What init and enroll do" above)
 │   └── lite/

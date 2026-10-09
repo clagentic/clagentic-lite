@@ -28,7 +28,13 @@
 #                    verdict. Secrets is NEVER eligible for this (every file,
 #                    unconditionally); see "Gate input domain" below cmd_log_run.
 #   log-run          internal: insert one row into gate_runs
-#   deferrals-lint   validate .clagentic/deferrals.json against the gate-code schema
+#   dispositions-lint validate .clagentic/dispositions.json (and the legacy
+#                    deferrals/acks files it replaces) against the entry schema
+#   deferrals-lint   deprecated alias of dispositions-lint
+#   evaluate         the code verdict: unified findings JSON on stdin, dispositions
+#                    and guardrails applied, per-HEAD accumulation; exits 1 when
+#                    BLOCKED. Alias of findings.py evaluate (standalone agents call
+#                    that file directly; runs here do not count toward ship)
 #   audit-vocab-lint warn-only: flag "cmd_log_run <gate> pass" audit rows whose
 #                    details string contains a failure word (a tool that never
 #                    ran should not log as a clean pass)
@@ -240,14 +246,35 @@ _gate_check_args() {
   _gca_posname="$3"
   shift 3
   _gca_usage="usage: gates.sh $_gca_sub"
-  for _gca_f in $_gca_flags; do _gca_usage="$_gca_usage [$_gca_f]"; done
+  # A flag listed with a trailing '=' takes a value, given as the next argument
+  # or as --flag=VALUE.
+  for _gca_f in $_gca_flags; do
+    case "$_gca_f" in
+      *=) _gca_usage="$_gca_usage [${_gca_f%=} VALUE]" ;;
+      *) _gca_usage="$_gca_usage [$_gca_f]" ;;
+    esac
+  done
   [ -n "$_gca_posname" ] && _gca_usage="$_gca_usage [$_gca_posname]"
   _gca_pos=0
+  _gca_want_value=""
   for _gca_arg in "$@"; do
+    if [ -n "$_gca_want_value" ]; then
+      _gca_want_value=""
+      continue
+    fi
     case "$_gca_arg" in
       -*)
+        # The argument is quoted inside the patterns: unquoted, a '*' or '?' in
+        # it would match any listed flag.
         case " $_gca_flags " in
-          *" $_gca_arg "*) continue ;;
+          *" ""$_gca_arg"" "*) continue ;;
+        esac
+        _gca_name=${_gca_arg%%=*}
+        case " $_gca_flags " in
+          *" ""$_gca_name""= "*)
+            [ "$_gca_name" != "$_gca_arg" ] || _gca_want_value="$_gca_name"
+            continue
+            ;;
         esac
         printf "gates.sh %s: unknown option '%s'\n%s\n" "$_gca_sub" "$_gca_arg" "$_gca_usage" 1>&2
         return 2
@@ -261,6 +288,10 @@ _gate_check_args() {
         ;;
     esac
   done
+  if [ -n "$_gca_want_value" ]; then
+    printf "gates.sh %s: option '%s' needs a value\n%s\n" "$_gca_sub" "$_gca_want_value" "$_gca_usage" 1>&2
+    return 2
+  fi
   return 0
 }
 
@@ -733,6 +764,7 @@ _gate_config_paths() {
 .clagentic/config
 .clagentic-bleed-ignore
 .clagentic/bleed-patterns
+.clagentic/dispositions.json
 .clagentic/deferrals.json
 .clagentic/adversarial-acks.json
 .clagentic/accepted-risks.md
@@ -2730,6 +2762,43 @@ _resolve_base_sha() {
   _git merge-base "$_rbs_fresh_tip" HEAD 2>/dev/null || true
 }
 
+# _gate_evaluate GATE INPUT_FILE BASE_SHA SCOPE [EXTRA ARGS...]
+#
+# The one way gate code asks the finding pipeline for the CODE VERDICT
+# (findings.py evaluate): the findings in INPUT_FILE are normalized to the
+# unified schema, added to this HEAD's accumulated findings, and the open
+# blocking ones, minus those a valid already-merged disposition clears, decide
+# pass or block. A model never takes part in that decision. INPUT_FILE empty
+# means "no new findings, just recompute" (the merge-gate). SCOPE is "gate"
+# (this gate's own findings) or "head" (every gate's, the merge-gate's view).
+# BASE_SHA may be empty; the pipeline then resolves the base itself and treats
+# every disposition as added in this change when it cannot.
+#
+# Prints the verdict text on stdout. Returns 0 for PASS, 1 for BLOCKED and
+# anything else (2: the pipeline refused the input or could not run) for "no
+# verdict was computed", which every caller treats as a block: a verdict that
+# could not be computed is never a pass.
+_gate_evaluate() {
+  _ge_gate="$1"
+  _ge_in="$2"
+  _ge_base="$3"
+  _ge_scope="$4"
+  shift 4
+  _ge_head=$(_git_repo_scoped_head_sha)
+  set -- --gate "$_ge_gate" --caller gates --scope "$_ge_scope" --root "$REPO_ROOT" \
+    --default-branch "${CLAGENTIC_DEFAULT_BRANCH:-main}" \
+    --threshold "${CLAGENTIC_BLOCK_SEVERITY:-high}" "$@"
+  [ -z "$_ge_head" ] || set -- "$@" --head "$_ge_head"
+  [ -z "$_ge_base" ] || set -- "$@" --base "$_ge_base"
+  _ge_rc=0
+  if [ -n "$_ge_in" ]; then
+    ds_findings_call -i "$_ge_in" -e any -o 1 evaluate "$@" || _ge_rc=$?
+  else
+    ds_findings_call -e any -o 1 evaluate --no-input "$@" || _ge_rc=$?
+  fi
+  return "$_ge_rc"
+}
+
 # _ledger_config_snapshot — one-line JSON object of the gate config in
 # effect for this review run (item 1's "gate config in effect" requirement).
 # Deliberately narrow: only the knobs that change WHAT was evaluated or HOW
@@ -2746,15 +2815,13 @@ _ledger_config_snapshot() {
   _lcs_diff="${2:-}"
   _lcs_threshold="${CLAGENTIC_BLOCK_SEVERITY:-high}"
   _lcs_dedup="${CLAGENTIC_CROSS_ROUND_DEDUP:-1}"
-  _lcs_recurrence_threshold=$(_review_recurrence_threshold)
   _lcs_run=""
   if [ "$_lcs_gate" = "review" ]; then
     _lcs_run=",$(_review_run_provenance_fields "$_lcs_diff")"
   fi
-  printf '{"block_severity":"%s","cross_round_dedup":%s,"recurrence_threshold":%s%s}' \
+  printf '{"block_severity":"%s","cross_round_dedup":%s%s}' \
     "$_lcs_threshold" \
     "$([ "$_lcs_dedup" = "1" ] && echo true || echo false)" \
-    "$_lcs_recurrence_threshold" \
     "$_lcs_run"
 }
 
@@ -2942,13 +3009,9 @@ _ledger_latest_passing_head_for_branch() {
 #
 # Item 5: findings carry stable identity across rounds so the ledger can
 # mark a finding recurring vs new. RECORDS RECURRENCE ONLY: this function
-# never adjusts severity, never excludes anything from severity_blockers'
-# count, and is entirely independent of
-# _review_recurrence_demote/_recurrence_demoted (that mechanism's
-# SEVERITY-DEMOTION POLICY is explicitly prior art this task must not
-# resurrect — see lr-66e598 and this task's own OUT OF SCOPE). The output
-# is informational annotation only: each finding in the returned array gets
-# `_ledger_recurring: true|false`.
+# never adjusts severity and never changes whether a finding blocks. The
+# output is informational annotation only: each finding in the returned array
+# gets `_ledger_recurring: true|false`.
 #
 # MATCH KEY: the (file, category, message) triple — deliberately NOT
 # finding_content_keys' sha256-of-a-diff-context-window key. That key is a
@@ -2958,10 +3021,7 @@ _ledger_latest_passing_head_for_branch() {
 # unresolved issue while THIS round's diff is elsewhere), which makes the
 # content-hash key uncomputable for both the live finding and the
 # re-derived prior one — a false negative, not a real absence of
-# recurrence. The (file, category, message) triple is exactly the SAME
-# match key `_review_recurrence_demote` and `_review_deferral_match`
-# already use for the identical "survive rounds where the file/line isn't
-# in the current diff" property (see their own doc comments in this file).
+# recurrence.
 #
 # stdout: the findings array with `_ledger_recurring` spliced onto every
 # finding object. On any failure (no python3, unparseable input, no prior
@@ -4037,241 +4097,38 @@ _cross_round_dedup() {
   esac
 }
 
-# _review_recurrence_threshold — round count at which a recurring finding is
-# demoted from blocking to advisory. Configurable via
-# CLAGENTIC_RECURRENCE_THRESHOLD (default 2 — "reported in a prior round AND
-# reported again" is what "recurs" means; a finding seen for the first time
-# is never demotable no matter how confident the model is). Same
-# integer-guard pattern as _invariant_feed_max_lines.
-_review_recurrence_threshold() {
-  _rrt_n="${CLAGENTIC_RECURRENCE_THRESHOLD:-2}"
-  case "$_rrt_n" in ''|*[!0-9]*) _rrt_n=2 ;; esac
-  # A threshold of 0 or 1 would demote a finding on its FIRST report ever,
-  # which is not "recurs" by any reading of the task -- floor at 2 so the
-  # configured value can only ever raise the bar for demotion, never make a
-  # brand-new finding demotable.
-  [ "$_rrt_n" -lt 2 ] && _rrt_n=2
-  printf '%s' "$_rrt_n"
-}
+# _review_recurrence_count ENVELOPE_FILE DIFF_FILE COUNTS_FILE
+#
+# Run AFTER _cross_round_dedup: records on each finding that survived it how
+# many rounds that finding has now been reported in (_recurrence_count, keyed
+# by the same content-hash key space dedup uses, kept in a separate counts
+# file). INFORMATION ONLY: the count is shown by render-review and never
+# changes whether a finding blocks. It used to demote a finding to advisory
+# once it recurred; that was a way to stop a finding blocking that no operator
+# had decided, and it is gone. A finding stays open until it is fixed or a
+# disposition (.clagentic/dispositions.json) clears it (docs/GATES.md "The
+# code verdict").
+#
+# Findings dedup kept only because an earlier run saw them (_seen_before) are
+# not counted again, so a plain re-run does not inflate the count. A finding
+# whose key cannot be computed is simply not counted; a failure leaves the
+# envelope's findings as they were. Without python3 this is a passthrough.
+_review_recurrence_count() {
+  _rrc_envelope="$1"
+  _rrc_diff="$2"
+  _rrc_counts="$3"
 
-# _review_recurrence_demote ENVELOPE_FILE DIFF_FILE COUNTS_FILE
-#
-# Third pass over ENVELOPE_FILE's findings, run AFTER _cross_round_dedup: for
-# every finding that SURVIVED dedup (i.e. is still in .findings — a finding
-# dedup suppressed was never reported this round and cannot recur by
-# definition), compute its content-hash key (finding_content_keys,
-# review-merge.sh — the SAME key space _cross_round_dedup/dedup_findings
-# already persists in SEEN_FILE, applied here to a SEPARATE counts file so
-# recurrence tracking never mutates dedup's own seen-keys semantics) and bump
-# its persisted round-count (finding_recurrence_bump, review-merge.sh).
-#
-# THRESHOLD SEMANTICS: "recurs" means this finding has now been reported in
-# at least _review_recurrence_threshold DISTINCT rounds, counting this one --
-# a finding on its first-ever reported round always has count 1 and is never
-# demotable. When count >= threshold, the finding's SEVERITY IS NEVER
-# TOUCHED (docs/GATES.md "Cross-round finding dedup": wrong suppressions
-# are worse than missed dedups
-# — the same posture forbids silently rewriting a finding's own reported
-# severity). Instead two fields are added to the finding object:
-#   _recurrence_count    — integer, rounds this key has been reported in
-#   _recurrence_demoted  — boolean, true when count >= threshold
-# severity_blockers() (this file) excludes _recurrence_demoted findings from
-# its block count — this is the mechanism that makes demotion a THRESHOLD
-# change, not suppression: the finding stays in .findings, fully visible in
-# cmd_render_review's output and in the audit trail, with its honest severity
-# unchanged; only its eligibility to gate /ship is affected.
-#
-# SECURITY-FLOOR INTERACTION: this function has no notion of a security floor
-# on its own — review findings do not carry reachable/tier fields (those are
-# adversarial-pass concepts, Gate 5). The floor this repo actually enforces
-# for review findings is severity_blockers()'s threshold comparison itself:
-# a review finding blocks solely because its severity rank meets
-# CLAGENTIC_BLOCK_SEVERITY. Demotion here can exempt a recurring finding from
-# THAT count, same as it does for any other review finding — there is no
-# separate reachable/tier-based floor to bypass on this path (that floor only
-# exists on the adversarial parser, _parse_adversarial_findings, which this
-# function does not touch and which is NOT wired into _review_recurrence_demote
-# at all). See the test suite for an explicit adversarial-floor-is-never-
-# demotable regression case covering the gate that DOES have a floor.
-#
-# CONSERVATIVE BIAS (mirrors _cross_round_dedup exactly, per task constraint
-# (d)): a finding whose key cannot be computed (empty key, no diff window, no
-# sha256 tool) is retained AND left un-demoted (finding_recurrence_bump gives
-# it a fresh count of 1, never eligible). Extraction or splice failure at any
-# step leaves the original findings untouched, un-annotated, un-demoted —
-# same fail-open direction as _cross_round_dedup's own failure paths. No JSON
-# tool at all is a full passthrough — ENVELOPE_FILE is left byte-identical.
-#
-# SECURITY PRECONDITION (lr-66e598 follow-up, BOBBIE-caught): this function
-# ASSUMES ENVELOPE_FILE's findings have already been reduced to the closed
-# review-finding schema by _sanitize_review_findings_envelope (this file),
-# which every caller runs immediately after the raw LLM write and before
-# this function ever sees the file. Before that fix existed, a finding whose
-# triple did NOT match a row in this round's bumped TSV was `continue`d over
-# UNTOUCHED below -- so a model that emitted _recurrence_demoted:true in its
-# OWN raw JSON response had that self-forged value survive verbatim, and a
-# first-ever-reported finding could self-exempt from blocking with zero
-# actual repetition. The splice below now explicitly OWNS the field for
-# every finding it processes (sets a definite _recurrence_count/
-# _recurrence_demoted even on the unmatched branch) as a second, independent
-# layer -- but the real closure point is the upstream ingest strip; this
-# function's own defense-in-depth does not substitute for it, since a
-# forged field on a MATCHED finding would still need the ingest strip to
-# have never let non-schema fields (or a spoofed value this splice
-# overwrites correctly, by coincidence, only on the matched path) reach this
-# function's other, non-recurrence-related reads of the object in the first
-# place.
-_review_recurrence_demote() {
-  _rrd_envelope="$1"
-  _rrd_diff="$2"
-  _rrd_counts="$3"
-
-  # Without the finding pipeline this is a full passthrough: the envelope
-  # stays unannotated, which only ever leaves a finding blocking.
   command -v python3 >/dev/null 2>&1 || return 0
 
-  _rrd_threshold=$(_review_recurrence_threshold)
-
-  # The stage keys this round's SURVIVING findings by content, bumps their
-  # persisted round counts and splices _recurrence_count/_recurrence_demoted
-  # into every finding by (file, category, message) value. It prints "none"
-  # when no finding had a computable key (envelope left untouched) and
-  # "demoted=N" otherwise.
-  #
-  # SEEN-BEFORE FINDINGS ARE NOT BUMPED. _cross_round_dedup keeps a finding an
-  # earlier run recorded (annotated _seen_before) instead of dropping it, so
-  # it reaches this stage on every re-run. Counting each re-run as another
-  # "round" would demote it to advisory on the second identical run, the same
-  # verdict-by-repetition hole the dedup change closes.
-  _rrd_result=$(ds_findings_call dispositions recurrence "$_rrd_envelope" \
-    --diff "$_rrd_diff" --counts "$_rrd_counts" --threshold "$_rrd_threshold") || return 0
-  case "$_rrd_result" in
-    demoted=*) _rrd_demoted_count="${_rrd_result#demoted=}" ;;
+  # The stage prints "none" when nothing was counted and "counted=N" otherwise.
+  _rrc_result=$(ds_findings_call dispositions recurrence "$_rrc_envelope" \
+    --diff "$_rrc_diff" --counts "$_rrc_counts") || return 0
+  case "$_rrc_result" in
+    counted=*) _rrc_count="${_rrc_result#counted=}" ;;
     *) return 0 ;;
   esac
-  case "$_rrd_demoted_count" in ''|*[!0-9]*) _rrd_demoted_count=0 ;; esac
-
-  if [ "$_rrd_demoted_count" -gt 0 ]; then
-    printf '[recurrence] %d finding(s) demoted to advisory (reported >= %d rounds running)\n' \
-      "$_rrd_demoted_count" "$_rrd_threshold" 1>&2
-  fi
-  ds_audit_log "review-recurrence" "pass" \
-    "demoted:${_rrd_demoted_count} threshold:${_rrd_threshold}"
-  return 0
-}
-
-# _review_deferral_match ENVELOPE_FILE (lr-2ebc41)
-#
-# WHY THIS EXISTS: lr-c567 shipped .clagentic/deferrals.json and injected it
-# into the Reviewer's prompt as context to weigh — suppression was left
-# entirely inside model judgment (docs/GATES.md "Reviewer-consulted
-# deferrals"). Field evidence (lr-2ebc41 task description):
-# a single stage-contract finding, accepted with a stable documented
-# rationale, was re-raised by the stateless Reviewer SIX times across a
-# 7-round run because nothing MECHANICALLY excluded it once accepted — the
-# Reviewer was merely asked to honor the deferral, not required to. This
-# function is the gate-code enforcement half: a finding whose (file,
-# category, message) triple matches a deferral entry AND whose named file's
-# content is byte-identical to the file's content when the deferral was
-# granted is annotated _deferral_matched: true / _deferral_id so
-# severity_blockers() (below) can exclude it from the block count — same
-# THRESHOLD-NOT-SUPPRESSION posture _recurrence_demoted already established
-# (lr-66e598): the finding stays fully visible in .findings, in
-# cmd_render_review's output, and in the audit trail with its honest
-# severity untouched. The gate does NOT drop rows or rewrite severity; it
-# only changes eligibility to block /ship. This deliberately reverses
-# lr-c567's "not in gate plumbing" call — see docs/GATES.md "Reviewer-
-# consulted deferrals" for the reversal rationale.
-#
-# MATCH KEY (the hard design question, lr-2ebc41 comment 1). Deliberately
-# NOT finding_content_keys' sha256-of-a-+-2-line-diff-window key
-# (review-merge.sh) — that key is exactly why this problem exists: it is
-# computed from SURROUNDING lines, so incidental edits nearby (a comment
-# added two lines up, a reflow) change the key and silently break the
-# match. The key here is the (file, category, message) triple instead —
-# the SAME triple _review_recurrence_demote already uses to join a bumped
-# TSV row back to a finding object (see its own doc comment above) — because
-# that triple is exactly what the model re-emits when it re-derives the
-# SAME observation about the SAME code: it is insensitive to line-number
-# drift by construction (it does not mention a line number at all), which
-# is the "survive incidental edits around the finding" property this task
-# requires. What it deliberately does NOT distinguish: two findings in
-# different files that happen to share category+message (extremely
-# unlikely for anything but a boilerplate lint rule, and even then the
-# `file` component of the triple still disambiguates); a finding whose
-# MESSAGE TEXT itself changes between rounds is a NEW finding, not a
-# re-raise, and correctly fails to match — this key does not attempt fuzzy/
-# semantic sameness (explicitly out of scope, task description).
-#
-# LAPSE (the other half of the hard design question, comment 2 and comment
-# 3). A (file, category, message) triple alone is stable enough to survive
-# incidental edits but is NOT sensitive to the deferred logic changing —
-# comment 2's field evidence is a deferral granted against round-3 behavior
-# that would still match round-6 behavior in the same file if line-window-
-# insensitivity were the ONLY property enforced. So capture (see
-# .clagentic/deferrals.json's new required `file_sha256` field,
-# scripts/llm-client.sh) pins the sha256 of the NAMED FILE's full content at
-# grant time, and matching here recomputes that same hash and requires an
-# EXACT match. Any edit anywhere in that file — not just near the finding —
-# lapses the deferral back to blocking. This correctly handles a :466-class
-# stable-contract acceptance (comment 3): the deferral's own validity
-# depends only on its own file's content, so a hash of that file is a sound
-# dependency signal.
-#
-# WHAT THIS DELIBERATELY DOES NOT SUPPORT (comment 3, outcome (b), blessed
-# by the task as a legitimate outcome rather than a failure): a deferral
-# whose validity depends on code in a DIFFERENT file or region than the one
-# it's filed against (comment 3's :139 case — a scope-boundary acceptance
-# whose truth depends on reset logic living elsewhere in a different file)
-# is NOT SUPPORTED by a single-file content hash — that dependency is
-# invisible to this mechanism by construction, since the named file's own
-# bytes can stay identical while the true dependency changes. This is a
-# DELIBERATE, DOCUMENTED restriction to the stable-contract class, not an
-# oversight: capture-time guidance (llm-client.sh's deferral schema comment,
-# docs/GATES.md, plugins/clagentic-lite/agents/builder.md) instructs the
-# capturing agent to REFUSE to write a deferral entry whose rationale
-# depends on anything outside the named file, loudly, at capture time,
-# rather than writing one this function would silently mis-honor. There is
-# no mechanical enforcement of that refusal (the shell has no way to verify
-# an English rationale is self-contained) — this is a documented boundary
-# of the feature's shape, not a false completeness claim.
-#
-# FAIL-CLOSED (the property that matters most, per the task). Any of the
-# following causes a finding to be retained as blocking, exactly as if no
-# deferral existed: deferrals.json absent/empty/malformed; a deferral entry
-# missing `file_sha256`, `scope`, `id`, `file`, or `message`; a deferral
-# entry whose `scope` is anything other than the literal string
-# "stable-contract" (only supported value — see capture-side validation);
-# the named file missing on disk; no sha256 tool available; more than one
-# LIVE (hash-matching) deferral entry claiming the same finding (ambiguous
-# match — "preserve when uncertain" per docs/GATES.md "Cross-round finding
-# dedup": wrong suppressions are worse than missed dedups). No
-# JSON tool at all is a full passthrough — ENVELOPE_FILE is left untouched,
-# matching every other splice step in this file's fail-open-on-tooling,
-# fail-closed-on-ambiguity posture.
-_review_deferral_match() {
-  _rdm_envelope="$1"
-
-  # No finding pipeline: full passthrough, which leaves every finding blocking.
-  command -v python3 >/dev/null 2>&1 || return 0
-
-  # The stage prints "none" when there is nothing to match against (no file,
-  # no eligible live entry) and "matched=N" otherwise. Every case that
-  # cannot be decided stays blocking: a malformed or ambiguous entry never
-  # suppresses a finding.
-  _rdm_result=$(ds_findings_call dispositions deferrals "$_rdm_envelope" --root "$REPO_ROOT") || return 0
-  case "$_rdm_result" in
-    matched=*) _rdm_matched_count="${_rdm_result#matched=}" ;;
-    *) return 0 ;;
-  esac
-  case "$_rdm_matched_count" in ''|*[!0-9]*) _rdm_matched_count=0 ;; esac
-
-  if [ "$_rdm_matched_count" -gt 0 ]; then
-    printf '[deferral] %d finding(s) matched a live operator deferral (threshold, not suppression — see clagentic-lite render-review)\n' \
-      "$_rdm_matched_count" 1>&2
-  fi
-  ds_audit_log "review-deferral-match" "pass" \
-    "matched:${_rdm_matched_count}"
+  case "$_rrc_count" in ''|*[!0-9]*) _rrc_count=0 ;; esac
+  ds_audit_log "review-recurrence" "pass" "counted:${_rrc_count}"
   return 0
 }
 
@@ -4304,30 +4161,20 @@ _extract_findings_json_strict() {
 # array in place to EXACTLY the closed review-finding schema
 # (ds_review_prompt, llm-client.sh: severity/file/line/category/message/
 # evidence/suggestion) via _llm_json_array_allowlist_fields
-# (scripts/platform.sh), DROPPING every other key -- including, critically,
-# any `_recurrence_demoted` / `_recurrence_count` (or any other future
-# internal `_`-prefixed control field) the MODEL ITSELF may have emitted in
-# its raw JSON response.
+# (scripts/platform.sh), DROPPING every other key -- including any gate-owned annotation
+# (`_recurrence_count`, `disposition`, `fingerprint`, or any future
+# `_`-prefixed control field) the MODEL ITSELF may have emitted in its raw
+# JSON response.
 #
 # WHY THIS EXISTS: last-review.json is written directly from LLM output
 # (llm-client.sh's `review` role) with no field allowlist anywhere on that
 # write path -- validate_output (llm-client.sh) checks only that .findings
 # is an array and that .severity, if present, is a legal enum value. Nothing
 # stopped a model (compromised, manipulated by attacker-influenced code
-# under review, or simply miscalibrated) from emitting
-# {"severity":"critical", ..., "_recurrence_demoted": true} in its
-# structured JSON on the FIRST-EVER round. Before this fix,
-# _review_recurrence_demote's splice step only OVERWRITES
-# _recurrence_demoted/_recurrence_count on a finding whose (file,category,
-# message) triple matches a row in this round's bumped TSV (i.e. whose line
-# falls inside finding_content_keys' diff-context window); a finding whose
-# triple does NOT match is `continue`d over UNTOUCHED (see
-# _review_recurrence_demote), so a self-forged _recurrence_demoted:true
-# survived verbatim into last-review.json and severity_blockers (which reads
-# ._recurrence_demoted with no provenance check) excluded it from the block
-# count -- a first-ever-reported finding could self-exempt from blocking
-# with zero actual repetition. Overwrite-on-match is not the same as
-# owning the field.
+# under review, or simply miscalibrated) from writing a field the gate code
+# later reads as its own. No annotation decides a verdict any more (the
+# exemption annotations are gone), but the strip stays the one choke point
+# that makes "this field was written by the gate" true.
 #
 # THE FIX IS AT INGEST, THE SAME CHOKE-POINT PATTERN THIS CODEBASE ALREADY
 # USES: _sanitize_adversarial_findings_json sanitizes immediately after
@@ -4340,13 +4187,8 @@ _extract_findings_json_strict() {
 # merge_envelopes ever unions them -- merge_envelopes/dedup_findings are
 # pure concatenation/dedup with no field validation of their own, so an
 # unsanitized chunk would carry a forged field through the merge
-# untouched), and BEFORE _cross_round_dedup, _review_recurrence_demote,
-# severity_blockers, or cmd_render_review ever read the file. Once this
-# runs, there is no field left on any finding object for
-# _review_recurrence_demote or severity_blockers to trust-by-accident --
-# the ONLY way _recurrence_demoted/_recurrence_count can exist on a finding
-# from this point forward is if THIS repo's own code (the recurrence
-# splice) put it there this round.
+# untouched), and BEFORE _cross_round_dedup, the code verdict or
+# cmd_render_review ever read the file.
 #
 # NUMERIC `line` FIELD: _llm_json_array_allowlist_fields' base contract
 # keeps only STRING-valued fields (safe for deferrals.json, an all-string
@@ -4388,11 +4230,13 @@ _sanitize_review_findings_envelope() {
   _srfe_file="$1"
   [ -f "$_srfe_file" ] || return 0
   # The pipeline reduces the file in place, or replaces it with the degraded
-  # stub on any failure. If the pipeline itself cannot run, the file still
-  # holds the model's raw findings, so the stub is written here too, with a
-  # printf literal that needs no tool.
+  # stub on any failure. If the pipeline itself cannot run (or could not write
+  # the stub), the file still holds the model's raw findings, so the stub is
+  # written here too, with a printf literal that needs no tool. If even that
+  # fails the raw findings must not be read as a review: return nonzero and let
+  # the caller stop the gate.
   if ! ds_findings_call -e any ingest review-envelope "$_srfe_file"; then
-    _review_envelope_mark_sanitize_failed "$_srfe_file"
+    _review_envelope_mark_sanitize_failed "$_srfe_file" || return 1
   fi
   return 0
 }
@@ -4400,10 +4244,17 @@ _sanitize_review_findings_envelope() {
 # _review_envelope_mark_sanitize_failed FILE — replace FILE with the degraded
 # envelope that says its findings could not be reduced to the closed schema.
 # Used when the raw model findings are still in FILE and cannot be cleaned.
-# The write is a printf literal so it works with no JSON tool.
+# The write is a printf literal so it works with no JSON tool. When the write
+# fails the file is removed; if it cannot be removed either, this returns 1:
+# unsanitized findings are never left as the answer.
 _review_envelope_mark_sanitize_failed() {
-  printf '%s\n' '{"degraded": true, "sanitize_failed": true, "summary": "[clagentic-lite degraded] review findings could not be sanitized", "checked": [], "findings": []}' > "$1" 2>/dev/null || :
+  if ! printf '%s\n' '{"degraded": true, "sanitize_failed": true, "summary": "[clagentic-lite degraded] review findings could not be sanitized", "checked": [], "findings": []}' > "$1" 2>/dev/null; then
+    rm -f "$1" 2>/dev/null || :
+    printf '[gates/review] review findings could not be sanitized and %s could not be replaced with the degraded stub; refusing to use it\n' "$1" 1>&2
+    return 1
+  fi
   printf '[gates/review] review findings could not be reduced to the closed schema; marked the envelope degraded\n' 1>&2
+  return 0
 }
 
 # _invariant_feed_max_lines — line cap on invariants.json entries. Guards
@@ -4643,6 +4494,68 @@ _invariant_feed_distill() {
   fi
 }
 
+# _review_code_verdict ENVELOPE_FILE BASE_SHA
+#
+# The review gate's block decision. The envelope's findings are handed to the
+# finding pipeline (findings.py evaluate), which adds them to this HEAD's
+# accumulated findings and returns the code verdict for the review gate: the
+# open blocking review findings, minus those a valid, already-merged
+# disposition clears. Annotates the envelope's findings with their fingerprint
+# and disposition. The verdict text goes to stderr.
+#
+# Sets _RCV_COMPUTED to 1 and _RCV_BLOCKERS to the number of open blocking
+# findings when a verdict was computed. When none could be (the pipeline refused
+# the input or could not run) _RCV_COMPUTED is 0 and _RCV_BLOCKERS is the
+# sentinel 99, which is never a finding count: a verdict that was not computed
+# is a block, never a pass. Callers decide through _review_verdict_blocks,
+# which treats anything but a computed zero as a block. Always returns 0 so a
+# caller under `set -e` reads the variables, not an exit status.
+_review_code_verdict() {
+  _rcv_env="$1"
+  _rcv_base="$2"
+  _rcv_rc=0
+  _rcv_text=$(_gate_evaluate review "$_rcv_env" "$_rcv_base" gate --annotate "$_rcv_env") || _rcv_rc=$?
+  [ -z "$_rcv_text" ] || printf '%s\n' "$_rcv_text" 1>&2
+  _RCV_BLOCKERS=99
+  _RCV_COMPUTED=0
+  case "$_rcv_rc" in
+    0) _RCV_BLOCKERS=0; _RCV_COMPUTED=1 ;;
+    1)
+      _rcv_n=${_rcv_text#VERDICT: BLOCKED (}
+      _rcv_n=${_rcv_n%% *}
+      case "$_rcv_n" in
+        ''|*[!0-9]*) ;;
+        0) ;;
+        *) _RCV_BLOCKERS=$_rcv_n; _RCV_COMPUTED=1 ;;
+      esac
+      ;;
+    *) printf '[gates/review] the code verdict could not be computed; treating the review as blocked\n' 1>&2 ;;
+  esac
+  return 0
+}
+
+# _review_verdict_blocks — success (block) unless _review_code_verdict computed
+# a verdict with zero open blocking findings. An unset, empty or non-numeric
+# count blocks: the old `${BLOCKERS:-0}` read the same states as a pass.
+_review_verdict_blocks() {
+  [ "${_RCV_COMPUTED:-}" = "1" ] || return 0
+  case "${_RCV_BLOCKERS:-}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_RCV_BLOCKERS" -gt 0 ]
+}
+
+# _review_blocked_reason THRESHOLD log|say — what to record (log: the audit-row
+# details) or print (say) about a blocked review. The sentinel is never
+# printed as a finding count.
+_review_blocked_reason() {
+  if [ "${_RCV_COMPUTED:-}" != "1" ]; then
+    printf 'the verdict could not be computed'
+  elif [ "$2" = "log" ]; then
+    printf '%s finding(s) at >= %s' "$_RCV_BLOCKERS" "$1"
+  else
+    printf "%s finding(s) at or above severity '%s'" "$_RCV_BLOCKERS" "$1"
+  fi
+}
+
 cmd_review() {
   _gate_check_args review "--full-review --since-last-review --reset-dedup" "" "$@" || return 2
   # Parse flags; all args consumed by the subcommand dispatcher.
@@ -4871,7 +4784,12 @@ cmd_review() {
         # _recurrence_demoted) straight through the merge. See
         # _sanitize_review_findings_envelope's own doc comment for the full
         # rationale.
-        _sanitize_review_findings_envelope "$_crv_env_file"
+        if ! _sanitize_review_findings_envelope "$_crv_env_file"; then
+          cmd_log_run review block "review envelope could not be sanitized or replaced; raw findings refused"
+          rm -rf "$_crv_chunk_dir" "$_crv_env_dir"
+          rm -f "$_crv_diff_tmp"
+          return 1
+        fi
         # Audit one row per chunk. STATUS-CHECKED (lr-7047bf, INV-1b): a
         # nonzero status is checked directly (3 = walk_chain's own degraded
         # signal; any other nonzero was normalized to a degraded envelope
@@ -4918,27 +4836,15 @@ cmd_review() {
         _crv_prior_seen_snap=$(mktemp -t clagentic-inv-prior.XXXXXX)
         cp "$_crv_seen_file" "$_crv_prior_seen_snap" 2>/dev/null || : > "$_crv_prior_seen_snap"
         _cross_round_dedup "$OUT" "$_crv_diff_tmp" "$_crv_seen_file"
-        # Recurrence demotion (lr-66e598): a finding that survived dedup and
-        # keeps reappearing across rounds is demoted to advisory (excluded
-        # from severity_blockers' count) rather than re-litigated forever.
-        # Second use of the same content-hash key space, per its own
-        # threshold (CLAGENTIC_RECURRENCE_THRESHOLD, default 2) — see
-        # _review_recurrence_demote for the full mechanics.
-        _review_recurrence_demote "$OUT" "$_crv_diff_tmp" "$_crv_recurrence_file"
+        # Informational recurrence count (never changes a verdict) — see
+        # _review_recurrence_count.
+        _review_recurrence_count "$OUT" "$_crv_diff_tmp" "$_crv_recurrence_file"
         if [ "${CLAGENTIC_ADVERSARIAL_INVARIANTS:-0}" = "1" ]; then
           _crv_live_findings=$(_extract_findings_json "$OUT")
           _invariant_feed_write review "$_crv_live_findings" "$_crv_diff_tmp" "$_crv_prior_seen_snap" "$_crv_seen_file"
         fi
         rm -f "$_crv_prior_seen_snap"
       fi
-
-      # Operator deferral matching (lr-2ebc41): gate-code enforcement of
-      # .clagentic/deferrals.json, independent of cross-round dedup state —
-      # a deferral can match on the very first round a finding is reported,
-      # so this runs unconditionally rather than being nested inside the
-      # CLAGENTIC_CROSS_ROUND_DEDUP gate above. See _review_deferral_match's
-      # own doc comment for the full match-key/lapse/fail-closed rationale.
-      _review_deferral_match "$OUT"
 
       # Aggregate audit row for the merged result.
       _crv_merged_outcome="pass"
@@ -4971,10 +4877,10 @@ cmd_review() {
       fi
 
       THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
-      BLOCKERS=$(severity_blockers "$OUT" "$THRESHOLD")
-      if [ "${BLOCKERS:-0}" -gt 0 ]; then
-        cmd_log_run review block "review-blocked: $BLOCKERS finding(s) at >= $THRESHOLD"
-        echo "[gates/review] REVIEW_BLOCKED: $BLOCKERS finding(s) at or above severity '$THRESHOLD'." 1>&2
+      _review_code_verdict "$OUT" "$_crv_base_sha"
+      if _review_verdict_blocks; then
+        cmd_log_run review block "review-blocked: $(_review_blocked_reason "$THRESHOLD" log)"
+        echo "[gates/review] REVIEW_BLOCKED: $(_review_blocked_reason "$THRESHOLD" say)." 1>&2
         cmd_render_review "$OUT" 1>&2
         _ledger_record_review_verdict review "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
         rm -f "$_crv_diff_tmp"
@@ -5011,7 +4917,11 @@ cmd_review() {
   # own doc comment for the full rationale — this is the choke point that
   # closes the self-exempting-suppression gap a raw, unallowlisted model
   # finding could otherwise use.
-  _sanitize_review_findings_envelope "$OUT"
+  if ! _sanitize_review_findings_envelope "$OUT"; then
+    cmd_log_run review block "review envelope could not be sanitized or replaced; raw findings refused"
+    rm -f "$_crv_diff_tmp"
+    return 1
+  fi
 
   # Stamp the output with the current HEAD SHA so build_gate_summary can
   # detect stale payloads (file written against a different branch/commit).
@@ -5040,20 +4950,14 @@ cmd_review() {
     _crv_prior_seen_snap=$(mktemp -t clagentic-inv-prior.XXXXXX)
     cp "$_crv_seen_file" "$_crv_prior_seen_snap" 2>/dev/null || : > "$_crv_prior_seen_snap"
     _cross_round_dedup "$OUT" "$_crv_diff_tmp" "$_crv_seen_file"
-    # Recurrence demotion (lr-66e598) — see the chunked-path comment above
-    # for the full rationale (same logic, single-pass path).
-    _review_recurrence_demote "$OUT" "$_crv_diff_tmp" "$_crv_recurrence_file"
+    # Informational recurrence count — see the chunked-path comment above.
+    _review_recurrence_count "$OUT" "$_crv_diff_tmp" "$_crv_recurrence_file"
     if [ "${CLAGENTIC_ADVERSARIAL_INVARIANTS:-0}" = "1" ]; then
       _crv_live_findings=$(_extract_findings_json "$OUT")
       _invariant_feed_write review "$_crv_live_findings" "$_crv_diff_tmp" "$_crv_prior_seen_snap" "$_crv_seen_file"
     fi
     rm -f "$_crv_prior_seen_snap"
   fi
-
-  # Operator deferral matching (lr-2ebc41) — see the chunked-path comment
-  # above for the full rationale (same logic, single-pass path). Runs
-  # unconditionally, outside the CLAGENTIC_CROSS_ROUND_DEDUP gate above.
-  _review_deferral_match "$OUT"
 
   # NOTE: $_crv_diff_tmp is deleted at each exit point below (not here) —
   # _ledger_record_review_verdict (item 1/2/5) still needs it for recurrence
@@ -5107,12 +5011,13 @@ cmd_review() {
     rm -f "$_crv_diff_tmp"
     return 2
   fi
-  # Severity gate: count findings >= configured threshold.
+  # Code verdict: open blocking findings (accumulated at this HEAD, minus the
+  # ones a merged disposition clears) at or above the configured threshold.
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
-  BLOCKERS=$(severity_blockers "$OUT" "$THRESHOLD")
-  if [ "${BLOCKERS:-0}" -gt 0 ]; then
-    cmd_log_run review block "review-blocked: $BLOCKERS finding(s) at >= $THRESHOLD"
-    echo "[gates/review] REVIEW_BLOCKED: $BLOCKERS finding(s) at or above severity '$THRESHOLD'." 1>&2
+  _review_code_verdict "$OUT" "$_crv_base_sha"
+  if _review_verdict_blocks; then
+    cmd_log_run review block "review-blocked: $(_review_blocked_reason "$THRESHOLD" log)"
+    echo "[gates/review] REVIEW_BLOCKED: $(_review_blocked_reason "$THRESHOLD" say)." 1>&2
     cmd_render_review "$OUT" 1>&2
     _ledger_record_review_verdict review "$OUT" "$_crv_diff_tmp" "block" "$_crv_base_sha" "$_review_sha"
     rm -f "$_crv_diff_tmp"
@@ -5535,6 +5440,72 @@ _sanitize_adversarial_findings_json() {
   _llm_json_array_sanitize_fields_strict "$_safj_json" file category message
 }
 
+# The adversarial audit's findings are added to HEAD's accumulated set (the
+# code verdict). When that cannot be done, a marker naming HEAD is left and the
+# merge gate refuses while it matches HEAD; a later successful record removes
+# it. The stamp the marker is written with and the stamp the merge gate
+# compares it to come from the one function below, so the two cannot drift
+# apart and leave a refusal that never fires.
+#
+# Exit status of cmd_adversarial (and of _adv_record_findings) when the
+# findings could not be recorded and the marker could not be written either:
+# nothing then makes the merge gate refuse, so the run itself fails loudly.
+_ADV_UNRECORDED_RC=4
+
+_adv_unrecorded_marker_path() {
+  printf '%s/.clagentic/lite/adversarial-unrecorded' "$REPO_ROOT"
+}
+
+_adv_unrecorded_stamp() {
+  _git_repo_scoped_head_sha
+}
+
+# Success when an unrecorded-findings marker for the current HEAD stands. A
+# marker that cannot be read counts as standing: not knowing is a refusal.
+_adv_unrecorded_pending() {
+  _aup_marker=$(_adv_unrecorded_marker_path)
+  [ -f "$_aup_marker" ] || return 1
+  _aup_have=$(cat "$_aup_marker") || return 0
+  [ "$_aup_have" = "$(_adv_unrecorded_stamp)" ]
+}
+
+_adv_unrecorded_mark() {
+  _aum_stamp=$(_adv_unrecorded_stamp)
+  printf '%s\n' "$_aum_stamp" > "$(_adv_unrecorded_marker_path)"
+}
+
+# _adv_record_findings FINDINGS_FILE BASE_SHA [quiet]
+#
+# Records FINDINGS_FILE (the audit's structured findings; an empty audit is a
+# run on record with no findings) in the code verdict. Returns 0 when recorded,
+# or when it was not but the marker now makes the merge gate refuse; returns
+# _ADV_UNRECORDED_RC when neither could be done. The verdict text goes to
+# stderr unless "quiet".
+_adv_record_findings() {
+  _arf_file="$1"
+  _arf_base="$2"
+  _arf_quiet="${3:-}"
+  _arf_rc=0
+  _arf_text=$(_gate_evaluate adversarial "$_arf_file" "$_arf_base" gate) || _arf_rc=$?
+  case "$_arf_rc" in
+    0|1)
+      if [ -z "$_arf_quiet" ] && [ -n "$_arf_text" ]; then
+        printf '%s\n' "$_arf_text" 1>&2
+      fi
+      rm -f "$(_adv_unrecorded_marker_path)"
+      return 0
+      ;;
+  esac
+  if _adv_unrecorded_mark; then
+    cmd_log_run adversarial warn "adversarial findings could not be recorded for the code verdict (status=$_arf_rc); the merge gate will refuse"
+    echo "[gates/adversarial] WARN: adversarial findings could not be recorded for the code verdict; the merge gate will refuse until this is fixed." 1>&2
+    return 0
+  fi
+  cmd_log_run adversarial block "adversarial findings could not be recorded (status=$_arf_rc) and the unrecorded marker could not be written; nothing will make the merge gate refuse"
+  echo "[gates/adversarial] ERROR: adversarial findings could not be recorded for the code verdict, and the marker that makes the merge gate refuse could not be written either. Fix the write access to $(_adv_unrecorded_marker_path) and re-run gates adversarial." 1>&2
+  return "$_ADV_UNRECORDED_RC"
+}
+
 cmd_adversarial() {
   _gate_check_args adversarial "--full-review" "" "$@" || return 2
   # --full-review: gates.sh's dispatcher now forwards argv
@@ -5609,6 +5580,16 @@ cmd_adversarial() {
     printf '[gates/adversarial] SKIP: %s — no findings can be reported on an empty input, this is not a clean pass\n' "$_adv_empty_reason" 1>&2
     _adv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
     _adv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_adv_fetch_timeout")
+    # An empty audit is still a run on record (with no findings), so the merge
+    # gate's "an adversarial run is on record" requirement holds for it. A
+    # failure to record it is handled exactly as on the main path: a marker
+    # that makes the merge gate refuse, or a hard error when that fails too.
+    _adv_record_rc=0
+    _adv_record_findings "$FINDINGS_OUT" "$_adv_base_sha" quiet || _adv_record_rc=$?
+    if [ "$_adv_record_rc" -ne 0 ]; then
+      rm -f "$_adv_diff_tmp"
+      return "$_adv_record_rc"
+    fi
     _ledger_record_review_verdict adversarial "$OUT" "$_adv_diff_tmp" "skip" "$_adv_base_sha" "$_adv_sha"
     rm -f "$_adv_diff_tmp"
     cat "$OUT"
@@ -5798,6 +5779,24 @@ cmd_adversarial() {
   _adv_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC "${CLAGENTIC_REVIEW_FETCH_TIMEOUT_SEC:-}" 30)
   _adv_base_sha=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_adv_fetch_timeout")
 
+  # Record this run's findings in the HEAD's accumulated set. The audit stays
+  # non-blocking here (a hostile-user narrative is not a pass/fail gate), but
+  # an open blocking finding is not forgotten: the merge gate's code verdict
+  # is the union of every review and adversarial run at this HEAD, so a
+  # reachable high-impact finding blocks the merge there until it is fixed or a
+  # merged disposition clears it. Skipped when no real audit happened. A failure
+  # to record is not silent: it leaves a marker naming this HEAD, and the merge
+  # gate refuses while the marker matches HEAD (a later successful run removes
+  # it).
+  if [ "$_adv_degraded" -ne 1 ] && [ "$_adv_findings_degraded" != "true" ]; then
+    _adv_record_rc=0
+    _adv_record_findings "$FINDINGS_OUT" "$_adv_base_sha" || _adv_record_rc=$?
+    if [ "$_adv_record_rc" -ne 0 ]; then
+      rm -f "$_adv_diff_tmp"
+      return "$_adv_record_rc"
+    fi
+  fi
+
   # cmd_adversarial can no longer report a clean audit when the auditor was
   # dead. A degraded emission is a distinct, mechanically-detectable outcome
   # ("degraded") from an ordinary non-blocking pass ("warn") -- both land in
@@ -5862,7 +5861,7 @@ cmd_adversarial() {
 #     files git diff would not otherwise reflect) without depending on any
 #     file's mtime — porcelain output is derived from content/index state.
 # Both are hashed together via the existing _rm_sha256 shim (review-merge.sh)
-# used by dedup_findings/_review_deferral_match for the exact same
+# used by dedup_findings for the exact same
 # fingerprint-content-not-timestamps reason. Symlink/toplevel canonicalization
 # delegates to _git_repo_scoped_head_sha (gates.sh, near the _git
 # definition), not a locally-duplicated inline check (lr-da1f28 sweep — this
@@ -5948,6 +5947,29 @@ _mg_refuse_stale() {
   return 0
 }
 
+# _mg_refuse_code REASON VERDICT_TEXT GATE_NAME
+#
+# The deterministic refusal for a code verdict that is BLOCKED, or that could
+# not be computed (no model call, no token burn). Writes last-merge-gate.json,
+# prints the verdict text (with, for each open finding, the exact disposition
+# stanza that would clear it) and returns 1 unless
+# CLAGENTIC_MERGE_GATE_BLOCKING=0, like every other refusal here.
+_mg_refuse_code() {
+  _mrc_reason="$1"
+  _mrc_text="$2"
+  _mrc_gate="$3"
+  printf '{"decision": "refuse", "code_verdict": "BLOCKED", "reason": "%s"}\n' \
+    "$(ds_json_escape "$_mrc_reason")" > "$OUT"
+  cmd_log_run "$_mrc_gate" block "code verdict BLOCKED: $_mrc_reason"
+  [ -z "$_mrc_text" ] || printf '%s\n' "$_mrc_text" 1>&2
+  printf '[gates/merge-gate] REFUSED (code verdict): %s\n' "$_mrc_reason" 1>&2
+  cat "$OUT"
+  if [ "${CLAGENTIC_MERGE_GATE_BLOCKING:-1}" != "0" ]; then
+    return 1
+  fi
+  return 0
+}
+
 cmd_merge_gate() {
   _gate_check_args merge-gate "--recheck" "" "$@" || return 2
   # Final LLM sanity check: feed gate outputs back through the merge-gate
@@ -5987,7 +6009,10 @@ cmd_merge_gate() {
       _mg_cached_details=${_mg_cached#*|}
       case "$_mg_cached_details" in
         *"[state=${_mg_state_id}]"*)
-          if [ "$_mg_cached_outcome" = "pass" ]; then
+          # A cached pass does not outlive an adversarial run at this state
+          # whose findings could not be recorded: that falls through to the
+          # full path, which refuses on the marker.
+          if [ "$_mg_cached_outcome" = "pass" ] && ! _adv_unrecorded_pending; then
             printf '[gates/merge-gate] already passed for this exact commit+content state — no-op (state=%s)\n' "$_mg_state_id" 1>&2
             if [ -f "$OUT" ]; then
               cat "$OUT"
@@ -6103,6 +6128,38 @@ except Exception:
     return $?
   fi
 
+  # CODE VERDICT. The block decision is made here, in code, before any model
+  # is consulted: every review and adversarial run at this HEAD has been added
+  # to one accumulated set, and the open blocking findings in it, minus those a
+  # valid already-merged disposition clears, decide. A BLOCKED code verdict is
+  # final; the merge-gate model is never called and could not change it. On a
+  # PASS the model receives the verdict and the applied dispositions in the
+  # payload (code_verdict) and may only ADD a refusal. A verdict that cannot be
+  # computed refuses: the merge gate does not run without one.
+  if _adv_unrecorded_pending; then
+    _mg_refuse_code "the adversarial findings at this HEAD could not be recorded, so the code verdict is incomplete; re-run gates adversarial" "" "$_mg_gate_name"
+    return $?
+  fi
+  _mg_cv_json="$REPO_ROOT/.clagentic/lite/code-verdict.json"
+  _mg_cv_timeout=$(ds_positive_int_or_warn CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC "${CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC:-}" 30)
+  _mg_cv_base=$(_resolve_base_sha "${CLAGENTIC_DEFAULT_BRANCH:-main}" "$_mg_cv_timeout")
+  _mg_cv_rc=0
+  _mg_cv_text=$(_gate_evaluate merge-gate "" "$_mg_cv_base" head --attach-to "$IN" --json-out "$_mg_cv_json") || _mg_cv_rc=$?
+  case "$_mg_cv_rc" in
+    0) [ -z "$_mg_cv_text" ] || printf '%s\n' "$_mg_cv_text" 1>&2 ;;
+    1)
+      _mg_cv_n=${_mg_cv_text#VERDICT: BLOCKED (}
+      _mg_cv_n=${_mg_cv_n%% *}
+      case "$_mg_cv_n" in ''|*[!0-9]*) _mg_cv_n="" ;; esac
+      _mg_refuse_code "${_mg_cv_n:-some} open blocking finding(s) at this HEAD; the code verdict is BLOCKED" "$_mg_cv_text" "$_mg_gate_name"
+      return $?
+      ;;
+    *)
+      _mg_refuse_code "the code verdict could not be computed; the merge gate does not run without one" "" "$_mg_gate_name"
+      return $?
+      ;;
+  esac
+
   # STATUS-CHECKED (lr-7047bf, INV-1b): guard explicitly -- gates.sh runs
   # under `set -e`, and walk_chain now returns 3 on a degraded emission (see
   # llm-client.sh walk_chain). $_mg_status is checked immediately below
@@ -6176,32 +6233,14 @@ except Exception:
   fi
   case "$DECISION" in
     approve)
-      ACK_COUNT=0
-      ACK_DETAIL=""
-      if command -v jq >/dev/null 2>&1; then
-        ACK_COUNT=$(jq -r '(.acknowledged // []) | length' "$OUT" 2>/dev/null || echo 0)
-        # Serialize per-finding detail (cwe + file + rationale) into the audit
-        # details column so the audit trail records WHICH findings were waved
-        # through, not just how many. AGENTS.md §6: the audit trail is the artifact.
-        if [ "${ACK_COUNT:-0}" -gt 0 ]; then
-          ACK_DETAIL=$(jq -r '.acknowledged[] | "\(.cwe) \(.file) — \(.rationale)"' "$OUT" 2>/dev/null | tr '\n' '; ')
-        fi
-      elif command -v python3 >/dev/null 2>&1; then
-        ACK_COUNT=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("acknowledged",[])))' "$OUT" 2>/dev/null || echo 0)
-        if [ "${ACK_COUNT:-0}" -gt 0 ]; then
-          ACK_DETAIL=$(python3 -c '
-import json, sys
-d = json.load(open(sys.argv[1]))
-parts = ["{} {} — {}".format(f.get("cwe",""), f.get("file",""), f.get("rationale","")) for f in d.get("acknowledged",[])]
-print("; ".join(parts))
-' "$OUT" 2>/dev/null)
-        fi
+      # The findings a disposition cleared are recorded in the audit trail from
+      # the code verdict, not from anything the model wrote: they are the
+      # artifact reviewers read.
+      _mg_cleared=""
+      if [ -f "$_mg_cv_json" ]; then
+        _mg_cleared=$(ds_findings_call -s -e any render cleared-summary < "$_mg_cv_json" 2>/dev/null) || _mg_cleared=""
       fi
-      if [ "${ACK_COUNT:-0}" -gt 0 ]; then
-        _cmd_log_run_checked_pass "$_mg_gate_name" "approve ($ACK_COUNT acknowledged finding(s)): $ACK_DETAIL$_mg_class_suffix$_mg_state_suffix"
-      else
-        _cmd_log_run_checked_pass "$_mg_gate_name" "approve$_mg_class_suffix$_mg_state_suffix"
-      fi
+      _cmd_log_run_checked_pass "$_mg_gate_name" "approve${_mg_cleared:+ ($_mg_cleared)}$_mg_class_suffix$_mg_state_suffix"
       ;;
     refuse)
       cmd_log_run "$_mg_gate_name" block "refuse$_mg_class_suffix"
@@ -6238,27 +6277,30 @@ severity_rank() {
 # an unresolved class escalation must never become a new way to gate /ship.
 # Do not add either field to this function's selection logic.
 severity_blockers() {
+  # The raw count of findings at or above THRESHOLD in one review file, before
+  # accumulation and before any disposition: a diagnostic. The gates decide
+  # with the code verdict (_review_code_verdict / findings.py evaluate), not
+  # with this number.
+  #
   # Parse-failure policy: ALWAYS fail closed. The sentinel value 99 trips the
   # caller's `> 0` block check unambiguously, and makes the audit-row message
   # ("99 finding(s) at >= high") visibly unusual, so users know this is
   # "blocked because the gate couldn't read the review" rather than a model
   # that legitimately found 99 issues. The count itself, the severity ranking
-  # (a non-string severity cannot be ranked and counts as blocking; strings
-  # are matched case-insensitively), the unknown-threshold default of 'high'
-  # and the _recurrence_demoted / _deferral_matched exclusions (thresholds,
-  # not suppression: the finding stays in .findings with its honest severity)
-  # all live in findings.py verdict blockers. A missing python3 is the same
-  # unreadable-review case.
+  # (a severity that is not a known rank name cannot be ranked and counts as
+  # blocking; known names are matched case-insensitively after stripping) and
+  # the unknown-threshold default of 'high' live in findings.py verdict
+  # blockers. A missing python3 is the same unreadable-review case.
   _sb_out=$(ds_findings_call -e int verdict blockers "$1" "$2") || _sb_out=""
   if [ -z "$_sb_out" ]; then echo 99; else echo "$_sb_out"; fi
 }
 
 # _blocking_findings_json THRESHOLD — read a JSON object with a .findings array
 # on stdin and print, as compact JSON, the findings severity_blockers would
-# count at THRESHOLD, reduced to {file, line, severity, message}. Same
-# predicate as severity_blockers (severity rank, not _recurrence_demoted, not
-# _deferral_matched) so the list a refusal shows is exactly the set that
-# blocked. Control bytes are stripped from the free text and message is capped:
+# count at THRESHOLD, reduced to {file, line, severity, message}, leaving out
+# a finding the review's verdict recorded as cleared by a disposition, so the
+# list a refusal shows is the set that blocked. Control bytes are stripped from
+# the free text and message is capped:
 # the text is model-authored and ends up on a terminal. Prints "null" (not "[]",
 # which would read as "nothing blocked") when no JSON tool exists or the input
 # is unreadable, never a partial list; _mg_stale_report renders null as "could
@@ -7103,8 +7145,6 @@ build_gate_summary() {
   # files: a missing meta file predates this feature, not evidence of a
   # truncation that actually happened.
   ADF_META="$REPO_ROOT/.clagentic/lite/last-adversarial-findings-meta.json"
-  ACKS_FILE="$REPO_ROOT/.clagentic/adversarial-acks.json"
-  AR_FILE="$REPO_ROOT/.clagentic/accepted-risks.md"
   THRESHOLD="${CLAGENTIC_BLOCK_SEVERITY:-high}"
   # ADVERSARIAL_DEGRADED (lr-7047bf, cmd_adversarial fold-in): cmd_adversarial
   # now writes a degraded markdown envelope AND a fresh (matching) SHA stamp
@@ -7322,61 +7362,6 @@ build_gate_summary() {
     fi
   fi
 
-  # Detect whether the ack/accepted-risks files are net-new (status A) in the
-  # current diff. This flag is passed to the merge-gate to enable the bootstrap
-  # exemption without requiring the LLM to infer it from prose. We check both
-  # the staged index and the branch diff (same priority as get_review_diff).
-  # Failure is fail-open (false) — the flag is informational only.
-  _ack_rel=".clagentic/adversarial-acks.json"
-  _ar_rel=".clagentic/accepted-risks.md"
-  INTRODUCES_ACK_FILE="false"
-  _diff_status=""
-  # REPO SCOPING (lr-da1f28 sweep): guard before trusting the staged diff —
-  # same ancestor-repo leak class as get_review_diff, here feeding the
-  # ack-bootstrap-exemption detection instead. Fail-open/informational only
-  # (denying the exemption is the safe direction), so an unscoped REPO_ROOT
-  # falls through to the branch-diff path below rather than hard-erroring.
-  if _git_repo_root_is_scoped && _git diff --cached --name-status 2>/dev/null | grep -q .; then
-    _diff_status=$(_git diff --cached --name-status 2>/dev/null || true)
-  else
-    # FRESHNESS IS A PRECONDITION, NOT AN ASSUMPTION (lr-53dc6e, propagating
-    # _gate_resolve_fresh_default_branch_ref's already-hardened form, :132-164,
-    # to this site). This used to resolve "origin/${_DEFAULT_BRANCH}" by name
-    # with no fetch at all — not even the non-fatal `|| true` fetch
-    # get_review_diff had — relying purely on whatever the local
-    # tracking ref already happened to be. Delegate to the shared
-    # provably-current check rather than trusting presence alone.
-    #
-    # Fail toward MORE coverage, never a silently narrower diff: on a
-    # freshness failure, fall back to the raw name resolution's prior
-    # behavior only insofar as it still runs — but with an explicit stderr
-    # note so the fail-open ack-bootstrap flag below is not mistaken for a
-    # verified read. INTRODUCES_ACK_FILE is documented fail-open/
-    # informational-only (it only ENABLES an exemption, denying it is the
-    # safe direction), so unlike get_review_diff this site degrades rather
-    # than hard-errors — but it must still attempt the verified resolution
-    # first, not skip straight to an unverified guess.
-    _DEFAULT_BRANCH="${CLAGENTIC_DEFAULT_BRANCH:-main}"
-    # 0 must not reach `timeout` (coreutils reads it as "no timeout"): a
-    # disabled bound on a freshness fetch is fail-open.
-    _bgs_fetch_timeout=$(ds_positive_int_or_warn CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC "${CLAGENTIC_MERGE_GATE_FETCH_TIMEOUT_SEC:-}" 30)
-
-    _bgs_fresh_err_tmp=$(mktemp -t clagentic-bgs-fresh-err.XXXXXX)
-    _bgs_fresh_tip=$(_gate_resolve_fresh_default_branch_ref "$_DEFAULT_BRANCH" "$_bgs_fetch_timeout" 2>"$_bgs_fresh_err_tmp") || true
-    _bgs_fresh_err=$(cat "$_bgs_fresh_err_tmp" 2>/dev/null || echo "")
-    rm -f "$_bgs_fresh_err_tmp"
-
-    if [ -n "$_bgs_fresh_tip" ]; then
-      _diff_status=$(_git diff "${_bgs_fresh_tip}...HEAD" --name-status 2>/dev/null || true)
-    else
-      printf '[gates/build-gate-summary] branch baseline not provably current (%s) — ack-bootstrap detection may be incomplete\n' "$_bgs_fresh_err" 1>&2
-      _diff_status=""
-    fi
-  fi
-  if printf '%s\n' "$_diff_status" | grep -qE "^A[[:space:]]+(\\.clagentic/adversarial-acks\\.json|\\.clagentic/accepted-risks\\.md)$"; then
-    INTRODUCES_ACK_FILE="true"
-  fi
-
   # Review and adversarial output reach the Merge Gate ONLY as sanitized,
   # fenced text (review_fenced, adversarial_fenced) plus review_sha, which
   # --recheck's staleness guard reads. The raw "review"/"adversarial" fields
@@ -7447,12 +7432,8 @@ build_gate_summary() {
   if command -v python3 >/dev/null 2>&1; then
     ADF_ARG=""
     ADF_META_ARG=""
-    ACKS_ARG=""
-    AR_ARG=""
     [ -f "$ADF" ] && ADF_ARG="$ADF"
     [ -f "$ADF_META" ] && ADF_META_ARG="$ADF_META"
-    [ -f "$ACKS_FILE" ] && ACKS_ARG="$ACKS_FILE"
-    [ -f "$AR_FILE" ] && AR_ARG="$AR_FILE"
     # INFORMATIONAL ONLY (lr-367a21): computed in sh and handed in pre-built,
     # rather than re-querying audit.db inside the pipeline. See
     # _read_deterministic_gates's doc comment.
@@ -7498,9 +7479,9 @@ build_gate_summary() {
       }
     fi
     ds_findings_call -e object render gate-summary \
-      --threshold "$THRESHOLD" --introduces-ack "$INTRODUCES_ACK_FILE" \
+      --threshold "$THRESHOLD" \
       --adversarial-missing "$ADVERSARIAL_MISSING" --adversarial-degraded "$ADVERSARIAL_DEGRADED" \
-      --acks "$ACKS_ARG" --accepted-risks "$AR_ARG" --adf "$ADF_ARG" --adf-meta "$ADF_META_ARG" \
+      --adf "$ADF_ARG" --adf-meta "$ADF_META_ARG" \
       --det-gates "$DETERMINISTIC_GATES_PAYLOAD" --det-gates-fenced "$DETERMINISTIC_GATES_FENCED_PAYLOAD" \
       --review-fenced-file "$_bgs_review_tmp" --adversarial-fenced-file "$_bgs_adv_tmp" \
       --review-sha "$REVIEW_SHA_VALUE" --review-degraded "$REVIEW_DEGRADED" \
@@ -7525,12 +7506,10 @@ build_gate_summary() {
   # all." gate_summary_degraded: true names that distinction explicitly so
   # cmd_merge_gate can refuse deterministically (same short-circuit shape as
   # stale_payload below) instead of silently proceeding on a payload it
-  # could not actually build. adversarial and accepted_risks are still
-  # dropped here -- arbitrary content cannot be safely JSON-encoded without
-  # jq or python3 -- but the caller is now told this happened rather than
-  # inferring it from an envelope that looks identical to a genuinely empty
-  # one. introduces_ack_file is included as false (conservative — no
-  # bootstrap exemption in degraded mode).
+  # could not actually build. adversarial is still dropped here -- arbitrary
+  # content cannot be safely JSON-encoded without jq or python3 -- but the
+  # caller is now told this happened rather than inferring it from an
+  # envelope that looks identical to a genuinely empty one.
   # deterministic_gates/deterministic_gates_fenced (lr-92d931): this branch
   # has no jq and no python3, so deterministic_gates was never populated
   # here even before this fix -- _read_deterministic_gates/
@@ -7557,7 +7536,7 @@ build_gate_summary() {
   # cmd_merge_gate refuses this envelope before any LLM call.
   # printf, not echo: dash's echo expands the literal \n sequences inside
   # DETGATES_UNAVAILABLE_FENCED into real newlines, corrupting the JSON.
-  printf '%s\n' "{\"review_fenced\": $REVIEW_FENCED_PAYLOAD, \"review_sha\": \"\", \"review_degraded\": $REVIEW_DEGRADED, \"adversarial_fenced\": $ADVERSARIAL_FENCED_PAYLOAD, \"adversarial_report_degraded\": $ADVERSARIAL_REPORT_DEGRADED, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_degraded\": $ADVERSARIAL_DEGRADED, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_findings_dropped_count\": 0, \"adversarial_acks\": [], \"accepted_risks\": \"\", \"introduces_ack_file\": false, \"threshold\": \"$THRESHOLD\", \"deterministic_gates\": $DETGATES_UNAVAILABLE_JSON, \"deterministic_gates_fenced\": $DETGATES_UNAVAILABLE_FENCED, \"gate_summary_degraded\": true}"
+  printf '%s\n' "{\"review_fenced\": $REVIEW_FENCED_PAYLOAD, \"review_sha\": \"\", \"review_degraded\": $REVIEW_DEGRADED, \"adversarial_fenced\": $ADVERSARIAL_FENCED_PAYLOAD, \"adversarial_report_degraded\": $ADVERSARIAL_REPORT_DEGRADED, \"adversarial_missing\": $ADVERSARIAL_MISSING, \"adversarial_degraded\": $ADVERSARIAL_DEGRADED, \"adversarial_findings\": [], \"adversarial_findings_fenced\": \"===BEGIN ADVERSARIAL FINDINGS DATA===\\n[]\\n===END ADVERSARIAL FINDINGS DATA===\", \"adversarial_blocking_count\": 0, \"adversarial_advisory_count\": 0, \"resolved_change_class\": null, \"adversarial_downgraded_by_class_count\": 0, \"adversarial_findings_dropped_count\": 0, \"threshold\": \"$THRESHOLD\", \"deterministic_gates\": $DETGATES_UNAVAILABLE_JSON, \"deterministic_gates_fenced\": $DETGATES_UNAVAILABLE_FENCED, \"gate_summary_degraded\": true}"
 }
 
 # cmd_render_manifest [FILE] (lr-37a9c8) — pretty-print the gate attestation
@@ -7610,53 +7589,57 @@ cmd_render_review() {
   ds_findings_call -e any render review "$FILE" || return 1
 }
 
-# cmd_deferrals_lint [FILE] (lr-2ebc41)
+# cmd_dispositions_lint [FILE]
 #
-# Validates .clagentic/deferrals.json (or FILE) against the STRICTER schema
-# _review_deferral_match requires for gate-code (mechanical) matching, and
-# refuses LOUDLY (non-zero exit, one line per problem on stderr) on any
-# entry that claims scope "stable-contract" but is not eligible — comment 3
-# (lr-2ebc41) requires conditional/scope-boundary acceptances to be
-# "explicitly declared unsupported and rejected at capture time rather than
-# silently accepted and mis-honored." This is the capture-time half of that
-# requirement: the Builder is expected to run this (or have it run for
-# them, e.g. from a commit hook or as part of the capture step itself)
-# immediately after writing a deferral entry, so a malformed grant is
-# caught in the SAME turn it was written, not discovered rounds later when
-# it silently fails to match. This does NOT validate the six lr-c567
-# prompt-context fields (category/description/expires/acknowledged_by are
-# all optional and freeform by design) — only the fields the GATE-CODE path
-# depends on: id, file, message, and, when scope=="stable-contract",
-# file_sha256 must also be present and must be a 64-hex-char sha256 digest.
-# An entry with any OTHER scope value (or no scope at all) is left alone —
-# it is not gate-code-eligible and stays purely a prompt-context hint, which
-# is a legitimate, unrestricted, always-valid use of this file (unchanged
-# lr-c567 behavior). Entries that are not JSON objects, or whose id/file/
-# message are missing/blank, are also refused for ANY scope value — a
-# deferral gate code cannot even identify is not useful in either mode.
-#
-# Does NOT compute or write file_sha256 — capture (the Builder, or the
-# operator directly) computes it themselves as part of the SAME edit that
-# adds the entry (sha256sum <file> | cut -d' ' -f1, or the platform.sh
-# _rm_sha256 shim: _rm_sha256 < <file>). This subcommand is a lint gate,
-# not a generator — see docs/GATES.md "Reviewer-consulted deferrals" for
-# why a separate "gates defer" writer subcommand is deliberately NOT
-# provided (lr-2ebc41 comment 1: a subcommand the operator must remember to
-# run is the same failure mode with a shorter path).
-cmd_deferrals_lint() {
-  _gate_check_args deferrals-lint "" "FILE" "$@" || return 2
-  _cdl_file="${1:-$REPO_ROOT/.clagentic/deferrals.json}"
-  [ -f "$_cdl_file" ] || { echo "[gates/deferrals-lint] no deferrals file at $_cdl_file — nothing to lint" ; return 0; }
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "[gates/deferrals-lint] python3 not available — cannot validate; deferrals.json will still fail closed at match time on any malformed entry" 1>&2
-    return 0
+# Validates the dispositions in force (.clagentic/dispositions.json, plus the
+# legacy deferrals/acks files still read for one release) or the one FILE
+# against the entry schema the code verdict applies: every entry needs an id,
+# gates, a match, a kind, a rationale, who and when; a mitigated entry must
+# name its control. An entry that fails is ignored by the verdict, loudly, so
+# this lint exists to catch it before the verdict does. Exit 1 when any entry
+# is invalid (or python3 is missing: nothing can be validated without it).
+# The file is operator-owned (the Builder role is blocked from writing it), so
+# this is a check, not a generator.
+cmd_dispositions_lint() {
+  _gate_check_args dispositions-lint "" "FILE" "$@" || return 2
+  if [ "$#" -gt 0 ]; then
+    [ -f "$1" ] || { echo "[gates/dispositions-lint] no file at $1" 1>&2; return 1; }
+    ds_findings_call -e any -o 1 dispositions lint --root "$REPO_ROOT" "$1"
+  else
+    ds_findings_call -e any -o 1 dispositions lint --root "$REPO_ROOT"
   fi
-
-  # The schema check is findings.py dispositions lint; its problems print on
-  # stdout, one line each, and a nonzero status means the file is not clean.
-  ds_findings_call -e any -o 1 dispositions lint "$_cdl_file"
   return $?
+}
+
+# cmd_deferrals_lint [FILE] — deprecated alias kept for one release.
+cmd_deferrals_lint() {
+  echo "[gates/deferrals-lint] DEPRECATED: use 'gates dispositions-lint'; deferrals.json is read for one more release and is linted with the rest" 1>&2
+  cmd_dispositions_lint "$@"
+}
+
+# cmd_evaluate — the standalone alias of findings.py evaluate: unified findings
+# JSON (or, with --format markdown, the Auditor's report) on stdin, the code
+# verdict on stdout, exit 1 when BLOCKED. Runs from here are recorded in the
+# same per-HEAD accumulation as the gates' own runs, but they are NOT gate
+# runs: they write no ledger entry, so they never satisfy `gates ship`
+# (fail closed). Options are findings.py evaluate's; --root defaults to this
+# repository.
+cmd_evaluate() {
+  _gate_check_args evaluate "--no-input --json --gate= --format= --scope= --caller= --root= --head= --base= --default-branch= --threshold= --today= --annotate= --attach-to= --json-out=" "" "$@" || return 2
+  _ev_has_root=0
+  _ev_no_input=0
+  for _ev_arg in "$@"; do
+    case "$_ev_arg" in
+      --root|--root=*) _ev_has_root=1 ;;
+      --no-input) _ev_no_input=1 ;;
+    esac
+  done
+  [ "$_ev_has_root" = "1" ] || set -- --root "$REPO_ROOT" "$@"
+  if [ "$_ev_no_input" = "1" ]; then
+    ds_findings_call -e any -o 1 evaluate "$@"
+  else
+    ds_findings_call -s -e any -o 1 evaluate "$@"
+  fi
 }
 
 # cmd_audit_vocab_lint [FILE] (lr-7047bf, foundry sub-class 1.6-1.11; widened
@@ -7972,6 +7955,14 @@ cmd_ship() {
     _adv_watermark=$(_manifest_audit_watermark)
     _adv_rc=0
     cmd_adversarial || _adv_rc=$?
+    if [ "$_adv_rc" -eq "$_ADV_UNRECORDED_RC" ]; then
+      # Not recorded and no marker to make the merge gate refuse: ship must
+      # not go on as if the audit were on record.
+      _manifest_record_llm_gate adversarial auditor failed "$_adv_watermark" "adversarial findings could not be recorded"
+      echo "[gates/ship] BLOCKED at adversarial: its findings could not be recorded"; ship_step_hint
+      _manifest_finalize "$_SHIP_DECLARED_GATES"
+      exit 1
+    fi
     if [ "$_adv_rc" -eq 2 ]; then
       _manifest_record_llm_gate adversarial auditor degraded "$_adv_watermark" "adversarial ran degraded (non-blocking)"
     else
@@ -8443,7 +8434,9 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
     merge-gate)     shift; cmd_merge_gate "$@" ;;
     render-review)  shift; cmd_render_review "$@" ;;
     render-manifest) shift; cmd_render_manifest "$@" ;;
+    dispositions-lint) shift; cmd_dispositions_lint "$@" ;;
     deferrals-lint) shift; cmd_deferrals_lint "$@" ;;
+    evaluate)       shift; cmd_evaluate "$@" ;;
     audit-vocab-lint) shift; cmd_audit_vocab_lint "$@" ;;
     ship)           shift; cmd_ship "$@" ;;
     pre-push)       shift; cmd_pre_push "$@" ;;
@@ -8451,7 +8444,7 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
     digest)         shift; cmd_digest "$@" ;;
     status)         shift; cmd_status "$@" ;;
     tail)           shift; cmd_tail "$@" ;;
-    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets [--full-scan]|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial [--full-review]|merge-gate [--recheck]|render-review|render-manifest [FILE]|deferrals-lint [FILE]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets [--full-scan]|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial [--full-review]|merge-gate [--recheck]|render-review|render-manifest [FILE]|dispositions-lint [FILE]|evaluate [OPTIONS]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
   esac
 elif [ -z "${CLAGENTIC_GATES_DELIBERATE_SOURCE:-}" ]; then
   echo "gates.sh: CLAGENTIC_GATES_SOURCE_ONLY is set but CLAGENTIC_GATES_DELIBERATE_SOURCE is not -- dispatch suppressed with no provenance asserting deliberate sourcing, refusing to report a false pass. If dot-sourcing this file on purpose, set both variables. If you did not mean to set CLAGENTIC_GATES_SOURCE_ONLY, unset it." 1>&2

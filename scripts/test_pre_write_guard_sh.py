@@ -186,5 +186,65 @@ class TestExistingBlockRulesUnaffected(unittest.TestCase):
         self.assertIn("W-006", stderr)
 
 
+class TestW007DispositionsFile(unittest.TestCase):
+    """W-007: the Builder role must not write .clagentic/dispositions.json.
+
+    The file is the operator's record of what has been accepted and the gate
+    code clears findings from it; a Builder that could write it could clear
+    its own findings. The payload shape is the one the other rules read:
+    `file_path` and `agent_type` at the top level, `agent_type` present only
+    inside a named subagent (lr-2a51 precedent). Both the namespaced and the
+    bare builder name must be refused."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="clagentic-test-pwg-")
+        _init_feature_branch_repo(self.tmpdir)
+        self.target = os.path.join(self.tmpdir, ".clagentic", "dispositions.json")
+
+    def _run(self, agent_type=None, path=None):
+        payload = {"file_path": path or self.target}
+        if agent_type is not None:
+            payload["agent_type"] = agent_type
+        return _run_hook(payload, cwd=self.tmpdir)
+
+    def test_builder_is_refused_by_the_named_rule(self):
+        for agent_type in ("clagentic-lite:builder", "builder"):
+            with self.subTest(agent_type=agent_type):
+                rc, _stdout, stderr = self._run(agent_type)
+                self.assertEqual(rc, 2, msg=f"stderr: {stderr}")
+                self.assertIn("W-007", stderr)
+                self.assertIn("stanza", stderr)
+
+    def test_the_refusal_is_ahead_of_the_general_clagentic_rule(self):
+        rc, _stdout, stderr = self._run("clagentic-lite:builder")
+        self.assertNotIn("W-003", stderr)
+
+    def test_other_roles_and_the_main_session_do_not_trip_w007(self):
+        for agent_type in ("clagentic-lite:reviewer", "general-purpose", None):
+            with self.subTest(agent_type=agent_type):
+                rc, _stdout, stderr = self._run(agent_type)
+                self.assertNotIn("W-007", stderr)
+                # They are still stopped by the general rule for .clagentic/.
+                self.assertEqual(rc, 2, msg=f"stderr: {stderr}")
+                self.assertIn("W-003", stderr)
+
+    def test_the_builder_is_not_refused_by_w007_for_other_files(self):
+        other = os.path.join(self.tmpdir, "scratch.txt")
+        rc, _stdout, stderr = self._run("clagentic-lite:builder", other)
+        self.assertEqual(rc, 0, msg=f"stderr: {stderr}")
+        self.assertNotIn("W-007", stderr)
+
+    def test_a_nested_look_alike_path_is_not_the_dispositions_file(self):
+        look_alike = os.path.join(self.tmpdir, "docs", "dispositions.json")
+        rc, _stdout, stderr = self._run("clagentic-lite:builder", look_alike)
+        self.assertEqual(rc, 0, msg=f"stderr: {stderr}")
+
+    def test_a_traversal_path_is_resolved_before_the_rule_applies(self):
+        sneaky = os.path.join(self.tmpdir, "docs", "..", ".clagentic", "dispositions.json")
+        rc, _stdout, stderr = self._run("clagentic-lite:builder", sneaky)
+        self.assertEqual(rc, 2, msg=f"stderr: {stderr}")
+        self.assertIn("W-007", stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

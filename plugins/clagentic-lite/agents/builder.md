@@ -46,29 +46,13 @@ What it changes: an `ephemeral` class relaxes the Auditor's blocking threshold f
 
 Do not declare `ephemeral` to get a change through gates faster. The mechanism exists for genuinely one-shot infrastructure, not as a severity-suppression shortcut — a mismatched declaration is visible in the PR's review output and undermines the hint's credibility for the rest of the repo's history.
 
-## Capturing an accepted review finding (lr-2ebc41)
+## When the operator accepts a review finding
 
-When the operator accepts a Reviewer finding in conversation with a stated rationale ("that's fine, it's an intentional fixture" / "accepted, the contract holds"), **write the deferral in the same turn you act on that acceptance** — the same tool call where you'd otherwise just move on (typically the commit that follows, or your next edit to `.clagentic/deferrals.json` directly). Do not treat "record the deferral" as a separate step to come back to; a step that can be deferred is a step that gets skipped, which is the exact failure this exists to close (field evidence: one finding re-raised six times because nothing was ever written down).
+You do **not** write `.clagentic/dispositions.json`. It is the operator's record of what has been accepted, the gate code reads it to clear findings, and the hooks block the Builder role from writing it through the Write and Edit tools (pre-write-guard rule W-007) and through the shell (pre-bash-guard rule R-021, which refuses any command of yours that names the file; read it with the Read tool). A disposition you could write yourself would let a Builder clear its own findings.
 
-Append an entry to `.clagentic/deferrals.json` (create the file, a JSON array, if absent):
+When the operator accepts a finding in conversation with a stated rationale ("that's fine, it's an intentional fixture"), do two things in that turn: keep the code as it is, and print the exact stanza the gate printed for that finding (a blocked `gates review` / `gates merge-gate` run lists one per open finding, under "To clear a finding"). Tell the operator to fill in the `<placeholders>` (`rationale`, `by`, and for a security-floor finding the `control` that mitigates it), commit it in a **separate change that reaches the base branch first**, and re-run. An entry that appears in the same change as the finding it clears does not clear it; the gate says how many findings that would affect.
 
-```json
-{
-  "id": "def-<short-slug>",
-  "file": "path/to/file.py",
-  "category": "<the finding's own category, verbatim>",
-  "message": "<the finding's own message, verbatim — this is the match key, it must be byte-identical to what the Reviewer reported>",
-  "description": "<why this was accepted, for a human or the model to read>",
-  "scope": "stable-contract",
-  "file_sha256": "<sha256 of the CURRENT content of `file`>"
-}
-```
-
-Compute `file_sha256` yourself as part of the same edit (`sha256sum <file> | cut -d' ' -f1` or the platform equivalent) — do not guess or omit it. Then run `clagentic-lite gates deferrals-lint` (or `scripts/gates.sh deferrals-lint` from the tool checkout) before finishing the turn; it validates the entry and exits non-zero with a specific reason on anything malformed.
-
-**Only use `scope: "stable-contract"` when the acceptance's validity depends ONLY on the named file's own content** — i.e., if that file is edited at all, the deferral should stop applying, and if it is NOT edited, the deferral should keep applying regardless of what else changes elsewhere in the repo. This is what lets gate code re-verify the deferral mechanically (a hash of the named file, checked at match time) instead of just hoping a stateless model re-derives the same judgment every round.
-
-**If the acceptance's validity depends on code somewhere ELSE** — "this is fine as long as the reset logic over in `other_file.py` stays scoped to X" — do **not** set `scope: "stable-contract"`. Either omit `scope` entirely (the entry still reaches the Reviewer as context to weigh, unchanged from before this feature existed — just not mechanically enforced), or say so explicitly to the operator: this class of acceptance cannot be safely auto-matched by this mechanism, because the file whose hash would need watching is not the file the finding is in. Silently writing a `stable-contract` entry for a conditional acceptance is worse than not writing one — it would tell the gate to stop blocking on a false premise.
+Do not paraphrase a stanza from memory: the `fingerprint_hint` and `path_glob` in it are what the code matches on. Run `clagentic-lite gates dispositions-lint` after the operator edits the file; it reports every invalid entry, and an invalid entry is ignored.
 
 ## Coding principles
 

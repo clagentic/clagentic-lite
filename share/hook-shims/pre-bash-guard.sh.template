@@ -3,7 +3,7 @@
 # Blocks dangerous shell commands. Exit 2 = block.
 # Rules R-001..R-020 documented in docs/GATES.md.
 #
-# managed-by: clagentic · clagentic-hooks-version: v5
+# managed-by: clagentic · clagentic-hooks-version: v6
 # Source of truth: share/hook-shims/pre-bash-guard.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/pre-bash-guard.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -85,6 +85,30 @@ block() {
   ds_audit_log bash-guard block "$RULE: $CMD"
   exit 2
 }
+
+# R-021: the Builder role must not write .clagentic/dispositions.json on any
+# channel. pre-write-guard W-007 covers the Write and Edit tools; this is the
+# same rule for the shell (redirect, tee, cp, mv, sed -i, python -c, ...), made
+# effective because a Builder that cannot use Write can still use Bash. It is a
+# static match on the command text, not a sandbox: ANY mention of the file name
+# (in any case, on any path) is refused for the Builder, since which commands
+# write cannot be told from the text. The Builder reads the file with the Read
+# tool. No CLAGENTIC_ALLOW_BASH_RULES escape: the file is what clears the
+# Builder's own findings. The role comes from agent_type (see ds_agent_is_builder).
+AGENT_TYPE=$(printf '%s' "$INPUT" | ds_json_field agent_type 2>/dev/null || true)
+_pbg_cmd_lc=$(printf '%s' "$CMD" | tr '[:upper:]' '[:lower:]')
+_pbg_names_file=0
+case "$_pbg_cmd_lc" in
+  *dispositions.json*) _pbg_names_file=1 ;;
+esac
+# A glob in the first segment under .clagentic/ ('.clagentic/d*') can expand to
+# the file without ever spelling its name.
+if printf '%s' "$_pbg_cmd_lc" | grep -Eq '\.clagentic/[^/[:space:]]*[*?[]'; then
+  _pbg_names_file=1
+fi
+if [ "$_pbg_names_file" -eq 1 ] && ds_agent_is_builder "$AGENT_TYPE"; then
+  block R-021 "the Builder role must not write .clagentic/dispositions.json on any channel; print the gate's stanza for the operator to commit instead (read the file with the Read tool)"
+fi
 
 case "$CMD" in
   *"rm -rf /"*|*"rm -rf /*"*)            _rule_allowed R-001 || block R-001 "rm -rf root" ;;

@@ -70,7 +70,8 @@ class TestModuleShape(unittest.TestCase):
                 imported.update(a.name.split(".")[0] for a in node.names)
             elif isinstance(node, ast.ImportFrom):
                 imported.add((node.module or "").split(".")[0])
-        stdlib = {"argparse", "fcntl", "hashlib", "io", "json", "os", "re", "sys", "tempfile"}
+        stdlib = {"argparse", "datetime", "fcntl", "hashlib", "io", "json", "os", "posixpath", "re",
+                  "subprocess", "sys", "tempfile"}
         self.assertTrue(imported <= stdlib, imported - stdlib)
 
     def test_code_names_no_shell_gate_or_enrollment_dependency(self):
@@ -345,78 +346,30 @@ class TestDispositions(Tmp):
         self.assertEqual(run(["dispositions", "cross-round", obj, "--diff", diff,
                               "--seen", self.path("s")]).returncode, 11)
 
-    def test_recurrence_demotes_at_threshold_without_touching_severity(self):
+    def test_recurrence_counts_rounds_without_ever_demoting(self):
         diff = self.diff_with_added_lines(["a", "b", "c", "d", "e"])
         counts = self.path("counts.json")
         results = []
         for _ in range(3):
             env = self.envelope([finding(line=3)])
             results.append(run(["dispositions", "recurrence", env, "--diff", diff,
-                                "--counts", counts, "--threshold", "2"]).stdout.strip())
+                                "--counts", counts]).stdout.strip())
             kept = self.read_json("env.json")["findings"][0]
-        self.assertEqual(results, ["demoted=0", "demoted=1", "demoted=1"])
-        self.assertEqual((kept["severity"], kept["_recurrence_count"], kept["_recurrence_demoted"]),
-                         ("high", 3, True))
+        self.assertEqual(results, ["counted=1"] * 3)
+        self.assertEqual((kept["severity"], kept["_recurrence_count"]), ("high", 3))
+        self.assertNotIn("_recurrence_demoted", kept)
 
-    def test_recurrence_skips_findings_dedup_already_saw_and_owns_the_field(self):
+    def test_recurrence_skips_findings_dedup_already_saw_and_clears_stale_counts(self):
         diff = self.diff_with_added_lines(["a", "b", "c", "d", "e"])
         counts = self.path("counts.json")
         seen_before = finding(line=3, _seen_before=True)
-        forged = finding(file="elsewhere.py", _recurrence_demoted=True)
-        env = self.envelope([seen_before, forged])
-        out = run(["dispositions", "recurrence", env, "--diff", diff, "--counts", counts,
-                   "--threshold", "2"]).stdout.strip()
+        stale = finding(file="elsewhere.py", _recurrence_count=9)
+        env = self.envelope([seen_before, stale])
+        out = run(["dispositions", "recurrence", env, "--diff", diff, "--counts", counts]).stdout.strip()
         self.assertEqual(out, "none")
-        unchanged = self.read_json("env.json")["findings"]
-        self.assertIs(unchanged[1]["_recurrence_demoted"], True)
-        env = self.envelope([finding(line=3), forged])
-        run(["dispositions", "recurrence", env, "--diff", diff, "--counts", counts, "--threshold", "2"])
-        owned = self.read_json("env.json")["findings"]
-        self.assertEqual((owned[1]["_recurrence_demoted"], owned[1]["_recurrence_count"]), (False, 0))
-
-    def deferral(self, root, **over):
-        target = os.path.join(root, "src.py")
-        with open(target, "w") as handle:
-            handle.write("content\n")
-        base = {"id": "d1", "file": "src.py", "category": "security", "message": "m",
-                "scope": "stable-contract",
-                "file_sha256": hashlib.sha256(b"content\n").hexdigest()}
-        base.update(over)
-        return base
-
-    def test_deferral_matches_exactly_one_live_entry_by_triple(self):
-        root = self.path("root")
-        os.makedirs(os.path.join(root, ".clagentic"))
-        self.write("root/.clagentic/deferrals.json", [self.deferral(root)])
-        env = self.envelope([finding(file="src.py", category="security", message="m"),
-                             finding(file="src.py", category="security", message="other")])
-        out = run(["dispositions", "deferrals", env, "--root", root]).stdout.strip()
-        self.assertEqual(out, "matched=1")
-        first, second = self.read_json("env.json")["findings"]
-        self.assertEqual((first["_deferral_matched"], first["_deferral_id"]), (True, "d1"))
-        self.assertIs(second["_deferral_matched"], False)
-
-    def test_deferral_lapses_on_edit_and_is_ambiguous_with_two_entries(self):
-        root = self.path("root")
-        os.makedirs(os.path.join(root, ".clagentic"))
-        stale = self.deferral(root, file_sha256="0" * 64)
-        self.write("root/.clagentic/deferrals.json", [stale])
-        env = self.envelope([finding(file="src.py", category="security", message="m")])
-        self.assertEqual(run(["dispositions", "deferrals", env, "--root", root]).stdout.strip(), "none")
-        self.write("root/.clagentic/deferrals.json",
-                   [self.deferral(root, id="d1"), self.deferral(root, id="d2")])
-        run(["dispositions", "deferrals", env, "--root", root])
-        self.assertIs(self.read_json("env.json")["findings"][0]["_deferral_matched"], False)
-
-    def test_deferral_with_wrong_scope_or_missing_fields_never_matches(self):
-        root = self.path("root")
-        os.makedirs(os.path.join(root, ".clagentic"))
-        entries = [self.deferral(root, scope="other"), self.deferral(root, id=""),
-                   {"id": "x"}, "junk"]
-        self.write("root/.clagentic/deferrals.json", entries)
-        env = self.envelope([finding(file="src.py", category="security", message="m")])
-        self.assertEqual(run(["dispositions", "deferrals", env, "--root", root]).stdout.strip(), "none")
-        self.assertNotIn("_deferral_matched", self.read_json("env.json")["findings"][0])
+        after = self.read_json("env.json")["findings"]
+        self.assertNotIn("_recurrence_count", after[1], "a count the pipeline did not just compute is cleared")
+        self.assertFalse(os.path.exists(counts), "a round that counted nothing persists nothing")
 
     def test_ledger_recurrence_marks_by_triple_and_leaves_severity_alone(self):
         ledger = self.path("ledger.jsonl")
@@ -434,19 +387,19 @@ class TestDispositions(Tmp):
                               "--branch", "b"], stdin="nope").stdout, "nope")
 
     def test_lint_reports_each_problem_and_accepts_a_clean_file(self):
-        clean = self.write("clean.json", [{"id": "a", "category": "x"},
-                                          {"id": "b", "scope": "stable-contract", "file": "f",
-                                           "message": "m", "file_sha256": "a" * 64}])
-        ok = run(["dispositions", "lint", clean])
+        entry = {"id": "a", "gates": ["review"], "match": {"path_glob": "f", "category": "x"},
+                 "kind": "by_design", "rationale": "r", "by": "me", "at": "2026-01-01"}
+        clean = self.write("clean.json", [entry, dict(entry, id="b")])
+        ok = run(["dispositions", "lint", clean, "--root", self.tmp])
         self.assertEqual((ok.returncode, ok.stdout.strip()),
-                         (0, "[gates/deferrals-lint] 2 entries, no problems"))
-        bad = self.write("bad.json", [{"scope": "stable-contract"}, {"id": "c", "scope": "weird"}, 4])
-        result = run(["dispositions", "lint", bad])
+                         (0, "[gates/dispositions-lint] 2 entries, no problems"))
+        bad = self.write("bad.json", [{"gates": ["review"]}, dict(entry, id="c", kind="weird"), 4])
+        result = run(["dispositions", "lint", bad, "--root", self.tmp])
         self.assertEqual(result.returncode, 1)
-        for needle in ("missing or empty required field 'id'", "file_sha256 is missing",
-                       "not a supported gate-code scope", "not a JSON object"):
+        for needle in ("missing or empty 'id'", "'kind' must be one of", "not a JSON object"):
             self.assertIn(needle, result.stdout)
-        self.assertEqual(run(["dispositions", "lint", self.write("n.json", "{}")]).returncode, 1)
+        self.assertEqual(run(["dispositions", "lint", self.write("n.json", "{}"),
+                              "--root", self.tmp]).returncode, 1)
 
 
 class TestVerdict(Tmp):
@@ -454,15 +407,17 @@ class TestVerdict(Tmp):
         review = self.write("review.json", {"findings": findings})
         return run(["verdict", "blockers", review, threshold]).stdout.strip()
 
-    def test_threshold_default_case_folding_and_exclusions(self):
+    def test_threshold_default_case_folding_and_no_annotation_excludes(self):
+        # A finding cannot excuse itself: the old exemption annotations are
+        # ignored, so these two critical findings count like any other.
         findings = [finding(severity="HIGH"), finding(severity="medium"), finding(severity="low"),
                     finding(severity="critical", _recurrence_demoted=True),
                     finding(severity="critical", _deferral_matched=True)]
-        self.assertEqual(self.blockers(findings, "high"), "1")
-        self.assertEqual(self.blockers(findings, "medium"), "2")
-        self.assertEqual(self.blockers(findings, "nonsense"), "1")
-        self.assertEqual(self.blockers(findings, "HIGH"), "1")
-        self.assertEqual(self.blockers(findings, "low"), "3")
+        self.assertEqual(self.blockers(findings, "high"), "3")
+        self.assertEqual(self.blockers(findings, "medium"), "4")
+        self.assertEqual(self.blockers(findings, "nonsense"), "3")
+        self.assertEqual(self.blockers(findings, "HIGH"), "3")
+        self.assertEqual(self.blockers(findings, "low"), "5")
 
     def test_unrankable_severity_blocks_and_null_does_not(self):
         for bad in (3, True, False, {"level": "low"}, ["high"]):
@@ -598,16 +553,16 @@ class TestRender(Tmp):
 
     def test_review_render_suffixes_and_class_lines(self):
         review = self.write("r.json", {"summary": "s", "findings": [
-            finding(_recurrence_demoted=True, _recurrence_count=3),
-            finding(message="d", _deferral_matched=True, _deferral_id="D9"),
+            finding(_recurrence_count=3),
+            finding(message="d", disposition={"status": "cleared", "id": "D9", "kind": "by_design"}),
             finding(message="e", _seen_before=True),
             finding(message="f", issue_class="a class", class_fix="fix it"),
             finding(message="g", issue_class="none — isolated", class_fix="n/a"),
         ]})
         out = run(["render", "review", review]).stdout
         self.assertTrue(out.startswith("== clagentic-lite review ==\nsummary: s\nfindings: 5\n\n"))
-        self.assertIn("(reported 3 rounds running — decide)", out)
-        self.assertIn("(matched deferral D9)", out)
+        self.assertIn("(reported 3 rounds running)", out)
+        self.assertIn("(cleared by disposition D9 [by_design])", out)
         self.assertIn("(reported in a prior run; still counted)", out)
         self.assertIn("\n    class: a class -> fix it", out)
         self.assertEqual(out.count("\n    class: "), 1)
@@ -633,13 +588,16 @@ class TestRender(Tmp):
         review = self.write("r.json", {"summary": "sum\x07", "_clagentic_diff_sha": "abc",
                                        "secret": "x",
                                        "findings": [finding(message="m\x07", evidence="e",
+                                                            _recurrence_count=2,
                                                             _recurrence_demoted=True, rogue="r")]})
         out = json.loads(run(["render", "sanitize-review", review]).stdout)
         self.assertEqual(list(out), ["summary", "findings", "_clagentic_diff_sha"])
         self.assertEqual(out["summary"], "sum")
         self.assertNotIn("rogue", out["findings"][0])
         self.assertEqual(out["findings"][0]["message"], "m")
-        self.assertIs(out["findings"][0]["_recurrence_demoted"], True)
+        self.assertEqual(out["findings"][0]["_recurrence_count"], 2)
+        self.assertNotIn("_recurrence_demoted", out["findings"][0],
+                         "the old exemption annotation is not part of what a model may read")
         self.assertEqual(run(["render", "sanitize-review", self.path("absent")]).stdout, "null")
         stub = self.write("s.json", {"sanitize_failed": True, "findings": []})
         self.assertEqual(run(["render", "sanitize-review", stub]).returncode, 1)
@@ -869,57 +827,6 @@ class TestControlBytesNeverReachATerminal(Tmp):
                                                                "severity": "high", "message": "m" + self.ESC}]})
         text = run(["render", "stale-report", summary]).stdout
         self.assertNotIn("\x1b", text)
-
-
-class TestDeferralLintMatchesTheMatcher(Tmp):
-    def test_lint_rejects_exactly_what_the_matcher_drops(self):
-        root = self.path("root")
-        os.makedirs(os.path.join(root, ".clagentic"))
-        with open(os.path.join(root, "src.py"), "w") as handle:
-            handle.write("content\n")
-        sha = hashlib.sha256(b"content\n").hexdigest()
-        for field in ("id", "file", "category", "message"):
-            for bad in ("\t", "\n", "\r"):
-                with self.subTest(field=field, char=repr(bad)):
-                    entry = {"id": "d1", "file": "src.py", "category": "security", "message": "m",
-                             "scope": "stable-contract", "file_sha256": sha}
-                    entry[field] = entry[field] + bad
-                    if field == "file":
-                        # The named file exists with the recorded hash, so the
-                        # only thing that can drop the entry is the unsafe char.
-                        with open(os.path.join(root, entry["file"]), "w") as handle:
-                            handle.write("content\n")
-                    lint_path = self.write("deferrals.json", [entry])
-                    lint = run(["dispositions", "lint", lint_path])
-                    self.assertEqual(lint.returncode, 1, lint.stdout)
-                    self.assertIn("tab, CR or LF", lint.stdout)
-                    self.write("root/.clagentic/deferrals.json", [entry])
-                    env = self.write("env.json", {"findings": [finding(
-                        file=entry["file"], category=entry["category"], message=entry["message"])]})
-                    self.assertEqual(run(["dispositions", "deferrals", env, "--root", root]).stdout.strip(),
-                                     "none")
-
-    def test_a_clean_entry_passes_lint_and_matches(self):
-        # Positive control for the test above: without it "none" could come
-        # from any cause, including a matcher that never matches.
-        root = self.path("root")
-        os.makedirs(os.path.join(root, ".clagentic"))
-        with open(os.path.join(root, "src.py"), "w") as handle:
-            handle.write("content\n")
-        entry = {"id": "d1", "file": "src.py", "category": "security", "message": "m",
-                 "scope": "stable-contract", "file_sha256": hashlib.sha256(b"content\n").hexdigest()}
-        self.assertEqual(run(["dispositions", "lint", self.write("d0.json", [entry])]).returncode, 0)
-        self.write("root/.clagentic/deferrals.json", [entry])
-        env = self.write("env.json", {"findings": [finding(
-            file="src.py", category="security", message="m")]})
-        self.assertEqual(run(["dispositions", "deferrals", env, "--root", root]).stdout.strip(),
-                         "matched=1")
-
-    def test_a_clean_entry_passes_lint(self):
-        entry = {"id": "d1", "file": "f", "category": "c", "message": "m",
-                 "scope": "stable-contract", "file_sha256": "a" * 64}
-        result = run(["dispositions", "lint", self.write("d.json", [entry])])
-        self.assertEqual(result.returncode, 0, result.stdout)
 
 
 class TestLedgerAppendIsSerialized(Tmp):

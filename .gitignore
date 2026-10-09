@@ -13,6 +13,12 @@
 # loadout config above is, or it can never be committed to the repo.
 !.clagentic/adversarial-acks.json
 
+# dispositions.json is the one committed record of what the operator accepted
+# about review/adversarial findings (docs/GATES.md "The code verdict"). It is
+# reviewed policy, not local state: un-ignored for the same reason as the acks
+# file above, which it replaces.
+!.clagentic/dispositions.json
+
 # semgrep-exclude is a committed, per-repo SAST rule-exclusion ladder entry
 # (docs/GATES.md Gate 4c "SAST", lr-321e18) -- same un-ignore treatment as
 # adversarial-acks.json above, for the same reason: it's tracked policy, not

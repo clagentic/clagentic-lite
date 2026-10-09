@@ -705,6 +705,20 @@ except Exception:
   fi
 }
 
+# Success when AGENT_TYPE (the PreToolUse payload's agent_type) names the
+# Builder role. Matched whatever the namespace ("clagentic-lite:builder",
+# "builder") and whatever the case ("Builder", "clagentic-lite:Builder"): the
+# value is chosen by the harness, and a rule that keyed on one spelling would
+# be bypassed by another. The one definition both write-protection hooks
+# (pre-write-guard W-007, pre-bash-guard R-021) use.
+ds_agent_is_builder() {
+  _dab_lc=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$_dab_lc" in
+    *builder*) return 0 ;;
+  esac
+  return 1
+}
+
 # Escape a string for safe embedding in a JSON string value (i.e. between the
 # surrounding double quotes -- callers supply those). Hoisted from
 # session-start.sh.template's _json_escape (lr-b82538): that shim's copy was
