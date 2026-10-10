@@ -40,12 +40,17 @@ only place either contract is expressed.
 Usage (mirrors the pattern every test in this suite already uses to build a
 `sh -c` script string and hand it to subprocess.run):
 
+    from isolated_env import shared_env
     from test_source_helpers import GATES_SH, LLM_CLIENT_SH, source_env
 
-    env = os.environ.copy()
+    env = shared_env(project=tmpdir)   # temp project root, HOME and tool home
     env.update(source_env(gates=True))
     script = f". '{GATES_SH}'\\n_some_internal_function ...\\n"
-    subprocess.run(["sh", "-c", script, GATES_SH], env=env, ...)
+    subprocess.run(["sh", "-c", script, GATES_SH], env=env, cwd=tmpdir, ...)
+
+Never source from, or run in, this checkout with the inherited environment:
+the sourced scripts resolve the project root, tool home and HOME from it and
+write there (scripts/isolated_env.py, scripts/live_tree_guard.py).
 
 `source_env` returns ONLY the sentinel(s) to merge into the subprocess's
 environment (never mutates os.environ itself) -- callers already build their
@@ -98,7 +103,16 @@ def source_env(gates=False, llm_client=False):
 # --------------------------------------------------------------------------
 import sqlite3
 import subprocess
+import sys
 import textwrap
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# One identity and one GIT_*-stripping rule for every throwaway repository in
+# the suite, shared with scripts/findings_test_support.py (a GIT_DIR or
+# GIT_INDEX_FILE inherited from a hook would otherwise redirect a fixture's git
+# call off its temp repository).
+from findings_test_support import GIT_IDENTITY as GIT_IDENTITY_ENV, clean_env  # noqa: E402
 
 RECURRING_FINDING = {
     "severity": "high",
@@ -108,10 +122,12 @@ RECURRING_FINDING = {
     "message": "unsanitized input reaches a sink",
 }
 
-GIT_IDENTITY_ENV = {
-    "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-    "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-}
+
+def git_env():
+    """The caller's environment minus GIT_*, plus the fixture identity."""
+    env = clean_env(drop=("GIT_",))
+    env.update(GIT_IDENTITY_ENV)
+    return env
 
 
 def setup_project(tmpdir):
@@ -136,13 +152,12 @@ def setup_project(tmpdir):
 
 
 def init_git_repo(project_root):
-    env = os.environ.copy()
-    env.update(GIT_IDENTITY_ENV)
+    env = git_env()
     subprocess.run(["git", "init", "-q", project_root], check=True, env=env)
     target = os.path.join(project_root, "app.py")
     with open(target, "w") as f:
         f.write("def handle(x):\n    return x\n")
-    subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
+    subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "seed"], check=True, cwd=project_root, env=env)
 
 
@@ -153,8 +168,7 @@ def stage_identical_recreation(project_root, round_n):
     the flagged line's content-hash key is stable regardless of git's
     diff-minimization (which would otherwise emit an unchanged line only as
     context). The gate under test sees a staged, uncommitted diff."""
-    env = os.environ.copy()
-    env.update(GIT_IDENTITY_ENV)
+    env = git_env()
     # A prior call leaves its recreation staged but uncommitted; without this
     # checkpoint the deletion commit below would find nothing to commit.
     subprocess.run(
@@ -164,13 +178,13 @@ def stage_identical_recreation(project_root, round_n):
     target = os.path.join(project_root, "app.py")
     if os.path.exists(target):
         os.remove(target)
-        subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
+        subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root, env=env)
         subprocess.run(
             ["git", "commit", "-q", "-m", "delete"], check=True, cwd=project_root, env=env,
         )
     with open(target, "w") as f:
         f.write("def handle(x):\n    return x\n")
-    subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root)
+    subprocess.run(["git", "add", "app.py"], check=True, cwd=project_root, env=env)
 
 
 def setup_fake_tool_home(fake_tool_home):
