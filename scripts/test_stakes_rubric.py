@@ -11,6 +11,7 @@ against throwaway git repositories under a temp dir.
 
 Run with: python3 -m unittest scripts.test_stakes_rubric -v
 """
+import datetime
 import json
 import os
 import re
@@ -446,6 +447,37 @@ class TestTreeInference(Repo):
     def test_no_inference_runs_and_nothing_is_said_without_a_profile(self):
         _, verdict = self.verdict([fact_finding(impact="code_exec")])
         self.assertEqual(verdict["warnings"], [])
+
+
+class TestAnEnclosingRepositoryIsNotTheTree(Repo):
+    """git -C answers with the ancestor's refs and files for a directory that
+    is only inside another repository; a profile read there would be the
+    ancestor's, deciding this tree's severity."""
+
+    def setUp(self):
+        super().setUp()
+        self.put_profile(INTERNAL_DEPLOY)
+        self.inner = os.path.join(self.repo, "pkg")
+        os.makedirs(self.inner)
+
+    def test_the_ancestors_profile_never_applies(self):
+        base = findings.resolve_base(self.inner, "", "main")
+        self.assertIsNotNone(base, "git resolves the ancestor's base, which is the hazard")
+        stakes = findings.load_stakes(self.inner, base, datetime.date(2026, 10, 9))
+        self.assertFalse(stakes.present)
+        self.assertEqual(stakes.dims_for("deploy/app.py")["exposure"][0], "internet")
+
+    def test_a_profile_file_in_such_a_directory_is_ignored_loudly(self):
+        write(os.path.join(self.inner, ".clagentic", "risk-profile.json"), INTERNAL_DEPLOY)
+        base = findings.resolve_base(self.inner, "", "main")
+        stakes = findings.load_stakes(self.inner, base, datetime.date(2026, 10, 9))
+        self.assertFalse(stakes.present)
+        self.assertTrue(any("could not be resolved" in w for w in stakes.warnings), stakes.warnings)
+
+    def test_the_profile_command_refuses_to_run_there(self):
+        result = run_findings(["profile", "--root", self.inner, "--today", TODAY])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not the top level of a git repository", result.stderr)
 
 
 class TestCodeowners(Repo):

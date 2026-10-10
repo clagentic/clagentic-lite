@@ -1742,6 +1742,11 @@ def load_stakes(root, base, today, max_age_days=None):
     except (OSError, ValueError) as exc:
         stakes.warnings.append("%s cannot be read from the working tree (%s)" % (PROFILE_REL, exc))
         work_text = None
+    # A directory inside some other repository's work tree is not a repository
+    # of its own: a base resolved there names the ancestor's commit, and a
+    # profile read at it would be the ancestor's, deciding this tree's severity.
+    if base and not is_repo_toplevel(root):
+        base = None
     base_text, base_failed = None, False
     if base:
         try:
@@ -2367,14 +2372,21 @@ def entry_can_clear(entry, finding):
 
 # ------------------------------------------------------------------ git state
 
-def repo_head(root):
-    """HEAD of the repository ROOT is the top level of, or None. 'git -C' only
-    changes directory before git walks upward looking for a repository, so the
-    top level must be ROOT itself: an ancestor repository is not ROOT's."""
+def is_repo_toplevel(root):
+    """Whether ROOT is itself the top level of a git repository. 'git -C' only
+    changes directory before git walks upward looking for a repository, so a
+    directory inside an ancestor's work tree would otherwise be answered with
+    the ancestor's refs and files."""
     top = git_run(root, ["rev-parse", "--show-toplevel"])
     if top is None or top.returncode != 0:
-        return None
-    if os.path.realpath(top.stdout.decode("utf-8", "replace").strip()) != os.path.realpath(root):
+        return False
+    return os.path.realpath(top.stdout.decode("utf-8", "replace").strip()) == os.path.realpath(root)
+
+
+def repo_head(root):
+    """HEAD of the repository ROOT is the top level of, or None. The top level
+    must be ROOT itself: an ancestor repository is not ROOT's."""
+    if not is_repo_toplevel(root):
         return None
     head = git_run(root, ["rev-parse", "HEAD"])
     if head is None or head.returncode != 0:
@@ -3166,6 +3178,9 @@ def write_profile(root, document):
 def cmd_profile(args):
     root = os.path.realpath(args.root or os.getcwd())
     try:
+        if not is_repo_toplevel(root):
+            raise ValueError("%s is not the top level of a git repository; run it from the repository "
+                             "root (or pass --root)" % terminal_text(root, 200))
         today = today_date(args.today)
         document, lines = build_profile(root, args.answer or [], args.confirm, today)
         if args.write:
