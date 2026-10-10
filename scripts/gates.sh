@@ -4621,15 +4621,19 @@ _review_llm_samples() {
     else
       _rls_usable=$((_rls_usable + 1))
       [ -n "$_rls_first_usable" ] || _rls_first_usable="$_rls_sample"
+      printf '%s\n' "$_rls_sample" >> "$_rls_dir/usable.list"
     fi
     cmd_log_run review-sample "$_rls_outcome" "sample=${_rls_i}/${_rls_n} status=${_rls_rc}"
   done
 
   if [ "$_rls_usable" -gt 0 ]; then
     set -- ingest union-samples
-    for _rls_f in "$_rls_dir"/sample-*.json; do
-      set -- "$@" "$_rls_f"
-    done
+    # Only the samples that passed above: a degraded or failed one is not
+    # handed to the union at all (findings.py would exclude it anyway, but the
+    # shell is the first line and the audit rows already name it).
+    while IFS= read -r _rls_f; do
+      [ -z "$_rls_f" ] || set -- "$@" "$_rls_f"
+    done < "$_rls_dir/usable.list"
     _rls_union_rc=0
     _rls_union=$(ds_findings_call -e object "$@" --root "$REPO_ROOT" \
       --default-branch "${CLAGENTIC_DEFAULT_BRANCH:-main}") || _rls_union_rc=$?

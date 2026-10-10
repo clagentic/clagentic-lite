@@ -312,8 +312,9 @@ class TestProfileEndToEnd(Repo):
         items = [fact_finding(impact="data_read"), fact_finding(file="src/a.py", line=9, message="b")]
         _, standalone = self.verdict(items, extra=["--caller", "standalone"])
         _, gates = self.verdict(items, extra=["--caller", "gates"], repo=other)
-        shape = lambda v: ([(i["file"], i["severity"], i["floor"]) for i in v["open"]],  # noqa: E731
-                           [(a["moved"], a["outcome"]) for a in v["adjusted"]], v["verdict"])
+        def shape(v):
+            return ([(i["file"], i["severity"], i["floor"]) for i in v["open"]],
+                    [(a["moved"], a["outcome"]) for a in v["adjusted"]], v["verdict"])
         self.assertEqual(shape(standalone), shape(gates))
         self.assertNotIn("review-ledger.jsonl",
                          os.listdir(os.path.join(self.repo, ".clagentic", "lite")))
@@ -670,6 +671,30 @@ class TestSampleUnion(Repo):
         result, merged = self.union({"degraded": True, "findings": []})
         self.assertEqual(result.returncode, 1)
         self.assertIsNone(merged)
+
+    def test_a_sample_that_is_not_an_envelope_object_is_excluded_not_a_crash(self):
+        good = fact_finding()
+        for odd in ([fact_finding(message="bare array")], "a string", 7, None):
+            with self.subTest(odd=odd):
+                result, merged = self.union(odd, {"findings": [good]})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn("sample 1/2: unreadable or unusable, excluded", result.stderr)
+                self.assertEqual([f["message"] for f in merged["findings"]], [good["message"]])
+
+    def test_a_sample_with_a_finding_that_is_not_an_object_is_excluded_whole(self):
+        good = fact_finding()
+        result, merged = self.union({"findings": [fact_finding(message="half"), "not a finding"]},
+                                    {"findings": [good]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sample 1/2: unreadable or unusable, excluded", result.stderr)
+        self.assertEqual([f["message"] for f in merged["findings"]], [good["message"]])
+
+    def test_only_unusable_samples_fail_closed(self):
+        result, merged = self.union([fact_finding()], "scalar", {"degraded": True})
+        self.assertEqual(result.returncode, 1)
+        self.assertIsNone(merged)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_the_union_applies_the_profile_of_the_repo(self):
         self.put_profile(INTERNAL_DEPLOY)
