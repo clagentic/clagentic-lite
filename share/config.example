@@ -580,12 +580,15 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # CLAGENTIC_RISK_PROFILE_MAX_AGE_DAYS=180
 
 # ---------- cross-round finding dedup ----------
-# Default-on: suppress findings already reported in a prior review round when the
-# relevant diff lines are unchanged since. Key strategy is content-hash (sha256
-# of a 5-line context window), so the key survives line shifts. Default: on (1).
+# Default-on: mark findings already reported in a prior review round (relevant
+# diff lines unchanged since) as seen before. A seen finding is annotated, never
+# dropped: it still counts toward the verdict, so re-running at the same HEAD
+# cannot pass by forgetting what the first run found. Key strategy is
+# content-hash (sha256 of a 5-line context window), so the key survives line
+# shifts. Default: on (1).
 # Seen-keys are persisted in .clagentic/lite/review-seen-keys (gitignored).
 # Reset with: clagentic-lite gates review --reset-dedup
-# Set =0 to opt out and see all findings on every round.
+# Set =0 to opt out of the seen-before annotation.
 # CLAGENTIC_CROSS_ROUND_DEDUP=1
 
 # ---------- cross-round finding recurrence count ----------

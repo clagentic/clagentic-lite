@@ -155,8 +155,9 @@ caller one frame up (trace at least one caller first); framework/library
 defaults that already auto-escape (an ORM or templating engine doing the
 safe thing is not an injection surface); security theater (Math.random()
 in non-cryptographic contexts, eval/Function in a plugin system whose
-purpose is code loading, a documented intentional trust boundary — candidate
-for accepted-risks.md, not a fresh CWE citation every round); and hardening
+purpose is code loading, a documented intentional trust boundary — a candidate
+for a reviewed entry in .clagentic/dispositions.json, not a fresh CWE citation
+every round); and hardening
 suggestions where validation already happens correctly at the boundary that
 matters (report advisory low/medium if at all, not as a vulnerability).
 Ask: "Can I point to the actual attacker-controlled input and the actual
@@ -203,9 +204,11 @@ Header field rules:
 
 If the model cannot emit `[FINDING]` headers (e.g., due to a format
 mismatch or model constraint), continue emitting prose findings — the
-output is still valid and usable. A finding with no parseable tier field
-is treated as advisory by the gate (fail-open on the non-blocking side —
-see "Parser default" note in gates.sh).
+output is still valid and usable. A header that leaves out or garbles a
+field never lowers a finding: the gate reads a missing reachable as yes
+(unknown when the header states facts), a missing precondition or impact as
+the worst case, and computes the tier itself from the facts, so omitting a
+field is not a way to make a finding advisory.
 @@@ cwe-ordering
 CWE and ordering discipline (follow exactly to ensure stable output across runs):
 - Assign exactly one CWE ID per finding using the most specific applicable
