@@ -64,9 +64,19 @@ def build_profile(root, answers, confirm, today):
             default[dimension] = value
             continue
         for entry in paths:
-            if entry.get("glob") == glob:
-                entry[dimension] = value
-                break
+            if entry.get("glob") != glob:
+                continue
+            if entry.get("inferred"):
+                if dimension not in entry:
+                    # An inferred entry for another dimension keeps its
+                    # inferred status; the answer gets an entry of its own.
+                    continue
+                # The operator now states this value: it is no longer
+                # inferred, and the evidence described the old value.
+                entry.pop("inferred", None)
+                entry.pop("evidence", None)
+            entry[dimension] = value
+            break
         else:
             paths.append({"glob": glob, dimension: value})
     markers, notes = infer_markers(root)
@@ -128,10 +138,12 @@ def write_profile(root, document):
     somewhere else."""
     target = os.path.join(root, PROFILE_REL)
     directory = os.path.dirname(target)
-    os.makedirs(directory, exist_ok=True)
     real_root = os.path.realpath(root)
     real_dir = os.path.realpath(directory)
+    # Checked before makedirs: creating the directory through a symlink that
+    # leaves the repository would already be a write outside it.
     if real_dir != real_root and not real_dir.startswith(real_root + os.sep):
         raise ValueError("%s resolves outside the repository; not written" % os.path.dirname(PROFILE_REL))
+    os.makedirs(directory, exist_ok=True)
     write_file_atomic(target, dumps(document, indent=2) + "\n")
     return target

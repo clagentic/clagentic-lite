@@ -85,6 +85,15 @@ def _print(text):
     sys.stdout.write(text)
 
 
+def _non_negative_int(raw):
+    """argparse type: a count that may be 0 but never negative. A negative
+    slice bound would keep all but the last N findings instead of capping."""
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError("%s is negative; expected 0 or more" % raw)
+    return value
+
+
 def cmd_ingest_review_envelope(args):
     return ingest_review_envelope(args.file)
 
@@ -244,19 +253,24 @@ def cmd_fingerprint_dedup(args):
 
 
 def cmd_fingerprint_keys(args):
+    # Undecodable or unparsable stdin is unreadable input (status 2), never an
+    # empty key list with status 0 that reads as "no findings had keys".
     try:
         findings = json.loads(read_stdin_text())
     except ValueError:
-        return 0
+        return 2
     if not isinstance(findings, list):
-        return 0
+        return 2
     for row in content_key_rows(findings, args.diff):
         _print("\t".join(row) + "\n")
     return 0
 
 
 def cmd_fingerprint_bump(args):
-    rows = [line for line in read_stdin_text().split("\n") if line]
+    try:
+        rows = [line for line in read_stdin_text().split("\n") if line]
+    except UnicodeDecodeError:
+        return 1
     keyed = [row for row in rows if row.split("\t")[0]]
     new_counts = iter(bump_counts(args.counts, [row.split("\t")[0] for row in keyed]))
     for row in rows:
@@ -281,7 +295,10 @@ def cmd_dispositions_recurrence(args):
 
 
 def cmd_dispositions_ledger_recurrence(args):
-    text = read_stdin_text()
+    try:
+        text = read_stdin_text()
+    except UnicodeDecodeError:
+        return 1
     try:
         findings = json.loads(text)
         if not isinstance(findings, list):
@@ -305,7 +322,7 @@ def cmd_dispositions_migrate(args):
     try:
         code, text, report = migrate_dispositions(root, args.write)
     except OSError as exc:
-        warn("[dispositions/migrate] failed: %s" % exc)
+        warn("[dispositions/migrate] failed: %s" % terminal_text(exc, 300))
         return 1
     for line in report:
         warn(line)
@@ -338,7 +355,7 @@ def cmd_profile(args):
             lines.append("wrote %s; review it and commit it as a change (it applies once merged)"
                          % PROFILE_REL)
     except (InputRefused, ValueError, OSError) as exc:
-        sys.stderr.write("profile refused: %s\n" % exc)
+        sys.stderr.write("profile refused: %s\n" % terminal_text(exc, 300))
         return 2
     for line in lines:
         warn("[profile] " + line)
@@ -356,9 +373,15 @@ def cmd_verdict_blocking_json(args):
     try:
         text = read_stdin_text()
     except UnicodeDecodeError:
-        text = ""
+        warn("[findings] blocking-json: stdin is not valid UTF-8")
+        return 2
     listing = blocking_findings_listing(text, args.threshold)
-    _print("null" if listing is None else dumps(listing))
+    if listing is None:
+        # "null" stays on stdout for a caller that reads it, but the status says
+        # the input was unreadable, which is not the same as nothing blocking.
+        _print("null")
+        return 2
+    _print(dumps(listing))
     return 0
 
 
@@ -410,13 +433,21 @@ def cmd_verdict_ledger_pass_head(args):
 
 
 def cmd_verdict_ledger_append(args):
-    ledger_append(args.ledger, read_stdin_text(), args.max)
+    try:
+        text = read_stdin_text()
+    except UnicodeDecodeError:
+        return 1
+    ledger_append(args.ledger, text, args.max)
     return 0
 
 
 def cmd_verdict_ledger_entry(args):
+    try:
+        text = read_stdin_text()
+    except UnicodeDecodeError:
+        return 1
     _print(build_ledger_entry(args.ts, args.branch, args.gate, args.base, args.head,
-                              args.verdict, read_stdin_text(), args.config))
+                              args.verdict, text, args.config))
     return 0
 
 
@@ -424,7 +455,7 @@ def cmd_render_review(args):
     try:
         code, lines = render_review(args.file)
     except (OSError, ValueError, AttributeError) as exc:
-        warn("[findings] cannot render %s: %s" % (args.file, exc))
+        warn("[findings] cannot render %s: %s" % (terminal_text(args.file, 200), terminal_text(exc, 300)))
         return 1
     for line in lines:
         _print(CLASS_FOOTER if line is None else line + "\n")
@@ -435,7 +466,7 @@ def cmd_render_cleared_summary(args):
     try:
         _print(cleared_summary(read_stdin_text()))
     except (ValueError, UnicodeDecodeError) as exc:
-        warn("[findings] cleared-summary: %s" % exc)
+        warn("[findings] cleared-summary: %s" % terminal_text(exc, 300))
         return 1
     return 0
 
@@ -488,7 +519,11 @@ def cmd_render_fence_data(args):
 
 
 def cmd_render_fence_findings(args):
-    _print(fence_findings(read_stdin_text()))
+    try:
+        text = read_stdin_text()
+    except UnicodeDecodeError:
+        return 1
+    _print(fence_findings(text))
     return 0
 
 
@@ -497,7 +532,7 @@ def cmd_render_json_field(args):
         value = json_string_field(read_stdin_text(), args.key)
     except (ValueError, AttributeError) as exc:
         # Malformed JSON is a failure; an absent key is an empty value and exit 0.
-        warn("[findings] json-field: input is not a JSON object: %s" % exc)
+        warn("[findings] json-field: input is not a JSON object: %s" % terminal_text(exc, 300))
         return 1
     _print(value)
     return 0
@@ -535,7 +570,7 @@ def build_parser():
     op(ingest, "adversarial-sanitize", cmd_ingest_adversarial_sanitize)
     op(ingest, "adversarial-sort", cmd_ingest_adversarial_sort)
     sub = op(ingest, "cap", cmd_ingest_cap)
-    sub.add_argument("--max", type=int, default=DEFAULT_FINDINGS_MAX)
+    sub.add_argument("--max", type=_non_negative_int, default=DEFAULT_FINDINGS_MAX)
     op(ingest, "length", cmd_ingest_length)
     op(ingest, "is-array", cmd_ingest_is_array)
     sub = op(ingest, "merge", cmd_ingest_merge, ("dir", {}))

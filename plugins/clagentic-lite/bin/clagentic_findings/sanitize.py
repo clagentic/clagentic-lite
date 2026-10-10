@@ -130,11 +130,13 @@ def sanitize_fields_strict(array, fields):
 
 
 def sanitize_tree(value, limit=1000):
-    """Every string in a JSON value sanitized for a prompt."""
+    """Every string in a JSON value, object keys included, sanitized for a
+    prompt. A key reaches the prompt exactly as a value does, so it gets the
+    same treatment."""
     if isinstance(value, str):
         return sanitize_text(value, limit)
     if isinstance(value, list):
         return [sanitize_tree(v, limit) for v in value]
     if isinstance(value, dict):
-        return {str(k): sanitize_tree(v, limit) for k, v in value.items()}
+        return {sanitize_text(str(k), limit): sanitize_tree(v, limit) for k, v in value.items()}
     return value

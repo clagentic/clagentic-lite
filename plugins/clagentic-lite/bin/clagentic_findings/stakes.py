@@ -223,19 +223,23 @@ def is_test_path(path):
 
 
 def _codeowners_texts(root, base):
-    """The CODEOWNERS files at BASE (the version the merge will be judged by),
-    or None when there are none. A change that adds one cannot support a claim
-    in the same change."""
+    """The CODEOWNERS file at BASE (the version the merge will be judged by) as
+    a one-item list, or None when there is none. A host reads only the first
+    file it finds, so the first location in CODEOWNERS_LOCATIONS order that
+    exists wins and the others are ignored: unioning them would let a stale
+    file the host never reads 'cover' a path. A location that exists but
+    cannot be read stops the search with None: guessing at a lower-precedence
+    file could cover a path the real file does not. A change that adds one
+    cannot support a claim in the same change."""
     reader = git_reader(root, base) if base else worktree_reader(root)
-    texts = []
     for rel in CODEOWNERS_LOCATIONS:
         try:
             text = reader(rel)
         except (OSError, ValueError):
-            continue
+            return None
         if text is not None:
-            texts.append(text)
-    return texts or None
+            return [text]
+    return None
 
 
 def load_stakes(root, base, today, max_age_days=None):
@@ -334,7 +338,12 @@ def _warn_reconfirmation(stakes, root, base, today, max_age_days=None):
                                % (confirmed.isoformat(), max_age))
     marker_files = {marker["file"] for marker in stakes.markers}
     touched = changed_paths(root, base, lambda p: touches_exposure_surface(p, marker_files))
-    if touched:
+    if touched is None:
+        stakes.warnings.append(
+            "the paths this change touches could not be listed (git failed or timed out); it is "
+            "treated as touching the exposure surface, so re-confirm the risk profile with "
+            "'findings.py profile' (clagentic-lite gates profile). This is a prompt, not a block.")
+    elif touched:
         stakes.warnings.append(
             "this change touches the exposure surface (%d path(s): %s); re-confirm the risk profile "
             "with 'findings.py profile' (clagentic-lite gates profile). This is a prompt, not a block."
