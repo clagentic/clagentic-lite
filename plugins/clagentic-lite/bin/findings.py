@@ -2398,7 +2398,12 @@ def repo_head(root):
 def resolve_base(root, explicit, default_branch):
     """The commit the gated change is measured against, or None. An explicit
     ref wins; otherwise the merge base of HEAD with origin/<default> or
-    <default>."""
+    <default>. None for a directory that is not itself a repository top level:
+    git would answer with an ancestor's refs, and a base that is not ROOT's
+    would let that ancestor's dispositions and stakes profile decide ROOT's
+    verdict."""
+    if not is_repo_toplevel(root):
+        return None
     if explicit:
         if not _BRANCH_RE.match(explicit) or explicit.startswith("-"):
             return None
