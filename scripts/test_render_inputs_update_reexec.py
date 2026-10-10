@@ -21,10 +21,9 @@ import tempfile
 import textwrap
 import unittest
 
+from scripts.isolated_env import shared_cli, shared_tool_home
 from scripts.test_support import clone_this_tool_home_with_overlay
 
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
 AGENTS = ("builder", "reviewer", "auditor", "merge-gate", "troubleshooter")
 
 GLOBAL_CONFIG = "CLAGENTIC_GATE_AGENT_MODEL=sonnet\n"
@@ -189,11 +188,11 @@ class TestDoctorNamesAnIgnoredExportedRenderKey(unittest.TestCase):
     def _doctor(self, extra_env):
         env = {k: v for k, v in os.environ.items() if not k.startswith("CLAGENTIC_")}
         env["HOME"] = self.home
-        env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
+        env["CLAGENTIC_LITE_HOME"] = shared_tool_home()
         env["CLAGENTIC_SKIP_UPDATE_ALERT"] = "1"
         env.update(extra_env)
         return subprocess.run(
-            [CLI, "doctor"], cwd=self.repo, env=env,
+            [shared_cli(), "doctor"], cwd=self.repo, env=env,
             capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
         )
 

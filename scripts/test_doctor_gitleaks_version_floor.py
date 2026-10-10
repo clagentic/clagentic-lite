@@ -24,8 +24,7 @@ import tempfile
 import textwrap
 import unittest
 
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
+from scripts.isolated_env import shared_cli, shared_tool_home
 
 
 def _init_git_repo(path):
@@ -61,7 +60,7 @@ def _write_fake_gitleaks(bin_dir, version_output):
 def _run_doctor(cwd, home, fake_bin_dir=None, env_extra=None):
     env = dict(os.environ)
     env["HOME"] = home
-    env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
+    env["CLAGENTIC_LITE_HOME"] = shared_tool_home()
     env["CLAGENTIC_SKIP_UPDATE_ALERT"] = "1"
     env.pop("CLAGENTIC_HOME", None)
     env.pop("CLAGENTIC_ROUTER_URL", None)
@@ -70,7 +69,7 @@ def _run_doctor(cwd, home, fake_bin_dir=None, env_extra=None):
     if env_extra:
         env.update(env_extra)
     proc = subprocess.run(
-        [CLI, "doctor"], cwd=cwd, env=env,
+        [shared_cli(), "doctor"], cwd=cwd, env=env,
         capture_output=True, text=True, timeout=30,
     )
     return proc.returncode, proc.stdout, proc.stderr
@@ -152,13 +151,13 @@ class TestGitleaksNotOnPath(_DoctorGitleaksTestBase):
 
         env = dict(os.environ)
         env["HOME"] = self.home
-        env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
+        env["CLAGENTIC_LITE_HOME"] = shared_tool_home()
         env["CLAGENTIC_SKIP_UPDATE_ALERT"] = "1"
         env.pop("CLAGENTIC_HOME", None)
         env.pop("CLAGENTIC_ROUTER_URL", None)
         env["PATH"] = no_gitleaks_bin
         proc = subprocess.run(
-            [CLI, "doctor"], cwd=self.repo, env=env,
+            [shared_cli(), "doctor"], cwd=self.repo, env=env,
             capture_output=True, text=True, timeout=30,
         )
         self.assertIn("INFO gitleaks: not on PATH", proc.stdout, msg=proc.stdout)

@@ -160,9 +160,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 # Synthetic, obviously-fake startUrls -- never a realistic-looking org
 # subdomain, per the task's explicit instruction not to invent one.
@@ -272,19 +271,21 @@ def _run_preflight(env_extra, home_dir=None):
           printf 'NOT-READY\\t%s\\n' "$_LLM_AUTH_MODE_PREFLIGHT_REASON"
         fi
     """)
-    env = dict(os.environ)
+    home = home_dir if home_dir is not None else tempfile.mkdtemp(prefix="clagentic-test-preflight-home-")
+    # The temp HOME doubles as the project root and cwd: the preflight needs
+    # no repo, and nothing here may resolve to this checkout.
+    env = shared_env(project=home, HOME=home)
     env.update(source_env(llm_client=True))
     env.pop("AWS_CONFIG_FILE", None)
     env.pop("AWS_SHARED_CREDENTIALS_FILE", None)
     env.pop("AWS_PROFILE", None)
     env.pop("AWS_DEFAULT_PROFILE", None)
-    env["HOME"] = home_dir if home_dir is not None else tempfile.mkdtemp(prefix="clagentic-test-preflight-home-")
     env.update(env_extra)
     r = subprocess.run(
         ["sh", "-c", script, LLM_CLIENT_SH],
         capture_output=True,
         text=True,
-        cwd=TOOL_HOME,
+        cwd=home,
         env=env,
         timeout=30,
     )
@@ -1079,13 +1080,12 @@ class TestNoPython3FailsClosed(_TempDirCase):
               printf 'NOT-READY\\t%s\\n' "$_LLM_AUTH_MODE_PREFLIGHT_REASON"
             fi
         """)
-        env = dict(os.environ)
+        env = shared_env(project=home, HOME=home)
         env.update(source_env(llm_client=True))
         env.pop("AWS_CONFIG_FILE", None)
         env.pop("AWS_SHARED_CREDENTIALS_FILE", None)
         env.pop("AWS_PROFILE", None)
         env.pop("AWS_DEFAULT_PROFILE", None)
-        env["HOME"] = home
         env["CLAGENTIC_AUTH_MODE"] = "bedrock-sso"
         env["CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR"] = tmpdir
         env["PATH"] = fake_bin
@@ -1093,7 +1093,7 @@ class TestNoPython3FailsClosed(_TempDirCase):
             ["sh", "-c", script, LLM_CLIENT_SH],
             capture_output=True,
             text=True,
-            cwd=TOOL_HOME,
+            cwd=home,
             env=env,
             timeout=30,
         )
@@ -1141,10 +1141,9 @@ class TestWalkChainIntegration(_TempDirCase):
             . '{LLM_CLIENT_SH}'
             printf 'stdin diff content' | walk_chain 'reviewer' 'json' _fixture_prompt
         """)
-        env = dict(os.environ)
+        env = shared_env(project=home, HOME=home)
         env["CLAGENTIC_AUTH_MODE"] = "bedrock-sso"
         env["CLAGENTIC_AUTH_MODE_SSO_CACHE_DIR"] = tmpdir
-        env["HOME"] = home
         env.pop("AWS_CONFIG_FILE", None)
         env.pop("AWS_SHARED_CREDENTIALS_FILE", None)
         env.pop("AWS_PROFILE", None)
@@ -1154,7 +1153,7 @@ class TestWalkChainIntegration(_TempDirCase):
             ["sh", "-c", script, LLM_CLIENT_SH],
             capture_output=True,
             text=True,
-            cwd=TOOL_HOME,
+            cwd=home,
             env=env,
             timeout=10,  # generous ceiling for "fails within seconds", never 30s+
         )

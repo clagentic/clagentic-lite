@@ -116,10 +116,10 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.isolated_env import shared_tool_home
 from scripts.test_support import clone_this_tool_home_with_overlay
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
 TEMPLATE = os.path.join(TOOL_HOME, "share", "hook-shims", "claude-settings.template")
 
 
@@ -158,7 +158,8 @@ def _run_cli(argv, cwd, home, env_extra=None, clagentic_lite_home=None,
     is the exact path under test."""
     env = dict(os.environ)
     env["HOME"] = home
-    env["CLAGENTIC_LITE_HOME"] = clagentic_lite_home or TOOL_HOME
+    clagentic_lite_home = clagentic_lite_home or shared_tool_home()
+    env["CLAGENTIC_LITE_HOME"] = clagentic_lite_home
     if scrub_home_vars:
         env.pop("CLAGENTIC_HOME", None)
     if scrub_router:
@@ -188,7 +189,7 @@ def _run_cli(argv, cwd, home, env_extra=None, clagentic_lite_home=None,
     if env_extra:
         env.update(env_extra)
     proc = subprocess.run(
-        [CLI] + argv,
+        [os.path.join(clagentic_lite_home, "bin", "clagentic-lite")] + argv,
         cwd=cwd,
         env=env,
         capture_output=True,
@@ -354,7 +355,7 @@ class TestConfigFileInertWhenAbsent(unittest.TestCase):
         for line in lines:
             if "__CLAGENTIC_ROUTER_ENV_BLOCK__" in line:
                 continue
-            out.append(line.replace("__CLAGENTIC_LITE_HOME__", TOOL_HOME))
+            out.append(line.replace("__CLAGENTIC_LITE_HOME__", shared_tool_home()))
         return "".join(out)
 
     def test_no_config_file_no_env_settings_json_byte_identical(self):
@@ -508,7 +509,7 @@ class TestClagenticLiteHomeExemptFromConfigFileOverride(unittest.TestCase):
         # which likewise never assert rc == 0 here); what this test proves
         # is narrower: check #1's own line names the real checkout, not the
         # bogus config-file value.
-        self.assertIn(f"CLAGENTIC_LITE_HOME={TOOL_HOME}", out, msg=out)
+        self.assertIn(f"CLAGENTIC_LITE_HOME={shared_tool_home()}", out, msg=out)
         self.assertNotIn(bogus_home, out, msg=out)
 
     def test_deprecated_clagentic_home_env_still_warns_with_config_file_present(self):
@@ -527,14 +528,15 @@ class TestClagenticLiteHomeExemptFromConfigFileOverride(unittest.TestCase):
         env = dict(os.environ)
         env["HOME"] = self.home
         env.pop("CLAGENTIC_LITE_HOME", None)
-        env["CLAGENTIC_HOME"] = TOOL_HOME
+        env["CLAGENTIC_HOME"] = shared_tool_home()
         env["CLAGENTIC_SKIP_UPDATE_ALERT"] = "1"
         proc = subprocess.run(
-            [CLI, "doctor"], cwd=self.repo, env=env,
+            [os.path.join(shared_tool_home(), "bin", "clagentic-lite"), "doctor"],
+            cwd=self.repo, env=env,
             capture_output=True, text=True, timeout=30,
         )
         self.assertIn("CLAGENTIC_HOME is deprecated", proc.stderr, msg=proc.stderr)
-        self.assertIn(f"CLAGENTIC_LITE_HOME={TOOL_HOME}", proc.stdout, msg=proc.stdout)
+        self.assertIn(f"CLAGENTIC_LITE_HOME={shared_tool_home()}", proc.stdout, msg=proc.stdout)
         self.assertIn("WARN CLAGENTIC_HOME is set (deprecated)", proc.stdout, msg=proc.stdout)
 
 
@@ -614,8 +616,17 @@ class TestHostileRepoLocalConfigNotExecutedPreTrust(unittest.TestCase):
 
     def test_update_on_unenrolled_clone_does_not_execute_hostile_config(self):
         self._plant_hostile_config()
+        # update restamps hooks and the rendered plugin into its tool home and
+        # may discard inside it: only ever a throwaway clone, never the shared
+        # one and never the live tree. The overlay leaves the clone dirty
+        # whenever this checkout is, which trips the non-tty discard guard;
+        # the clone is disposable, so opt in.
+        fake_tool_home = os.path.join(self.tmpdir, "fake-tool-home")
+        clone_this_tool_home_with_overlay(fake_tool_home)
         _run_cli(["update"], cwd=self.repo, home=self.home,
-                  env_extra={"CLAGENTIC_SKIP_FETCH": "1"})
+                  clagentic_lite_home=fake_tool_home,
+                  env_extra={"CLAGENTIC_SKIP_FETCH": "1",
+                             "CLAGENTIC_UPDATE_ALLOW_DISCARD": "1"})
         self._assert_sentinel_absent("update")
 
     def test_show_on_unenrolled_clone_does_not_execute_hostile_config(self):

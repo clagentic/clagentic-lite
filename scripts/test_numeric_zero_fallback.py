@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.isolated_env import shared_env, shared_project
 from scripts.test_config_key_drift import _ROLES, _code_files
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -90,15 +91,14 @@ def _numeric_keys_in_config_example():
 
 
 def _sh(script, env=None):
-    full_env = os.environ.copy()
-    for key in [k for k in full_env if k.startswith("CLAGENTIC_")]:
-        del full_env[key]
+    # shared_env drops every ambient CLAGENTIC_* variable.
+    full_env = shared_env(project=shared_project())
     # The finding pipeline is found only under the tool home.
     full_env["TOOL_HOME"] = os.path.abspath(TOOL_HOME)
     if env:
         full_env.update(env)
     return subprocess.run(
-        ["sh", "-c", script], capture_output=True, text=True, env=full_env, cwd=TOOL_HOME
+        ["sh", "-c", script], capture_output=True, text=True, env=full_env, cwd=shared_project()
     )
 
 

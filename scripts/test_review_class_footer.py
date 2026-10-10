@@ -19,6 +19,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env, shared_project  # noqa: E402
 from test_source_helpers import (  # noqa: E402
     GATES_SH, LLM_CLIENT_SH, PLATFORM_SH, TOOL_HOME, source_env,
 )
@@ -37,7 +38,7 @@ def _finding(issue_class, class_fix="fix", severity="low"):
 def _run_raw(script, env):
     return subprocess.run(
         ["sh", "-c", script, GATES_SH], capture_output=True, text=True,
-        cwd=os.path.join(TOOL_HOME, "scripts"), env=env,
+        cwd=env["CLAGENTIC_PROJECT_ROOT"], env=env,
     )
 
 
@@ -62,7 +63,7 @@ def _run_gates(body, review):
             . '{GATES_SH}'
             {body.format(path=path)}
         """)
-        env = os.environ.copy()
+        env = shared_env(project=shared_project())
         env.update(source_env(gates=True))
         return _run_checked(script, env)
 
@@ -124,7 +125,7 @@ def _run_gates_raw_file(body, content):
             . '{GATES_SH}'
             {body.format(path=path)}
         """)
-        env = os.environ.copy()
+        env = shared_env(project=shared_project())
         env.update(source_env(gates=True))
         return _run_raw(script, env)
 
@@ -173,9 +174,8 @@ class TestRenderReviewWithoutJq(unittest.TestCase):
                 if command -v jq >/dev/null 2>&1; then echo JQ_PRESENT; exit 9; fi
                 cmd_render_review '{path}'
             """)
-            env = os.environ.copy()
+            env = shared_env(project=d)
             env.update(source_env(gates=True))
-            env["CLAGENTIC_PROJECT_ROOT"] = d
             env["PATH"] = _path_without_jq(d)
             r = _run_raw(script, env)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -205,7 +205,7 @@ class TestBuilderPromptSurfaces(unittest.TestCase):
 
     def test_ds_build_prompt_carries_rule(self):
         script = f". '{LLM_CLIENT_SH}'\nds_build_prompt\n"
-        env = os.environ.copy()
+        env = shared_env(project=shared_project())
         env.update(source_env(llm_client=True))
         r = _run_checked(script, env)
         self.assertIn("Fix the class, not the line", r.stdout)
@@ -215,7 +215,7 @@ class TestBuilderPromptSurfaces(unittest.TestCase):
         with open(BUILDER_MD) as f:
             builder = " ".join(f.read().split())
         script = f". '{LLM_CLIENT_SH}'\nds_build_prompt\n"
-        env = os.environ.copy()
+        env = shared_env(project=shared_project())
         env.update(source_env(llm_client=True))
         prompt = " ".join(_run_checked(script, env).stdout.split())
         for name, text in (("builder.md", builder), ("ds_build_prompt", prompt)):

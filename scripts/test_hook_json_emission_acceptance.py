@@ -48,6 +48,8 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.isolated_env import shared_env
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 HOOK_SHIMS_DIR = os.path.join(TOOL_HOME, "share", "hook-shims")
 MEMORY_SH = os.path.join(TOOL_HOME, "scripts", "memory.sh")
@@ -66,9 +68,7 @@ def _init_repo(tmp):
 
 
 def _mem_env(tmp, **overrides):
-    env = dict(os.environ)
-    env["CLAGENTIC_PROJECT_ROOT"] = tmp
-    env["HOME"] = os.environ.get("HOME", "/root")
+    env = shared_env(project=tmp)
     env.update(overrides)
     return env
 
@@ -93,11 +93,7 @@ def _seed_memory_db(tmp, summary, tags="seed", extra_rows=None):
 
 
 def _run_shim(template_path, cwd, payload=None, env_overrides=None):
-    env = dict(os.environ)
-    env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
-    env["HOME"] = os.environ.get("HOME", "/root")
-    env.pop("GIT_DIR", None)
-    env.pop("GIT_WORK_TREE", None)
+    env = shared_env()
     if env_overrides:
         env.update(env_overrides)
     stdin_bytes = None

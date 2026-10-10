@@ -47,9 +47,8 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 # The four router-scoped vars the fix must strip from every non-Claude
 # subprocess. Kept as a plain tuple here (test-side), independent of the
@@ -134,7 +133,7 @@ class _RouterEnvStripTestBase(unittest.TestCase):
             with open(input_file, "w") as f:
                 f.write("test diff")
 
-            env = dict(os.environ)
+            env = shared_env(project=tmpdir)
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
             env.update(_PARENT_ROUTER_ENV)
             env.update(source_env(llm_client=True))
@@ -151,7 +150,7 @@ class _RouterEnvStripTestBase(unittest.TestCase):
                 ["sh", "-c", script, sourced],
                 capture_output=True,
                 text=True,
-                cwd=TOOL_HOME,
+                cwd=tmpdir,
                 env=env,
             )
             self.assertTrue(
@@ -233,7 +232,7 @@ class TestCodexVersionCheckStripsRouterEnv(unittest.TestCase):
 
             sourced = LLM_CLIENT_SH
 
-            env = dict(os.environ)
+            env = shared_env(project=tmpdir)
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
             env.update(_PARENT_ROUTER_ENV)
             env.update(source_env(llm_client=True))
@@ -246,7 +245,7 @@ class TestCodexVersionCheckStripsRouterEnv(unittest.TestCase):
                 ["sh", "-c", script, sourced],
                 capture_output=True,
                 text=True,
-                cwd=TOOL_HOME,
+                cwd=tmpdir,
                 env=env,
             )
             self.assertTrue(

@@ -26,8 +26,7 @@ import subprocess
 import tempfile
 import unittest
 
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
+from scripts.isolated_env import shared_cli, shared_tool_home
 
 
 def _init_git_repo(path):
@@ -47,7 +46,7 @@ def _init_git_repo(path):
 def _run_cli(argv, cwd, home, env_extra=None):
     env = dict(os.environ)
     env["HOME"] = home
-    env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
+    env["CLAGENTIC_LITE_HOME"] = shared_tool_home()
     env.pop("CLAGENTIC_HOME", None)
     env.pop("CLAGENTIC_ROUTER_URL", None)
     env.pop("CLAGENTIC_ROUTER_TOKEN", None)
@@ -57,7 +56,7 @@ def _run_cli(argv, cwd, home, env_extra=None):
     if env_extra:
         env.update(env_extra)
     proc = subprocess.run(
-        [CLI] + argv,
+        [shared_cli()] + argv,
         cwd=cwd,
         env=env,
         capture_output=True,

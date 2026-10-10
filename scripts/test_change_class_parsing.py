@@ -29,9 +29,8 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import GATES_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _parse_findings(markdown_text):
@@ -50,13 +49,13 @@ def _parse_findings(markdown_text):
             . '{sourced_gates}'
             _parse_adversarial_findings '{md_file}' > '{out_file}'
         """)
-        env = os.environ.copy()
+        env = shared_env(project=tmpdir)
         env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True,
             text=True,
-            cwd=os.path.join(TOOL_HOME, "scripts"),
+            cwd=tmpdir,
             env=env,
         )
         assert r.returncode == 0, f"sourcing/parsing failed: {r.stderr}"
@@ -286,12 +285,12 @@ class TestSanitizeLeavesClassUntouched(unittest.TestCase):
                 . '{sourced_gates}'
                 _sanitize_adversarial_findings_json '{payload}'
             """)
-            env = os.environ.copy()
+            env = shared_env(project=tmpdir)
             env.update(source_env(gates=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced_gates],
                 capture_output=True, text=True,
-                cwd=os.path.join(TOOL_HOME, "scripts"),
+                cwd=tmpdir,
                 env=env,
             )
             self.assertEqual(r.returncode, 0, r.stderr)

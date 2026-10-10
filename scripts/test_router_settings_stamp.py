@@ -29,10 +29,10 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.isolated_env import shared_cli, shared_tool_home
 from scripts.test_support import clone_this_tool_home_with_overlay
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
 TEMPLATE = os.path.join(TOOL_HOME, "share", "hook-shims", "claude-settings.template")
 
 
@@ -53,14 +53,14 @@ def _init_git_repo(path):
 def _run_cli(argv, cwd, home, env_extra=None):
     env = dict(os.environ)
     env["HOME"] = home
-    env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
+    env["CLAGENTIC_LITE_HOME"] = shared_tool_home()
     env.pop("CLAGENTIC_HOME", None)
     env.pop("CLAGENTIC_ROUTER_URL", None)
     env.pop("CLAGENTIC_ROUTER_TOKEN", None)
     if env_extra:
         env.update(env_extra)
     proc = subprocess.run(
-        [CLI] + argv,
+        [shared_cli()] + argv,
         cwd=cwd,
         env=env,
         capture_output=True,
@@ -92,7 +92,7 @@ class TestRouterSettingsStampInertWhenUnset(unittest.TestCase):
         for line in lines:
             if "__CLAGENTIC_ROUTER_ENV_BLOCK__" in line:
                 continue  # sentinel line must vanish entirely when unset
-            out.append(line.replace("__CLAGENTIC_LITE_HOME__", TOOL_HOME))
+            out.append(line.replace("__CLAGENTIC_LITE_HOME__", shared_tool_home()))
         return "".join(out)
 
     def test_enroll_settings_json_byte_identical_to_baseline(self):

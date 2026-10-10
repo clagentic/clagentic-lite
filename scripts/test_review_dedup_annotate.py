@@ -33,6 +33,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import (  # noqa: E402
     LLM_CLIENT_SH,
     PLATFORM_SH,
@@ -66,7 +67,7 @@ def _dedup(findings, seen_path, mode):
         diff_path = os.path.join(work, "d.diff")
         with open(diff_path, "w") as f:
             f.write(_DIFF)
-        env = os.environ.copy()
+        env = shared_env(project=work)
         # The finding pipeline is found only under the tool home.
         env["TOOL_HOME"] = TOOL_HOME
         script = textwrap.dedent(f"""\
@@ -76,7 +77,7 @@ def _dedup(findings, seen_path, mode):
         """)
         r = subprocess.run(["sh", "-c", script], input=json.dumps(findings),
                            capture_output=True, text=True, env=env,
-                           cwd=os.path.join(TOOL_HOME, "scripts"))
+                           cwd=work)
         return json.loads(r.stdout), r
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -123,9 +124,8 @@ class TestDedupFindingsAnnotateMode(unittest.TestCase):
 
 def _run_review(tool_home, project, extra_env=None):
     _setup_fake_tool_home(tool_home)
-    env = os.environ.copy()
+    env = shared_env(project=project)
     env.update({
-        "CLAGENTIC_PROJECT_ROOT": project,
         "CLAGENTIC_ALLOW_MISSING_GITLEAKS": "1",
         "CLAGENTIC_ALLOW_MISSING_SEMGREP": "1",
         "CLAGENTIC_ALLOW_MISSING_OSV": "1",
@@ -317,16 +317,15 @@ class TestLlmClientRecordsRunMeta(unittest.TestCase):
             . '{LLM_CLIENT_SH}'
             _llm_record_run_meta claude high claude-test-9 '{prompt}' '{inp}'
         """)
-        env = os.environ.copy()
-        env.update(source_env(llm_client=True))
-        env.pop("CLAGENTIC_LLM_RUN_META_FILE", None)
         # Sourcing llm-client.sh resolves REPO_ROOT and its audit.db from the
         # cwd otherwise, i.e. the live checkout.
-        env["CLAGENTIC_PROJECT_ROOT"] = os.path.dirname(meta_path)
+        project = os.path.dirname(meta_path)
+        env = shared_env(project=project)
+        env.update(source_env(llm_client=True))
         if set_env:
             env["CLAGENTIC_LLM_RUN_META_FILE"] = meta_path
         return subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env,
-                              cwd=os.path.join(TOOL_HOME, "scripts"))
+                              cwd=project)
 
     def test_line_carries_model_prompt_hash_and_sizes(self):
         with tempfile.TemporaryDirectory() as d:

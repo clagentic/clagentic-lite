@@ -34,6 +34,7 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import GATES_SH, source_env  # noqa: E402
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -81,13 +82,12 @@ def _run_gates_cmd(project_root, fake_llm_client_sh, cmd):
             TOOL_HOME='{fake_tool_home}'
             {cmd}
         """)
-        env = os.environ.copy()
-        env["CLAGENTIC_PROJECT_ROOT"] = project_root
+        env = shared_env(project=project_root)
         env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True, text=True, env=env,
-            cwd=os.path.join(TOOL_HOME, "scripts"),
+            cwd=project_root,
         )
         return r.stdout, r.stderr, r.returncode
     finally:
@@ -273,8 +273,7 @@ class TestCmdMergeGateDistinguishesModelOutputUnparseableFromInfraDegraded(unitt
                 f.write(_FAKE_LLM_CLIENT_CLEAN_REVIEW)
             os.chmod(stub_path, 0o755)
 
-            env = os.environ.copy()
-            env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
+            env = shared_env(project=self._tmpdir)
             env["CLAGENTIC_ALLOW_MISSING_GITLEAKS"] = "1"
             env["CLAGENTIC_ALLOW_MISSING_SEMGREP"] = "1"
             env["CLAGENTIC_ALLOW_MISSING_OSV"] = "1"

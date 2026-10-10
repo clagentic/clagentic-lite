@@ -13,7 +13,8 @@ import tempfile
 import textwrap
 import unittest
 
-from test_source_helpers import GATES_SH, PLATFORM_SH, TOOL_HOME, path_without, source_env
+from isolated_env import shared_env
+from test_source_helpers import GATES_SH, PLATFORM_SH, path_without, source_env
 
 
 def _finding(**over):
@@ -42,9 +43,8 @@ class TestSeverityBlockersMalformedSeverity(unittest.TestCase):
             . '{GATES_SH}'
             severity_blockers '{review_path}' high
         """)
-        env = os.environ.copy()
+        env = shared_env(project=self._tmpdir)
         env.update(source_env(gates=True))
-        env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
         if hide_tool:
             shadow = path_without(hide_tool)
             self._shadows.append(shadow)
@@ -52,7 +52,7 @@ class TestSeverityBlockersMalformedSeverity(unittest.TestCase):
         r = subprocess.run(
             ["sh", "-c", script, GATES_SH],
             capture_output=True, text=True,
-            cwd=os.path.join(TOOL_HOME, "scripts"), env=env,
+            cwd=self._tmpdir, env=env,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.strip()

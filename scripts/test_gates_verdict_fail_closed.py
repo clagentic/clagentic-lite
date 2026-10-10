@@ -18,9 +18,11 @@ import sys
 import tempfile
 import unittest
 
-from scripts.findings_test_support import TOOL_HOME, commit_file, finding, head, make_repo
+from scripts.findings_test_support import commit_file, finding, head, make_repo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from isolated_env import shared_env  # noqa: E402
 
 from test_review_code_verdict import (  # noqa: E402
     CLEAN_ENVELOPE, Case, run_review)
@@ -30,12 +32,11 @@ from test_source_helpers import (  # noqa: E402
 
 def source_gates(project, body):
     """Run BODY in a shell that has sourced the real gates.sh functions."""
-    env = dict(os.environ)
+    env = shared_env(project=project)
     env.update(source_env(gates=True))
-    env["CLAGENTIC_PROJECT_ROOT"] = project
     return subprocess.run(["sh", "-c", '. "%s"; %s' % (GATES_SH, body), GATES_SH],
                           capture_output=True, text=True, env=env,
-                          cwd=os.path.join(TOOL_HOME, "scripts"), timeout=120)
+                          cwd=project, timeout=120)
 
 
 class TestVerdictDecision(unittest.TestCase):
@@ -127,8 +128,7 @@ class TestEvaluateArguments(unittest.TestCase):
         commit_file(self.other, "extra.txt", "x\n", "second")
 
     def evaluate(self, *args, stdin=None):
-        env = dict(os.environ)
-        env.update({"CLAGENTIC_PROJECT_ROOT": self.home, "CLAGENTIC_FINDINGS_TODAY": "2026-10-09"})
+        env = shared_env(project=self.home, CLAGENTIC_FINDINGS_TODAY="2026-10-09")
         return subprocess.run(["sh", GATES_SH, "evaluate"] + list(args), input=stdin,
                               capture_output=True, text=True, env=env, cwd=self.home, timeout=120)
 
@@ -168,9 +168,16 @@ class TestEvaluateArguments(unittest.TestCase):
         self.assertIn("unknown option", result.stderr)
 
     def test_no_input_reads_nothing(self):
-        result = self.evaluate("--no-input", "--gate", "merge-gate", "--json")
-        self.assertIn(result.returncode, (0, 1, 2), result.stderr)
+        # Garbage on stdin would be refused ("the input is not JSON") if the
+        # no-input run read it; a repository with no accumulated findings
+        # yields the read-only PASS verdict for its own HEAD.
+        result = self.evaluate("--no-input", "--gate", "merge-gate", "--json", stdin="{not json")
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("unknown option", result.stderr)
+        self.assertNotIn("not JSON", result.stderr)
+        verdict = json.loads(result.stdout)
+        self.assertEqual(verdict["verdict"], "PASS")
+        self.assertEqual(verdict["head"], head(self.home))
 
 
 if __name__ == "__main__":

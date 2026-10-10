@@ -13,13 +13,16 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.isolated_env import shared_env
+
 
 # Absolute path to the tool's own checkout root -- the hook script's source
 # of truth moved from a tracked, live .claude/hooks/post-tool-nudge.sh to
 # share/hook-shims/post-tool-nudge.sh.template (lr-57db23; see AGENTS.md
 # INV-7). The template resolves its own CLAGENTIC_LITE_HOME via
 # `${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}` -- run it directly with
-# CLAGENTIC_LITE_HOME set to this checkout so platform.sh (and everything it
+# CLAGENTIC_LITE_HOME set to a throwaway clone of this checkout
+# (scripts/isolated_env.py) so platform.sh (and everything it
 # provides: ds_json_field, ds_repo_root, ds_load_env, $DS_TIMEOUT_CMD)
 # resolves against the REAL, current tracked scripts/, exactly as it would
 # once materialized into $CLAGENTIC_LITE_HOME/.claude/hooks/ by
@@ -29,12 +32,12 @@ _TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _HOOK = os.path.join(_TOOL_HOME, "share", "hook-shims", "post-tool-nudge.sh.template")
 
 
-def _run_hook(payload: dict, env_overrides: dict | None = None) -> subprocess.CompletedProcess:
-    """Run the hook with the given payload dict and return the CompletedProcess."""
-    env = dict(os.environ)
+def _run_hook(payload: dict, cwd: str, env_overrides: dict | None = None) -> subprocess.CompletedProcess:
+    """Run the hook with the given payload dict from CWD (a temp git repo, so
+    the hook's project root is never this checkout) and return the
+    CompletedProcess."""
     # Suppress real ds_load_env config loading to keep tests hermetic.
-    env["CLAGENTIC_ENV_LOADED"] = "1"
-    env["CLAGENTIC_LITE_HOME"] = _TOOL_HOME
+    env = shared_env(CLAGENTIC_ENV_LOADED="1")
     if env_overrides:
         env.update(env_overrides)
     return subprocess.run(
@@ -42,6 +45,7 @@ def _run_hook(payload: dict, env_overrides: dict | None = None) -> subprocess.Co
         input=json.dumps(payload).encode(),
         capture_output=True,
         env=env,
+        cwd=cwd,
     )
 
 
@@ -94,13 +98,9 @@ class TestContextBudgetMonitor(unittest.TestCase):
         return p
 
     def _run(self, payload: dict, env: dict | None = None) -> subprocess.CompletedProcess:
-        full_env = dict(os.environ)
-        full_env["CLAGENTIC_ENV_LOADED"] = "1"
-        full_env["HOME"] = os.environ.get("HOME", "/root")
-        full_env["CLAGENTIC_LITE_HOME"] = _TOOL_HOME
-        # Unset GIT_DIR/GIT_WORK_TREE so git uses the real repo at self._tmp (cwd).
-        full_env.pop("GIT_DIR", None)
-        full_env.pop("GIT_WORK_TREE", None)
+        # shared_env drops GIT_DIR/GIT_WORK_TREE so git uses the repo at
+        # self._tmp (cwd).
+        full_env = shared_env(CLAGENTIC_ENV_LOADED="1")
         if env:
             full_env.update(env)
         return subprocess.run(
@@ -281,7 +281,7 @@ class TestContextBudgetMonitor(unittest.TestCase):
             ["/bin/sh", _HOOK],
             input=b"",
             capture_output=True,
-            env={**os.environ, "CLAGENTIC_ENV_LOADED": "1", "CLAGENTIC_LITE_HOME": _TOOL_HOME},
+            env=shared_env(CLAGENTIC_ENV_LOADED="1"),
             cwd=self._tmp,
         )
         self.assertEqual(result.returncode, 0)

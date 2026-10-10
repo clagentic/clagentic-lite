@@ -46,9 +46,8 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _run_unwrap(result_value, mode="json", role="reviewer"):
@@ -82,13 +81,13 @@ def _run_unwrap(result_value, mode="json", role="reviewer"):
             _llm_unwrap_json_envelope '{mode}' '{target_file}' '{role}' || RC=$?
             exit "$RC"
         """)
-        env = os.environ.copy()
+        env = shared_env(project=tmpdir)
         env.update(source_env(llm_client=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced],
             capture_output=True,
             text=True,
-            cwd=TOOL_HOME,
+            cwd=tmpdir,
             env=env,
         )
         with open(target_file) as f:
@@ -294,9 +293,9 @@ class TestNonEnvelopeAndNonJsonModePassthrough(unittest.TestCase):
                 _llm_unwrap_json_envelope 'markdown' '{target_file}' 'auditor' || RC=$?
                 exit "$RC"
             """)
-            env = os.environ.copy()
+            env = shared_env(project=tmpdir)
             env.update(source_env(llm_client=True))
-            r = subprocess.run(["sh", "-c", script, sourced], capture_output=True, text=True, cwd=TOOL_HOME, env=env)
+            r = subprocess.run(["sh", "-c", script, sourced], capture_output=True, text=True, cwd=tmpdir, env=env)
             self.assertEqual(r.returncode, 0, f"markdown mode must be a no-op. stderr={r.stderr!r}")
             with open(target_file) as f:
                 self.assertEqual(f.read(), original)
@@ -320,9 +319,9 @@ class TestNonEnvelopeAndNonJsonModePassthrough(unittest.TestCase):
                 _llm_unwrap_json_envelope 'json' '{target_file}' 'reviewer' || RC=$?
                 exit "$RC"
             """)
-            env = os.environ.copy()
+            env = shared_env(project=tmpdir)
             env.update(source_env(llm_client=True))
-            r = subprocess.run(["sh", "-c", script, sourced], capture_output=True, text=True, cwd=TOOL_HOME, env=env)
+            r = subprocess.run(["sh", "-c", script, sourced], capture_output=True, text=True, cwd=tmpdir, env=env)
             self.assertEqual(r.returncode, 0, f"bare JSON (no envelope) must be a no-op. stderr={r.stderr!r}")
             with open(target_file) as f:
                 self.assertEqual(json.loads(f.read()), json.loads(_REVIEWER_JSON))

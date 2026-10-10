@@ -26,6 +26,7 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import PLATFORM_SH, TOOL_HOME  # noqa: E402
 
 # platform.sh has no source guard / trailing dispatch (unlike gates.sh and
@@ -40,12 +41,11 @@ def _call_allowlist_fields(call_line):
     try:
         # The finding pipeline is found only under the tool home.
         script = f"TOOL_HOME='{TOOL_HOME}'\n. '{PLATFORM_SH}'\n{call_line}\n"
-        env = os.environ.copy()
-        env["HOME"] = tmpdir
+        env = shared_env(project=tmpdir, HOME=tmpdir)
         r = subprocess.run(
             [shutil.which("sh") or "/bin/sh", "-c", script, PLATFORM_SH],
             capture_output=True, text=True,
-            cwd=os.path.join(TOOL_HOME, "scripts"), env=env,
+            cwd=tmpdir, env=env,
         )
         return r.stdout, r.stderr, r.returncode
     finally:

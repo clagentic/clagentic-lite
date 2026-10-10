@@ -85,6 +85,8 @@ import tempfile
 import textwrap
 import unittest
 
+from scripts.isolated_env import shared_env
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 # The exact title text the fake claude CLI emits for the CWE-697 and CWE-770
@@ -393,8 +395,7 @@ def _run_adversarial_round(snapshot_text, fake_tool_home, bin_dir, project_root,
     subprocess.run(["git", "add", "app/dedup.py"], check=True, cwd=project_root)
 
     fake_gates = os.path.join(fake_tool_home, "scripts", "gates.sh")
-    env = os.environ.copy()
-    env["CLAGENTIC_PROJECT_ROOT"] = project_root
+    env = shared_env(project=project_root)
     env["CLAGENTIC_ADVERSARIAL_INVARIANTS"] = "1" if invariants_on else "0"
     env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
     env["CLAGENTIC_AUDITOR_CMD"] = "claude"
@@ -774,8 +775,7 @@ class TestInvariantFeedPromptInjectionNeutralized(unittest.TestCase):
         subprocess.run(["git", "add", "app/handle.py"], check=True, cwd=self._project)
 
         fake_gates = os.path.join(self._fake_tool_home, "scripts", "gates.sh")
-        env = os.environ.copy()
-        env["CLAGENTIC_PROJECT_ROOT"] = self._project
+        env = shared_env(project=self._project)
         env["CLAGENTIC_ADVERSARIAL_INVARIANTS"] = "1"
         env["PATH"] = self._bin_dir + os.pathsep + env.get("PATH", "")
         env["CLAGENTIC_AUDITOR_CMD"] = "claude"

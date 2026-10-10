@@ -23,6 +23,9 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.findings_test_support import git, make_repo
+from scripts.isolated_env import shared_env
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 WRITE_HOOK = os.path.join(TOOL_HOME, "share", "hook-shims", "pre-write-guard.sh.template")
 BASH_HOOK = os.path.join(TOOL_HOME, "share", "hook-shims", "pre-bash-guard.sh.template")
@@ -71,9 +74,7 @@ HARMLESS_COMMANDS = (
 
 
 def _env():
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAGENTIC_", "GIT_"))}
-    env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
-    return env
+    return shared_env()
 
 
 def run_hook(hook, payload, cwd):
@@ -83,14 +84,8 @@ def run_hook(hook, payload, cwd):
 
 
 def init_repo(path):
-    subprocess.run(["git", "init", "-q", "-b", "main", path], check=True, env=_env())
-    for key, value in (("user.email", "test@example.com"), ("user.name", "Test")):
-        subprocess.run(["git", "-C", path, "config", key, value], check=True, env=_env())
-    with open(os.path.join(path, "README.md"), "w") as handle:
-        handle.write("init\n")
-    subprocess.run(["git", "-C", path, "add", "README.md"], check=True, env=_env())
-    subprocess.run(["git", "-C", path, "commit", "-q", "-m", "init"], check=True, env=_env())
-    subprocess.run(["git", "-C", path, "checkout", "-q", "-b", "feat/x"], check=True, env=_env())
+    make_repo(path)
+    git(path, "checkout", "-q", "-b", "feat/x")
 
 
 class Repo(unittest.TestCase):

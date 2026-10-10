@@ -29,9 +29,8 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import GATES_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _run_build_gate_summary(findings, meta, project_root):
@@ -58,15 +57,14 @@ def _run_build_gate_summary(findings, meta, project_root):
                     json.dump(meta, f)
 
         script = f". '{sourced_gates}'\nbuild_gate_summary\n"
-        env = os.environ.copy()
-        env["CLAGENTIC_PROJECT_ROOT"] = project_root
+        env = shared_env(project=project_root)
         env["CLAGENTIC_ALLOW_STALE_PAYLOAD"] = "1"
         env.update(source_env(gates=True))
 
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True, text=True, env=env,
-            cwd=os.path.join(TOOL_HOME, "scripts"),
+            cwd=project_root,
         )
         assert r.returncode == 0, f"build_gate_summary failed: {r.stderr}"
         return json.loads(r.stdout)

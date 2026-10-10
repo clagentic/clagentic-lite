@@ -29,9 +29,8 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import GATES_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _parse_findings(markdown_text):
@@ -40,8 +39,9 @@ def _parse_findings(markdown_text):
 
     gates.sh sources platform.sh and review-merge.sh unconditionally at the
     top (before any function definitions), so both must be reachable at
-    their real relative path — running from TOOL_HOME/scripts satisfies
-    `. "$(dirname "$0")/platform.sh"` without needing to symlink a whole
+    their real relative path — passing the real gates.sh path as $0 satisfies
+    `. "$(dirname "$0")/platform.sh"` (the cwd is a temp project, never this
+    checkout) without needing to symlink a whole
     fake tool tree (unlike the merge-gate --recheck tests, which fake
     TOOL_HOME to substitute a stub llm-client.sh; this test never invokes
     an LLM at all).
@@ -62,13 +62,13 @@ def _parse_findings(markdown_text):
         # Pass sourced_gates as $0 so gates.sh's own
         # `. "$(dirname "$0")/platform.sh"` self-source resolves — under
         # plain `sh -c script`, $0 would be "sh".
-        env = os.environ.copy()
+        env = shared_env(project=tmpdir)
         env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True,
             text=True,
-            cwd=os.path.join(TOOL_HOME, "scripts"),
+            cwd=tmpdir,
             env=env,
         )
         assert r.returncode == 0, f"sourcing/parsing failed: {r.stderr}"
@@ -231,12 +231,12 @@ def _run_sh_function_for_rank(severity_value):
     try:
         sourced_gates = GATES_SH
         script = f". '{sourced_gates}'\nseverity_rank '{severity_value}'\n"
-        env = os.environ.copy()
+        env = shared_env(project=tmpdir)
         env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True, text=True,
-            cwd=os.path.join(TOOL_HOME, "scripts"),
+            cwd=tmpdir,
             env=env,
         )
         return r.stdout, r.stderr, r.returncode

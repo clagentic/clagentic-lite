@@ -51,9 +51,8 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 _AUTH_FAILURE_TEXT = "Failed to authenticate. API Error: 401 Invalid bearer token"
 
@@ -167,13 +166,13 @@ def _run_walk_chain(role_lower, mode, stub_writer, cli="claude"):
             . '{sourced}'
             printf 'stdin diff content' | walk_chain '{role_lower}' '{mode}' _fixture_prompt
         """)
-        env = os.environ.copy()
+        env = shared_env(project=tmpdir)
         env.update(source_env(llm_client=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced],
             capture_output=True,
             text=True,
-            cwd=TOOL_HOME,
+            cwd=tmpdir,
             env=env,
         )
         return r.stdout, r.stderr, r.returncode

@@ -60,9 +60,8 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import GATES_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _run_lint(target_file, project_root=None):
@@ -73,14 +72,14 @@ def _run_lint(target_file, project_root=None):
             . '{sourced_gates}'
             cmd_audit_vocab_lint '{target_file}'
         """)
-        env = os.environ.copy()
-        if project_root:
-            env["CLAGENTIC_PROJECT_ROOT"] = project_root
+        # No project root asked for: the lint only reads the target file, so
+        # a scratch project keeps the sourced gates.sh off this checkout.
+        env = shared_env(project=project_root or tmpdir)
         env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True, text=True, env=env,
-            cwd=os.path.join(TOOL_HOME, "scripts"),
+            cwd=project_root or tmpdir,
         )
         return r.stdout, r.stderr, r.returncode
     finally:
@@ -282,15 +281,14 @@ def _run_checked_pass(gate, details, extra_env=None):
         . '{sourced_gates}'
         _cmd_log_run_checked_pass '{gate}' '{details}'
     """)
-    env = os.environ.copy()
-    env["CLAGENTIC_PROJECT_ROOT"] = project_dir
+    env = shared_env(project=project_dir)
     if extra_env:
         env.update(extra_env)
     env.update(source_env(gates=True))
     r = subprocess.run(
         ["sh", "-c", script, sourced_gates],
         capture_output=True, text=True, env=env,
-        cwd=os.path.join(TOOL_HOME, "scripts"),
+        cwd=project_dir,
     )
     return r.stdout, r.stderr, r.returncode, tmpdir, project_dir
 

@@ -16,7 +16,8 @@ exactly as Claude Code does. A regression in the shell logic — the wrong
 field name, an accidental `exit 2`, a warn that fires when agent_type is
 present — would be caught here; a Python reimplementation would not catch it.
 Runs the tracked TEMPLATE directly (the file a diff review actually sees),
-with CLAGENTIC_LITE_HOME set to this checkout so its
+with CLAGENTIC_LITE_HOME set to a throwaway clone of this checkout (overlaid
+with the on-disk files, scripts/isolated_env.py) so its
 `${CLAGENTIC_LITE_HOME:=__CLAGENTIC_LITE_HOME__}` fallback resolves
 platform.sh against the real, current scripts/ -- exactly as it would once
 materialized into $CLAGENTIC_LITE_HOME/.claude/hooks/ by _stamp_claude_hooks.
@@ -29,6 +30,8 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.isolated_env import shared_env
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 HOOK_SH = os.path.join(TOOL_HOME, "share", "hook-shims", "pre-write-guard.sh.template")
 
@@ -37,9 +40,7 @@ def _run_hook(payload, cwd, env_extra=None):
     """Run the real pre-write-guard.sh template with `payload` (dict) piped
     as JSON on stdin, from `cwd` (a git repo on a non-default branch).
     Returns (returncode, stdout, stderr)."""
-    env = dict(os.environ)
-    env.pop("CLAGENTIC_ENV_LOADED", None)
-    env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
+    env = shared_env()
     if env_extra:
         env.update(env_extra)
     proc = subprocess.run(

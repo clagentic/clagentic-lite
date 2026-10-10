@@ -129,9 +129,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 # Distinguishing sentinel values -- non-empty, host-agnostic, obviously fake
 # (AGENTS.md invariant 6: nothing host-specific hardcoded) -- so an unfixed
@@ -203,7 +202,7 @@ class _DirectApiEnsureTestBase(unittest.TestCase):
             with open(input_file, "w") as f:
                 f.write("test diff")
 
-            env = dict(os.environ)
+            env = shared_env(project=tmpdir)
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
             for var in _ROUTER_SCOPED_VARS:
                 env.pop(var, None)
@@ -243,7 +242,7 @@ class _DirectApiEnsureTestBase(unittest.TestCase):
                 ["sh", "-c", script, LLM_CLIENT_SH],
                 capture_output=True,
                 text=True,
-                cwd=TOOL_HOME,
+                cwd=tmpdir,
                 env=env,
             )
             self.assertTrue(
@@ -417,7 +416,7 @@ class TestAcceptance6NonClaudeEnvStripUnaffected(unittest.TestCase):
                 . '{LLM_CLIENT_SH}'
                 invoke_generic "some-generic-cli" "" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" 5
             """)
-            env = dict(os.environ)
+            env = shared_env(project=tmpdir)
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
             env["CLAGENTIC_AUTH_MODE"] = "enterprise"
             env["ANTHROPIC_BASE_URL"] = _FIXTURE_BASE_URL
@@ -427,7 +426,7 @@ class TestAcceptance6NonClaudeEnvStripUnaffected(unittest.TestCase):
                 ["sh", "-c", script, LLM_CLIENT_SH],
                 capture_output=True,
                 text=True,
-                cwd=TOOL_HOME,
+                cwd=tmpdir,
                 env=env,
             )
             self.assertTrue(os.path.exists(dump_path), f"stdout={r.stdout!r} stderr={r.stderr!r}")

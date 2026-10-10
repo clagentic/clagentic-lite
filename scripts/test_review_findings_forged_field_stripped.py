@@ -69,7 +69,8 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_source_helpers import GATES_SH, PLATFORM_SH, source_env  # noqa: E402
+from isolated_env import shared_env, shared_project  # noqa: E402
+from test_source_helpers import GATES_SH, PLATFORM_SH, git_env, source_env  # noqa: E402
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -87,12 +88,12 @@ def _call_sanitize_envelope(envelope_path):
         . '{GATES_SH}'
         _sanitize_review_findings_envelope '{envelope_path}'
     """)
-    env = os.environ.copy()
+    env = shared_env(project=shared_project())
     env.update(source_env(gates=True))
     r = subprocess.run(
         ["sh", "-c", script, GATES_SH],
         capture_output=True, text=True,
-        cwd=os.path.join(TOOL_HOME, "scripts"), env=env,
+        cwd=shared_project(), env=env,
     )
     return r.stdout, r.stderr, r.returncode
 
@@ -356,15 +357,8 @@ def _setup_project(tmpdir):
     return tmpdir
 
 
-_GIT_IDENTITY_ENV = {
-    "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-    "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-}
-
-
 def _init_git_repo(project_root):
-    env = os.environ.copy()
-    env.update(_GIT_IDENTITY_ENV)
+    env = git_env()
     subprocess.run(["git", "init", "-q", project_root], check=True, env=env)
     target = os.path.join(project_root, "app.py")
     with open(target, "w") as f:
@@ -432,8 +426,7 @@ def _setup_fake_tool_home(fake_tool_home):
 def _run_review(fake_tool_home, project_root, env_overrides=None):
     _setup_fake_tool_home(fake_tool_home)
     fake_gates = os.path.join(fake_tool_home, "scripts", "gates.sh")
-    env = os.environ.copy()
-    env["CLAGENTIC_PROJECT_ROOT"] = project_root
+    env = shared_env(project=project_root)
     env["CLAGENTIC_ALLOW_MISSING_GITLEAKS"] = "1"
     env["CLAGENTIC_ALLOW_MISSING_SEMGREP"] = "1"
     env["CLAGENTIC_ALLOW_MISSING_OSV"] = "1"
@@ -607,12 +600,12 @@ def _call_validate_output(envelope, role="reviewer", mode="json", jq_available=T
             path_env = no_jq_bin
 
         script = f". '{sourced}'\nvalidate_output '{mode}' '{env_path}' '{role}'\n"
-        env = os.environ.copy()
+        env = shared_env(project=tmpdir)
         env["PATH"] = path_env
         env.update(source_env(llm_client=True))
         r = subprocess.run(
             [sh_path, "-c", script, sourced],
-            capture_output=True, text=True, cwd=TOOL_HOME, env=env,
+            capture_output=True, text=True, cwd=tmpdir, env=env,
         )
         return r.stdout, r.stderr, r.returncode
     finally:
