@@ -100,15 +100,43 @@ def entry(**over):
     return base
 
 
+# Facts the rubric turns back into a given severity, off the security floor: the
+# severity a fixture names is its claim, and the rubric decides from facts, so
+# a fixture that means "a medium finding" has to say what makes it one.
+_OFF_FLOOR_FACTS = {
+    "critical": ("network", "code_exec"),
+    "high": ("authenticated_user", "code_exec"),
+    "medium": ("authenticated_user", "availability"),
+    "low": ("authenticated_user", "quality_only"),
+}
+
+
+def with_facts(item):
+    """ITEM with the closed-vocabulary facts its severity (and reachable) imply,
+    unless it states some itself. Reachable at high or critical is the security
+    floor (anyone, code execution); anything else is off it. A severity that is
+    not one of the four (unrankable) gets no facts: the worst case."""
+    if "attacker_precondition" in item or "impact" in item:
+        return item
+    severity = str(item.get("severity", "")).strip().lower()
+    if item.get("reachable") == "yes" and severity in ("high", "critical"):
+        facts = ("network", "code_exec")
+    else:
+        facts = _OFF_FLOOR_FACTS.get(severity)
+    if facts is not None:
+        item["attacker_precondition"], item["impact"] = facts
+    return item
+
+
 def finding(**over):
     base = {"severity": "high", "file": "app.py", "line": 2, "category": "security",
             "message": "unsanitized input reaches a sink"}
     base.update(over)
-    return base
+    return with_facts(base)
 
 
 def adversarial_finding(**over):
     base = {"file": "app.py", "line": 2, "category": "CWE-78", "message": "shell injection",
             "severity": "high", "reachable": "yes", "tier": "blocking", "class": "durable"}
     base.update(over)
-    return base
+    return with_facts(base)

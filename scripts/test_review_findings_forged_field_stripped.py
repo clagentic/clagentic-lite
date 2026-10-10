@@ -540,8 +540,10 @@ class TestForgedRecurrenceFlagCannotSelfExempt(unittest.TestCase):
         envelope = {
             "summary": "clean-ish", "checked": ["style"],
             "findings": [{
-                "severity": "low", "file": "app.py", "line": 1,
+                "severity_claimed": "low", "file": "app.py", "line": 1,
                 "category": "style", "message": "minor nit",
+                "reachable": "yes", "attacker_precondition": "local_ci_only",
+                "impact": "quality_only", "class": "durable",
             }],
         }
         _make_stub_llm_client(self._tmpdir, envelope)

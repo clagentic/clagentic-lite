@@ -1018,26 +1018,17 @@ def _line_number(value):
     return 0
 
 
-def adversarial_tier(reachable, severity, given):
-    """Reachability is the precondition for blocking; reachable at high or
-    above is the security floor and always blocks. Between the two the
-    model's own tier stands."""
-    if reachable != "yes":
-        return "advisory"
-    if severity_rank(severity) >= FLOOR_RANK:
-        return "blocking"
-    return given if given in ("blocking", "advisory") else "advisory"
-
-
 def unify_finding(raw, source, stakes=None):
     """One input finding as a unified record. Raises ValueError for an input
     that is not an object: a finding that cannot be read is never skipped.
 
-    A finding that states facts (attacker_precondition or impact) has its
-    severity (and, for the Auditor, its tier) decided by the rubric from those
-    facts and STAKES; the model's own severity is kept as severity_claimed for
-    display. A finding with neither fact is from a producer that predates the
-    vocabulary and keeps the severity it claimed."""
+    Every finding has its severity (and, for the Auditor, its tier) decided by
+    the rubric from its facts and STAKES; the model's own severity is kept as
+    severity_claimed for display and decides nothing. A fact that is absent or
+    outside its vocabulary is the worst case, so a finding that states neither
+    attacker_precondition nor impact is rated as if it were reachable by
+    anyone with the largest impact: omitting the facts never lowers a finding
+    and never keeps what the model claimed."""
     if not isinstance(raw, dict):
         raise ValueError("a finding is not an object")
     claimed = raw.get("severity_claimed", raw.get("severity"))
@@ -1067,19 +1058,14 @@ def unify_finding(raw, source, stakes=None):
         "severity_claimed": sanitize_text(shown, 40),
         "severity": severity,
     }
-    if source == "adversarial":
-        given = raw.get("tier")
-        record["tier"] = adversarial_tier(
-            reachable, severity, given.strip().lower() if isinstance(given, str) else "")
     for key in ("suggestion", "issue_class", "class_fix"):
         if isinstance(raw.get(key), str):
             record[key] = _clean(raw[key], 500)
     record["schema"] = FINDING_SCHEMA
-    if has_facts(raw):
-        record["attacker_precondition"] = fact_value(
-            raw.get("attacker_precondition"), PRECONDITIONS, UNKNOWN_FACT)
-        record["impact"] = fact_value(raw.get("impact"), IMPACTS, UNKNOWN_FACT)
-        apply_rubric(record, stakes)
+    record["attacker_precondition"] = fact_value(
+        raw.get("attacker_precondition"), PRECONDITIONS, UNKNOWN_FACT)
+    record["impact"] = fact_value(raw.get("impact"), IMPACTS, UNKNOWN_FACT)
+    apply_rubric(record, stakes)
     record["fingerprint"] = finding_identity(
         source, record["file"], record["category"], record["message"])
     return record
@@ -1096,20 +1082,16 @@ def unify_findings(raw_findings, source, stakes=None):
 def is_floor(finding):
     """The security floor. A finding on it can be cleared by a fix, or by a
     mitigation that names the control, and by nothing that merely calls it
-    acceptable. For a finding the rubric decided, it is reachable, high impact
-    and an EFFECTIVE precondition of none or network (the finding's own
-    precondition raised only by what the profile genuinely establishes); for
-    one from a producer without facts it is reachable at severity high or
-    above, as before."""
-    if finding.get("rubric_applied"):
-        return bool(finding.get("floor"))
-    return finding.get("reachable") == "yes" and severity_rank(finding.get("severity")) >= FLOOR_RANK
+    acceptable. As the rubric decided it: reachable, high impact and an
+    EFFECTIVE precondition of none or network (the finding's own precondition
+    raised only by what the profile genuinely establishes)."""
+    return bool(finding.get("floor"))
 
 
 def is_blocking(finding, threshold):
     """Whether an unaddressed finding blocks. An adversarial finding blocks by
-    its tier (clamped, or decided by the rubric); a review finding blocks when
-    its severity (the rubric's, when it has facts) meets the threshold."""
+    its rubric tier; a review finding blocks when its rubric severity meets the
+    threshold."""
     if finding.get("source") == "adversarial":
         return finding.get("tier") == "blocking"
     return severity_rank(finding.get("severity")) >= threshold
@@ -1183,12 +1165,6 @@ def fact_value(raw, allowed, worst):
         if value in allowed:
             return value
     return worst
-
-
-def has_facts(raw):
-    """A finding states facts when it carries either of the two the rubric
-    cannot do without; one without is from a producer that predates them."""
-    return "attacker_precondition" in raw or "impact" in raw
 
 
 def worst_dims():
@@ -1684,9 +1660,11 @@ def infer_markers(root, files=None):
     return markers, notes
 
 
-def changed_paths(root, base):
+def changed_paths(root, base, wanted=None):
     """Paths that differ between BASE and the working tree, plus untracked
-    ones: what the gated change touches. [] when BASE is unknown."""
+    ones: what the gated change touches. [] when BASE is unknown. WANTED, when
+    given, filters BEFORE the cap, so a large change cannot push the paths the
+    caller cares about past CHANGED_PATHS_MAX."""
     if not base:
         return []
     paths = set()
@@ -1694,6 +1672,8 @@ def changed_paths(root, base):
         proc = git_run(root, args)
         if proc is not None and proc.returncode == 0:
             paths.update(n for n in proc.stdout.decode("utf-8", "replace").split("\0") if n)
+    if wanted is not None:
+        paths = {n for n in paths if wanted(n)}
     return sorted(paths)[:CHANGED_PATHS_MAX]
 
 
@@ -1826,7 +1806,7 @@ def _warn_reconfirmation(stakes, root, base, today, max_age_days=None):
                                "re-confirm it with 'findings.py profile' (clagentic-lite gates profile)"
                                % (confirmed.isoformat(), max_age))
     marker_files = {marker["file"] for marker in stakes.markers}
-    touched = [p for p in changed_paths(root, base) if touches_exposure_surface(p, marker_files)]
+    touched = changed_paths(root, base, lambda p: touches_exposure_surface(p, marker_files))
     if touched:
         stakes.warnings.append(
             "this change touches the exposure surface (%d path(s): %s); re-confirm the risk profile "
@@ -2328,13 +2308,42 @@ def load_store(root, reader, check_hash=True):
     return store
 
 
-def introduced_entry_keys(root, base):
-    """The set of entry contents the BASE commit already had, or None when the
-    base is unknown. None means every entry counts as added in this change."""
-    if not base:
-        return None
-    base_store = load_store(root, git_reader(root, base), check_hash=False)
-    return {entry_key(entry) for entry in base_store["entries"]}
+def load_policy(root, base):
+    """The dispositions that apply, and the ones that only could.
+
+    Policy (the dispositions file and the legacy deferral and ack files) is
+    read ONLY from the trusted base revision, through git, never from the
+    working tree or the branch: whatever wrote a policy file, by whatever
+    channel, a change to it applies only once it is merged. That is the
+    guarantee; the Builder write blocks (W-007, R-021) are a best-effort
+    deterrent on top of it, not part of it. With no resolvable BASE nothing
+    applies (the worst case) and the third element says so.
+
+    Returns (store, proposed, notes): STORE is what load_store reads at BASE
+    (empty without one); PROPOSED are the entries in the working tree that the
+    base does not have, which clear nothing and are only reported as what this
+    change would clear once merged; NOTES are lines for the verdict. Problems
+    found in the working tree's copy are appended to STORE's 'invalid' list so
+    the author sees them before merging; they decide nothing."""
+    notes = []
+    if base:
+        store = load_store(root, git_reader(root, base))
+        base_keys = {entry_key(entry) for entry in store["entries"]}
+    else:
+        store = {"entries": [], "invalid": [], "warnings": [], "legacy": []}
+        base_keys = set()
+    branch = load_store(root, worktree_reader(root), check_hash=False)
+    proposed = [entry for entry in branch["entries"] if entry_key(entry) not in base_keys]
+    known_invalid = {dumps(record, sort_keys=True) for record in store["invalid"]}
+    unread = [record for record in branch["invalid"] if dumps(record, sort_keys=True) not in known_invalid]
+    # Problems in the working tree's copy are shown so the author sees them
+    # before merging; they cannot change a verdict, which only the base decides.
+    store["invalid"] = store["invalid"] + unread
+    if not base and (branch["entries"] or branch["invalid"] or branch["legacy"]):
+        notes.append("the base commit could not be resolved: no disposition entry applies (the "
+                     "worst case); entries are read only from the base revision, so every entry "
+                     "in the working tree is treated as added in this change and clears nothing")
+    return store, proposed, notes
 
 
 _GLOB_CACHE = {}
@@ -2465,6 +2474,12 @@ def load_state(root, head):
         if (not isinstance(item, dict) or item.get("source") not in SOURCES
                 or not isinstance(item.get("fingerprint"), str)):
             raise StateError("%s holds a malformed finding; remove it to start a fresh accumulation" % path)
+        if not item.get("rubric_applied"):
+            # Written by a version that kept the model's severity when no
+            # facts were stated. Without facts the worst case applies, so the
+            # record is read as one that states none; no user action needed.
+            item["attacker_precondition"] = item["impact"] = UNKNOWN_FACT
+            item["rubric_applied"] = True
     return data
 
 
@@ -2528,23 +2543,17 @@ def accumulate(state, incoming, gate, caller):
             by_place[place] = record
             new += 1
             continue
-        if known.get("rubric_applied") and record.get("rubric_applied"):
-            # Both carry facts: the stronger facts win and the verdict re-derives
-            # the severity from them, so the merge can only raise a finding.
-            merge_facts(known, record)
-        else:
-            # Facts on only one side: fall back to the older reading (the
-            # higher claimed or computed severity wins), which can only raise.
-            if severity_rank(record["severity"]) > severity_rank(known.get("severity")):
-                known["severity"], known["severity_claimed"] = record["severity"], record["severity_claimed"]
-            if known.get("rubric_applied"):
-                known["rubric_applied"] = False
+        # The stronger facts win and the verdict re-derives the severity (and
+        # an Auditor finding's tier) from them, so the merge can only raise a
+        # finding.
+        merge_facts(known, record)
         if _REACHABLE_ORDER[record["reachable"]] > _REACHABLE_ORDER.get(known.get("reachable"), 1):
             known["reachable"] = record["reachable"]
-        if record.get("tier") == "blocking" and not known.get("rubric_applied"):
-            known["tier"] = "blocking"
         if record["class"] == "durable":
             known["class"] = "durable"
+        # The stored severity is the unprofiled reading of the merged facts;
+        # the verdict re-reads it with the profile of the day.
+        apply_rubric(known, None)
     state["runs"].append({"gate": gate, "caller": caller, "count": len(incoming), "new": new})
     del state["runs"][:-200]
     return new
@@ -2594,26 +2603,26 @@ def clearing_stanza(finding, today):
     return stanza
 
 
-def build_verdict(state, store, base_keys, threshold_name, today, scope, head, base, stakes=None):
+def build_verdict(state, store, proposed, threshold_name, today, scope, head, base, stakes=None,
+                  policy_notes=()):
     """The code verdict. Open blocking findings at HEAD, minus the ones a valid,
-    live, already-merged disposition clears. A finding that carries facts has
-    its severity re-derived here from the (merged) facts and STAKES, so the
-    verdict never depends on which run wrote the severity down."""
+    live disposition from the base revision clears (STORE, see load_policy).
+    PROPOSED entries (in the working tree, not in the base) clear nothing; the
+    findings they would clear are reported. Every finding has its severity
+    re-derived here from its (merged) facts and STAKES, so the verdict never
+    depends on which run wrote the severity down."""
     threshold = threshold_rank(threshold_name)
     findings = []
     for stored in state["findings"]:
         if scope not in (None, stored["source"]):
             continue
-        if stored.get("rubric_applied"):
-            stored = apply_rubric(dict(stored), stakes)
-        findings.append(stored)
+        findings.append(apply_rubric(dict(stored), stakes))
     live, expired = [], []
     for entry in store["entries"]:
         until = parse_date(entry.get("expires")) if entry.get("expires") else None
         (expired if until is not None and until < today else live).append(entry)
-
-    def introduced(entry):
-        return base_keys is None or entry_key(entry) not in base_keys
+    live_proposed = [e for e in proposed
+                     if not (e.get("expires") and (parse_date(e["expires"]) or today) < today)]
 
     opened, cleared, pending, refused, advisory = [], [], [], [], 0
     expired_hits = {}
@@ -2630,10 +2639,15 @@ def build_verdict(state, store, base_keys, threshold_name, today, scope, head, b
                 continue
             if not entry_can_clear(entry, finding):
                 refusals.append(entry)
-            elif introduced(entry):
-                added.append(entry)
             elif winner is None:
                 winner = entry
+        for entry in live_proposed:
+            if not entry_matches(entry, finding):
+                continue
+            if not entry_can_clear(entry, finding):
+                refusals.append(entry)
+            else:
+                added.append(entry)
         for entry in expired:
             if entry_matches(entry, finding) and entry_can_clear(entry, finding):
                 expired_hits[entry["id"]] = expired_hits.get(entry["id"], 0) + 1
@@ -2651,9 +2665,7 @@ def build_verdict(state, store, base_keys, threshold_name, today, scope, head, b
         opened.append(record)
         status[key] = {"status": "open"}
     warnings = list(store["warnings"])
-    if base_keys is None and store["entries"]:
-        warnings.append("the base commit could not be resolved: every disposition entry is treated "
-                        "as added in this change and clears nothing")
+    warnings.extend(policy_notes)
     adjusted = []
     for finding in findings:
         moved = rubric_moved_text(finding)
@@ -2815,13 +2827,7 @@ def prompt_verdict(verdict):
 def _write_rubric_fields(item, record):
     """Copy what the rubric decided about RECORD onto the input finding ITEM:
     the severity it now has (the model's own moves to severity_claimed), the
-    tier of an Auditor finding, and what moved it. A finding without facts is
-    left as it was, except that a model which wrote only severity_claimed gets
-    that reading under the name every renderer and count reads."""
-    if not record.get("rubric_applied"):
-        if "severity" not in item and record.get("severity"):
-            item["severity"] = record["severity"]
-        return
+    tier of an Auditor finding, and what moved it."""
     item["severity_claimed"] = record["severity_claimed"]
     item["severity"] = record["severity"]
     if record.get("source") == "adversarial":
@@ -2956,11 +2962,10 @@ def run_evaluate(args):
             raise InputRefused(str(exc))
         except OSError as exc:
             raise InputRefused("the findings state cannot be written: %s" % exc)
-        store = load_store(root, worktree_reader(root))
-        base_keys = introduced_entry_keys(root, base)
+        store, proposed, policy_notes = load_policy(root, base)
         scope = gate if args.scope == "gate" and gate in SOURCES else None
-        verdict = build_verdict(state, store, base_keys, threshold_name, today, scope, head, base,
-                                stakes)
+        verdict = build_verdict(state, store, proposed, threshold_name, today, scope, head, base,
+                                stakes, policy_notes)
         if args.annotate:
             annotate_file(args.annotate, unified, verdict)
         if args.rubric_into:

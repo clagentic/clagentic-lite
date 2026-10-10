@@ -166,10 +166,22 @@ class TestUnifiedRecord(unittest.TestCase):
         legacy = findings.unify_finding({"severity": "low", "file": "a.py", "message": "m"}, "review")
         self.assertEqual(legacy["schema"], 2)
 
-    def test_a_finding_without_facts_keeps_the_severity_it_claimed(self):
-        record = findings.unify_finding({"severity": "low", "file": "a.py", "message": "m"}, "review")
-        self.assertEqual(record["severity"], "low")
-        self.assertNotIn("rubric_applied", record)
+    def test_a_finding_without_facts_is_the_worst_case_and_never_keeps_the_claim(self):
+        for source in ("review", "adversarial"):
+            for claimed in ("low", "critical", None):
+                with self.subTest(source=source, claimed=claimed):
+                    raw = {"file": "a.py", "message": "m"}
+                    if claimed:
+                        raw["severity"] = claimed
+                    record = findings.unify_finding(raw, source)
+                    self.assertEqual(record["severity"], "critical")
+                    self.assertTrue(record["rubric_applied"] and record["floor"])
+                    self.assertEqual((record["attacker_precondition"], record["impact"]),
+                                     ("unknown", "unknown"))
+                    if source == "adversarial":
+                        self.assertEqual(record["tier"], "blocking")
+        low = findings.unify_finding({"severity": "low", "file": "a.py", "message": "m"}, "review")
+        self.assertEqual(low["severity_claimed"], "low", "the claim is still shown")
 
     def test_a_finding_with_facts_takes_the_rubric_severity_and_keeps_the_claim(self):
         record = findings.unify_finding(fact_finding(severity_claimed="low"), "review")
@@ -558,6 +570,19 @@ class TestReconfirmation(Repo):
         self.assertTrue(any("touches the exposure surface" in w and "deploy/ingress.yaml" in w
                             for w in verdict["warnings"]), verdict["warnings"])
 
+    def test_the_exposure_filter_runs_before_the_path_cap(self):
+        self.put_profile({"version": 1, "confirmed_at": "2026-10-01", "default": {"data": "internal"}})
+        git(self.repo, "checkout", "-q", "-b", "feat/x")
+        for index in range(5):
+            write(os.path.join(self.repo, "a%d.txt" % index), "x\n")
+        commit_file(self.repo, "deploy/ingress.yaml", "kind: Ingress\n", "an ingress sorted past the cap")
+        base = findings.resolve_base(self.repo, "main", "main")
+        saved = findings.CHANGED_PATHS_MAX
+        findings.CHANGED_PATHS_MAX = 3
+        self.addCleanup(setattr, findings, "CHANGED_PATHS_MAX", saved)
+        touched = findings.changed_paths(self.repo, base, lambda p: p.endswith("ingress.yaml"))
+        self.assertEqual(touched, ["deploy/ingress.yaml"])
+
     def test_an_unrelated_diff_does_not(self):
         self.put_profile({"version": 1, "confirmed_at": "2026-10-01", "default": {"data": "internal"}})
         git(self.repo, "checkout", "-q", "-b", "feat/x")
@@ -682,13 +707,13 @@ class TestSampleUnion(Repo):
                 self.assertIn("sample 1/2: unreadable or unusable, excluded", result.stderr)
                 self.assertEqual([f["message"] for f in merged["findings"]], [good["message"]])
 
-    def test_a_sample_with_a_finding_that_is_not_an_object_is_excluded_whole(self):
+    def test_a_finding_that_is_not_an_object_is_kept_as_a_blank_worst_case_one(self):
         good = fact_finding()
-        result, merged = self.union({"findings": [fact_finding(message="half"), "not a finding"]},
-                                    {"findings": [good]})
+        result, merged = self.union({"findings": ["not a finding"]}, {"findings": [good]})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("sample 1/2: unreadable or unusable, excluded", result.stderr)
-        self.assertEqual([f["message"] for f in merged["findings"]], [good["message"]])
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(len(merged["findings"]), 2, "a finding is never dropped for being malformed")
+        self.assertIn({}, merged["findings"])
 
     def test_only_unusable_samples_fail_closed(self):
         result, merged = self.union([fact_finding()], "scalar", {"degraded": True})

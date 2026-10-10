@@ -171,17 +171,17 @@ class TestChangeIntroducedEntries(RepoCase):
         result = self.evaluate([finding(), finding(line=9, message="another problem")])
         self.assertIn("2 findings would be cleared by entries added in this PR", result.stdout)
 
-    def test_an_uncommitted_edit_counts_as_added(self):
+    def test_an_uncommitted_edit_changes_nothing_the_base_version_applies(self):
         self.put_dispositions([entry()])
         self.start_branch()
         write(os.path.join(self.repo, ".clagentic/dispositions.json"),
               json.dumps({"entries": [entry(rationale="rewritten after the fact")]}))
-        result = self.evaluate([finding()])
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("would be cleared by entries added in this PR", result.stdout)
+        result, verdict = self.verdict_json([finding()])
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(verdict["cleared"][0]["entry"]["rationale"], "intentional fixture")
 
     def test_a_changed_entry_is_not_the_one_the_base_had(self):
-        self.put_dispositions([entry(match={"path_glob": "app.py", "category": "security"})])
+        self.put_dispositions([entry(match={"path_glob": "docs/**", "category": "security"})])
         self.start_branch()
         commit_file(self.repo, ".clagentic/dispositions.json", json.dumps({"entries": [
             entry(match={"path_glob": "**/*.py", "category": "security"})]}), "widen it")
@@ -248,6 +248,15 @@ class TestSecurityFloor(RepoCase):
         self.start_branch()
         medium = adversarial_finding(severity="medium", tier="blocking")
         self.assertEqual(self.evaluate([medium], gate="adversarial").returncode, 0)
+
+    def test_a_blocking_finding_off_the_floor_is_cleared_by_by_design(self):
+        self.put_dispositions([entry(gates=["adversarial"],
+                                     match={"path_glob": "app.py", "category": "CWE-78"})])
+        self.start_branch()
+        off_floor = adversarial_finding(attacker_precondition="authenticated_user", impact="code_exec")
+        result, verdict = self.verdict_json([off_floor], gate="adversarial")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(verdict["cleared"]), 1, "blocking by tier, and by_design may clear it")
 
     def test_the_floor_is_reachable_and_at_least_high(self):
         self.assertTrue(findings.is_floor(findings.unify_finding(self.FLOOR, "adversarial")))
@@ -450,8 +459,8 @@ class TestLegacyFiles(RepoCase):
         commit_file(self.repo, ".clagentic/adversarial-acks.json", json.dumps([{
             "cwe": "CWE-78", "path_glob": "app.py", "rationale": "internal tool only",
             "acknowledged_by": "maintainer", "acknowledged_at": "2026-05-01"}]), "ack")
-        result = self.evaluate([adversarial_finding(severity="medium", tier="blocking",
-                                                    reachable="yes")], gate="adversarial")
+        result = self.evaluate([adversarial_finding(attacker_precondition="authenticated_user",
+                                                    impact="code_exec")], gate="adversarial")
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("ack-", result.stdout)
 
