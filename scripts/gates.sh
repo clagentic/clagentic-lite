@@ -2789,9 +2789,13 @@ _gate_evaluate() {
   _ge_scope="$4"
   shift 4
   _ge_head=$(_git_repo_scoped_head_sha)
+  # The age after which the optional stakes profile is prompted for
+  # re-confirmation; validated here like every other numeric knob, and optional.
+  _ge_profile_age=$(ds_positive_int_or_warn CLAGENTIC_RISK_PROFILE_MAX_AGE_DAYS "${CLAGENTIC_RISK_PROFILE_MAX_AGE_DAYS:-}" 180)
   set -- --gate "$_ge_gate" --caller gates --scope "$_ge_scope" --root "$REPO_ROOT" \
     --default-branch "${CLAGENTIC_DEFAULT_BRANCH:-main}" \
-    --threshold "${CLAGENTIC_BLOCK_SEVERITY:-high}" "$@"
+    --threshold "${CLAGENTIC_BLOCK_SEVERITY:-high}" \
+    --profile-max-age-days "$_ge_profile_age" "$@"
   [ -z "$_ge_head" ] || set -- "$@" --head "$_ge_head"
   [ -z "$_ge_base" ] || set -- "$@" --base "$_ge_base"
   _ge_rc=0
@@ -4631,7 +4635,7 @@ _review_llm_samples() {
       --default-branch "${CLAGENTIC_DEFAULT_BRANCH:-main}") || _rls_union_rc=$?
     if [ "$_rls_union_rc" -eq 0 ]; then
       printf '%s\n' "$_rls_union" > "$_rls_out"
-      cmd_log_run review-sample pass "union of ${_rls_usable}/${_rls_n} usable samples"
+      _cmd_log_run_checked_pass review-sample "union of ${_rls_usable}/${_rls_n} usable samples"
       rm -rf "$_rls_dir"
       return 0
     fi
@@ -7715,7 +7719,7 @@ cmd_deferrals_lint() {
 # (fail closed). Options are findings.py evaluate's; --root defaults to this
 # repository.
 cmd_evaluate() {
-  _gate_check_args evaluate "--no-input --json --gate= --format= --scope= --caller= --root= --head= --base= --default-branch= --threshold= --today= --annotate= --rubric-into= --attach-to= --json-out=" "" "$@" || return 2
+  _gate_check_args evaluate "--no-input --json --gate= --format= --scope= --caller= --root= --head= --base= --default-branch= --threshold= --today= --annotate= --rubric-into= --profile-max-age-days= --attach-to= --json-out=" "" "$@" || return 2
   _ev_has_root=0
   _ev_no_input=0
   for _ev_arg in "$@"; do

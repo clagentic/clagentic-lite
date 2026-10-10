@@ -1731,10 +1731,11 @@ def _codeowners_texts(root, base):
     return texts or None
 
 
-def load_stakes(root, base, today):
+def load_stakes(root, base, today, max_age_days=None):
     """The Stakes for a run: the risk profile as of BASE, inference over the
-    tree, CODEOWNERS coverage, and the re-confirmation warnings. Returns an
-    inert Stakes when there is no usable profile; never raises."""
+    tree, CODEOWNERS coverage, and the re-confirmation warnings (a profile older
+    than MAX_AGE_DAYS, else the environment's, else 180). Returns an inert
+    Stakes when there is no usable profile; never raises."""
     stakes = Stakes()
     try:
         work_text = worktree_reader(root)(PROFILE_REL)
@@ -1780,7 +1781,7 @@ def load_stakes(root, base, today):
     stakes.markers, inference_notes = infer_markers(root)
     stakes.notes.extend(inference_notes)
     _warn_contradictions(stakes)
-    _warn_reconfirmation(stakes, root, base, today)
+    _warn_reconfirmation(stakes, root, base, today, max_age_days)
     return stakes
 
 
@@ -1806,8 +1807,11 @@ def _warn_contradictions(stakes):
                        terminal_text(marker["why"], 200), marker["dimension"], marker["value"]))
 
 
-def _warn_reconfirmation(stakes, root, base, today):
-    max_age = positive_int_env("CLAGENTIC_RISK_PROFILE_MAX_AGE_DAYS", PROFILE_DEFAULT_MAX_AGE_DAYS)
+def _warn_reconfirmation(stakes, root, base, today, max_age_days=None):
+    if isinstance(max_age_days, int) and not isinstance(max_age_days, bool) and max_age_days > 0:
+        max_age = max_age_days
+    else:
+        max_age = positive_int_env("CLAGENTIC_RISK_PROFILE_MAX_AGE_DAYS", PROFILE_DEFAULT_MAX_AGE_DAYS)
     confirmed = parse_date(stakes.confirmed_at) if stakes.confirmed_at else None
     if confirmed is None:
         stakes.warnings.append("the risk profile has no valid confirmed_at date; re-confirm it with "
@@ -2795,8 +2799,11 @@ def _write_rubric_fields(item, record):
     """Copy what the rubric decided about RECORD onto the input finding ITEM:
     the severity it now has (the model's own moves to severity_claimed), the
     tier of an Auditor finding, and what moved it. A finding without facts is
-    left exactly as it was."""
+    left as it was, except that a model which wrote only severity_claimed gets
+    that reading under the name every renderer and count reads."""
     if not record.get("rubric_applied"):
+        if "severity" not in item and record.get("severity"):
+            item["severity"] = record["severity"]
         return
     item["severity_claimed"] = record["severity_claimed"]
     item["severity"] = record["severity"]
@@ -2909,7 +2916,7 @@ def run_evaluate(args):
         # the one as of that commit, and the rubric reads it while the findings
         # are unified.
         base = resolve_base(root, args.base, args.default_branch)
-        stakes = load_stakes(root, base, today)
+        stakes = load_stakes(root, base, today, args.profile_max_age_days)
         incoming, unified = None, []
         if not args.no_input:
             incoming = findings_from_text(read_stdin_bounded(), args.format)
@@ -4359,6 +4366,7 @@ def build_parser():
     sub.add_argument("--scope", choices=("head", "gate"), default="head")
     sub.add_argument("--caller", choices=("standalone", "gates"), default="standalone")
     sub.add_argument("--json", action="store_true")
+    sub.add_argument("--profile-max-age-days", type=int, default=0)
     for name in ("root", "head", "base", "default-branch", "threshold", "today",
                  "annotate", "rubric-into", "attach-to", "json-out"):
         sub.add_argument("--" + name, default="")

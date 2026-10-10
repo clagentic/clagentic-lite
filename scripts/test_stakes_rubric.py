@@ -19,7 +19,7 @@ import tempfile
 import unittest
 
 from scripts.findings_test_support import (
-    FINDINGS_PY, TOOL_HOME, commit_file, git, load_module, make_repo, run_findings, write)
+    TOOL_HOME, commit_file, git, load_module, make_repo, run_findings, write)
 
 findings = load_module()
 
