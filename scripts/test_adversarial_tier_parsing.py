@@ -250,7 +250,10 @@ class TestBackwardCompatibleOldHeaderFormat(unittest.TestCase):
     a model that has not picked up the new prompt instructions, or an old
     cached prompt in a chain fallback step, must not break the pipeline."""
 
-    def test_old_four_field_header_defaults_to_advisory(self):
+    def test_old_four_field_header_absent_reachable_is_worst_case(self):
+        """Expectation flipped from the earlier 'no': an absent reachable is
+        the worst case, so a high-severity old-shape header is reachable and
+        the security floor makes it blocking."""
         md = (
             "[FINDING] CWE-798 | scripts/z.sh:7 | severity: high | "
             "title: Hardcoded credential\n\n"
@@ -260,11 +263,24 @@ class TestBackwardCompatibleOldHeaderFormat(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         f = findings[0]
         self.assertEqual(f["severity"], "high")
-        self.assertEqual(f["reachable"], "no",
-                          "absent reachable field must default to 'no', not be left unset")
-        self.assertEqual(f["tier"], "advisory",
-                          "absent tier field must default to advisory — a parser gap can only under-block")
+        self.assertEqual(f["reachable"], "yes",
+                          "absent reachable field must resolve to the worst case, never 'no'")
+        self.assertEqual(f["tier"], "blocking",
+                          "reachable high severity is the security floor, whatever tier the header omitted")
         self.assertEqual(f["message"], "Hardcoded credential")
+
+    def test_old_four_field_header_low_severity_stays_advisory(self):
+        md = "[FINDING] CWE-1 | a.sh:1 | severity: low | title: Minor\n\nBody.\n"
+        f = _parse_findings(md)[0]
+        self.assertEqual(f["reachable"], "yes")
+        self.assertEqual(f["tier"], "advisory")
+
+    def test_invalid_reachable_is_worst_case(self):
+        md = ("[FINDING] CWE-1 | a.sh:1 | severity: critical | reachable: maybe | "
+              "title: Odd\n\nBody.\n")
+        f = _parse_findings(md)[0]
+        self.assertEqual(f["reachable"], "yes")
+        self.assertEqual(f["tier"], "blocking")
 
 
 class TestMixedFindingsAndOrdering(unittest.TestCase):

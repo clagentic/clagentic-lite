@@ -465,14 +465,15 @@ def parse_adversarial_text(text):
         else:
             fname, lineno = fileline, 0
         severity = severity_raw if severity_raw in SEVERITY_RANKS else "unknown"
-        # A header that states facts is read by the rubric, where an unstated or
-        # invalid reachable is the worst case (unknown, treated as reachable). A
-        # header without facts keeps the older reading, where it is "no".
+        # An unstated or invalid reachable is the worst case, never "no": a
+        # header that states facts is read by the rubric as unknown (treated as
+        # reachable); a header without facts has no rubric reading, so it is
+        # "yes" and the severity floor applies to it.
         facts_stated = precondition_raw is not None or impact_raw is not None
         if reachable_raw in ("yes", "no"):
             reachable = reachable_raw
         else:
-            reachable = "unknown" if facts_stated else "no"
+            reachable = "unknown" if facts_stated else "yes"
         tier = tier_raw if tier_raw in ("blocking", "advisory") else "advisory"
         # Reachability is the precondition for blocking, never a judgment the
         # tier field alone can override.
@@ -3274,6 +3275,35 @@ def union_review_samples(paths, stakes):
     return {"summary": summary, "checked": checked, "findings": union, "samples": len(paths)}, lines
 
 
+POLICY_FILES = (DISPOSITIONS_REL, LEGACY_DEFERRALS_REL, LEGACY_ACKS_REL, LEGACY_RISKS_REL, PROFILE_REL)
+
+
+def read_policy_file_at_base(root, base, rel):
+    """The text of policy file REL as the trusted base revision has it, or ""
+    when there is no base or the base does not have it. A prompt that quotes a
+    policy file reads it here, through the same revision load_policy uses, so
+    what the model is shown is what the gate would honour; the working tree's
+    copy is never consulted. Raises ValueError for a path that is not a policy
+    file and OSError when the base cannot be read."""
+    if rel not in POLICY_FILES:
+        raise ValueError("%s is not a policy file" % rel)
+    if not base:
+        return ""
+    return git_reader(root, base)(rel) or ""
+
+
+def cmd_ingest_policy_file(args):
+    root = os.path.realpath(args.root or os.getcwd())
+    try:
+        base = resolve_base(root, args.base, args.default_branch)
+        text = read_policy_file_at_base(root, base, args.rel)
+    except (ValueError, OSError) as exc:
+        warn("[findings] policy-file: %s" % terminal_text(exc, 200))
+        return 1
+    _print(text)
+    return 0
+
+
 def cmd_ingest_union_samples(args):
     root = os.path.realpath(args.root or os.getcwd())
     try:
@@ -4368,6 +4398,10 @@ def build_parser():
     sub.add_argument("--max", type=int, default=0)
     op(ingest, "allowlist", cmd_ingest_allowlist, ("fields", {"nargs": "+"}))
     op(ingest, "sanitize-fields", cmd_ingest_sanitize_fields, ("fields", {"nargs": "+"}))
+    sub = op(ingest, "policy-file", cmd_ingest_policy_file, ("rel", {}))
+    sub.add_argument("--root", default="")
+    sub.add_argument("--base", default="")
+    sub.add_argument("--default-branch", default="")
     sub = op(ingest, "union-samples", cmd_ingest_union_samples, ("files", {"nargs": "+"}))
     sub.add_argument("--root", default="")
     sub.add_argument("--base", default="")

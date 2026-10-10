@@ -5392,14 +5392,13 @@ _llm_degraded_remediation_lines() {
 # fails to compute a context window and the finding is simply omitted from
 # the key set — same conservative-drop behavior documented there).
 #
-# Parser default (fail-open, non-blocking side): reachable/tier are OPTIONAL
-# fields for backward compatibility with a model that emits the pre-lr-e2b975
-# header shape (severity | title, no reachable/tier), or that omits them
-# despite the prompt instruction. A finding with no parseable tier is
-# classified "advisory" — never "blocking" — so a parser gap can only ever
-# under-block (findings still fully visible in output/audit), matching the
-# task's "never suppression" constraint from the other direction: silence in
-# a gate-plumbing field must not manufacture a block that was never earned.
+# Parser defaults: reachable/tier are OPTIONAL fields for backward
+# compatibility with a model that emits the older header shape (severity |
+# title, no reachable/tier), or that omits them despite the prompt
+# instruction. An ABSENT or invalid reachable is the WORST CASE ("yes"), never
+# "no": silence must not lower a finding's standing, so the severity floor
+# applies to a high or critical finding that did not say it was unreachable.
+# An absent tier is "advisory" and is raised to blocking only by that floor.
 #
 # Every enum-shaped field (severity, reachable, tier, class) is validated and
 # force-corrected here, at parse time, to a member of its closed set — none
@@ -5481,7 +5480,8 @@ _parse_adversarial_findings() {
 #     re-verify the enum check in _parse_adversarial_findings still runs
 #     before trusting this comment again.
 #   reachable — closed set (yes/no). ENUM-VALIDATED AND FORCE-CORRECTED at
-#     parse time (unrecognized/absent -> "no"). Same reasoning as severity:
+#     parse time (unrecognized/absent -> "yes", the worst case; "unknown"
+#     when the header states rubric facts). Same reasoning as severity:
 #     no free text left after parsing, nothing for this function to do.
 #   tier      — closed set (blocking/advisory). ENUM-VALIDATED AND
 #     FORCE-CORRECTED at parse time: (unrecognized/absent -> "advisory");

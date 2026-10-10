@@ -253,13 +253,14 @@ ds_review_prompt() {
   # closed schema FIRST (_llm_json_array_allowlist_fields) is what makes
   # "only six named fields get sanitized" safe here: after the reduction,
   # there is no seventh field left to have skipped.
+  # The file is read from the BASE revision through git, never from the working
+  # tree (findings.py load_policy's rule): a deferral added on the branch under
+  # review must not reach the prompt as if it were already granted. An absent
+  # file, an unresolvable base and a read error all mean no deferrals, the
+  # worst case for the author.
   _drp_deferrals=""
-  _drp_dfile="$REPO_ROOT/.clagentic/deferrals.json"
-  if [ -f "$_drp_dfile" ]; then
-    _drp_deferrals=$(cat "$_drp_dfile" 2>/dev/null) || _drp_deferrals=""
-    # Validate that the content is non-empty after read; a read error yields "".
-    # If cat produced an empty string (empty file or read error), treat as no deferrals.
-  fi
+  _drp_deferrals=$(ds_findings_call -e any ingest policy-file .clagentic/deferrals.json \
+    --root "$REPO_ROOT" --default-branch "${CLAGENTIC_DEFAULT_BRANCH:-main}") || _drp_deferrals=""
 
   _drp_deferrals_failed=0
   if [ -n "$_drp_deferrals" ]; then
