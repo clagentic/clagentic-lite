@@ -324,8 +324,10 @@ class TestLlmClientRecordsRunMeta(unittest.TestCase):
         env.update(source_env(llm_client=True))
         if set_env:
             env["CLAGENTIC_LLM_RUN_META_FILE"] = meta_path
-        return subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env,
-                              cwd=project)
+        # $0 is llm-client.sh so its own `. "$(dirname "$0")/platform.sh"` resolves
+        # from the real scripts directory, not from the temp project cwd.
+        return subprocess.run(["sh", "-c", script, LLM_CLIENT_SH], capture_output=True,
+                              text=True, env=env, cwd=project)
 
     def test_line_carries_model_prompt_hash_and_sizes(self):
         with tempfile.TemporaryDirectory() as d:
