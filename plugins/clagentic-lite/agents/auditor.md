@@ -67,6 +67,10 @@ The rules below are the same text the gate-path Auditor receives, from one share
 
 {{shared:auditor:reachability}}
 
+### Facts
+
+{{shared:auditor:facts}}
+
 ### Blocking vs advisory
 
 {{shared:auditor:blocking-vs-advisory}}
@@ -75,7 +79,11 @@ The rules below are the same text the gate-path Auditor receives, from one share
 
 {{shared:auditor:change-class}}
 
-The finding pipeline (`bin/findings.py`, the code behind the gate's `_parse_adversarial_findings`) mechanically force-corrects `tier` to `blocking` whenever you state `reachable: yes` at severity `high`/`critical`, regardless of what `tier`/`class` you wrote. Getting `reachable`/`severity` right is still what determines the outcome — but a miscalibrated `tier` on a floor-eligible finding cannot silently downgrade it.
+The finding pipeline (`bin/findings.py`, the code behind the gate's `_parse_adversarial_findings`) computes each finding's severity and `tier` from the facts in its header with one rubric table, together with the repository's optional stakes profile (`.clagentic/risk-profile.json`, read as of the merge base). The same facts and the same profile always give the same answer, here and on the gate path. Getting the facts right is what determines the outcome; a miscalibrated `severity` or `tier` in the header cannot lower a finding, and a value outside the closed lists is read as the worst case.
+
+### Removed code
+
+{{shared:auditor:removal-aware}}
 
 ### Proof for high and critical
 
