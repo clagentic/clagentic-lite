@@ -41,7 +41,6 @@ cmd_update, cmd_doctor) or gates.sh.
 
 Run with: python3 -m unittest scripts.test_unified_plugin_render -v
 """
-import importlib.util
 import os
 import shlex
 import shutil
@@ -50,6 +49,8 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+
+from scripts.findings_test_support import manifest
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
@@ -883,15 +884,6 @@ def _extract_findings_probe():
     return content[start:content.index("\n}\n", start) + 3]
 
 
-def _pipeline_modules():
-    spec = importlib.util.spec_from_file_location(
-        "pipeline_manifest",
-        os.path.join(TOOL_HOME, "plugins", "clagentic-lite", "bin", "clagentic_findings", "__init__.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.MODULES
-
-
 class TestRenderedPluginCarriesTheFindingPackage(_RenderTestBase):
     """The Reviewer and Auditor agents run the rendered plugin's copy of the
     finding pipeline: the entrypoint and a package of modules. A rendered
@@ -918,7 +910,7 @@ class TestRenderedPluginCarriesTheFindingPackage(_RenderTestBase):
         self._render()
         package = os.path.join(self._rendered_bin(), "clagentic_findings")
         self.assertTrue(os.path.isfile(os.path.join(self._rendered_bin(), "findings.py")))
-        for name in ("__init__",) + tuple(_pipeline_modules()):
+        for name in ("__init__",) + tuple(manifest()):
             self.assertTrue(os.path.isfile(os.path.join(package, name + ".py")), name)
 
     def test_the_probe_passes_on_the_checkout_and_on_the_rendered_copy(self):

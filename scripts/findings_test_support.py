@@ -65,6 +65,16 @@ def load_module():
     return facade
 
 
+def manifest():
+    """The package's MODULES tuple, read from its __init__.py without
+    importing any module."""
+    spec = importlib.util.spec_from_file_location(
+        "manifest_under_test", os.path.join(PIPELINE_PACKAGE_DIR, "__init__.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.MODULES
+
+
 def copy_pipeline(bin_dir):
     """A copy of the shipped entrypoint and its package in BIN_DIR, for a test
     that must alter a module of the pipeline without touching the checkout."""

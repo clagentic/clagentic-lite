@@ -19,9 +19,11 @@ import sys
 import tempfile
 import unittest
 
+from scripts.findings_test_support import PIPELINE_PACKAGE_DIR
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 FINDINGS_PY = os.path.join(TOOL_HOME, "plugins", "clagentic-lite", "bin", "findings.py")
-PACKAGE_DIR = os.path.join(TOOL_HOME, "plugins", "clagentic-lite", "bin", "clagentic_findings")
+PACKAGE_DIR = PIPELINE_PACKAGE_DIR
 
 
 def run(args, stdin=None, cwd=None, env=None):

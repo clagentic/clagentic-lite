@@ -14,7 +14,6 @@ Structure and trust tests for the finding pipeline's package layout
 Run with: python3 -m unittest scripts/test_findings_package.py -v
 """
 import ast
-import importlib.util
 import os
 import shutil
 import subprocess
@@ -23,7 +22,7 @@ import tempfile
 import unittest
 
 from scripts.findings_test_support import (
-    FINDINGS_PY, PIPELINE_PACKAGE_DIR, clean_env, copy_pipeline, make_repo)
+    FINDINGS_PY, PIPELINE_PACKAGE_DIR, clean_env, copy_pipeline, make_repo, manifest)
 
 MAX_MODULE_LINES = 800
 
@@ -31,14 +30,6 @@ MAX_MODULE_LINES = 800
 def module_files():
     return sorted(name for name in os.listdir(PIPELINE_PACKAGE_DIR)
                   if name.endswith(".py") and name != "__init__.py")
-
-
-def manifest():
-    spec = importlib.util.spec_from_file_location(
-        "manifest_under_test", os.path.join(PIPELINE_PACKAGE_DIR, "__init__.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.MODULES
 
 
 def relative_imports(path):
@@ -251,6 +242,33 @@ class TestAPartialCopyFailsLoudlyAndClosed(Tmp):
         self.assertEqual((result.returncode, result.stdout), (70, ""))
         self.assertIn("RuntimeError: boom", result.stderr)
 
+    def test_a_crash_in_the_entrypoint_handler_path_exits_70_not_1(self):
+        bin_dir, entry = self.copy()
+        cli_path = os.path.join(bin_dir, "clagentic_findings", "cli.py")
+        with open(cli_path, "a") as handle:
+            handle.write("\n\ndef run(argv=None):\n    raise RuntimeError('boom-run')\n")
+        result = run_entrypoint(["verdict", "rank", "high"], entry=entry)
+        self.assertEqual((result.returncode, result.stdout), (70, ""))
+        self.assertIn("RuntimeError: boom-run", result.stderr)
+
+    def test_a_system_exit_from_run_passes_through_unchanged(self):
+        bin_dir, entry = self.copy()
+        cli_path = os.path.join(bin_dir, "clagentic_findings", "cli.py")
+        with open(cli_path, "a") as handle:
+            handle.write("\n\ndef run(argv=None):\n    raise SystemExit(2)\n")
+        result = run_entrypoint(["verdict", "rank", "high"], entry=entry)
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_any_exception_type_raised_while_loading_is_refused_with_70(self):
+        for exc in ("RuntimeError('boom-load')", "ValueError('bad')", "ZeroDivisionError()"):
+            with self.subTest(exc=exc):
+                bin_dir, entry = self.copy()
+                with open(os.path.join(bin_dir, "clagentic_findings", "severity.py"), "a") as handle:
+                    handle.write("\nraise %s\n" % exc)
+                self.assert_refused(run_entrypoint(["verdict", "rank", "high"], entry=entry),
+                                    "cannot be loaded", exc.split("(")[0])
+                shutil.rmtree(self.path("plugin"))
+
 
 class TestStandaloneInAnUnenrolledRepository(Tmp):
     def test_the_entrypoint_gives_a_verdict_from_a_copy_far_from_any_install(self):
@@ -262,7 +280,7 @@ class TestStandaloneInAnUnenrolledRepository(Tmp):
                                 entry=os.path.join(bin_dir, "findings.py"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(result.stdout.startswith("VERDICT: PASS"), result.stdout)
-        # Nothing but the accumulation state may appear, and only under .clagentic.
+        # A read-only stage leaves the repository's top level exactly as it was.
         self.assertEqual([n for n in sorted(os.listdir(repo)) if n not in before], [])
 
     def test_a_blocking_finding_blocks_and_exits_1(self):

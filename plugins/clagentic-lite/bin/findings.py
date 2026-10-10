@@ -62,18 +62,25 @@ def _load_package(directory):
     return importlib.import_module(PACKAGE + ".cli")
 
 
+def _crash(message):
+    sys.stderr.write("[clagentic-lite] %s Failing closed.\n" % message)
+    return CRASH_STATUS
+
+
 def main():
     directory = os.path.dirname(os.path.realpath(__file__))
     _drop_untrusted_path_entries()
+    # Exception, not BaseException: SystemExit from the cli passes through unchanged.
     try:
         cli = _load_package(directory)
-    except (ImportError, OSError, SyntaxError, AttributeError) as exc:
-        sys.stderr.write("[clagentic-lite] the finding pipeline package in %s cannot be loaded "
-                         "(%s: %s); the install is incomplete or damaged: reinstall "
-                         "(clagentic-lite update). Failing closed.\n"
-                         % (os.path.join(directory, PACKAGE), type(exc).__name__, exc))
-        return CRASH_STATUS
-    return cli.run()
+    except Exception as exc:  # any load failure of a damaged package must exit 70, not 1
+        return _crash("the finding pipeline package in %s cannot be loaded (%s: %s); the "
+                      "install is incomplete or damaged: reinstall (clagentic-lite update)."
+                      % (os.path.join(directory, PACKAGE), type(exc).__name__, exc))
+    try:
+        return cli.run()
+    except Exception as exc:  # python's default status 1 would read as a refusal to callers
+        return _crash("the finding pipeline crashed (%s: %s)." % (type(exc).__name__, exc))
 
 
 if __name__ == "__main__":

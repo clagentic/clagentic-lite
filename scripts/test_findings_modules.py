@@ -71,14 +71,11 @@ class TestFileio(Tmp):
                 self.assertEqual("WARN" in err.getvalue(), raw not in ("7", ""))
 
     def test_max_field_chars_is_resolved_once_per_process(self):
-        cache = M["fileio"]._MAX_FIELD_CHARS
-        saved = list(cache)
-        self.addCleanup(lambda: cache.__setitem__(slice(None), saved))
-        del cache[:]
+        fileio = load_module().modules["fileio"]
         with mock.patch.dict(os.environ, {"CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS": "250"}):
-            self.assertEqual(M["fileio"].max_field_chars(), 250)
+            self.assertEqual(fileio.max_field_chars(), 250)
         with mock.patch.dict(os.environ, {"CLAGENTIC_INVARIANT_FEED_MAX_FIELD_CHARS": "999"}):
-            self.assertEqual(M["fileio"].max_field_chars(), 250)
+            self.assertEqual(fileio.max_field_chars(), 250)
 
 
 class TestDigest(unittest.TestCase):
