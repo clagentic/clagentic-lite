@@ -44,14 +44,10 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_source_helpers import GATES_SH, source_env  # noqa: E402
+from isolated_env import shared_env, shared_project  # noqa: E402
+from test_source_helpers import GATES_SH, git_env, source_env  # noqa: E402
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-_GIT_ENV = {
-    "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-    "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-}
 
 
 def _gitleaks_available():
@@ -59,7 +55,7 @@ def _gitleaks_available():
 
 
 def _run_gates_sh(script_body, env_extra=None, cwd=None):
-    env = os.environ.copy()
+    env = shared_env(project=shared_project())
     env.update(source_env(gates=True))
     if env_extra:
         env.update(env_extra)
@@ -67,7 +63,7 @@ def _run_gates_sh(script_body, env_extra=None, cwd=None):
     return subprocess.run(
         ["sh", "-c", script, GATES_SH],
         capture_output=True, text=True, env=env,
-        cwd=cwd or os.path.join(TOOL_HOME, "scripts"),
+        cwd=cwd or shared_project(),
         timeout=120,
     )
 
@@ -504,8 +500,8 @@ class TestCanaryFixturesAreNotSourceLiterals(unittest.TestCase):
         content."""
         tmp = tempfile.mkdtemp(prefix="clagentic-test-branch-history-")
         try:
-            subprocess.run(["git", "init", "-q", "-b", "feature", tmp], check=True)
-            env = {**os.environ, **_GIT_ENV}
+            env = git_env()
+            subprocess.run(["git", "init", "-q", "-b", "feature", tmp], check=True, env=env)
             scripts_dir = os.path.join(tmp, "scripts")
             os.makedirs(scripts_dir)
             shutil.copy(GATES_SH, os.path.join(scripts_dir, "gates.sh"))
@@ -531,7 +527,7 @@ class TestCanaryFixturesAreNotSourceLiterals(unittest.TestCase):
             if probe.returncode == 0:
                 r = subprocess.run(
                     ["gitleaks", "git", "--no-banner", "--redact"],
-                    capture_output=True, text=True, cwd=tmp, timeout=120,
+                    capture_output=True, text=True, cwd=tmp, timeout=120, env=env,
                 )
             else:
                 report = tempfile.mktemp(prefix="clagentic-test-branch-history-", suffix=".json")
@@ -559,8 +555,8 @@ class TestCmdSecretsConfigPreflight(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="clagentic-test-cmdsecrets-")
-        subprocess.run(["git", "init", "-q", "-b", "main", self._tmp], check=True)
-        env = {**os.environ, **_GIT_ENV}
+        env = git_env()
+        subprocess.run(["git", "init", "-q", "-b", "main", self._tmp], check=True, env=env)
         with open(os.path.join(self._tmp, "app.py"), "w") as f:
             f.write("def handle(x):\n    return x\n")
         subprocess.run(["git", "add", "app.py"], check=True, cwd=self._tmp, env=env)
@@ -575,8 +571,7 @@ class TestCmdSecretsConfigPreflight(unittest.TestCase):
             description = "rules-less -- the reported defect"
             paths = ['''^.*$''']
         """))
-        env = os.environ.copy()
-        env["CLAGENTIC_PROJECT_ROOT"] = self._tmp
+        env = {"CLAGENTIC_PROJECT_ROOT": self._tmp}
         r = _run_gates_sh("cmd_secrets", env_extra=env, cwd=self._tmp)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("defines no rules", r.stderr)
@@ -593,8 +588,7 @@ class TestCmdSecretsConfigPreflight(unittest.TestCase):
             [extend]
             useDefault = true
         """))
-        env = os.environ.copy()
-        env["CLAGENTIC_PROJECT_ROOT"] = self._tmp
+        env = {"CLAGENTIC_PROJECT_ROOT": self._tmp}
         r = _run_gates_sh("cmd_secrets", env_extra=env, cwd=self._tmp)
         self.assertNotIn("defines no rules", r.stderr)
 
@@ -607,8 +601,8 @@ class TestReadDeterministicGatesNoCoverage(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="clagentic-test-nocoverage-")
-        subprocess.run(["git", "init", "-q", self._tmp], check=True)
-        env = {**os.environ, **_GIT_ENV}
+        env = git_env()
+        subprocess.run(["git", "init", "-q", self._tmp], check=True, env=env)
         subprocess.run(["git", "-C", self._tmp, "commit", "-q", "--allow-empty", "-m", "seed"],
                         check=True, env=env)
 
@@ -616,12 +610,11 @@ class TestReadDeterministicGatesNoCoverage(unittest.TestCase):
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _seed_and_read(self, gate, outcome, details):
-        env = os.environ.copy()
-        env["CLAGENTIC_PROJECT_ROOT"] = self._tmp
+        env = shared_env(project=self._tmp)
         r = subprocess.run(
             [GATES_SH, "log-run", gate, outcome, details],
             capture_output=True, text=True, env=env,
-            cwd=os.path.join(TOOL_HOME, "scripts"), timeout=30,
+            cwd=self._tmp, timeout=30,
         )
         assert r.returncode == 0, r.stderr
         r2 = _run_gates_sh("_read_deterministic_gates", env_extra={"CLAGENTIC_PROJECT_ROOT": self._tmp})

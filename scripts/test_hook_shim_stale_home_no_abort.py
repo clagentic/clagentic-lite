@@ -69,6 +69,8 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.isolated_env import shared_tool_home
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 HOOK_SHIMS_DIR = os.path.join(TOOL_HOME, "share", "hook-shims")
 DASH = shutil.which("dash") or "/usr/bin/dash"
@@ -232,15 +234,18 @@ class TestHookShimStillWorksWithValidHome(unittest.TestCase):
         template_path = os.path.join(
             HOOK_SHIMS_DIR, "pre-write-guard.sh.template"
         )
+        scratch_home = tempfile.mkdtemp(prefix="clagentic-test-hookshim-home-")
+        self.addCleanup(shutil.rmtree, scratch_home, True)
         minimal_env = {
-            "CLAGENTIC_LITE_HOME": TOOL_HOME,
+            "CLAGENTIC_LITE_HOME": shared_tool_home(),
             "PATH": "/usr/bin:/bin",
-            "HOME": tempfile.mkdtemp(prefix="clagentic-test-hookshim-home-"),
+            "HOME": scratch_home,
         }
         proc = subprocess.run(
             [DASH, template_path],
             input="{}",
             env=minimal_env,
+            cwd=scratch_home,
             capture_output=True,
             text=True,
             timeout=10,

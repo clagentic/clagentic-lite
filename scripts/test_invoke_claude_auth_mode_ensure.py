@@ -90,9 +90,8 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _write_environ_dump_success_claude(bin_dir, out_path, num_turns=5):
@@ -239,7 +238,7 @@ class _InvokeClaudeEnsureTestBase(unittest.TestCase):
             with open(input_file, "w") as f:
                 f.write("test diff")
 
-            env = dict(os.environ)
+            env = shared_env(project=tmpdir)
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
             env.pop("CLAGENTIC_AUTH_MODE", None)
@@ -259,7 +258,7 @@ class _InvokeClaudeEnsureTestBase(unittest.TestCase):
                 ["sh", "-c", script, LLM_CLIENT_SH],
                 capture_output=True,
                 text=True,
-                cwd=TOOL_HOME,
+                cwd=tmpdir,
                 env=env,
             )
             self.assertTrue(
@@ -345,7 +344,7 @@ class TestAcceptance4GateRoleNoFallback(unittest.TestCase):
                 . '{LLM_CLIENT_SH}'
                 printf 'stdin diff content' | walk_chain 'gate' 'json' _fixture_prompt
             """)
-            env = dict(os.environ)
+            env = shared_env(project=tmpdir)
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
             env.pop("CLAGENTIC_AUTH_MODE", None)
             env.pop("AWS_CONFIG_FILE", None)
@@ -361,7 +360,7 @@ class TestAcceptance4GateRoleNoFallback(unittest.TestCase):
                 ["sh", "-c", script, LLM_CLIENT_SH],
                 capture_output=True,
                 text=True,
-                cwd=TOOL_HOME,
+                cwd=tmpdir,
                 env=env,
             )
             child_env = _read_environ_dump(dump_path) if os.path.exists(dump_path) else {}
@@ -417,7 +416,7 @@ class TestAcceptance5ReviewerLayer2FallbackCarriesEnsure(unittest.TestCase):
                 . '{LLM_CLIENT_SH}'
                 printf 'stdin diff content' | walk_chain 'reviewer' 'json' _fixture_prompt
             """)
-            env = dict(os.environ)
+            env = shared_env(project=tmpdir)
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
             env.pop("AWS_CONFIG_FILE", None)
             env.pop("AWS_SHARED_CREDENTIALS_FILE", None)
@@ -431,7 +430,7 @@ class TestAcceptance5ReviewerLayer2FallbackCarriesEnsure(unittest.TestCase):
                 ["sh", "-c", script, LLM_CLIENT_SH],
                 capture_output=True,
                 text=True,
-                cwd=TOOL_HOME,
+                cwd=tmpdir,
                 env=env,
                 timeout=30,
             )
@@ -501,7 +500,7 @@ class TestAcceptance6NonClaudeEnvStripUnaffected(unittest.TestCase):
                 . '{LLM_CLIENT_SH}'
                 invoke_generic "some-generic-cli" "" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" 5
             """)
-            env = dict(os.environ)
+            env = shared_env(project=tmpdir)
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
             env["CLAGENTIC_AUTH_MODE"] = "bedrock-sso"
@@ -513,7 +512,7 @@ class TestAcceptance6NonClaudeEnvStripUnaffected(unittest.TestCase):
                 ["sh", "-c", script, LLM_CLIENT_SH],
                 capture_output=True,
                 text=True,
-                cwd=TOOL_HOME,
+                cwd=tmpdir,
                 env=env,
             )
             self.assertTrue(os.path.exists(dump_path), f"stdout={r.stdout!r} stderr={r.stderr!r}")
@@ -588,7 +587,7 @@ class TestAcceptance7DsTimeoutMissingStillFailsClosed(unittest.TestCase):
                 invoke_claude "" "$PROMPT_FILE" "$INPUT_FILE" "$OUTPUT_FILE" "$ERR_FILE" 5 "markdown" "auditor"
                 exit $?
             """)
-            env = dict(os.environ)
+            env = shared_env(project=tmpdir)
             env["PATH"] = bin_dir
             env.pop("CLAUDE_CODE_USE_BEDROCK", None)
             env["CLAGENTIC_AUTH_MODE"] = "bedrock-sso"
@@ -597,7 +596,7 @@ class TestAcceptance7DsTimeoutMissingStillFailsClosed(unittest.TestCase):
                 ["sh", "-c", script, LLM_CLIENT_SH],
                 capture_output=True,
                 text=True,
-                cwd=TOOL_HOME,
+                cwd=tmpdir,
                 env=env,
             )
             err_file_content = ""

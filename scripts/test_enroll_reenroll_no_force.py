@@ -24,8 +24,10 @@ must never point CLAGENTIC_LITE_HOME at the real dev checkout while
 exercising an enroll/update code path, since `update`'s non-tty
 discard-uncommitted-changes path (git stash push + stash drop) has
 previously silently discarded uncommitted edits when misdirected. This file
-never calls `update`, and CLAGENTIC_LITE_HOME is always the read-only tool
-checkout (never mutated), while the enroll TARGET is always a fresh
+never calls `update`, and CLAGENTIC_LITE_HOME is always the throwaway clone
+from scripts/isolated_env.py (enroll materializes hook scripts and the
+rendered plugin into the tool home, so it must not be the live tree), while
+the enroll TARGET is always a fresh
 tempfile.mkdtemp() git repo.
 
 Run with: python3 -m unittest scripts/test_enroll_reenroll_no_force.py -v
@@ -37,8 +39,7 @@ import subprocess
 import tempfile
 import unittest
 
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
+from scripts.isolated_env import shared_cli, shared_tool_home
 
 
 def _init_git_repo(path):
@@ -53,10 +54,10 @@ def _init_git_repo(path):
 def _run_cli(argv, cwd, home):
     env = dict(os.environ)
     env["HOME"] = home
-    env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
+    env["CLAGENTIC_LITE_HOME"] = shared_tool_home()
     env.pop("CLAGENTIC_HOME", None)
     proc = subprocess.run(
-        [CLI] + argv,
+        [shared_cli()] + argv,
         cwd=cwd,
         env=env,
         capture_output=True,

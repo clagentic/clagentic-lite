@@ -33,9 +33,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env, shared_project  # noqa: E402
 from test_source_helpers import LLM_CLIENT_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _run_indirect_read(call, extra_env=None):
@@ -46,7 +45,7 @@ def _run_indirect_read(call, extra_env=None):
         . '{LLM_CLIENT_SH}'
         {call}
     """)
-    env = os.environ.copy()
+    env = shared_env(project=shared_project())
     env.update(source_env(llm_client=True))
     if extra_env:
         env.update(extra_env)
@@ -54,7 +53,7 @@ def _run_indirect_read(call, extra_env=None):
         ["sh", "-c", script, LLM_CLIENT_SH],
         capture_output=True,
         text=True,
-        cwd=TOOL_HOME,
+        cwd=shared_project(),
         env=env,
     )
     return r.stdout, r.stderr, r.returncode

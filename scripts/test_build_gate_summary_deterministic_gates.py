@@ -42,9 +42,8 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import GATES_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _git_init_with_commit(path):
@@ -92,12 +91,11 @@ def _seed_audit_db(project_root, rows):
     rows are the ones _read_deterministic_gates should surface as latest).
     """
     for gate, outcome, details in rows:
-        env = os.environ.copy()
-        env["CLAGENTIC_PROJECT_ROOT"] = project_root
+        env = shared_env(project=project_root)
         r = subprocess.run(
             [GATES_SH, "log-run", gate, outcome, details],
             capture_output=True, text=True, env=env,
-            cwd=os.path.join(TOOL_HOME, "scripts"),
+            cwd=project_root,
         )
         assert r.returncode == 0, f"log-run failed: {r.stderr}"
 
@@ -105,8 +103,7 @@ def _seed_audit_db(project_root, rows):
 def _run_build_gate_summary(project_root, path_override=None):
     sourced_gates = GATES_SH
     script = f". '{sourced_gates}'\nbuild_gate_summary\n"
-    env = os.environ.copy()
-    env["CLAGENTIC_PROJECT_ROOT"] = project_root
+    env = shared_env(project=project_root)
     env["CLAGENTIC_ALLOW_STALE_PAYLOAD"] = "1"
     env.update(source_env(gates=True))
     if path_override is not None:
@@ -115,7 +112,7 @@ def _run_build_gate_summary(project_root, path_override=None):
     r = subprocess.run(
         ["sh", "-c", script, sourced_gates],
         capture_output=True, text=True, env=env,
-        cwd=os.path.join(TOOL_HOME, "scripts"),
+        cwd=project_root,
     )
     assert r.returncode == 0, f"build_gate_summary failed: {r.stderr}"
     return json.loads(r.stdout)
@@ -223,15 +220,14 @@ def _call_read_deterministic_gates(project_root, path_override=None):
     (e.g. test_build_gate_summary_change_class.py sources gates.sh and
     calls build_gate_summary directly rather than the CLI)."""
     script = f". '{GATES_SH}'\n_read_deterministic_gates\n"
-    env = os.environ.copy()
-    env["CLAGENTIC_PROJECT_ROOT"] = project_root
+    env = shared_env(project=project_root)
     env.update(source_env(gates=True))
     if path_override is not None:
         env["PATH"] = path_override
     r = subprocess.run(
         ["sh", "-c", script, GATES_SH],
         capture_output=True, text=True, env=env,
-        cwd=os.path.join(TOOL_HOME, "scripts"),
+        cwd=project_root,
     )
     assert r.returncode == 0, f"_read_deterministic_gates failed: {r.stderr}"
     return json.loads(r.stdout)

@@ -330,7 +330,7 @@ class TestGateFunctionsFailClosedOnAMidRunFailure(Base):
                        PATH=path or (self.stub_dir + os.pathsep + os.environ.get("PATH", "")))
         env.update(source_env(gates=True))
         return subprocess.run(["sh", "-c", ". '%s'\n%s\n" % (GATES_SH, body), GATES_SH],
-                              capture_output=True, text=True, cwd=os.path.join(TOOL_HOME, "scripts"),
+                              capture_output=True, text=True, cwd=self.project,
                               env=env, timeout=120)
 
     def test_severity_blockers_prints_the_sentinel_not_the_fragment(self):

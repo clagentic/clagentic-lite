@@ -37,9 +37,8 @@ from test_merge_gate_recheck import (  # noqa: E402
     _run_merge_gate,
     _setup_project,
 )
+from isolated_env import shared_env, shared_project  # noqa: E402
 from test_source_helpers import GATES_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 REVIEW_BEGIN = "===BEGIN REVIEW FINDINGS DATA==="
 REVIEW_END = "===END REVIEW FINDINGS DATA==="
@@ -78,8 +77,7 @@ def _git_init_with_commit(path):
 
 def _run_build_gate_summary(project_root, path_override=None):
     script = f". '{GATES_SH}'\nbuild_gate_summary\n"
-    env = os.environ.copy()
-    env["CLAGENTIC_PROJECT_ROOT"] = project_root
+    env = shared_env(project=project_root)
     env["CLAGENTIC_ALLOW_STALE_PAYLOAD"] = "1"
     env.update(source_env(gates=True))
     if path_override is not None:
@@ -87,7 +85,7 @@ def _run_build_gate_summary(project_root, path_override=None):
     r = subprocess.run(
         ["sh", "-c", script, GATES_SH],
         capture_output=True, text=True, env=env,
-        cwd=os.path.join(TOOL_HOME, "scripts"),
+        cwd=project_root,
     )
     assert r.returncode == 0, f"build_gate_summary failed: {r.stderr}"
     return json.loads(r.stdout)
@@ -306,12 +304,11 @@ class TestSanitizeHelperLargeArrays(_Base):
             f". '{GATES_SH}'\n"
             f"_llm_json_array_sanitize_fields_strict \"$(cat '{payload_file}')\" message\n"
         )
-        env = os.environ.copy()
-        env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
+        env = shared_env(project=self._tmpdir)
         env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, GATES_SH], capture_output=True, text=True,
-            env=env, cwd=os.path.join(TOOL_HOME, "scripts"),
+            env=env, cwd=self._tmpdir,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout)
@@ -344,12 +341,11 @@ class TestExtractFindingsStrictContract(_Base):
         with open(path, "w") as f:
             f.write(raw_text)
         script = f". '{GATES_SH}'\n_extract_findings_json_strict '{path}'\n"
-        env = os.environ.copy()
-        env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
+        env = shared_env(project=self._tmpdir)
         env.update(source_env(gates=True))
         return subprocess.run(
             ["sh", "-c", script, GATES_SH], capture_output=True, text=True,
-            env=env, cwd=os.path.join(TOOL_HOME, "scripts"),
+            env=env, cwd=self._tmpdir,
         )
 
     def test_absent_key_is_empty_list(self):
@@ -381,12 +377,11 @@ class TestExtractFindingsStrictContract(_Base):
                 with open(path, "w") as f:
                     f.write(raw)
                 script = f". '{GATES_SH}'\n_sanitize_review_findings_envelope '{path}'\n"
-                env = os.environ.copy()
-                env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
+                env = shared_env(project=self._tmpdir)
                 env.update(source_env(gates=True))
                 r = subprocess.run(
                     ["sh", "-c", script, GATES_SH], capture_output=True,
-                    text=True, env=env, cwd=os.path.join(TOOL_HOME, "scripts"),
+                    text=True, env=env, cwd=self._tmpdir,
                 )
                 self.assertEqual(r.returncode, 0, r.stderr)
                 with open(path) as f:
@@ -461,11 +456,11 @@ class TestRecheckReadsReviewSha(unittest.TestCase):
 class TestMergeGatePromptReadsOnlyFencedForms(unittest.TestCase):
     def _prompt(self):
         from test_source_helpers import LLM_CLIENT_SH
-        env = os.environ.copy()
+        env = shared_env(project=shared_project())
         env.update(source_env(llm_client=True))
         r = subprocess.run(
             ["sh", "-c", f". '{LLM_CLIENT_SH}'\nds_merge_gate_prompt\n", LLM_CLIENT_SH],
-            capture_output=True, text=True, cwd=TOOL_HOME, env=env,
+            capture_output=True, text=True, cwd=shared_project(), env=env,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
@@ -521,8 +516,7 @@ class _FailureBase(_Base):
 
     def _run(self, path, script_body="build_gate_summary", extra_env=None, unset_stale=False):
         script = f". '{GATES_SH}'\n{script_body}\n"
-        env = os.environ.copy()
-        env["CLAGENTIC_PROJECT_ROOT"] = self._tmpdir
+        env = shared_env(project=self._tmpdir)
         env["TMPDIR"] = self._private_tmp
         if unset_stale:
             env.pop("CLAGENTIC_ALLOW_STALE_PAYLOAD", None)
@@ -534,7 +528,7 @@ class _FailureBase(_Base):
         env["PATH"] = path
         return subprocess.run(
             ["sh", "-c", script, GATES_SH], capture_output=True, text=True,
-            env=env, cwd=os.path.join(TOOL_HOME, "scripts"),
+            env=env, cwd=self._tmpdir,
         )
 
     def _payload(self, path, **kw):

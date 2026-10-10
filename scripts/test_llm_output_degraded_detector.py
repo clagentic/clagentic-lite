@@ -51,9 +51,8 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import GATES_SH, source_env  # noqa: E402
-
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 # Coreutils gates.sh's own sourcing preamble and _llm_output_is_degraded's
 # own body need on PATH (dirname for the `. "$(dirname "$0")/platform.sh"`
@@ -92,7 +91,7 @@ def _run_sh_function(call_line, extra_script="", extra_env=None):
             {extra_script}
             {call_line}
         """)
-        env = os.environ.copy()
+        env = shared_env(project=tmpdir)
         if extra_env:
             env.update(extra_env)
         env.update(source_env(gates=True))
@@ -100,7 +99,7 @@ def _run_sh_function(call_line, extra_script="", extra_env=None):
             ["sh", "-c", script, sourced_gates],
             capture_output=True,
             text=True,
-            cwd=os.path.join(TOOL_HOME, "scripts"),
+            cwd=tmpdir,
             env=env,
         )
         return r.stdout, r.stderr, r.returncode
@@ -334,11 +333,11 @@ class TestFailClosedOnNoValidator(unittest.TestCase):
                 . '{sourced_gates}'
                 {call_line}
             """)
-            env = os.environ.copy()
+            env = shared_env(project=tmpdir)
             env.update(source_env(gates=True))
             r = subprocess.run(
                 ["sh", "-c", script, sourced_gates],
-                capture_output=True, text=True, cwd=os.path.join(TOOL_HOME, "scripts"),
+                capture_output=True, text=True, cwd=tmpdir,
                 env=env,
             )
             return r.stdout, r.stderr, r.returncode

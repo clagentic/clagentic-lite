@@ -18,9 +18,9 @@ for exercising cmd_doctor's "6. Registry + enrolled repos" per-repo loop
 (bin/clagentic-lite ~line 2368), which this scope item extends with a new
 .gitleaks.toml check rather than building a parallel warning path.
 
-`doctor` never runs `git -C "$CLAGENTIC_LITE_HOME" stash`, unlike `update`,
-so CLAGENTIC_LITE_HOME can point straight at the live checkout here -- no
-throwaway clone needed for this file specifically.
+CLAGENTIC_LITE_HOME points at the per-process throwaway clone from
+scripts/isolated_env.py, never the live checkout: no test in this suite may
+aim the CLI at the live tree.
 
 Run with: python3 -m unittest scripts.test_doctor_gitleaks_config_advisory -v
 """
@@ -30,8 +30,7 @@ import subprocess
 import tempfile
 import unittest
 
-TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
+from scripts.isolated_env import shared_cli, shared_tool_home
 
 
 def _init_git_repo(path):
@@ -74,12 +73,12 @@ class _DoctorGitleaksAdvisoryTestBase(unittest.TestCase):
     def _run_doctor(self):
         env = dict(os.environ)
         env["HOME"] = self.home
-        env["CLAGENTIC_LITE_HOME"] = TOOL_HOME
+        env["CLAGENTIC_LITE_HOME"] = shared_tool_home()
         env["CLAGENTIC_SKIP_UPDATE_ALERT"] = "1"
         env.pop("CLAGENTIC_HOME", None)
         env.pop("CLAGENTIC_ROUTER_URL", None)
         proc = subprocess.run(
-            [CLI, "doctor"], cwd=self.repo, env=env,
+            [shared_cli(), "doctor"], cwd=self.repo, env=env,
             capture_output=True, text=True, timeout=30,
         )
         return proc.returncode, proc.stdout, proc.stderr

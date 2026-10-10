@@ -45,6 +45,7 @@ import unittest
 # only resolves reliably once this file's own directory is on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import GATES_SH, PLATFORM_SH, source_env  # noqa: E402
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -62,7 +63,7 @@ def _run_platform_function(call_line):
         """)
         r = subprocess.run(
             ["sh", "-c", script, PLATFORM_SH],
-            capture_output=True, text=True, cwd=os.path.join(TOOL_HOME, "scripts"),
+            capture_output=True, text=True, cwd=tmpdir, env=shared_env(project=tmpdir),
         )
         return r.stdout, r.stderr, r.returncode
     finally:
@@ -175,15 +176,14 @@ def _run_cmd_adversarial(project_root, fake_llm_client_sh, extra_env=None):
             TOOL_HOME='{fake_tool_home}'
             cmd_adversarial
         """)
-        env = os.environ.copy()
-        env["CLAGENTIC_PROJECT_ROOT"] = project_root
+        env = shared_env(project=project_root)
         if extra_env:
             env.update(extra_env)
         env.update(source_env(gates=True))
         r = subprocess.run(
             ["sh", "-c", script, sourced_gates],
             capture_output=True, text=True, env=env,
-            cwd=os.path.join(TOOL_HOME, "scripts"),
+            cwd=project_root,
         )
         return r.stdout, r.stderr, r.returncode
     finally:

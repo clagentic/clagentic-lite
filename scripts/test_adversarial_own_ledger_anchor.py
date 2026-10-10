@@ -55,6 +55,8 @@ import tempfile
 import textwrap
 import unittest
 
+from scripts.isolated_env import shared_env
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 _GIT_IDENTITY_ENV = {
@@ -215,8 +217,7 @@ def _make_stub_llm_client(fake_tool_home, diffs_dir):
 
 def _run_gates(subcmd, extra_args, fake_tool_home, project_root, env_overrides=None):
     fake_gates = os.path.join(fake_tool_home, "scripts", "gates.sh")
-    env = os.environ.copy()
-    env["CLAGENTIC_PROJECT_ROOT"] = project_root
+    env = shared_env(project=project_root)
     env["CLAGENTIC_ALLOW_MISSING_GITLEAKS"] = "1"
     env["CLAGENTIC_ALLOW_MISSING_SEMGREP"] = "1"
     env["CLAGENTIC_ALLOW_MISSING_OSV"] = "1"

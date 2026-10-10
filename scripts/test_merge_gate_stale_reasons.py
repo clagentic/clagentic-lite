@@ -29,11 +29,11 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from isolated_env import shared_env  # noqa: E402
 from test_source_helpers import (  # noqa: E402
     GATES_SH,
     PLATFORM_SH,
     RECURRING_FINDING as _RECURRING_FINDING,
-    TOOL_HOME,
     init_git_repo as _init_git_repo,
     path_without,
     setup_fake_tool_home as _setup_fake_tool_home,
@@ -69,9 +69,8 @@ class _Base(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
     def _env(self, hide=None):
-        env = os.environ.copy()
+        env = shared_env(project=self._project)
         env.update({
-            "CLAGENTIC_PROJECT_ROOT": self._project,
             "CLAGENTIC_ALLOW_MISSING_GITLEAKS": "1",
             "CLAGENTIC_ALLOW_MISSING_SEMGREP": "1",
             "CLAGENTIC_ALLOW_MISSING_OSV": "1",
@@ -311,7 +310,7 @@ class TestEmptyHead(_Base):
         env.update(source_env(gates=True))
         env["SUMMARY_OUT"] = summary
         r = subprocess.run(["sh", "-c", script, GATES_SH], capture_output=True, text=True,
-                           env=env, cwd=os.path.join(TOOL_HOME, "scripts"))
+                           env=env, cwd=self._project)
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(summary) as f:
             body = json.load(f)

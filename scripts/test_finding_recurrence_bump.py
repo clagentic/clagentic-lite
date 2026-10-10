@@ -18,7 +18,12 @@ import os
 import subprocess
 import tempfile
 import textwrap
+import sys
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from isolated_env import shared_env, shared_project  # noqa: E402
 
 TOOL_HOME = os.path.join(os.path.dirname(__file__), "..")
 RM_SH = os.path.join(TOOL_HOME, "scripts", "review-merge.sh")
@@ -31,7 +36,8 @@ def sh(script, stdin=None):
         input=stdin,
         capture_output=True,
         text=True,
-        cwd=TOOL_HOME,
+        cwd=shared_project(),
+        env=shared_env(project=shared_project()),
     )
     return r.stdout, r.stderr, r.returncode
 

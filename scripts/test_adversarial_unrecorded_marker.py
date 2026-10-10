@@ -22,6 +22,7 @@ import textwrap
 import unittest
 
 from scripts.findings_test_support import TOOL_HOME, head, make_repo, write
+from scripts.isolated_env import shared_env
 from scripts.test_merge_gate_code_verdict import Case, _fake_tool_home
 from scripts.test_source_helpers import GATES_SH, source_env
 
@@ -51,8 +52,8 @@ class AdversarialCase(Case):
         # A staged change keeps get_review_diff on its network-free path.
         write(os.path.join(self.project, "app.py"), "print('changed')\n")
         subprocess.run(["git", "-C", self.project, "add", "app.py"], check=True)
-        env = dict(os.environ)
-        env.update({"CLAGENTIC_PROJECT_ROOT": self.project, "CLAGENTIC_ALLOW_MISSING_GITLEAKS": "1",
+        env = shared_env(project=self.project)
+        env.update({"CLAGENTIC_ALLOW_MISSING_GITLEAKS": "1",
                     "CLAGENTIC_ALLOW_MISSING_SEMGREP": "1", "CLAGENTIC_ALLOW_MISSING_OSV": "1",
                     "CLAGENTIC_FINDINGS_TODAY": "2026-10-09", "CLAGENTIC_DEFAULT_BRANCH": "main"})
         return subprocess.run(["sh", os.path.join(self.tmp, "scripts", "gates.sh"), "adversarial"],
@@ -146,13 +147,12 @@ class TestBothRecordSitesShareTheHelper(unittest.TestCase):
         # sites read it: through a conditional.
         script = ('. "%s"; if _adv_record_findings "%s" "" quiet; then echo "rc=0"; '
                   'else echo "rc=$?"; fi') % (GATES_SH, os.path.join(lite, "f.json"))
-        env = dict(os.environ)
+        env = shared_env(project=project)
         env.update(source_env(gates=True))
-        env["CLAGENTIC_PROJECT_ROOT"] = project
 
         def call():
             return subprocess.run(["sh", "-c", script, GATES_SH], capture_output=True, text=True,
-                                  env=env, cwd=os.path.join(TOOL_HOME, "scripts"), timeout=120)
+                                  env=env, cwd=project, timeout=120)
 
         proc = call()
         self.assertIn("rc=0", proc.stdout, proc.stderr)

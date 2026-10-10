@@ -31,6 +31,7 @@ from scripts.test_gates_git_env_remote_auth import (
     _AUTH_PASS, _AUTH_USER, _HAVE_TIMEOUT, _HangingServer, _ScratchBase,
     _Server,
 )
+from scripts.isolated_env import shared_cli, shared_tool_home
 from scripts.test_support import clone_this_tool_home_with_overlay
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -204,7 +205,7 @@ class _ToolHome(unittest.TestCase):
 
 class TestDoctorUsesTheFloorTable(_ToolHome):
     def _doctor(self, path_dirs):
-        r = self._run(TOOL_HOME, ["doctor"], path_dirs, timeout=60)
+        r = self._run(shared_tool_home(), ["doctor"], path_dirs, timeout=60)
         return r.stdout + r.stderr
 
     def _plain(self, name, version):
@@ -415,11 +416,11 @@ class _RemoteBase(_ScratchBase, _ToolHome):
 
     def _doctor_out(self, extra=None):
         env = dict(self.env)
-        env.update({"CLAGENTIC_LITE_HOME": TOOL_HOME,
+        env.update({"CLAGENTIC_LITE_HOME": shared_tool_home(),
                     "CLAGENTIC_SKIP_UPDATE_ALERT": "1"})
         if extra:
             env.update(extra)
-        r = subprocess.run([CLI, "doctor"], cwd=self.work, env=env,
+        r = subprocess.run([shared_cli(), "doctor"], cwd=self.work, env=env,
                            capture_output=True, text=True, timeout=120)
         return r.stdout + r.stderr
 

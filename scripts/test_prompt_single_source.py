@@ -55,7 +55,7 @@ def gate_prompt(func):
         env["CLAGENTIC_PROJECT_ROOT"] = tmp
         script = f". '{LLM_CLIENT_SH}'\n{func}\n"
         result = subprocess.run(["sh", "-c", script, LLM_CLIENT_SH], capture_output=True,
-                                text=True, cwd=TOOL_HOME, env=env)
+                                text=True, cwd=tmp, env=env)
     assert result.returncode == 0, result.stderr
     return result.stdout
 
