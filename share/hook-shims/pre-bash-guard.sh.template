@@ -86,6 +86,11 @@ block() {
   exit 2
 }
 
+# R-021 is a BEST-EFFORT deterrent, not the guarantee. Policy files are read by
+# the gate only from the base revision (findings.py load_policy), so a file
+# written by any route, including ones this check cannot see, applies only once
+# it is merged. This rule is deliberately not extended to chase new spellings.
+#
 # R-021: the Builder role must not write the two governance files that decide
 # what the gates accept: .clagentic/dispositions.json (what the operator
 # accepted about findings) and .clagentic/risk-profile.json (what is at stake on

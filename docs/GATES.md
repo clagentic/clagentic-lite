@@ -51,7 +51,7 @@ Bash rules (R-001 through R-021) implemented inline in `pre-bash-guard.sh`:
 | R-018 | `> /dev/sda*` / `dd of=/dev/...` | disk-level write |
 | R-019 | `find ... -delete` without a literal (non-wildcard) `-path` constraint | unbounded delete |
 | R-020 | truncating `.env` / `*.pem` / `*.key` (`: > .env`, `truncate ... .env`) | credential destruction |
-| R-021 | The Builder role (an `agent_type` naming a builder, in any case) running a command that names `dispositions.json` or `risk-profile.json`, or a glob in the first segment under `.clagentic/`, or a `cd`/`pushd` into `.clagentic` followed by a write: the shell-channel half of W-007. The text is matched as written and again with its `//`, `/./` and `name/../` segments collapsed, so `.clagentic/./d*`, `.clagentic/lite/../d*` and `.clagentic//r*` are caught. No `CLAGENTIC_ALLOW_BASH_RULES` escape | the first file clears the Builder's own findings, the second scales their severity; a static check of the command text, not a sandbox (quoting, variable expansion and command substitution that assemble a name at run time are not seen) |
+| R-021 | The Builder role (an `agent_type` naming a builder, in any case) running a command that names `dispositions.json` or `risk-profile.json`, or a glob in the first segment under `.clagentic/`, or a `cd`/`pushd` into `.clagentic` followed by a write: the shell-channel half of W-007. The text is matched as written and again with its `//`, `/./` and `name/../` segments collapsed, so `.clagentic/./d*`, `.clagentic/lite/../d*` and `.clagentic//r*` are caught. No `CLAGENTIC_ALLOW_BASH_RULES` escape | BEST-EFFORT deterrent, not the guarantee: a static check of the command text, not a sandbox. It does not see quoting, variable expansion, command substitution, glob spellings, in-place editors or tools such as `rsync`, `ed`, `tar` or `unzip` that reach the file without naming it, and it is not extended to chase them. What keeps a write from mattering is that policy is read only from the base revision (see "Policy is read from the base revision"): a file written by any route applies only once it is merged |
 
 Write rules (`pre-write-guard.sh`; the blocking rules exit 2, the two warn-only rules exit 0 and log a `warn` row to `audit.db`):
 
@@ -63,7 +63,7 @@ Write rules (`pre-write-guard.sh`; the blocking rules exit 2, the two warn-only 
 | W-004 | No writes to files matching `*.pem`, `*id_rsa*`, `*.key` | none |
 | W-005 | Warn only: editing `CLAUDE.md`, `.claude/settings.json`, `.claude/settings.local.json`, `.claude/hooks/*.sh`, or an MCP config mid-session invalidates Claude's prompt cache | none needed (does not block) |
 | W-006 | Warn only: a Write/Edit made by the main session rather than a dispatched subagent (no `agent_type` in the hook payload); prompts delegating code changes to the Builder | none needed (does not block) |
-| W-007 | The Builder role (an `agent_type` naming a builder, matched without regard to case or namespace) must not write `.clagentic/dispositions.json` or `.clagentic/risk-profile.json` (paths compared without regard to case); R-021 is the same rule for the shell: the first is the operator's record of what was accepted and gate code clears findings from it, the second records what is at stake on each path and gate code scales every finding's severity by it. Checked ahead of W-003 so the refusal names the rule | none for the Builder — print the gate's stanza (or the profile change) for the operator to commit |
+| W-007 | The Builder role (an `agent_type` naming a builder, matched without regard to case or namespace) must not write `.clagentic/dispositions.json` or `.clagentic/risk-profile.json` (paths compared without regard to case); R-021 is the same rule for the shell: the first is the operator's record of what was accepted and gate code clears findings from it, the second records what is at stake on each path and gate code scales every finding's severity by it. Checked ahead of W-003 so the refusal names the rule. Best-effort, like R-021: the base-revision read of policy is what actually keeps a written file from applying | none for the Builder — print the gate's stanza (or the profile change) for the operator to commit |
 
 ## Gate 3 — Cross-CLI review
 
@@ -153,24 +153,43 @@ record (schema 2): `source` (`review` or `adversarial`), `file`, `line`,
 `category` (a CWE or rule class), `message`, `evidence`, the facts `reachable`
 (`yes|no|unknown`), `attacker_precondition`, `impact` and `class`
 (`durable|ephemeral`), `severity_claimed` (the model's own value, display
-only), `severity` (the rubric's, for a finding that states facts; otherwise the
-claimed value as a known rank, or `unknown` when it is not one), `tier`
-(adversarial only), and the pipeline-added `fingerprint`, `disposition` and
-`schema`. The record is rebuilt field by field: a `fingerprint`,
-`disposition` or any other key a model wrote is not carried over. A finding
-from a producer that predates the facts (neither `attacker_precondition` nor
-`impact` present) keeps the severity it claimed, exactly as in schema 1.
+only), `severity` (always the rubric's), `tier` (adversarial only), and the
+pipeline-added `fingerprint`, `disposition` and `schema`. The record is rebuilt
+field by field: a `fingerprint`, `disposition` or any other key a model wrote is
+not carried over. A finding with no `attacker_precondition` and no `impact`
+(a producer that predates the facts, or a model that left them out) resolves to
+the worst case on both and is rated as such; it never keeps the severity it
+claimed. Migration from schema 1: a fixture or integration that fed findings
+without facts and relied on its own severity now has to state the facts.
 
 **What blocks.** A review finding blocks when its severity meets
-`CLAGENTIC_BLOCK_SEVERITY` (default `high`); a severity that is not one of
-`low`/`medium`/`high`/`critical` once stripped and lower-cased (`blocker`,
-`crit`, a number) cannot be ranked and blocks. For a finding that states facts
-that severity is the rubric's (see "Facts, the rubric and the stakes profile").
-An adversarial finding blocks by its tier: for a finding with facts the tier is
-`blocking` exactly when it is reachable and the rubric puts it at `high` or
-above; for one without, `reachable: yes` at `high` or above is always
-`blocking` (the security floor), anything not reachable is `advisory`, and in
-between the model's own tier stands.
+`CLAGENTIC_BLOCK_SEVERITY` (default `high`). That severity is the rubric's (see
+"Facts, the rubric and the stakes profile"); what the model claimed decides
+nothing, so a claim that cannot be ranked (`blocker`, `crit`, a number) is only
+displayed. An adversarial finding blocks by its tier: `blocking` exactly when it
+is reachable (or reachability is unknown) and the rubric puts it at `high` or
+above, otherwise `advisory`; the tier a model wrote is not read.
+
+**Policy is read from the base revision.** Three kinds of file decide what
+blocks: the dispositions file (`.clagentic/dispositions.json`), the legacy
+deferral and ack files (`deferrals.json`, `adversarial-acks.json`) and the
+stakes profile (`.clagentic/risk-profile.json`). The gate and `evaluate` read
+them only from the trusted base revision, through `git show <base>:<path>`:
+the merge base of HEAD with the default branch (`--base`, else `origin/<default>`
+or `<default>`), which is HEAD itself on the default branch. They never read
+them from the working tree or from the branch. So a change to a policy file
+applies only after it is merged, whatever wrote it (a Write tool, a shell
+redirect or glob, an in-place editor, `rsync`, another process, a commit on the
+branch). With no resolvable base no policy file applies, the worst case holds,
+and the output says so. What this change would clear if it were merged is still
+reported ("N findings would be cleared by entries added in this PR", working
+tree and branch against the base), so a reviewer can see the effect of a policy
+change before merging it. This base-revision read is the guarantee. The Builder
+write blocks (W-007 for the Write and Edit tools, R-021 for the shell) are a
+best-effort deterrent on top of it: static checks of what a tool call says that
+stop the ordinary routes and are not a sandbox, and nothing depends on them. A
+note on the prompt-only copy of `deferrals.json` shown to the Reviewer: it is
+read for context, carries no authority and never clears a finding in code.
 
 ### Facts, the rubric and the stakes profile
 
@@ -260,10 +279,11 @@ path the worse value wins; the default applies only where no glob states it.
   `merge_control=unrestricted`): today's behavior. A value outside a dimension's
   list is that dimension's worst case, with a warning.
 - *It cannot apply to the change that edits it.* The profile in force is read
-  from the merge base, by the same mechanism as dispositions. A profile added or
-  edited in the gated change is reported ("applies once merged", or "differs
-  from its base version") and the base version, or none, applies. If the base
-  cannot be resolved the profile is ignored, loudly.
+  from the base revision, by the same mechanism as dispositions ("Policy is read
+  from the base revision", above). A profile added or edited in the gated
+  change, committed or not, is reported ("applies once merged", or "differs from
+  its base version") and the base version, or none, applies. If the base cannot
+  be resolved the profile is ignored, loudly.
 - *The tree can contradict it, in the unsafe direction only.* Each run
   infers, from the committed tree, markers that a path is exposed or handles
   sensitive data: ingress, route, gateway and virtual-service manifests and
@@ -310,7 +330,10 @@ is reported when it is written. The Builder role never writes the file
 **Several samples** (`CLAGENTIC_REVIEW_SAMPLES`, optional, default 1, review
 gate only): the review call is made N times and the usable results are unioned
 by fingerprint hint and by location, keeping of each group the finding with the
-highest *rubric* severity, never the highest claimed one. Each sample is an
+highest *rubric* severity, never the highest claimed one. A sample that is
+degraded, unreadable or not an envelope object (a bare array, a scalar) is
+excluded and reported, never an error, and the usable ones are still unioned;
+with none usable the review takes its degraded path. Each sample is an
 audit row (`gate=review-sample`). It is a knob for operators who want a second
 opinion on the same diff; nothing requires it.
 
@@ -368,25 +391,30 @@ with every field: `share/dispositions.example.json`.
 
 **Guardrails.**
 
-1. An entry added or changed in the change being gated does not clear that
-   change's findings. "Added or changed" is measured against the merge base
+1. Only the base revision's entries apply (see "Policy is read from the base
+   revision"). An entry added or changed in the change being gated, committed
+   or not, does not clear that change's findings, and an entry removed or
+   loosened there does not stop clearing them either; the base version applies
+   until the change is merged. "Added or changed" is measured against the base
    (`--base`, else the merge base of HEAD with `origin/<default>` or
-   `<default>`): an entry whose exact content the base commit did not have, or
-   any entry when the base cannot be resolved. The output says `N findings
-   would be cleared by entries added in this PR`. Land the disposition in its
-   own reviewed change first.
+   `<default>`): an entry whose exact content the base commit did not have; with
+   no resolvable base no entry applies and every entry counts as added. The
+   output says `N findings would be cleared by entries added in this PR`. Land
+   the disposition in its own reviewed change first.
 2. A security-floor finding is not cleared by `by_design`, `false_positive` or
    `accepted_risk`: only by a fix, or by `kind: mitigated` naming the control.
-   For a finding that states facts the floor is the one defined under "Facts,
-   the rubric and the stakes profile" (reachable, high impact, and an
-   effective precondition of `none` or `network`); for one without facts it is
-   `reachable: yes` at `high` or above. The output says which entry was refused
-   and why.
+   The floor is the one defined under "Facts, the rubric and the stakes
+   profile" (reachable, high impact, and an effective precondition of `none` or
+   `network`; a finding that states no facts is the worst case on both). The
+   output says which entry was refused and why.
 3. `rationale`, `by` and `at` are required; an entry that fails validation is
    ignored, loudly, and the rest still apply. A file that cannot be parsed
    applies nothing. A symlink out of the repository is an error.
-4. The Builder role cannot write the file: `pre-write-guard` rule W-007 for the
-   Write and Edit tools, `pre-bash-guard` rule R-021 for the shell.
+4. The Builder role is blocked from writing the file, best-effort:
+   `pre-write-guard` rule W-007 for the Write and Edit tools, `pre-bash-guard`
+   rule R-021 for the shell. These are static checks of the tool call's text, a
+   deterrent and not the guarantee: the guarantee is guardrail 1, that nothing
+   written to the working tree or the branch applies before it is merged.
 5. Cleared findings are always printed, with the entry's id, kind, who, when
    and rationale; the merge gate records them in the audit trail from the
    verdict.
