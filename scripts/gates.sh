@@ -35,6 +35,10 @@
 #                    and guardrails applied, per-HEAD accumulation; exits 1 when
 #                    BLOCKED. Alias of findings.py evaluate (standalone agents call
 #                    that file directly; runs here do not count toward ship)
+#   profile          draft or update .clagentic/risk-profile.json (the optional
+#                    stakes profile the rubric reads) from the tree and the
+#                    operator's --answer statements; --write saves it as a
+#                    change to review and commit. Alias of findings.py profile
 #   audit-vocab-lint warn-only: flag "cmd_log_run <gate> pass" audit rows whose
 #                    details string contains a failure word (a tool that never
 #                    ran should not log as a clean pass)
@@ -4556,6 +4560,92 @@ _review_blocked_reason() {
   fi
 }
 
+# _review_llm_samples INPUT_FILE OUTPUT_FILE [STDERR_FILE]
+#
+# One reviewer call, or CLAGENTIC_REVIEW_SAMPLES of them: an optional knob,
+# default 1 and never required (INV-8), capped at 10. A single sample is the
+# call exactly as it has always been made. With more than one, each sample is
+# logged to the audit trail as its own row, the usable ones (neither degraded
+# nor unreadable) are unioned by findings.py ingest union-samples (findings
+# linked by fingerprint hint or by location; of a linked group the one with
+# the highest RUBRIC severity is kept, never the highest claimed), and the
+# union is what OUTPUT_FILE holds. If no sample is usable OUTPUT_FILE holds
+# the first sample, so the caller's degraded handling sees exactly what a
+# single failed call would have shown. Returns the status of the single call,
+# or 0 when a union was produced, or the first sample's status otherwise.
+_review_llm_samples() {
+  _rls_in="$1"
+  _rls_out="$2"
+  _rls_err="${3:-}"
+  _rls_n=$(ds_positive_int_or_warn CLAGENTIC_REVIEW_SAMPLES "${CLAGENTIC_REVIEW_SAMPLES:-}" 1)
+  if [ "$_rls_n" -gt 10 ]; then
+    printf '[gates/review] CLAGENTIC_REVIEW_SAMPLES=%s is above the cap; using 10\n' "$_rls_n" 1>&2
+    _rls_n=10
+  fi
+  _rls_rc=0
+  if [ "$_rls_n" -le 1 ]; then
+    if [ -n "$_rls_err" ]; then
+      CLAGENTIC_LLM_RUN_META_FILE="$_REVIEW_RUN_PROV_FILE" \
+        "$TOOL_HOME/scripts/llm-client.sh" review < "$_rls_in" > "$_rls_out" 2>"$_rls_err" || _rls_rc=$?
+    else
+      CLAGENTIC_LLM_RUN_META_FILE="$_REVIEW_RUN_PROV_FILE" \
+        "$TOOL_HOME/scripts/llm-client.sh" review < "$_rls_in" > "$_rls_out" || _rls_rc=$?
+    fi
+    return "$_rls_rc"
+  fi
+
+  _rls_dir=$(mktemp -d -t clagentic-review-samples.XXXXXX) || return 1
+  _rls_i=0
+  _rls_usable=0
+  _rls_first_usable=""
+  _rls_first_rc=""
+  while [ "$_rls_i" -lt "$_rls_n" ]; do
+    _rls_i=$((_rls_i + 1))
+    _rls_sample="$_rls_dir/sample-$_rls_i.json"
+    _rls_rc=0
+    if [ -n "$_rls_err" ]; then
+      CLAGENTIC_LLM_RUN_META_FILE="$_REVIEW_RUN_PROV_FILE" \
+        "$TOOL_HOME/scripts/llm-client.sh" review < "$_rls_in" > "$_rls_sample" 2>>"$_rls_err" || _rls_rc=$?
+    else
+      CLAGENTIC_LLM_RUN_META_FILE="$_REVIEW_RUN_PROV_FILE" \
+        "$TOOL_HOME/scripts/llm-client.sh" review < "$_rls_in" > "$_rls_sample" || _rls_rc=$?
+    fi
+    [ -n "$_rls_first_rc" ] || _rls_first_rc="$_rls_rc"
+    _rls_outcome="pass"
+    if [ "$_rls_rc" -ne 0 ] || review_is_degraded "$_rls_sample" 2>/dev/null; then
+      _rls_outcome="degraded"
+    else
+      _rls_usable=$((_rls_usable + 1))
+      [ -n "$_rls_first_usable" ] || _rls_first_usable="$_rls_sample"
+    fi
+    cmd_log_run review-sample "$_rls_outcome" "sample=${_rls_i}/${_rls_n} status=${_rls_rc}"
+  done
+
+  if [ "$_rls_usable" -gt 0 ]; then
+    set -- ingest union-samples
+    for _rls_f in "$_rls_dir"/sample-*.json; do
+      set -- "$@" "$_rls_f"
+    done
+    _rls_union_rc=0
+    _rls_union=$(ds_findings_call -e object "$@" --root "$REPO_ROOT" \
+      --default-branch "${CLAGENTIC_DEFAULT_BRANCH:-main}") || _rls_union_rc=$?
+    if [ "$_rls_union_rc" -eq 0 ]; then
+      printf '%s\n' "$_rls_union" > "$_rls_out"
+      cmd_log_run review-sample pass "union of ${_rls_usable}/${_rls_n} usable samples"
+      rm -rf "$_rls_dir"
+      return 0
+    fi
+    printf '[gates/review] the %s review samples could not be unioned; using the first usable sample\n' "$_rls_n" 1>&2
+    cmd_log_run review-sample degraded "union of ${_rls_n} samples failed (status=${_rls_union_rc}); the first usable sample is used"
+    cat "$_rls_first_usable" > "$_rls_out"
+    rm -rf "$_rls_dir"
+    return 0
+  fi
+  cat "$_rls_dir/sample-1.json" > "$_rls_out"
+  rm -rf "$_rls_dir"
+  return "$_rls_first_rc"
+}
+
 cmd_review() {
   _gate_check_args review "--full-review --since-last-review --reset-dedup" "" "$@" || return 2
   # Parse flags; all args consumed by the subcommand dispatcher.
@@ -4749,8 +4839,7 @@ cmd_review() {
         _crv_chunk_status=0
         _crv_chunk_err=$(mktemp -t clagentic-review-chunk-err.XXXXXX)
         _REVIEW_RUN_CHUNK_SIZES="${_REVIEW_RUN_CHUNK_SIZES:+$_REVIEW_RUN_CHUNK_SIZES }${_crv_cbytes}"
-        CLAGENTIC_LLM_RUN_META_FILE="$_REVIEW_RUN_PROV_FILE" \
-          "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_chunk" > "$_crv_env_file" 2>"$_crv_chunk_err" || _crv_chunk_status=$?
+        _review_llm_samples "$_crv_chunk" "$_crv_env_file" "$_crv_chunk_err" || _crv_chunk_status=$?
         _crv_chunk_outcome="pass"
         if [ "$_crv_chunk_status" -ne 0 ] && [ "$_crv_chunk_status" -ne 3 ] && [ "$_crv_chunk_status" -ne 4 ]; then
           # A nonzero status that is NOT one of walk_chain's own degraded
@@ -4906,8 +4995,7 @@ cmd_review() {
   # details string below for the same reason the chunked path records it.
   _crv_review_status=0
   _REVIEW_RUN_CHUNK_SIZES="$_crv_diff_bytes"
-  CLAGENTIC_LLM_RUN_META_FILE="$_REVIEW_RUN_PROV_FILE" \
-    "$TOOL_HOME/scripts/llm-client.sh" review < "$_crv_diff_tmp" > "$OUT" || _crv_review_status=$?
+  _review_llm_samples "$_crv_diff_tmp" "$OUT" || _crv_review_status=$?
   # Note: _crv_diff_tmp is NOT deleted yet — cross-round dedup needs it below.
 
   # SECURITY (lr-66e598 follow-up): strip every finding to the closed
@@ -5486,7 +5574,9 @@ _adv_record_findings() {
   _arf_base="$2"
   _arf_quiet="${3:-}"
   _arf_rc=0
-  _arf_text=$(_gate_evaluate adversarial "$_arf_file" "$_arf_base" gate) || _arf_rc=$?
+  # --rubric-into: the sidecar gets the severity and tier the rubric decided
+  # (the merge gate's counts read it), nothing else new.
+  _arf_text=$(_gate_evaluate adversarial "$_arf_file" "$_arf_base" gate --rubric-into "$_arf_file") || _arf_rc=$?
   case "$_arf_rc" in
     0|1)
       if [ -z "$_arf_quiet" ] && [ -n "$_arf_text" ]; then
@@ -7625,7 +7715,7 @@ cmd_deferrals_lint() {
 # (fail closed). Options are findings.py evaluate's; --root defaults to this
 # repository.
 cmd_evaluate() {
-  _gate_check_args evaluate "--no-input --json --gate= --format= --scope= --caller= --root= --head= --base= --default-branch= --threshold= --today= --annotate= --attach-to= --json-out=" "" "$@" || return 2
+  _gate_check_args evaluate "--no-input --json --gate= --format= --scope= --caller= --root= --head= --base= --default-branch= --threshold= --today= --annotate= --rubric-into= --attach-to= --json-out=" "" "$@" || return 2
   _ev_has_root=0
   _ev_no_input=0
   for _ev_arg in "$@"; do
@@ -7640,6 +7730,25 @@ cmd_evaluate() {
   else
     ds_findings_call -s -e any -o 1 evaluate "$@"
   fi
+}
+
+# cmd_profile — draft or update .clagentic/risk-profile.json, the optional,
+# committed record of what is at stake on each path (exposure, data,
+# visibility, merge control). Alias of findings.py profile. It reads the tree,
+# applies the operator's --answer [GLOB:]DIMENSION=VALUE statements, prints the
+# result, and with --write saves it as a change to review and commit. A
+# profile never applies to the change that adds or edits it, and a repository
+# without one behaves as it always has.
+cmd_profile() {
+  _gate_check_args profile "--write --confirm --answer= --root= --today=" "" "$@" || return 2
+  _pf_has_root=0
+  for _pf_arg in "$@"; do
+    case "$_pf_arg" in
+      --root|--root=*) _pf_has_root=1 ;;
+    esac
+  done
+  [ "$_pf_has_root" = "1" ] || set -- --root "$REPO_ROOT" "$@"
+  ds_findings_call -e any profile "$@"
 }
 
 # cmd_audit_vocab_lint [FILE] (lr-7047bf, foundry sub-class 1.6-1.11; widened
@@ -8437,6 +8546,7 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
     dispositions-lint) shift; cmd_dispositions_lint "$@" ;;
     deferrals-lint) shift; cmd_deferrals_lint "$@" ;;
     evaluate)       shift; cmd_evaluate "$@" ;;
+    profile)        shift; cmd_profile "$@" ;;
     audit-vocab-lint) shift; cmd_audit_vocab_lint "$@" ;;
     ship)           shift; cmd_ship "$@" ;;
     pre-push)       shift; cmd_pre_push "$@" ;;
@@ -8444,7 +8554,7 @@ if [ -z "${CLAGENTIC_GATES_SOURCE_ONLY:-}" ]; then
     digest)         shift; cmd_digest "$@" ;;
     status)         shift; cmd_status "$@" ;;
     tail)           shift; cmd_tail "$@" ;;
-    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets [--full-scan]|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial [--full-review]|merge-gate [--recheck]|render-review|render-manifest [FILE]|dispositions-lint [FILE]|evaluate [OPTIONS]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
+    *) echo "usage: gates.sh {init|bleed [--full-scan]|secrets [--full-scan]|deps|sast|review [--full-review] [--since-last-review] [--reset-dedup]|adversarial [--full-review]|merge-gate [--recheck]|render-review|render-manifest [FILE]|dispositions-lint [FILE]|evaluate [OPTIONS]|profile [--answer [GLOB:]DIM=VALUE] [--write] [--confirm]|audit-vocab-lint [FILE]|ship|pre-push|log-run|digest|status|tail [--no-follow]}" 1>&2; exit 1 ;;
   esac
 elif [ -z "${CLAGENTIC_GATES_DELIBERATE_SOURCE:-}" ]; then
   echo "gates.sh: CLAGENTIC_GATES_SOURCE_ONLY is set but CLAGENTIC_GATES_DELIBERATE_SOURCE is not -- dispatch suppressed with no provenance asserting deliberate sourcing, refusing to report a false pass. If dot-sourcing this file on purpose, set both variables. If you did not mean to set CLAGENTIC_GATES_SOURCE_ONLY, unset it." 1>&2

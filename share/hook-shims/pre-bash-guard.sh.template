@@ -3,7 +3,7 @@
 # Blocks dangerous shell commands. Exit 2 = block.
 # Rules R-001..R-020 documented in docs/GATES.md.
 #
-# managed-by: clagentic · clagentic-hooks-version: v6
+# managed-by: clagentic · clagentic-hooks-version: v7
 # Source of truth: share/hook-shims/pre-bash-guard.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/pre-bash-guard.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -86,28 +86,64 @@ block() {
   exit 2
 }
 
-# R-021: the Builder role must not write .clagentic/dispositions.json on any
-# channel. pre-write-guard W-007 covers the Write and Edit tools; this is the
-# same rule for the shell (redirect, tee, cp, mv, sed -i, python -c, ...), made
-# effective because a Builder that cannot use Write can still use Bash. It is a
-# static match on the command text, not a sandbox: ANY mention of the file name
-# (in any case, on any path) is refused for the Builder, since which commands
-# write cannot be told from the text. The Builder reads the file with the Read
-# tool. No CLAGENTIC_ALLOW_BASH_RULES escape: the file is what clears the
-# Builder's own findings. The role comes from agent_type (see ds_agent_is_builder).
+# R-021: the Builder role must not write the two governance files that decide
+# what the gates accept: .clagentic/dispositions.json (what the operator
+# accepted about findings) and .clagentic/risk-profile.json (what is at stake on
+# each path, which scales every finding's severity), on any channel.
+# pre-write-guard W-007 covers the Write and Edit tools; this is the same rule
+# for the shell (redirect, tee, cp, mv, sed -i, python -c, ...), made effective
+# because a Builder that cannot use Write can still use Bash. It is a static
+# match on the command text, not a sandbox: ANY mention of either file name (in
+# any case, on any path) is refused for the Builder, since which commands write
+# cannot be told from the text. The Builder reads the files with the Read tool.
+# No CLAGENTIC_ALLOW_BASH_RULES escape: the files are what clear or lower the
+# Builder's own findings. The role comes from agent_type (see
+# ds_agent_is_builder).
+#
+# The match runs on the command text as written AND on that text with its path
+# segments normalized, because the file can be reached without spelling the
+# name or the directory plainly: '.clagentic/./d*', '.clagentic/lite/../d*',
+# '.clagentic//d*', or a 'cd .clagentic' followed by a write on a bare word or
+# glob. The disclosed limit of the model stands: quoting, variable expansion and
+# command substitution that assemble a name at run time are not seen.
 AGENT_TYPE=$(printf '%s' "$INPUT" | ds_json_field agent_type 2>/dev/null || true)
 _pbg_cmd_lc=$(printf '%s' "$CMD" | tr '[:upper:]' '[:lower:]')
+
+# Collapse '//', '/./', 'name/../' and a trailing 'name/..' until the text stops
+# changing (bounded). A space is appended so the trailing form has a delimiter
+# to match against at the end of the command.
+_pbg_normalize_paths() {
+  _pbn_text="$1 "
+  _pbn_round=0
+  while [ "$_pbn_round" -lt 20 ]; do
+    _pbn_next=$(printf '%s' "$_pbn_text" | sed -e 's#//*#/#g' -e 's#/\./#/#g' -e 's#[^/[:space:]]*/\.\./##g' -e 's#[^/[:space:]]*/\.\.\([[:space:];&|)"'"'"']\)#\1#g')
+    [ "$_pbn_next" = "$_pbn_text" ] && break
+    _pbn_text="$_pbn_next"
+    _pbn_round=$((_pbn_round + 1))
+  done
+  printf '%s' "$_pbn_text"
+}
+_pbg_cmd_norm=$(_pbg_normalize_paths "$_pbg_cmd_lc")
+
 _pbg_names_file=0
-case "$_pbg_cmd_lc" in
-  *dispositions.json*) _pbg_names_file=1 ;;
-esac
-# A glob in the first segment under .clagentic/ ('.clagentic/d*') can expand to
-# the file without ever spelling its name.
-if printf '%s' "$_pbg_cmd_lc" | grep -Eq '\.clagentic/[^/[:space:]]*[*?[]'; then
+for _pbg_text in "$_pbg_cmd_lc" "$_pbg_cmd_norm"; do
+  case "$_pbg_text" in
+    *dispositions.json*|*risk-profile.json*) _pbg_names_file=1 ;;
+  esac
+  # A glob in the first segment under .clagentic/ ('.clagentic/d*') can expand
+  # to either file without ever spelling its name.
+  if printf '%s' "$_pbg_text" | grep -Eq '\.clagentic/[^/[:space:]]*[*?[]'; then
+    _pbg_names_file=1
+  fi
+done
+# 'cd .clagentic' (or pushd) followed by anything that writes: the file is then
+# reached by a bare name or glob with no '.clagentic/' in front of it.
+if printf '%s' "$_pbg_cmd_norm" | grep -Eq '(^|[;&|(`[:space:]])(cd|pushd)[[:space:]]+[^;&|]*\.clagentic/?(["'"'"'[:space:];&|)]|$)' \
+   && printf '%s' "$_pbg_cmd_norm" | grep -Eq '>|(^|[;&|(`[:space:]])(cp|mv|tee|ln|dd|install|rm|truncate|touch|sed|perl|python3?|ruby|node|git|patch|curl|wget|chmod)([[:space:]]|$)'; then
   _pbg_names_file=1
 fi
 if [ "$_pbg_names_file" -eq 1 ] && ds_agent_is_builder "$AGENT_TYPE"; then
-  block R-021 "the Builder role must not write .clagentic/dispositions.json on any channel; print the gate's stanza for the operator to commit instead (read the file with the Read tool)"
+  block R-021 "the Builder role must not write .clagentic/dispositions.json or .clagentic/risk-profile.json on any channel; print the gate's stanza (or the profile change) for the operator to commit instead (read the files with the Read tool)"
 fi
 
 case "$CMD" in

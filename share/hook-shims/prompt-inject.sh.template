@@ -6,7 +6,7 @@
 # asking the user to recall them manually.
 # Non-blocking — any failure exits 0 silently.
 #
-# managed-by: clagentic · clagentic-hooks-version: v6
+# managed-by: clagentic · clagentic-hooks-version: v7
 # Source of truth: share/hook-shims/prompt-inject.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/prompt-inject.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite

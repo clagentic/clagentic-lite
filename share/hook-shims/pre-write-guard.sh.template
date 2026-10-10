@@ -3,7 +3,7 @@
 # Blocks writes to the default branch, outside the repo, or to sensitive paths.
 # Exit 2 = block.
 #
-# managed-by: clagentic · clagentic-hooks-version: v6
+# managed-by: clagentic · clagentic-hooks-version: v7
 # Source of truth: share/hook-shims/pre-write-guard.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/pre-write-guard.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite
@@ -185,20 +185,22 @@ case "$PATH_TARGET" in
   *)  block W-002 "could not resolve write target against repo root '$REPO_ROOT'" ;;
 esac
 
-# W-007: the Builder role must not write the dispositions file. It is the
-# operator's record of what has been accepted, and the gate code clears
-# findings from it; a Builder that could write it could clear its own
-# findings. Placed ahead of W-003 so the refusal names the actual rule. The
-# role is read from agent_type (see the AGENT_TYPE capture above): a payload
-# whose agent_type names a builder is refused, whatever the exact namespace or
-# case ("clagentic-lite:builder", "Builder"). The path is compared in lower
-# case too: on a case-insensitive filesystem "Dispositions.JSON" is the same
-# file. pre-bash-guard R-021 is the same rule for the shell channel.
+# W-007: the Builder role must not write the two governance files that decide
+# what the gates accept. The dispositions file is the operator's record of what
+# has been accepted, and the gate code clears findings from it; the risk
+# profile records what is at stake on each path, and the gate code scales every
+# finding's severity by it. A Builder that could write either could clear or
+# lower its own findings. Placed ahead of W-003 so the refusal names the actual
+# rule. The role is read from agent_type (see the AGENT_TYPE capture above): a
+# payload whose agent_type names a builder is refused, whatever the exact
+# namespace or case ("clagentic-lite:builder", "Builder"). The path is compared
+# in lower case too: on a case-insensitive filesystem "Dispositions.JSON" is the
+# same file. pre-bash-guard R-021 is the same rule for the shell channel.
 _pwg_target_lc=$(printf '%s' "$PATH_TARGET" | tr '[:upper:]' '[:lower:]')
 case "$_pwg_target_lc" in
-  */.clagentic/dispositions.json)
+  */.clagentic/dispositions.json|*/.clagentic/risk-profile.json)
     if ds_agent_is_builder "$AGENT_TYPE"; then
-      block W-007 "the Builder role must not write .clagentic/dispositions.json; print the gate's stanza for the operator to commit instead"
+      block W-007 "the Builder role must not write .clagentic/dispositions.json or .clagentic/risk-profile.json; print the gate's stanza (or the profile change) for the operator to commit instead"
     fi
     ;;
 esac
