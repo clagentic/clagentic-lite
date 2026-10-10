@@ -26,7 +26,7 @@ def _load_fenced(path, unavailable_literal, degraded_in):
         value = load_json_file(path)
     except (OSError, ValueError):
         return marker, True
-    if value is None or (isinstance(value, str) and value):
+    if isinstance(value, str) and value:
         return value, False
     return marker, True
 
@@ -45,7 +45,7 @@ def build_gate_summary(opts):
             raise ValueError("empty deterministic_gates payload")
         deterministic_gates = json.loads(opts.det_gates)
         deterministic_gates_fenced = json.loads(opts.det_gates_fenced)
-    except ValueError:
+    except (ValueError, TypeError):
         deterministic_gates = {"secrets": None, "deps": None, "sast": None,
                                "audit_db_unavailable": True}
         deterministic_gates_fenced = (DETGATES_FENCE_BEGIN
@@ -75,6 +75,13 @@ def build_gate_summary(opts):
         if opts.adversarial_unavailable:
             adversarial_fenced = json.loads(opts.adversarial_unavailable)
         findings = []
+    # Applied before any count is taken: a degraded source reports no
+    # findings, so the counts must say zero in step with the empty list rather
+    # than describe findings the payload no longer carries.
+    adf_unavailable_fenced = None
+    if _flag(opts.adf_degraded):
+        findings = []
+        adf_unavailable_fenced = json.loads(opts.adf_unavailable)
     dicts = [f for f in findings if isinstance(f, dict)]
     blocking = sum(1 for f in dicts if f.get("tier") == "blocking")
     advisory = sum(1 for f in dicts if f.get("tier") == "advisory")
@@ -98,12 +105,12 @@ def build_gate_summary(opts):
             dropped = value if isinstance(value, int) else 0
         except (OSError, ValueError, AttributeError):
             dropped = 0
-    findings_fenced = ("===BEGIN ADVERSARIAL FINDINGS DATA===\n"
-                       + json.dumps(findings, indent=2)
-                       + "\n===END ADVERSARIAL FINDINGS DATA===")
-    if _flag(opts.adf_degraded):
-        findings = []
-        findings_fenced = json.loads(opts.adf_unavailable)
+    if adf_unavailable_fenced is not None:
+        findings_fenced = adf_unavailable_fenced
+    else:
+        findings_fenced = ("===BEGIN ADVERSARIAL FINDINGS DATA===\n"
+                           + json.dumps(findings, indent=2)
+                           + "\n===END ADVERSARIAL FINDINGS DATA===")
     return json.dumps({
         "review_fenced": review_fenced,
         "review_sha": opts.review_sha,

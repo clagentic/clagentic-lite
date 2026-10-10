@@ -58,16 +58,31 @@ _SURFACE_EXPOSURE_RE = re.compile(
     r"|loadbalancer)", re.I)
 
 
+def _is_candidate(rel):
+    """Whether inference reads REL at all: a manifest, container file, source
+    file, workflow or schema file. Anything else can never yield a marker."""
+    lowered = posixpath.basename(rel).lower()
+    ext = posixpath.splitext(lowered)[1]
+    wants_exposure_text = (ext in _MANIFEST_EXTS or lowered.startswith(("dockerfile", "containerfile"))
+                           or ext in _SOURCE_EXTS or rel.startswith(_WORKFLOW_DIRS))
+    schema_like = (ext in _SCHEMA_EXTS or lowered in _SCHEMA_NAMES
+                   or any(part in _SCHEMA_DIRS for part in rel.split("/")[:-1]))
+    return wants_exposure_text or schema_like
+
+
 def list_repo_files(root):
-    """Repo-relative paths of the tracked and untracked-but-not-ignored files,
-    up to INFER_MAX_FILES, or None when git cannot list them."""
+    """Repo-relative paths of the tracked and untracked-but-not-ignored files
+    inference can read, up to INFER_MAX_FILES, or None when git cannot list
+    them. The candidate filter runs BEFORE the cap, so a tree full of
+    non-candidate files cannot push the manifests and sources past it."""
     proc = git_run(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
     if proc is None or proc.returncode != 0:
         return None
     names = [n for n in proc.stdout.decode("utf-8", "replace").split("\0") if n]
     names = sorted(set(names))
     return [n for n in names
-            if not any(part in _SKIP_DIRS for part in n.split("/")[:-1])][:INFER_MAX_FILES]
+            if not any(part in _SKIP_DIRS for part in n.split("/")[:-1])
+            and _is_candidate(n)][:INFER_MAX_FILES]
 
 
 def _dir_glob(path):
@@ -115,11 +130,9 @@ def infer_markers(root, files=None):
         name = posixpath.basename(rel)
         lowered = name.lower()
         ext = posixpath.splitext(lowered)[1]
-        wants_exposure_text = (ext in _MANIFEST_EXTS or lowered.startswith(("dockerfile", "containerfile"))
-                               or ext in _SOURCE_EXTS or rel.startswith(_WORKFLOW_DIRS))
         schema_like = (ext in _SCHEMA_EXTS or lowered in _SCHEMA_NAMES
                        or any(part in _SCHEMA_DIRS for part in rel.split("/")[:-1]))
-        if not (wants_exposure_text or schema_like):
+        if not _is_candidate(rel):
             continue
         text = _read_head(root, rel, budget)
         if text is None:
@@ -147,16 +160,19 @@ def infer_markers(root, files=None):
 
 def changed_paths(root, base, wanted=None):
     """Paths that differ between BASE and the working tree, plus untracked
-    ones: what the gated change touches. [] when BASE is unknown. WANTED, when
-    given, filters BEFORE the cap, so a large change cannot push the paths the
-    caller cares about past CHANGED_PATHS_MAX."""
+    ones: what the gated change touches. [] when BASE is unknown. None when a
+    git call failed or timed out: "cannot tell" is not "nothing changed", and
+    the caller must resolve it to the worst case. WANTED, when given, filters
+    BEFORE the cap, so a large change cannot push the paths the caller cares
+    about past CHANGED_PATHS_MAX."""
     if not base:
         return []
     paths = set()
     for args in (["diff", "--name-only", "-z", base], ["ls-files", "-z", "--others", "--exclude-standard"]):
         proc = git_run(root, args)
-        if proc is not None and proc.returncode == 0:
-            paths.update(n for n in proc.stdout.decode("utf-8", "replace").split("\0") if n)
+        if proc is None or proc.returncode != 0:
+            return None
+        paths.update(n for n in proc.stdout.decode("utf-8", "replace").split("\0") if n)
     if wanted is not None:
         paths = {n for n in paths if wanted(n)}
     return sorted(paths)[:CHANGED_PATHS_MAX]

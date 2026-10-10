@@ -287,6 +287,13 @@ def load_store(root, reader, check_hash=True):
         store["warnings"].extend(notes)
         for raw in raws[:MAX_ENTRIES]:
             add(raw, rel)
+        if len(raws) > MAX_ENTRIES:
+            # Entries past the cap never reach the store; without a record the
+            # migration would report success and advise deleting the legacy
+            # file that still holds them.
+            invalid(rel, "<overflow>", [
+                "entries past the limit of %d (%d of them) are not read and not migrated"
+                % (MAX_ENTRIES, len(raws) - MAX_ENTRIES)])
     text, problem = read(LEGACY_RISKS_REL)
     if problem:
         invalid(LEGACY_RISKS_REL, "<file>", ["cannot read the file: " + problem])

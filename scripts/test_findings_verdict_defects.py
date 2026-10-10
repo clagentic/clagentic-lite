@@ -52,25 +52,28 @@ class TestIngestNeverEmitsRawFindings(Tmp):
         return self.write("env.json", {"summary": "s", "findings": {"severity": "critical"}})
 
     def _failing_open(self, target, reason):
-        """An open() that refuses to write TARGET, as a full or read-only disk would."""
-        real_open = open
+        """A stub writer that refuses to write, as a full or read-only disk would.
+        The stub goes through write_file_atomic (a temp file renamed over the
+        envelope), so the failure is injected there; the original envelope is
+        read through the real open() as before."""
+        real_atomic = findings.modules["ingest"].write_file_atomic
 
-        def failing_open(path, mode="r", *args, **kwargs):
-            if os.fspath(path) == target and "w" in mode:
+        def failing_write(path, text):
+            if os.fspath(path) == target and text == findings.SANITIZE_FAILED_ENVELOPE:
                 raise OSError(reason)
-            return real_open(path, mode, *args, **kwargs)
-        return failing_open
+            return real_atomic(path, text)
+        return mock.patch.object(findings.modules["ingest"], "write_file_atomic", failing_write)
 
     def test_stub_write_failure_exits_nonzero(self):
         target = self._unusable_envelope()
-        with mock.patch("builtins.open", self._failing_open(target, "disk full")):
+        with self._failing_open(target, "disk full"):
             status = findings.ingest_review_envelope(target)
         self.assertEqual(status, 1)
 
     def test_unremovable_raw_file_is_reported_not_hidden(self):
         target = self._unusable_envelope()
         stderr = io.StringIO()
-        with mock.patch("builtins.open", self._failing_open(target, "read-only")), \
+        with self._failing_open(target, "read-only"), \
                 mock.patch("os.unlink", side_effect=OSError("busy")), \
                 mock.patch.object(findings.sys, "stderr", stderr):
             self.assertFalse(findings.mark_review_sanitize_failed(target))
@@ -82,7 +85,7 @@ class TestIngestNeverEmitsRawFindings(Tmp):
 
     def test_a_removed_raw_file_does_not_survive_as_a_review(self):
         target = self._unusable_envelope()
-        with mock.patch("builtins.open", self._failing_open(target, "read-only")):
+        with self._failing_open(target, "read-only"):
             status = findings.ingest_review_envelope(target)
         self.assertEqual(status, 1)
         self.assertFalse(os.path.exists(target), "the raw envelope was left in place")

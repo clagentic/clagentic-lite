@@ -8,8 +8,8 @@ from .fileio import dumps, load_json_file, warn, write_file_atomic
 from .fingerprint import dedup_findings
 from .rubric import (IMPACTS, PRECONDITIONS, UNKNOWN_FACT, fact_value,
                      rubric_for_record)
-from .sanitize import allowlist_fields
-from .severity import SEVERITY_RANKS
+from .sanitize import allowlist_fields, terminal_text
+from .severity import SEVERITY_RANKS, severity_rank
 
 DEFAULT_FINDINGS_MAX = 200
 
@@ -53,7 +53,7 @@ def extract_findings(path):
         # Lenient callers still get [], but never silently: a present non-array
         # is a malformed envelope, and the strict path is what fails closed on it.
         warn("[findings] %s: 'findings' is not an array; read as no findings here "
-             "(the strict path refuses it)" % path)
+             "(the strict path refuses it)" % terminal_text(path, 200))
     return []
 
 
@@ -86,15 +86,15 @@ def mark_review_sanitize_failed(path):
     False when the stub could not be written: the raw findings may then still
     be in PATH, and the caller must not let the run go on with them."""
     try:
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(SANITIZE_FAILED_ENVELOPE)
+        write_file_atomic(path, SANITIZE_FAILED_ENVELOPE)
     except OSError as exc:
-        warn("[findings] could not rewrite %s: %s" % (path, exc))
+        warn("[findings] could not rewrite %s: %s"
+             % (terminal_text(path, 200), terminal_text(exc, 300)))
         try:
             os.unlink(path)
         except OSError as unlink_exc:
             warn("[findings] could not remove %s either: %s; it may still hold raw "
-                 "unsanitized findings" % (path, unlink_exc))
+                 "unsanitized findings" % (terminal_text(path, 200), terminal_text(unlink_exc, 300)))
         return False
     warn("[gates/review] review findings could not be reduced to the closed schema; "
          "marked the envelope degraded")
@@ -127,7 +127,8 @@ def parse_adversarial_findings(path):
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
     except (OSError, ValueError) as exc:
-        warn("_parse_adversarial_findings: could not read %s: %s" % (path, exc))
+        warn("_parse_adversarial_findings: could not read %s: %s"
+             % (terminal_text(path, 200), terminal_text(exc, 300)))
         raise
     return parse_adversarial_text(text)
 
@@ -171,8 +172,12 @@ def parse_adversarial_text(text):
         # An absent or unparseable class defaults to the one that relaxes
         # nothing, so a parser gap can only leave the full bar in place.
         change_class = class_raw if class_raw in ("durable", "ephemeral") else "durable"
-        # Security floor: reachable and high/critical is always blocking,
-        # whatever tier or class the model wrote.
+        # Security floor for a header that states no facts: reachable and
+        # high/critical is always blocking, whatever tier or class the model
+        # wrote. A header that does state facts is decided by the rubric below,
+        # whose own floor (open to anyone, high impact: at least high, and
+        # blocking) is the one it holds; the rubric is the only thing that may
+        # move a finding that states facts, and only from those facts.
         if reachable == "yes" and severity in ("high", "critical"):
             tier = "blocking"
         record = {
@@ -205,7 +210,10 @@ def sort_blocking_first(array):
         index, item = pair
         is_dict = isinstance(item, dict)
         blocking = 1 if is_dict and item.get("tier") == "blocking" else 0
-        severity = SEVERITY_RANKS.get(item.get("severity") if is_dict else None, 0)
+        # severity_rank, not a dict lookup: an unhashable severity (a list or
+        # object from a model) would raise, and an unrankable one must sort
+        # with the blocking end, never past the count cap.
+        severity = severity_rank(item.get("severity") if is_dict else None)
         return (-blocking, -severity, index)
     return [item for _, item in sorted(enumerate(array), key=order)]
 
