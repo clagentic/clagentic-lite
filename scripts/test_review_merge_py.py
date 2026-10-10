@@ -8,16 +8,13 @@ call it directly: what they prove is the shipped behaviour, not a copy of it.
 
 Run with: python3 -m unittest scripts/test_review_merge_py.py -v
 """
-import importlib.util
 import os
 import tempfile
 import unittest
 
-_TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_PIPELINE_PATH = os.path.join(_TOOL_HOME, "plugins", "clagentic-lite", "bin", "findings.py")
-_spec = importlib.util.spec_from_file_location("findings_pipeline_under_test", _PIPELINE_PATH)
-pipeline = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(pipeline)
+from scripts.findings_test_support import load_module
+
+pipeline = load_module()
 
 
 def compute_key(f, strategy, diff_file=""):

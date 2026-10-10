@@ -28,6 +28,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from findings_test_support import copy_pipeline  # noqa: E402
 from test_source_helpers import (  # noqa: E402
     GATES_SH, PLATFORM_SH, REVIEW_MERGE_SH, TOOL_HOME, init_git_repo, path_without,
     setup_project, source_env,
@@ -175,13 +176,16 @@ class TestPrimitiveContract(Base):
     def test_a_stage_crash_is_not_accepted_as_a_listed_answer(self):
         # Python's own uncaught-exception status is 1, the status predicate
         # stages use for "no"; the real file must exit differently on a crash.
-        real = os.path.join(TOOL_HOME, "plugins", "clagentic-lite", "bin", "findings.py")
-        with open(real) as handle:
+        home = self.make_home("")
+        bin_dir = os.path.join(home, "plugins", "clagentic-lite", "bin")
+        copy_pipeline(bin_dir)
+        cli_path = os.path.join(bin_dir, "clagentic_findings", "cli.py")
+        with open(cli_path) as handle:
             source = handle.read()
         marker = "def main(argv=None):\n"
         self.assertIn(marker, source)
-        crashing = source.replace(marker, marker + "    raise RuntimeError('boom')\n", 1)
-        home = self.make_home(crashing)
+        with open(cli_path, "w") as handle:
+            handle.write(source.replace(marker, marker + "    raise RuntimeError('boom')\n", 1))
         result = self.platform("ds_findings_call -t '[]' -e any -o 1 verdict ledger-pass", home=home)
         self.assertEqual((result.returncode, result.stdout), (70, ""))
         self.assertIn("rc=70", result.stderr)

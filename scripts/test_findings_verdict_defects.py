@@ -230,7 +230,9 @@ class TestEnvelopeAccess(Tmp):
                                     "@@ -0,0 +1,3 @@\n+a\n+b\n+c\n")
         env = self.write("env.json", {"findings": [finding(line=2)]})
         counts, seen = self.path("counts.json"), self.path("seen")
-        with mock.patch.object(findings, "splice_findings", side_effect=OSError("full")):
+        # splice_findings is looked up in the globals of each module that calls it.
+        with mock.patch.object(findings.modules["rounds"], "splice_findings",
+                               side_effect=OSError("full")):
             self.assertIsNone(findings.recurrence_count(env, diff, counts))
             with self.assertRaises(findings.StageFailure):
                 findings.cross_round(env, diff, seen)
