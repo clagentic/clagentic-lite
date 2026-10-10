@@ -50,6 +50,8 @@ import tempfile
 import textwrap
 import unittest
 
+from scripts.findings_test_support import manifest
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CLI = os.path.join(TOOL_HOME, "bin", "clagentic-lite")
 AGENTS_SRC = os.path.join(TOOL_HOME, "plugins", "clagentic-lite", "agents")
@@ -867,6 +869,74 @@ class TestDoctorRenderStampStalenessCheck(_RenderTestBase):
         self.assertIn("STALE", result.stdout, msg=result.stdout)
         self.assertIn("clagentic-lite update", result.stdout)
         self.assertNotIn("OK:", result.stdout, msg=result.stdout)
+
+
+_PROBE_MARKER = "_findings_pipeline_probe() {"
+
+
+def _extract_findings_probe():
+    """The doctor's finding-pipeline probe, sliced out of bin/clagentic-lite
+    the same way the render functions above are."""
+    with open(CLI) as f:
+        content = f.read()
+    assert _PROBE_MARKER in content, "extraction marker drifted -- the probe definition moved"
+    start = content.index(_PROBE_MARKER)
+    return content[start:content.index("\n}\n", start) + 3]
+
+
+class TestRenderedPluginCarriesTheFindingPackage(_RenderTestBase):
+    """The Reviewer and Auditor agents run the rendered plugin's copy of the
+    finding pipeline: the entrypoint and a package of modules. A rendered
+    plugin that has the entrypoint but lost a module must fail loudly."""
+
+    def _rendered_bin(self):
+        return os.path.join(self.fake_home, ".clagentic", "rendered-plugin",
+                            "plugins", "clagentic-lite", "bin")
+
+    def _render(self):
+        result = self._run("_render_clagentic_lite_plugin_dir")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def _probe(self, findings_py):
+        script = (_extract_findings_probe() + "\n"
+                  f"_findings_pipeline_probe '{findings_py}'\n"
+                  "status=$?\n"
+                  "printf '%s|%s' \"$status\" \"$_FINDINGS_PROBE_DETAIL\"\n")
+        result = self._run(script)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        return result.stdout.split("|", 1)
+
+    def test_the_render_copies_the_entrypoint_and_every_module_of_the_package(self):
+        self._render()
+        package = os.path.join(self._rendered_bin(), "clagentic_findings")
+        self.assertTrue(os.path.isfile(os.path.join(self._rendered_bin(), "findings.py")))
+        for name in ("__init__",) + tuple(manifest()):
+            self.assertTrue(os.path.isfile(os.path.join(package, name + ".py")), name)
+
+    def test_the_probe_passes_on_the_checkout_and_on_the_rendered_copy(self):
+        checkout = os.path.join(self.fake_home, "plugins", "clagentic-lite", "bin", "findings.py")
+        self.assertEqual(self._probe(checkout)[0], "0")
+        self._render()
+        self.assertEqual(self._probe(os.path.join(self._rendered_bin(), "findings.py"))[0], "0")
+
+    def test_the_probe_fails_loudly_when_the_rendered_copy_lost_a_module(self):
+        self._render()
+        os.unlink(os.path.join(self._rendered_bin(), "clagentic_findings", "rubric.py"))
+        status, detail = self._probe(os.path.join(self._rendered_bin(), "findings.py"))
+        self.assertEqual(status, "1")
+        self.assertIn("rubric", detail)
+        self.assertIn("incomplete", detail)
+
+    def test_the_probe_fails_loudly_when_the_rendered_copy_lost_the_package(self):
+        self._render()
+        shutil.rmtree(os.path.join(self._rendered_bin(), "clagentic_findings"))
+        status, detail = self._probe(os.path.join(self._rendered_bin(), "findings.py"))
+        self.assertEqual(status, "1")
+        self.assertIn("cannot be loaded", detail)
+
+    def test_the_probe_fails_on_a_path_that_is_not_a_pipeline(self):
+        status, _ = self._probe(os.path.join(self.tmp, "absent.py"))
+        self.assertEqual(status, "1")
 
 
 if __name__ == "__main__":

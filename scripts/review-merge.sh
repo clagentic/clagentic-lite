@@ -322,8 +322,8 @@ dedup_findings() {
 # key here is directly comparable to one persisted in a SEEN_FILE.
 finding_content_keys() {
   # A failed pipeline yields no rows (and ds_findings_call says why on stderr).
-  # No key means no recurrence count, so no demotion: the direction that keeps
-  # a finding blocking.
+  # No key means no recurrence count for that finding. A count never changes
+  # whether a finding blocks, so a missing one cannot weaken the verdict.
   ds_findings_call -s -e any fingerprint keys --diff "$1" || return 0
 }
 
@@ -336,7 +336,8 @@ finding_content_keys() {
 #         for that key (an integer >= 1). COUNTS_FILE is a JSON object mapping
 #         key -> count, persisted across rounds. A row with an empty key gets
 #         count 1 and is not persisted; an unreadable COUNTS_FILE reads as
-#         empty, so a count can only be undercounted, which can only under-demote.
+#         empty, so a count can only be undercounted. The count is
+#         informational: it never changes whether a finding blocks.
 finding_recurrence_bump() {
   _frb_input=$(cat)
   # The rows go in on stdin: a large round as one argv string fails exec (E2BIG).
@@ -344,7 +345,7 @@ finding_recurrence_bump() {
     return 0
   fi
   # Failed pipeline: every row gets count 1, the documented undercount, which
-  # can only under-demote. Nothing was printed by the failed call.
+  # does not affect the verdict. Nothing was printed by the failed call.
   printf '%s\n' "$_frb_input" | while IFS= read -r _frb_row; do
     if [ -n "$_frb_row" ]; then
       printf '%s\t1\n' "$_frb_row"

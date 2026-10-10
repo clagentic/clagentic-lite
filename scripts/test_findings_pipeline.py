@@ -19,8 +19,11 @@ import sys
 import tempfile
 import unittest
 
+from scripts.findings_test_support import PIPELINE_PACKAGE_DIR
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 FINDINGS_PY = os.path.join(TOOL_HOME, "plugins", "clagentic-lite", "bin", "findings.py")
+PACKAGE_DIR = PIPELINE_PACKAGE_DIR
 
 
 def run(args, stdin=None, cwd=None, env=None):
@@ -60,27 +63,34 @@ class Tmp(unittest.TestCase):
                           % (fname, fname, fname, fname, start, len(lines), body))
 
 
+PIPELINE_SOURCES = [FINDINGS_PY] + sorted(
+    os.path.join(PACKAGE_DIR, name) for name in os.listdir(PACKAGE_DIR) if name.endswith(".py"))
+
+
 class TestModuleShape(unittest.TestCase):
-    def test_imports_only_the_standard_library(self):
-        with open(FINDINGS_PY) as handle:
-            tree = ast.parse(handle.read())
+    def test_imports_only_the_standard_library_and_its_own_modules(self):
         imported = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported.update(a.name.split(".")[0] for a in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                imported.add((node.module or "").split(".")[0])
-        stdlib = {"argparse", "datetime", "fcntl", "hashlib", "io", "json", "os", "posixpath", "re",
-                  "subprocess", "sys", "tempfile"}
+        for source in PIPELINE_SOURCES:
+            with open(source) as handle:
+                tree = ast.parse(handle.read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.update(a.name.split(".")[0] for a in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    imported.add((node.module or "").split(".")[0])
+        stdlib = {"argparse", "datetime", "fcntl", "hashlib", "importlib", "io", "json", "os",
+                  "posixpath", "re", "subprocess", "sys", "tempfile"}
         self.assertTrue(imported <= stdlib, imported - stdlib)
 
     def test_code_names_no_shell_gate_or_enrollment_dependency(self):
-        with open(FINDINGS_PY) as handle:
-            text = handle.read()
-        docstring = ast.get_docstring(ast.parse(text), clean=False) or ""
-        code = text.replace(docstring, "")
-        for forbidden in ("gates.sh", "llm-client.sh", "platform.sh", "audit.db", "CLAGENTIC_LITE_HOME"):
-            self.assertNotIn(forbidden, code)
+        for source in PIPELINE_SOURCES:
+            with open(source) as handle:
+                text = handle.read()
+            docstring = ast.get_docstring(ast.parse(text), clean=False) or ""
+            code = text.replace(docstring, "")
+            for forbidden in ("gates.sh", "llm-client.sh", "platform.sh", "audit.db",
+                              "CLAGENTIC_LITE_HOME"):
+                self.assertNotIn(forbidden, code, source)
 
 
 class TestStandaloneInUnenrolledRepo(Tmp):

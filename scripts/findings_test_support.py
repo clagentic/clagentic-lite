@@ -1,15 +1,19 @@
 """
 Shared fixtures for the tests of the standalone finding pipeline
-(plugins/clagentic-lite/bin/findings.py): a throwaway git repository, a
-subprocess runner with no CLAGENTIC_* environment, and an importable copy of the
-module for unit-level assertions. Every path lives under a temp directory;
+(plugins/clagentic-lite/bin/findings.py and its clagentic_findings package): a
+throwaway git repository, a subprocess runner with no CLAGENTIC_* environment,
+and an importable copy of the pipeline for unit-level assertions. Every path lives under a temp directory;
 nothing here touches this checkout's own .clagentic state.
 """
+import importlib
 import importlib.util
+import itertools
 import json
 import os
+import shutil
 import subprocess
 import sys
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,7 +25,10 @@ register(__name__, sys.modules[__name__])
 scrub_git_env()
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-FINDINGS_PY = os.path.join(TOOL_HOME, "plugins", "clagentic-lite", "bin", "findings.py")
+PIPELINE_BIN = os.path.join(TOOL_HOME, "plugins", "clagentic-lite", "bin")
+FINDINGS_PY = os.path.join(PIPELINE_BIN, "findings.py")
+PIPELINE_PACKAGE_DIR = os.path.join(PIPELINE_BIN, "clagentic_findings")
+_LOADS = itertools.count()
 
 GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
@@ -30,11 +37,51 @@ GIT_IDENTITY = {
 
 
 def load_module():
-    """findings.py imported as a module (its __main__ guard keeps it inert)."""
-    spec = importlib.util.spec_from_file_location("findings_under_test", FINDINGS_PY)
+    """The finding pipeline imported in-process, one fresh copy per call.
+
+    The package is loaded under a private name so each caller gets its own
+    module state, then every module's names are flattened into one namespace
+    (the shape the single-file pipeline had). A test that patches a name must
+    patch it on the module that owns it, found in `.modules` by module name:
+    the other modules look the name up in their own globals."""
+    name = "findings_under_test_%d" % next(_LOADS)
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(PIPELINE_PACKAGE_DIR, "__init__.py"),
+        submodule_search_locations=[PIPELINE_PACKAGE_DIR])
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[name] = package
+    spec.loader.exec_module(package)
+    facade = types.ModuleType("findings_under_test")
+    facade.modules = {}
+    for module_name in package.MODULES:
+        owner = importlib.import_module("%s.%s" % (name, module_name))
+        facade.modules[module_name] = owner
+        for attr, value in vars(owner).items():
+            if attr.startswith("__"):
+                continue
+            defined_here = getattr(value, "__module__", None) == owner.__name__
+            if defined_here or not hasattr(facade, attr):
+                setattr(facade, attr, value)
+    return facade
+
+
+def manifest():
+    """The package's MODULES tuple, read from its __init__.py without
+    importing any module."""
+    spec = importlib.util.spec_from_file_location(
+        "manifest_under_test", os.path.join(PIPELINE_PACKAGE_DIR, "__init__.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module
+    return module.MODULES
+
+
+def copy_pipeline(bin_dir):
+    """A copy of the shipped entrypoint and its package in BIN_DIR, for a test
+    that must alter a module of the pipeline without touching the checkout."""
+    os.makedirs(bin_dir, exist_ok=True)
+    shutil.copy(FINDINGS_PY, os.path.join(bin_dir, "findings.py"))
+    shutil.copytree(PIPELINE_PACKAGE_DIR, os.path.join(bin_dir, "clagentic_findings"),
+                    ignore=shutil.ignore_patterns("__pycache__"))
 
 
 def clean_env(drop=("CLAGENTIC_", "GIT_")):

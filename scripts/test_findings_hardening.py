@@ -214,7 +214,8 @@ class TestStateLockRefuses(Tmp):
                          today="2026-10-09", default_branch="", scope="head", caller="standalone",
                          annotate="", attach_to="", json_out="", json=False, format="json")
         with mock.patch("fcntl.flock", side_effect=OSError("no locks here")), \
-                mock.patch.object(findings, "read_stdin_bounded", return_value=json.dumps([finding()])):
+                mock.patch.object(findings.modules["evaluate"], "read_stdin_bounded",
+                                  return_value=json.dumps([finding()])):
             code, text = findings.run_evaluate(args)
         self.assertEqual(code, 2, text)
         self.assertIn("lock", text)

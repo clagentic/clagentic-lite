@@ -577,9 +577,10 @@ class TestReconfirmation(Repo):
             write(os.path.join(self.repo, "a%d.txt" % index), "x\n")
         commit_file(self.repo, "deploy/ingress.yaml", "kind: Ingress\n", "an ingress sorted past the cap")
         base = findings.resolve_base(self.repo, "main", "main")
-        saved = findings.CHANGED_PATHS_MAX
-        findings.CHANGED_PATHS_MAX = 3
-        self.addCleanup(setattr, findings, "CHANGED_PATHS_MAX", saved)
+        infer = findings.modules["infer"]
+        saved = infer.CHANGED_PATHS_MAX
+        infer.CHANGED_PATHS_MAX = 3
+        self.addCleanup(setattr, infer, "CHANGED_PATHS_MAX", saved)
         touched = findings.changed_paths(self.repo, base, lambda p: p.endswith("ingress.yaml"))
         self.assertEqual(touched, ["deploy/ingress.yaml"])
 

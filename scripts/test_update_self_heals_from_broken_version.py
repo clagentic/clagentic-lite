@@ -56,6 +56,7 @@ Run with: python3 -m unittest scripts.test_update_self_heals_from_broken_version
 import fcntl
 import os
 import pty
+import select
 import shutil
 import signal
 import stat
@@ -321,6 +322,18 @@ class _UpdateSelfHealPtyTestBase(unittest.TestCase):
                         os.write(master_fd, b"\n")
                     except OSError:
                         pass
+                # Drain what `update` prints. A pty holds only a few KiB
+                # between the slave's writes and a reader; `git pull` lists
+                # every file the pull changed, so output grows with each
+                # change to the tree, and an undrained terminal blocks the
+                # writer in write(2) -- a hang this test would then report
+                # as the SIGTTIN regression it exists to catch.
+                try:
+                    while select.select([master_fd], [], [], 0)[0]:
+                        if not os.read(master_fd, 65536):
+                            break
+                except OSError:
+                    pass
                 try:
                     os.waitpid(pid, os.WNOHANG)
                 except ChildProcessError:
