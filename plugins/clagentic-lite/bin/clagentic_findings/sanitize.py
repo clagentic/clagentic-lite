@@ -132,11 +132,36 @@ def sanitize_fields_strict(array, fields):
 def sanitize_tree(value, limit=1000):
     """Every string in a JSON value, object keys included, sanitized for a
     prompt. A key reaches the prompt exactly as a value does, so it gets the
-    same treatment."""
+    same treatment. Two distinct keys can sanitize to the same string (stripped
+    control bytes, truncation); the first keeps its name and each later one gets
+    a ' (dup N)' suffix, so no value is silently replaced."""
     if isinstance(value, str):
         return sanitize_text(value, limit)
     if isinstance(value, list):
         return [sanitize_tree(v, limit) for v in value]
     if isinstance(value, dict):
-        return {sanitize_text(str(k), limit): sanitize_tree(v, limit) for k, v in value.items()}
+        named = [(key, sanitize_text(str(key), limit), item) for key, item in value.items()]
+        # A key sanitizing to itself owns its name whatever the key order, so a
+        # legitimate field is never renamed by a hostile look-alike listed first.
+        taken = {name for key, name, _ in named if key == name}
+        cleaned = {}
+        for key, name, item in named:
+            if key != name:
+                if name in taken:
+                    name = _unused_key(name, taken, limit)
+                taken.add(name)
+            cleaned[name] = sanitize_tree(item, limit)
+        return cleaned
     return value
+
+
+def _unused_key(name, taken, limit):
+    """NAME with a ' (dup N)' suffix, N the lowest that is free in TAKEN. The
+    base is cut so the suffixed key still fits LIMIT."""
+    count = 1
+    while True:
+        suffix = " (dup %d)" % count
+        candidate = name[:max(limit - len(suffix), 0)] + suffix
+        if candidate not in taken:
+            return candidate
+        count += 1

@@ -8,7 +8,7 @@ from .fileio import dumps, load_json_file, warn, write_file_atomic
 from .fingerprint import dedup_findings
 from .rubric import (IMPACTS, PRECONDITIONS, UNKNOWN_FACT, fact_value,
                      rubric_for_record)
-from .sanitize import allowlist_fields
+from .sanitize import allowlist_fields, terminal_text
 from .severity import SEVERITY_RANKS, severity_rank
 
 DEFAULT_FINDINGS_MAX = 200
@@ -53,7 +53,7 @@ def extract_findings(path):
         # Lenient callers still get [], but never silently: a present non-array
         # is a malformed envelope, and the strict path is what fails closed on it.
         warn("[findings] %s: 'findings' is not an array; read as no findings here "
-             "(the strict path refuses it)" % path)
+             "(the strict path refuses it)" % terminal_text(path, 200))
     return []
 
 
@@ -88,12 +88,13 @@ def mark_review_sanitize_failed(path):
     try:
         write_file_atomic(path, SANITIZE_FAILED_ENVELOPE)
     except OSError as exc:
-        warn("[findings] could not rewrite %s: %s" % (path, exc))
+        warn("[findings] could not rewrite %s: %s"
+             % (terminal_text(path, 200), terminal_text(exc, 300)))
         try:
             os.unlink(path)
         except OSError as unlink_exc:
             warn("[findings] could not remove %s either: %s; it may still hold raw "
-                 "unsanitized findings" % (path, unlink_exc))
+                 "unsanitized findings" % (terminal_text(path, 200), terminal_text(unlink_exc, 300)))
         return False
     warn("[gates/review] review findings could not be reduced to the closed schema; "
          "marked the envelope degraded")
@@ -126,7 +127,8 @@ def parse_adversarial_findings(path):
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
     except (OSError, ValueError) as exc:
-        warn("_parse_adversarial_findings: could not read %s: %s" % (path, exc))
+        warn("_parse_adversarial_findings: could not read %s: %s"
+             % (terminal_text(path, 200), terminal_text(exc, 300)))
         raise
     return parse_adversarial_text(text)
 

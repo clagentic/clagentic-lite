@@ -64,6 +64,27 @@ class TestSanitizeTreeSanitizesKeys(unittest.TestCase):
     def test_non_string_keys_still_become_strings(self):
         self.assertEqual(M["sanitize"].sanitize_tree({1: "a"}), {"1": "a"})
 
+    def test_a_control_byte_collision_replaces_nothing(self):
+        cleaned = M["sanitize"].sanitize_tree({"severity": "low", "severity\x07": "high"})
+        self.assertEqual(cleaned, {"severity": "low", "severity (dup 1)": "high"})
+
+    def test_a_legitimate_key_keeps_its_value_whatever_the_order(self):
+        cleaned = M["sanitize"].sanitize_tree({"severity\x07": "forged", "severity": "real"})
+        self.assertEqual(cleaned["severity"], "real")
+        self.assertEqual(sorted(cleaned.values()), ["forged", "real"])
+
+    def test_a_truncation_collision_replaces_nothing(self):
+        raw = {"k" * 60 + "a": 1, "k" * 60 + "b": 2, "k" * 60 + "c": 3}
+        cleaned = M["sanitize"].sanitize_tree(raw, 50)
+        self.assertEqual(sorted(cleaned.values()), [1, 2, 3])
+        for key in cleaned:
+            self.assertLessEqual(len(key), 50)
+
+    def test_a_string_key_and_a_number_key_that_meet_both_survive(self):
+        cleaned = M["sanitize"].sanitize_tree({1: "number", "1": "string"})
+        self.assertEqual(cleaned["1"], "string")
+        self.assertEqual(sorted(cleaned.values()), ["number", "string"])
+
 
 class TestChangedPathsCannotTell(Iso):
     def setUp(self):
@@ -325,7 +346,27 @@ class TestCliUnreadableInput(Iso):
         for args in cases:
             with self.subTest(args=args[:2]):
                 result = run_bytes(args, b"\xff\xfe")
-                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn(b"Traceback", result.stderr)
+
+    def test_every_stdin_command_answers_undecodable_input_with_2(self):
+        ledger = self.path("ledger.jsonl")
+        cases = (
+            ["fingerprint", "dedup"],
+            ["fingerprint", "keys"],
+            ["ingest", "sanitize-text"],
+            ["verdict", "blocking-json", "high"],
+            ["verdict", "ledger-field", "x"],
+            ["render", "fence-data", "LABEL", "KIND"],
+            ["render", "cleared-summary"],
+            ["render", "verdict-lines", "abc"],
+            ["render", "json-field", "k"],
+            ["dispositions", "ledger-recurrence", "--ledger", ledger, "--branch", "b"],
+        )
+        for args in cases:
+            with self.subTest(args=args[:2]):
+                result = run_bytes(args, b"\xff\xfe")
+                self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertNotIn(b"Traceback", result.stderr)
 
     def test_cap_rejects_a_negative_max_and_accepts_zero(self):
@@ -389,6 +430,24 @@ class TestIngestRobustness(Iso):
                 mock.patch.object(sys, "stderr", io.StringIO()):
             self.assertFalse(M["ingest"].mark_review_sanitize_failed(target))
         self.assertFalse(os.path.exists(target), "the raw envelope was left in place")
+
+    def test_ingest_warnings_print_path_and_error_through_terminal_text(self):
+        hostile = "p\x1b[31m‮"
+        err = io.StringIO()
+        with mock.patch.object(M["ingest"], "write_file_atomic", side_effect=OSError(hostile)), \
+                mock.patch.object(M["ingest"].os, "unlink", side_effect=OSError(hostile)), \
+                mock.patch.object(sys, "stderr", err):
+            M["ingest"].mark_review_sanitize_failed(self.path("env" + hostile))
+        self.assertTrue(err.getvalue())
+        for char in ("\x1b", "‮"):
+            self.assertNotIn(char, err.getvalue())
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            M["ingest"].extract_findings(write(self.path("e" + hostile), {"findings": 1}))
+            with self.assertRaises(OSError):
+                M["ingest"].parse_adversarial_findings(self.path("missing" + hostile))
+        for char in ("\x1b", "‮"):
+            self.assertNotIn(char, err.getvalue())
 
     def test_an_unhashable_severity_ranks_as_unrankable_and_sorts_with_the_blockers(self):
         items = [{"severity": "low"}, {"severity": ["high"]}, {"severity": {"a": 1}},

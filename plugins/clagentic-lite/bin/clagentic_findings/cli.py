@@ -79,6 +79,18 @@ from .summary import build_gate_summary
 from .verdict import blocking_findings_listing, count_blockers
 
 CRASH_STATUS = 70
+UNREADABLE_INPUT = 2
+
+
+def _stdin_text():
+    """Stdin decoded as UTF-8, or None when it cannot be. Every command that
+    reads stdin answers None with UNREADABLE_INPUT, so a caller can tell input
+    it could not read from a refusal (status 1) the same way in every command."""
+    try:
+        return read_stdin_text()
+    except UnicodeDecodeError:
+        warn("[findings] stdin is not valid UTF-8")
+        return None
 
 
 def _print(text):
@@ -172,10 +184,10 @@ def cmd_ingest_merge(args):
 
 def cmd_ingest_sanitize_text(args):
     limit = args.max if args.max and args.max > 0 else None
-    try:
-        _print(sanitize_text(read_stdin_text(), limit))
-    except UnicodeDecodeError:
-        return 1
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
+    _print(sanitize_text(text, limit))
     return 0
 
 
@@ -232,10 +244,9 @@ def cmd_ingest_union_samples(args):
 
 
 def cmd_fingerprint_dedup(args):
-    try:
-        text = read_stdin_text()
-    except UnicodeDecodeError:
-        return 1
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
     try:
         findings = json.loads(text)
         if not isinstance(findings, list):
@@ -255,22 +266,25 @@ def cmd_fingerprint_dedup(args):
 def cmd_fingerprint_keys(args):
     # Undecodable or unparsable stdin is unreadable input (status 2), never an
     # empty key list with status 0 that reads as "no findings had keys".
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
     try:
-        findings = json.loads(read_stdin_text())
+        findings = json.loads(text)
     except ValueError:
-        return 2
+        return UNREADABLE_INPUT
     if not isinstance(findings, list):
-        return 2
+        return UNREADABLE_INPUT
     for row in content_key_rows(findings, args.diff):
         _print("\t".join(row) + "\n")
     return 0
 
 
 def cmd_fingerprint_bump(args):
-    try:
-        rows = [line for line in read_stdin_text().split("\n") if line]
-    except UnicodeDecodeError:
-        return 1
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
+    rows = [line for line in text.split("\n") if line]
     keyed = [row for row in rows if row.split("\t")[0]]
     new_counts = iter(bump_counts(args.counts, [row.split("\t")[0] for row in keyed]))
     for row in rows:
@@ -295,10 +309,9 @@ def cmd_dispositions_recurrence(args):
 
 
 def cmd_dispositions_ledger_recurrence(args):
-    try:
-        text = read_stdin_text()
-    except UnicodeDecodeError:
-        return 1
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
     try:
         findings = json.loads(text)
         if not isinstance(findings, list):
@@ -370,11 +383,9 @@ def cmd_verdict_blockers(args):
 
 
 def cmd_verdict_blocking_json(args):
-    try:
-        text = read_stdin_text()
-    except UnicodeDecodeError:
-        warn("[findings] blocking-json: stdin is not valid UTF-8")
-        return 2
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
     listing = blocking_findings_listing(text, args.threshold)
     if listing is None:
         # "null" stays on stdout for a caller that reads it, but the status says
@@ -404,8 +415,11 @@ def cmd_verdict_ledger_latest(args):
 
 
 def cmd_verdict_ledger_field(args):
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
     try:
-        entry = json.loads(read_stdin_text())
+        entry = json.loads(text)
         if not isinstance(entry, dict):
             raise ValueError("entry is not an object")
     except ValueError:
@@ -433,19 +447,17 @@ def cmd_verdict_ledger_pass_head(args):
 
 
 def cmd_verdict_ledger_append(args):
-    try:
-        text = read_stdin_text()
-    except UnicodeDecodeError:
-        return 1
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
     ledger_append(args.ledger, text, args.max)
     return 0
 
 
 def cmd_verdict_ledger_entry(args):
-    try:
-        text = read_stdin_text()
-    except UnicodeDecodeError:
-        return 1
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
     _print(build_ledger_entry(args.ts, args.branch, args.gate, args.base, args.head,
                               args.verdict, text, args.config))
     return 0
@@ -463,9 +475,12 @@ def cmd_render_review(args):
 
 
 def cmd_render_cleared_summary(args):
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
     try:
-        _print(cleared_summary(read_stdin_text()))
-    except (ValueError, UnicodeDecodeError) as exc:
+        _print(cleared_summary(text))
+    except ValueError as exc:
         warn("[findings] cleared-summary: %s" % terminal_text(exc, 300))
         return 1
     return 0
@@ -485,10 +500,9 @@ def cmd_render_class_footer(args):
 
 
 def cmd_render_verdict_lines(args):
-    try:
-        text = read_stdin_text()
-    except UnicodeDecodeError:
-        return 2
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
     code, out = render_verdict_lines(args.head, text)
     _print(out)
     return code
@@ -511,25 +525,27 @@ def cmd_render_sanitize_report(args):
 
 
 def cmd_render_fence_data(args):
-    try:
-        _print(fence_data_block(args.label, args.kind, read_stdin_text()))
-    except UnicodeDecodeError:
-        return 1
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
+    _print(fence_data_block(args.label, args.kind, text))
     return 0
 
 
 def cmd_render_fence_findings(args):
-    try:
-        text = read_stdin_text()
-    except UnicodeDecodeError:
-        return 1
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
     _print(fence_findings(text))
     return 0
 
 
 def cmd_render_json_field(args):
+    text = _stdin_text()
+    if text is None:
+        return UNREADABLE_INPUT
     try:
-        value = json_string_field(read_stdin_text(), args.key)
+        value = json_string_field(text, args.key)
     except (ValueError, AttributeError) as exc:
         # Malformed JSON is a failure; an absent key is an empty value and exit 0.
         warn("[findings] json-field: input is not a JSON object: %s" % terminal_text(exc, 300))
