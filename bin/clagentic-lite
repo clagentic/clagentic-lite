@@ -275,7 +275,7 @@ PLUGIN_RENDER_VERSION="v3"
 # path (enrolled repos never receive their own copy of these scripts).
 # Bump on any content change to any hook template so `clagentic-lite update`
 # re-stamps existing installs.
-CLAUDE_HOOKS_VERSION="v6"
+CLAUDE_HOOKS_VERSION="v7"
 
 # Single source of truth for which hook scripts are stamped into
 # $CLAGENTIC_LITE_HOME/.claude/hooks/. Space-separated POSIX-sh string (no
@@ -302,7 +302,7 @@ CLAGENTIC_SECURITY_TOOLS="gitleaks semgrep osv-scanner"
 # _config_missing_keys helpers; neither depends on this constant. Bump on any
 # structural change to config.example's key set (add/remove/rename a key) —
 # content-only comment edits do not require a bump.
-CONFIG_SCHEMA_VERSION="v6"
+CONFIG_SCHEMA_VERSION="v7"
 
 say()  { printf '[clagentic-lite] %s\n' "$*"; }
 warn() { printf '[clagentic-lite] WARN: %s\n' "$*" 1>&2; }

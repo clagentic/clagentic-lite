@@ -20,7 +20,7 @@
 #    Opt-out: CLAGENTIC_DISABLE_AUTOSUMMARIZE=1
 #    Threshold: CLAGENTIC_AUTOSUMMARIZE_BYTES (default 32768)
 #
-# managed-by: clagentic · clagentic-hooks-version: v6
+# managed-by: clagentic · clagentic-hooks-version: v7
 # Source of truth: share/hook-shims/post-tool-nudge.sh.template. Materialized
 # into $CLAGENTIC_LITE_HOME/.claude/hooks/post-tool-nudge.sh at `init`/`update`
 # time via __CLAGENTIC_LITE_HOME__ substitution (bin/clagentic-lite

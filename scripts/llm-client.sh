@@ -253,13 +253,14 @@ ds_review_prompt() {
   # closed schema FIRST (_llm_json_array_allowlist_fields) is what makes
   # "only six named fields get sanitized" safe here: after the reduction,
   # there is no seventh field left to have skipped.
+  # The file is read from the BASE revision through git, never from the working
+  # tree (findings.py load_policy's rule): a deferral added on the branch under
+  # review must not reach the prompt as if it were already granted. An absent
+  # file, an unresolvable base and a read error all mean no deferrals, the
+  # worst case for the author.
   _drp_deferrals=""
-  _drp_dfile="$REPO_ROOT/.clagentic/deferrals.json"
-  if [ -f "$_drp_dfile" ]; then
-    _drp_deferrals=$(cat "$_drp_dfile" 2>/dev/null) || _drp_deferrals=""
-    # Validate that the content is non-empty after read; a read error yields "".
-    # If cat produced an empty string (empty file or read error), treat as no deferrals.
-  fi
+  _drp_deferrals=$(ds_findings_call -e any ingest policy-file .clagentic/deferrals.json \
+    --root "$REPO_ROOT" --default-branch "${CLAGENTIC_DEFAULT_BRANCH:-main}") || _drp_deferrals=""
 
   _drp_deferrals_failed=0
   if [ -n "$_drp_deferrals" ]; then
@@ -459,7 +460,7 @@ match reality.
   # platform.sh). What stays here is specific to this call: the identity line
   # and the output-format rule that makes the response parseable.
   printf '%s\n\n' "You are the clagentic-lite Reviewer. Read the staged git diff on stdin."
-  ds_prompt_blocks reviewer schema || return 1
+  ds_prompt_blocks reviewer schema facts || return 1
   printf '\n'
   cat <<'EOF'
 Output format is EXACTLY one of the following two shapes, never a mix and
@@ -477,7 +478,7 @@ review.
 EOF
   printf '\n'
   ds_prompt_blocks reviewer pre-report-gate proof-required class-fields \
-    zero-findings false-positives change-class
+    zero-findings false-positives change-class removal-aware
 }
 
 ds_summarize_prompt() {
@@ -594,9 +595,9 @@ surfaces you considered. Output is markdown. Non-blocking by design — see
 Merge Gate.
 EOF
   printf '\n'
-  ds_prompt_blocks auditor pre-report-gate reachability blocking-vs-advisory \
-    change-class proof-required zero-findings false-positives finding-format \
-    cwe-ordering
+  ds_prompt_blocks auditor pre-report-gate reachability facts blocking-vs-advisory \
+    change-class removal-aware proof-required zero-findings false-positives \
+    finding-format cwe-ordering
 }
 
 ds_merge_gate_prompt() {
@@ -2849,13 +2850,13 @@ validate_output() {
             # Severity check applies to whichever form is accepted.
             if jq -e '.findings | type == "array"' "$F" >/dev/null 2>&1; then
               # Bare top-level .findings — primary path.
-              jq -e '.findings // [] | all(.severity == null or (.severity | ascii_downcase | IN("low","medium","high","critical")))' "$F" >/dev/null 2>&1 || return 1
+              jq -e '.findings // [] | all((.severity == null or (.severity | ascii_downcase | IN("low","medium","high","critical"))) and (.severity_claimed == null or (.severity_claimed | ascii_downcase | IN("low","medium","high","critical"))))' "$F" >/dev/null 2>&1 || return 1
             else
               # Try single-key wrapper: extract the sole value, check it has .findings.
               # `to_entries[0].value` on a one-key object yields the inner object directly.
               # Fails (returns non-zero) on multi-key objects or non-objects.
               jq -e '(to_entries | length == 1) and (to_entries[0].value.findings | type == "array")' "$F" >/dev/null 2>&1 || return 1
-              jq -e 'to_entries[0].value.findings // [] | all(.severity == null or (.severity | ascii_downcase | IN("low","medium","high","critical")))' "$F" >/dev/null 2>&1 || return 1
+              jq -e 'to_entries[0].value.findings // [] | all((.severity == null or (.severity | ascii_downcase | IN("low","medium","high","critical"))) and (.severity_claimed == null or (.severity_claimed | ascii_downcase | IN("low","medium","high","critical"))))' "$F" >/dev/null 2>&1 || return 1
             fi
             # ISSUE_CLASS / CLASS_FIX PRESENCE (lr-3eb18c): scoped to
             # "reviewer" only -- ds_review_prompt (this file) is the only
@@ -2921,9 +2922,12 @@ import json, sys
 def findings_valid(lst):
     valid_sev = {"low", "medium", "high", "critical"}
     for item in lst:
-        sev = item.get("severity")
-        if sev is not None and sev.lower() not in valid_sev:
-            return False
+        # severity_claimed is the facts-era name for the model's own severity;
+        # both are checked against the same closed set.
+        for key in ("severity", "severity_claimed"):
+            sev = item.get(key)
+            if sev is not None and sev.lower() not in valid_sev:
+                return False
     return True
 
 def findings_have_issue_class(lst):

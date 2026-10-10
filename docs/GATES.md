@@ -51,7 +51,7 @@ Bash rules (R-001 through R-021) implemented inline in `pre-bash-guard.sh`:
 | R-018 | `> /dev/sda*` / `dd of=/dev/...` | disk-level write |
 | R-019 | `find ... -delete` without a literal (non-wildcard) `-path` constraint | unbounded delete |
 | R-020 | truncating `.env` / `*.pem` / `*.key` (`: > .env`, `truncate ... .env`) | credential destruction |
-| R-021 | The Builder role (an `agent_type` naming a builder, in any case) running a command that names `dispositions.json`, or a glob in the first segment under `.clagentic/`: the shell-channel half of W-007. No `CLAGENTIC_ALLOW_BASH_RULES` escape | the file clears the Builder's own findings; a static check of the command text, not a sandbox |
+| R-021 | The Builder role (an `agent_type` naming a builder, in any case) running a command that names `dispositions.json` or `risk-profile.json`, or a glob in the first segment under `.clagentic/`, or a `cd`/`pushd` into `.clagentic` followed by a write: the shell-channel half of W-007. The text is matched as written and again with its `//`, `/./` and `name/../` segments collapsed, so `.clagentic/./d*`, `.clagentic/lite/../d*` and `.clagentic//r*` are caught. No `CLAGENTIC_ALLOW_BASH_RULES` escape | BEST-EFFORT deterrent, not the guarantee: a static check of the command text, not a sandbox. It does not see quoting, variable expansion, command substitution, glob spellings, in-place editors or tools such as `rsync`, `ed`, `tar` or `unzip` that reach the file without naming it, and it is not extended to chase them. What keeps a write from mattering is that policy is read only from the base revision (see "Policy is read from the base revision"): a file written by any route applies only once it is merged |
 
 Write rules (`pre-write-guard.sh`; the blocking rules exit 2, the two warn-only rules exit 0 and log a `warn` row to `audit.db`):
 
@@ -63,7 +63,7 @@ Write rules (`pre-write-guard.sh`; the blocking rules exit 2, the two warn-only 
 | W-004 | No writes to files matching `*.pem`, `*id_rsa*`, `*.key` | none |
 | W-005 | Warn only: editing `CLAUDE.md`, `.claude/settings.json`, `.claude/settings.local.json`, `.claude/hooks/*.sh`, or an MCP config mid-session invalidates Claude's prompt cache | none needed (does not block) |
 | W-006 | Warn only: a Write/Edit made by the main session rather than a dispatched subagent (no `agent_type` in the hook payload); prompts delegating code changes to the Builder | none needed (does not block) |
-| W-007 | The Builder role (an `agent_type` naming a builder, matched without regard to case or namespace) must not write `.clagentic/dispositions.json` (path compared without regard to case); R-021 is the same rule for the shell: it is the operator's record of what was accepted, and gate code clears findings from it. Checked ahead of W-003 so the refusal names the rule | none for the Builder — print the gate's stanza for the operator to commit |
+| W-007 | The Builder role (an `agent_type` naming a builder, matched without regard to case or namespace) must not write `.clagentic/dispositions.json` or `.clagentic/risk-profile.json` (paths compared without regard to case); R-021 is the same rule for the shell: the first is the operator's record of what was accepted and gate code clears findings from it, the second records what is at stake on each path and gate code scales every finding's severity by it. Checked ahead of W-003 so the refusal names the rule. Best-effort, like R-021: the base-revision read of policy is what actually keeps a written file from applying | none for the Builder — print the gate's stanza (or the profile change) for the operator to commit |
 
 ## Gate 3 — Cross-CLI review
 
@@ -149,22 +149,193 @@ disposition clears.
 
 **One finding schema.** Review findings (JSON) and adversarial findings
 (markdown `[FINDING]` headers) are reduced by `findings.py evaluate` to one
-record: `source` (`review` or `adversarial`), `file`, `line`, `category` (a CWE
-or rule class), `message`, `evidence`, `reachable` (`yes|no|unknown`), `class`
+record (schema 2): `source` (`review` or `adversarial`), `file`, `line`,
+`category` (a CWE or rule class), `message`, `evidence`, the facts `reachable`
+(`yes|no|unknown`), `attacker_precondition`, `impact` and `class`
 (`durable|ephemeral`), `severity_claimed` (the model's own value, display
-only), `severity` (that value as a known rank, or `unknown` when it is not
-one), `tier` (adversarial only), and the pipeline-added `fingerprint` and
-`disposition`. The record is rebuilt field by field: a `fingerprint`,
-`disposition` or any other key a model wrote is not carried over.
+only), `severity` (always the rubric's), `tier` (adversarial only), and the
+pipeline-added `fingerprint`, `disposition` and `schema`. The record is rebuilt
+field by field: a `fingerprint`, `disposition` or any other key a model wrote is
+not carried over. A finding with no `attacker_precondition` and no `impact`
+(a producer that predates the facts, or a model that left them out) resolves to
+the worst case on both and is rated as such; it never keeps the severity it
+claimed. Migration from schema 1: a fixture or integration that fed findings
+without facts and relied on its own severity now has to state the facts.
 
 **What blocks.** A review finding blocks when its severity meets
-`CLAGENTIC_BLOCK_SEVERITY` (default `high`); a severity that is not one of
-`low`/`medium`/`high`/`critical` once stripped and lower-cased (`blocker`,
-`crit`, a number) cannot be ranked and blocks. An adversarial finding blocks
-by its tier: `reachable: yes` at `high` or above is always `blocking`
-(the security floor), anything not reachable is `advisory`, and in between the
-model's own tier stands. Severity is still the model's claim in this version;
-a later change replaces the claim with a rubric.
+`CLAGENTIC_BLOCK_SEVERITY` (default `high`). That severity is the rubric's (see
+"Facts, the rubric and the stakes profile"); what the model claimed decides
+nothing, so a claim that cannot be ranked (`blocker`, `crit`, a number) is only
+displayed. An adversarial finding blocks by its tier: `blocking` exactly when it
+is reachable (or reachability is unknown) and the rubric puts it at `high` or
+above, otherwise `advisory`; the tier a model wrote is not read.
+
+**Policy is read from the base revision.** Three kinds of file decide what
+blocks: the dispositions file (`.clagentic/dispositions.json`), the legacy
+deferral and ack files (`deferrals.json`, `adversarial-acks.json`) and the
+stakes profile (`.clagentic/risk-profile.json`). The gate and `evaluate` read
+them only from the trusted base revision, through `git show <base>:<path>`:
+the merge base of HEAD with the default branch (`--base`, else `origin/<default>`
+or `<default>`), which is HEAD itself on the default branch. They never read
+them from the working tree or from the branch. So a change to a policy file
+applies only after it is merged, whatever wrote it (a Write tool, a shell
+redirect or glob, an in-place editor, `rsync`, another process, a commit on the
+branch). With no resolvable base no policy file applies, the worst case holds,
+and the output says so. What this change would clear if it were merged is still
+reported ("N findings would be cleared by entries added in this PR", working
+tree and branch against the base), so a reviewer can see the effect of a policy
+change before merging it. This base-revision read is the guarantee. The Builder
+write blocks (W-007 for the Write and Edit tools, R-021 for the shell) are a
+best-effort deterrent on top of it: static checks of what a tool call says that
+stop the ordinary routes and are not a sandbox, and nothing depends on them. A
+note on the prompt-only copy of `deferrals.json` shown to the Reviewer: it is
+read for context, carries no authority and never clears a finding in code.
+
+### Facts, the rubric and the stakes profile
+
+The Reviewer and Auditor are asked for facts, not for a severity they would
+have to defend (`plugins/clagentic-lite/prompts/*.shared.txt`, the `facts`
+blocks; the same text reaches the gate path and the agent files):
+
+| Fact | Values |
+|---|---|
+| `reachable` | `yes`, `no` |
+| `attacker_precondition` | `none`, `network`, `authenticated_user`, `repo_write_can_merge`, `maintainer_admin`, `local_ci_only` |
+| `impact` | `code_exec`, `data_read`, `data_write`, `integrity`, `availability`, `quality_only` |
+| `class` | `durable`, `ephemeral` (one value for the whole diff) |
+
+The Auditor writes them in its `[FINDING]` header (`precondition:` and
+`impact:` after `reachable:`). A value outside its list, or an omitted one, is
+the worst case for that fact (`none` for the precondition, `code_exec` for the
+impact, reachable for `reachable`), so garbling a field can only raise a
+finding. `severity_claimed` is still asked for and shown, and decides nothing.
+
+**The rubric** is one table in `findings.py` (`RUBRIC_TABLE`): severity is a
+function of the impact weight, the effective precondition, reachability and
+class, nothing else. The same facts and the same profile always give the same
+severity, on the gate path and in a standalone agent.
+
+| Impact weight (impact, scaled by data) | none or network | authenticated_user | repo_write_can_merge | maintainer_admin | local_ci_only |
+|---|---|---|---|---|---|
+| severe (`code_exec`) | critical | high | high | medium | medium |
+| high (`data_write`, `integrity`; `data_read` on regulated data) | critical | high | medium | medium | low |
+| moderate (`data_read`) | high | medium | medium | low | low |
+| low (`availability`) | medium | medium | low | low | low |
+| negligible (`quality_only`) | medium | low | low | low | low |
+
+`reachable: no` caps the result at `medium`. An `ephemeral` change lowers
+`availability` and `quality_only` by one row and nothing else.
+
+**The profile adjusts two things, as CVSS does.**
+
+- *Effective precondition* (Attack Vector / Privileges Required): the finding's
+  own precondition, raised by what the profile says an attacker must already
+  have. `exposure=internal_authenticated` turns `network` into
+  `authenticated_user`; `exposure=local_or_ci_only` turns `network` and
+  `authenticated_user` into `local_ci_only`;
+  `merge_control=code_owner_review_required` turns `repo_write_can_merge` into
+  `maintainer_admin` (merging is then held only by trusted reviewers);
+  `visibility=private` turns `none` into `authenticated_user` where the path is
+  not itself internet-exposed (there is no anonymous reader). A precondition of
+  `none` is never raised by `internal_authenticated`.
+- *Data scales impact* (Confidentiality / Integrity Requirement):
+  `data=regulated_or_customer` raises `data_read`, `data_write` and `integrity`
+  by one row, `data=public_or_none` lowers them by one, `internal` leaves them.
+
+**The security floor is unchanged in spirit: ephemeral never means unsafe.** A
+reachable finding with high impact (`code_exec`, `data_write`, `integrity`,
+or one the data raised to that weight) whose *effective* precondition is
+`none` or `network` is always at least `high` and always blocks, on any
+profile. The profile lowers a finding only by genuinely raising the
+precondition, and never for a path served to the internet (`exposure=internet`
+raises nothing). Data can raise a finding onto the floor but never lower one
+off it. The floor is also what the dispositions guardrail uses (below): a floor
+finding is cleared by a fix or a `mitigated` entry, never by `by_design`.
+
+**Stakes profile** (`.clagentic/risk-profile.json`, optional, committed):
+
+```json
+{"version": 1, "confirmed_at": "2026-10-09",
+ "default": {"data": "internal", "visibility": "private"},
+ "paths": [
+   {"glob": "deploy/**", "exposure": "internal_authenticated"},
+   {"glob": "tests/**", "exposure": "local_or_ci_only", "data": "public_or_none"}
+ ]}
+```
+
+Dimensions: `exposure` (`internet`, `internal_authenticated` for an internal
+network behind SSO or a VPN, `local_or_ci_only`), `data`
+(`regulated_or_customer` for PII, customer data, credentials and payment,
+`internal`, `public_or_none`), `visibility` (`public`, `private`) and
+`merge_control` (`code_owner_review_required`, `review_required`,
+`unrestricted`; only the first changes a severity). Each is set per path glob,
+with a repo-wide `default`. Where several globs state the same dimension for a
+path the worse value wins; the default applies only where no glob states it.
+`confirmed_at` is the date an operator last confirmed the file.
+
+- *Absent means no change.* A repository without the file, and every dimension
+  the file leaves unstated, is the worst case (`exposure=internet`,
+  `data=regulated_or_customer`, `visibility=public`,
+  `merge_control=unrestricted`): today's behavior. A value outside a dimension's
+  list is that dimension's worst case, with a warning.
+- *It cannot apply to the change that edits it.* The profile in force is read
+  from the base revision, by the same mechanism as dispositions ("Policy is read
+  from the base revision", above). A profile added or edited in the gated
+  change, committed or not, is reported ("applies once merged", or "differs from
+  its base version") and the base version, or none, applies. If the base cannot
+  be resolved the profile is ignored, loudly.
+- *The tree can contradict it, in the unsafe direction only.* Each run
+  infers, from the committed tree, markers that a path is exposed or handles
+  sensitive data: ingress, route, gateway and virtual-service manifests and
+  `type: LoadBalancer` services with no internal marker (an internal ingress
+  class, an internal load-balancer annotation, an auth annotation or source
+  ranges); a Dockerfile `EXPOSE`; a file starting a server or declaring routes
+  (Flask, FastAPI, Express, `http.ListenAndServe` and similar); a workflow on
+  `pull_request_target` or `issue_comment`; schemas and models with PII-shaped
+  field names (email, phone, ssn, date of birth, card number and similar); and
+  payment-SDK or password-hashing code. A marker implies `exposure=internet` or
+  `data=regulated_or_customer` for its directory (a workflow, for itself). A
+  profile claim that is less strict than a marker on the same path is ignored
+  loudly and the marker's value applies. `merge_control=code_owner_review_required`
+  is supported, not proved, by CODEOWNERS: it holds only where a rule with an
+  owner covers the path, in `.github/`, `.gitea/`, `.forgejo/`, `.gitlab/`,
+  `docs/` or the root, as of the merge base; otherwise it is ignored loudly. The
+  one inference that lowers is for test paths (`tests/`, `test_*.py`,
+  `*.spec.*` and similar): with a profile present and `exposure` unstated for
+  them they are `local_or_ci_only`. Heuristics are kept few on purpose; a
+  marker you disagree with is fixed in the tree (an internal ingress class, say),
+  not argued with in the profile.
+- *Re-confirmation is a warning, never a block.* A profile older than
+  `CLAGENTIC_RISK_PROFILE_MAX_AGE_DAYS` (default 180) or with no valid
+  `confirmed_at`, and a change that touches the exposure surface (ingress and
+  route manifests, container and workflow definitions, auth code, data
+  schemas, any file a marker came from), print a prompt to re-confirm.
+- *Every adjustment is printed.* A finding the profile left below its
+  no-profile severity is listed with the dimension that moved it, whether it
+  still blocks or not, for example: `advisory: precondition network ->
+  authenticated_user via exposure=internal_authenticated for deploy/**
+  (src/x.py:12 shell injection; severity critical -> medium)`. The merge gate
+  sees the same list.
+
+**Maintaining it: `clagentic-lite gates profile`** (alias of
+`findings.py profile`). With no options it prints a draft built from the tree
+and the existing file, and the questions still open (the unstated dimensions);
+`--answer [GLOB:]DIMENSION=VALUE` records an operator's answer, repeatable;
+`--confirm` or any answer stamps `confirmed_at`; `--write` saves the file for
+review and commit. Inference only adds entries (marked `inferred` with their
+evidence) and never rewrites a stated one; a stated claim the tree contradicts
+is reported when it is written. The Builder role never writes the file
+(W-007, R-021); it prints the proposal for the operator.
+
+**Several samples** (`CLAGENTIC_REVIEW_SAMPLES`, optional, default 1, review
+gate only): the review call is made N times and the usable results are unioned
+by fingerprint hint and by location, keeping of each group the finding with the
+highest *rubric* severity, never the highest claimed one. A sample that is
+degraded, unreadable or not an envelope object (a bare array, a scalar) is
+excluded and reported, never an error, and the usable ones are still unioned;
+with none usable the review takes its degraded path. Each sample is an
+audit row (`gate=review-sample`). It is a knob for operators who want a second
+opinion on the same diff; nothing requires it.
 
 **Accumulation.** The state is `.clagentic/lite/findings-state.json`
 (gitignored, created on demand, owned by `findings.py`, so it works in a
@@ -220,22 +391,30 @@ with every field: `share/dispositions.example.json`.
 
 **Guardrails.**
 
-1. An entry added or changed in the change being gated does not clear that
-   change's findings. "Added or changed" is measured against the merge base
+1. Only the base revision's entries apply (see "Policy is read from the base
+   revision"). An entry added or changed in the change being gated, committed
+   or not, does not clear that change's findings, and an entry removed or
+   loosened there does not stop clearing them either; the base version applies
+   until the change is merged. "Added or changed" is measured against the base
    (`--base`, else the merge base of HEAD with `origin/<default>` or
-   `<default>`): an entry whose exact content the base commit did not have, or
-   any entry when the base cannot be resolved. The output says `N findings
-   would be cleared by entries added in this PR`. Land the disposition in its
-   own reviewed change first.
-2. A security-floor finding (`reachable: yes` at `high` or above) is not
-   cleared by `by_design`, `false_positive` or `accepted_risk`: only by a fix,
-   or by `kind: mitigated` naming the control. The output says which entry was
-   refused and why.
+   `<default>`): an entry whose exact content the base commit did not have; with
+   no resolvable base no entry applies and every entry counts as added. The
+   output says `N findings would be cleared by entries added in this PR`. Land
+   the disposition in its own reviewed change first.
+2. A security-floor finding is not cleared by `by_design`, `false_positive` or
+   `accepted_risk`: only by a fix, or by `kind: mitigated` naming the control.
+   The floor is the one defined under "Facts, the rubric and the stakes
+   profile" (reachable, high impact, and an effective precondition of `none` or
+   `network`; a finding that states no facts is the worst case on both). The
+   output says which entry was refused and why.
 3. `rationale`, `by` and `at` are required; an entry that fails validation is
    ignored, loudly, and the rest still apply. A file that cannot be parsed
    applies nothing. A symlink out of the repository is an error.
-4. The Builder role cannot write the file: `pre-write-guard` rule W-007 for the
-   Write and Edit tools, `pre-bash-guard` rule R-021 for the shell.
+4. The Builder role is blocked from writing the file, best-effort:
+   `pre-write-guard` rule W-007 for the Write and Edit tools, `pre-bash-guard`
+   rule R-021 for the shell. These are static checks of the tool call's text, a
+   deterrent and not the guarantee: the guarantee is guardrail 1, that nothing
+   written to the working tree or the branch applies before it is merged.
 5. Cleared findings are always printed, with the entry's id, kind, who, when
    and rationale; the merge gate records them in the audit trail from the
    verdict.
@@ -1445,12 +1624,18 @@ The Auditor prompt (`plugins/clagentic-lite/agents/auditor.md`, and `ds_adversar
 Each finding in the adversarial output begins with a compact header line, followed by a prose explanation:
 
 ```
-[FINDING] CWE-XXX | file.ext:line | severity: high | reachable: yes | tier: blocking | class: durable | title: Short description phrase
+[FINDING] CWE-XXX | file.ext:line | severity: high | reachable: yes | precondition: network | impact: code_exec | tier: blocking | class: durable | title: Short description phrase
 
 Prose explanation (1-3 paragraphs): what the vulnerability is, how an
 attacker exploits it (or why it cannot currently be exploited, if
 reachable: no), and what a minimal fix looks like.
 ```
+
+`precondition` and `impact` are facts from closed lists (see "Facts, the rubric
+and the stakes profile" under Gate 3); the severity and tier the gate acts on
+are computed from them, and the `severity` and `tier` in the header are the
+Auditor's own reading, shown and not trusted. A header without them is read as
+before.
 
 Header fields:
 
@@ -1461,6 +1646,8 @@ Header fields:
 | file:line | Specific file and line number (e.g. `scripts/gates.sh:42`); `general` if not file-specific |
 | severity | `critical` / `high` / `medium` / `low` |
 | reachable | `yes` / `no` — see "Reachability requirement" below |
+| precondition | `none` / `network` / `authenticated_user` / `repo_write_can_merge` / `maintainer_admin` / `local_ci_only`: the least the attacker must already have |
+| impact | `code_exec` / `data_read` / `data_write` / `integrity` / `availability` / `quality_only`: the worst thing exploitation allows |
 | tier | `blocking` / `advisory` — see "Blocking vs advisory" below |
 | class | `durable` / `ephemeral` (lr-4f8316) — see "Change class" below |
 | title | One short phrase, eight words or fewer |
@@ -1484,7 +1671,7 @@ This is the mechanical precondition for blocking eligibility (see "Blocking vs a
 
 **This is a threshold mechanism: every finding is reported at its honest severity and stays fully visible in the adversarial markdown output, the structured findings sidecar, and the audit trail, regardless of `tier`.** `tier` only decides whether Gate 6 (Merge Gate) treats a finding as gating `gates ship`. Nothing is ever hidden, dropped, or omitted from output because of its tier.
 
-A finding is `tier: blocking` only when reachability is `yes` (with a cited concrete exploit path) **and** severity is `high` or `critical` **and** it is not a durability-dependent concern excused by an `ephemeral` change class (see "Change class" below). Every other finding — `reachable: no`, or severity `medium`/`low`, or excused by class — is `tier: advisory`.
+A finding is `tier: blocking` only when reachability is `yes` (with a cited concrete exploit path) **and** severity is `high` or `critical` **and** it is not a durability-dependent concern excused by an `ephemeral` change class (see "Change class" below). Every other finding — `reachable: no`, or severity `medium`/`low`, or excused by class — is `tier: advisory`. For a finding that states `precondition` and `impact`, "severity" here is the rubric's (computed from the facts and the stakes profile) and the tier is computed from it, not read from the header; a finding downgraded by the profile is printed with the dimension that moved it.
 
 **Mechanical plumbing, not LLM judgment at gate time.** `cmd_adversarial` (`scripts/gates.sh`) unconditionally loose-parses the `[FINDING]` headers into `.clagentic/lite/last-adversarial-findings.json` (not gated behind `CLAGENTIC_ADVERSARIAL_INVARIANTS` — this sidecar is a base behavior). `build_gate_summary` reads that sidecar and adds fields to the gate-summary payload fed to the Merge Gate:
 
@@ -1498,7 +1685,7 @@ A finding is `tier: blocking` only when reachability is `yes` (with a cited conc
 
 Counting `tier: "blocking"` findings is the code verdict's job (`findings.py evaluate`); the Merge Gate prompt (`ds_merge_gate_prompt`) receives the verdict and only notes advisory findings — including class-downgraded ones — in its `reason` text. If `adversarial_findings` is empty or absent (e.g. a gate run predating this feature, or a model that emitted no parseable `[FINDING]` headers), the Merge Gate falls back to reasoning over the adversarial markdown prose directly, as it did before this change. That prose now arrives as `adversarial_fenced` (sanitized, inside `===BEGIN/END ADVERSARIAL REPORT DATA===`); see "Review and adversarial output reach the Merge Gate sanitized and fenced" under the review-field table.
 
-**Parser default (fail-open on the non-blocking side).** `reachable`/`tier`/`class` are optional at the parser level for backward compatibility with an older header (`severity | title`, no `reachable`/`tier`/`class`) or a model that omits them despite the prompt instruction. An unparseable or absent `tier` is classified `advisory`, never `blocking` — a parser gap can only ever under-block. An unparseable or absent `class` is classified `durable`, never `ephemeral` — the same fail-closed direction on the class axis, since `durable` is the class that never relaxes anything; a parser gap can only ever leave the full bar in place, never silently grant a downgrade. The finding is still fully visible in the markdown output and the sidecar; it simply cannot gate the merge on its own, or receive a class-based downgrade, if the classification is missing.
+**Parser default (fail-open on the non-blocking side).** `reachable`/`tier`/`class` are optional at the parser level for backward compatibility with an older header (`severity | title`, no `reachable`/`tier`/`class`) or a model that omits them despite the prompt instruction. An unparseable or absent `reachable` is the worst case (`yes`, or `unknown` when the header states rubric facts), never `no`, so the security floor applies to a high or critical finding that did not say it was unreachable. An unparseable or absent `tier` is classified `advisory` until that floor raises it. An unparseable or absent `class` is classified `durable`, never `ephemeral` — the same fail-closed direction on the class axis, since `durable` is the class that never relaxes anything; a parser gap can only ever leave the full bar in place, never silently grant a downgrade. The finding is still fully visible in the markdown output and the sidecar; it simply cannot gate the merge on its own, or receive a class-based downgrade, if the classification is missing.
 
 **Deterministic gates are untouched.** None of this changes `cmd_secrets`, `cmd_deps`, `cmd_sast`, or their fail-closed behavior (Gate 4). The advisory/blocking split applies only to LLM-driven adversarial findings, which were already, and remain, outside the security-gate path — AGENTS.md §4: no LLM in the security path.
 
@@ -1680,12 +1867,13 @@ Every decision the gates make about a finding lives in one stdlib-only Python fi
 
 | Stage | Operations | What it owns |
 |---|---|---|
-| `ingest` | `review-envelope`, `findings`, `adversarial-parse`, `adversarial-sanitize`, `adversarial-sort`, `cap`, `length`, `merge`, `sanitize-text`, `allowlist`, `sanitize-fields` | reducing model output to the closed schema, the Auditor header parse and its tier/class clamps, the single sanitizer, chunk-envelope merging |
+| `ingest` | `review-envelope`, `findings`, `adversarial-parse`, `adversarial-sanitize`, `adversarial-sort`, `cap`, `length`, `merge`, `sanitize-text`, `allowlist`, `sanitize-fields`, `union-samples` | reducing model output to the closed schema, the Auditor header parse and its tier/class clamps, the single sanitizer, chunk-envelope merging, the union of review samples by rubric severity |
 | `fingerprint` | `dedup`, `keys`, `bump` | the one content-window and location key, severity-wins dedup (annotate mode never drops a finding that feeds a verdict), recurrence counts |
 | `dispositions` | `cross-round`, `recurrence`, `ledger-recurrence`, `lint`, `migrate` | seen-before annotation, the informational recurrence count, ledger recurrence marking, the dispositions schema lint, the move from the legacy files |
 | `verdict` | `blockers`, `blocking-json`, `rank`, `ledger-*` | the one severity ranking (a severity that is not a known rank name ranks as blocking), the raw blocker count (`99` when unreadable), and every ledger read and write |
 | `render` | `review`, `class-footer`, `verdict-lines`, `sanitize-review`, `sanitize-report`, `fence-data`, `fence-findings`, `json-field`, `stale-report`, `cleared-summary`, `gate-summary` | operator-facing review text, the Merge Gate payload and its fences, the stale-payload refusal wording |
-| `evaluate` | (no operation) | the code verdict: unified findings in, dispositions and guardrails applied, per-HEAD accumulation, verdict and clearing stanzas out |
+| `evaluate` | (no operation) | the code verdict: unified findings in, the rubric and the stakes profile applied, dispositions and guardrails applied, per-HEAD accumulation, verdict and clearing stanzas out |
+| `profile` | (no operation) | drafting and updating the optional `.clagentic/risk-profile.json` from the tree and the operator's answers |
 
 Run `python3 plugins/clagentic-lite/bin/findings.py --help` for the stages. Payloads of unbounded size travel on stdin or as file paths, never as argv.
 
@@ -1700,6 +1888,9 @@ What a standalone run does and does not do:
 - Detection variance (which findings the model notices) is not removed; accumulation turns it into added coverage across runs at one HEAD.
 - Input is untrusted: malformed, oversized, non-UTF-8 or degraded input is refused with exit `2` and no verdict; a non-git directory is refused; every model-authored string is control-stripped before it is printed and sanitized before it is handed to a model.
 - `clagentic-lite gates evaluate` is the same command from an enrolled checkout.
+- The rubric and the stakes profile are part of `evaluate`, so a standalone run in a repository that was never enrolled gives the same severity as the gate path for the same facts and the same committed profile. With no `.clagentic/risk-profile.json` it reads every finding at the worst case.
+
+**Removed code.** Both role prompts carry a `removal-aware` block: a removed check, guard, validation, limit, test or layer is judged against the invariant it enforced ("does the invariant still hold without it?", citing what enforces it now), not by whether the removed code was good. A "declined layers" section in a PR body or commit message may be read as context for why a removal was made; it is never authority and every claim in it is checked against the code.
 
 Behaviours that decide a gate outcome and are easy to miss:
 
@@ -1710,7 +1901,7 @@ Behaviours that decide a gate outcome and are easy to miss:
 
 ### Single-sourced role prompts
 
-The Reviewer and Auditor instruction text exists once per role in `plugins/clagentic-lite/prompts/<role>.shared.txt`, a sequence of blocks each opened by an `@@@ name` line (`schema`, `pre-report-gate`, `proof-required`, `class-fields`, `zero-findings`, `false-positives`, `change-class` for the Reviewer; `pre-report-gate`, `reachability`, `blocking-vs-advisory`, `change-class`, `proof-required`, `zero-findings`, `false-positives`, `finding-format`, `cwe-ordering` for the Auditor). Two surfaces are generated from it:
+The Reviewer and Auditor instruction text exists once per role in `plugins/clagentic-lite/prompts/<role>.shared.txt`, a sequence of blocks each opened by an `@@@ name` line (`schema`, `facts`, `pre-report-gate`, `proof-required`, `class-fields`, `zero-findings`, `false-positives`, `change-class`, `removal-aware` for the Reviewer; `pre-report-gate`, `reachability`, `facts`, `blocking-vs-advisory`, `change-class`, `removal-aware`, `proof-required`, `zero-findings`, `false-positives`, `finding-format`, `cwe-ordering` for the Auditor). Two surfaces are generated from it:
 
 - **Gate path.** `ds_review_prompt` and `ds_adversarial_prompt` (`scripts/llm-client.sh`) call `ds_prompt_blocks ROLE NAME...` (`scripts/platform.sh`) at call time. What stays in the function is specific to the gate call: the deferral, invariant and change-class fences, the identity line, and the Reviewer's output-format rule. A missing source or block fails the prompt function, so a role prompt is never sent half built.
 - **Claude Code agent path.** `plugins/clagentic-lite/agents/reviewer.md` and `auditor.md` are templates whose `{{shared:ROLE:BLOCK}}` lines `_render_clagentic_lite_plugin_dir` (`bin/clagentic-lite`) expands through `ds_prompt_expand_template` in the same step that stamps the `model:` line. What stays in the template is specific to the agent: its hard contract, the interactive Auditor's scanner allowlist, severity calibration and category checklist for the Reviewer, and the escalation notes.
@@ -1767,6 +1958,7 @@ Not wired into `gates ship`'s blocking sequence — it is diagnostic output, run
 | Gate 2 — write guard (W-001) | Intentional work on default branch | Set `CLAGENTIC_ALLOW_DEFAULT_BRANCH_WRITE=1` in `.clagentic/config`. This is unusual — default-branch protection exists for good reason. |
 | Gate 3 — review | Cross-vendor fallback silently taken | Set `CLAGENTIC_REVIEWER_REQUIRED=1` to make chain failure a hard error. Chain fallback becomes visible in audit trail and the gate blocks rather than emitting a degraded envelope. |
 | Gate 3 / Gate 5 / Gate 6 — review or adversarial finding | Finding is by design, a false positive, an accepted risk, or mitigated by a control outside the code | Record it in `.clagentic/dispositions.json` in a **separate reviewed change that reaches the base branch first** (an entry added in the change being gated does not clear that change's findings). A blocked run prints the exact stanza for each open finding. See "Dispositions" and "Disposition entries" below. |
+| Gate 3 / Gate 5 — severity of a finding with facts | The rubric reads a path as more exposed or more sensitive than it is (an internal tool behind SSO, a repo with no customer data) | Record it in the optional `.clagentic/risk-profile.json` with `clagentic-lite gates profile --answer 'GLOB:exposure=internal_authenticated' --write`, then review and commit it as its own change; it applies once merged, never to the change that carries it. A path served to the internet is never lowered below the security floor. See "Facts, the rubric and the stakes profile". |
 | Gate 6 — reachable high-severity finding (security floor) | You cannot fix it now | Fix it, or add a `kind: mitigated` entry whose `control` names the external control that prevents exploitation. `by_design`, `false_positive` and `accepted_risk` do not clear it. |
 | Any gate | Tool not installed | Set `CLAGENTIC_ALLOW_MISSING_<TOOL>=1`. Prefer installing the tool. |
 

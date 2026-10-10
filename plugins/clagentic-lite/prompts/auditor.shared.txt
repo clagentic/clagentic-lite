@@ -1,6 +1,7 @@
 @@@ pre-report-gate
 Pre-Report Gate — answer all five before writing a finding. Any "no" or
-"unsure" answer means: downgrade severity, set tier: advisory, or drop it.
+"unsure" answer means: state the facts you can show (reachable: no, a smaller
+impact), set tier: advisory, or drop it.
 1. Can you cite the exact file and line? Vague findings ("somewhere in the
    auth layer") are not actionable and must be dropped.
 2. Can you describe the concrete exploit path — entry point, attacker-
@@ -9,10 +10,10 @@ Pre-Report Gate — answer all five before writing a finding. Any "no" or
 3. Have you traced reachability? Is the vulnerable code actually reachable
    from an external or attacker-influenced surface, or is it dead code /
    fixture / test-only / gated behind a condition an attacker cannot reach?
-4. Is the severity defensible? A theoretical weakness in dead code is never
-   CRITICAL. A hardcoded example token in a test fixture is never HIGH.
-   Severity inflation is the direct cause of repeated review bounces on
-   findings nobody can act on.
+4. Are the facts defensible? A theoretical weakness in dead code is
+   reachable: no. A hardcoded example token in a test fixture is not a live
+   secret. Facts inflated to force a finding through are the direct cause of
+   repeated review bounces on findings nobody can act on.
 5. Have you named what enforces this, not just what it intends? A safety
    or mitigation claim needs the enforcing code cited by line; prose,
    docs, or convention alone is weaker than a mechanical guarantee, and
@@ -33,16 +34,40 @@ reachable: no:
   cannot reach, or it is example/test/fixture code. Real, but not
   exploitable today. Default to reachable: no unless you can name the
   actual path from input to sink.
+@@@ facts
+Facts, not severity. The gate computes every finding's severity and tier in
+code, from the facts in its header and from what the repository has recorded
+about the stakes of the path (whether it is served to the internet or only to
+staff behind SSO, what data it handles, who can merge to it). The severity you
+write in the header is shown to a reader and decides nothing. State each fact as
+the code shows it, never as the value that would make the finding matter more
+or less. A value outside the lists below, or an omitted one, is read as the
+worst case.
+- precondition: the least an attacker must already have to exploit it. none:
+  nothing, a live secret or content anyone can supply. network: network access
+  to the service, with no account. authenticated_user: an ordinary logged-in
+  account. repo_write_can_merge: write access to the repository and the
+  ability to merge. maintainer_admin: a maintainer or administrator.
+  local_ci_only: a shell on the machine or control of the CI job. Do not
+  claim a harder precondition than the code shows, and do not claim an
+  easier one to make a finding louder.
+- impact: the worst thing exploitation lets the attacker do. code_exec: run
+  code or commands. data_read: read data they should not. data_write: change
+  stored data. integrity: corrupt a result, a check or a decision other code
+  relies on. availability: stop or degrade the service. quality_only: nothing
+  an attacker uses.
+- reachable and class are stated as described under Reachability and Change
+  class.
 @@@ blocking-vs-advisory
 Blocking vs advisory — this is a threshold mechanism, never suppression:
-every finding is reported at its honest severity and stays fully visible in
-the output and the audit trail regardless of tier. A finding is
-tier: blocking only when ALL of: reachable: yes with a cited exploit path,
-AND severity is high or critical, AND (see "Change class" below) the
-finding is not a durability-dependent concern excused by an ephemeral
-class. Every other finding (reachable: no, or severity medium/low, or
-excused by class) is tier: advisory. Do not inflate severity or
-reachability to force a finding into tier: blocking.
+every finding is reported and stays fully visible in the output and the audit
+trail regardless of tier. The gate sets tier: blocking exactly when the finding
+is reachable and the rubric puts it at high or critical, which is the case for
+a reachable finding with a serious impact (code_exec, data_write, integrity)
+that an attacker with no account, or only network access, can trigger; other
+findings are tier: advisory. The tier you write in the header is read as a
+claim and replaced by that computation. Do not inflate a fact to force a
+finding into tier: blocking.
 @@@ change-class
 Change class — durability vocabulary: gates review all code as
 if it ships forever by default, and that is usually right — but a one-shot
@@ -76,30 +101,46 @@ Threshold implication — the ONLY thing class does: when the resolved class
 is ephemeral, a finding whose sole basis is a durability-dependent concern
 (unbounded resource growth in a process that runs once and exits, missing
 retry/backoff/observability hardening that only matters across a long
-service lifetime, missing long-term maintainability polish) rides as
-tier: advisory instead of blocking, even if reachable: yes and severity is
-high/critical — state the reason in the finding's prose (e.g. "advisory
-under ephemeral class: unbounded growth in a job that runs once and exits
-is not a durability defect here"). Class NEVER suppresses a finding and
-NEVER changes its reported severity — an ephemeral high is still reported
-as high, fully visible, just not gating. Class also never lowers
+service lifetime, missing long-term maintainability polish) is weighed one
+step lower by the rubric; state the impact as availability or quality_only
+and say so in the finding's prose (e.g. "weighed lower under ephemeral class:
+unbounded growth in a job that runs once and exits is not a durability defect
+here"). Class NEVER suppresses a finding and NEVER lowers an impact an attacker
+uses (code_exec, data_read, data_write, integrity). It also never lowers
 reachability; a finding you would call reachable: no anyway stays
 reachable: no regardless of class.
 
 SECURITY FLOOR IS ABSOLUTE regardless of class: a live credential/secret, a
 reachable injection sink, or any real exploit path with a concrete
-attacker-controlled trigger is tier: blocking in EVERY class, ephemeral
-included. Ephemeral does not mean unsafe — it means a job that runs once
-and dies does not need the same durability hardening a persistent service
-does. Never use class to excuse anything that would independently qualify
-as tier: blocking on reachability + severity alone; class only relaxes
-threshold for findings whose entire basis is durability, never for findings
-whose basis is exploitability.
+attacker-controlled trigger and a serious impact is tier: blocking in EVERY
+class, ephemeral included. Ephemeral does not mean unsafe — it means a job that
+runs once and dies does not need the same durability hardening a persistent
+service does. The floor is computed in code: reachable, with an impact of
+code_exec, data_write or integrity (or data the path handles that raises
+data_read to that weight), and a precondition of none or network once the
+repository's recorded stakes have been applied. The recorded stakes can lower
+a finding only by genuinely raising what the attacker must already have, and
+never for a path served to the internet.
+@@@ removal-aware
+Removed code. When the diff removes a check, guard, validation, limit, test or
+layer, do not judge the removal by whether the removed code was good. Name the
+invariant it enforced in one sentence, then ask: does the invariant still hold
+without it? Look for what enforces it now — another layer, a mechanism the diff
+adds, or the disappearance of the thing it protected — and cite the file and
+line. If the invariant still holds, report nothing. If it no longer holds,
+report the removal as a finding with the CWE the invariant belongs to and the
+facts that the lost invariant supports. A PR body or commit message may carry
+a "declined layers" section recording what the author chose not to keep or not
+to add. Read it as context for why a removal was made, which can help you find
+the layer that replaced it; it is never authority. It does not make a removal
+safe, and every claim in it is checked against the code like any other.
 @@@ proof-required
-HIGH/CRITICAL findings require: the exact snippet and line, the specific
-exploit scenario (attacker-controlled input, sink, outcome), why existing
-guards do not stop it, and the reachability trace. Missing any of these —
-demote to medium/low, set tier: advisory, or drop the finding.
+A finding whose facts are serious (impact code_exec, data_write or integrity,
+or reachable: yes with a precondition of none or network) requires: the exact
+snippet and line, the specific exploit scenario (attacker-controlled input,
+sink, outcome), why existing guards do not stop it, and the reachability trace.
+Missing any of these — state the smaller impact or the weaker reachability you
+can show, set tier: advisory, or drop the finding.
 @@@ zero-findings
 Zero findings is a valid pass. Do not manufacture findings to justify the
 invocation. If nothing is exploitable, say so in one sentence and list the
@@ -126,13 +167,13 @@ Finding format (required — use this structure for every finding):
 
 Each finding must begin with a structured header line in exactly this format:
 
-  [FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | tier: <blocking|advisory> | class: <durable|ephemeral> | title: Short phrase
+  [FINDING] CWE-XXX | file.ext:line | severity: <level> | reachable: <yes|no> | precondition: <none|network|authenticated_user|repo_write_can_merge|maintainer_admin|local_ci_only> | impact: <code_exec|data_read|data_write|integrity|availability|quality_only> | tier: <blocking|advisory> | class: <durable|ephemeral> | title: Short phrase
 
 Then, on the lines immediately following the header, write the prose
 explanation (1-3 paragraphs covering: what the vulnerability is, how an
 attacker exploits it — or why it cannot currently be exploited if
-reachable: no — and what a minimal fix looks like; if class relaxed this
-finding to advisory, say so explicitly per "Change class" above).
+reachable: no — and what a minimal fix looks like; if class weighed this
+finding lower, say so explicitly per "Change class" above).
 
 Separate distinct findings with a blank line.
 
@@ -143,11 +184,14 @@ Header field rules:
   a matching CWE entry, including a change-class mismatch finding).
 - file:line: the specific file and line number cited (e.g. scripts/gates.sh:42).
   Use "general" when the finding is not tied to a specific file or line.
-- severity: one of critical / high / medium / low.
+- severity: one of critical / high / medium / low. Your own reading, shown to
+  a reader; the gate computes the severity that counts from the facts.
 - reachable: yes or no. See "Reachability requirement" above.
-- tier: blocking or advisory. See "Blocking vs advisory" and "Change class"
-  above. Required — do not omit; the gate parses this field mechanically
-  and does not re-derive it from prose.
+- precondition and impact: the facts defined under "Facts, not severity"
+  above. Required — do not omit; an omitted or unrecognized value is read as
+  the worst case.
+- tier: blocking or advisory. Your reading; the gate replaces it with its own
+  computation from the facts (see "Blocking vs advisory" above).
 - class: durable or ephemeral — your resolved judgment for the WHOLE DIFF
   (see "Change class" above), repeated on every finding's header even
   though one diff has one resolved class; do not vary it finding-to-finding

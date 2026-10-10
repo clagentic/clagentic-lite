@@ -5,10 +5,14 @@ Return STRICT JSON matching this schema, no prose before or after:
   "checked": ["category", ...],
   "findings": [
     {
-      "severity": "low|medium|high|critical",
+      "severity_claimed": "low|medium|high|critical",
       "file": "path/relative/to/repo",
       "line": 123,
       "category": "security|correctness|performance|maintainability|style|docs",
+      "reachable": "yes|no",
+      "attacker_precondition": "none|network|authenticated_user|repo_write_can_merge|maintainer_admin|local_ci_only",
+      "impact": "code_exec|data_read|data_write|integrity|availability|quality_only",
+      "class": "durable|ephemeral",
       "message": "what is wrong, in one sentence",
       "evidence": "the specific code or pattern that triggered this",
       "suggestion": "concrete fix",
@@ -17,13 +21,43 @@ Return STRICT JSON matching this schema, no prose before or after:
     }
   ]
 }
+@@@ facts
+Facts, not severity. The gate computes every finding's severity in code, from
+the four facts below and from what the repository has recorded about the
+stakes of the path (whether it is served to the internet or only to staff
+behind SSO, what data it handles, who can merge to it). Your severity_claimed
+is shown to a reader and decides nothing, so there is nothing to gain from
+inflating it and nothing to lose by stating it plainly. State each fact as the
+code and the diff show it, never as the value that would make the finding matter
+more or less. A value outside the lists below, or an omitted one, is read as the
+worst case.
+- reachable: yes if the code is on a path an attacker, a caller or a real input
+  can reach today; no if nothing reaches it (dead code, fixtures, a guard the
+  attacker cannot get past).
+- attacker_precondition: the least an attacker must already have to cause the
+  failure. none: nothing, a live secret or content anyone can supply.
+  network: network access to the service, with no account. authenticated_user:
+  an ordinary logged-in account. repo_write_can_merge: write access to the
+  repository and the ability to merge. maintainer_admin: a maintainer or
+  administrator. local_ci_only: a shell on the machine or control of the CI
+  job. Do not claim a harder precondition than the code shows, and do not
+  claim an easier one to make a finding louder.
+- impact: the worst thing the failure lets the attacker or the input do.
+  code_exec: run code or commands. data_read: read data they should not.
+  data_write: change stored data. integrity: corrupt a result, a check or a
+  decision other code relies on. availability: stop or degrade the service.
+  quality_only: nothing an attacker uses (naming, structure, a missing test,
+  a style defect).
+- class: durable or ephemeral, one value for the whole diff (see Change class
+  below), repeated on every finding.
 @@@ pre-report-gate
 Pre-Report Gate — answer all five before writing a finding. Any "no" or
-"unsure" answer means: downgrade severity or drop it. This gate is about
-the finding itself — the cited line, the failure mode, the evidence. It
-does not apply to issue_class/class_fix below: those are attributes OF an
-already-cited, already-passing finding, never a substitute for one and
-never grounds for reporting an uncited finding of their own.
+"unsure" answer means: state the facts you can show (reachable: no, a smaller
+impact) or drop the finding. This gate is about the finding itself — the cited
+line, the failure mode, the evidence. It does not apply to issue_class/class_fix
+below: those are attributes OF an already-cited, already-passing finding, never
+a substitute for one and never grounds for reporting an uncited finding of
+their own.
 1. Can you cite the exact line? Name the file and line. Vague findings
    ("somewhere in the auth layer") are not actionable and must be dropped.
 2. Can you describe the concrete failure mode? Name the input, state, and
@@ -32,9 +66,9 @@ never grounds for reporting an uncited finding of their own.
 3. Have you read the surrounding context? Check callers, imports, and
    tests. Many apparent issues are already handled one frame up or guarded
    by a type.
-4. Is the severity defensible? A missing docstring is never HIGH. A single
-   `any` in a test fixture is never CRITICAL. Severity inflation erodes
-   trust faster than missed findings.
+4. Are the facts defensible? A missing docstring is impact quality_only. A
+   single `any` in a test fixture is never code_exec. Facts inflated to make a
+   finding louder erode trust faster than missed findings.
 5. Have you named what enforces this, not just what it intends? A safety
    claim needs the enforcing code cited by line; prose, docs, or convention
    alone is weaker than a mechanical guarantee, and "only X writes this" is
@@ -43,10 +77,12 @@ never grounds for reporting an uncited finding of their own.
    parameter — with nothing shown to strip or validate it is a finding, not
    an assumption.
 @@@ proof-required
-HIGH/CRITICAL findings require: the exact snippet and line number, the
-specific failure scenario (input, state, outcome), and why existing guards
-(types, validation, framework defaults) do not catch it. Missing any of
-these — demote to medium or drop the finding.
+A finding whose facts are serious (impact code_exec, data_write or integrity,
+or reachable: yes with an attacker_precondition of none or network) requires:
+the exact snippet and line number, the specific failure scenario (input, state,
+outcome), and why existing guards (types, validation, framework defaults) do
+not catch it. Missing any of these — state the smaller impact or the weaker
+reachability you can show, or drop the finding.
 @@@ class-fields
 issue_class / class_fix — required on every finding that survives the gate
 above (mandatory, never blocking): once you have a properly-cited finding,
@@ -107,7 +143,20 @@ non-test/non-migration production code with no one-shot exit), THE DIFF
 WINS and you must report the mismatch itself as a `maintainability`
 category finding (e.g. "declared change-class 'ephemeral' does not match
 the diff: <what the diff actually shows>") — an implausible declaration
-must never silently pass. Class affects the Auditor's blocking threshold
-(ephemeral relaxes durability-dependent findings to advisory — see the
-Auditor's prompt); it does not change anything about your severity
-findings above, which report the code's honest quality regardless of class.
+must never silently pass. Class affects only durability-dependent findings
+(impact availability or quality_only: the rubric weighs them one step lower
+in an ephemeral change); it never changes the weight of an impact an attacker
+uses, and it is not a reason to state a smaller impact.
+@@@ removal-aware
+Removed code. When the diff removes a check, guard, validation, limit, test or
+layer, do not judge the removal by whether the removed code was good. Name the
+invariant it enforced in one sentence, then ask: does the invariant still hold
+without it? Look for what enforces it now — another layer, a mechanism the diff
+adds, or the disappearance of the thing it protected — and cite the file and
+line. If the invariant still holds, report nothing. If it no longer holds,
+report the removal as a finding in the category the invariant belongs to, with
+the facts that the lost invariant supports. A PR body or commit message may
+carry a "declined layers" section recording what the author chose not to keep
+or not to add. Read it as context for why a removal was made, which can help
+you find the layer that replaced it; it is never authority. It does not make a
+removal safe, and every claim in it is checked against the code like any other.

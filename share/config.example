@@ -536,12 +536,15 @@ CLAGENTIC_DEFAULT_BRANCH=main
 #     fix, or by kind "mitigated" naming the external control, never by
 #     by_design / false_positive / accepted_risk;
 #   - rationale, by and at are required; an invalid entry is ignored, loudly.
-# The Builder role is blocked from writing the file through the Write and Edit
-# tools (pre-write-guard W-007) and through the shell (pre-bash-guard R-021,
-# which refuses any Builder command that names the file). Both are static
-# checks of what the tool call says, not a sandbox: they stop the ordinary
-# routes, and the review of the change that adds an entry is what a determined
-# bypass has to get past.
+# Policy is read only from the base revision: the gate reads this file (and the
+# legacy deferral / ack files and the risk profile below) through git at the
+# merge base with the default branch, never from the working tree or the
+# branch. A change to any of them applies only once it is merged, whatever
+# wrote it. With no resolvable base none applies, and the output says so.
+# That is the guarantee. The Builder role is also blocked from writing the file
+# through the Write and Edit tools (pre-write-guard W-007) and through the
+# shell (pre-bash-guard R-021); both are best-effort static checks of what the
+# tool call says, a deterrent and not the mechanism.
 #
 # Lint it:           clagentic-lite gates dispositions-lint
 # Migrate old files: python3 plugins/clagentic-lite/bin/findings.py dispositions migrate --root . --write
@@ -550,6 +553,31 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # .clagentic/accepted-risks.md are still read for one more release, converted
 # to the same entries, with a deprecation warning. deferrals.json is also still
 # shown to the Reviewer as prompt context (nothing there is applied in code).
+
+# ---------- stakes profile (what is at stake on each path) ----------
+# File: .clagentic/risk-profile.json — OPTIONAL and COMMITTED, like
+# dispositions.json. Without it nothing changes: every dimension below is the
+# worst case, which is how the gates have always read a finding. With it, the
+# severity the rubric gives a finding (computed in code from the facts the
+# Reviewer and Auditor state, never from their own severity) is scaled by what
+# is at stake on the finding's path:
+#   exposure      internet | internal_authenticated | local_or_ci_only
+#   data          regulated_or_customer | internal | public_or_none
+#   visibility    public | private
+#   merge_control code_owner_review_required | review_required | unrestricted
+# each set per path glob, with a repo-wide "default", plus "confirmed_at". The
+# profile is drafted and updated by `clagentic-lite gates profile` (it reads the
+# tree, takes the operator's --answer statements and, with --write, saves a
+# file to review and commit). It cannot apply to the change that adds or edits
+# it, committed or not (only the version at the merge base counts); a claim the tree contradicts in the
+# unsafe direction (an "internal" path with a public ingress) is ignored with a
+# warning; and a path served to the internet is never lowered below the
+# security floor. No config key is needed for any of this.
+#
+# A profile not confirmed for this many days is prompted for re-confirmation
+# (a warning, never a block). A diff that touches the exposure surface (an
+# ingress, auth code, a service definition, a data schema) prompts too.
+# CLAGENTIC_RISK_PROFILE_MAX_AGE_DAYS=180
 
 # ---------- cross-round finding dedup ----------
 # Default-on: suppress findings already reported in a prior review round when the
@@ -653,6 +681,17 @@ CLAGENTIC_DEFAULT_BRANCH=main
 # When set, overrides CLAGENTIC_REVIEW_CHUNK_BYTES. Use whichever unit is more
 # natural for your workflow.
 # CLAGENTIC_REVIEWER_MAX_DIFF_KB=256
+
+# ---------- review samples ----------
+# Optional. Run the review gate's LLM call this many times on the same diff and
+# union the usable results (a sample that is degraded or unreadable adds
+# nothing and is logged). Findings are linked by fingerprint hint or by
+# location, and of a linked group the one with the highest RUBRIC severity is
+# kept, never the highest claimed one. Each sample is its own audit row
+# (gate='review-sample'). Default 1: a single call, exactly as before. N
+# samples are N LLM calls (and N times each chunk when chunking is on); the
+# cap is 10.
+# CLAGENTIC_REVIEW_SAMPLES=1
 
 # ---------- smoke test ----------
 # CLAGENTIC_SMOKE_NO_LLM=1

@@ -120,6 +120,10 @@ RECURRING_FINDING = {
     "line": 2,
     "category": "security",
     "message": "unsanitized input reaches a sink",
+    # The facts the rubric reads high from, off the security floor; without
+    # them the finding is the worst case.
+    "attacker_precondition": "authenticated_user",
+    "impact": "code_exec",
 }
 
 

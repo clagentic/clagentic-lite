@@ -351,15 +351,20 @@ class TestCmdAdversarialSanitizesSidecarBeforeWrite(unittest.TestCase):
                           f"file field must be defanged, got: {finding['file']!r}")
         self.assertNotIn(forged_marker, finding["message"],
                           f"message field must be defanged, got: {finding['message']!r}")
-        # severity: enum-validated + force-corrected, not sanitized text --
-        # an unrecognized value (this payload is not low/medium/high/critical)
-        # must become the "unknown" sentinel, never survive as free text.
+        # severity_claimed: enum-validated + force-corrected, not sanitized
+        # text -- an unrecognized value (this payload is not
+        # low/medium/high/critical) must become the "unknown" sentinel, never
+        # survive as free text. The severity that counts is the rubric's, from
+        # the facts (absent here, so the worst case), and is always one of
+        # the four names.
         self.assertEqual(
-            finding["severity"], "unknown",
-            f"severity must force-correct to 'unknown' for an unrecognized "
-            f"value, got: {finding['severity']!r}",
+            finding["severity_claimed"], "unknown",
+            f"severity_claimed must force-correct to 'unknown' for an unrecognized "
+            f"value, got: {finding['severity_claimed']!r}",
         )
+        self.assertIn(finding["severity"], ("low", "medium", "high", "critical"))
         self.assertNotIn(forged_marker, finding["severity"])
+        self.assertNotIn(forged_marker, finding["severity_claimed"])
         # reachable/tier: enum-validated + force-corrected at parse time;
         # untouched by this payload (it targets severity, not these fields),
         # asserted here as a completeness check that the whole record was

@@ -30,6 +30,8 @@ Standard input is `git diff --cached --unified=3`. Repo context is available via
 
 {{shared:reviewer:schema}}
 
+{{shared:reviewer:facts}}
+
 Empty `findings` is valid and expected for clean diffs.
 
 ## Pre-Report Gate
@@ -46,7 +48,9 @@ Empty `findings` is valid and expected for clean diffs.
 
 {{shared:reviewer:zero-findings}}
 
-## Severity calibration
+## `severity_claimed`
+
+Your own reading of how serious a finding is, shown to the human reading the report. It decides nothing: the gate computes the severity from the facts above. Use the same scale a reader would expect:
 
 - **critical** — exploitable security flaw, data loss risk, or guaranteed crash on common input
 - **high** — likely bug in common path, missing input validation on external surface, broken contract
@@ -71,7 +75,11 @@ Always inspect, in this order:
 
 {{shared:reviewer:change-class}}
 
-The Builder declares a class as a `Change-class: <value>` trailer in the tip commit message, surfaced to you as a `BUILDER-DECLARED CHANGE-CLASS HINT` note ahead of the diff when present. This diff-level durable/ephemeral class has no field of its own in your JSON schema — only the mismatch case above, reported as an ordinary finding. It is unrelated to the per-finding `issue_class`/`class_fix` fields, which name the recurring ISSUE class a single finding belongs to, not the diff's own durability.
+The Builder declares a class as a `Change-class: <value>` trailer in the tip commit message, surfaced to you as a `BUILDER-DECLARED CHANGE-CLASS HINT` note ahead of the diff when present. The diff-level durable/ephemeral class is the `class` fact on each finding, and a mismatch with the declaration is reported as an ordinary finding. It is unrelated to the per-finding `issue_class`/`class_fix` fields, which name the recurring ISSUE class a single finding belongs to, not the diff's own durability.
+
+## Removed code
+
+{{shared:reviewer:removal-aware}}
 
 ## What to refuse
 
