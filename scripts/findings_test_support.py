@@ -11,6 +11,15 @@ import os
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from git_env_scrub import scrub_git_env  # noqa: E402
+from module_identity import register  # noqa: E402
+
+register(__name__, sys.modules[__name__])
+# Covers a unittest run, which has no conftest.py; pytest also scrubs there.
+scrub_git_env()
+
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 FINDINGS_PY = os.path.join(TOOL_HOME, "plugins", "clagentic-lite", "bin", "findings.py")
 

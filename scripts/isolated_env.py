@@ -38,7 +38,12 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from findings_test_support import clean_env, make_repo  # noqa: E402
+from module_identity import register  # noqa: E402
 from test_support import TOOL_HOME, clone_this_tool_home_with_overlay  # noqa: E402
+
+# `isolated_env` and `scripts.isolated_env` are the same object, so the shared
+# clone below is built once per process whichever spelling a test uses.
+register(__name__, sys.modules[__name__])
 
 # Variables that point a child at a config or state location outside HOME.
 _REDIRECTS = ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME")

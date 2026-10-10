@@ -38,6 +38,14 @@ unaffected.
 import os
 import shutil
 import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from findings_test_support import clean_env  # noqa: E402
+from module_identity import register  # noqa: E402
+
+register(__name__, sys.modules[__name__])
 
 TOOL_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -53,10 +61,12 @@ def clone_tool_home_with_overlay(tool_home, dest):
     bin/clagentic-lite is invisible to a test that only clones -- it would
     silently validate the last commit instead of the change under review.
     """
-    subprocess.run(["git", "clone", "-q", tool_home, dest], check=True, capture_output=True)
+    env = clean_env(drop=("GIT_",))
+    subprocess.run(["git", "clone", "-q", tool_home, dest], check=True, capture_output=True,
+                   env=env)
     tracked = subprocess.run(
         ["git", "-C", tool_home, "ls-files", "-z"],
-        check=True, capture_output=True,
+        check=True, capture_output=True, env=env,
     ).stdout
     for rel_raw in tracked.split(b"\0"):
         if not rel_raw:
@@ -71,9 +81,9 @@ def clone_tool_home_with_overlay(tool_home, dest):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(src, dst)
     subprocess.run(["git", "-C", dest, "config", "user.email", "test@example.com"],
-                    check=True, capture_output=True)
+                    check=True, capture_output=True, env=env)
     subprocess.run(["git", "-C", dest, "config", "user.name", "Test"],
-                    check=True, capture_output=True)
+                    check=True, capture_output=True, env=env)
 
 
 def clone_this_tool_home_with_overlay(dest):

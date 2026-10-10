@@ -500,8 +500,8 @@ class TestCanaryFixturesAreNotSourceLiterals(unittest.TestCase):
         content."""
         tmp = tempfile.mkdtemp(prefix="clagentic-test-branch-history-")
         try:
-            subprocess.run(["git", "init", "-q", "-b", "feature", tmp], check=True)
             env = git_env()
+            subprocess.run(["git", "init", "-q", "-b", "feature", tmp], check=True, env=env)
             scripts_dir = os.path.join(tmp, "scripts")
             os.makedirs(scripts_dir)
             shutil.copy(GATES_SH, os.path.join(scripts_dir, "gates.sh"))
@@ -527,7 +527,7 @@ class TestCanaryFixturesAreNotSourceLiterals(unittest.TestCase):
             if probe.returncode == 0:
                 r = subprocess.run(
                     ["gitleaks", "git", "--no-banner", "--redact"],
-                    capture_output=True, text=True, cwd=tmp, timeout=120,
+                    capture_output=True, text=True, cwd=tmp, timeout=120, env=env,
                 )
             else:
                 report = tempfile.mktemp(prefix="clagentic-test-branch-history-", suffix=".json")
@@ -555,8 +555,8 @@ class TestCmdSecretsConfigPreflight(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="clagentic-test-cmdsecrets-")
-        subprocess.run(["git", "init", "-q", "-b", "main", self._tmp], check=True)
         env = git_env()
+        subprocess.run(["git", "init", "-q", "-b", "main", self._tmp], check=True, env=env)
         with open(os.path.join(self._tmp, "app.py"), "w") as f:
             f.write("def handle(x):\n    return x\n")
         subprocess.run(["git", "add", "app.py"], check=True, cwd=self._tmp, env=env)
@@ -601,8 +601,8 @@ class TestReadDeterministicGatesNoCoverage(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="clagentic-test-nocoverage-")
-        subprocess.run(["git", "init", "-q", self._tmp], check=True)
         env = git_env()
+        subprocess.run(["git", "init", "-q", self._tmp], check=True, env=env)
         subprocess.run(["git", "-C", self._tmp, "commit", "-q", "--allow-empty", "-m", "seed"],
                         check=True, env=env)
 
