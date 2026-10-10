@@ -16,6 +16,7 @@ Usage: findings.py STAGE OP [ARGS]
                 adversarial-parse FILE | adversarial-sanitize | adversarial-sort
                 cap --max N | length | is-array | merge DIR [--strategy S]
                 sanitize-text [--max N] | allowlist FIELD... | sanitize-fields FIELD...
+                union-samples FILE... [--root DIR] [--base REF]  (N review samples)
   fingerprint   dedup --strategy S --seen FILE [--diff FILE] [--mode drop|annotate]
                 keys --diff FILE | bump COUNTS_FILE
   dispositions  cross-round FILE --diff FILE --seen FILE
@@ -31,7 +32,14 @@ Usage: findings.py STAGE OP [ARGS]
   evaluate      [--gate review|adversarial|merge-gate] [--format json|markdown]
                 [--no-input] [--root DIR] [--head SHA] [--base REF] [--json]
                 the code verdict: unified findings on stdin, dispositions and
-                guardrails, per-HEAD accumulation; exits 1 when BLOCKED
+                guardrails, per-HEAD accumulation; exits 1 when BLOCKED. A
+                finding that states facts (attacker_precondition, impact,
+                reachable, class) has its severity decided by the rubric from
+                those facts and the stakes profile, never by its own claim.
+  profile       [--root DIR] [--write] [--confirm] [--answer [GLOB:]DIM=VALUE]...
+                draft or update .clagentic/risk-profile.json from the tree and
+                the operator's answers; prints it, or writes it with --write
+                as a change to review and commit
 
 Findings and other payloads of unbounded size arrive on stdin or as file
 paths, never as argv: one argv string over the kernel's MAX_ARG_STRLEN fails
@@ -64,20 +72,25 @@ DEFAULT_MAX_FIELD_CHARS = 500
 DEFAULT_FINDINGS_MAX = 200
 TRUNCATION_SUFFIX = "...[truncated]"
 
+# severity_claimed is the model's own severity, kept for display; the facts
+# (reachable, attacker_precondition, impact, class) are what the rubric reads.
 REVIEW_FINDING_FIELDS = (
-    "severity", "file", "line:number", "category", "message", "evidence",
-    "suggestion", "issue_class", "class_fix",
+    "severity", "severity_claimed", "file", "line:number", "category", "message",
+    "evidence", "suggestion", "issue_class", "class_fix", "reachable",
+    "attacker_precondition", "impact", "class",
 )
 # Free-text review fields that reach the merge-gate prompt, and the closed set
 # of keys a finding may carry into that payload (the review schema plus the
 # gate-written annotations, which are not free text).
 PROMPT_REVIEW_TEXT_FIELDS = (
-    "severity", "file", "category", "message", "evidence", "suggestion",
-    "issue_class", "class_fix",
+    "severity", "severity_claimed", "file", "category", "message", "evidence",
+    "suggestion", "issue_class", "class_fix", "reachable", "attacker_precondition",
+    "impact", "class", "severity_moved",
 )
 PROMPT_REVIEW_KEEP_KEYS = (
-    "severity", "file", "line", "category", "message", "evidence", "suggestion",
-    "issue_class", "class_fix", "_recurrence_count",
+    "severity", "severity_claimed", "file", "line", "category", "message", "evidence",
+    "suggestion", "issue_class", "class_fix", "reachable", "attacker_precondition",
+    "impact", "class", "severity_moved", "_recurrence_count",
 )
 
 SANITIZE_FAILED_ENVELOPE = (
@@ -117,6 +130,8 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ADVERSARIAL_HEADER_RE = re.compile(
     r"^\[FINDING\]\s*([^|]+)\|\s*([^|]+)\|\s*severity:\s*([^|]+?)\s*"
     r"(?:\|\s*reachable:\s*([^|]+?)\s*)?"
+    r"(?:\|\s*precondition:\s*([^|]+?)\s*)?"
+    r"(?:\|\s*impact:\s*([^|]+?)\s*)?"
     r"(?:\|\s*tier:\s*([^|]+?)\s*)?"
     r"(?:\|\s*class:\s*([^|]+?)\s*)?"
     r"\|\s*title:\s*(.+)$"
@@ -439,16 +454,25 @@ def parse_adversarial_text(text):
         fileline = match.group(2).strip()
         severity_raw = match.group(3).strip().lower()
         reachable_raw = (match.group(4) or "").strip().lower()
-        tier_raw = (match.group(5) or "").strip().lower()
-        class_raw = (match.group(6) or "").strip().lower()
-        title = match.group(7).strip()
+        precondition_raw = match.group(5)
+        impact_raw = match.group(6)
+        tier_raw = (match.group(7) or "").strip().lower()
+        class_raw = (match.group(8) or "").strip().lower()
+        title = match.group(9).strip()
         located = _FILE_LINE_RE.match(fileline)
         if located:
             fname, lineno = located.group(1), int(located.group(2))
         else:
             fname, lineno = fileline, 0
         severity = severity_raw if severity_raw in SEVERITY_RANKS else "unknown"
-        reachable = reachable_raw if reachable_raw in ("yes", "no") else "no"
+        # A header that states facts is read by the rubric, where an unstated or
+        # invalid reachable is the worst case (unknown, treated as reachable). A
+        # header without facts keeps the older reading, where it is "no".
+        facts_stated = precondition_raw is not None or impact_raw is not None
+        if reachable_raw in ("yes", "no"):
+            reachable = reachable_raw
+        else:
+            reachable = "unknown" if facts_stated else "no"
         tier = tier_raw if tier_raw in ("blocking", "advisory") else "advisory"
         # Reachability is the precondition for blocking, never a judgment the
         # tier field alone can override.
@@ -461,11 +485,24 @@ def parse_adversarial_text(text):
         # whatever tier or class the model wrote.
         if reachable == "yes" and severity in ("high", "critical"):
             tier = "blocking"
-        findings.append({
+        record = {
             "file": fname, "line": lineno, "category": cwe, "message": title,
             "severity": severity, "reachable": reachable, "tier": tier,
             "class": change_class,
-        })
+        }
+        if facts_stated:
+            # The closed vocabulary is enforced here too, so free text in a fact
+            # position never reaches a sidecar. The severity and tier written
+            # above are the model's; the rubric replaces them at evaluation, and
+            # the unprofiled reading below is what a sidecar shows until then.
+            record["severity_claimed"] = severity
+            record["attacker_precondition"] = fact_value(
+                precondition_raw, PRECONDITIONS, UNKNOWN_FACT)
+            record["impact"] = fact_value(impact_raw, IMPACTS, UNKNOWN_FACT)
+            provisional = rubric_for_record(record, None)
+            record["severity"] = provisional["severity"]
+            record["tier"] = provisional["tier"]
+        findings.append(record)
     return findings
 
 
@@ -992,9 +1029,15 @@ def adversarial_tier(reachable, severity, given):
     return given if given in ("blocking", "advisory") else "advisory"
 
 
-def unify_finding(raw, source):
+def unify_finding(raw, source, stakes=None):
     """One input finding as a unified record. Raises ValueError for an input
-    that is not an object: a finding that cannot be read is never skipped."""
+    that is not an object: a finding that cannot be read is never skipped.
+
+    A finding that states facts (attacker_precondition or impact) has its
+    severity (and, for the Auditor, its tier) decided by the rubric from those
+    facts and STAKES; the model's own severity is kept as severity_claimed for
+    display. A finding with neither fact is from a producer that predates the
+    vocabulary and keeps the severity it claimed."""
     if not isinstance(raw, dict):
         raise ValueError("a finding is not an object")
     claimed = raw.get("severity_claimed", raw.get("severity"))
@@ -1031,34 +1074,755 @@ def unify_finding(raw, source):
     for key in ("suggestion", "issue_class", "class_fix"):
         if isinstance(raw.get(key), str):
             record[key] = _clean(raw[key], 500)
+    record["schema"] = FINDING_SCHEMA
+    if has_facts(raw):
+        record["attacker_precondition"] = fact_value(
+            raw.get("attacker_precondition"), PRECONDITIONS, UNKNOWN_FACT)
+        record["impact"] = fact_value(raw.get("impact"), IMPACTS, UNKNOWN_FACT)
+        apply_rubric(record, stakes)
     record["fingerprint"] = finding_identity(
         source, record["file"], record["category"], record["message"])
     return record
 
 
-def unify_findings(raw_findings, source):
+def unify_findings(raw_findings, source, stakes=None):
     if not isinstance(raw_findings, list):
         raise ValueError("findings is not an array")
     if len(raw_findings) > EVALUATE_MAX_FINDINGS:
         raise ValueError("more than %d findings" % EVALUATE_MAX_FINDINGS)
-    return [unify_finding(raw, source) for raw in raw_findings]
+    return [unify_finding(raw, source, stakes) for raw in raw_findings]
 
 
 def is_floor(finding):
-    """The security floor: reachable, at high impact or above. A finding on it
-    can be cleared by a fix, or by a mitigation that names the control, and by
-    nothing that merely calls it acceptable."""
+    """The security floor. A finding on it can be cleared by a fix, or by a
+    mitigation that names the control, and by nothing that merely calls it
+    acceptable. For a finding the rubric decided, it is reachable, high impact
+    and an EFFECTIVE precondition of none or network (the finding's own
+    precondition raised only by what the profile genuinely establishes); for
+    one from a producer without facts it is reachable at severity high or
+    above, as before."""
+    if finding.get("rubric_applied"):
+        return bool(finding.get("floor"))
     return finding.get("reachable") == "yes" and severity_rank(finding.get("severity")) >= FLOOR_RANK
 
 
 def is_blocking(finding, threshold):
     """Whether an unaddressed finding blocks. An adversarial finding blocks by
-    its (mechanically clamped) tier; a review finding blocks when its severity
-    meets the threshold. The severity is still the model's claim; the rubric
-    that replaces the claim is a later change."""
+    its tier (clamped, or decided by the rubric); a review finding blocks when
+    its severity (the rubric's, when it has facts) meets the threshold."""
     if finding.get("source") == "adversarial":
         return finding.get("tier") == "blocking"
     return severity_rank(finding.get("severity")) >= threshold
+
+
+# ----------------------------------------------- facts and the deterministic rubric
+#
+# A model is asked for facts, never for a severity it would have to defend. The
+# facts are drawn from closed vocabularies; a value outside its vocabulary, or
+# a missing one, resolves to the WORST case, so a model cannot lower a finding
+# by garbling a field. The severity of a finding that states facts is then a
+# pure function of those facts and the stakes profile (below):
+#
+#     severity = RUBRIC_TABLE[impact weight][effective precondition]
+#
+# where the impact weight is the impact scaled by the data the path handles,
+# and the effective precondition is what the attacker must already have once
+# the profile's exposure, visibility and merge control are taken into account
+# (the CVSS Attack Vector / Privileges Required and Confidentiality /
+# Integrity Requirement analogues). The same facts and the same profile always
+# give the same severity, on the gate path and in a standalone agent.
+
+FINDING_SCHEMA = 2
+UNKNOWN_FACT = "unknown"
+PRECONDITIONS = ("none", "network", "authenticated_user", "repo_write_can_merge",
+                 "maintainer_admin", "local_ci_only")
+IMPACTS = ("code_exec", "data_read", "data_write", "integrity", "availability",
+           "quality_only")
+EXPOSURES = ("internet", "internal_authenticated", "local_or_ci_only")
+DATA_LEVELS = ("regulated_or_customer", "internal", "public_or_none")
+VISIBILITIES = ("public", "private")
+MERGE_CONTROLS = ("code_owner_review_required", "review_required", "unrestricted")
+DIMENSIONS = {"exposure": EXPOSURES, "data": DATA_LEVELS, "visibility": VISIBILITIES,
+              "merge_control": MERGE_CONTROLS}
+# Unstated dimensions mean the worst case, so an absent profile is today's
+# behavior. Each tuple lists a dimension's values worst first.
+WORST_DIMS = {"exposure": "internet", "data": "regulated_or_customer",
+              "visibility": "public", "merge_control": "unrestricted"}
+WORST_ORDER = {"exposure": EXPOSURES, "data": DATA_LEVELS, "visibility": VISIBILITIES,
+               "merge_control": ("unrestricted", "review_required", "code_owner_review_required")}
+WORST_PRECONDITION = "none"
+WORST_IMPACT = "code_exec"
+
+IMPACT_WEIGHT = {"quality_only": 0, "availability": 1, "data_read": 2, "data_write": 3,
+                 "integrity": 3, "code_exec": 4}
+IMPACT_WEIGHT_NAMES = ("negligible", "low", "moderate", "high", "severe")
+DATA_SCALED_IMPACTS = ("data_read", "data_write", "integrity")
+DATA_SHIFT = {"regulated_or_customer": 1, "internal": 0, "public_or_none": -1}
+# Impact weights at or above this one are "high impact" for the security floor.
+FLOOR_IMPACT_WEIGHT = 3
+PRECONDITION_COLUMN = {"none": 0, "network": 0, "authenticated_user": 1,
+                       "repo_write_can_merge": 2, "maintainer_admin": 3, "local_ci_only": 4}
+# Rows are impact weights 0..4. Columns: none or network (open to anyone),
+# authenticated_user, repo_write_can_merge, maintainer_admin, local_ci_only.
+RUBRIC_TABLE = (
+    ("medium", "low", "low", "low", "low"),
+    ("medium", "medium", "low", "low", "low"),
+    ("high", "medium", "medium", "low", "low"),
+    ("critical", "high", "medium", "medium", "low"),
+    ("critical", "high", "high", "medium", "medium"),
+)
+UNREACHABLE_CAP = "medium"
+SEVERITY_NAMES = ("low", "medium", "high", "critical")
+
+
+def fact_value(raw, allowed, worst):
+    """RAW as a member of ALLOWED (case and surrounding space ignored), else
+    WORST. The one place a fact is checked against its vocabulary."""
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in allowed:
+            return value
+    return worst
+
+
+def has_facts(raw):
+    """A finding states facts when it carries either of the two the rubric
+    cannot do without; one without is from a producer that predates them."""
+    return "attacker_precondition" in raw or "impact" in raw
+
+
+def worst_dims():
+    return {dim: (WORST_DIMS[dim], "no profile statement") for dim in DIMENSIONS}
+
+
+def evaluate_rubric(precondition, impact, reachable, change_class, dims):
+    """The rubric as a pure function. PRECONDITION and IMPACT are fact values
+    (anything outside the vocabulary reads as the worst case), REACHABLE is
+    yes, no or unknown (unknown reads as yes), CHANGE_CLASS durable or
+    ephemeral, DIMS maps each stakes dimension to (value, where it came from).
+    Returns severity, whether the finding is on the security floor, the
+    effective precondition and the steps by which the profile moved it."""
+    precondition = precondition if precondition in PRECONDITIONS else WORST_PRECONDITION
+    impact = impact if impact in IMPACTS else WORST_IMPACT
+    is_reachable = reachable != "no"
+    exposure, exposure_via = dims["exposure"]
+    visibility, visibility_via = dims["visibility"]
+    merge, merge_via = dims["merge_control"]
+    data, data_via = dims["data"]
+    moves = []
+    effective = precondition
+
+    def move(new, dimension, value, via):
+        if new != effective:
+            moves.append("precondition %s -> %s via %s=%s for %s"
+                         % (effective, new, dimension, value, via))
+        return new
+
+    # A private repository has no anonymous reader, but only where the path is
+    # not itself exposed to the internet: an internet-facing path keeps its
+    # anonymous attacker whoever can read the source.
+    if visibility == "private" and exposure != "internet" and effective == "none":
+        effective = move("authenticated_user", "visibility", visibility, visibility_via)
+    if exposure == "internal_authenticated" and effective == "network":
+        effective = move("authenticated_user", "exposure", exposure, exposure_via)
+    elif exposure == "local_or_ci_only" and effective in ("network", "authenticated_user"):
+        effective = move("local_ci_only", "exposure", exposure, exposure_via)
+    if merge == "code_owner_review_required" and effective == "repo_write_can_merge":
+        effective = move("maintainer_admin", "merge_control", merge, merge_via)
+
+    weight = IMPACT_WEIGHT[impact]
+    scaled = weight
+    if impact in DATA_SCALED_IMPACTS:
+        scaled = min(max(weight + DATA_SHIFT[data], 0), 4)
+        worst_case = min(weight + DATA_SHIFT[WORST_DIMS["data"]], 4)
+        if scaled != worst_case:
+            moves.append("impact weight %s -> %s via data=%s for %s"
+                         % (IMPACT_WEIGHT_NAMES[worst_case], IMPACT_WEIGHT_NAMES[scaled],
+                            data, data_via))
+    # A throwaway change excuses only what longevity makes matter; it never
+    # touches an impact an attacker uses.
+    if change_class == "ephemeral" and impact in ("availability", "quality_only"):
+        scaled = max(scaled - 1, 0)
+    severity = RUBRIC_TABLE[scaled][PRECONDITION_COLUMN[effective]]
+    # The profile can raise the weight (regulated data) but never lower a
+    # high-impact finding out of the floor: the floor reads the larger of the
+    # unscaled and scaled weight.
+    floor = (is_reachable and effective in ("none", "network")
+             and max(weight, scaled) >= FLOOR_IMPACT_WEIGHT)
+    if floor and severity_rank(severity) < FLOOR_RANK:
+        severity = "high"
+    if not is_reachable and severity_rank(severity) > severity_rank(UNREACHABLE_CAP):
+        severity = UNREACHABLE_CAP
+    return {"severity": severity, "floor": floor, "effective_precondition": effective,
+            "moves": moves}
+
+
+def rubric_for_record(record, stakes):
+    """The rubric's reading of one unified RECORD under STAKES (None means no
+    profile: the worst case in every dimension). Adds the tier an Auditor
+    finding takes (blocking exactly when it is reachable and at least high) and
+    the severity the same facts get with no profile, which is what 'moved by
+    the profile' is measured against."""
+    dims = stakes.dims_for(record.get("file", "")) if stakes is not None else worst_dims()
+    facts = (record.get("attacker_precondition"), record.get("impact"),
+             record.get("reachable"), record.get("class"))
+    result = evaluate_rubric(*facts, dims=dims)
+    result["unprofiled"] = evaluate_rubric(*facts, dims=worst_dims())["severity"]
+    reachable = record.get("reachable") != "no"
+    result["tier"] = ("blocking" if reachable and severity_rank(result["severity"]) >= FLOOR_RANK
+                      else "advisory")
+    return result
+
+
+def apply_rubric(record, stakes):
+    """Replace RECORD's severity (and an Auditor finding's tier) with the
+    rubric's. The model's own severity stays in severity_claimed, display only."""
+    result = rubric_for_record(record, stakes)
+    record["rubric_applied"] = True
+    record["severity"] = result["severity"]
+    record["floor"] = result["floor"]
+    record["effective_precondition"] = result["effective_precondition"]
+    record["severity_unprofiled"] = result["unprofiled"]
+    record["moves"] = result["moves"]
+    if record.get("source") == "adversarial":
+        record["tier"] = result["tier"]
+    return record
+
+
+def rubric_moved_text(record):
+    """What moved a finding below its no-profile severity, or '' when nothing
+    did: the steps, each naming the dimension and the path glob or default that
+    moved it."""
+    if not record.get("rubric_applied") or not record.get("moves"):
+        return ""
+    if severity_rank(record.get("severity")) >= severity_rank(record.get("severity_unprofiled")):
+        return ""
+    return "; ".join(record["moves"])
+
+
+_IMPACT_ORDER = {name: index for index, name in enumerate(IMPACTS)}
+
+
+def _stronger_precondition(first, second):
+    if first not in PRECONDITIONS or second not in PRECONDITIONS:
+        return UNKNOWN_FACT
+    return first if PRECONDITIONS.index(first) <= PRECONDITIONS.index(second) else second
+
+
+def _stronger_impact(first, second):
+    if first not in IMPACTS or second not in IMPACTS:
+        return UNKNOWN_FACT
+    rank = lambda name: (IMPACT_WEIGHT[name], -_IMPACT_ORDER[name])  # noqa: E731
+    return first if rank(first) >= rank(second) else second
+
+
+def merge_facts(known, record):
+    """Fold RECORD's facts into KNOWN toward the stronger reading of each (the
+    easier precondition, the larger impact; a value outside its vocabulary on
+    either side stays the worst case). The rubric then reads the merged facts,
+    so a re-run can only raise a finding, never lower it."""
+    known["attacker_precondition"] = _stronger_precondition(
+        known.get("attacker_precondition"), record.get("attacker_precondition"))
+    known["impact"] = _stronger_impact(known.get("impact"), record.get("impact"))
+
+
+# ------------------------------------------------------------ the stakes profile
+#
+# What is at stake on a path is not something a model can see in a diff: whether
+# it is served to the internet or only to staff behind SSO, whether it handles
+# customer data, who can merge to it. That is recorded, optionally, in one
+# committed file, .clagentic/risk-profile.json, and read here in code. The file
+# is optional and agent-maintained (the `profile` command drafts and updates it
+# from the tree and the operator's answers, as a reviewable change); it cannot
+# apply itself (the version at the merge base is the one that counts, exactly as
+# for dispositions); an unstated dimension means the worst case, so an absent
+# profile changes nothing; and a claim the tree contradicts in the unsafe
+# direction is ignored, loudly.
+
+PROFILE_REL = ".clagentic/risk-profile.json"
+PROFILE_SCHEMA = 1
+PROFILE_MAX_ENTRIES = 500
+PROFILE_DEFAULT_MAX_AGE_DAYS = 180
+INFER_MAX_FILES = 20000
+INFER_MAX_FILE_BYTES = 64 * 1024
+INFER_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+CHANGED_PATHS_MAX = 5000
+CODEOWNERS_LOCATIONS = (".github/CODEOWNERS", ".gitea/CODEOWNERS", ".forgejo/CODEOWNERS",
+                        ".gitlab/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
+_PROFILE_ENTRY_KEYS = ("glob", "inferred", "evidence", "note")
+
+
+def _worse_value(dimension, first, second):
+    order = WORST_ORDER[dimension]
+    return first if order.index(first) <= order.index(second) else second
+
+
+def parse_profile(text):
+    """(profile, problems) for the text of a risk profile. PROFILE is None when
+    the text cannot be used at all; otherwise it holds the repo-wide 'default'
+    dimensions, the per-glob 'entries' [(glob, dims)] and 'confirmed_at'. A
+    dimension with a value outside its vocabulary is set to its worst case (and
+    reported), so a typo can only ever make the profile stricter."""
+    problems = []
+    try:
+        document = json.loads(text)
+    except ValueError as exc:
+        return None, ["is not valid JSON: %s" % exc]
+    if not isinstance(document, dict):
+        return None, ["is not a JSON object"]
+
+    def read_dims(container, label):
+        found = {}
+        for dimension, allowed in DIMENSIONS.items():
+            if dimension not in container:
+                continue
+            value = container[dimension]
+            if isinstance(value, str) and value.strip().lower() in allowed:
+                found[dimension] = value.strip().lower()
+            else:
+                found[dimension] = WORST_DIMS[dimension]
+                problems.append("%s: %s=%s is not one of %s; the worst case (%s) applies" % (
+                    label, dimension, terminal_text(dumps(value), 60), ", ".join(allowed),
+                    WORST_DIMS[dimension]))
+        return found
+
+    raw_default = document.get("default", {})
+    if not isinstance(raw_default, dict):
+        problems.append("'default' is not an object; ignored (unstated dimensions are the worst case)")
+        raw_default = {}
+    default = read_dims(raw_default, "default")
+    raw_paths = document.get("paths", [])
+    if not isinstance(raw_paths, list):
+        problems.append("'paths' is not an array; ignored")
+        raw_paths = []
+    if len(raw_paths) > PROFILE_MAX_ENTRIES:
+        problems.append("more than %d 'paths' entries; the rest are ignored" % PROFILE_MAX_ENTRIES)
+    entries = []
+    for index, item in enumerate(raw_paths[:PROFILE_MAX_ENTRIES]):
+        label = "paths[%d]" % index
+        if not isinstance(item, dict):
+            problems.append("%s is not an object; ignored" % label)
+            continue
+        glob = item.get("glob")
+        if (not isinstance(glob, str) or not glob.strip() or len(glob) > 500
+                or _UNSAFE_RE.search(glob)):
+            problems.append("%s has no usable 'glob'; ignored" % label)
+            continue
+        dims = read_dims(item, label)
+        if not dims:
+            problems.append("%s states no dimension; ignored" % label)
+            continue
+        entries.append((glob.strip(), dims))
+    confirmed = document.get("confirmed_at")
+    return {"default": default, "entries": entries,
+            "confirmed_at": confirmed if isinstance(confirmed, str) else None}, problems
+
+
+def codeowners_globs(pattern):
+    """The path globs a CODEOWNERS pattern covers: an unanchored name matches at
+    any depth, a name with a slash is anchored to the root, a trailing slash or
+    a plain name covers everything under it."""
+    anchored = pattern.startswith("/")
+    body = pattern.lstrip("/")
+    is_dir = body.endswith("/")
+    body = body.rstrip("/")
+    if not body:
+        return []
+    if "/" in body:
+        anchored = True
+    base = body if anchored else "**/" + body
+    if is_dir:
+        return [base + "/**"]
+    globs = [base]
+    if not any(char in body for char in "*?"):
+        globs.append(base + "/**")
+    return globs
+
+
+class Codeowners(object):
+    """CODEOWNERS rules. covers(path) is true when the last rule matching the
+    path names at least one owner, the way the git hosts read the file."""
+
+    def __init__(self, texts):
+        self.rules = []
+        for text in texts:
+            for line in text.splitlines()[:5000]:
+                line = line.split("#", 1)[0].strip()
+                if not line or line.startswith("[") or line.startswith("^["):
+                    continue
+                parts = line.split()
+                globs = [compile_glob(glob) for glob in codeowners_globs(parts[0])]
+                if globs:
+                    self.rules.append((globs, len(parts) > 1))
+
+    def covers(self, path):
+        owned = False
+        for globs, has_owner in self.rules:
+            if any(glob_match_compiled(compiled, path) for compiled in globs):
+                owned = has_owner
+        return owned
+
+
+class Stakes(object):
+    """The stakes in force for one run: the profile read at the merge base, the
+    markers inferred from the tree, and the warnings and notes about both. With
+    no profile present it is inert: every path resolves to the worst case."""
+
+    def __init__(self):
+        self.present = False
+        self.default = {}
+        self.entries = []
+        self.markers = []
+        self.codeowners = None
+        self.warnings = []
+        self.notes = []
+        self.confirmed_at = None
+        self._warned = set()
+
+    def warn_once(self, message):
+        if message not in self._warned:
+            self._warned.add(message)
+            self.warnings.append(message)
+
+    def dims_for(self, path):
+        """{dimension: (value, where it came from)} for the repo path PATH."""
+        path = norm_path(path)
+        if not self.present:
+            return worst_dims()
+        dims, stated = {}, {}
+        for dimension in DIMENSIONS:
+            value, via, claimed = WORST_DIMS[dimension], "no profile statement", False
+            hits = [(glob, dims_[dimension]) for glob, compiled, dims_ in self.entries
+                    if dimension in dims_ and glob_match_compiled(compiled, path)]
+            if hits:
+                glob, value = hits[0]
+                for other_glob, other in hits[1:]:
+                    if _worse_value(dimension, other, value) != value:
+                        glob, value = other_glob, other
+                via, claimed = glob, True
+            elif dimension in self.default:
+                value, via, claimed = self.default[dimension], "the repo-wide default", True
+            dims[dimension], stated[dimension] = (value, via), claimed
+        self._apply_inference(path, dims, stated)
+        self._apply_codeowners(path, dims)
+        return dims
+
+    def _apply_inference(self, path, dims, stated):
+        # A path the profile says nothing about on exposure, and which is a
+        # test path, is not served: the one inference that LOWERS, and only
+        # where an operator has opted in by keeping a profile at all.
+        if not stated["exposure"] and is_test_path(path):
+            dims["exposure"] = ("local_or_ci_only", "tree inference (a test path)")
+        for marker in self.markers:
+            if not glob_match_compiled(marker["compiled"], path):
+                continue
+            current, _ = dims[marker["dimension"]]
+            if _worse_value(marker["dimension"], marker["value"], current) != current:
+                dims[marker["dimension"]] = (marker["value"], "tree inference (%s)" % marker["why"])
+
+    def _apply_codeowners(self, path, dims):
+        value, via = dims["merge_control"]
+        if value != "code_owner_review_required":
+            return
+        if self.codeowners is None:
+            self.warn_once("the profile claims merge_control=code_owner_review_required but no "
+                           "CODEOWNERS file exists in any conventional location (%s); the claim is "
+                           "ignored and the worst case applies"
+                           % ", ".join(CODEOWNERS_LOCATIONS))
+        elif self.codeowners.covers(path):
+            return
+        else:
+            self.warn_once("the profile claims merge_control=code_owner_review_required for %s but "
+                           "no CODEOWNERS rule with an owner covers %s; the claim is ignored and the "
+                           "worst case applies there" % (via, terminal_text(path, 120)))
+        dims["merge_control"] = (WORST_DIMS["merge_control"], "CODEOWNERS does not cover the path")
+
+
+def is_test_path(path):
+    parts = path.split("/")
+    name = parts[-1]
+    if any(part in ("test", "tests", "__tests__", "spec", "specs", "fixtures", "testdata")
+           for part in parts[:-1]):
+        return True
+    return (name.startswith("test_") or "_test." in name or ".test." in name
+            or ".spec." in name)
+
+
+# Tree inference. Heuristics, deliberately few; each is a marker that a path is
+# exposed or handles sensitive data, found by reading the committed tree. A
+# marker can only RAISE a dimension (and contradict a profile that says
+# otherwise), except the test-path fill above.
+
+_SOURCE_EXTS = (".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rb", ".java", ".kt", ".php",
+                ".rs", ".cs", ".scala", ".ex", ".exs")
+_MANIFEST_EXTS = (".yaml", ".yml", ".tpl")
+_SCHEMA_EXTS = (".sql", ".prisma", ".proto", ".graphql", ".avsc", ".xsd")
+_SCHEMA_DIRS = ("models", "model", "schemas", "schema", "entities", "migrations", "migrate")
+_SCHEMA_NAMES = ("models.py", "schema.py", "schema.rb", "models.ts", "models.js")
+_WORKFLOW_DIRS = (".github/workflows/", ".gitea/workflows/", ".forgejo/workflows/")
+_SKIP_DIRS = (".git", "node_modules", "vendor", ".clagentic", ".venv", "venv", "__pycache__")
+_INGRESS_RE = re.compile(
+    r"^\s*kind:\s*[\"']?(?:Ingress|IngressRoute|HTTPRoute|VirtualService|Gateway|Route)[\"']?\s*$",
+    re.M)
+_LOADBALANCER_RE = re.compile(r"^\s*type:\s*[\"']?LoadBalancer[\"']?\s*$", re.M)
+# Signs that an ingress or load balancer is internal or sits behind an auth
+# layer; with one present the file is not read as a public ingress.
+_INTERNAL_SIGNAL_RE = re.compile(
+    r"ingressClassName:\s*[\"']?[\w./-]*internal|kubernetes\.io/ingress\.class:\s*[\"']?[\w./-]*internal"
+    r"|load-balancer-internal|load-balancer-type:\s*[\"']?internal|\bauth-url\b|\bauth-signin\b"
+    r"|oauth2-proxy|whitelist-source-range|allowlist-source-range|loadBalancerSourceRanges",
+    re.I)
+_EXPOSE_RE = re.compile(r"^\s*EXPOSE\s+\d", re.M | re.I)
+_SERVER_RE = re.compile(
+    r"\b(?:Flask|FastAPI|Sanic|Starlette|Bottle)\(|\bexpress\(\)|\b[Ff]astify\(|http\.ListenAndServe"
+    r"|http\.createServer|\bapp\.listen\(|@(?:app|router|bp|blueprint)\.(?:route|get|post|put|delete)\("
+    r"|\bgin\.(?:Default|New)\(|\becho\.New\(|\bfiber\.New\(|\buvicorn\.run\(|Rails\.application\.routes"
+    r"|@(?:Get|Post|Put|Delete|Request)Mapping")
+_PUBLIC_TRIGGER_RE = re.compile(r"\bpull_request_target\b|\bissue_comment\b")
+_PII_RE = re.compile(
+    r"\b(?:ssn|social_security(?:_number)?|date_of_birth|dob|birth_?date|passport(?:_number)?"
+    r"|national_id|tax_id|drivers?_?licen[cs]e|credit_card|card_number|cvv|iban|account_number"
+    r"|email(?:_address)?|phone(?:_number)?|home_address|street_address|salary|diagnosis)\b", re.I)
+_PAYMENT_RE = re.compile(
+    r"^\s*(?:import|from|use|using)\b[^\n]*\b(?:stripe|braintree|paypal|adyen)\b"
+    r"|require\(\s*[\"'](?:stripe|braintree|paypal|adyen)[\"']\s*\)", re.I | re.M)
+_CREDENTIAL_RE = re.compile(
+    r"\b(?:bcrypt|argon2|scrypt|pbkdf2|password_hash|hashpw|check_password_hash"
+    r"|generate_password_hash)\b", re.I)
+_SURFACE_AUTH_RE = re.compile(
+    r"(?:^|[/_.-])(?:auth|authn|authz|oauth|oidc|saml|sso|login|session|rbac|acl|permission)s?"
+    r"(?:[/_.-]|$)", re.I)
+_SURFACE_EXPOSURE_RE = re.compile(
+    r"(?:ingress|route|gateway|virtualservice|dockerfile|containerfile|docker-compose"
+    r"|loadbalancer)", re.I)
+
+
+def list_repo_files(root):
+    """Repo-relative paths of the tracked and untracked-but-not-ignored files,
+    up to INFER_MAX_FILES, or None when git cannot list them."""
+    proc = git_run(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+    if proc is None or proc.returncode != 0:
+        return None
+    names = [n for n in proc.stdout.decode("utf-8", "replace").split("\0") if n]
+    names = sorted(set(names))
+    return [n for n in names
+            if not any(part in _SKIP_DIRS for part in n.split("/")[:-1])][:INFER_MAX_FILES]
+
+
+def _dir_glob(path):
+    directory = posixpath.dirname(path)
+    return "**" if not directory else glob_escape(directory) + "/**"
+
+
+def _read_head(root, rel, budget):
+    """Up to INFER_MAX_FILE_BYTES of REL as text, or None; BUDGET is a one-item
+    list of the bytes still allowed to be read in this scan."""
+    if budget[0] <= 0:
+        return None
+    handle = open_contained_regular(root, rel)
+    if handle is None:
+        return None
+    try:
+        data = handle.read(INFER_MAX_FILE_BYTES)
+    except OSError:
+        return None
+    finally:
+        handle.close()
+    budget[0] -= len(data)
+    return data.decode("utf-8", "replace")
+
+
+def infer_markers(root, files=None):
+    """(markers, notes) read from the working tree. A marker is a dict with
+    dimension, value (the worse value it implies), glob, compiled, file, why."""
+    notes = []
+    if files is None:
+        files = list_repo_files(root)
+    if files is None:
+        return [], ["the tree could not be listed; nothing was inferred from it"]
+    if len(files) >= INFER_MAX_FILES:
+        notes.append("the tree has more than %d files; inference read only the first %d"
+                     % (INFER_MAX_FILES, INFER_MAX_FILES))
+    budget = [INFER_MAX_TOTAL_BYTES]
+    markers = []
+
+    def add(dimension, value, glob, rel, why):
+        markers.append({"dimension": dimension, "value": value, "glob": glob,
+                        "compiled": compile_glob(glob), "file": rel, "why": why})
+
+    for rel in files:
+        name = posixpath.basename(rel)
+        lowered = name.lower()
+        ext = posixpath.splitext(lowered)[1]
+        wants_exposure_text = (ext in _MANIFEST_EXTS or lowered.startswith(("dockerfile", "containerfile"))
+                               or ext in _SOURCE_EXTS or rel.startswith(_WORKFLOW_DIRS))
+        schema_like = (ext in _SCHEMA_EXTS or lowered in _SCHEMA_NAMES
+                       or any(part in _SCHEMA_DIRS for part in rel.split("/")[:-1]))
+        if not (wants_exposure_text or schema_like):
+            continue
+        text = _read_head(root, rel, budget)
+        if text is None:
+            continue
+        if ext in _MANIFEST_EXTS:
+            public = _INGRESS_RE.search(text) or _LOADBALANCER_RE.search(text)
+            if public and not _INTERNAL_SIGNAL_RE.search(text):
+                what = "an ingress or route" if _INGRESS_RE.search(text) else "a LoadBalancer service"
+                add("exposure", "internet", _dir_glob(rel), rel, "%s declares %s with no internal marker" % (rel, what))
+        if lowered.startswith(("dockerfile", "containerfile")) and _EXPOSE_RE.search(text):
+            add("exposure", "internet", _dir_glob(rel), rel, "%s EXPOSEs a port" % rel)
+        if ext in _SOURCE_EXTS and _SERVER_RE.search(text):
+            add("exposure", "internet", _dir_glob(rel), rel, "%s starts a server or declares routes" % rel)
+        if rel.startswith(_WORKFLOW_DIRS) and _PUBLIC_TRIGGER_RE.search(text):
+            add("exposure", "internet", glob_escape(rel), rel,
+                "%s runs on a trigger any outsider can cause (pull_request_target or issue_comment)" % rel)
+        if schema_like and _PII_RE.search(text):
+            add("data", "regulated_or_customer", _dir_glob(rel), rel,
+                "%s defines PII-shaped fields" % rel)
+        if ext in _SOURCE_EXTS and (_PAYMENT_RE.search(text) or _CREDENTIAL_RE.search(text)):
+            add("data", "regulated_or_customer", _dir_glob(rel), rel,
+                "%s handles payments or credentials" % rel)
+    return markers, notes
+
+
+def changed_paths(root, base):
+    """Paths that differ between BASE and the working tree, plus untracked
+    ones: what the gated change touches. [] when BASE is unknown."""
+    if not base:
+        return []
+    paths = set()
+    for args in (["diff", "--name-only", "-z", base], ["ls-files", "-z", "--others", "--exclude-standard"]):
+        proc = git_run(root, args)
+        if proc is not None and proc.returncode == 0:
+            paths.update(n for n in proc.stdout.decode("utf-8", "replace").split("\0") if n)
+    return sorted(paths)[:CHANGED_PATHS_MAX]
+
+
+def touches_exposure_surface(path, marker_files):
+    """Whether PATH is part of what the profile's exposure and data claims
+    describe: an ingress, route or service manifest, a container or workflow
+    definition, auth code, a data schema, or a file inference drew a marker
+    from."""
+    if path in marker_files:
+        return True
+    lowered = path.lower()
+    name = posixpath.basename(lowered)
+    if _SURFACE_EXPOSURE_RE.search(name) or path.startswith(_WORKFLOW_DIRS):
+        return True
+    if _SURFACE_AUTH_RE.search(lowered):
+        return True
+    ext = posixpath.splitext(name)[1]
+    return (ext in _SCHEMA_EXTS or name in _SCHEMA_NAMES
+            or any(part in _SCHEMA_DIRS for part in lowered.split("/")[:-1]))
+
+
+def _codeowners_texts(root, base):
+    """The CODEOWNERS files at BASE (the version the merge will be judged by),
+    or None when there are none. A change that adds one cannot support a claim
+    in the same change."""
+    reader = git_reader(root, base) if base else worktree_reader(root)
+    texts = []
+    for rel in CODEOWNERS_LOCATIONS:
+        try:
+            text = reader(rel)
+        except (OSError, ValueError):
+            continue
+        if text is not None:
+            texts.append(text)
+    return texts or None
+
+
+def load_stakes(root, base, today):
+    """The Stakes for a run: the risk profile as of BASE, inference over the
+    tree, CODEOWNERS coverage, and the re-confirmation warnings. Returns an
+    inert Stakes when there is no usable profile; never raises."""
+    stakes = Stakes()
+    try:
+        work_text = worktree_reader(root)(PROFILE_REL)
+    except (OSError, ValueError) as exc:
+        stakes.warnings.append("%s cannot be read from the working tree (%s)" % (PROFILE_REL, exc))
+        work_text = None
+    base_text, base_failed = None, False
+    if base:
+        try:
+            base_text = git_reader(root, base)(PROFILE_REL)
+        except (OSError, ValueError) as exc:
+            stakes.warnings.append("%s cannot be read at the base commit (%s); no profile applies"
+                                   % (PROFILE_REL, exc))
+            base_failed = True
+    elif work_text is not None:
+        stakes.warnings.append(
+            "%s exists but the base commit could not be resolved; the profile is ignored (a profile "
+            "applies only as of the merge base) and the worst case applies" % PROFILE_REL)
+        return stakes
+    if base_failed:
+        return stakes
+    if base_text is None:
+        if work_text is not None:
+            stakes.notes.append("%s is not in the base commit; it applies once it is merged, and "
+                                "the worst case applies to this change" % PROFILE_REL)
+        return stakes
+    if work_text != base_text:
+        stakes.notes.append("%s differs from its base version in this change; the base version "
+                            "applies to this change" % PROFILE_REL)
+    profile, problems = parse_profile(base_text)
+    for problem in problems:
+        stakes.warnings.append("%s %s" % (PROFILE_REL, terminal_text(problem, 300)))
+    if profile is None:
+        return stakes
+    stakes.present = True
+    stakes.default = profile["default"]
+    stakes.entries = [(glob, compile_glob(glob), dims) for glob, dims in profile["entries"]]
+    stakes.confirmed_at = profile["confirmed_at"]
+    stakes.codeowners = None
+    texts = _codeowners_texts(root, base)
+    if texts:
+        stakes.codeowners = Codeowners(texts)
+    stakes.markers, inference_notes = infer_markers(root)
+    stakes.notes.extend(inference_notes)
+    _warn_contradictions(stakes)
+    _warn_reconfirmation(stakes, root, base, today)
+    return stakes
+
+
+def _warn_contradictions(stakes):
+    """A claim the tree contradicts in the unsafe direction is ignored. Say so
+    once per marker, naming both sides."""
+    for marker in stakes.markers:
+        probe = marker["file"]
+        dims = {}
+        stated = False
+        for glob, compiled, entry in stakes.entries:
+            if marker["dimension"] in entry and glob_match_compiled(compiled, probe):
+                dims[glob] = entry[marker["dimension"]]
+                stated = True
+        if not stated and marker["dimension"] in stakes.default:
+            dims["the repo-wide default"] = stakes.default[marker["dimension"]]
+        for where, claimed in dims.items():
+            if _worse_value(marker["dimension"], marker["value"], claimed) != claimed:
+                stakes.warn_once(
+                    "the profile claims %s=%s for %s but the tree contradicts it (%s); the claim is "
+                    "ignored and %s=%s applies there"
+                    % (marker["dimension"], claimed, terminal_text(where, 120),
+                       terminal_text(marker["why"], 200), marker["dimension"], marker["value"]))
+
+
+def _warn_reconfirmation(stakes, root, base, today):
+    max_age = positive_int_env("CLAGENTIC_RISK_PROFILE_MAX_AGE_DAYS", PROFILE_DEFAULT_MAX_AGE_DAYS)
+    confirmed = parse_date(stakes.confirmed_at) if stakes.confirmed_at else None
+    if confirmed is None:
+        stakes.warnings.append("the risk profile has no valid confirmed_at date; re-confirm it with "
+                               "'findings.py profile' (clagentic-lite gates profile)")
+    elif (today - confirmed).days > max_age:
+        stakes.warnings.append("the risk profile was last confirmed on %s, more than %d days ago; "
+                               "re-confirm it with 'findings.py profile' (clagentic-lite gates profile)"
+                               % (confirmed.isoformat(), max_age))
+    marker_files = {marker["file"] for marker in stakes.markers}
+    touched = [p for p in changed_paths(root, base) if touches_exposure_surface(p, marker_files)]
+    if touched:
+        stakes.warnings.append(
+            "this change touches the exposure surface (%d path(s): %s); re-confirm the risk profile "
+            "with 'findings.py profile' (clagentic-lite gates profile). This is a prompt, not a block."
+            % (len(touched), ", ".join(terminal_text(p, 80) for p in touched[:5])))
 
 
 # ------------------------------------------------------- dispositions store
@@ -1743,11 +2507,20 @@ def accumulate(state, incoming, gate, caller):
             by_place[place] = record
             new += 1
             continue
-        if severity_rank(record["severity"]) > severity_rank(known.get("severity")):
-            known["severity"], known["severity_claimed"] = record["severity"], record["severity_claimed"]
+        if known.get("rubric_applied") and record.get("rubric_applied"):
+            # Both carry facts: the stronger facts win and the verdict re-derives
+            # the severity from them, so the merge can only raise a finding.
+            merge_facts(known, record)
+        else:
+            # Facts on only one side: fall back to the older reading (the
+            # higher claimed or computed severity wins), which can only raise.
+            if severity_rank(record["severity"]) > severity_rank(known.get("severity")):
+                known["severity"], known["severity_claimed"] = record["severity"], record["severity_claimed"]
+            if known.get("rubric_applied"):
+                known["rubric_applied"] = False
         if _REACHABLE_ORDER[record["reachable"]] > _REACHABLE_ORDER.get(known.get("reachable"), 1):
             known["reachable"] = record["reachable"]
-        if record.get("tier") == "blocking":
+        if record.get("tier") == "blocking" and not known.get("rubric_applied"):
             known["tier"] = "blocking"
         if record["class"] == "durable":
             known["class"] = "durable"
@@ -1761,7 +2534,12 @@ def accumulate(state, incoming, gate, caller):
 def _public_finding(finding):
     keys = ("source", "file", "line", "category", "message", "severity", "severity_claimed",
             "reachable", "fingerprint")
-    return {key: finding.get(key) for key in keys}
+    out = {key: finding.get(key) for key in keys}
+    if finding.get("rubric_applied"):
+        out["rubric_applied"] = True
+        out["attacker_precondition"] = finding.get("attacker_precondition")
+        out["impact"] = finding.get("impact")
+    return out
 
 
 def _public_entry(entry):
@@ -1795,11 +2573,19 @@ def clearing_stanza(finding, today):
     return stanza
 
 
-def build_verdict(state, store, base_keys, threshold_name, today, scope, head, base):
+def build_verdict(state, store, base_keys, threshold_name, today, scope, head, base, stakes=None):
     """The code verdict. Open blocking findings at HEAD, minus the ones a valid,
-    live, already-merged disposition clears."""
+    live, already-merged disposition clears. A finding that carries facts has
+    its severity re-derived here from the (merged) facts and STAKES, so the
+    verdict never depends on which run wrote the severity down."""
     threshold = threshold_rank(threshold_name)
-    findings = [f for f in state["findings"] if scope in (None, f["source"])]
+    findings = []
+    for stored in state["findings"]:
+        if scope not in (None, stored["source"]):
+            continue
+        if stored.get("rubric_applied"):
+            stored = apply_rubric(dict(stored), stakes)
+        findings.append(stored)
     live, expired = [], []
     for entry in store["entries"]:
         until = parse_date(entry.get("expires")) if entry.get("expires") else None
@@ -1847,6 +2633,16 @@ def build_verdict(state, store, base_keys, threshold_name, today, scope, head, b
     if base_keys is None and store["entries"]:
         warnings.append("the base commit could not be resolved: every disposition entry is treated "
                         "as added in this change and clears nothing")
+    adjusted = []
+    for finding in findings:
+        moved = rubric_moved_text(finding)
+        if moved:
+            adjusted.append(dict(_public_finding(finding), moved=moved,
+                                 severity_unprofiled=finding["severity_unprofiled"],
+                                 outcome="blocking" if is_blocking(finding, threshold) else "advisory"))
+    if stakes is not None:
+        warnings.extend(stakes.warnings)
+        warnings.extend(stakes.notes)
     return {
         "verdict": "BLOCKED" if opened else "PASS",
         "head": head,
@@ -1862,6 +2658,7 @@ def build_verdict(state, store, base_keys, threshold_name, today, scope, head, b
         "expired": [dict(_public_entry(e), would_have_cleared=expired_hits.get(e["id"], 0))
                     for e in expired],
         "invalid": store["invalid"],
+        "adjusted": adjusted,
         "warnings": warnings,
         "runs": len(state["runs"]),
         "_status": status,
@@ -1886,10 +2683,23 @@ def render_verdict_text(verdict, caller):
     if verdict["open"]:
         lines.append("Open blocking findings:")
         for item in verdict["open"]:
+            if item.get("rubric_applied"):
+                shown = item["severity"]
+                claimed = item.get("severity_claimed")
+                if claimed and claimed != shown:
+                    shown = "%s; model claimed %s" % (shown, claimed)
+            else:
+                shown = item["severity_claimed"] or item["severity"] or "unrated"
             lines.append("  [%s] [%s] %s:%s %s: %s (fingerprint %s)%s" % (
-                t(item["source"]), t(item["severity_claimed"] or item["severity"] or "unrated"),
+                t(item["source"]), t(shown),
                 t(item["file"]), t(item["line"]), t(item["category"]), t(item["message"], 300),
                 t(item["fingerprint"][:12]), "  [security floor]" if item["floor"] else ""))
+    if verdict.get("adjusted"):
+        lines.append("Severity set below its no-profile reading by the stakes profile (always listed):")
+        for item in verdict["adjusted"]:
+            lines.append("  - %s: %s (%s:%s %s; severity %s -> %s)" % (
+                t(item["outcome"]), t(item["moved"], 400), t(item["file"]), t(item["line"]),
+                t(item["message"], 120), t(item["severity_unprofiled"]), t(item["severity"])))
     if verdict["cleared"]:
         lines.append("Cleared by dispositions (always listed):")
         for item in verdict["cleared"]:
@@ -1977,12 +2787,32 @@ def prompt_verdict(verdict):
     out["refused"] = verdict["refused"]
     out["expired"] = verdict["expired"]
     out["invalid_entries"] = len(verdict["invalid"])
+    out["adjusted_by_profile"] = verdict["adjusted"]
     return sanitize_tree(out)
 
 
+def _write_rubric_fields(item, record):
+    """Copy what the rubric decided about RECORD onto the input finding ITEM:
+    the severity it now has (the model's own moves to severity_claimed), the
+    tier of an Auditor finding, and what moved it. A finding without facts is
+    left exactly as it was."""
+    if not record.get("rubric_applied"):
+        return
+    item["severity_claimed"] = record["severity_claimed"]
+    item["severity"] = record["severity"]
+    if record.get("source") == "adversarial":
+        item["tier"] = record["tier"]
+    moved = rubric_moved_text(record)
+    if moved:
+        item["severity_moved"] = sanitize_text(moved, 400)
+    else:
+        item.pop("severity_moved", None)
+
+
 def annotate_file(path, unified, verdict):
-    """Write each input finding's fingerprint and disposition status back into
-    PATH (an envelope object or a bare array), index-aligned with the input."""
+    """Write each input finding's fingerprint, disposition status and rubric
+    reading back into PATH (an envelope object or a bare array), index-aligned
+    with the input."""
     document = load_json_file(path)
     items = document.get("findings") if isinstance(document, dict) else document
     if not isinstance(items, list) or len(items) != len(unified):
@@ -1991,9 +2821,23 @@ def annotate_file(path, unified, verdict):
         if not isinstance(item, dict):
             continue
         item["fingerprint"] = record["fingerprint"]
+        _write_rubric_fields(item, record)
         found = verdict["_status"].get((record["source"], record["fingerprint"]))
         if found:
             item["disposition"] = {k: sanitize_text(str(v), 120) for k, v in found.items()}
+    write_file_atomic(path, dumps(document) + "\n")
+
+
+def annotate_rubric_file(path, unified):
+    """Like annotate_file but writes only the rubric reading: for the Auditor's
+    sidecar, which must carry the tier the code decided and nothing else new."""
+    document = load_json_file(path)
+    items = document.get("findings") if isinstance(document, dict) else document
+    if not isinstance(items, list) or len(items) != len(unified):
+        raise ValueError("cannot annotate %s: its findings do not match the evaluated input" % path)
+    for item, record in zip(items, unified):
+        if isinstance(item, dict):
+            _write_rubric_fields(item, record)
     write_file_atomic(path, dumps(document) + "\n")
 
 
@@ -2061,11 +2905,16 @@ def run_evaluate(args):
             raise InputRefused("%s is not a git repository with a commit; the accumulation is "
                                "per HEAD and cannot be kept without one" % root)
         threshold_name = args.threshold or os.environ.get("CLAGENTIC_BLOCK_SEVERITY") or "high"
+        # The merge base is resolved first: the stakes profile that applies is
+        # the one as of that commit, and the rubric reads it while the findings
+        # are unified.
+        base = resolve_base(root, args.base, args.default_branch)
+        stakes = load_stakes(root, base, today)
         incoming, unified = None, []
         if not args.no_input:
             incoming = findings_from_text(read_stdin_bounded(), args.format)
             try:
-                unified = unify_findings(incoming, gate)
+                unified = unify_findings(incoming, gate, stakes)
             except ValueError as exc:
                 raise InputRefused(str(exc))
         try:
@@ -2083,13 +2932,15 @@ def run_evaluate(args):
             raise InputRefused(str(exc))
         except OSError as exc:
             raise InputRefused("the findings state cannot be written: %s" % exc)
-        base = resolve_base(root, args.base, args.default_branch)
         store = load_store(root, worktree_reader(root))
         base_keys = introduced_entry_keys(root, base)
         scope = gate if args.scope == "gate" and gate in SOURCES else None
-        verdict = build_verdict(state, store, base_keys, threshold_name, today, scope, head, base)
+        verdict = build_verdict(state, store, base_keys, threshold_name, today, scope, head, base,
+                                stakes)
         if args.annotate:
             annotate_file(args.annotate, unified, verdict)
+        if args.rubric_into:
+            annotate_rubric_file(args.rubric_into, unified)
         if args.attach_to:
             attach_verdict(args.attach_to, verdict)
         public = {k: v for k, v in verdict.items() if k != "_status"}
@@ -2176,6 +3027,220 @@ def migrate_dispositions(root, write):
         report.append("[dispositions/migrate] wrote %s; review it, commit it, then delete the legacy files"
                       % DISPOSITIONS_REL)
     return 0, text, report
+
+
+# ------------------------------------------------------------ the profile command
+
+_ANSWER_RE = re.compile(r"^(?:(.+):)?([a-z_]+)=([a-z_]+)$")
+
+
+def parse_answer(spec):
+    """(glob or None, dimension, value) for an answer written
+    '[GLOB:]DIMENSION=VALUE', or raises ValueError naming what is wrong."""
+    match = _ANSWER_RE.match(spec.strip())
+    if not match:
+        raise ValueError("answer %r is not [GLOB:]DIMENSION=VALUE" % terminal_text(spec, 80))
+    glob, dimension, value = match.groups()
+    if dimension not in DIMENSIONS:
+        raise ValueError("answer %r: dimension must be one of %s"
+                         % (terminal_text(spec, 80), ", ".join(DIMENSIONS)))
+    if value not in DIMENSIONS[dimension]:
+        raise ValueError("answer %r: %s must be one of %s"
+                         % (terminal_text(spec, 80), dimension, ", ".join(DIMENSIONS[dimension])))
+    if glob is not None and (not glob.strip() or len(glob) > 500 or _UNSAFE_RE.search(glob)):
+        raise ValueError("answer %r: the glob is not usable" % terminal_text(spec, 80))
+    return (glob.strip() if glob else None), dimension, value
+
+
+def build_profile(root, answers, confirm, today):
+    """Draft or update the risk profile: the existing working-tree file (if
+    any), plus the operator's ANSWERS, plus what the tree implies. Returns
+    (document, report lines). Existing statements are never rewritten by
+    inference; inference only adds entries, each marked inferred with its
+    evidence, and a stated claim the tree contradicts is reported. Raises
+    ValueError when the existing file cannot be read as a profile or an answer
+    is malformed."""
+    existing = None
+    try:
+        text = worktree_reader(root)(PROFILE_REL)
+    except (OSError, ValueError) as exc:
+        raise ValueError("cannot read %s: %s" % (PROFILE_REL, exc))
+    if text is not None:
+        try:
+            existing = json.loads(text)
+        except ValueError as exc:
+            raise ValueError("%s is not valid JSON (%s); fix or remove it first" % (PROFILE_REL, exc))
+        if not isinstance(existing, dict):
+            raise ValueError("%s is not a JSON object; fix or remove it first" % PROFILE_REL)
+    document = {"version": PROFILE_SCHEMA}
+    default = dict(existing.get("default", {})) if existing and isinstance(existing.get("default"), dict) else {}
+    paths = [dict(p) for p in existing.get("paths", []) if isinstance(p, dict)] \
+        if existing and isinstance(existing.get("paths"), list) else []
+    lines = []
+    parsed = [parse_answer(spec) for spec in answers]
+    for glob, dimension, value in parsed:
+        if glob is None:
+            default[dimension] = value
+            continue
+        for entry in paths:
+            if entry.get("glob") == glob:
+                entry[dimension] = value
+                break
+        else:
+            paths.append({"glob": glob, dimension: value})
+    markers, notes = infer_markers(root)
+    lines.extend("note: " + n for n in notes)
+    added = 0
+    stated = {(e.get("glob"), d) for e in paths for d in DIMENSIONS if d in e}
+    for marker in markers:
+        key = (marker["glob"], marker["dimension"])
+        if key in stated:
+            continue
+        stated.add(key)
+        paths.append({"glob": marker["glob"], marker["dimension"]: marker["value"],
+                      "inferred": True, "evidence": marker["why"]})
+        added += 1
+    if added:
+        lines.append("inferred %d entr%s from the tree (marked inferred, with their evidence); they "
+                     "only ever state the stricter value, so they cannot lower anything"
+                     % (added, "y" if added == 1 else "ies"))
+    for marker in markers:
+        for entry in paths:
+            if entry.get("inferred") or marker["dimension"] not in entry:
+                continue
+            if not glob_match_compiled(compile_glob(str(entry.get("glob", ""))), marker["file"]):
+                continue
+            claimed = entry[marker["dimension"]]
+            if claimed in DIMENSIONS[marker["dimension"]] \
+                    and _worse_value(marker["dimension"], marker["value"], claimed) != claimed:
+                lines.append("WARN: %s=%s for %s is contradicted by the tree (%s); the gate will "
+                             "ignore that claim and apply %s there" % (
+                                 marker["dimension"], claimed, terminal_text(entry.get("glob"), 120),
+                                 terminal_text(marker["why"], 200), marker["value"]))
+        claimed = default.get(marker["dimension"])
+        if claimed in DIMENSIONS[marker["dimension"]] \
+                and _worse_value(marker["dimension"], marker["value"], claimed) != claimed:
+            lines.append("WARN: the default %s=%s is contradicted by the tree (%s); the gate will "
+                         "ignore it for the paths the marker covers" % (
+                             marker["dimension"], claimed, terminal_text(marker["why"], 200)))
+    if default:
+        document["default"] = default
+    document["paths"] = paths
+    confirmed = existing.get("confirmed_at") if existing else None
+    if parsed or confirm:
+        confirmed = today.isoformat()
+    if confirmed:
+        document["confirmed_at"] = confirmed
+    unstated = [d for d in DIMENSIONS if d not in default]
+    if unstated:
+        lines.append("unstated (the worst case applies until answered): " + "; ".join(
+            "%s (%s)" % (d, " | ".join(DIMENSIONS[d])) for d in unstated))
+        lines.append("answer with: profile --answer DIMENSION=VALUE for the whole repository, or "
+                     "--answer 'GLOB:DIMENSION=VALUE' for a path; add --write to save the file, "
+                     "then review and commit it")
+    return document, lines
+
+
+def write_profile(root, document):
+    """Write the profile atomically, only inside ROOT: the .clagentic directory
+    may be a symlink, and a profile must never be written through one to
+    somewhere else."""
+    target = os.path.join(root, PROFILE_REL)
+    directory = os.path.dirname(target)
+    os.makedirs(directory, exist_ok=True)
+    real_root = os.path.realpath(root)
+    real_dir = os.path.realpath(directory)
+    if real_dir != real_root and not real_dir.startswith(real_root + os.sep):
+        raise ValueError("%s resolves outside the repository; not written" % os.path.dirname(PROFILE_REL))
+    write_file_atomic(target, dumps(document, indent=2) + "\n")
+    return target
+
+
+def cmd_profile(args):
+    root = os.path.realpath(args.root or os.getcwd())
+    try:
+        today = today_date(args.today)
+        document, lines = build_profile(root, args.answer or [], args.confirm, today)
+        if args.write:
+            write_profile(root, document)
+            lines.append("wrote %s; review it and commit it as a change (it applies once merged)"
+                         % PROFILE_REL)
+    except (InputRefused, ValueError, OSError) as exc:
+        sys.stderr.write("profile refused: %s\n" % exc)
+        return 2
+    for line in lines:
+        warn("[profile] " + line)
+    if not args.write:
+        _print(dumps(document, indent=2) + "\n")
+    return 0
+
+
+# --------------------------------------------------------- review sample union
+
+def union_review_samples(paths, stakes):
+    """Union the findings of N review samples of one diff. Returns (envelope,
+    report lines); envelope is None when no sample was usable. Findings are
+    linked by fingerprint hint OR by location (file, line, category); of a
+    linked group the one whose RUBRIC severity is highest is kept (the model's
+    claimed severity never decides), ties to the earliest sample. A sample that
+    is unreadable or marked degraded contributes nothing and is reported."""
+    lines, usable, groups, by_key = [], 0, [], {}
+    summaries, checked = [], []
+    for index, path in enumerate(paths, 1):
+        label = "sample %d/%d" % (index, len(paths))
+        try:
+            document = load_json_file(path)
+            raw = extract_findings_strict(path)
+        except (OSError, ValueError, KeyError) as exc:
+            lines.append("%s: unreadable (%s)" % (label, terminal_text(exc, 120)))
+            continue
+        if document.get("degraded") is True or document.get("sanitize_failed") is True:
+            lines.append("%s: degraded; its findings are not used" % label)
+            continue
+        usable += 1
+        if isinstance(document.get("summary"), str) and document["summary"] not in summaries:
+            summaries.append(document["summary"])
+        for item in document.get("checked", []) if isinstance(document.get("checked"), list) else []:
+            if item not in checked:
+                checked.append(item)
+        cleaned = allowlist_fields(raw, REVIEW_FINDING_FIELDS)
+        lines.append("%s: %d finding(s)" % (label, len(cleaned)))
+        for item in cleaned:
+            record = unify_finding(item, "review", stakes)
+            keys = [("print", record["fingerprint"]),
+                    ("place", record["file"], record["line"], record["category"].lower())]
+            hit = next((by_key[k] for k in keys if k in by_key), None)
+            if hit is None:
+                hit = len(groups)
+                groups.append({"item": item, "rank": severity_rank(record["severity"])})
+            elif severity_rank(record["severity"]) > groups[hit]["rank"]:
+                groups[hit] = {"item": item, "rank": severity_rank(record["severity"])}
+            for k in keys:
+                by_key.setdefault(k, hit)
+    if not usable:
+        return None, lines
+    union = [group["item"] for group in groups]
+    lines.append("union of %d usable sample(s): %d distinct finding(s)" % (usable, len(union)))
+    summary = " | ".join(summaries)
+    return {"summary": summary, "checked": checked, "findings": union, "samples": len(paths)}, lines
+
+
+def cmd_ingest_union_samples(args):
+    root = os.path.realpath(args.root or os.getcwd())
+    try:
+        today = today_date(None)
+        base = resolve_base(root, args.base, args.default_branch)
+        stakes = load_stakes(root, base, today)
+        envelope, lines = union_review_samples(args.files, stakes)
+    except (InputRefused, ValueError, OSError) as exc:
+        warn("[gates/review] could not union the review samples: %s" % terminal_text(exc, 200))
+        return 1
+    for line in lines:
+        warn("[gates/review] " + line)
+    if envelope is None:
+        return 1
+    _print(dumps(envelope) + "\n")
+    return 0
 
 
 # ----------------------------------------------------------- verdict: blockers
@@ -3254,6 +4319,10 @@ def build_parser():
     sub.add_argument("--max", type=int, default=0)
     op(ingest, "allowlist", cmd_ingest_allowlist, ("fields", {"nargs": "+"}))
     op(ingest, "sanitize-fields", cmd_ingest_sanitize_fields, ("fields", {"nargs": "+"}))
+    sub = op(ingest, "union-samples", cmd_ingest_union_samples, ("files", {"nargs": "+"}))
+    sub.add_argument("--root", default="")
+    sub.add_argument("--base", default="")
+    sub.add_argument("--default-branch", default="")
 
     fingerprint = stages.add_parser("fingerprint").add_subparsers(dest="op", required=True)
     sub = op(fingerprint, "dedup", cmd_fingerprint_dedup)
@@ -3291,8 +4360,16 @@ def build_parser():
     sub.add_argument("--caller", choices=("standalone", "gates"), default="standalone")
     sub.add_argument("--json", action="store_true")
     for name in ("root", "head", "base", "default-branch", "threshold", "today",
-                 "annotate", "attach-to", "json-out"):
+                 "annotate", "rubric-into", "attach-to", "json-out"):
         sub.add_argument("--" + name, default="")
+
+    sub = stages.add_parser("profile")
+    sub.set_defaults(func=cmd_profile)
+    sub.add_argument("--root", default="")
+    sub.add_argument("--today", default="")
+    sub.add_argument("--write", action="store_true")
+    sub.add_argument("--confirm", action="store_true")
+    sub.add_argument("--answer", action="append", default=[])
 
     verdict = stages.add_parser("verdict").add_subparsers(dest="op", required=True)
     op(verdict, "blockers", cmd_verdict_blockers, ("file", {}), ("threshold", {}))
